@@ -114,9 +114,13 @@ pub(crate) fn prepare(draft: &str, editor: &str) -> Result<Edit, EditorError> {
 
 impl Edit {
     /// The program and arguments that open the draft: the shell runs the
-    /// editor command with the file as its last argument, as git does.
+    /// editor command with the file as its last argument, as git does, and
+    /// `exec`s it, so the process Octet waits on and stops is the editor
+    /// itself. (Linux's dash would otherwise stay as its parent: a Ctrl+C
+    /// would end the shell under the editor, and stopping it would leave
+    /// the editor running.)
     pub(crate) fn command(&self) -> (&'static str, Vec<OsString>) {
-        let script = format!("{} \"$@\"", self.editor);
+        let script = format!("exec {} \"$@\"", self.editor);
         (
             "sh",
             vec![
@@ -297,5 +301,41 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert_eq!(edit.finish(Some(0)).unwrap(), "edited:--wait");
+    }
+    #[test]
+    fn the_shell_becomes_the_editor() {
+        // Octet stops and waits on the process it starts. Under dash (Linux's
+        // sh) a plain `-c` script forks the editor and stays as its parent,
+        // so signals and stops would reach the wrong process.
+        let tools = octet_testkit::TempDir::new("octet-editor-exec");
+        std::fs::create_dir_all(tools.path()).unwrap();
+        let pid_file = tools.path().join("pid");
+        let script = octet_testkit::write_script(
+            tools.path(),
+            "editor",
+            &format!("echo $$ > '{}'", pid_file.display()),
+        );
+        let edit = prepare("draft", &format!("'{}'", script.display())).unwrap();
+        let (_, args) = edit.command();
+        for shell in ["sh", "/bin/dash"] {
+            if shell.starts_with('/') && !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            let mut child = std::process::Command::new(shell)
+                .args(&args)
+                .spawn()
+                .unwrap();
+            let started = child.id();
+            assert!(child.wait().unwrap().success());
+            let editor: u32 = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                editor, started,
+                "under {shell} the editor is not the process started"
+            );
+        }
     }
 }
