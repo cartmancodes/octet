@@ -87,7 +87,16 @@ impl Pty {
         // SAFETY: the closure runs in the child before exec and calls only async-signal-safe functions (setsid, ioctl).
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) == -1 {
+                #[cfg_attr(
+                    target_os = "linux",
+                    expect(
+                        clippy::useless_conversion,
+                        reason = "TIOCSCTTY already has ioctl's request type on Linux; \
+                                  macOS needs the widening from u32"
+                    )
+                )]
+                let request = libc::TIOCSCTTY.into();
+                if libc::setsid() == -1 || libc::ioctl(0, request, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
