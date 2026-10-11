@@ -98,6 +98,13 @@ impl SkillCatalogs {
             .insert((engine, workspace.to_path_buf()), (skills, at));
     }
 
+    /// When `engine`'s list for `workspace` was fetched, if ever.
+    pub fn fetched(&self, engine: Engine, workspace: &Path) -> Option<SystemTime> {
+        self.lists
+            .get(&(engine, workspace.to_path_buf()))
+            .map(|(_, fetched)| *fetched)
+    }
+
     /// `engine`'s list for `workspace`, if one was ever fetched.
     pub fn get(&self, engine: Engine, workspace: &Path) -> Option<&[SkillInfo]> {
         self.lists

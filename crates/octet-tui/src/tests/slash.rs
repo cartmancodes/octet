@@ -850,3 +850,17 @@ async fn an_unknown_name_still_gets_the_helpful_error() {
         app.entries_text()
     );
 }
+#[tokio::test]
+async fn a_typed_skill_that_cannot_go_keeps_the_draft() {
+    let mut app = app();
+    crate::test_support::idle(&mut app);
+    app.conn.skills = vec![skill("imagegen", &[], Some("/s/imagegen/SKILL.md"))];
+    app.conn.start_turn();
+    for i in 0..crate::app::QUEUE_LIMIT {
+        app.composer.queue.push_back(Prompt::plain(format!("p{i}")));
+    }
+    let action =
+        commands::try_command(&mut app, &RecordingVendor::default(), "/imagegen a cat").await;
+    assert!(action.is_none(), "the draft stays to send later");
+    assert_eq!(app.composer.queue.len(), crate::app::QUEUE_LIMIT);
+}

@@ -9,12 +9,7 @@ use super::{
     push_bounded, valid_identifier,
 };
 use serde_json::{Value, json};
-use std::{
-    collections::VecDeque,
-    ffi::OsString,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::VecDeque, ffi::OsString, path::Path, time::Duration};
 use tokio::{sync::mpsc, time::Instant};
 
 /// Claude Code's row in the provider table.
@@ -45,12 +40,13 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
 }
 
 fn launch_args(config: &Config) -> Vec<OsString> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    launch_args_with_home(config, home.as_deref())
+    let user = super::claude_settings::user_dir();
+    launch_args_from(config, user.as_deref())
 }
 
-/// The launch arguments, with the user's settings read from `home`.
-fn launch_args_with_home(config: &Config, home: Option<&Path>) -> Vec<OsString> {
+/// The launch arguments, with the user's settings read from Claude's user
+/// folder `user`.
+fn launch_args_from(config: &Config, user: Option<&Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--print",
         "--input-format",
@@ -70,9 +66,12 @@ fn launch_args_with_home(config: &Config, home: Option<&Path>) -> Vec<OsString> 
     if config.plugins.load {
         // Only the plugins Claude's settings enable; the rest of those
         // settings stays off, so Octet still answers the approvals.
-        let (names, _) = super::claude_settings::enabled_plugins(home, &config.cwd);
+        let (names, _) = super::claude_settings::enabled_plugins(user, &config.cwd);
         let mut settings = serde_json::Map::new();
-        if !config.plugins.hooks {
+        // A catalog-only probe wants the plugins' skills, never their hooks:
+        // nothing would journal a hook it ran.
+        let hooks = config.plugins.hooks && !config.catalog_only;
+        if !hooks {
             settings.insert("disableAllHooks".into(), Value::Bool(true));
         }
         settings.insert(
@@ -88,7 +87,9 @@ fn launch_args_with_home(config: &Config, home: Option<&Path>) -> Vec<OsString> 
             "--settings".into(),
             Value::Object(settings).to_string().into(),
         ]);
-        args.push("--include-hook-events".into());
+        if hooks {
+            args.push("--include-hook-events".into());
+        }
     }
     args.extend(
         claude_permission_args(config.mode)
@@ -190,9 +191,9 @@ impl Protocol for ClaudeProtocol {
 
     async fn initialize(&mut self, core: &mut Core) -> Result<(), DriverError> {
         if core.config.plugins.load {
-            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let user = super::claude_settings::user_dir();
             let (_, warnings) =
-                super::claude_settings::enabled_plugins(home.as_deref(), &core.config.cwd);
+                super::claude_settings::enabled_plugins(user.as_deref(), &core.config.cwd);
             for warning in warnings {
                 core.emit(Event::Notice(warning))?;
             }
@@ -706,6 +707,7 @@ mod tests {
     #[test]
     fn plugin_switches_shape_the_launch() {
         let home = octet_testkit::TempDir::new("octet-claude-flags");
+        let user = home.path().join(".claude");
         std::fs::create_dir_all(home.path().join(".claude")).unwrap();
         std::fs::write(
             home.path().join(".claude/settings.json"),
@@ -714,7 +716,7 @@ mod tests {
         .unwrap();
         let mut config = Config::new(Engine::CLAUDE, "claude", std::env::temp_dir());
         let args = |c: &Config| {
-            launch_args_with_home(c, Some(home.path()))
+            launch_args_from(c, Some(&user))
                 .into_iter()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
@@ -734,6 +736,17 @@ mod tests {
             value_after(&no_hooks, "--settings"),
             r#"{"disableAllHooks":true,"enabledPlugins":{"x@m":true}}"#
         );
+        // A catalog-only probe loads the plugins for their skills, but runs
+        // no hook: nothing would journal it.
+        config.plugins.hooks = true;
+        config.catalog_only = true;
+        let probe = args(&config);
+        assert_eq!(
+            value_after(&probe, "--settings"),
+            r#"{"disableAllHooks":true,"enabledPlugins":{"x@m":true}}"#
+        );
+        assert!(!probe.contains(&"--include-hook-events".to_owned()));
+        config.catalog_only = false;
         config.plugins.load = false;
         let off = args(&config);
         assert!(!off.contains(&"--settings".to_owned()));

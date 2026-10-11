@@ -415,7 +415,8 @@ bring, and runs them.
 | `--no-plugins` | No plugins (as before this feature) | `app-server --disable plugins` |
 
 - **Which Claude plugins:** the `enabledPlugins` maps in
-  `~/.claude/settings.json`, `<workspace>/.claude/settings.json` and
+  `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`),
+  `<workspace>/.claude/settings.json` and
   `<workspace>/.claude/settings.local.json`, the later file winning for a
   name, as Claude reads them. Only that map is read. A file that cannot be
   read is skipped with a one-line notice at connect.
@@ -431,7 +432,8 @@ bring, and runs them.
   (Octet was not asked)"). Codex hooks are not shown. `--no-plugin-hooks` is
   the control; it also stops start-up bootstraps such as superpowers'.
 - The switches apply to every launch: the interface, `--print`, `--rpc` and
-  the background model-list fetches.
+  the background model-list fetches. A background fetch loads the plugins
+  for their skills but never runs their hooks, since nothing would show it.
 
 ### Skills
 
@@ -449,7 +451,8 @@ bring, and runs them.
   bundled ones.
 - `/skills` lists the current provider's skills first (as its session
   reported them), then each other provider's, cached per workspace in
-  `skills.json` beside `models.json` and fetched with the model lists.
+  `skills.json` beside `models.json` and fetched with the model lists (also
+  when a workspace has none yet, or they are a day old).
 - Enter on another provider's skill switches to that provider (its default
   model, the conversation carried as for any switch), then runs the skill
   as the first turn. If the switch fails, the skill is not run and a note

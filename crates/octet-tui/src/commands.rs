@@ -103,8 +103,8 @@ fn skill_command(app: &mut App, vendor: &dyn Vendor, name: &str, argument: &str)
         .iter()
         .find(|(engine, skill)| *engine == app.conn.engine && named(skill))
     {
-        crate::input::run_skill(app, vendor, skill, argument);
-        return Some(Action::Continue);
+        // A skill that cannot go leaves the draft, as a prompt does.
+        return crate::input::run_skill(app, vendor, skill, argument).then_some(Action::Continue);
     }
     if let Some((engine, _)) = entries.iter().find(|(_, skill)| named(skill)) {
         app.note(format!("{name} is a {engine} skill; /skills runs it there"));

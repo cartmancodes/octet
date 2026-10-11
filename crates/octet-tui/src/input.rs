@@ -200,9 +200,11 @@ fn pick_skill(app: &mut App, vendor: &dyn Vendor, item: Option<String>) -> Actio
         return Action::Continue;
     };
     if engine == app.conn.engine {
-        app.composer.completion = None;
-        app.composer.editor.take();
-        run_skill(app, vendor, &skill, "");
+        // The picker and its draft stay when the skill cannot go.
+        if run_skill(app, vendor, &skill, "") {
+            app.composer.completion = None;
+            app.composer.editor.take();
+        }
         return Action::Continue;
     }
     if let Err(refusal) = crate::commands::can_reconnect(app) {
@@ -222,33 +224,34 @@ fn pick_skill(app: &mut App, vendor: &dyn Vendor, item: Option<String>) -> Actio
     }))
 }
 /// Runs `skill` with `args` as a turn, or queues it behind the running one,
-/// as a typed prompt goes.
+/// as a typed prompt goes. False, with a notice, when it could not go.
 pub(crate) fn run_skill(
     app: &mut App,
     vendor: &dyn Vendor,
     skill: &octet_core::SkillInfo,
     args: &str,
-) {
+) -> bool {
     let prompt = Prompt::skill(skill, args);
     if app.conn.is_running() {
         if app.composer.queue.len() >= QUEUE_LIMIT {
             app.status_line = format!(
                 "The queue is full ({QUEUE_LIMIT} prompts); wait for the turn or press Esc"
             );
-            return;
+            return false;
         }
         app.composer.queue.push_back(prompt.clone());
         app.hint(format!("Queued ({} waiting)", app.composer.queue.len()));
     } else if !app.is_idle() {
         app.hint(crate::registry::NOT_CONNECTED);
-        return;
+        return false;
     } else if let Err(error) =
         app.begin_turn(vendor, prompt.clone().into_command(), By::User, "sending")
     {
         app.error(error.to_string());
-        return;
+        return false;
     }
     app.remember(prompt.display);
+    true
 }
 /// The model picker is open on a draft that already names a model exactly:
 /// `default`, or a name or full ID some provider lists.

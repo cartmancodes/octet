@@ -123,21 +123,42 @@ pub(crate) fn skills_query(text: &str, cursor: usize) -> Option<(usize, &str)> {
     .then(|| (start, &text[start..cursor]))
 }
 
-/// The skills picker's lines for `query`: `name · provider · description`,
-/// those whose name or an alias contains `query`, or whose description does.
+/// The skills picker's lines for `query`: `name · provider · description`.
+/// A name or alias that is `query` comes first, then one that starts with it,
+/// then one that contains it, then a description that does; within each, the
+/// entries' order (the current provider's first). Enter takes the top line,
+/// so a description never outranks a name.
 pub(crate) fn skill_items(
     entries: &[(octet_core::Engine, octet_core::SkillInfo)],
     query: &str,
 ) -> Vec<String> {
     let lower = query.to_lowercase();
-    entries
+    let rank = |s: &octet_core::SkillInfo| {
+        let names: Vec<String> = std::iter::once(&s.name)
+            .chain(&s.aliases)
+            .map(|name| name.to_lowercase())
+            .collect();
+        if names.contains(&lower) {
+            Some(0)
+        } else if names.iter().any(|name| name.starts_with(&lower)) {
+            Some(1)
+        } else if names.iter().any(|name| name.contains(&lower)) {
+            Some(2)
+        } else if s.description.to_lowercase().contains(&lower) {
+            Some(3)
+        } else {
+            None
+        }
+    };
+    let mut ranked: Vec<(u8, &(octet_core::Engine, octet_core::SkillInfo))> = entries
         .iter()
-        .filter(|(_, s)| {
-            s.name.to_lowercase().contains(&lower)
-                || s.aliases.iter().any(|a| a.to_lowercase().contains(&lower))
-                || s.description.to_lowercase().contains(&lower)
-        })
-        .map(|(engine, s)| {
+        .filter_map(|entry| rank(&entry.1).map(|tier| (tier, entry)))
+        .collect();
+    // Stable: the entries' order holds within a tier.
+    ranked.sort_by_key(|(tier, _)| *tier);
+    ranked
+        .into_iter()
+        .map(|(_, (engine, s))| {
             let description = crate::text::clean(&s.description);
             if description.is_empty() {
                 format!("{} · {engine}", s.name)
@@ -393,6 +414,39 @@ fn fence_for(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn skill_names_outrank_descriptions_whatever_the_provider() {
+        use octet_core::Engine;
+        let skill = |name: &str, aliases: &[&str], description: &str| octet_core::SkillInfo {
+            name: name.into(),
+            description: description.into(),
+            aliases: aliases.iter().map(|a| (*a).to_owned()).collect(),
+            argument_hint: String::new(),
+            path: None,
+        };
+        // The current provider's (Codex) first, as `skill_entries` orders them.
+        let entries = [
+            (Engine::CODEX, skill("doctor", &[], "Checks your context")),
+            (Engine::CODEX, skill("my-context-tool", &[], "")),
+            (Engine::CODEX, skill("contexts", &[], "")),
+            (Engine::CLAUDE, skill("superpowers:x", &["context"], "")),
+            (Engine::CLAUDE, skill("context", &[], "")),
+        ];
+        let names: Vec<String> = skill_items(&entries, "context")
+            .iter()
+            .map(|item| item.split(" · ").next().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "superpowers:x",
+                "context",
+                "contexts",
+                "my-context-tool",
+                "doctor"
+            ]
+        );
+    }
     use crate::shell::Status;
     fn ran(command: &str, output: &str, code: i32) -> Ran {
         Ran {

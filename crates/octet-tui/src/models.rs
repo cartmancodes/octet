@@ -108,10 +108,26 @@ impl Models {
             return;
         }
         for engine in others(active) {
-            if self.catalogs.stale(engine, now) && !self.failed.contains_key(&engine) {
+            if (self.catalogs.stale(engine, now) || self.skills_stale(engine, now))
+                && !self.failed.contains_key(&engine)
+            {
                 self.probe(engine);
             }
         }
+    }
+
+    /// Whether `engine`'s skills for the probes' workspace are missing or as
+    /// old as a stale model list: skills differ by folder, the models do not.
+    fn skills_stale(&self, engine: Engine, now: SystemTime) -> bool {
+        let Some(prober) = &self.prober else {
+            return false;
+        };
+        self.skill_catalogs
+            .fetched(engine, &prober.cwd)
+            .is_none_or(|fetched| {
+                now.duration_since(fetched)
+                    .map_or(true, |age| age >= catalog::STALE_AFTER)
+            })
     }
 
     /// `/model refresh`: probes every other provider now, forgetting any
@@ -356,6 +372,25 @@ mod tests {
             argument_hint: String::new(),
             path: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_workspace_without_skills_is_probed_though_the_models_are_fresh() {
+        let dir = temp("octet-models-skills-stale");
+        let mut models = attached(dir.path());
+        let now = SystemTime::now();
+        models
+            .catalogs
+            .set(Engine::CODEX, vec![model("gpt-x")], now);
+        // `fake_prober` probes in the temporary directory, which has no
+        // Codex skills yet.
+        models.probe_stale(Engine::CLAUDE, now);
+        assert!(models.probing.contains(&Engine::CODEX));
+        let probed = models.next().await;
+        models.probed(probed, SystemTime::now());
+        // Both fresh now: no probe.
+        models.probe_stale(Engine::CLAUDE, SystemTime::now());
+        assert!(models.probing.is_empty());
     }
 
     #[test]

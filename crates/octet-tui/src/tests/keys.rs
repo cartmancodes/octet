@@ -934,3 +934,14 @@ async fn a_failed_switch_drops_the_pending_skill() {
     .await;
     assert!(claude.sent.borrow().is_empty());
 }
+#[tokio::test]
+async fn a_picked_skill_that_cannot_go_keeps_the_picker_draft() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills image").await;
+    // The session drops while the picker is open.
+    app.conn.phase = crate::app::ConnPhase::Connecting;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(vendor.sent.borrow().is_empty());
+    assert_eq!(app.composer.editor.text(), "/skills image");
+}

@@ -332,8 +332,9 @@ async fn session_event(app: &mut App, vendor: &dyn Vendor, event: octet_core::Ev
         if let Some(run) = app
             .pending_skill
             .take_if(|run| run.engine == app.conn.engine)
+            && !input::run_skill(app, vendor, &run.skill, &run.args)
         {
-            input::run_skill(app, vendor, &run.skill, &run.args);
+            app.note(format!("The skill /{} was not run", run.skill.name));
         }
     }
     if stopped && let Some(run) = app.pending_skill.take() {
