@@ -1,7 +1,7 @@
 //! The command line, parsed once into `Args`. Usage errors (exit 2) are kept
 //! apart from failures while running (exit 1), so a script driving
 //! `--print` can tell a bad flag from a failed turn.
-use octet_core::{Config, Engine, Mode};
+use octet_core::{Config, Engine, Mode, Plugins};
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 use thiserror::Error;
 
@@ -66,6 +66,7 @@ pub(crate) struct Args {
     pub(crate) mode: Mode,
     pub(crate) approval_timeout: Duration,
     pub(crate) effort: Option<String>,
+    pub(crate) plugins: Plugins,
     pub(crate) run: Run,
 }
 
@@ -82,6 +83,7 @@ impl Args {
             mode: self.mode,
             approval_timeout: self.approval_timeout,
             effort: self.effort.clone(),
+            plugins: self.plugins,
             ..Config::new(self.engine, binary, cwd)
         }
     }
@@ -136,6 +138,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
     let mut mode = Mode::Ask;
     let mut approval_timeout = octet_core::DEFAULT_APPROVAL_TIMEOUT;
     let mut effort = None;
+    let mut plugins = Plugins::default();
     let mut print = None;
     let mut output = None;
     let mut rpc = false;
@@ -155,6 +158,8 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
             "--help" | "-h" => return Ok(Parsed::Help),
             "--version" => return Ok(Parsed::Version),
             "--rpc" => rpc = true,
+            "--no-plugins" => plugins.load = false,
+            "--no-plugin-hooks" => plugins.hooks = false,
             "--engine" => engine = text(&mut args, name)?,
             "--binary" => binary = Some(PathBuf::from(value(&mut args, name)?)),
             "--cwd" => cwd = Some(PathBuf::from(value(&mut args, name)?)),
@@ -231,6 +236,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
         mode,
         approval_timeout,
         effort,
+        plugins,
         run,
     })))
 }
@@ -306,6 +312,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plugin_switches_parse() {
+        assert_eq!(
+            args(&[]).plugins,
+            octet_core::Plugins {
+                load: true,
+                hooks: true
+            }
+        );
+        assert!(!args(&["--no-plugins"]).plugins.load);
+        let no_hooks = args(&["--no-plugin-hooks"]).plugins;
+        assert!(no_hooks.load && !no_hooks.hooks);
+        assert!(!args(&["--no-plugins"]).config("/tmp".into()).plugins.load);
+    }
     #[test]
     fn defaults_are_codex_in_ask_mode_with_the_interface() {
         let parsed = args(&[]);

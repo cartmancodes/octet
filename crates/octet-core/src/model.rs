@@ -69,6 +69,7 @@ impl Selection {
             // the original instead would write into it.
             fork: same && session.is_empty() && current.fork,
             catalog_only: false,
+            plugins: current.plugins,
             engine: self.provider,
             model: self.model.clone(),
             cwd: current.cwd.clone(),

@@ -9,6 +9,7 @@ use tokio::{
 };
 
 mod claude;
+mod claude_settings;
 mod codex;
 mod demo;
 mod driver;
@@ -278,6 +279,24 @@ pub struct Config {
     /// Open the CLI only far enough to list its models: no vendor session,
     /// no prompt. Used by `probe`.
     pub catalog_only: bool,
+    /// Load the vendor's plugins, and run their hooks.
+    pub plugins: Plugins,
+}
+/// Whether the vendor's plugins load, and whether their hooks run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Plugins {
+    /// Load the plugins the vendor's settings enable (`--no-plugins` turns it off).
+    pub load: bool,
+    /// Run the hooks those plugins bring (`--no-plugin-hooks` turns it off).
+    pub hooks: bool,
+}
+impl Default for Plugins {
+    fn default() -> Self {
+        Self {
+            load: true,
+            hooks: true,
+        }
+    }
 }
 impl Config {
     /// Ask mode, the vendor's default model, a new vendor session.
@@ -293,6 +312,7 @@ impl Config {
             effort: None,
             fork: false,
             catalog_only: false,
+            plugins: Plugins::default(),
         }
     }
 }

@@ -9,7 +9,12 @@ use super::{
     push_bounded, valid_identifier,
 };
 use serde_json::{Value, json};
-use std::{collections::VecDeque, ffi::OsString, time::Duration};
+use std::{
+    collections::VecDeque,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::{sync::mpsc, time::Instant};
 
 /// Claude Code's row in the provider table.
@@ -40,6 +45,12 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
 }
 
 fn launch_args(config: &Config) -> Vec<OsString> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    launch_args_with_home(config, home.as_deref())
+}
+
+/// The launch arguments, with the user's settings read from `home`.
+fn launch_args_with_home(config: &Config, home: Option<&Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--print",
         "--input-format",
@@ -56,6 +67,29 @@ fn launch_args(config: &Config) -> Vec<OsString> {
     .into_iter()
     .map(Into::into)
     .collect();
+    if config.plugins.load {
+        // Only the plugins Claude's settings enable; the rest of those
+        // settings stays off, so Octet still answers the approvals.
+        let (names, _) = super::claude_settings::enabled_plugins(home, &config.cwd);
+        let mut settings = serde_json::Map::new();
+        if !config.plugins.hooks {
+            settings.insert("disableAllHooks".into(), Value::Bool(true));
+        }
+        settings.insert(
+            "enabledPlugins".into(),
+            Value::Object(
+                names
+                    .into_iter()
+                    .map(|name| (name, Value::Bool(true)))
+                    .collect(),
+            ),
+        );
+        args.extend([
+            "--settings".into(),
+            Value::Object(settings).to_string().into(),
+        ]);
+        args.push("--include-hook-events".into());
+    }
     args.extend(
         claude_permission_args(config.mode)
             .into_iter()
@@ -155,6 +189,14 @@ impl Protocol for ClaudeProtocol {
     }
 
     async fn initialize(&mut self, core: &mut Core) -> Result<(), DriverError> {
+        if core.config.plugins.load {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let (_, warnings) =
+                super::claude_settings::enabled_plugins(home.as_deref(), &core.config.cwd);
+            for warning in warnings {
+                core.emit(Event::Notice(warning))?;
+            }
+        }
         core.send(json!({"type":"control_request","request_id":"octet-init","request":{"subtype":"initialize"}}))
             .await
     }
@@ -532,6 +574,44 @@ pub(crate) fn claude_reported_mode(raw: &str) -> Option<Mode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::Engine;
+    #[test]
+    fn plugin_switches_shape_the_launch() {
+        let home = octet_testkit::TempDir::new("octet-claude-flags");
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"x@m":true}}"#,
+        )
+        .unwrap();
+        let mut config = Config::new(Engine::CLAUDE, "claude", std::env::temp_dir());
+        let args = |c: &Config| {
+            launch_args_with_home(c, Some(home.path()))
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let value_after = |list: &[String], flag: &str| {
+            list[list.iter().position(|a| a == flag).unwrap() + 1].clone()
+        };
+        let on = args(&config);
+        assert_eq!(
+            value_after(&on, "--settings"),
+            r#"{"enabledPlugins":{"x@m":true}}"#
+        );
+        assert!(on.contains(&"--include-hook-events".to_owned()));
+        config.plugins.hooks = false;
+        let no_hooks = args(&config);
+        assert_eq!(
+            value_after(&no_hooks, "--settings"),
+            r#"{"disableAllHooks":true,"enabledPlugins":{"x@m":true}}"#
+        );
+        config.plugins.load = false;
+        let off = args(&config);
+        assert!(!off.contains(&"--settings".to_owned()));
+        assert!(!off.contains(&"--include-hook-events".to_owned()));
+        assert!(off.contains(&"--setting-sources=".to_owned()));
+    }
     #[test]
     fn stray_permission_denial_says_why() {
         let request = json!({"subtype": "can_use_tool", "tool_name": "Bash", "input": {}});

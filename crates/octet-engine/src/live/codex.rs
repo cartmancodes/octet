@@ -73,8 +73,8 @@ pub(super) struct CodexProtocol {
 }
 
 impl Protocol for CodexProtocol {
-    fn launch_args(_config: &Config) -> Vec<OsString> {
-        vec!["app-server".into()]
+    fn launch_args(config: &Config) -> Vec<OsString> {
+        launch_args(config)
     }
 
     fn answer(wire: &Value, allow: bool) -> Value {
@@ -485,6 +485,18 @@ impl CodexProtocol {
     }
 }
 
+/// The app server, with plugins or their hooks turned off when asked (stable
+/// feature flags: `--disable plugins`, `--disable hooks`).
+fn launch_args(config: &Config) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["app-server".into()];
+    if !config.plugins.load {
+        args.extend(["--disable".into(), "plugins".into()]);
+    } else if !config.plugins.hooks {
+        args.extend(["--disable".into(), "hooks".into()]);
+    }
+    args
+}
+
 /// Codex takes `target` from the next turn: record it and say so.
 fn adopt_mode_now(core: &mut Core, target: Mode) -> Result<(), DriverError> {
     core.mode = target;
@@ -635,6 +647,22 @@ pub(crate) fn codex_turn_overrides(mode: Mode) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::Engine;
+    #[test]
+    fn plugin_switches_reach_the_app_server() {
+        let mut c = Config::new(Engine::CODEX, "codex", ".");
+        let args = |c: &Config| {
+            launch_args(c)
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(args(&c), ["app-server"]);
+        c.plugins.hooks = false;
+        assert_eq!(args(&c), ["app-server", "--disable", "hooks"]);
+        c.plugins.load = false;
+        assert_eq!(args(&c), ["app-server", "--disable", "plugins"]);
+    }
     #[test]
     fn error_text_prefers_the_vendor_message() {
         assert_eq!(

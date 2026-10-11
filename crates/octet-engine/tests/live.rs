@@ -2029,3 +2029,23 @@ async fn a_silent_cli_is_gone_after_the_probe_gives_up() {
         .success();
     assert!(!alive, "the CLI {pid} is still running");
 }
+
+#[tokio::test]
+async fn no_plugins_starts_codex_with_plugins_disabled() {
+    let child = octet_testkit::protocol_child();
+    let (dir, script) = script_vendor(
+        "octet-codex-no-plugins",
+        &format!(
+            "echo \"$@\" > \"$(dirname \"$0\")/argv.log\"\nexec '{}' \"$@\"",
+            child.display()
+        ),
+    );
+    let mut c = config();
+    c.binary = script;
+    c.plugins.load = false;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    stop(&handle, task).await;
+    let argv = std::fs::read_to_string(dir.path().join("argv.log")).unwrap();
+    assert_eq!(argv.trim(), "app-server --disable plugins");
+}
