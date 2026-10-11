@@ -117,6 +117,10 @@ pub(super) async fn demo(
                         emit(tx, Event::Notice("The offline demo has no reasoning effort".into()))?;
                         continue;
                     }
+                    Some(Command::Skill { .. }) => {
+                        emit(tx, Event::Notice("The offline demo has no skills".into()))?;
+                        continue;
+                    }
                     Some(Command::Compact) => {
                         emit(tx, Event::Notice("The offline demo has no context to compact".into()))?;
                         continue;

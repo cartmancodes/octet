@@ -13,6 +13,8 @@ pub(crate) struct Handoff {
     pub(crate) text: String,
     /// The user prompts it carries.
     pub(crate) turns: usize,
+    /// Where the transcript block ends, before the new-message line.
+    context_end: usize,
 }
 
 /// What the new model reads first: whose conversation this is, and how to
@@ -31,6 +33,11 @@ impl Handoff {
     /// Its size, for the note that says what went.
     pub(crate) fn bytes(&self) -> usize {
         self.text.len()
+    }
+    /// The preamble and the transcript, without the new-message line: what
+    /// goes after a skill's own invocation.
+    pub(crate) fn context(&self) -> &str {
+        &self.text[..self.context_end]
     }
     /// `wire` (the prompt as the vendor receives it) after the transcript.
     pub(crate) fn wrap(&self, wire: &str) -> String {
@@ -153,11 +160,14 @@ pub(crate) fn render<'a>(
         .filter(|part| part.starts_with("User:\n"))
         .count();
     let tag = block_tag();
-    let text = format!(
-        "{PREAMBLE}\n\n<{tag}>\n{}</{tag}>\n\n{NEW_MESSAGE}\n\n",
-        parts.join("\n")
-    );
-    Some(Handoff { text, turns })
+    let context = format!("{PREAMBLE}\n\n<{tag}>\n{}</{tag}>\n", parts.join("\n"));
+    let context_end = context.len();
+    let text = format!("{context}\n{NEW_MESSAGE}\n\n");
+    Some(Handoff {
+        text,
+        turns,
+        context_end,
+    })
 }
 
 #[cfg(test)]
@@ -173,6 +183,17 @@ mod tests {
     }
     fn reply(text: &str) -> Entry {
         entry(Role::Assistant, Engine::CLAUDE, text)
+    }
+
+    #[test]
+    fn the_context_is_the_handoff_without_the_new_message_line() {
+        let handoff = render(&[user("Fix the build")], HANDOFF_BUDGET).unwrap();
+        let context = handoff.context();
+        assert!(context.starts_with("[Octet handoff]"), "{context}");
+        assert!(context.trim_end().ends_with('>'), "{context}");
+        assert!(context.contains("</earlier-conversation-"), "{context}");
+        assert!(!context.contains(NEW_MESSAGE), "{context}");
+        assert!(handoff.text.starts_with(context));
     }
 
     #[test]

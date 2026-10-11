@@ -457,6 +457,36 @@ async fn only_the_first_prompt_carries_it() {
     assert_eq!(sent[1].0, "second");
 }
 #[test]
+fn a_skill_after_a_switch_carries_the_handoff_as_context() {
+    let mut app = switched_to_codex();
+    let context = app.pending_handoff.as_ref().unwrap().context().to_owned();
+    let vendor = RecordingVendor::default();
+    app.begin_turn(
+        &vendor,
+        Command::Skill {
+            name: "fixture-codex-skill".into(),
+            path: None,
+            args: "go".into(),
+            display: "/fixture-codex-skill go".into(),
+            context: None,
+        },
+        By::User,
+        "sending",
+    )
+    .unwrap();
+    match &vendor.sent.borrow()[..] {
+        [Command::Skill { context: sent, .. }] => assert_eq!(sent.as_deref(), Some(&*context)),
+        other => panic!("{other:?}"),
+    }
+    assert!(app.pending_handoff.is_none());
+    assert!(
+        app.entries_text()
+            .contains("Carried the earlier conversation to codex"),
+        "{}",
+        app.entries_text()
+    );
+}
+#[test]
 fn a_refused_send_keeps_the_handoff() {
     let mut app = switched_to_codex();
     let vendor = RecordingVendor::default();

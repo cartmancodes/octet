@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     fmt::Write as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -140,20 +140,31 @@ impl Protocol for CodexProtocol {
                     .map(|image| json!({"type":"localImage","path":image.path})),
             )
             .collect();
-        let mut params = json!({"threadId":core.session,"input":input});
-        if let Some(model) = &core.config.model {
-            params["model"] = json!(model);
+        self.turn_start(core, input).await
+    }
+
+    /// A skill item (or `$name` when there is no path), then the context
+    /// and the arguments as one text item.
+    async fn send_skill(
+        &mut self,
+        core: &mut Core,
+        name: &str,
+        path: Option<&Path>,
+        args: &str,
+        context: Option<&str>,
+    ) -> Result<(), DriverError> {
+        let mut input = vec![match path {
+            Some(path) => json!({"type":"skill","name":name,"path":path}),
+            None => json!({"type":"text","text":format!("${name}")}),
+        }];
+        let text: Vec<&str> = [context.unwrap_or(""), args]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect();
+        if !text.is_empty() {
+            input.push(json!({"type":"text","text":text.join("\n\n")}));
         }
-        if let Some(effort) = &core.config.effort {
-            params["effort"] = json!(effort);
-        }
-        if let (Some(target), Value::Object(extra)) =
-            (params.as_object_mut(), codex_turn_overrides(core.mode))
-        {
-            target.extend(extra);
-        }
-        self.request(core, Outstanding::Start, "turn/start", params)
-            .await
+        self.turn_start(core, input).await
     }
 
     /// Compaction is a turn on the thread; an error reply fails it as a
@@ -421,6 +432,24 @@ impl CodexProtocol {
         }
         self.request_models(core, None).await?;
         self.request_skills(core, false).await
+    }
+
+    /// `turn/start` with `input`, the model, effort and the mode's overrides.
+    async fn turn_start(&mut self, core: &Core, input: Vec<Value>) -> Result<(), DriverError> {
+        let mut params = json!({"threadId":core.session,"input":input});
+        if let Some(model) = &core.config.model {
+            params["model"] = json!(model);
+        }
+        if let Some(effort) = &core.config.effort {
+            params["effort"] = json!(effort);
+        }
+        if let (Some(target), Value::Object(extra)) =
+            (params.as_object_mut(), codex_turn_overrides(core.mode))
+        {
+            target.extend(extra);
+        }
+        self.request(core, Outstanding::Start, "turn/start", params)
+            .await
     }
 
     /// Asks for the workspace's skills; `reload` after Codex says they changed.

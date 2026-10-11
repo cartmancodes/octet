@@ -206,6 +206,28 @@ impl Protocol for ClaudeProtocol {
             .await
     }
 
+    /// A skill is its slash command as prompt text, so it leads the
+    /// message; the context follows it.
+    async fn send_skill(
+        &mut self,
+        core: &mut Core,
+        name: &str,
+        _path: Option<&Path>,
+        args: &str,
+        context: Option<&str>,
+    ) -> Result<(), DriverError> {
+        let mut text = format!("/{name}");
+        if !args.is_empty() {
+            text.push(' ');
+            text.push_str(args);
+        }
+        if let Some(context) = context {
+            text.push_str("\n\n");
+            text.push_str(context);
+        }
+        self.send_prompt(core, &text, &[]).await
+    }
+
     /// Images go inline as base64 blocks, read now; an image that cannot
     /// be read fails the turn.
     async fn send_prompt(

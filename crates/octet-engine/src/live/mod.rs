@@ -576,20 +576,38 @@ pub enum Command {
     SetEffort(Option<String>),
     /// Ask the vendor to compact its context; it runs as a turn.
     Compact,
+    /// Run one of the vendor's skills as a turn, in the vendor's form.
+    Skill {
+        /// The skill's name, as the vendor listed it.
+        name: String,
+        /// Its `SKILL.md`, which a Codex skill input names.
+        path: Option<PathBuf>,
+        /// What the user typed after the name.
+        args: String,
+        /// What the transcript and journal show (`/name args`).
+        display: String,
+        /// Earlier conversation sent with it (a handoff).
+        context: Option<String>,
+    },
 }
 impl Command {
     /// Whether this command starts a turn: a prompt or a compaction.
     pub fn starts_turn(&self) -> bool {
         matches!(
             self,
-            Command::Prompt(_) | Command::PromptWithDisplay { .. } | Command::Compact
+            Command::Prompt(_)
+                | Command::PromptWithDisplay { .. }
+                | Command::Compact
+                | Command::Skill { .. }
         )
     }
     /// What the transcript shows for a turn command.
     fn turn_display(&self) -> Option<&str> {
         match self {
             Command::Prompt(text) => Some(text),
-            Command::PromptWithDisplay { display, .. } => Some(display),
+            Command::PromptWithDisplay { display, .. } | Command::Skill { display, .. } => {
+                Some(display)
+            }
             Command::Compact => Some("/compact"),
             _ => None,
         }
@@ -599,7 +617,9 @@ impl Command {
     fn prompt_bytes(&self) -> usize {
         match self {
             Command::Prompt(text) | Command::Steer(text) => text.len(),
-            Command::PromptWithDisplay { display, .. } => display.len(),
+            Command::PromptWithDisplay { display, .. } | Command::Skill { display, .. } => {
+                display.len()
+            }
             Command::Answer { .. }
             | Command::SetMode(_)
             | Command::SetEffort(_)
@@ -611,6 +631,12 @@ impl Command {
     fn wire_bytes(&self) -> usize {
         match self {
             Command::PromptWithDisplay { wire, .. } => wire.len(),
+            Command::Skill {
+                name,
+                args,
+                context,
+                ..
+            } => name.len() + args.len() + context.as_ref().map_or(0, String::len),
             other => other.prompt_bytes(),
         }
     }

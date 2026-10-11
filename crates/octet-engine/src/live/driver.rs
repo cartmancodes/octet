@@ -252,6 +252,26 @@ impl<P: Protocol> Driver<P> {
             Command::Steer(text) => self.steer(text).await,
             Command::SetEffort(effort) => self.set_effort(effort),
             Command::Compact => self.compact().await,
+            Command::Skill {
+                name,
+                path,
+                args,
+                display,
+                context,
+            } => {
+                if self.begin_turn(display)? {
+                    self.protocol
+                        .send_skill(
+                            &mut self.core,
+                            &name,
+                            path.as_deref(),
+                            &args,
+                            context.as_deref(),
+                        )
+                        .await?;
+                }
+                Ok(())
+            }
         }
     }
 

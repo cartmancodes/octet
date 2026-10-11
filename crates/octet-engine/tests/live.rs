@@ -2116,3 +2116,75 @@ async fn a_probe_lists_models_and_skills() {
     assert!(!listing.models.is_empty());
     assert_eq!(listing.skills[0].name, "fixture-codex-skill");
 }
+
+#[tokio::test]
+async fn a_claude_skill_is_sent_as_its_slash_command() {
+    let (dir, script) = logged("octet-skill-claude");
+    let mut c = claude();
+    c.binary = script;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::Skill {
+            name: "fixture-skill".into(),
+            path: None,
+            args: "go".into(),
+            display: "/fixture-skill go".into(),
+            context: None,
+        })
+        .unwrap();
+    let user = wait_for(&mut events, |e| matches!(e, Event::User(_))).await;
+    assert!(
+        matches!(&user, Event::User(text) if text == "/fixture-skill go"),
+        "{user:?}"
+    );
+    wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    stop(&handle, task).await;
+    let sent = std::fs::read_to_string(dir.path().join("sent.log")).unwrap();
+    let texts: Vec<String> = sent
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| v["type"] == "user")
+        .filter_map(|v| {
+            let content = &v["message"]["content"];
+            content
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| content[0]["text"].as_str().map(str::to_owned))
+        })
+        .collect();
+    assert_eq!(texts, ["/fixture-skill go"], "{sent}");
+}
+
+#[tokio::test]
+async fn a_codex_skill_is_sent_as_a_skill_item_with_its_context() {
+    let (dir, script) = logged("octet-skill-codex");
+    let mut c = config();
+    c.binary = script;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Skill {
+            name: "fixture-codex-skill".into(),
+            path: Some("/tmp/fixture-codex-skill/SKILL.md".into()),
+            args: "go".into(),
+            display: "/fixture-codex-skill go".into(),
+            context: Some("EARLIER".into()),
+        })
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    stop(&handle, task).await;
+    let sent = std::fs::read_to_string(dir.path().join("sent.log")).unwrap();
+    let start = sent
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v["method"] == "turn/start")
+        .expect("turn/start was sent");
+    assert_eq!(
+        start["params"]["input"],
+        serde_json::json!([
+            {"type":"skill","name":"fixture-codex-skill","path":"/tmp/fixture-codex-skill/SKILL.md"},
+            {"type":"text","text":"EARLIER\n\ngo"}
+        ])
+    );
+}

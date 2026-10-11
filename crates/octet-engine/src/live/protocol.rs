@@ -7,7 +7,7 @@ use super::{
 };
 use octet_proc::Process;
 use serde_json::Value;
-use std::{collections::HashMap, ffi::OsString, future::Future, time::Duration};
+use std::{collections::HashMap, ffi::OsString, future::Future, path::Path, time::Duration};
 use tokio::{
     sync::mpsc,
     time::{Instant, timeout},
@@ -229,6 +229,16 @@ pub(crate) trait Protocol: Default + Send {
         core: &mut Core,
         text: &str,
         images: &[ImageAttachment],
+    ) -> impl Future<Output = Result<(), DriverError>> + Send;
+    /// Runs the skill `name` with `args`, after `context` when there is
+    /// one; the turn has already started.
+    fn send_skill(
+        &mut self,
+        core: &mut Core,
+        name: &str,
+        path: Option<&Path>,
+        args: &str,
+        context: Option<&str>,
     ) -> impl Future<Output = Result<(), DriverError>> + Send;
     /// Asks the vendor to compact its context; the turn has already started.
     fn compact(&mut self, core: &mut Core) -> impl Future<Output = Result<(), DriverError>> + Send;

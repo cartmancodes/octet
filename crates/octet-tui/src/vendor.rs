@@ -101,6 +101,25 @@ impl App {
                 },
                 Some((handoff.turns, handoff.bytes())),
             ),
+            (
+                Some(handoff),
+                Command::Skill {
+                    name,
+                    path,
+                    args,
+                    display,
+                    context: None,
+                },
+            ) => (
+                Command::Skill {
+                    name,
+                    path,
+                    args,
+                    display,
+                    context: Some(handoff.context().to_owned()),
+                },
+                Some((handoff.turns, handoff.bytes())),
+            ),
             (_, command) => (command, None),
         };
         vendor.send(command)?;
