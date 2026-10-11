@@ -52,10 +52,7 @@ impl Catalogs {
                 continue;
             };
             // A time the clock cannot hold is a bad entry, not a crash.
-            let Some(fetched) = entry["fetched"]
-                .as_u64()
-                .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
-            else {
+            let Some(fetched) = fetched_at(&entry["fetched"]) else {
                 continue;
             };
             let models = entry["models"]
@@ -89,10 +86,7 @@ impl Catalogs {
         }
         let mut root = Map::new();
         for (engine, listed) in &self.lists {
-            let seconds = listed
-                .fetched
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs());
+            let seconds = seconds(listed.fetched);
             let models: Vec<Value> = listed.models.iter().map(model_to_json).collect();
             root.insert(
                 engine.as_str().into(),
@@ -100,27 +94,7 @@ impl Catalogs {
             );
         }
         let bytes = serde_json::to_vec(&Value::Object(root)).map_err(io::Error::other)?;
-        // One temporary name per save: parallel savers never share it.
-        let temporary = path.with_extension(format!(
-            "json.{}.{}.tmp",
-            std::process::id(),
-            SAVES.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)
-            .and_then(|mut file| {
-                file.write_all(&bytes)?;
-                file.sync_all()
-            })
-            .and_then(|()| std::fs::rename(&temporary, path));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        written
+        write_private(path, &bytes)
     }
 
     /// Replaces `engine`'s list.
@@ -184,6 +158,58 @@ impl Catalogs {
     }
 }
 
+/// Writes `bytes` to `path` through a private (0600) temporary file renamed
+/// over it, so a reader or another window never sees half a file.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    // One temporary name per save: parallel savers never share it.
+    let temporary = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        SAVES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// Cached text as the drivers keep a live list's: control characters become
+/// spaces, and over-long text is cut rather than lost.
+pub(crate) fn cached_text(value: &Value, limit: usize) -> String {
+    let mut text: String = value
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    text.truncate(text.floor_char_boundary(limit));
+    text
+}
+
+/// When an entry was fetched, if the clock can hold it.
+pub(crate) fn fetched_at(value: &Value) -> Option<SystemTime> {
+    value
+        .as_u64()
+        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+}
+
+/// `at` as whole seconds since the epoch, for the file.
+pub(crate) fn seconds(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 /// Every vendor provider, in table order.
 fn vendors() -> impl Iterator<Item = Engine> {
     Engine::ALL
@@ -196,18 +222,7 @@ fn vendors() -> impl Iterator<Item = Engine> {
 fn model_from_json(value: &Value) -> Option<ModelInfo> {
     let valid = |s: &&str| octet_engine::live::valid_identifier(s);
     let selection = value["selection"].as_str().filter(valid)?;
-    // As the drivers keep a live list's text: control characters become
-    // spaces, and over-long text is cut rather than lost.
-    let text = |key: &str, limit: usize| {
-        let mut text: String = value[key]
-            .as_str()
-            .unwrap_or_default()
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
-        text.truncate(text.floor_char_boundary(limit));
-        text
-    };
+    let text = |key: &str, limit: usize| cached_text(&value[key], limit);
     Some(ModelInfo {
         selection: selection.to_owned(),
         id: value["id"].as_str().filter(valid).map(str::to_owned),

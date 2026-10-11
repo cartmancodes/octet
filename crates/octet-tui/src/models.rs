@@ -1,8 +1,9 @@
 //! Every provider's model list for `/model`: the cache, the probes that
 //! refresh it, and how fresh each list is. Nothing here names a vendor.
 use octet_core::{
-    Engine, ModelInfo,
+    Engine, ModelInfo, SkillInfo,
     catalog::{self, Catalogs},
+    skills::{self, SkillCatalogs},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -53,6 +54,10 @@ pub(crate) struct Models {
     pub(crate) catalogs: Catalogs,
     /// The cache file; `None` keeps the lists in memory only.
     path: Option<PathBuf>,
+    /// Each provider's skills, per workspace.
+    skill_catalogs: SkillCatalogs,
+    /// Their cache file, beside `path`.
+    skill_path: Option<PathBuf>,
     /// Set once the interface may start probes.
     prober: Option<Prober>,
     pub(crate) probing: HashSet<Engine>,
@@ -68,6 +73,8 @@ impl Default for Models {
         Self {
             catalogs: Catalogs::default(),
             path: None,
+            skill_catalogs: SkillCatalogs::default(),
+            skill_path: None,
             prober: None,
             probing: HashSet::new(),
             failed: HashMap::new(),
@@ -83,6 +90,9 @@ impl Models {
         let path = directory.join(catalog::FILE);
         self.catalogs = Catalogs::load(&path);
         self.path = Some(path);
+        let skill_path = directory.join(skills::FILE);
+        self.skill_catalogs = SkillCatalogs::load(&skill_path);
+        self.skill_path = Some(skill_path);
         self.prober = Some(prober);
     }
 
@@ -157,7 +167,14 @@ impl Models {
             Ok(listing) => {
                 self.failed.remove(&probed.engine);
                 self.catalogs.set(probed.engine, listing.models, now);
-                self.save()
+                let saved = self.save();
+                // The probe ran in the workspace, so its skills are that one's.
+                let skills_saved = self.prober.as_ref().map(|p| p.cwd.clone()).and_then(|ws| {
+                    self.skill_catalogs
+                        .set(probed.engine, &ws, listing.skills, now);
+                    self.save_skills()
+                });
+                saved.or(skills_saved)
             }
             Err(error) => {
                 self.failed.insert(probed.engine, error);
@@ -192,6 +209,42 @@ impl Models {
         }
         self.catalogs.set(engine, models, now);
         self.save()
+    }
+
+    /// The active provider's live skills for `workspace`. A note when they
+    /// could not be saved.
+    pub(crate) fn live_skills(
+        &mut self,
+        engine: Engine,
+        workspace: &Path,
+        skills: Vec<SkillInfo>,
+        now: SystemTime,
+    ) -> Option<String> {
+        // The same list is not written again (Codex re-lists on every change).
+        if !engine.is_vendor() || self.skill_catalogs.get(engine, workspace) == Some(&skills[..]) {
+            return None;
+        }
+        self.skill_catalogs.set(engine, workspace, skills, now);
+        self.save_skills()
+    }
+
+    /// `engine`'s skills for `workspace`, as last listed; empty when never.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the /skills picker, next, reads it")
+    )]
+    pub(crate) fn skills(&self, engine: Engine, workspace: &Path) -> &[SkillInfo] {
+        self.skill_catalogs
+            .get(engine, workspace)
+            .unwrap_or_default()
+    }
+
+    fn save_skills(&mut self) -> Option<String> {
+        let path = self.skill_path.as_ref()?;
+        self.skill_catalogs
+            .save(path)
+            .err()
+            .map(|error| format!("The skill lists could not be cached: {error}"))
     }
 
     fn save(&mut self) -> Option<String> {
@@ -297,6 +350,66 @@ mod tests {
         let dir = octet_testkit::TempDir::new(name);
         std::fs::create_dir_all(dir.path()).unwrap();
         dir
+    }
+
+    fn skill(name: &str) -> octet_core::SkillInfo {
+        octet_core::SkillInfo {
+            name: name.into(),
+            description: String::new(),
+            aliases: Vec::new(),
+            argument_hint: String::new(),
+            path: None,
+        }
+    }
+
+    #[test]
+    fn a_live_skills_list_is_cached_for_its_workspace() {
+        let dir = temp("octet-models-live-skills");
+        let mut models = attached(dir.path());
+        let ws = Path::new("/work/a");
+        assert!(
+            models
+                .live_skills(
+                    Engine::CLAUDE,
+                    ws,
+                    vec![skill("brainstorm")],
+                    SystemTime::now()
+                )
+                .is_none()
+        );
+        assert_eq!(models.skills(Engine::CLAUDE, ws)[0].name, "brainstorm");
+        assert!(
+            models
+                .skills(Engine::CLAUDE, Path::new("/work/b"))
+                .is_empty()
+        );
+        let cached =
+            octet_core::skills::SkillCatalogs::load(&dir.path().join(octet_core::skills::FILE));
+        assert_eq!(
+            cached.get(Engine::CLAUDE, ws).unwrap()[0].name,
+            "brainstorm"
+        );
+    }
+
+    #[test]
+    fn a_probes_skills_are_cached_for_the_probes_workspace() {
+        let dir = temp("octet-models-probed-skills");
+        let mut models = attached(dir.path());
+        let listing = octet_core::Listing {
+            models: vec![model("gpt-x")],
+            skills: vec![skill("pdf")],
+        };
+        let probed = Probed {
+            engine: Engine::CODEX,
+            result: Ok(listing),
+        };
+        assert!(models.probed(probed, SystemTime::now()).is_none());
+        // `fake_prober` probes in the temporary directory.
+        let ws = std::env::temp_dir();
+        assert_eq!(models.skills(Engine::CODEX, &ws)[0].name, "pdf");
+        let cached =
+            octet_core::skills::SkillCatalogs::load(&dir.path().join(octet_core::skills::FILE));
+        assert_eq!(cached.get(Engine::CODEX, &ws).unwrap()[0].name, "pdf");
     }
 
     #[tokio::test]

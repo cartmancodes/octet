@@ -755,7 +755,17 @@ impl App {
                     _ => State::Error,
                 };
             }
-            Event::Skills(skills) => self.conn.skills = skills,
+            Event::Skills(skills) => {
+                let now = std::time::SystemTime::now();
+                let workspace = self.workspace().to_path_buf();
+                let note =
+                    self.models
+                        .live_skills(self.conn.engine, &workspace, skills.clone(), now);
+                self.conn.skills = skills;
+                if let Some(note) = note {
+                    self.note(note);
+                }
+            }
             Event::Hook {
                 name,
                 outcome,
@@ -810,6 +820,10 @@ impl App {
                 self.conn.status = "disconnected".into();
             }
         }
+    }
+    /// The workspace: where the session runs, and what its skills belong to.
+    pub(crate) fn workspace(&self) -> &std::path::Path {
+        &self.composer.root
     }
     pub(crate) fn mascot_state(&self) -> State {
         if self.overlay.approvals.is_empty() {

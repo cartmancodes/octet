@@ -261,6 +261,7 @@ pub mod catalog;
 pub mod goal;
 pub mod model;
 pub mod sessions;
+pub mod skills;
 pub use octet_store::JournalSummary;
 pub use sessions::{RecentSession, recent_sessions};
 
