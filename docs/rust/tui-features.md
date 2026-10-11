@@ -14,6 +14,7 @@ removed from the repository on 2026-10-04.
 | --- | --- |
 | Provider sessions | Start a multi-turn conversation with Codex or Claude. Responses stream into the transcript alongside tool activity, usage, and errors. An offline `demo` engine exercises the interface without a vendor login, and shows the full text a model would receive when `!` attachments or a goal change it. |
 | Model discovery | `/model` lists **every provider's** models in one list, the current provider's first, with names, full model IDs, descriptions, freshness and selection commands. The current list is live (Codex pages through `model/list`; Claude uses its initialization catalog); others come from `models.json`, fetched in the background when missing or a day old by starting that CLI catalog-only (no session, no tokens). `/model refresh` fetches them now; `/model list N` opens another page. |
+| Plugins and skills | Claude loads the plugins its settings enable (`enabledPlugins` from user, project and local settings, nothing else); Codex loads its own. `--no-plugins` and `--no-plugin-hooks` turn plugins, or only their hooks, off on both. Hooks are journaled; failed, blocking or approval-deciding ones show. `/skills` lists every provider's skills (live for the current one, `skills.json` per workspace for others); Enter runs one, switching provider first when needed; `/NAME args` runs the current provider's. |
 | Model selection | Start with `--model ID`, or use `/model ID`, `/model codex ID`, or `/model claude ID`. A bare `/model ID` goes to the provider whose list holds it, else by the leading word its listed IDs share, else the current provider; Tab completes model names across providers; `/model` alone opens a picker (Up/Down, Enter switches). `/model default` selects the current provider's default. `/session` shows the requested selection, catalog ID, and confirmed session model ID separately. Custom IDs may be entered even when absent from the catalog. |
 | Provider switching | `/model claude` and `/model codex` switch the active engine. The visible transcript and prompt history remain on screen. A same-provider switch resumes the vendor session; switching providers opens a new vendor session and a new journal, and the next prompt carries a transcript of the conversation (at most 64 KiB, newest turns and the first prompt kept). |
 | Prompt editor | Multiline input, Unicode-aware cursor movement, bracketed paste, a 50-prompt history, and a 64 KiB prompt limit. Enter sends; Alt+Enter or Ctrl+J inserts a newline. The prompt box grows with the draft, from 4 rows up to 7. `@` file mentions with fuzzy search, Tab completion for paths and commands, Ctrl+G to edit in `$EDITOR`, and `!`/`!!` shell commands whose output can be attached to the next prompt. |
@@ -91,8 +92,8 @@ messages, and the new provider receives them as a transcript with your next prom
   application are not read.
 - Done on 2026-10-07: images, steering and the follow-up queue, reasoning
   effort, fork, compaction, and print/JSON/RPC modes.
-- Fleet orchestration, quota routing, the vendors' plugin, hook and resource
-  surfaces, and Octet-owned history with branching remain; the
+- Fleet orchestration, quota routing, managing the vendors' plugins and their
+  resource surfaces, and Octet-owned history with branching remain; the
   [acceptance matrix](parity-matrix.md) gives the reason for each.
 - Octet does not execute Python extensions. This is an accepted
   compatibility break for the Rust design; the earlier Python application was

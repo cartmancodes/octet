@@ -69,6 +69,16 @@ running across turns, and pick the session up from your phone.
   stays on screen, and your next prompt carries it to the new provider (at
   most 64 KiB, newest turns first).
 
+**Plugins and skills**
+
+- The plugins you enabled in Claude (and Codex's own) load in Octet's
+  sessions; `--no-plugins` turns them off and `--no-plugin-hooks` only their
+  hooks. Hooks that fail, block or answer an approval show in the
+  transcript.
+- `/skills` lists every provider's skills; Enter runs one, switching
+  provider first when it is another's. `/NAME args` runs the current
+  provider's skill.
+
 **Permissions and approvals**
 
 - Four permission modes, mapped onto each vendor's own settings: `ask`,
@@ -126,8 +136,8 @@ and provider switching, resume, fork, compaction, reasoning effort, images,
 steering, the session browser, `!` and `@`, goals, export, print/JSON/RPC
 modes and clean shutdown.
 
-Not yet supported: multi-agent (fleet) orchestration and quota routing, the
-vendors' plugin, hook and resource surfaces, Octet-owned history with
+Not yet supported: multi-agent (fleet) orchestration and quota routing,
+managing the vendors' plugins and their resource surfaces, Octet-owned history with
 branching and labels, and the Python era's RPC envelope. The
 [parity matrix](docs/rust/parity-matrix.md) says why each waits.
 

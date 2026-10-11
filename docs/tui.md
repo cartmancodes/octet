@@ -36,7 +36,9 @@ SHA-256 file, and attaches them to a GitHub release
 version, the full checks run first, a tag with a `-` (`v0.2.0-rc1`) is
 published as a pre-release, and re-running replaces the archives.
 
-`--effort LEVEL` sets the reasoning effort (see below).
+`--effort LEVEL` sets the reasoning effort (see below). `--no-plugins` and
+`--no-plugin-hooks` turn the vendors' plugins, or only their hooks, off (see
+[Plugins and skills](#plugins-and-skills)).
 
 ### Without the interface: print, JSON and RPC
 
@@ -106,6 +108,7 @@ is respected. The minimum usable size is 38 columns by 12 rows.
 | Ctrl+P | Command palette (also offers Ctrl+G, `@` and `!`) |
 | `@` | Mention a workspace file; a popup suggests paths as you type (Enter or Tab inserts, Esc closes) |
 | `/model` | Model picker: Up/Down choose, Enter switches, Tab inserts the name, Esc closes |
+| `/skills` | Skills picker: Up/Down choose, Enter runs, Tab inserts `/name `, Esc closes |
 | Tab | Complete a path, or a `/command` at the start of the prompt |
 | Ctrl+G | Write the prompt in `$VISUAL` or `$EDITOR` (default `vi`), run by the shell as git runs it: quote a path with spaces |
 | Ctrl+X | Copy the last reply to the clipboard (same as `/copy`) |
@@ -172,7 +175,7 @@ It uses the OSC 52 escape. Inside tmux it needs
 `set -g set-clipboard on`; mosh 1.4 and later pass it on; terminal and
 phone apps vary in whether they accept it.
 
-Commands: `/help`, `/model`, `/mode`, `/goal`, `/session`, `/new`, `/reconnect`, `/export [new-path]`, `/copy`,
+Commands: `/help`, `/model`, `/skills`, `/mode`, `/goal`, `/session`, `/new`, `/reconnect`, `/export [new-path]`, `/copy`,
 `/remote-control`, `/queue`, `/steer`, `/effort`, `/fork`, `/compact`, `/image`, `/sessions`, `/resume`,
 `/quit` (or `/exit`).
 Help (F1) and the command palette (Ctrl+P) scroll when the screen is short.
@@ -399,6 +402,70 @@ is its advertised picker catalog, not an exhaustive inventory of every historica
 Anthropic API model. Full custom IDs are accepted even when absent from the list.
 Update the vendor CLI separately with `claude update`, then `/reconnect` to refresh.
 
+## Plugins and skills
+
+Octet drives the vendors' own CLIs, so the vendor CLI is the plugin host.
+Octet loads the plugins you already enabled there, shows the skills they
+bring, and runs them.
+
+| Launch | Claude | Codex |
+|---|---|---|
+| Default | Your enabled plugins load; their hooks run | `app-server` as always: its plugins load |
+| `--no-plugin-hooks` | Plugins load; no hooks run (`disableAllHooks`) | `app-server --disable hooks` |
+| `--no-plugins` | No plugins (as before this feature) | `app-server --disable plugins` |
+
+- **Which Claude plugins:** the `enabledPlugins` maps in
+  `~/.claude/settings.json`, `<workspace>/.claude/settings.json` and
+  `<workspace>/.claude/settings.local.json`, the later file winning for a
+  name, as Claude reads them. Only that map is read. A file that cannot be
+  read is skipped with a one-line notice at connect.
+- **What stays off on Claude:** the rest of your Claude settings (permission
+  rules, settings hooks, default mode) and your MCP servers. Octet still
+  answers the approvals a vendor asks for: in `ask` and `accept-edits` its
+  dialog decides, in `auto` the vendor's reviewer does, and `full-access`
+  asks nothing.
+- **Hooks:** a plugin hook runs as it does in `claude`, and one that decides
+  a tool approval does so before Octet is asked. Every hook run is journaled
+  (record `hook`); the transcript shows one only when it failed, blocked
+  something, or answered an approval ("Hook PreToolUse:Bash allowed the tool
+  (Octet was not asked)"). Codex hooks are not shown. `--no-plugin-hooks` is
+  the control; it also stops start-up bootstraps such as superpowers'.
+- The switches apply to every launch: the interface, `--print`, `--rpc` and
+  the background model-list fetches.
+
+### Skills
+
+```text
+/skills                Pick a skill from any provider: Enter runs it
+/skills FILTER         The picker, filtered by name, alias or description
+/NAME [ARGS]           Run the current provider's skill NAME (or alias)
+```
+
+- **What is listed:** Claude reports its commands, so its list holds plugin
+  skills (`superpowers:brainstorming`) and its built-in commands (`context`,
+  `usage`). Your personal and project Claude skills (`~/.claude/skills`,
+  `.claude/skills`) stay off with the rest of those settings. Codex lists the
+  enabled skills of its plugins, `~/.agents/skills`, `.agents/skills` and its
+  bundled ones.
+- `/skills` lists the current provider's skills first (as its session
+  reported them), then each other provider's, cached per workspace in
+  `skills.json` beside `models.json` and fetched with the model lists.
+- Enter on another provider's skill switches to that provider (its default
+  model, the conversation carried as for any switch), then runs the skill
+  as the first turn. If the switch fails, the skill is not run and a note
+  says so.
+- Typing `/NAME args` runs a skill the current provider lists. Octet's own
+  commands win a clash (`/model` is always Octet's; pick such a skill from
+  `/skills`). Another provider's skill typed by name gets a hint to use
+  `/skills`, and an unknown name the usual error.
+- A skill runs as a turn: it queues behind a running one and can be
+  interrupted. Claude receives `/NAME args` as the prompt; Codex a skill
+  input naming its `SKILL.md`. The transcript and journal show `/NAME args`.
+- Not supported yet: Codex plugins that ask the user a question
+  (`item/tool/requestUserInput`) or need MCP elicitation load but fail when
+  they ask ("Request declined"). Installing and managing plugins stays with
+  the vendors (`claude plugin`, `codex plugin`).
+
 ## Persistence and limits
 
 ### Goals
@@ -477,16 +544,16 @@ images, a session browser, print/JSON/RPC modes, release archives, and an
 offline demo.
 
 Pending, each for a reason the [acceptance matrix](rust/parity-matrix.md)
-gives: fleet orchestration and quota routing, the vendors' plugin, hook and
-resource surfaces, Octet-owned history with branching and labels, and the
+gives: fleet orchestration and quota routing, managing the vendors' plugins
+and their resource surfaces, Octet-owned history with branching and labels, and the
 Python era's RPC envelope.
 The earlier Python application was removed from the repository on 2026-10-04;
 Python extensions remain the explicitly accepted compatibility break.
 
-Claude preview launches with vendor setting sources disabled and strict MCP
-configuration. It does not yet expose the existing hook/plugin/resource surface.
-Codex currently uses its vendor configuration. Do not infer plugin parity from
-successful chat. The [acceptance matrix](rust/parity-matrix.md) tracks the remaining
+Claude launches with its setting sources off and strict MCP configuration,
+plus the plugins you enabled (see [Plugins and skills](#plugins-and-skills));
+Codex uses its vendor configuration. Skills work on both; arbitrary plugin
+compatibility is not promised. The [acceptance matrix](rust/parity-matrix.md) tracks the remaining
 migration, including comparative performance and long-session tests.
 
 ## Checks

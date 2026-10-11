@@ -11,6 +11,14 @@ Claude Code and Codex CLIs.
 
 ### Added
 
+- Plugins pass through: Claude sessions load the plugins your Claude
+  settings enable (user, project and local `enabledPlugins`), with hook
+  activity journaled and the hooks that fail, block or answer an approval
+  shown. `--no-plugins` and `--no-plugin-hooks` turn plugins, or only their
+  hooks, off on both providers.
+- One skills list: `/skills` shows every provider's skills (cached per
+  workspace in `skills.json`); Enter runs one, switching provider first when
+  it is another's, and `/NAME args` runs the current provider's.
 - One model list across providers: `/model` shows every provider's models,
   fetched from each CLI when missing or a day old (no session, no tokens) and
   cached in `models.json`; `/model refresh` fetches them now. `/model NAME`
