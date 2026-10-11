@@ -55,7 +55,7 @@ pub(crate) struct Models {
     /// The cache file; `None` keeps the lists in memory only.
     path: Option<PathBuf>,
     /// Each provider's skills, per workspace.
-    skill_catalogs: SkillCatalogs,
+    pub(crate) skill_catalogs: SkillCatalogs,
     /// Their cache file, beside `path`.
     skill_path: Option<PathBuf>,
     /// Set once the interface may start probes.
@@ -229,10 +229,6 @@ impl Models {
     }
 
     /// `engine`'s skills for `workspace`, as last listed; empty when never.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the /skills picker, next, reads it")
-    )]
     pub(crate) fn skills(&self, engine: Engine, workspace: &Path) -> &[SkillInfo] {
         self.skill_catalogs
             .get(engine, workspace)

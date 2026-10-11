@@ -151,6 +151,105 @@ pub(crate) fn refresh_model_picker(app: &mut App) {
         }
     }
 }
+/// Opens, refilters or closes the skills picker as the draft is, or stops
+/// being, `/skills <word>`.
+pub(crate) fn refresh_skill_picker(app: &mut App) {
+    let text = app.composer.editor.text();
+    match composer::skills_query(text, app.composer.editor.cursor()) {
+        Some((start, query)) => {
+            let items = composer::skill_items(&app.skill_entries(), query);
+            // The same list: keep the highlight where the arrows left it.
+            let selected = app
+                .composer
+                .completion
+                .as_ref()
+                .filter(|c| c.kind == composer::Kind::Skill && c.start == start && c.items == items)
+                .map_or(0, |open| open.selected);
+            app.composer.completion = Some(composer::Completion {
+                kind: composer::Kind::Skill,
+                items,
+                selected,
+                start,
+            });
+        }
+        None => {
+            if app
+                .composer
+                .completion
+                .as_ref()
+                .is_some_and(|c| c.kind == composer::Kind::Skill)
+            {
+                app.composer.completion = None;
+            }
+        }
+    }
+}
+/// The skill a picker line (`name · provider …`) names, and its provider.
+fn picked_skill(app: &App, item: &str) -> Option<(octet_core::Engine, octet_core::SkillInfo)> {
+    let mut parts = item.split(" · ");
+    let name = parts.next()?;
+    let provider = octet_core::Engine::parse(parts.next()?)?;
+    app.skill_entries()
+        .into_iter()
+        .find(|(engine, skill)| *engine == provider && skill.name == name)
+}
+/// Enter on a skills picker line: runs it here, or, for another provider's,
+/// switches there and runs it once that session is ready.
+fn pick_skill(app: &mut App, vendor: &dyn Vendor, item: Option<String>) -> Action {
+    let Some((engine, skill)) = item.and_then(|item| picked_skill(app, &item)) else {
+        return Action::Continue;
+    };
+    if engine == app.conn.engine {
+        app.composer.completion = None;
+        app.composer.editor.take();
+        run_skill(app, vendor, &skill, "");
+        return Action::Continue;
+    }
+    if let Err(refusal) = crate::commands::can_reconnect(app) {
+        app.hint(refusal);
+        return Action::Continue;
+    }
+    app.composer.completion = None;
+    app.composer.editor.take();
+    app.pending_skill = Some(crate::app::SkillRun {
+        engine,
+        skill,
+        args: String::new(),
+    });
+    Action::Exit(Exit::Model(octet_core::model::Selection {
+        provider: engine,
+        model: None,
+    }))
+}
+/// Runs `skill` with `args` as a turn, or queues it behind the running one,
+/// as a typed prompt goes.
+pub(crate) fn run_skill(
+    app: &mut App,
+    vendor: &dyn Vendor,
+    skill: &octet_core::SkillInfo,
+    args: &str,
+) {
+    let prompt = Prompt::skill(skill, args);
+    if app.conn.is_running() {
+        if app.composer.queue.len() >= QUEUE_LIMIT {
+            app.status_line = format!(
+                "The queue is full ({QUEUE_LIMIT} prompts); wait for the turn or press Esc"
+            );
+            return;
+        }
+        app.composer.queue.push_back(prompt.clone());
+        app.hint(format!("Queued ({} waiting)", app.composer.queue.len()));
+    } else if !app.is_idle() {
+        app.hint(crate::registry::NOT_CONNECTED);
+        return;
+    } else if let Err(error) =
+        app.begin_turn(vendor, prompt.clone().into_command(), By::User, "sending")
+    {
+        app.error(error.to_string());
+        return;
+    }
+    app.remember(prompt.display);
+}
 /// The model picker is open on a draft that already names a model exactly:
 /// `default`, or a name or full ID some provider lists.
 fn typed_a_model(app: &App) -> bool {
@@ -194,6 +293,20 @@ pub(crate) fn accept_completion(app: &mut App) {
         composer::Kind::Path => item.clone(),
         composer::Kind::Command => format!("{item} "),
         composer::Kind::Model => model_text(app, item),
+        composer::Kind::Skill => {
+            // Tab on a skill puts its name in the draft, to add arguments.
+            match picked_skill(app, item) {
+                Some((engine, skill)) if engine == app.conn.engine => {
+                    app.composer.editor.set(format!("/{} ", skill.name));
+                }
+                Some((engine, skill)) => app.hint(format!(
+                    "/{} is a {engine} skill; Enter on it switches there",
+                    skill.name
+                )),
+                None => {}
+            }
+            return;
+        }
     };
     app.replace_or_warn(completion.start, &text);
 }
@@ -291,7 +404,7 @@ pub(crate) async fn key_action(app: &mut App, vendor: &dyn Vendor, key: KeyEvent
     if app.overlay.palette {
         return palette_press(app, vendor, key).await;
     }
-    if let Some(action) = completion_key(app, key) {
+    if let Some(action) = completion_key(app, vendor, key) {
         return action;
     }
     composer_key(app, vendor, key, quit_armed).await
@@ -365,7 +478,7 @@ async fn palette_press(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Act
     Action::Continue
 }
 /// Keys an open popup takes; `None` lets the key reach the draft.
-fn completion_key(app: &mut App, key: KeyEvent) -> Option<Action> {
+fn completion_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Option<Action> {
     if key.code == KeyCode::Enter && typed_a_model(app) {
         // An exact name, or `default`, means what typing it always meant:
         // the draft goes as typed, resolved like any `/model NAME`.
@@ -373,6 +486,10 @@ fn completion_key(app: &mut App, key: KeyEvent) -> Option<Action> {
         return None;
     }
     let completion = app.composer.completion.as_mut()?;
+    if key.code == KeyCode::Enter && completion.kind == composer::Kind::Skill {
+        let item = completion.items.get(completion.selected).cloned();
+        return Some(pick_skill(app, vendor, item));
+    }
     if key.code == KeyCode::Enter && completion.kind == composer::Kind::Model {
         // Enter on a model switches to it: the draft becomes its explicit
         // `/model` line and the key goes on to send it.
@@ -402,7 +519,7 @@ fn completion_key(app: &mut App, key: KeyEvent) -> Option<Action> {
         _ => {
             if !matches!(
                 completion.kind,
-                composer::Kind::File | composer::Kind::Model
+                composer::Kind::File | composer::Kind::Model | composer::Kind::Skill
             ) {
                 app.composer.completion = None;
             }
@@ -489,6 +606,12 @@ async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
         // `/model` alone opens the picker.
         app.composer.editor.set("/model ".into());
         refresh_model_picker(app);
+        return Action::Continue;
+    }
+    if draft == "/skills" {
+        // So does `/skills`.
+        app.composer.editor.set("/skills ".into());
+        refresh_skill_picker(app);
         return Action::Continue;
     }
     if draft.starts_with('/') && draft != octet_core::APPROVAL_DEMO && !path_like {
@@ -617,6 +740,7 @@ async fn composer_key(
     }
     refresh_completion(app);
     refresh_model_picker(app);
+    refresh_skill_picker(app);
     Action::Continue
 }
 /// Interrupts the turn; a goal working on it is paused first, and prompts
@@ -665,6 +789,7 @@ pub(crate) fn compose(app: &App, draft: &str) -> Result<Prompt, String> {
         wire,
         display,
         images: app.composer.images.clone(),
+        skill: None,
     })
 }
 /// Sends `draft` as a prompt, or queues it behind the running turn. Its

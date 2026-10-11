@@ -810,3 +810,127 @@ async fn tab_on_another_providers_line_keeps_its_provider() {
     key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
     assert_eq!(app.composer.editor.text(), "/model claude default ");
 }
+
+/// A Codex interface with a live Codex skill and a cached Claude skill.
+fn skills_app() -> App {
+    let mut app = app();
+    crate::test_support::idle(&mut app);
+    app.conn.skills = vec![skill("imagegen", &[], Some("/s/imagegen/SKILL.md"))];
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        Engine::CLAUDE,
+        &ws,
+        vec![skill("brainstorming", &[], None)],
+        std::time::SystemTime::now(),
+    );
+    app
+}
+#[tokio::test]
+async fn the_skills_picker_lists_both_providers_and_enter_runs() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    let picker = app.composer.completion.as_ref().expect("picker open");
+    assert_eq!(picker.kind, composer::Kind::Skill);
+    assert!(
+        picker.items[0].starts_with("imagegen · codex"),
+        "{:?}",
+        picker.items
+    );
+    assert!(
+        picker.items[1].starts_with("brainstorming · claude"),
+        "{:?}",
+        picker.items
+    );
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(matches!(
+        &vendor.sent.borrow()[0],
+        Command::Skill { name, path: Some(_), .. } if name == "imagegen"
+    ));
+    assert!(app.composer.editor.text().is_empty());
+}
+#[tokio::test]
+async fn the_skills_picker_filters_and_tab_inserts() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills image").await;
+    let skills = app.composer.completion.as_ref().expect("picker open");
+    assert_eq!(skills.kind, composer::Kind::Skill);
+    assert_eq!(skills.items.len(), 1, "{:?}", skills.items);
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    assert_eq!(app.composer.editor.text(), "/imagegen ");
+    assert!(vendor.sent.borrow().is_empty());
+}
+#[tokio::test]
+async fn picking_another_providers_skill_switches_then_runs() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Down)).await;
+    let action = key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(matches!(&action, Action::Exit(Exit::Model(s)) if s.provider == Engine::CLAUDE));
+    assert!(app.pending_skill.is_some());
+    // The kept interface connects to Claude; on ready, the skill runs there.
+    app.connection(
+        &octet_core::Config::new(Engine::CLAUDE, "claude", "/tmp"),
+        "journal".into(),
+    );
+    let claude = RecordingVendor::default();
+    crate::session_event(
+        &mut app,
+        &claude,
+        octet_core::Event::Ready {
+            session: String::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        &claude.sent.borrow()[0],
+        Command::Skill { name, .. } if name == "brainstorming"
+    ));
+    assert!(app.pending_skill.is_none());
+}
+#[tokio::test]
+async fn a_failed_switch_drops_the_pending_skill() {
+    let mut app = skills_app();
+    app.pending_skill = Some(crate::app::SkillRun {
+        engine: Engine::CLAUDE,
+        skill: skill("brainstorming", &[], None),
+        args: String::new(),
+    });
+    app.connection(
+        &octet_core::Config::new(Engine::CLAUDE, "claude", "/tmp"),
+        "journal".into(),
+    );
+    let claude = RecordingVendor::default();
+    crate::session_event(
+        &mut app,
+        &claude,
+        octet_core::Event::Error("claude: not found".into()),
+    )
+    .await;
+    crate::session_event(&mut app, &claude, octet_core::Event::Stopped).await;
+    assert!(app.pending_skill.is_none());
+    assert!(
+        app.entries_text()
+            .contains("The skill /brainstorming was not run: the switch to claude failed"),
+        "{}",
+        app.entries_text()
+    );
+    // A later ready (after /reconnect) runs nothing.
+    app.connection(
+        &octet_core::Config::new(Engine::CLAUDE, "claude", "/tmp"),
+        "journal".into(),
+    );
+    crate::session_event(
+        &mut app,
+        &claude,
+        octet_core::Event::Ready {
+            session: String::new(),
+        },
+    )
+    .await;
+    assert!(claude.sent.borrow().is_empty());
+}

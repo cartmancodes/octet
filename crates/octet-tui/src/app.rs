@@ -283,6 +283,16 @@ pub(crate) struct App {
     /// The conversation so far, waiting to go with the next prompt to a
     /// provider that took over from another.
     pub(crate) pending_handoff: Option<crate::handoff::Handoff>,
+    /// Another provider's skill, picked in `/skills`: it runs once the
+    /// switch to that provider is ready.
+    pub(crate) pending_skill: Option<SkillRun>,
+}
+/// A skill to run on a provider the interface is switching to.
+#[derive(Debug, Clone)]
+pub(crate) struct SkillRun {
+    pub(crate) engine: octet_core::Engine,
+    pub(crate) skill: octet_core::SkillInfo,
+    pub(crate) args: String,
 }
 impl App {
     pub(crate) fn new(config: &octet_core::Config, journal: PathBuf) -> Self {
@@ -331,6 +341,7 @@ impl App {
             shell: None,
             models: crate::models::Models::default(),
             pending_handoff: None,
+            pending_skill: None,
         }
     }
     pub(crate) fn connection(&mut self, config: &octet_core::Config, journal: PathBuf) {
@@ -463,6 +474,35 @@ impl App {
     }
     /// The current provider's models first (its live list, else its cache),
     /// then every other provider's cached list, in table order.
+    /// Every provider's skills for `/skills`: the current provider's as it
+    /// listed them (else as cached), then each other's cached for this
+    /// workspace.
+    pub(crate) fn skill_entries(&self) -> Vec<(octet_core::Engine, octet_core::SkillInfo)> {
+        let active = self.conn.engine;
+        let workspace = self.workspace();
+        let first = if self.conn.skills.is_empty() {
+            self.models.skills(active, workspace).to_vec()
+        } else {
+            self.conn.skills.clone()
+        };
+        first
+            .into_iter()
+            .map(|skill| (active, skill))
+            .chain(
+                octet_core::Engine::ALL
+                    .iter()
+                    .copied()
+                    .filter(|engine| engine.is_vendor() && *engine != active)
+                    .flat_map(|engine| {
+                        self.models
+                            .skills(engine, workspace)
+                            .iter()
+                            .cloned()
+                            .map(move |skill| (engine, skill))
+                    }),
+            )
+            .collect()
+    }
     pub(crate) fn model_entries(&self) -> Vec<(octet_core::Engine, octet_core::ModelInfo)> {
         let active = self.conn.engine;
         let first = if self.conn.models.is_empty() {

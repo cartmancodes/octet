@@ -319,6 +319,7 @@ async fn session_event(app: &mut App, vendor: &dyn Vendor, event: octet_core::Ev
     };
     let failed = matches!(event, octet_core::Event::Error(_));
     let ready = matches!(event, octet_core::Event::Ready { .. });
+    let stopped = matches!(event, octet_core::Event::Stopped);
     if should_alert(app, &event) {
         alert();
     }
@@ -327,6 +328,19 @@ async fn session_event(app: &mut App, vendor: &dyn Vendor, event: octet_core::Ev
         // Fetch any other provider's model list that is missing or stale.
         app.models
             .probe_stale(app.conn.engine, std::time::SystemTime::now());
+        // A skill picked on the provider just switched to runs now.
+        if let Some(run) = app
+            .pending_skill
+            .take_if(|run| run.engine == app.conn.engine)
+        {
+            input::run_skill(app, vendor, &run.skill, &run.args);
+        }
+    }
+    if stopped && let Some(run) = app.pending_skill.take() {
+        app.note(format!(
+            "The skill /{} was not run: the switch to {} failed",
+            run.skill.name, run.engine
+        ));
     }
     if failed && let Err(error) = app.goals.turn_failed().await {
         app.goal_save_failed(error, true);

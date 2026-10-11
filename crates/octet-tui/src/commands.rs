@@ -33,11 +33,7 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
     let (name, argument) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
     let argument = argument.trim();
     let Some(spec) = Spec::find(name) else {
-        app.note(format!(
-            "Unknown command {name}. Use /help, or edit the draft: \
-             only a path such as /usr/lib can start a prompt with a slash."
-        ));
-        return None;
+        return skill_command(app, vendor, name, argument);
     };
     let cmd = spec.id;
     let refusal = match spec.requires {
@@ -65,6 +61,12 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
         Cmd::Steer => steer(app, vendor, argument.to_owned()),
         Cmd::Copy => copy_reply(app),
         Cmd::Model => return Some(model_command(app, argument)),
+        Cmd::Skills => {
+            // The picker, filtered by the argument; the draft stays for it.
+            app.composer.editor.set(format!("/skills {argument}"));
+            crate::input::refresh_skill_picker(app);
+            return None;
+        }
         Cmd::Mode => return Some(mode_command(app, vendor, argument)),
         Cmd::New => return Some(Action::Exit(Exit::New)),
         Cmd::Reconnect => return Some(Action::Exit(Exit::Reconnect)),
@@ -87,6 +89,33 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
         Cmd::Export => return start_job(app, export_job(app, argument)),
     }
     Some(Action::Continue)
+}
+/// `/NAME` that is no Octet command: the current provider's skill of that
+/// name or alias runs; another provider's gets a hint; anything else the
+/// unknown-command note. `None` leaves the draft to correct.
+fn skill_command(app: &mut App, vendor: &dyn Vendor, name: &str, argument: &str) -> Option<Action> {
+    let wanted = name.strip_prefix('/').unwrap_or(name);
+    let named = |skill: &octet_core::SkillInfo| {
+        skill.name == wanted || skill.aliases.iter().any(|alias| alias == wanted)
+    };
+    let entries = app.skill_entries();
+    if let Some((_, skill)) = entries
+        .iter()
+        .find(|(engine, skill)| *engine == app.conn.engine && named(skill))
+    {
+        crate::input::run_skill(app, vendor, skill, argument);
+        return Some(Action::Continue);
+    }
+    if let Some((engine, _)) = entries.iter().find(|(_, skill)| named(skill)) {
+        app.note(format!("{name} is a {engine} skill; /skills runs it there"));
+        return None;
+    }
+    app.note(format!(
+        "Unknown command {name}. Use /help, or edit the draft: \
+         only a path such as /usr/lib can start a prompt with a slash. \
+         /skills lists what each provider offers."
+    ));
+    None
 }
 /// `/effort`: show the reasoning effort, or change it. Codex takes it per
 /// turn; Claude takes it at launch, so a change reconnects there.

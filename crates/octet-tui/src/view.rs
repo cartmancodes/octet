@@ -296,6 +296,9 @@ fn completion_popup(frame: &mut Frame, composer: Rect, app: &App) {
             (crate::composer::Kind::Model, _) if app.model_entries().is_empty() => {
                 " No model list yet · /model refresh"
             }
+            (crate::composer::Kind::Skill, _) if app.skill_entries().is_empty() => {
+                " No skills yet · /model refresh fetches them"
+            }
             _ => " No matches",
         };
         lines.push(Line::from(Span::styled(
@@ -317,6 +320,7 @@ fn completion_popup(frame: &mut Frame, composer: Rect, app: &App) {
         crate::composer::Kind::Path => " Paths ",
         crate::composer::Kind::Command => " Commands ",
         crate::composer::Kind::Model => " Models ",
+        crate::composer::Kind::Skill => " Skills · Enter runs · Tab inserts ",
     };
     // On a short screen the popup is clipped; scroll so the selected row
     // stays in sight.

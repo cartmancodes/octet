@@ -48,6 +48,16 @@ fn sizes_read_naturally() {
     assert_eq!(size_label(1229), "1.2 KiB");
     assert_eq!(size_label(100 * 1024), "100.0 KiB");
 }
+/// A skill as a provider lists it, with no description or hint.
+fn skill(name: &str, aliases: &[&str], path: Option<&str>) -> octet_core::SkillInfo {
+    octet_core::SkillInfo {
+        name: name.into(),
+        description: String::new(),
+        aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+        argument_hint: String::new(),
+        path: path.map(Into::into),
+    }
+}
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }

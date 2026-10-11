@@ -781,3 +781,72 @@ fn a_live_list_is_cached() {
         "opus"
     );
 }
+
+#[tokio::test]
+async fn a_typed_skill_name_runs_on_the_current_provider() {
+    let mut app = app(); // Codex
+    crate::test_support::idle(&mut app);
+    app.conn.skills = vec![skill("imagegen", &[], Some("/s/imagegen/SKILL.md"))];
+    let vendor = RecordingVendor::default();
+    assert!(matches!(
+        commands::try_command(&mut app, &vendor, "/imagegen a cat").await,
+        Some(Action::Continue)
+    ));
+    let sent = vendor.sent.borrow();
+    assert!(
+        matches!(&sent[0], Command::Skill { name, args, display, .. }
+            if name == "imagegen" && args == "a cat" && display == "/imagegen a cat"),
+        "{sent:?}"
+    );
+}
+#[tokio::test]
+async fn an_alias_runs_its_skill_and_octet_commands_win() {
+    let mut app = app();
+    crate::test_support::idle(&mut app);
+    app.conn.skills = vec![
+        skill("superpowers:brainstorming", &["brainstorming"], None),
+        skill("model", &[], None),
+    ];
+    let vendor = RecordingVendor::default();
+    commands::try_command(&mut app, &vendor, "/brainstorming").await;
+    assert!(matches!(
+        &vendor.sent.borrow()[0],
+        Command::Skill { name, .. } if name == "superpowers:brainstorming"
+    ));
+    // `/model` is Octet's: it shows the list, never the skill.
+    let before = vendor.sent.borrow().len();
+    commands::try_command(&mut app, &vendor, "/model list").await;
+    assert_eq!(vendor.sent.borrow().len(), before);
+}
+#[tokio::test]
+async fn another_providers_skill_typed_gives_the_hint() {
+    let mut app = app(); // Codex
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        Engine::CLAUDE,
+        &ws,
+        vec![skill("brainstorming", &[], None)],
+        std::time::SystemTime::now(),
+    );
+    let action =
+        commands::try_command(&mut app, &RecordingVendor::default(), "/brainstorming").await;
+    assert!(action.is_none(), "the draft stays");
+    assert!(
+        app.entries_text()
+            .contains("/brainstorming is a claude skill; /skills runs it there"),
+        "{}",
+        app.entries_text()
+    );
+}
+#[tokio::test]
+async fn an_unknown_name_still_gets_the_helpful_error() {
+    let mut app = app();
+    let action = commands::try_command(&mut app, &RecordingVendor::default(), "/nope").await;
+    assert!(action.is_none());
+    assert!(
+        app.entries_text()
+            .contains("/skills lists what each provider offers"),
+        "{}",
+        app.entries_text()
+    );
+}

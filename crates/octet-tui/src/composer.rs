@@ -10,6 +10,8 @@ pub(crate) enum Kind {
     Command,
     /// A model name; items read `name · provider`.
     Model,
+    /// A skill; items read `name · provider · description`.
+    Skill,
 }
 
 /// The suggestion popup above the prompt box.
@@ -108,6 +110,42 @@ pub(crate) fn model_query(text: &str, cursor: usize) -> Option<(usize, &str)> {
         && before.ends_with(char::is_whitespace)
         && text[cursor..].trim().is_empty())
     .then(|| (start, &text[start..cursor]))
+}
+
+/// The `/skills` filter being typed, when the draft is `/skills <word>`
+/// with the cursor at its end: where the word starts, and the word.
+pub(crate) fn skills_query(text: &str, cursor: usize) -> Option<(usize, &str)> {
+    let start = word_start(text, cursor);
+    let before = &text[..start];
+    (before.trim_end() == "/skills"
+        && before.ends_with(char::is_whitespace)
+        && text[cursor..].trim().is_empty())
+    .then(|| (start, &text[start..cursor]))
+}
+
+/// The skills picker's lines for `query`: `name · provider · description`,
+/// those whose name or an alias contains `query`, or whose description does.
+pub(crate) fn skill_items(
+    entries: &[(octet_core::Engine, octet_core::SkillInfo)],
+    query: &str,
+) -> Vec<String> {
+    let lower = query.to_lowercase();
+    entries
+        .iter()
+        .filter(|(_, s)| {
+            s.name.to_lowercase().contains(&lower)
+                || s.aliases.iter().any(|a| a.to_lowercase().contains(&lower))
+                || s.description.to_lowercase().contains(&lower)
+        })
+        .map(|(engine, s)| {
+            let description = crate::text::clean(&s.description);
+            if description.is_empty() {
+                format!("{} · {engine}", s.name)
+            } else {
+                format!("{} · {engine} · {description}", s.name)
+            }
+        })
+        .collect()
 }
 
 /// The model picker's lines for `query`: `selection · provider · name`, the

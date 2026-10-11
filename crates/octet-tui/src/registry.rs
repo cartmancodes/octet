@@ -5,6 +5,7 @@
 pub(crate) enum Cmd {
     Help,
     Model,
+    Skills,
     Mode,
     Goal,
     Session,
@@ -101,6 +102,12 @@ pub(crate) const COMMANDS: &[Spec] = &[
         "Switch model or provider",
     )
     .quick("Switch model"),
+    spec(
+        Cmd::Skills,
+        "/skills",
+        "/skills [filter] · Up/Down choose, Enter runs",
+        "Run a skill from any provider",
+    ),
     spec(
         Cmd::Mode,
         "/mode",
@@ -220,9 +227,10 @@ pub(crate) const COMMANDS: &[Spec] = &[
 impl Cmd {
     /// Every command, for the registry coverage test.
     #[cfg(test)]
-    pub(crate) const ALL: [Cmd; 19] = [
+    pub(crate) const ALL: [Cmd; 20] = [
         Cmd::Help,
         Cmd::Model,
+        Cmd::Skills,
         Cmd::Mode,
         Cmd::Goal,
         Cmd::Session,

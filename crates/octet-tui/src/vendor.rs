@@ -28,6 +28,15 @@ pub(crate) struct Prompt {
     pub(crate) wire: String,
     pub(crate) display: String,
     pub(crate) images: Vec<ImageAttachment>,
+    /// A skill to run, with `wire` as its arguments.
+    pub(crate) skill: Option<SkillCall>,
+}
+
+/// The skill a queued prompt runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillCall {
+    pub(crate) name: String,
+    pub(crate) path: Option<std::path::PathBuf>,
 }
 
 impl Prompt {
@@ -37,12 +46,39 @@ impl Prompt {
             wire: text.clone(),
             display: text,
             images: Vec::new(),
+            skill: None,
+        }
+    }
+
+    /// `skill` run with `args`, shown as `/name args`.
+    pub(crate) fn skill(skill: &octet_core::SkillInfo, args: &str) -> Self {
+        let display = if args.is_empty() {
+            format!("/{}", skill.name)
+        } else {
+            format!("/{} {args}", skill.name)
+        };
+        Self {
+            wire: args.to_owned(),
+            display,
+            images: Vec::new(),
+            skill: Some(SkillCall {
+                name: skill.name.clone(),
+                path: skill.path.clone(),
+            }),
         }
     }
 
     /// The command that sends it.
     pub(crate) fn into_command(self) -> Command {
-        if self.wire == self.display && self.images.is_empty() {
+        if let Some(skill) = self.skill {
+            Command::Skill {
+                name: skill.name,
+                path: skill.path,
+                args: self.wire,
+                display: self.display,
+                context: None,
+            }
+        } else if self.wire == self.display && self.images.is_empty() {
             Command::Prompt(self.wire)
         } else {
             Command::PromptWithDisplay {
