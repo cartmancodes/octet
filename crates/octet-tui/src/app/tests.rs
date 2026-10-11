@@ -179,3 +179,27 @@ fn a_long_streamed_reply_rewraps_in_steps() {
     let wrapped = crate::view::transcript::WRAPPED.get();
     assert!(wrapped < 2 * 1024 * 1024, "re-wrapped {wrapped} bytes");
 }
+
+#[test]
+fn only_notable_hooks_reach_the_transcript() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CLAUDE);
+    app.event(Event::Hook {
+        name: "SessionStart:startup".into(),
+        event: "SessionStart".into(),
+        outcome: octet_core::HookOutcome::Ran,
+        detail: String::new(),
+    });
+    assert!(!app.entries_text().contains("SessionStart"));
+    app.event(Event::Hook {
+        name: "PreToolUse:Bash".into(),
+        event: "PreToolUse".into(),
+        outcome: octet_core::HookOutcome::Decided("allow".into()),
+        detail: String::new(),
+    });
+    assert!(
+        app.entries_text()
+            .contains("Hook PreToolUse:Bash allowed the tool (Octet was not asked)"),
+        "{}",
+        app.entries_text()
+    );
+}

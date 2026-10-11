@@ -2,9 +2,9 @@
 //! disk and subscriber failures stop execution instead of losing output silently.
 #![forbid(unsafe_code)]
 pub use octet_engine::live::{
-    APPROVAL_DEMO, Command, Config, DEFAULT_APPROVAL_TIMEOUT, Engine, Event, Handle, IMAGE_LIMIT,
-    IMAGES_PER_PROMPT, ImageAttachment, ImageError, Mode, Outcome, PROBE_LIMIT, PROMPT_LIMIT,
-    Plugins, SendError, WIRE_LIMIT, check_inline, encoded_len, probe, valid_effort,
+    APPROVAL_DEMO, Command, Config, DEFAULT_APPROVAL_TIMEOUT, Engine, Event, Handle, HookOutcome,
+    IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment, ImageError, Mode, Outcome, PROBE_LIMIT,
+    PROMPT_LIMIT, Plugins, SendError, WIRE_LIMIT, check_inline, encoded_len, probe, valid_effort,
 };
 use octet_store::Journal;
 use serde_json::{Value, json};
@@ -189,6 +189,15 @@ fn record(event: &Event) -> (&'static str, Value) {
         Event::ApprovalClosed(id) => ("approval_closed", json!(id)),
         Event::Usage(text) => ("usage", json!(text)),
         Event::Finished { outcome } => ("finished", json!(outcome.as_str())),
+        Event::Hook {
+            name,
+            event,
+            outcome,
+            detail,
+        } => (
+            "hook",
+            json!({"name":name,"event":event,"outcome":format!("{outcome:?}"),"detail":detail}),
+        ),
         Event::Notice(text) => ("notice", json!(text)),
         Event::Error(text) => ("error", json!(text)),
         Event::Stopped => ("stopped", Value::Null),

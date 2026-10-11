@@ -752,6 +752,28 @@ impl App {
                     _ => State::Error,
                 };
             }
+            Event::Hook {
+                name,
+                outcome,
+                detail,
+                ..
+            } => {
+                let what = match &outcome {
+                    octet_core::HookOutcome::Ran => return,
+                    octet_core::HookOutcome::Failed if detail.is_empty() => {
+                        format!("Hook {name} failed")
+                    }
+                    octet_core::HookOutcome::Failed => format!("Hook {name} failed: {detail}"),
+                    octet_core::HookOutcome::Blocked => format!("Hook {name} blocked the action"),
+                    octet_core::HookOutcome::Decided(d) if d == "allow" => {
+                        format!("Hook {name} allowed the tool (Octet was not asked)")
+                    }
+                    octet_core::HookOutcome::Decided(d) => {
+                        format!("Hook {name} answered the approval: {d}")
+                    }
+                };
+                self.note(what);
+            }
             Event::Notice(text) => self.note(text),
             Event::Error(text) => {
                 self.add(Role::Error, &text);

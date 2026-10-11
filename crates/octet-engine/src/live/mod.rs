@@ -431,6 +431,26 @@ impl std::fmt::Display for Outcome {
     }
 }
 
+/// What a hook did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookOutcome {
+    /// It ran and decided nothing.
+    Ran,
+    /// It exited with an error.
+    Failed,
+    /// It blocked the action.
+    Blocked,
+    /// It answered a tool approval itself: `allow`, `deny` or `ask`.
+    Decided(String),
+}
+impl HookOutcome {
+    /// Whether the transcript shows it; a hook that only ran is journal-only.
+    #[must_use]
+    pub fn notable(&self) -> bool {
+        !matches!(self, Self::Ran)
+    }
+}
+
 #[derive(Clone, Debug)]
 /// What a session reports to the interface, in order.
 pub enum Event {
@@ -468,6 +488,17 @@ pub enum Event {
     Finished {
         /// How it ended.
         outcome: Outcome,
+    },
+    /// A plugin or settings hook ran.
+    Hook {
+        /// The hook, as the vendor names it (`PreToolUse:Bash`).
+        name: String,
+        /// The hook event (`PreToolUse`, `SessionStart`, …).
+        event: String,
+        /// What it did.
+        outcome: HookOutcome,
+        /// Its error output, for a hook that failed.
+        detail: String,
     },
     /// Something the user should know that is not an error.
     Notice(String),

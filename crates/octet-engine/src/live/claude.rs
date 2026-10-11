@@ -1,8 +1,8 @@
 //! Claude Code stream-json protocol: launch arguments, control requests and
 //! the frame handler.
 use super::{
-    BoxFuture, Channels, Config, DriverError, Event, ImageAttachment, Limits, Mode, ModelInfo,
-    Outcome, Provider, check_inline, deadline_after, limited,
+    BoxFuture, Channels, Config, DriverError, Event, HookOutcome, ImageAttachment, Limits, Mode,
+    ModelInfo, Outcome, Provider, check_inline, deadline_after, limited,
     mode::confirm_mode,
     model_catalog_with,
     protocol::{Core, Phase, Protocol},
@@ -324,17 +324,13 @@ impl Protocol for ClaudeProtocol {
             return Ok(());
         }
         if kind == "control_cancel_request" {
-            let ids: Vec<u64> = core
-                .pending
-                .iter()
-                .filter(|(_, pending)| pending.wire["request_id"] == v["request_id"])
-                .map(|(id, _)| *id)
-                .collect();
-            for id in ids {
-                core.pending.remove(&id);
-                core.emit(Event::ApprovalClosed(id))?;
-            }
-            core.resume_watchdog();
+            cancel_approvals(core, &v)?;
+        }
+        // Hooks run during the handshake too, so before the phase check.
+        if kind == "system"
+            && let Some(hook) = hook_event(&v)
+        {
+            core.emit(hook)?;
         }
         if !core.phase.is_running() {
             return Ok(());
@@ -571,10 +567,88 @@ pub(crate) fn claude_permission_args(mode: Mode) -> Vec<&'static str> {
 pub(crate) fn claude_reported_mode(raw: &str) -> Option<Mode> {
     Mode::ALL.into_iter().find(|mode| claude_mode(*mode) == raw)
 }
+/// Claude withdrew an approval request: close it, and resume the watchdog.
+fn cancel_approvals(core: &mut Core, v: &Value) -> Result<(), DriverError> {
+    let ids: Vec<u64> = core
+        .pending
+        .iter()
+        .filter(|(_, pending)| pending.wire["request_id"] == v["request_id"])
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        core.pending.remove(&id);
+        core.emit(Event::ApprovalClosed(id))?;
+    }
+    core.resume_watchdog();
+    Ok(())
+}
+
+/// A `hook_response` frame as an event: what the hook did. `hook_started`
+/// gives nothing, since only the response says what happened.
+fn hook_event(frame: &Value) -> Option<Event> {
+    if frame["subtype"] != "hook_response" {
+        return None;
+    }
+    let output = serde_json::from_str::<Value>(frame["output"].as_str().unwrap_or(""))
+        .unwrap_or(Value::Null);
+    let decision = output
+        .pointer("/hookSpecificOutput/permissionDecision")
+        .and_then(Value::as_str);
+    let outcome = if frame["exit_code"] == 2 || output["decision"] == "block" {
+        HookOutcome::Blocked
+    } else if frame["outcome"] != "success"
+        || frame["exit_code"].as_i64().is_some_and(|code| code != 0)
+    {
+        HookOutcome::Failed
+    } else if let Some(decision) = decision {
+        HookOutcome::Decided(limited(decision))
+    } else {
+        HookOutcome::Ran
+    };
+    Some(Event::Hook {
+        name: limited(frame["hook_name"].as_str().unwrap_or("hook")),
+        event: limited(frame["hook_event"].as_str().unwrap_or("")),
+        outcome,
+        detail: limited(frame["stderr"].as_str().unwrap_or("")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::live::Engine;
+
+    #[test]
+    fn hook_responses_say_what_a_hook_did() {
+        let frame = |exit: i64, outcome: &str, output: &str| {
+            json!({"type":"system","subtype":"hook_response",
+                "hook_name":"PreToolUse:Bash","hook_event":"PreToolUse","exit_code":exit,
+                "outcome":outcome,"output":output,"stderr":"boom"})
+        };
+        let outcome = |f: Value| match hook_event(&f) {
+            Some(Event::Hook { outcome, .. }) => outcome,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(outcome(frame(0, "success", "{}")), HookOutcome::Ran);
+        assert_eq!(outcome(frame(1, "error", "")), HookOutcome::Failed);
+        assert_eq!(outcome(frame(2, "success", "")), HookOutcome::Blocked);
+        assert_eq!(
+            outcome(frame(0, "success", r#"{"decision":"block"}"#)),
+            HookOutcome::Blocked
+        );
+        assert_eq!(
+            outcome(frame(
+                0,
+                "success",
+                r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#
+            )),
+            HookOutcome::Decided("allow".into())
+        );
+        assert!(
+            hook_event(&json!({"type":"system","subtype":"hook_started","hook_name":"x"}))
+                .is_none()
+        );
+    }
     #[test]
     fn plugin_switches_shape_the_launch() {
         let home = octet_testkit::TempDir::new("octet-claude-flags");
