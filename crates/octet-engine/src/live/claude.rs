@@ -2,7 +2,7 @@
 //! the frame handler.
 use super::{
     BoxFuture, Channels, Config, DriverError, Event, HookOutcome, ImageAttachment, Limits, Mode,
-    ModelInfo, Outcome, Provider, check_inline, deadline_after, limited,
+    ModelInfo, Outcome, Provider, SkillInfo, check_inline, deadline_after, limited,
     mode::confirm_mode,
     model_catalog_with,
     protocol::{Core, Phase, Protocol},
@@ -452,6 +452,10 @@ impl ClaudeProtocol {
                 .and_then(Value::as_str)
                 .map(|raw| (claude_reported_mode(raw), limited(raw)));
             core.adopt_mode(reported)?;
+            // Skills first: a probe returns once it has the models.
+            core.emit(Event::Skills(commands(
+                &v["response"]["response"]["commands"],
+            )))?;
             core.emit(Event::Models(catalog(&v["response"]["response"]["models"])))?;
         }
         Ok(false)
@@ -581,6 +585,34 @@ fn cancel_approvals(core: &mut Core, v: &Value) -> Result<(), DriverError> {
     }
     core.resume_watchdog();
     Ok(())
+}
+
+/// The handshake's `commands` as skills: each with a usable name, bounded.
+fn commands(value: &Value) -> Vec<SkillInfo> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(512)
+        .filter_map(|v| {
+            let name = v["name"].as_str().filter(|name| super::skill_name(name))?;
+            Some(SkillInfo {
+                name: name.to_owned(),
+                description: super::skill_text(&v["description"]),
+                aliases: v["aliases"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|alias| super::skill_name(alias))
+                    .take(16)
+                    .map(str::to_owned)
+                    .collect(),
+                argument_hint: super::skill_text(&v["argumentHint"]),
+                path: None,
+            })
+        })
+        .collect()
 }
 
 /// A `hook_response` frame as an event: what the hook did. `hook_started`

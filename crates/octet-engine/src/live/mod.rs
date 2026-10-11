@@ -316,6 +316,43 @@ impl Config {
         }
     }
 }
+/// A skill or command the vendor offers, as it lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillInfo {
+    /// What invokes it: `/name` on Claude, the skill item's name on Codex.
+    pub name: String,
+    /// The vendor's one-line description.
+    pub description: String,
+    /// Other names that invoke it (Claude).
+    pub aliases: Vec<String>,
+    /// What it takes after the name, such as `[topic]` (Claude).
+    pub argument_hint: String,
+    /// Its `SKILL.md` (Codex), which a Codex skill input names.
+    pub path: Option<PathBuf>,
+}
+
+/// A probe's result: the provider's models and skills.
+#[derive(Debug, Default)]
+pub struct Listing {
+    /// The model catalog.
+    pub models: Vec<ModelInfo>,
+    /// The skills, empty when the CLI listed none.
+    pub skills: Vec<SkillInfo>,
+}
+
+/// Whether `name` can be a skill's name: an identifier with no whitespace,
+/// so `/name args` splits back into it.
+fn skill_name(name: &str) -> bool {
+    valid_identifier(name) && !name.chars().any(char::is_whitespace)
+}
+
+/// A skill's description or hint, bounded and on one line.
+fn skill_text(value: &Value) -> String {
+    let text = value.as_str().unwrap_or("");
+    let end = text.floor_char_boundary(1024);
+    text[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Provider-owned picker metadata; selection and resolved ID can differ.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelInfo {
@@ -489,6 +526,8 @@ pub enum Event {
         /// How it ended.
         outcome: Outcome,
     },
+    /// The skills the vendor offers in this workspace.
+    Skills(Vec<SkillInfo>),
     /// A plugin or settings hook ran.
     Hook {
         /// The hook, as the vendor names it (`PreToolUse:Bash`).
@@ -762,39 +801,37 @@ fn limited(text: &str) -> String {
 /// How long a probe may take before it gives up.
 pub const PROBE_LIMIT: Duration = Duration::from_secs(20);
 
-/// The models `engine`'s CLI lists, read without opening a vendor session
-/// or sending a prompt: the CLI starts catalog-only and is stopped once it
-/// has listed them (Codex sends `Ready` after its last page; Claude before
-/// its list).
+/// The models and skills `config`'s CLI lists, read without opening a
+/// vendor session or sending a prompt: the CLI starts catalog-only and is
+/// stopped once it has listed them (Codex sends `Ready` after its skills;
+/// Claude its skills before its models).
 ///
 /// # Errors
 ///
 /// The provider cannot list its models, or its CLI could not start,
 /// failed, or did not list them within `limit`.
-pub async fn probe(
-    engine: Engine,
-    binary: PathBuf,
-    cwd: PathBuf,
-    limit: Duration,
-) -> Result<Vec<ModelInfo>, String> {
-    let title = engine.title();
-    if !engine.provider().lists_models {
+pub async fn probe(mut config: Config, limit: Duration) -> Result<Listing, String> {
+    let title = config.engine.title();
+    if !config.engine.provider().lists_models {
         return Err(format!("{title} cannot list its models"));
     }
-    let mut config = Config::new(engine, binary, cwd);
     config.catalog_only = true;
     let (handle, mut events, task) = spawn(config);
     let listed = timeout(limit, async {
-        let (mut ready, mut models) = (false, None);
+        let (mut ready, mut models, mut skills) = (false, None, Vec::new());
         while let Some(event) = events.recv().await {
             match event {
                 Event::Ready { .. } => ready = true,
                 Event::Models(list) => models = Some(list),
+                Event::Skills(list) => skills = list,
                 Event::Error(error) => return Err(error),
                 _ => {}
             }
-            if ready && let Some(list) = models.take() {
-                return Ok(list);
+            if ready && let Some(models) = models.take() {
+                return Ok(Listing {
+                    models,
+                    skills: std::mem::take(&mut skills),
+                });
             }
         }
         Err(format!("{title} stopped before listing its models"))

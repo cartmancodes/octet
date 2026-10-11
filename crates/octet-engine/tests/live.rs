@@ -1907,9 +1907,13 @@ fn logged(name: &str) -> (octet_testkit::TempDir, std::path::PathBuf) {
 #[tokio::test]
 async fn a_codex_probe_lists_every_page_and_opens_no_thread() {
     let (dir, script) = logged("octet-probe-codex");
-    let models = probe(Engine::CODEX, script, std::env::temp_dir(), PROBE_LIMIT)
-        .await
-        .unwrap();
+    let models = probe(
+        Config::new(Engine::CODEX, script, std::env::temp_dir()),
+        PROBE_LIMIT,
+    )
+    .await
+    .unwrap()
+    .models;
     let names: Vec<&str> = models.iter().map(|m| m.selection.as_str()).collect();
     assert_eq!(names, ["fixture", "other-full-id"]);
     let sent = std::fs::read_to_string(dir.path().join("sent.log")).unwrap();
@@ -1920,9 +1924,13 @@ async fn a_codex_probe_lists_every_page_and_opens_no_thread() {
 #[tokio::test]
 async fn a_claude_probe_lists_its_models_and_sends_no_prompt() {
     let (dir, script) = logged("octet-probe-claude");
-    let models = probe(Engine::CLAUDE, script, std::env::temp_dir(), PROBE_LIMIT)
-        .await
-        .unwrap();
+    let models = probe(
+        Config::new(Engine::CLAUDE, script, std::env::temp_dir()),
+        PROBE_LIMIT,
+    )
+    .await
+    .unwrap()
+    .models;
     assert_eq!(models[0].selection, "sonnet");
     let sent = std::fs::read_to_string(dir.path().join("sent.log")).unwrap();
     assert!(!sent.contains(r#""type":"user""#), "{sent}");
@@ -1933,9 +1941,7 @@ async fn a_silent_cli_gives_up_at_the_limit() {
     let (_dir, script) = script_vendor("octet-probe-silent", "exec sleep 30");
     let started = std::time::Instant::now();
     let error = probe(
-        Engine::CODEX,
-        script,
-        std::env::temp_dir(),
+        Config::new(Engine::CODEX, script, std::env::temp_dir()),
         Duration::from_millis(300),
     )
     .await
@@ -1947,9 +1953,11 @@ async fn a_silent_cli_gives_up_at_the_limit() {
 #[tokio::test]
 async fn a_provider_without_a_list_is_not_probed() {
     let error = probe(
-        Engine::DEMO,
-        "demo".into(),
-        std::env::temp_dir(),
+        Config::new(
+            Engine::DEMO,
+            std::path::PathBuf::from("demo"),
+            std::env::temp_dir(),
+        ),
         PROBE_LIMIT,
     )
     .await
@@ -1958,7 +1966,8 @@ async fn a_provider_without_a_list_is_not_probed() {
 }
 
 /// A fake Codex app server in shell: logs what it is sent to `sent.log`,
-/// answers `initialize`, and answers each `model/list` with `listing`.
+/// answers `initialize`, each `model/list` with `listing`, and `skills/list`
+/// with no skills.
 fn scripted_codex(name: &str, listing: &str) -> (octet_testkit::TempDir, std::path::PathBuf) {
     script_vendor(
         name,
@@ -1970,6 +1979,7 @@ while IFS= read -r line; do
   case "$line" in
     *'"initialize"'*) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
     *'"model/list"'*) printf '{{"id":%s,{listing}}}\n' "$id" ;;
+    *'"skills/list"'*) printf '{{"id":%s,"result":{{"data":[]}}}}\n' "$id" ;;
   esac
 done"#
         ),
@@ -1982,9 +1992,12 @@ async fn a_codex_probe_whose_listing_fails_opens_no_thread() {
         "octet-probe-list-error",
         r#""error":{"code":-1,"message":"no models for you"}"#,
     );
-    let error = probe(Engine::CODEX, script, std::env::temp_dir(), PROBE_LIMIT)
-        .await
-        .unwrap_err();
+    let error = probe(
+        Config::new(Engine::CODEX, script, std::env::temp_dir()),
+        PROBE_LIMIT,
+    )
+    .await
+    .unwrap_err();
     assert!(error.contains("no models for you"), "{error}");
     let sent = std::fs::read_to_string(dir.path().join("sent.log")).unwrap();
     assert!(!sent.contains("thread/"), "{sent}");
@@ -1996,9 +2009,13 @@ async fn a_codex_probe_that_pages_forever_ends_without_a_thread() {
         "octet-probe-paging",
         r#""result":{"data":[{"id":"loop","model":"loop-model","displayName":"Loop"}],"nextCursor":"again"}"#,
     );
-    let models = probe(Engine::CODEX, script, std::env::temp_dir(), PROBE_LIMIT)
-        .await
-        .unwrap();
+    let models = probe(
+        Config::new(Engine::CODEX, script, std::env::temp_dir()),
+        PROBE_LIMIT,
+    )
+    .await
+    .unwrap()
+    .models;
     assert_eq!(models.len(), 1);
     let sent = std::fs::read_to_string(dir.path().join("sent.log")).unwrap();
     assert_eq!(sent.matches("model/list").count(), 2, "{sent}");
@@ -2013,9 +2030,7 @@ async fn a_silent_cli_is_gone_after_the_probe_gives_up() {
     );
     // Long enough for the shell to start and write its PID on a busy machine.
     let error = probe(
-        Engine::CODEX,
-        script,
-        std::env::temp_dir(),
+        Config::new(Engine::CODEX, script, std::env::temp_dir()),
         Duration::from_secs(2),
     )
     .await
@@ -2048,4 +2063,56 @@ async fn no_plugins_starts_codex_with_plugins_disabled() {
     stop(&handle, task).await;
     let argv = std::fs::read_to_string(dir.path().join("argv.log")).unwrap();
     assert_eq!(argv.trim(), "app-server --disable plugins");
+}
+
+#[tokio::test]
+async fn both_providers_list_their_skills() {
+    for (engine, name) in [
+        (Engine::CLAUDE, "fixture-skill"),
+        (Engine::CODEX, "fixture-codex-skill"),
+    ] {
+        let mut c = config();
+        c.engine = engine;
+        let (handle, mut events, task) = spawn(c);
+        let skills = wait_for(&mut events, |e| matches!(e, Event::Skills(_))).await;
+        let Event::Skills(skills) = skills else {
+            unreachable!()
+        };
+        assert_eq!(skills[0].name, name);
+        stop(&handle, task).await;
+    }
+}
+
+#[tokio::test]
+async fn a_codex_skills_change_refreshes_the_list_mid_turn() {
+    let (handle, mut events, task) = spawn(config());
+    wait_for(&mut events, |e| matches!(e, Event::Skills(_))).await;
+    handle
+        .send(Command::Prompt(scenario::SKILLS_CHANGED.into()))
+        .unwrap();
+    // The re-listed skills may arrive before or after the turn ends.
+    let (mut skills, mut finished) = (false, false);
+    while !(skills && finished) {
+        match wait_for(&mut events, |e| {
+            matches!(e, Event::Skills(_) | Event::Finished { .. })
+        })
+        .await
+        {
+            Event::Skills(_) => skills = true,
+            _ => finished = true,
+        }
+    }
+    stop(&handle, task).await;
+}
+
+#[tokio::test]
+async fn a_probe_lists_models_and_skills() {
+    let c = Config::new(
+        Engine::CODEX,
+        octet_testkit::protocol_child(),
+        std::env::temp_dir(),
+    );
+    let listing = probe(c, PROBE_LIMIT).await.unwrap();
+    assert!(!listing.models.is_empty());
+    assert_eq!(listing.skills[0].name, "fixture-codex-skill");
 }

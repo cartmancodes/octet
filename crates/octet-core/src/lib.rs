@@ -3,8 +3,9 @@
 #![forbid(unsafe_code)]
 pub use octet_engine::live::{
     APPROVAL_DEMO, Command, Config, DEFAULT_APPROVAL_TIMEOUT, Engine, Event, Handle, HookOutcome,
-    IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment, ImageError, Mode, Outcome, PROBE_LIMIT,
-    PROMPT_LIMIT, Plugins, SendError, WIRE_LIMIT, check_inline, encoded_len, probe, valid_effort,
+    IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment, ImageError, Listing, Mode, Outcome,
+    PROBE_LIMIT, PROMPT_LIMIT, Plugins, SendError, WIRE_LIMIT, check_inline, encoded_len, probe,
+    valid_effort,
 };
 use octet_store::Journal;
 use serde_json::{Value, json};
@@ -164,6 +165,13 @@ async fn pump(
 
 fn record(event: &Event) -> (&'static str, Value) {
     match event {
+        Event::Skills(skills) => {
+            let skills: Vec<Value> = skills
+                .iter()
+                .map(|s| json!({"name":s.name,"description":s.description,"aliases":s.aliases}))
+                .collect();
+            ("skills", json!(skills))
+        }
         Event::Models(models) => {
             let models: Vec<Value> = models
                 .iter()
@@ -256,7 +264,7 @@ pub mod sessions;
 pub use octet_store::JournalSummary;
 pub use sessions::{RecentSession, recent_sessions};
 
-pub use octet_engine::live::ModelInfo;
+pub use octet_engine::live::{ModelInfo, SkillInfo};
 
 #[cfg(test)]
 mod tests {

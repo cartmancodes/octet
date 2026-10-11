@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub(crate) struct Probed {
     pub(crate) engine: Engine,
-    pub(crate) result: Result<Vec<ModelInfo>, String>,
+    pub(crate) result: Result<octet_core::Listing, String>,
 }
 
 /// Where probes run and which CLI each provider's starts.
@@ -25,6 +25,8 @@ pub(crate) struct Prober {
     /// The CLI a provider runs when it is not its default (`--binary`).
     pub(crate) binaries: HashMap<Engine, PathBuf>,
     pub(crate) limit: Duration,
+    /// The run's plugin switches, so a probe loads what a session would.
+    pub(crate) plugins: octet_core::Plugins,
 }
 
 impl Prober {
@@ -129,7 +131,11 @@ impl Models {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let binary = prober.binary(engine);
-            let result = octet_core::probe(engine, binary, prober.cwd, prober.limit).await;
+            let config = octet_core::Config {
+                plugins: prober.plugins,
+                ..octet_core::Config::new(engine, binary, prober.cwd)
+            };
+            let result = octet_core::probe(config, prober.limit).await;
             let _ = tx.send(Probed { engine, result });
         });
         true
@@ -148,9 +154,9 @@ impl Models {
     pub(crate) fn probed(&mut self, probed: Probed, now: SystemTime) -> Option<String> {
         self.probing.remove(&probed.engine);
         match probed.result {
-            Ok(models) => {
+            Ok(listing) => {
                 self.failed.remove(&probed.engine);
-                self.catalogs.set(probed.engine, models, now);
+                self.catalogs.set(probed.engine, listing.models, now);
                 self.save()
             }
             Err(error) => {
@@ -279,6 +285,7 @@ mod tests {
                 .map(|engine| (*engine, octet_testkit::protocol_child()))
                 .collect(),
             limit: octet_core::PROBE_LIMIT,
+            plugins: octet_core::Plugins::default(),
         }
     }
     fn attached(dir: &Path) -> Models {
@@ -325,7 +332,7 @@ mod tests {
         models.probe_stale(Engine::CLAUDE, SystemTime::now());
         let probed = models.next().await;
         assert_eq!(probed.engine, Engine::CODEX);
-        assert_eq!(probed.result.unwrap()[0].selection, "fixture");
+        assert_eq!(probed.result.unwrap().models[0].selection, "fixture");
     }
 
     #[tokio::test]

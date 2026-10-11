@@ -26,6 +26,8 @@ pub const CHATTER: &str = "chatter";
 pub const FAIL: &str = "fail";
 /// Codex: a failed turn whose message is nested JSON.
 pub const FAIL_NESTED: &str = "fail-nested";
+/// Codex: the skills change mid-turn (`skills/changed`), then a normal reply.
+pub const SKILLS_CHANGED: &str = "skills-changed";
 /// Codex: a slow turn of dots.
 pub const SLOW: &str = "slow";
 /// Codex: echo the thread and turn parameters received.

@@ -771,6 +771,7 @@ fn a_live_list_is_cached() {
             cwd: std::env::temp_dir(),
             binaries: std::collections::HashMap::new(),
             limit: octet_core::PROBE_LIMIT,
+            plugins: octet_core::Plugins::default(),
         },
     );
     app.event(octet_core::Event::Models(vec![listed("opus")]));

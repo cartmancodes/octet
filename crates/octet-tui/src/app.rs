@@ -80,6 +80,8 @@ pub(crate) struct Connection {
     pub(crate) requested_model: Option<String>,
     pub(crate) resolved_model: Option<String>,
     pub(crate) models: Vec<octet_core::ModelInfo>,
+    /// The active provider's skills, as it last listed them.
+    pub(crate) skills: Vec<octet_core::SkillInfo>,
     pub(crate) session: String,
     pub(crate) journal: PathBuf,
     pub(crate) phase: ConnPhase,
@@ -119,6 +121,7 @@ impl Connection {
             requested_model: config.model.clone(),
             resolved_model: None,
             models: Vec::new(),
+            skills: Vec::new(),
             session: String::new(),
             journal,
             phase: ConnPhase::Connecting,
@@ -752,6 +755,7 @@ impl App {
                     _ => State::Error,
                 };
             }
+            Event::Skills(skills) => self.conn.skills = skills,
             Event::Hook {
                 name,
                 outcome,

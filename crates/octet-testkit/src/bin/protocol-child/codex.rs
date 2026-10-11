@@ -1,4 +1,4 @@
-//! The fake Codex app server: `thread/*`, `turn/*` and `model/list`, with
+//! The fake Codex app server: `thread/*`, `turn/*`, `model/list` and `skills/list`, with
 //! the scripts in `scenario` chosen by the turn's text or the thread's model.
 use crate::wire::{codex_delta, codex_turn_completed, emit, goal_reply};
 use octet_testkit::scenario;
@@ -31,6 +31,9 @@ pub(crate) fn run() {
         let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
         match v["method"].as_str() {
             Some("model/list") => model_list(&v),
+            Some("skills/list") => emit(
+                &json!({"id":v["id"],"result":{"data":[{"cwd":".","errors":[],"skills":[{"name":"fixture-codex-skill","description":"A Codex fixture skill","enabled":true,"path":"/tmp/fixture-codex-skill/SKILL.md","scope":"user"}]}]}}),
+            ),
             Some("initialize") => emit(&json!({"id":v["id"],"result":{}})),
             Some("thread/start" | "thread/resume" | "thread/fork") => codex.open_thread(&v),
             Some("thread/compact/start") => codex.compact(&v),
@@ -198,6 +201,10 @@ impl CodexFixture {
                 let echo = json!({"thread":self.thread_params,"turn":v["params"]}).to_string();
                 emit(&codex_delta("fixture-thread", &active, "params", &echo));
                 done();
+            }
+            scenario::SKILLS_CHANGED => {
+                emit(&json!({"method":"skills/changed","params":{}}));
+                reply(&active, text, v);
             }
             _ => reply(&active, text, v),
         }

@@ -85,7 +85,7 @@ impl ClaudeFixture {
         };
         emit(&claude_control_success(
             &v["request_id"],
-            &json!({"current_permission_mode":reported,"models":[{"value":"sonnet","resolvedModel":"claude-fixture-full-id","displayName":"Fixture Sonnet","description":"Provider description"}]}),
+            &json!({"current_permission_mode":reported,"models":[{"value":"sonnet","resolvedModel":"claude-fixture-full-id","displayName":"Fixture Sonnet","description":"Provider description"}],"commands":[{"name":"fixture-skill","description":"A fixture skill","argumentHint":"[topic]","aliases":["fs"]}]}),
         ));
     }
 

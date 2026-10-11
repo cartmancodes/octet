@@ -2,7 +2,7 @@
 //! server requests and turn notifications.
 use super::{
     BoxFuture, Channels, Config, DriverError, EVENT_BYTES, Event, ImageAttachment, Limits, Mode,
-    ModelInfo, Outcome, Provider, limited, model_catalog_with,
+    ModelInfo, Outcome, Provider, SkillInfo, limited, model_catalog_with,
     protocol::{Core, Phase, Protocol},
     push_bounded, short, valid_identifier,
 };
@@ -11,6 +11,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     fmt::Write as _,
+    path::PathBuf,
     time::Duration,
 };
 
@@ -49,6 +50,7 @@ enum Outstanding {
     Initialize,
     OpenThread,
     ModelList,
+    SkillsList,
     /// `turn/start` or `thread/compact/start`: an error fails the turn.
     Start,
     Interrupt,
@@ -88,6 +90,7 @@ impl Protocol for CodexProtocol {
             .pointer("/params/threadId")
             .and_then(Value::as_str)
             .is_none_or(|id| id == core.session)
+            && frame["method"] != "skills/changed"
     }
 
     fn turn_started(&mut self) {
@@ -178,6 +181,10 @@ impl Protocol for CodexProtocol {
         }
         if v.get("id").is_some() {
             return self.server_request(core, v).await;
+        }
+        // Not tied to a thread, so before the thread filter.
+        if method == "skills/changed" {
+            return self.request_skills(core, true).await;
         }
         if v.pointer("/params/threadId").and_then(Value::as_str) != Some(core.session.as_str()) {
             return Ok(());
@@ -324,6 +331,18 @@ impl CodexProtocol {
             Outstanding::Initialize => self.handshaken(core, v).await,
             Outstanding::OpenThread => self.opened(core, v).await,
             Outstanding::ModelList => self.catalog_page(core, v).await,
+            Outstanding::SkillsList => {
+                if v.get("error").is_none() {
+                    core.emit(Event::Skills(skills(&v["result"]["data"])))?;
+                }
+                if core.config.catalog_only {
+                    // Models and skills are in: a probe takes them now.
+                    core.emit(Event::Ready {
+                        session: String::new(),
+                    })?;
+                }
+                Ok(())
+            }
             Outstanding::Start => {
                 if v.get("error").is_some() {
                     self.drop_held_steers(core)?;
@@ -400,7 +419,15 @@ impl CodexProtocol {
         {
             core.emit(Event::ModelSelected(model.into()))?;
         }
-        self.request_models(core, None).await
+        self.request_models(core, None).await?;
+        self.request_skills(core, false).await
+    }
+
+    /// Asks for the workspace's skills; `reload` after Codex says they changed.
+    async fn request_skills(&mut self, core: &Core, reload: bool) -> Result<(), DriverError> {
+        let params = json!({"cwds":[core.config.cwd],"forceReload":reload});
+        self.request(core, Outstanding::SkillsList, "skills/list", params)
+            .await
     }
 
     /// Asks for a page of the model catalog.
@@ -452,10 +479,8 @@ impl CodexProtocol {
         }
         core.emit(Event::Models(self.catalog.clone()))?;
         if core.config.catalog_only && !more {
-            // The whole list is in: a probe takes it now.
-            core.emit(Event::Ready {
-                session: String::new(),
-            })?;
+            // The whole list is in; the skills, then `Ready`.
+            self.request_skills(core, false).await?;
         }
         Ok(())
     }
@@ -508,6 +533,30 @@ fn adopt_mode_now(core: &mut Core, target: Mode) -> Result<(), DriverError> {
 }
 
 /// The Codex catalog: `model` is both the selection and the resolved ID.
+/// `skills/list` data as skills: the enabled ones with a usable name, bounded.
+fn skills(data: &Value) -> Vec<SkillInfo> {
+    data.as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
+        .filter(|v| v["enabled"] == true)
+        .filter_map(|v| {
+            let name = v["name"].as_str().filter(|name| super::skill_name(name))?;
+            Some(SkillInfo {
+                name: name.to_owned(),
+                description: super::skill_text(&v["description"]),
+                aliases: Vec::new(),
+                argument_hint: String::new(),
+                path: v["path"]
+                    .as_str()
+                    .filter(|path| valid_identifier(path))
+                    .map(PathBuf::from),
+            })
+        })
+        .take(512)
+        .collect()
+}
+
 fn catalog(value: &Value) -> Vec<ModelInfo> {
     model_catalog_with(value, "model", "model")
 }

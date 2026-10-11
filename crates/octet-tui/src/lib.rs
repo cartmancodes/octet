@@ -247,6 +247,7 @@ fn attach_models(
                 // Each provider's CLI as Octet runs it: a `--binary` override, else its default.
                 binaries: binaries.clone(),
                 limit: octet_core::PROBE_LIMIT,
+                plugins: config.plugins,
             },
         );
     }
