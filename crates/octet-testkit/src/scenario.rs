@@ -16,6 +16,8 @@ pub const DIE_ON_INTERRUPT: &str = "die-on-interrupt";
 pub const APPROVAL: &str = "approval";
 /// Codex and Claude: ask for nine approvals at once.
 pub const APPROVALS_9: &str = "approvals-9";
+/// Codex: a file change starts, then asks for approval.
+pub const FILE_APPROVAL: &str = "file-approval";
 /// Claude: ask for an approval, then cancel the request.
 pub const APPROVAL_CANCEL: &str = "approval-cancel";
 /// Codex: a tool with large output.
@@ -34,6 +36,8 @@ pub const SLOW: &str = "slow";
 pub const PARAMS: &str = "params";
 /// Claude: one tool use.
 pub const TOOL: &str = "tool";
+/// Codex and Claude: one tool whose result is an error.
+pub const TOOL_FAIL: &str = "tool-fail";
 /// Claude: a failed result with error details.
 pub const ERRORS: &str = "errors";
 /// Claude: echo the launch arguments.

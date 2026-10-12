@@ -32,3 +32,41 @@ pub(crate) fn idle(app: &mut App) {
         "no event makes this session idle"
     );
 }
+
+/// A tool call event, as an adapter sends it.
+pub(crate) fn tool(
+    id: &str,
+    name: &str,
+    target: &str,
+    phase: octet_core::ToolPhase,
+) -> octet_core::Event {
+    octet_core::Event::Tool(octet_core::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        target: target.into(),
+        phase,
+        detail: format!("{name} {target}"),
+    })
+}
+
+/// An approval event with a shell-command summary.
+pub(crate) fn approval(id: u64, detail: &str) -> octet_core::Event {
+    octet_core::Event::Approval {
+        id,
+        detail: detail.into(),
+        summary: octet_core::ApprovalSummary {
+            command: Some("cargo test".into()),
+            cwd: Some("/tmp".into()),
+            ..octet_core::ApprovalSummary::new("Run a shell command")
+        },
+    }
+}
+
+/// A waiting approval for `id` with a plain summary.
+pub(crate) fn asked(id: u64, detail: &str) -> crate::app::Asked {
+    crate::app::Asked {
+        id,
+        detail: detail.into(),
+        summary: octet_core::ApprovalSummary::new("Run a shell command"),
+    }
+}

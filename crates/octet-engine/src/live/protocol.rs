@@ -2,8 +2,8 @@
 //! supplies (`Protocol`). The driver loop in `driver.rs` joins the two; a new
 //! vendor implements `Protocol` in its own file and adds a provider row.
 use super::{
-    Config, DriverError, EVENT_BYTES, Event, ImageAttachment, Limits, Mode, Outcome,
-    deadline_after, emit, mode::confirm_mode,
+    ApprovalSummary, Config, DriverError, EVENT_BYTES, Event, ImageAttachment, Limits, Mode,
+    Outcome, deadline_after, emit, mode::confirm_mode,
 };
 use octet_proc::Process;
 use serde_json::Value;
@@ -140,6 +140,7 @@ impl Core {
         &mut self,
         wire: Value,
         detail: String,
+        summary: ApprovalSummary,
     ) -> Result<(), DriverError> {
         let refusal = if detail.len() > EVENT_BYTES {
             Some((
@@ -162,6 +163,7 @@ impl Core {
         self.emit(Event::Approval {
             id: self.approval_id,
             detail,
+            summary,
         })?;
         let deadline = deadline_after(self.config.approval_timeout);
         self.pending

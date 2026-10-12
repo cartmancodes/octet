@@ -278,7 +278,9 @@ async fn ctrl_c_in_approval_dialog_pauses_the_active_goal() {
     ));
     app.goals.goal_prompt_sent();
     app.conn.start_turn();
-    app.overlay.approvals.push_back((1, "command".into()));
+    app.overlay
+        .approvals
+        .push_back(crate::test_support::asked(1, "command"));
     let temp = octet_testkit::TempDir::new("octet-goal-cancel");
     let directory = temp.path().to_path_buf();
     let config = Config::new(Engine::DEMO, "demo", directory.clone());
@@ -389,7 +391,7 @@ async fn enter_while_running_queues_the_prompt() {
     key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
     assert_eq!(app.composer.queue.len(), 1);
     assert!(app.composer.editor.text().is_empty());
-    assert!(crate::view::composer_title(&app).contains("+1 queued"));
+    assert_eq!(crate::view::chips(&app).as_deref(), Some("1 queued"));
 }
 #[tokio::test]
 async fn cancel_drops_the_queue() {
@@ -485,10 +487,7 @@ async fn one_tab_listing_at_a_time() {
 async fn an_answer_key_right_after_an_approval_is_ignored() {
     let mut app = app();
     let vendor = RecordingVendor::default();
-    app.event(octet_core::Event::Approval {
-        id: 7,
-        detail: "rm -rf build".into(),
-    });
+    app.event(crate::test_support::approval(7, "rm -rf build"));
     // A letter typed as the dialog opens must not answer it.
     key_action(&mut app, &vendor, key(KeyCode::Char('a'))).await;
     assert!(
@@ -826,7 +825,7 @@ fn skills_app() -> App {
     app
 }
 #[tokio::test]
-async fn the_skills_picker_lists_both_providers_and_enter_runs() {
+async fn enter_in_the_skills_picker_prepares_the_skill() {
     let mut app = skills_app();
     let vendor = RecordingVendor::default();
     type_keys(&mut app, &vendor, "/skills").await;
@@ -844,11 +843,18 @@ async fn the_skills_picker_lists_both_providers_and_enter_runs() {
         picker.items
     );
     key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert_eq!(app.composer.editor.text(), "/imagegen ");
+    assert!(app.composer.completion.is_none());
+    assert!(
+        vendor.sent.borrow().is_empty(),
+        "nothing runs until the draft is sent"
+    );
+    type_keys(&mut app, &vendor, "a cat").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
     assert!(matches!(
         &vendor.sent.borrow()[0],
-        Command::Skill { name, path: Some(_), .. } if name == "imagegen"
+        Command::Skill { name, args, .. } if name == "imagegen" && args == "a cat"
     ));
-    assert!(app.composer.editor.text().is_empty());
 }
 #[tokio::test]
 async fn the_skills_picker_filters_and_tab_inserts() {
@@ -863,15 +869,104 @@ async fn the_skills_picker_filters_and_tab_inserts() {
     assert!(vendor.sent.borrow().is_empty());
 }
 #[tokio::test]
-async fn picking_another_providers_skill_switches_then_runs() {
+async fn another_providers_skill_is_prepared_then_switches_with_its_arguments() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Down)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    assert_eq!(
+        app.composer.editor.text(),
+        "/brainstorming ",
+        "Tab prepares another provider's too"
+    );
+    type_keys(&mut app, &vendor, "the cache").await;
+    assert_eq!(
+        crate::commands::foreign_skill(&app, app.composer.editor.text()),
+        Some(Engine::CLAUDE)
+    );
+    let action = key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(matches!(&action, Action::Exit(Exit::Model(s)) if s.provider == Engine::CLAUDE));
+    let run = app.pending_skill.as_ref().expect("waits for the switch");
+    assert_eq!(
+        (run.skill.name.as_str(), run.args.as_str()),
+        ("brainstorming", "the cache")
+    );
+    assert!(app.composer.editor.text().is_empty());
+}
+#[tokio::test]
+async fn enter_on_another_providers_line_prepares_it_too() {
     let mut app = skills_app();
     let vendor = RecordingVendor::default();
     type_keys(&mut app, &vendor, "/skills").await;
     key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
     key_action(&mut app, &vendor, key(KeyCode::Down)).await;
     let action = key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
-    assert!(matches!(&action, Action::Exit(Exit::Model(s)) if s.provider == Engine::CLAUDE));
-    assert!(app.pending_skill.is_some());
+    assert!(matches!(action, Action::Continue));
+    assert_eq!(app.composer.editor.text(), "/brainstorming ");
+    assert!(app.pending_skill.is_none());
+}
+#[tokio::test]
+async fn a_picked_skill_named_like_an_octet_command_says_it_cannot_run() {
+    let mut app = skills_app();
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        Engine::CLAUDE,
+        &ws,
+        vec![skill("model", &[], None)],
+        std::time::SystemTime::now(),
+    );
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills model").await;
+    let skills = app.composer.completion.as_ref().expect("picker open");
+    assert!(
+        skills.items[0].starts_with("model · claude"),
+        "{:?}",
+        skills.items
+    );
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert_eq!(
+        app.composer.editor.text(),
+        "/skills model",
+        "the draft stays"
+    );
+    assert_eq!(
+        app.status_line,
+        "/model is an Octet command; the claude skill of that name cannot run from Octet"
+    );
+    assert!(vendor.sent.borrow().is_empty());
+}
+#[tokio::test]
+async fn an_octet_command_never_switches_provider() {
+    let mut app = skills_app();
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        Engine::CLAUDE,
+        &ws,
+        vec![skill("model", &[], None)],
+        std::time::SystemTime::now(),
+    );
+    assert_eq!(crate::commands::foreign_skill(&app, "/model list"), None);
+    assert_eq!(
+        crate::commands::foreign_skill(&app, "/imagegen x"),
+        None,
+        "the current provider's"
+    );
+    assert_eq!(
+        crate::commands::foreign_skill(&app, "hello /brainstorming"),
+        None,
+        "not a slash draft"
+    );
+}
+#[tokio::test]
+async fn a_pending_skill_runs_once_the_switch_is_ready() {
+    let mut app = skills_app();
+    app.pending_skill = Some(crate::app::SkillRun {
+        engine: Engine::CLAUDE,
+        skill: skill("brainstorming", &[], None),
+        args: "the cache".into(),
+    });
     // The kept interface connects to Claude; on ready, the skill runs there.
     app.connection(
         &octet_core::Config::new(Engine::CLAUDE, "claude", "/tmp"),
@@ -888,7 +983,7 @@ async fn picking_another_providers_skill_switches_then_runs() {
     .await;
     assert!(matches!(
         &claude.sent.borrow()[0],
-        Command::Skill { name, .. } if name == "brainstorming"
+        Command::Skill { name, args, .. } if name == "brainstorming" && args == "the cache"
     ));
     assert!(app.pending_skill.is_none());
 }
@@ -935,13 +1030,152 @@ async fn a_failed_switch_drops_the_pending_skill() {
     assert!(claude.sent.borrow().is_empty());
 }
 #[tokio::test]
-async fn a_picked_skill_that_cannot_go_keeps_the_picker_draft() {
-    let mut app = skills_app();
+async fn ctrl_o_flips_tool_details_for_every_tools_entry() {
+    let mut app = app();
     let vendor = RecordingVendor::default();
-    type_keys(&mut app, &vendor, "/skills image").await;
-    // The session drops while the picker is open.
-    app.conn.phase = crate::app::ConnPhase::Connecting;
+    app.event(crate::test_support::tool(
+        "1",
+        "Read",
+        "a.rs",
+        octet_core::ToolPhase::Done,
+    ));
+    app.event(octet_core::Event::Text("x".into()));
+    app.event(crate::test_support::tool(
+        "2",
+        "Read",
+        "b.rs",
+        octet_core::ToolPhase::Done,
+    ));
+    key_action(&mut app, &vendor, ctrl('o')).await;
+    assert!(app.chat.tools_expanded);
+    assert!(
+        app.chat
+            .entries
+            .iter()
+            .filter(|e| e.role == crate::app::Role::Tool)
+            .all(|e| e.expanded)
+    );
+    assert_eq!(app.status_line, "Tool details shown");
+    key_action(&mut app, &vendor, ctrl('o')).await;
+    assert!(!app.chat.tools_expanded);
+    assert_eq!(app.status_line, "Tool details hidden");
+    app.event(crate::test_support::tool(
+        "3",
+        "Read",
+        "c.rs",
+        octet_core::ToolPhase::Done,
+    ));
+    assert!(
+        !app.chat.entries.back().unwrap().expanded,
+        "a new entry follows the setting"
+    );
+}
+#[tokio::test]
+async fn typing_filters_the_palette_and_enter_runs_the_match() {
+    let mut app = app();
+    let vendor = RecordingVendor::default();
+    key_action(
+        &mut app,
+        &vendor,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    )
+    .await;
+    type_keys(&mut app, &vendor, "edit").await;
+    assert_eq!(app.overlay.palette_query, "edit");
+    let names: Vec<&str> = view::palette_matches(&app.overlay.palette_query)
+        .into_iter()
+        .map(|i| view::palette_entries().nth(i).unwrap().0)
+        .collect();
+    assert!(names.contains(&"Ctrl+G"), "{names:?}");
+    assert!(names.iter().all(|n| {
+        let (name, summary) = view::palette_entries().find(|(k, _)| k == n).unwrap();
+        format!("{name} {summary}").to_lowercase().contains("edit")
+    }));
+    key_action(&mut app, &vendor, key(KeyCode::Backspace)).await;
+    assert_eq!(app.overlay.palette_query, "edi");
+    assert_eq!(app.overlay.selection, 0, "a change selects the first match");
+}
+#[tokio::test]
+async fn opening_the_palette_starts_unfiltered() {
+    let mut app = app();
+    let vendor = RecordingVendor::default();
+    app.overlay.palette_query = "zz".into();
+    key_action(
+        &mut app,
+        &vendor,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    )
+    .await;
+    assert!(app.overlay.palette_query.is_empty());
+}
+#[tokio::test]
+async fn f2_hides_and_shows_the_task_sidebar() {
+    let mut app = app();
+    let vendor = RecordingVendor::default();
+    assert!(app.sidebar);
+    key_action(&mut app, &vendor, key(KeyCode::F(2))).await;
+    assert!(!app.sidebar);
+    key_action(&mut app, &vendor, key(KeyCode::F(2))).await;
+    assert!(app.sidebar);
+}
+#[tokio::test]
+async fn f2_on_a_narrow_terminal_says_when_the_sidebar_shows() {
+    let vendor = RecordingVendor::default();
+    for (width, hint) in [(100, "The Task sidebar shows from 112 columns"), (120, "")] {
+        let mut app = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::view::draw(frame, &mut app))
+            .unwrap();
+        key_action(&mut app, &vendor, key(KeyCode::F(2))).await;
+        assert!(!app.sidebar, "the state flips either way");
+        assert_eq!(app.status_line, hint, "{width} columns");
+    }
+}
+
+#[tokio::test]
+async fn a_picked_skill_keeps_its_provider_when_both_have_the_name() {
+    let mut app = skills_app();
+    app.conn.skills = vec![skill("brainstorming", &[], Some("/s/codex/SKILL.md"))];
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
     key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
-    assert!(vendor.sent.borrow().is_empty());
-    assert_eq!(app.composer.editor.text(), "/skills image");
+    key_action(&mut app, &vendor, key(KeyCode::Down)).await;
+    let selected = &app.composer.completion.as_ref().unwrap().items[1];
+    assert!(selected.contains("claude"), "{selected}");
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    type_keys(&mut app, &vendor, "the cache").await;
+    let action = key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(
+        matches!(action, Action::Exit(Exit::Model(s)) if s.provider == Engine::CLAUDE),
+        "selected Claude but sent to current provider: {:?}",
+        vendor.sent.borrow()
+    );
+}
+#[tokio::test]
+async fn a_picked_skill_shows_its_switch_and_is_forgotten_when_the_draft_changes() {
+    let mut app = skills_app();
+    app.conn.skills = vec![skill("brainstorming", &[], Some("/s/codex/SKILL.md"))];
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Down)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    // The current provider has the name too, but the pick was Claude's: the hint says so.
+    assert_eq!(
+        crate::commands::foreign_skill(&app, app.composer.editor.text()),
+        Some(Engine::CLAUDE)
+    );
+    key_action(&mut app, &vendor, ctrl('u')).await;
+    assert!(
+        app.composer.chosen_skill.is_none(),
+        "an emptied draft forgets the pick"
+    );
+    type_keys(&mut app, &vendor, "/brainstorming").await;
+    assert_eq!(
+        crate::commands::foreign_skill(&app, app.composer.editor.text()),
+        None,
+        "typed again by hand, the current provider's runs"
+    );
 }

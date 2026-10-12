@@ -53,6 +53,7 @@ pub(crate) fn palette_key(app: &mut App, key: &str) -> Action {
             app.composer.completion = None;
             return Action::ExternalEditor;
         }
+        "Ctrl+O" => app.toggle_tool_details(),
         "@" => {
             let after_word = app.composer.editor.text()[..app.composer.editor.cursor()]
                 .chars()
@@ -176,35 +177,39 @@ fn picked_skill(app: &App, item: &str) -> Option<(octet_core::Engine, octet_core
         .into_iter()
         .find(|(engine, skill)| *engine == provider && skill.name == name)
 }
-/// Enter on a skills picker line: runs it here, or, for another provider's,
-/// switches there and runs it once that session is ready.
-fn pick_skill(app: &mut App, vendor: &dyn Vendor, item: Option<String>) -> Action {
-    let Some((engine, skill)) = item.and_then(|item| picked_skill(app, &item)) else {
-        return Action::Continue;
-    };
-    if engine == app.conn.engine {
-        // The picker and its draft stay when the skill cannot go.
-        if run_skill(app, vendor, &skill, "") {
-            app.composer.completion = None;
-            app.composer.editor.take();
+/// Enter or Tab on a skills picker line: the draft becomes `/name `, for its arguments.
+/// Nothing runs until the draft is sent. A skill named like an Octet command could never run, so
+/// the draft stays and a hint says why.
+fn choose_skill(app: &mut App, item: Option<String>) {
+    if let Some((engine, skill)) = item.and_then(|item| picked_skill(app, &item)) {
+        if crate::registry::Spec::find(&format!("/{}", skill.name)).is_some() {
+            app.hint(format!(
+                "/{} is an Octet command; the {engine} skill of that name cannot run from Octet",
+                skill.name
+            ));
+        } else {
+            app.composer.editor.set(format!("/{} ", skill.name));
+            app.composer.chosen_skill = Some((engine, skill));
         }
-        return Action::Continue;
-    }
-    if let Err(refusal) = crate::commands::can_reconnect(app) {
-        app.hint(refusal);
-        return Action::Continue;
     }
     app.composer.completion = None;
-    app.composer.editor.take();
-    app.pending_skill = Some(crate::app::SkillRun {
-        engine,
-        skill,
-        args: String::new(),
-    });
-    Action::Exit(Exit::Model(octet_core::model::Selection {
-        provider: engine,
-        model: None,
-    }))
+}
+/// The picked skill is forgotten once the draft no longer starts with its `/name`.
+fn forget_stale_skill(app: &mut App) {
+    let draft = app.composer.editor.text();
+    let still = app
+        .composer
+        .chosen_skill
+        .as_ref()
+        .is_some_and(|(_, skill)| {
+            draft
+                .strip_prefix('/')
+                .and_then(|rest| rest.split(char::is_whitespace).next())
+                == Some(skill.name.as_str())
+        });
+    if !still {
+        app.composer.chosen_skill = None;
+    }
 }
 /// Runs `skill` with `args` as a turn, or queues it behind the running one,
 /// as a typed prompt goes. False, with a notice, when it could not go.
@@ -298,17 +303,8 @@ pub(crate) fn accept_completion(app: &mut App) {
         composer::Kind::Command => format!("{item} "),
         composer::Kind::Model => model_text(app, item),
         composer::Kind::Skill => {
-            // Tab on a skill puts its name in the draft, to add arguments.
-            match picked_skill(app, item) {
-                Some((engine, skill)) if engine == app.conn.engine => {
-                    app.composer.editor.set(format!("/{} ", skill.name));
-                }
-                Some((engine, skill)) => app.hint(format!(
-                    "/{} is a {engine} skill; Enter on it switches there",
-                    skill.name
-                )),
-                None => {}
-            }
+            let item = Some(item.clone());
+            choose_skill(app, item);
             return;
         }
     };
@@ -400,15 +396,15 @@ pub(crate) async fn key_action(app: &mut App, vendor: &dyn Vendor, key: KeyEvent
         return Action::Continue;
     }
     // Approval keys never leak into the composer. A queued modal takes priority.
-    if let Some((id, _)) = app.overlay.approvals.front() {
-        let id = *id;
+    if let Some(asked) = app.overlay.approvals.front() {
+        let id = asked.id;
         approval_key(app, vendor, key, id).await;
         return Action::Continue;
     }
     if app.overlay.palette {
         return palette_press(app, vendor, key).await;
     }
-    if let Some(action) = completion_key(app, vendor, key) {
+    if let Some(action) = completion_key(app, key) {
         return action;
     }
     composer_key(app, vendor, key, quit_armed).await
@@ -459,30 +455,39 @@ async fn approval_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent, id: u64
 }
 async fn palette_press(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Action {
     let ctrl_c = ctrl(key, 'c');
+    let matches = view::palette_matches(&app.overlay.palette_query);
     match key.code {
         _ if ctrl_c => app.overlay.palette = false,
         KeyCode::Esc => app.overlay.palette = false,
         KeyCode::Up => app.overlay.selection = app.overlay.selection.saturating_sub(1),
         KeyCode::Down => {
             app.overlay.selection =
-                (app.overlay.selection + 1).min(view::palette_entries().count() - 1);
+                (app.overlay.selection + 1).min(matches.len().saturating_sub(1));
+        }
+        KeyCode::Backspace => {
+            app.overlay.palette_query.pop();
+            app.overlay.selection = 0;
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.overlay.palette_query.push(c);
+            app.overlay.selection = 0;
         }
         KeyCode::Enter => {
+            let Some(&index) = matches.get(app.overlay.selection) else {
+                return Action::Continue;
+            };
             app.overlay.palette = false;
-            if let Some(spec) = COMMANDS.get(app.overlay.selection) {
+            if let Some(spec) = COMMANDS.get(index) {
                 return command(app, vendor, spec.name).await;
             }
-            return palette_key(
-                app,
-                view::PALETTE_KEYS[app.overlay.selection - COMMANDS.len()].0,
-            );
+            return palette_key(app, view::PALETTE_KEYS[index - COMMANDS.len()].0);
         }
         _ => {}
     }
     Action::Continue
 }
 /// Keys an open popup takes; `None` lets the key reach the draft.
-fn completion_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Option<Action> {
+fn completion_key(app: &mut App, key: KeyEvent) -> Option<Action> {
     if key.code == KeyCode::Enter && typed_a_model(app) {
         // An exact name, or `default`, means what typing it always meant:
         // the draft goes as typed, resolved like any `/model NAME`.
@@ -492,7 +497,8 @@ fn completion_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Option<A
     let completion = app.composer.completion.as_mut()?;
     if key.code == KeyCode::Enter && completion.kind == composer::Kind::Skill {
         let item = completion.items.get(completion.selected).cloned();
-        return Some(pick_skill(app, vendor, item));
+        choose_skill(app, item);
+        return Some(Action::Continue);
     }
     if key.code == KeyCode::Enter && completion.kind == composer::Kind::Model {
         // Enter on a model switches to it: the draft becomes its explicit
@@ -692,9 +698,23 @@ async fn composer_key(
         || (ctrl && key.code == KeyCode::Char('j'));
     match key.code {
         KeyCode::F(1) => app.overlay.help = true,
+        KeyCode::F(2) => {
+            app.sidebar = !app.sidebar;
+            if app.last_width < crate::view::SIDEBAR_FROM {
+                app.hint(format!(
+                    "The Task sidebar shows from {} columns",
+                    crate::view::SIDEBAR_FROM
+                ));
+            }
+        }
         KeyCode::BackTab => return cycle_mode(app, vendor),
-        KeyCode::Char('p') if ctrl => app.overlay.palette = true,
+        KeyCode::Char('p') if ctrl => {
+            app.overlay.palette = true;
+            app.overlay.palette_query.clear();
+            app.overlay.selection = 0;
+        }
         KeyCode::Char('x') if ctrl => copy_reply(app),
+        KeyCode::Char('o') if ctrl => app.toggle_tool_details(),
         KeyCode::Char('g') if ctrl => {
             // The edited draft must not meet a popup about the old one.
             app.composer.completion = None;
@@ -745,6 +765,7 @@ async fn composer_key(
     refresh_completion(app);
     refresh_model_picker(app);
     refresh_skill_picker(app);
+    forget_stale_skill(app);
     Action::Continue
 }
 /// Interrupts the turn; a goal working on it is paused first, and prompts

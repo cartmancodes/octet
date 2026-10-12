@@ -46,6 +46,7 @@ fn mode_chip(app: &App) -> Span<'static> {
     Span::styled(text, Style::default().fg(color).bold())
 }
 pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
+    app.last_width = frame.area().width;
     paint(frame, app);
     if app.monochrome {
         without_colour(frame.buffer_mut());
@@ -78,30 +79,106 @@ fn paint(frame: &mut Frame, app: &mut App) {
     // Laid out once per frame: its row count sizes the composer, and its
     // lines and cursor are drawn there.
     let draft = app.composer.editor.layout(draft_width(area.width));
+    let compact = compact(area);
     let regions = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(if compact { 1 } else { 3 }),
         Constraint::Min(3),
-        Constraint::Length(composer_height(draft.0.len())),
+        Constraint::Length(composer_height(draft.0.len(), chips(app).is_some())),
         Constraint::Length(1),
     ])
-    .margin(1)
+    .horizontal_margin(1)
+    .vertical_margin(u16::from(!compact))
     .split(area);
-    header(frame, regions[0], app);
+    if compact {
+        header_line(frame, regions[0], app);
+    } else {
+        header(frame, regions[0], app);
+    }
     conversation(frame, regions[1], area.width, app);
     let cursor = composer(frame, regions[2], area.width, app, draft);
-    status_line(frame, regions[3], app);
+    status_line(frame, regions[3], app, compact);
     overlays(frame, area, app, cursor);
 }
-/// Banner on the left, status and usage on the right.
-fn header(frame: &mut Frame, area: Rect, app: &App) {
-    let status = format!(
+/// Below this many rows the header is one row and the layout has no vertical margin.
+pub(crate) const COMPACT_BELOW: u16 = 30;
+/// Short terminals trade the banner for transcript rows.
+fn compact(area: Rect) -> bool {
+    area.height < COMPACT_BELOW
+}
+/// The one-cell mark's colour: the mascot's state at a glance.
+fn mark_color(state: mascot::State) -> Color {
+    match state {
+        mascot::State::Approval | mascot::State::Error => AMBER,
+        mascot::State::Idle | mascot::State::Sleeping => MUTED,
+        _ => ACCENT,
+    }
+}
+/// The connection's status, or the pending approval, with its dot.
+fn status_text(app: &App) -> String {
+    format!(
         "● {}",
         if app.overlay.approvals.is_empty() {
             app.conn.status.as_str()
         } else {
             "approval needed"
         }
+    )
+}
+/// Amber for an approval, muted once stopped, else the accent.
+fn status_color(app: &App) -> Color {
+    if !app.overlay.approvals.is_empty() {
+        AMBER
+    } else if app.conn.is_stopped() {
+        MUTED
+    } else {
+        ACCENT
+    }
+}
+/// The compact header: mark, name, mode, model and workspace on the left; status and usage right.
+fn header_line(frame: &mut Frame, area: Rect, app: &App) {
+    let status = status_text(app);
+    // The status always shows in full; the usage joins it only where there is room.
+    let room = (area.width / 2).max(cells(status.width()));
+    let with_usage = format!("{status} · {}", app.conn.usage);
+    let right = if !app.conn.usage.is_empty() && cells(with_usage.width()) <= room {
+        with_usage
+    } else {
+        status
+    };
+    let right_width = cells(right.width());
+    let [left, right_area] =
+        Layout::horizontal([Constraint::Min(6), Constraint::Length(right_width)])
+            .spacing(1)
+            .areas(area);
+    let mark = if app.monochrome { "◇" } else { "◆" };
+    let model = format!("{} / {}", app.conn.engine, app.conn.model);
+    let (first, second) = if area.width < 80 {
+        (&app.conn.workspace, &model)
+    } else {
+        (&model, &app.conn.workspace)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{mark} "),
+                Style::default().fg(mark_color(app.mascot_state())),
+            ),
+            Span::styled("Octet", Style::default().fg(ACCENT).bold()),
+            Span::styled(" · ", Style::default().fg(MUTED)),
+            mode_chip(app),
+            Span::styled(format!(" · {first}  {second}"), Style::default().fg(MUTED)),
+        ])),
+        left,
     );
+    frame.render_widget(
+        Paragraph::new(Span::styled(right, Style::default().fg(status_color(app))))
+            .alignment(Alignment::Right),
+        right_area,
+    );
+}
+/// Banner on the left, status and usage on the right.
+fn header(frame: &mut Frame, area: Rect, app: &App) {
+    let status = status_text(app);
     // Status and usage keep the right edge, sized to their text so a narrow
     // terminal never cuts them; the banner takes the rest.
     let status_width = cells(status.width().max(app.conn.usage.width())).clamp(12, 22);
@@ -109,16 +186,9 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
         .spacing(1)
         .split(area);
     banner(frame, header[0], app);
-    let status_color = if !app.overlay.approvals.is_empty() {
-        AMBER
-    } else if app.conn.is_stopped() {
-        MUTED
-    } else {
-        ACCENT
-    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(status, Style::default().fg(status_color))),
+            Line::from(Span::styled(status, Style::default().fg(status_color(app)))),
             Line::from(Span::styled(
                 app.conn.usage.clone(),
                 Style::default().fg(MUTED),
@@ -128,9 +198,11 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
         header[1],
     );
 }
+/// The narrowest terminal that shows the Task sidebar.
+pub(crate) const SIDEBAR_FROM: u16 = 112;
 /// The transcript, and the sidebar on wide terminals.
 fn conversation(frame: &mut Frame, area: Rect, width: u16, app: &mut App) {
-    let columns = Layout::horizontal(if width >= 112 {
+    let columns = Layout::horizontal(if width >= SIDEBAR_FROM && app.sidebar {
         vec![Constraint::Min(40), Constraint::Length(29)]
     } else {
         vec![Constraint::Min(20)]
@@ -141,14 +213,16 @@ fn conversation(frame: &mut Frame, area: Rect, width: u16, app: &mut App) {
     // Before the first message the conversation area stays blank, reserved
     // for what the conversation will fill.
     if !app.chat.entries.is_empty() {
-        let block = card(if app.chat.scroll > 0 {
-            " Conversation · scrollback "
-        } else {
-            " Conversation "
-        });
-        let inner = block.inner(transcript);
-        frame.render_widget(block, transcript);
+        let inner = card(" Conversation ").inner(transcript);
         let lines = app.visible_lines(inner.width.saturating_sub(2), inner.height as usize);
+        let mut block = card(" Conversation ");
+        if app.chat.unseen {
+            block = block.title_bottom(Line::from(Span::styled(
+                " New output below · Ctrl+End follows ",
+                Style::default().fg(ACCENT),
+            )));
+        }
+        frame.render_widget(block, transcript);
         frame.render_widget(
             Paragraph::new(lines),
             Rect {
@@ -170,21 +244,18 @@ fn composer(
     app: &App,
     draft: (Vec<String>, (usize, usize)),
 ) -> (u16, u16) {
-    let title = composer_title(app);
-    let composer = card(&title).border_style(Style::default().fg(if app.conn.is_running() {
-        EDGE
-    } else {
-        ACCENT
-    }));
+    let composer = card(composer_title(app))
+        .border_style(Style::default().fg(if app.conn.is_running() { EDGE } else { ACCENT }));
     let inner = composer.inner(area);
     frame.render_widget(composer, area);
-    // The hint line takes the last row only when the draft keeps one; at
-    // the minimum height the box has a single row and the draft gets it.
+    let chips = chips(app);
+    // At the minimum height the draft keeps its row; the hint, then the chips, give way.
     let hint_rows = u16::from(inner.height >= 2);
+    let chip_rows = u16::from(chips.is_some() && inner.height >= 3);
     let input = Rect {
         x: inner.x + 1,
         width: inner.width.saturating_sub(2),
-        height: inner.height - hint_rows,
+        height: inner.height - hint_rows - chip_rows,
         ..inner
     };
     let (lines, (col, row)) = draft;
@@ -208,20 +279,25 @@ fn composer(
             input,
         );
     }
-    let hints = Rect {
-        x: input.x,
-        y: inner.bottom().saturating_sub(1),
-        width: input.width,
-        height: hint_rows,
-    };
+    if let Some(chips) = chips.filter(|_| chip_rows == 1) {
+        frame.render_widget(
+            Paragraph::new(chips).style(Style::default().fg(ACCENT)),
+            Rect {
+                y: input.bottom(),
+                height: 1,
+                ..input
+            },
+        );
+    }
+    let (hint, color) = composer_hint(app, width);
     frame.render_widget(
-        Paragraph::new(if width >= 80 {
-            "Enter send   Alt+Enter newline   ↑ history   Ctrl+P commands   Esc cancel"
-        } else {
-            "Enter send · Ctrl+J newline · F1 help"
-        })
-        .style(Style::default().fg(MUTED)),
-        hints,
+        Paragraph::new(hint).style(Style::default().fg(color)),
+        Rect {
+            x: input.x,
+            y: inner.bottom().saturating_sub(1),
+            width: input.width,
+            height: hint_rows,
+        },
     );
     completion_popup(frame, area, app);
     (
@@ -230,10 +306,16 @@ fn composer(
     )
 }
 /// The bottom line: the latest notice, or the standing hints.
-fn status_line(frame: &mut Frame, area: Rect, app: &App) {
+fn status_line(frame: &mut Frame, area: Rect, app: &App, compact: bool) {
     frame.render_widget(
         Paragraph::new(if app.status_line.is_empty() {
-            if app.conn.engine.offline() {
+            if compact {
+                if app.conn.engine.offline() {
+                    " Offline demo · F1 help · Ctrl+C ×2 quit".into()
+                } else {
+                    " F1 help · Ctrl+C ×2 quit".into()
+                }
+            } else if app.conn.engine.offline() {
                 " Offline demo · no model calls   |   Ctrl+C twice to quit".into()
             } else {
                 " Journal saved locally   |   F1 help   |   Ctrl+C twice to quit".into()
@@ -254,17 +336,15 @@ fn overlays(frame: &mut Frame, area: Rect, app: &mut App, cursor: (u16, u16)) {
         help(frame, area, &mut app.overlay.help_scroll);
     } else if app.overlay.palette {
         app.overlay.approval_hidden();
-        palette(frame, area, app.overlay.selection);
-    } else if let Some((id, detail)) = app.overlay.approvals.front() {
-        let count = app.overlay.approvals.len();
-        approval(
+        palette(
             frame,
             area,
-            *id,
-            detail,
-            &mut app.overlay.approval_scroll,
-            count,
+            app.overlay.selection,
+            &app.overlay.palette_query,
         );
+    } else if let Some(asked) = app.overlay.approvals.front() {
+        let count = app.overlay.approvals.len();
+        approval(frame, area, asked, &mut app.overlay.approval_scroll, count);
         app.overlay.approval_drawn();
     } else {
         frame.set_cursor_position(cursor);
@@ -320,7 +400,7 @@ fn completion_popup(frame: &mut Frame, composer: Rect, app: &App) {
         crate::composer::Kind::Path => " Paths ",
         crate::composer::Kind::Command => " Commands ",
         crate::composer::Kind::Model => " Models ",
-        crate::composer::Kind::Skill => " Skills · Enter runs · Tab inserts ",
+        crate::composer::Kind::Skill => " Skills · Enter choose ",
     };
     // On a short screen the popup is clipped; scroll so the selected row
     // stays in sight.
@@ -344,33 +424,72 @@ fn completion_popup(frame: &mut Frame, composer: Rect, app: &App) {
         area,
     );
 }
-/// The prompt box's title: what Enter will do, then what waits to go.
-pub(crate) fn composer_title(app: &App) -> String {
-    let mut parts = vec![if app.conn.is_running() {
-        "Next prompt · Enter queues it · Esc cancels the turn".to_owned()
+/// The prompt box's title: whether this prompt goes now or after the turn.
+pub(crate) fn composer_title(app: &App) -> &'static str {
+    if app.conn.is_running() {
+        " Next prompt "
     } else {
-        "Prompt".to_owned()
-    }];
-    parts.extend(crate::composer::chip(&app.composer.attachments));
+        " Prompt "
+    }
+}
+/// What waits to go with the next prompt: attachments, images, the queue.
+pub(crate) fn chips(app: &App) -> Option<String> {
+    let mut parts: Vec<String> = crate::composer::chip(&app.composer.attachments)
+        .into_iter()
+        .collect();
     match app.composer.images.as_slice() {
         [] => {}
         [one] => parts.push(format!("+ image {}", one.name)),
         many => parts.push(format!("+{} images", many.len())),
     }
     if !app.composer.queue.is_empty() {
-        parts.push(format!("+{} queued", app.composer.queue.len()));
+        parts.push(format!("{} queued", app.composer.queue.len()));
     }
-    format!(" {} ", parts.join(" · "))
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+/// The hint row: what Enter does now, then the next keys that fit.
+pub(crate) fn composer_hint(app: &App, width: u16) -> (String, Color) {
+    let draft = app.composer.editor.text();
+    if let Some(engine) = crate::commands::foreign_skill(app, draft) {
+        // Enter switches only when a reconnect may go; while connecting it says so itself.
+        match crate::commands::can_reconnect(app) {
+            Ok(()) => {
+                let name = draft.split(char::is_whitespace).next().unwrap_or(draft);
+                return (
+                    format!("Enter switches to {engine}, then runs {name}"),
+                    AMBER,
+                );
+            }
+            Err(crate::registry::TURN_OPEN) => {
+                return (format!("Finish the turn to switch to {engine}"), AMBER);
+            }
+            Err(_) => {}
+        }
+    }
+    let keys: &[&str] = if app.conn.is_running() {
+        &["Enter queue", "Esc cancel turn", "Ctrl+P commands"]
+    } else if width < 80 {
+        // A narrow screen is often a phone, which rarely sends Alt+Enter.
+        &["Enter send", "Ctrl+J newline"]
+    } else {
+        &[
+            "Enter send",
+            "Alt+Enter newline",
+            "↑ history",
+            "Ctrl+P commands",
+        ]
+    };
+    let shown = if width >= 80 { keys.len() } else { 2 };
+    (keys[..shown].join(" · "), MUTED)
 }
 /// The width the draft wraps at: margin, border and padding take three
 /// columns on each side.
 fn draft_width(terminal_width: u16) -> usize {
     terminal_width.saturating_sub(6) as usize
 }
-/// The composer's height from the draft's wrapped rows: borders, 1–4 draft
-/// rows, and the hint row. An empty prompt takes 4 rows, a long draft 7.
-fn composer_height(draft_rows: usize) -> u16 {
-    2 + cells(draft_rows.clamp(1, 4)) + 1
+/// The composer's height: borders, 1–4 draft rows, the chips row when there is one, the hint row.
+fn composer_height(draft_rows: usize, chips: bool) -> u16 {
+    2 + cells(draft_rows.clamp(1, 4)) + u16::from(chips) + 1
 }
 /// The top-left banner, after Claude Code's: the mini Octet (or a text mark
 /// without colour) beside three lines. The permission mode leads its line so
@@ -416,53 +535,56 @@ fn banner(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(mark), mark_area);
     frame.render_widget(Paragraph::new(lines), text);
 }
+/// The Task card: the goal, what is happening now, and what is queued.
 fn sidebar(frame: &mut Frame, area: Rect, app: &App) {
-    let block = card(" Workspace ");
+    let block = card(" Task ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let id = if app.conn.session.is_empty() {
-        "Waiting for session…"
-    } else {
-        app.conn.session.as_str()
+    let width = usize::from(inner.width.saturating_sub(1)).max(1);
+    let head = |text: &'static str| {
+        Line::from(Span::styled(format!(" {text}"), Style::default().fg(MUTED)))
     };
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled(" ENGINE", Style::default().fg(MUTED))),
-        Line::from(format!(" {}", app.conn.engine)),
-        Line::default(),
-        Line::from(Span::styled(" MODEL", Style::default().fg(MUTED))),
-        Line::from(format!(" {}", app.conn.model)),
-        Line::from(" /session for full details"),
-        Line::default(),
-        Line::from(Span::styled(" SESSION", Style::default().fg(MUTED))),
-        Line::from(format!(" {id}")),
-        Line::default(),
-        Line::from(Span::styled(" GOAL", Style::default().fg(MUTED))),
-        Line::from(match app.goals.goal() {
-            Some(goal) => format!(
-                " {} · {}/{} turns",
-                goal.status(),
-                goal.turns(),
-                octet_core::goal::MAX_GOAL_TURNS
-            ),
-            None => " No active goal".into(),
-        }),
-        Line::default(),
-        Line::from(Span::styled(" QUICK COMMANDS", Style::default().fg(MUTED))),
-    ];
+    let body = |text: String| Line::from(format!(" {text}"));
+    let mut lines = vec![Line::default(), head("GOAL")];
+    match app.goals.goal() {
+        Some(goal) => {
+            let mut rows = transcript::wrap(&crate::text::clean(goal.objective()), width);
+            if rows.len() > 4 {
+                rows.truncate(4);
+                rows[3].push('…');
+            }
+            lines.extend(rows.into_iter().map(body));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {} · {}/{} turns",
+                    goal.status(),
+                    goal.turns(),
+                    octet_core::goal::MAX_GOAL_TURNS
+                ),
+                Style::default().fg(MUTED),
+            )));
+        }
+        None => lines.push(body("No goal · /goal sets one".into())),
+    }
+    lines.extend([Line::default(), head("NOW")]);
     lines.extend(
-        COMMANDS
-            .iter()
-            .filter_map(|spec| Some(Line::from(format!(" {:<11} {}", spec.name, spec.quick?)))),
+        transcript::wrap(&app.now_line(), width)
+            .into_iter()
+            .take(2)
+            .map(body),
     );
-    lines.extend([
-        Line::default(),
-        Line::from(Span::styled(" CONTROL", Style::default().fg(MUTED))),
-        Line::from(" Esc         Cancel turn"),
-        Line::from(" PgUp/PgDn   Read history"),
-        Line::from(" Ctrl+C ×2   Save and quit"),
-    ]);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines.extend([Line::default(), head("QUEUED")]);
+    if app.composer.queue.is_empty() {
+        lines.push(body("Nothing queued".into()));
+    }
+    for prompt in app.composer.queue.iter().take(3) {
+        let first = crate::text::clean(prompt.display().lines().next().unwrap_or_default());
+        lines.push(body(transcript::wrap(&first, width).swap_remove(0)));
+    }
+    if app.composer.queue.len() > 3 {
+        lines.push(body(format!("+{} more", app.composer.queue.len() - 3)));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 fn modal(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(4));
@@ -485,6 +607,8 @@ pub(crate) fn help_lines() -> Vec<String> {
         "Ctrl+End follow · Esc/Ctrl+C cancel turn",
         "Ctrl+C twice quit · Ctrl+Z suspend (return with fg)",
         "Ctrl+P commands · Ctrl+G write the prompt in $EDITOR",
+        "Ctrl+O show or hide tool details",
+        "F2 show or hide the Task sidebar",
         "!cmd run and attach output · !!cmd run only · Esc stops",
         "@ mention a file · Tab completes paths and /commands",
         "",
@@ -533,10 +657,11 @@ fn help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
     );
 }
 /// Keys the palette also offers, after the commands.
-pub(crate) const PALETTE_KEYS: [(&str, &str); 3] = [
+pub(crate) const PALETTE_KEYS: [(&str, &str); 4] = [
     ("Ctrl+G", "Write the prompt in $EDITOR"),
     ("@", "Mention a file"),
     ("!", "Run a shell command"),
+    ("Ctrl+O", "Show or hide tool details"),
 ];
 /// The palette's rows: every command, then the keys it also offers.
 pub(crate) fn palette_entries() -> impl Iterator<Item = (&'static str, &'static str)> {
@@ -545,7 +670,16 @@ pub(crate) fn palette_entries() -> impl Iterator<Item = (&'static str, &'static 
         .map(|spec| (spec.name, spec.summary))
         .chain(PALETTE_KEYS.iter().copied())
 }
-fn palette(frame: &mut Frame, area: Rect, selected: usize) {
+/// The palette rows whose name or summary contains `query`, ignoring case.
+pub(crate) fn palette_matches(query: &str) -> Vec<usize> {
+    let query = query.to_lowercase();
+    palette_entries()
+        .enumerate()
+        .filter(|(_, (name, summary))| format!("{name} {summary}").to_lowercase().contains(&query))
+        .map(|(index, _)| index)
+        .collect()
+}
+fn palette(frame: &mut Frame, area: Rect, selected: usize, query: &str) {
     let name_width = palette_entries()
         .map(|(name, _)| name.len())
         .max()
@@ -555,33 +689,49 @@ fn palette(frame: &mut Frame, area: Rect, selected: usize) {
         .max()
         .unwrap_or(0);
     // Width: borders, the marker and spaces around each column. Height:
-    // borders and a blank line above and below the list.
+    // borders and a blank line above and below the list. The height is the
+    // full list's, so the modal does not jump as the filter narrows it.
     let area = modal(
         area,
         cells(name_width + description_width + 7),
         cells(palette_entries().count()).saturating_add(4),
     );
     frame.render_widget(Clear, area);
+    let matches = palette_matches(query);
     // On a short screen the list scrolls to keep the selected row in sight.
     let window = usize::from(area.height.saturating_sub(4)).max(1);
     let first = selected.saturating_sub(window - 1);
     let mut lines = vec![Line::default()];
-    for (index, (command, description)) in palette_entries().enumerate().skip(first).take(window) {
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   No matching commands",
+            Style::default().fg(MUTED).bg(PANEL),
+        )));
+    }
+    let entries: Vec<(&str, &str)> = palette_entries().collect();
+    for (row, &index) in matches.iter().enumerate().skip(first).take(window) {
+        let (command, description) = entries[index];
+        let chosen = row == selected;
         lines.push(Line::from(Span::styled(
             format!(
                 " {} {:<name_width$} {}",
-                if index == selected { "›" } else { " " },
+                if chosen { "›" } else { " " },
                 command,
                 description
             ),
             Style::default()
-                .fg(if index == selected { ACCENT } else { FG })
-                .bg(if index == selected { SELECTED } else { PANEL }),
+                .fg(if chosen { ACCENT } else { FG })
+                .bg(if chosen { SELECTED } else { PANEL }),
         )));
     }
+    let title = if query.is_empty() {
+        " Commands · ↑ ↓ choose · Enter run · Esc close ".to_owned()
+    } else {
+        format!(" Commands · \"{query}\" · ↑ ↓ · Enter run · Esc close ")
+    };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(card(" Commands · ↑ ↓ choose · Enter run · Esc close "))
+            .block(card(&title))
             .style(Style::default().bg(PANEL)),
         area,
     );
@@ -593,38 +743,114 @@ fn wrapped<S: AsRef<str>>(lines: &[S], width: usize) -> Vec<String> {
         .flat_map(|line| transcript::wrap(line.as_ref(), width))
         .collect()
 }
-fn approval(frame: &mut Frame, area: Rect, id: u64, detail: &str, scroll: &mut u16, count: usize) {
+/// The approval's lead: what it would do, its command (3 lines at most), its files (5 at most),
+/// where, and what allowing grants.
+pub(crate) fn summary_lines(summary: &octet_core::ApprovalSummary) -> Vec<String> {
+    let mut lines = vec![summary.action.clone()];
+    if let Some(command) = &summary.command {
+        let all: Vec<&str> = command.lines().collect();
+        for (n, line) in all.iter().take(3).enumerate() {
+            lines.push(format!("{} {line}", if n == 0 { "$" } else { " " }));
+        }
+        if all.len() > 3 {
+            lines.push("  …".into());
+        }
+    }
+    lines.extend(summary.files.iter().take(5).cloned());
+    if summary.files.len() > 5 {
+        lines.push(format!("+{} more", summary.files.len() - 5));
+    }
+    if let Some(cwd) = &summary.cwd {
+        lines.push(format!("in {cwd}"));
+    }
+    lines.push(format!("Allows: {}", summary.scope));
+    lines
+}
+/// `rows` within `room`: the head, one `…` for the cut middle and the last `tail` rows; a tight room drops the
+/// mark, then the head, then the tail's own first rows, so the last row always stays.
+fn fit_lead(rows: Vec<String>, room: usize, tail: usize) -> Vec<String> {
+    if rows.len() <= room {
+        return rows;
+    }
+    let tail = tail.min(room);
+    let free = room - tail;
+    let head = if free > 1 { free - 1 } else { free };
+    let mut fitted: Vec<String> = rows[..head].to_vec();
+    if free > 1 {
+        fitted.push("…".into());
+    }
+    fitted.extend_from_slice(&rows[rows.len() - tail..]);
+    fitted
+}
+/// The fewest rows the approval's full request keeps: its borders and one line.
+const REQUEST_ROWS: u16 = 3;
+fn approval(
+    frame: &mut Frame,
+    area: Rect,
+    asked: &crate::app::Asked,
+    scroll: &mut u16,
+    count: usize,
+) {
     let area = modal(area, 86, 24);
     frame.render_widget(Clear, area);
-    let parts = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(2),
-        Constraint::Length(3),
+    frame.render_widget(Block::default().style(Style::default().bg(PANEL)), area);
+    let width = usize::from(area.width.saturating_sub(2));
+    let lines = summary_lines(&asked.summary);
+    // The folder (when there is one) and the grant are the rows that must stay.
+    let kept = wrapped(
+        &lines[lines.len() - 1 - usize::from(asked.summary.cwd.is_some())..],
+        width,
+    )
+    .len();
+    // The heading, the keys and the smallest request box (a border and one line) keep their
+    // rows, so the full request can always be scrolled to before it is allowed.
+    let lead = fit_lead(
+        wrapped(&lines, width),
+        usize::from(area.height.saturating_sub(3 + REQUEST_ROWS)),
+        kept,
+    );
+    // The keys keep their rows; the lead comes next; the full request takes what is left.
+    let [heading, lead_area, request, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(cells(lead.len())),
+        Constraint::Min(0),
+        Constraint::Length(2),
     ])
-    .split(area);
-    let heading = format!(
-        "Permission required  #{id}   ·   {count} pending\nReview the requested action before allowing it."
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            " Permission required · #{} · {count} pending",
+            asked.id
+        ))
+        .style(Style::default().fg(AMBER).bg(PANEL).bold()),
+        heading,
     );
     frame.render_widget(
-        Paragraph::new(heading).style(Style::default().fg(AMBER).bg(PANEL)),
-        parts[0],
+        Paragraph::new(
+            lead.iter()
+                .map(|l| Line::from(format!(" {l}")))
+                .collect::<Vec<_>>(),
+        )
+        .style(Style::default().fg(FG).bg(PANEL)),
+        lead_area,
     );
-    // Wrapped here so the scroll can stop at the last row.
-    let inner = usize::from(parts[1].width.saturating_sub(2));
-    let rows = wrapped(&detail.lines().collect::<Vec<_>>(), inner);
-    let visible = parts[1].height.saturating_sub(2);
+    let inner = usize::from(request.width.saturating_sub(2));
+    let rows = wrapped(&asked.detail.lines().collect::<Vec<_>>(), inner);
+    let visible = request.height.saturating_sub(2);
     *scroll = (*scroll).min(cells(rows.len()).saturating_sub(visible));
-    frame.render_widget(
-        Paragraph::new(rows.join("\n"))
-            .scroll((*scroll, 0))
-            .block(card(" Request details · PgUp/PgDn "))
-            .style(Style::default().bg(PANEL).fg(FG)),
-        parts[1],
-    );
+    if request.height >= REQUEST_ROWS {
+        frame.render_widget(
+            Paragraph::new(rows.join("\n"))
+                .scroll((*scroll, 0))
+                .block(card(" Full request · PgUp/PgDn "))
+                .style(Style::default().bg(PANEL).fg(MUTED)),
+            request,
+        );
+    }
     frame.render_widget(
         Paragraph::new("\n A  Allow once     D / Esc  Deny     Ctrl+C  Cancel turn")
             .style(Style::default().fg(AMBER).bg(PANEL)),
-        parts[2],
+        keys,
     );
 }
 

@@ -324,6 +324,7 @@ code until then.
 | Change the permission mode | `/mode auto` (Shift+Tab if your app sends it) |
 | Help | `/help` (F1 isn't on phone keyboards) |
 | Scroll | PgUp/PgDn from the key bar |
+| Show tool details | **Ctrl+O** (a failed tool call opens by itself) |
 | Leave Octet running | Close the app, or press **Ctrl+B** then **D** to detach |
 | Quit Octet | **Ctrl+C** twice; this ends the agent's session |
 

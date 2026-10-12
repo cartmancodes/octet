@@ -26,7 +26,7 @@ const MAX_ENTRIES: usize = 160;
 /// Models listed per `/model` page.
 pub(crate) const CATALOG_PAGE: usize = 20;
 /// The farthest the conversation scrolls back, in rows.
-const MAX_SCROLL: usize = 65_536;
+pub(crate) const MAX_SCROLL: usize = 65_536;
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Role {
     User,
@@ -48,6 +48,14 @@ pub(crate) struct Entry {
     pub(crate) cache: Vec<Line<'static>>,
     /// Where appended text starts re-wrapping.
     pub(crate) tail: crate::view::transcript::Tail,
+    /// The calls of a tools entry, in order.
+    pub(crate) tools: Vec<octet_core::ToolCall>,
+    /// Its calls are drawn in full.
+    pub(crate) expanded: bool,
+    /// Its turn ended: calls still running were stopped.
+    pub(crate) turn_over: bool,
+    /// Its place in the conversation, newest highest.
+    pub(crate) seq: u64,
 }
 impl Entry {
     pub(crate) fn new(role: Role, engine: octet_core::Engine, text: String) -> Self {
@@ -58,7 +66,45 @@ impl Entry {
             width: None,
             cache: Vec::new(),
             tail: crate::view::transcript::Tail::default(),
+            tools: Vec::new(),
+            expanded: false,
+            turn_over: false,
+            seq: 0,
         }
+    }
+    /// An empty tools entry, drawn in full when `expanded`.
+    pub(crate) fn tools(engine: octet_core::Engine, expanded: bool) -> Self {
+        Self {
+            expanded,
+            ..Self::new(Role::Tool, engine, String::new())
+        }
+    }
+    /// Bytes it holds, for the transcript's limit.
+    pub(crate) fn size(&self) -> usize {
+        self.text.len()
+            + self
+                .tools
+                .iter()
+                .map(|c| c.name.len() + c.target.len() + c.detail.len())
+                .sum::<usize>()
+    }
+    /// A call's start or end: an end replaces the call with its ID (keeping the start's target
+    /// when it has none); anything else is added. Its rows are drawn again.
+    pub(crate) fn record(&mut self, mut call: octet_core::ToolCall) {
+        let same = self
+            .tools
+            .iter_mut()
+            .find(|c| !call.id.is_empty() && c.id == call.id);
+        match same {
+            Some(existing) => {
+                if call.target.is_empty() {
+                    call.target = std::mem::take(&mut existing.target);
+                }
+                *existing = call;
+            }
+            None => self.tools.push(call),
+        }
+        self.invalidate();
     }
     /// Its text changed other than at the end: wrap it whole next time.
     pub(crate) fn invalidate(&mut self) {
@@ -171,6 +217,18 @@ impl Connection {
     }
 }
 
+/// Where the reader's view ends, so the rows below it can be counted again each frame.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Anchor {
+    /// The entry holding the view's bottom row.
+    pub(crate) seq: u64,
+    /// The width its rows were counted at.
+    pub(crate) width: u16,
+    /// Its rows at or above the view's bottom edge; the rest, and every newer entry, are below.
+    pub(crate) above: usize,
+    /// The scroll it last gave: any other scroll means the reader moved.
+    pub(crate) scroll: usize,
+}
 /// The conversation: entries, scroll and the copyable reply.
 pub(crate) struct Transcript {
     pub(crate) entries: VecDeque<Entry>,
@@ -185,6 +243,14 @@ pub(crate) struct Transcript {
     pub(crate) reply_break: bool,
     /// A new turn started; the last reply stays copyable until its first text.
     pub(crate) reply_stale: bool,
+    /// Tool calls are drawn in full (Ctrl+O).
+    pub(crate) tools_expanded: bool,
+    /// The sequence number the next entry takes.
+    pub(crate) next_seq: u64,
+    /// Where the scrolled-up reader is, so rows added below do not move the view.
+    pub(crate) anchor: Option<Anchor>,
+    /// Output arrived below the scrolled-up view.
+    pub(crate) unseen: bool,
 }
 /// A prompt as history keeps it: its text and the images sent with it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -217,10 +283,19 @@ pub(crate) struct Composer {
     pub(crate) listing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Prompts sent while a turn ran, sent in order as turns finish.
     pub(crate) queue: VecDeque<crate::vendor::Prompt>,
+    /// The skill picked in `/skills`, with its provider, while the draft still starts with its
+    /// `/name`: sending runs that provider's, even when the other lists the same name.
+    pub(crate) chosen_skill: Option<(octet_core::Engine, octet_core::SkillInfo)>,
+}
+/// An approval waiting for the user.
+pub(crate) struct Asked {
+    pub(crate) id: u64,
+    pub(crate) detail: String,
+    pub(crate) summary: octet_core::ApprovalSummary,
 }
 /// Dialogs over the screen: help, the palette and approvals.
 pub(crate) struct Overlays {
-    pub(crate) approvals: VecDeque<(u64, String)>,
+    pub(crate) approvals: VecDeque<Asked>,
     pub(crate) approval_scroll: u16,
     /// When the front approval was last drawn after being hidden (it
     /// arrived, or help, the palette or the editor covered it); `None` while
@@ -231,6 +306,8 @@ pub(crate) struct Overlays {
     /// Lines scrolled past at the top of the help screen.
     pub(crate) help_scroll: u16,
     pub(crate) palette: bool,
+    /// What the palette is filtered by.
+    pub(crate) palette_query: String,
     pub(crate) selection: usize,
 }
 /// How long answer keys wait after an approval is shown.
@@ -286,6 +363,10 @@ pub(crate) struct App {
     /// Another provider's skill, picked in `/skills`: it runs once the
     /// switch to that provider is ready.
     pub(crate) pending_skill: Option<SkillRun>,
+    /// Whether the Task sidebar shows on wide terminals; F2 flips it.
+    pub(crate) sidebar: bool,
+    /// The terminal's width at the last frame, for F2 to say when the sidebar can show.
+    pub(crate) last_width: u16,
 }
 /// A skill to run on a provider the interface is switching to.
 #[derive(Debug, Clone)]
@@ -308,6 +389,10 @@ impl App {
                 reply_sanitizer: Sanitizer::keeping_tabs(),
                 reply_break: false,
                 reply_stale: false,
+                tools_expanded: false,
+                next_seq: 0,
+                anchor: None,
+                unseen: false,
             },
             composer: Composer {
                 editor: Editor::default(),
@@ -322,6 +407,7 @@ impl App {
                 completion: None,
                 files: crate::files::Files::Unbuilt,
                 queue: VecDeque::new(),
+                chosen_skill: None,
             },
             overlay: Overlays {
                 approvals: VecDeque::new(),
@@ -330,6 +416,7 @@ impl App {
                 help: false,
                 help_scroll: 0,
                 palette: false,
+                palette_query: String::new(),
                 selection: 0,
             },
             monochrome: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
@@ -342,6 +429,8 @@ impl App {
             models: crate::models::Models::default(),
             pending_handoff: None,
             pending_skill: None,
+            sidebar: true,
+            last_width: 0,
         }
     }
     pub(crate) fn connection(&mut self, config: &octet_core::Config, journal: PathBuf) {
@@ -357,9 +446,22 @@ impl App {
             ..Connection::new(config, journal)
         };
         self.chat.catalog_focus = None;
+        self.calls_over();
         self.overlay.approvals.clear();
         self.overlay.approval_scroll = 0;
         self.goals.reset_turn();
+    }
+    /// The turn ended, finished or not: its calls still running were stopped.
+    fn calls_over(&mut self) {
+        for entry in self
+            .chat
+            .entries
+            .iter_mut()
+            .filter(|e| e.role == Role::Tool && !e.turn_over)
+        {
+            entry.turn_over = true;
+            entry.invalidate();
+        }
     }
     /// Another provider takes over: renders the conversation so far to go
     /// with the next prompt. Whether there was anything to carry.
@@ -608,15 +710,100 @@ impl App {
             text = format!("[Earlier output is in the journal]\n{}", &text[start..]);
         }
         self.chat.bytes += text.len();
+        let mut entry = Entry::new(role, self.conn.engine, text);
+        self.chat.next_seq += 1;
+        entry.seq = self.chat.next_seq;
+        self.chat.entries.push_back(entry);
+        self.trim();
+    }
+    /// An end goes to the current turn's call with its ID, wherever other entries put it; any other
+    /// call joins the newest entry when that is an open tools entry under `BLOCK_BYTES`, else
+    /// starts one.
+    fn tool(&mut self, mut call: octet_core::ToolCall) {
+        call.name = clean(&call.name);
+        call.target = clean(&call.target);
+        call.detail = clean(&call.detail);
+        if call.detail.len() > BLOCK_BYTES {
+            let start = call
+                .detail
+                .ceil_char_boundary(call.detail.len() - BLOCK_BYTES);
+            call.detail = format!(
+                "[Earlier output is in the journal]\n{}",
+                &call.detail[start..]
+            );
+        }
+        let paired = (call.phase != octet_core::ToolPhase::Running && !call.id.is_empty())
+            .then(|| {
+                self.chat.entries.iter().rposition(|e| {
+                    e.role == Role::Tool && !e.turn_over && e.tools.iter().any(|c| c.id == call.id)
+                })
+            })
+            .flatten();
+        let index = if let Some(index) = paired {
+            index
+        } else {
+            if self
+                .chat
+                .entries
+                .back()
+                .is_none_or(|e| e.role != Role::Tool || e.turn_over || e.size() > BLOCK_BYTES)
+            {
+                let mut entry = Entry::tools(self.conn.engine, self.chat.tools_expanded);
+                self.chat.next_seq += 1;
+                entry.seq = self.chat.next_seq;
+                self.chat.entries.push_back(entry);
+            }
+            self.chat.entries.len() - 1
+        };
+        let entry = &mut self.chat.entries[index];
+        let before = entry.size();
+        entry.record(call);
+        self.chat.bytes = self.chat.bytes - before + entry.size();
+        self.trim();
+    }
+    /// The newest call still running, in a turn that has not ended.
+    pub(crate) fn running_tool(&self) -> Option<&octet_core::ToolCall> {
         self.chat
             .entries
-            .push_back(Entry::new(role, self.conn.engine, text));
-        self.trim();
+            .iter()
+            .rev()
+            .filter(|e| e.role == Role::Tool && !e.turn_over)
+            .flat_map(|e| e.tools.iter().rev())
+            .find(|c| c.phase == octet_core::ToolPhase::Running)
+    }
+    /// What is happening now, for the sidebar.
+    pub(crate) fn now_line(&self) -> String {
+        if !self.overlay.approvals.is_empty() {
+            return "Waiting for approval".into();
+        }
+        match self.conn.phase {
+            ConnPhase::Connecting => "Connecting".into(),
+            ConnPhase::Stopped => "Stopped".into(),
+            ConnPhase::Idle => "Idle".into(),
+            ConnPhase::Running { .. } => match self.running_tool() {
+                Some(call) => format!(
+                    "Running {} {}",
+                    crate::view::transcript::label(&call.name),
+                    call.target
+                )
+                .trim_end()
+                .to_owned(),
+                None if self
+                    .chat
+                    .entries
+                    .back()
+                    .is_some_and(|e| e.role == Role::Assistant) =>
+                {
+                    "Writing reply".into()
+                }
+                None => "Thinking".into(),
+            },
+        }
     }
     fn trim(&mut self) {
         while self.chat.bytes > MAX_BYTES || self.chat.entries.len() > MAX_ENTRIES {
             if let Some(old) = self.chat.entries.pop_front() {
-                self.chat.bytes -= old.text.len();
+                self.chat.bytes -= old.size();
             } else {
                 break;
             }
@@ -647,6 +834,26 @@ impl App {
     /// A turn is running or an approval waits: the session is busy.
     pub(crate) fn turn_open(&self) -> bool {
         self.conn.is_running() || !self.overlay.approvals.is_empty()
+    }
+    /// Ctrl+O: every tools entry is drawn in full, or collapsed again.
+    pub(crate) fn toggle_tool_details(&mut self) {
+        let expanded = !self.chat.tools_expanded;
+        self.chat.tools_expanded = expanded;
+        self.chat.anchor = None;
+        for entry in self
+            .chat
+            .entries
+            .iter_mut()
+            .filter(|e| e.role == Role::Tool)
+        {
+            entry.expanded = expanded;
+            entry.invalidate();
+        }
+        self.hint(if expanded {
+            "Tool details shown"
+        } else {
+            "Tool details hidden"
+        });
     }
     /// A refusal or a passing hint, on the status line only.
     pub(crate) fn hint(&mut self, text: impl Into<String>) {
@@ -712,6 +919,8 @@ impl App {
             Event::User(text) => {
                 self.add(Role::User, &text);
                 self.chat.scroll = 0;
+                self.chat.anchor = None;
+                self.chat.unseen = false;
             }
             Event::Started => {
                 self.conn.start_turn();
@@ -744,32 +953,50 @@ impl App {
                     let remove = e.text.ceil_char_boundary(e.text.len() - BLOCK_BYTES);
                     e.text.drain(..remove);
                     self.chat.bytes -= remove;
-                    // Its start moved: the next paint wraps it whole.
+                    // Its start moved: the next paint wraps it whole, and a
+                    // scrolled-up reader re-anchors there without moving.
                     e.invalidate();
+                    self.chat.anchor = None;
                 }
                 self.trim();
             }
-            Event::Tool(text) => {
+            Event::Tool(call) => {
                 self.chat.reply_break = true;
-                self.conn.activity = State::tool(&text);
-                self.add(Role::Tool, &text);
+                self.conn.activity = State::tool(&call);
+                self.tool(call);
             }
-            Event::Approval { id, detail } => {
+            Event::Approval {
+                id,
+                detail,
+                summary,
+            } => {
                 let first = self.overlay.approvals.is_empty();
-                self.overlay.approvals.push_back((id, clean(&detail)));
+                let summary = octet_core::ApprovalSummary {
+                    action: clean(&summary.action),
+                    command: summary.command.as_deref().map(clean),
+                    files: summary.files.iter().map(|f| clean(f)).collect(),
+                    cwd: summary.cwd.as_deref().map(clean),
+                    scope: clean(&summary.scope),
+                };
+                self.overlay.approvals.push_back(Asked {
+                    id,
+                    detail: clean(&detail),
+                    summary,
+                });
                 if first {
                     self.overlay.front_changed();
                 }
             }
             Event::ApprovalClosed(id) => {
-                let front = self.overlay.approvals.front().map(|(key, _)| *key);
-                self.overlay.approvals.retain(|(key, _)| *key != id);
+                let front = self.overlay.approvals.front().map(|asked| asked.id);
+                self.overlay.approvals.retain(|asked| asked.id != id);
                 if front == Some(id) {
                     self.overlay.front_changed();
                 }
             }
             Event::Usage(text) => self.conn.usage = clean(&text),
             Event::Finished { outcome } => {
+                self.calls_over();
                 self.conn.end_turn();
                 self.clear_status(StatusKind::Cancelling);
                 self.conn.status = clean(outcome.as_str());
@@ -820,6 +1047,7 @@ impl App {
             }
             Event::Stopped => {
                 // A cancelled connection stops without finishing a turn.
+                self.calls_over();
                 self.clear_status(StatusKind::Cancelling);
                 if self.conn.activity != State::Error {
                     self.conn.activity = State::Sleeping;
@@ -899,6 +1127,8 @@ impl App {
     pub(crate) fn follow_latest(&mut self) {
         self.chat.scroll = 0;
         self.chat.catalog_focus = None;
+        self.chat.anchor = None;
+        self.chat.unseen = false;
     }
     /// Scrolls the conversation by `rows`, up when positive.
     pub(crate) fn scroll_by(&mut self, rows: isize) {

@@ -92,8 +92,12 @@ line) and the journal records why.
 ## Interaction
 
 The warm charcoal background, muted crimson accents and amber approval state adapt
-to narrow terminals; a workspace/session panel appears at 112 columns. NO_COLOR
-is respected. The minimum usable size is 38 columns by 12 rows.
+to narrow terminals; a Task sidebar (goal, what the agent is doing now, the
+queue) appears from 112 columns, and F2 hides it. Engine, model and session are
+in the header and `/session`. Under 30 rows the layout turns compact: a one-row
+header (`◆ Octet · mode · engine / model  workspace   ● status · usage`), no
+vertical margin, and a standing hint, ` F1 help · Ctrl+C ×2 quit`. NO_COLOR is
+respected. The minimum usable size is 38 columns by 12 rows.
 
 | Key | Action |
 | --- | --- |
@@ -104,11 +108,13 @@ is respected. The minimum usable size is 38 columns by 12 rows.
 | Ctrl+U | Clear draft |
 | PageUp/PageDown | Scroll the conversation or approval details |
 | Ctrl+End | Follow the latest output |
+| Ctrl+O | Show or hide every tool call's detail |
+| F2 | Show or hide the Task sidebar (from 112 columns) |
 | Esc / Ctrl+C | Cancel the active operation. Ctrl+C also closes help or the palette, and clears a draft when idle |
-| Ctrl+P | Command palette (also offers Ctrl+G, `@` and `!`) |
+| Ctrl+P | Command palette: type to filter it, Backspace edits, Up/Down choose, Enter runs (also offers Ctrl+G, `@`, `!` and Ctrl+O) |
 | `@` | Mention a workspace file; a popup suggests paths as you type (Enter or Tab inserts, Esc closes) |
 | `/model` | Model picker: Up/Down choose, Enter switches, Tab inserts the name, Esc closes |
-| `/skills` | Skills picker: Up/Down choose, Enter runs, Tab inserts `/name `, Esc closes |
+| `/skills` | Skills picker: Up/Down choose, Enter or Tab puts `/name ` in the prompt (nothing runs until you send it), Esc closes |
 | Tab | Complete a path, or a `/command` at the start of the prompt |
 | Ctrl+G | Write the prompt in `$VISUAL` or `$EDITOR` (default `vi`), run by the shell as git runs it: quote a path with spaces |
 | Ctrl+X | Copy the last reply to the clipboard (same as `/copy`) |
@@ -116,7 +122,7 @@ is respected. The minimum usable size is 38 columns by 12 rows.
 | F1 | Help |
 | Ctrl+C twice | Quit, as in Claude Code: on an idle, empty prompt the first press shows "Press Ctrl+C again to quit", and a second within 1.5 seconds stops vendor children, finishes journal writes and exits |
 | Ctrl+Z | Restore terminal and suspend; use the shell's `fg` to return |
-| A / D / Esc in an approval | Allow once / deny / deny, from 0.4 s after the dialog appears |
+| A / D / Esc in an approval | Allow once / deny / deny, from 0.4 s after the dialog appears (PgUp/PgDn read the full request) |
 
 Bracketed paste preserves newlines and tabs without submitting them (a tab
 shows as spaces to the next stop of four, and is sent as a tab). A rejected
@@ -135,12 +141,22 @@ When an approval starts waiting, Octet rings the terminal bell once and sends a 
 notification (OSC 9). The bell passes through tmux and mosh to a phone app;
 the notification reaches only a desktop terminal connected directly.
 
-The prompt box grows with the draft: 4 rows when empty, up to 7 for a draft of
-four or more lines, leaving the rest of the screen to the conversation.
+The prompt box, titled ` Prompt ` (` Next prompt ` while a turn runs), grows
+with the draft: 4 rows when empty, up to 7 for a draft of four or more lines
+(one more while the chips row shows), leaving the rest of the screen to the
+conversation. One hint row sits under the draft: `Enter send · Alt+Enter newline · ↑ history · Ctrl+P commands`
+when idle, and `Enter queue · Esc cancel turn · Ctrl+P commands` while a turn
+runs; under 80 columns, `Enter send · Ctrl+J newline` (a phone rarely sends
+Alt+Enter) and `Enter queue · Esc cancel turn`.
+When the draft names only another provider's skill, the hint turns amber:
+`Enter switches to {provider}, then runs /name`, or during a turn
+`Finish the turn to switch to {provider}`. Above the hint a chips row
+lists what will go with the next prompt: `+ ls (exit 0) · + image x.png ·
+2 queued`.
 
 A prompt starting with `!` runs the rest as a shell command in the workspace:
 `!git status` shows the output in the conversation as a `SHELL` entry and
-attaches it to your next prompt (the prompt box title shows
+attaches it to your next prompt (the chips row shows
 `+ git status (exit 0)`); `!!git status` shows it without attaching. The
 vendor receives the output as a fenced block after your text; the
 conversation and the journal show `[+ git status]`. Commands run with your
@@ -178,7 +194,9 @@ phone apps vary in whether they accept it.
 Commands: `/help`, `/model`, `/skills`, `/mode`, `/goal`, `/session`, `/new`, `/reconnect`, `/export [new-path]`, `/copy`,
 `/remote-control`, `/queue`, `/steer`, `/effort`, `/fork`, `/compact`, `/image`, `/sessions`, `/resume`,
 `/quit` (or `/exit`).
-Help (F1) and the command palette (Ctrl+P) scroll when the screen is short.
+Help (F1) and the command palette (Ctrl+P) scroll when the screen is short;
+in the palette, typing filters the list (by name or summary) and Backspace
+edits the filter.
 `/remote-control` checks, without changing anything, whether this session can be
 reached from a phone over tmux, Tailscale SSH and mosh, and prints the phone
 command. Setup steps: [Use Octet from your phone](remote-control.md).
@@ -205,7 +223,8 @@ prompt may start with a path such as `/usr/lib`; it is sent, not treated as a co
 ## During and between turns
 
 **The follow-up queue.** While a turn runs, Enter queues the draft instead of
-sending it; the prompt box title shows `+N queued`. When the turn finishes,
+sending it; the chips row shows `N queued` and the Task sidebar lists the
+prompts under QUEUED. When the turn finishes,
 the next queued prompt goes, with the `!` output and images attached when it
 was queued. The queue holds 8 prompts. Esc or Ctrl+C cancels the turn and
 drops the queue ("Dropped N queued prompts"), even a prompt sent the moment
@@ -242,7 +261,7 @@ forks again, so the original is never written to.
 output streams as usual and Esc cancels it.
 
 **Images.** `/image PATH` attaches an image to the next prompt; the prompt
-box title shows `+ image name.png` (or `+N images`). PNG, JPEG, GIF and WebP
+box's chips row shows `+ image name.png` (or `+N images`). PNG, JPEG, GIF and WebP
 are accepted, by extension, up to 5 MiB each and 4 per prompt. A relative
 path is in the workspace, `~/` is your home folder, and a path dragged in
 from Finder (quoted, or with `\ ` escapes) works as typed. Codex receives
@@ -255,6 +274,25 @@ the images it was sent with (unless the prompt you are writing has images of
 its own, which stay attached); a failed `/image` leaves the line in the prompt
 box to correct. The transcript and journal show `[+ image name.png]`,
 never the image. Esc on an empty prompt drops attached images and `!` output.
+
+**Tool activity.** A run of tool calls is one transcript entry, not a line
+per call. Collapsed, it reads `▸ Read 3 files · Ran 1 command   Ctrl+O
+details`; while a call runs it shows `… Bash cargo test`. A failed call opens
+in amber: `✗ Bash …` with the last 8 lines of its output and `+N more lines ·
+Ctrl+O` when there are more. A call still running when its turn ends (cancelled
+or otherwise) is marked `· stopped`. Ctrl+O shows or hides the detail of every call at once.
+
+**Approvals.** The dialog leads with what is being asked: the action (for
+example `Edit 2 files`), the command as `$ command`, the files (five at most,
+then `+N more`), `in {cwd}`, and `Allows: This request only, once`. Below
+that, under the heading "Full request · PgUp/PgDn", is the complete request as
+the vendor sent it, then the keys row. Headless, the denial warning names the
+action and the command's first line.
+
+**Scrollback.** Scrolling up with PageUp/PageDown stops following: the text
+stays where you put it, and when new rows arrive below, the conversation's
+bottom border says "New output below · Ctrl+End follows". Ctrl+End returns to the
+latest output.
 
 ## Permission modes
 
@@ -438,7 +476,7 @@ bring, and runs them.
 ### Skills
 
 ```text
-/skills                Pick a skill from any provider: Enter runs it
+/skills                Pick a skill from any provider: Enter puts it in the prompt
 /skills FILTER         The picker, filtered by name, alias or description
 /NAME [ARGS]           Run the current provider's skill NAME (or alias)
 ```
@@ -453,14 +491,23 @@ bring, and runs them.
   reported them), then each other provider's, cached per workspace in
   `skills.json` beside `models.json` and fetched with the model lists (also
   when a workspace has none yet, or they are a day old).
-- Enter on another provider's skill switches to that provider (its default
-  model, the conversation carried as for any switch), then runs the skill
-  as the first turn. If the switch fails, the skill is not run and a note
-  says so.
-- Typing `/NAME args` runs a skill the current provider lists. Octet's own
-  commands win a clash (`/model` is always Octet's; pick such a skill from
-  `/skills`). Another provider's skill typed by name gets a hint to use
-  `/skills`, and an unknown name the usual error.
+- Enter (or Tab) on a skill puts `/name ` in the prompt, and nothing runs
+  until you send it; add arguments first if it takes any. Sending another
+  provider's skill switches to that provider (its default model, the
+  conversation carried as for any switch), then runs the skill as the first
+  turn, with its arguments. While the draft names only another provider's
+  skill, the hint row turns amber: `Enter switches to {provider}, then runs
+  /name`. If the switch fails, the skill is not run and a note says so.
+  When both providers list the same name, the one you picked is the one that
+  runs, for as long as the draft still starts with its `/name`; typed by
+  hand (or recalled from history), the current provider's runs.
+- Typing `/NAME args` runs a skill the current provider lists; typing
+  another provider's skill switches to it on send, as a picked one does
+  (during a turn the hint says `Finish the turn to switch to {provider}`
+  and Enter refuses). An unknown name gets the usual error.
+- Octet's own commands win a clash: `/model` is always Octet's. A skill
+  named like an Octet command cannot run from Octet; picking one in
+  `/skills` leaves the prompt as it was and the status line says so.
 - A skill runs as a turn: it queues behind a running one and can be
   interrupted. Claude receives `/NAME args` as the prompt; Codex a skill
   input naming its `SKILL.md`. The transcript and journal show `/NAME args`.
@@ -497,6 +544,13 @@ view. The list comes from Octet's own journals (at most the first 64 KiB of
 each, skipping a torn last line); reconnects of one session show as one entry.
 Reconnection does not load the earlier local transcript into the viewport yet.
 `/new` starts fresh vendor context without deleting previous journals.
+
+Tool activity is journaled as `tool` records, `{id, name, target, phase,
+detail}`, with `phase` one of `running`, `done` or `failed`, so a call's start
+and end share an `id`. An `approval` record carries `id`, `detail` and a
+`summary`, `{action, command, files, cwd, scope}`, the same facts the dialog
+leads with. Claude ends a call when its tool result arrives, so a failure
+shows as soon as the vendor reports it.
 
 Preview journals are separate append-only JSONL files under
 `$XDG_DATA_HOME/octet/rust-preview`, or `~/.local/share/octet/rust-preview`
@@ -539,7 +593,8 @@ Implemented: real multi-turn conversations, streamed responses, tool events,
 per-request command/file approval with a configurable window and an alert,
 four permission modes with live switching, cancellation, vendor context resume,
 model selection and in-session switching, multiline editing, history,
-scrollback, new sessions, journal export, terminal restoration, persistent
+scrollback that stays put, grouped tool activity with Ctrl+O details, a Task
+sidebar, new sessions, journal export, terminal restoration, persistent
 goals, phone-access checks (`/remote-control`), `@` file mentions, Tab
 completion, `!` shell commands with attachments, an external editor (Ctrl+G),
 `/copy`, a follow-up queue, steering, reasoning effort, fork, compaction,
@@ -616,6 +671,9 @@ three lines:
 - the permission mode, then the engine and model. The mode leads its line so
   a long model name cannot push it off a narrow screen;
 - the activity name, then the workspace path.
+
+Under 30 rows the banner gives way to a one-row header with the same facts:
+`◆ Octet · mode · engine / model  workspace   ● status · usage`.
 
 Status and usage stay at the right edge, sized to their text so a narrow
 terminal never cuts them. Below the banner, the conversation

@@ -193,7 +193,9 @@ async fn full_access_requires_idle_ready_session() {
         Action::Continue
     ));
     crate::test_support::idle(&mut app);
-    app.overlay.approvals.push_back((1, "x".into()));
+    app.overlay
+        .approvals
+        .push_back(crate::test_support::asked(1, "x"));
     assert!(matches!(
         command(&mut app, "/mode full-access").await,
         Action::Continue
@@ -341,7 +343,10 @@ async fn image_attaches_and_shows_in_the_title() {
     app.composer.root = dir.path().to_path_buf();
     command(&mut app, "/image shot.png").await;
     assert_eq!(app.composer.images.len(), 1);
-    assert!(crate::view::composer_title(&app).contains("+ image shot.png"));
+    assert_eq!(
+        crate::view::chips(&app).as_deref(),
+        Some("+ image shot.png")
+    );
     let vendor = RecordingVendor::default();
     app.conn.start_turn();
     assert!(app.composer.editor.insert("look"));
@@ -387,7 +392,7 @@ async fn oversized_or_unknown_images_are_refused() {
         app.entries_text()
             .contains("A prompt takes at most 4 images")
     );
-    assert!(crate::view::composer_title(&app).contains("+4 images"));
+    assert_eq!(crate::view::chips(&app).as_deref(), Some("+4 images"));
     // Esc on an empty prompt drops them.
     let vendor = RecordingVendor::default();
     key_action(&mut app, &vendor, key(KeyCode::Esc)).await;
@@ -491,7 +496,10 @@ async fn up_recalls_a_prompt_with_its_images() {
     app.recall(true);
     assert_eq!(app.composer.editor.text(), "look");
     assert_eq!(app.composer.images.len(), 1);
-    assert!(crate::view::composer_title(&app).contains("+ image shot.png"));
+    assert_eq!(
+        crate::view::chips(&app).as_deref(),
+        Some("+ image shot.png · 1 queued")
+    );
     // Back down: the empty draft, without the recalled images.
     app.recall(false);
     assert!(app.composer.editor.text().is_empty());
@@ -524,7 +532,9 @@ async fn every_command_needing_no_open_turn_refuses_the_same_way() {
             if open == "running" {
                 app.conn.start_turn();
             } else {
-                app.overlay.approvals.push_back((1, "x".into()));
+                app.overlay
+                    .approvals
+                    .push_back(crate::test_support::asked(1, "x"));
             }
             let vendor = RecordingVendor::default();
             let action = commands::command(&mut app, &vendor, &format!("{} 1", spec.name)).await;
@@ -679,10 +689,7 @@ async fn reconnecting_commands_share_one_guard() {
     for line in ["/model other", "/effort high", "/mode full-access"] {
         let mut busy = app();
         busy.conn.engine = Engine::CLAUDE;
-        busy.event(octet_core::Event::Approval {
-            id: 1,
-            detail: "x".into(),
-        });
+        busy.event(crate::test_support::approval(1, "x"));
         command(&mut busy, line).await;
         assert_eq!(busy.status_line, TURN_OPEN, "{line}");
         let mut connecting = app();
@@ -826,7 +833,7 @@ async fn an_alias_runs_its_skill_and_octet_commands_win() {
     assert_eq!(vendor.sent.borrow().len(), before);
 }
 #[tokio::test]
-async fn another_providers_skill_typed_gives_the_hint() {
+async fn another_providers_skill_typed_switches() {
     let mut app = app(); // Codex
     let ws = app.workspace().to_path_buf();
     app.models.skill_catalogs.set(
@@ -835,15 +842,33 @@ async fn another_providers_skill_typed_gives_the_hint() {
         vec![skill("brainstorming", &[], None)],
         std::time::SystemTime::now(),
     );
+    let action = commands::try_command(
+        &mut app,
+        &RecordingVendor::default(),
+        "/brainstorming the cache",
+    )
+    .await;
+    assert!(matches!(action, Some(Action::Exit(Exit::Model(s))) if s.provider == Engine::CLAUDE));
+    let run = app.pending_skill.as_ref().expect("waits for the switch");
+    assert_eq!(run.args, "the cache");
+}
+#[tokio::test]
+async fn another_providers_skill_typed_during_a_turn_is_refused() {
+    let mut app = app(); // Codex
+    crate::test_support::idle(&mut app);
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        Engine::CLAUDE,
+        &ws,
+        vec![skill("brainstorming", &[], None)],
+        std::time::SystemTime::now(),
+    );
+    app.event(octet_core::Event::Started);
     let action =
         commands::try_command(&mut app, &RecordingVendor::default(), "/brainstorming").await;
     assert!(action.is_none(), "the draft stays");
-    assert!(
-        app.entries_text()
-            .contains("/brainstorming is a claude skill; /skills runs it there"),
-        "{}",
-        app.entries_text()
-    );
+    assert!(app.pending_skill.is_none());
+    assert_eq!(app.status_line, crate::registry::TURN_OPEN);
 }
 #[tokio::test]
 async fn an_unknown_name_still_gets_the_helpful_error() {

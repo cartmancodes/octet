@@ -135,10 +135,7 @@ async fn demo_session(name: &str) -> (octet_testkit::TempDir, Session) {
 #[test]
 fn only_the_first_waiting_approval_rings() {
     let mut app = app();
-    let approval = |id| octet_core::Event::Approval {
-        id,
-        detail: "run tests".into(),
-    };
+    let approval = |id| crate::test_support::approval(id, "run tests");
     assert!(should_alert(&app, &approval(1)));
     app.event(approval(1));
     assert!(!should_alert(&app, &approval(2)), "one is already waiting");

@@ -1,8 +1,10 @@
 //! Codex app-server JSON-RPC protocol: session setup, the model catalog,
 //! server requests and turn notifications.
 use super::{
-    BoxFuture, Channels, Config, DriverError, EVENT_BYTES, Event, ImageAttachment, Limits, Mode,
-    ModelInfo, Outcome, Provider, SkillInfo, limited, model_catalog_with,
+    ApprovalSummary, BoxFuture, Channels, Config, DriverError, EVENT_BYTES, Event, ImageAttachment,
+    Limits, Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
+    activity::one_line,
+    limited, model_catalog_with,
     protocol::{Core, Phase, Protocol},
     push_bounded, short, valid_identifier,
 };
@@ -72,6 +74,8 @@ pub(super) struct CodexProtocol {
     catalog_cursors: HashSet<String>,
     /// Steering sent before Codex named the turn; sent once it does.
     pending_steer: VecDeque<String>,
+    /// Each `fileChange` item's paths from its start, for its approval; cleared as the turn ends.
+    file_changes: HashMap<String, Vec<String>>,
 }
 
 impl Protocol for CodexProtocol {
@@ -255,12 +259,12 @@ impl Protocol for CodexProtocol {
                         }
                     }
                     "commandExecution" | "fileChange" | "mcpToolCall" => {
-                        let phase = if method == "item/started" {
-                            "running"
-                        } else {
-                            "finished"
-                        };
-                        core.emit(Event::Tool(codex_tool_detail(item, phase)))?;
+                        let started = method == "item/started";
+                        if started && item["type"] == "fileChange" && self.file_changes.len() < 64 {
+                            let id = one_line(item["id"].as_str().unwrap_or_default());
+                            self.file_changes.insert(id, change_paths(item));
+                        }
+                        core.emit(Event::Tool(codex_tool_call(item, started)))?;
                     }
                     _ => {}
                 }
@@ -270,6 +274,7 @@ impl Protocol for CodexProtocol {
                 if self.turn.is_none() || completed != self.turn.as_deref() {
                     return Ok(());
                 }
+                self.file_changes.clear();
                 let status = v
                     .pointer("/params/turn/status")
                     .and_then(Value::as_str)
@@ -528,7 +533,13 @@ impl CodexProtocol {
             && v.pointer("/params/turnId").and_then(Value::as_str) == self.turn.as_deref();
         if approval && core.phase == Phase::InTurn && this_turn {
             let detail = serde_json::to_string_pretty(&v["params"]).unwrap_or_default();
-            return core.queue_approval(v, detail).await;
+            let item = v
+                .pointer("/params/itemId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let files = self.file_changes.get(item).map_or(&[][..], Vec::as_slice);
+            let summary = codex_approval_summary(method, &v["params"], files);
+            return core.queue_approval(v, detail, summary).await;
         }
         if let Some(reply) = stray(&v) {
             let notice = format!("Request declined: {}", short(method));
@@ -628,6 +639,62 @@ pub(super) fn codex_tool_detail(item: &Value, phase: &str) -> String {
         }
     }
     limited(&text)
+}
+/// A Codex tool item as a call: running when `started`, else done or failed by its status
+/// and exit code.
+pub(super) fn codex_tool_call(item: &Value, started: bool) -> ToolCall {
+    let kind = item["type"].as_str().unwrap_or("tool");
+    let failed = matches!(item["status"].as_str(), Some("failed" | "declined"))
+        || item["exitCode"].as_i64().is_some_and(|code| code != 0);
+    let phase = match (started, failed) {
+        (true, _) => ToolPhase::Running,
+        (false, true) => ToolPhase::Failed,
+        (false, false) => ToolPhase::Done,
+    };
+    let target = match kind {
+        "commandExecution" => item["command"].as_str(),
+        "fileChange" => item.pointer("/changes/0/path").and_then(Value::as_str),
+        "mcpToolCall" => item["tool"].as_str(),
+        _ => None,
+    };
+    ToolCall {
+        id: one_line(item["id"].as_str().unwrap_or_default()),
+        name: one_line(kind),
+        target: target.map(one_line).unwrap_or_default(),
+        phase,
+        detail: codex_tool_detail(item, if started { "running" } else { "finished" }),
+    }
+}
+/// The paths a `fileChange` item would change.
+fn change_paths(item: &Value) -> Vec<String> {
+    item["changes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|change| change["path"].as_str())
+        .map(str::to_owned)
+        .collect()
+}
+/// What a Codex approval request would do. A file-change request names only its item, so its
+/// `files` come from that item's start.
+pub(super) fn codex_approval_summary(
+    method: &str,
+    params: &Value,
+    files: &[String],
+) -> ApprovalSummary {
+    if method == "item/fileChange/requestApproval" {
+        let mut summary = ApprovalSummary::new(match files.len() {
+            0 => "Change files".to_owned(),
+            1 => "Edit 1 file".to_owned(),
+            n => format!("Edit {n} files"),
+        });
+        summary.files = files.to_vec();
+        return summary;
+    }
+    let mut summary = ApprovalSummary::new("Run a shell command");
+    summary.command = params["command"].as_str().map(str::to_owned);
+    summary.cwd = params["cwd"].as_str().map(str::to_owned);
+    summary
 }
 /// The reply to a Codex request Octet will not put in front of the user:
 /// approvals outside a turn are declined, anything else is unsupported.
@@ -844,6 +911,65 @@ mod tests {
         assert_eq!(
             error_text(&Value::Null),
             "The vendor reported an error without details"
+        );
+    }
+    #[test]
+    fn an_item_is_a_call_that_fails_on_status_or_exit() {
+        let started = json!({"id":"c1","type":"commandExecution","command":"cargo test","status":"inProgress"});
+        let call = codex_tool_call(&started, true);
+        assert_eq!(
+            (
+                call.id.as_str(),
+                call.name.as_str(),
+                call.target.as_str(),
+                call.phase
+            ),
+            ("c1", "commandExecution", "cargo test", ToolPhase::Running)
+        );
+        let ok = json!({"id":"c1","type":"commandExecution","command":"x","status":"completed","exitCode":0});
+        assert_eq!(codex_tool_call(&ok, false).phase, ToolPhase::Done);
+        for failed in [
+            json!({"id":"c","type":"commandExecution","status":"completed","exitCode":101}),
+            json!({"id":"c","type":"commandExecution","status":"failed"}),
+            json!({"id":"c","type":"fileChange","status":"declined","changes":[]}),
+            json!({"id":"c","type":"mcpToolCall","status":"failed","tool":"echo"}),
+        ] {
+            assert_eq!(
+                codex_tool_call(&failed, false).phase,
+                ToolPhase::Failed,
+                "{failed}"
+            );
+        }
+        let change = json!({"path":"a.rs","kind":"update","diff":""});
+        let files = json!({"id":"f","type":"fileChange","status":"completed","changes":[change]});
+        assert_eq!(codex_tool_call(&files, false).target, "a.rs");
+        let mcp =
+            json!({"id":"m","type":"mcpToolCall","status":"completed","tool":"echo","server":"fx"});
+        assert_eq!(codex_tool_call(&mcp, false).target, "echo");
+    }
+
+    #[test]
+    fn approvals_name_the_command_folder_or_files() {
+        let params = json!({"command":"cargo test","cwd":"/w","itemId":"c1"});
+        let summary = codex_approval_summary("item/commandExecution/requestApproval", &params, &[]);
+        assert_eq!(summary.action, "Run a shell command");
+        assert_eq!(
+            (summary.command.as_deref(), summary.cwd.as_deref()),
+            (Some("cargo test"), Some("/w"))
+        );
+        let files = ["a.rs".to_owned(), "b.rs".to_owned()];
+        let summary = codex_approval_summary(
+            "item/fileChange/requestApproval",
+            &json!({"itemId":"f"}),
+            &files,
+        );
+        assert_eq!(
+            (summary.action.as_str(), summary.files.len()),
+            ("Edit 2 files", 2)
+        );
+        assert_eq!(
+            codex_approval_summary("item/fileChange/requestApproval", &json!({}), &[]).action,
+            "Change files"
         );
     }
 }

@@ -220,6 +220,19 @@ impl ClaudeFixture {
                 emit(
                     &json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo fixture"}}]}}),
                 );
+                emit(
+                    &json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"fixture\n","is_error":false}]}}),
+                );
+                emit(&claude_result(sid, ""));
+            }
+            scenario::TOOL_FAIL => {
+                emit(&claude_init(sid));
+                emit(
+                    &json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_9","name":"Bash","input":{"command":"false"}}]}}),
+                );
+                emit(
+                    &json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_9","content":[{"type":"text","text":"exit 1"}],"is_error":true}]}}),
+                );
                 emit(&claude_result(sid, ""));
             }
             scenario::ERRORS => fail(sid),

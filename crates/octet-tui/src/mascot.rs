@@ -45,10 +45,10 @@ impl State {
             Self::Sleeping => "SLEEPING",
         }
     }
-    pub(crate) fn tool(detail: &str) -> Self {
-        // Inspect the tool name and command line, not arbitrary tool output.
-        let name = detail.lines().next().unwrap_or("").to_ascii_lowercase();
-        let command = detail.lines().nth(1).unwrap_or("").trim();
+    pub(crate) fn tool(call: &octet_core::ToolCall) -> Self {
+        // The tool's name and command, not arbitrary tool output.
+        let name = call.name.to_ascii_lowercase();
+        let command = call.target.trim();
         if ["dispatch", "delegate", "spawn_agent", "task", "collabagent"]
             .iter()
             .any(|word| name.contains(word))
@@ -57,7 +57,7 @@ impl State {
         } else if ["search", "read", "glob", "grep"]
             .iter()
             .any(|word| name.contains(word))
-            || ["$ rg ", "$ grep ", "$ find ", "$ cat ", "$ ls"]
+            || ["rg ", "grep ", "find ", "cat ", "ls"]
                 .iter()
                 .any(|prefix| command.starts_with(prefix))
         {
@@ -165,15 +165,25 @@ mod tests {
     }
     #[test]
     fn classifies_provider_tools_without_reading_output() {
-        assert_eq!(State::tool("Read\n{}"), State::Searching);
+        let call = |name: &str, target: &str, detail: &str| octet_core::ToolCall {
+            id: String::new(),
+            name: name.into(),
+            target: target.into(),
+            phase: octet_core::ToolPhase::Running,
+            detail: detail.into(),
+        };
+        assert_eq!(State::tool(&call("Read", "", "{}")), State::Searching);
         assert_eq!(
-            State::tool("commandExecution · running\n$ rg needle src"),
+            State::tool(&call("commandExecution", "rg needle src", "")),
             State::Searching
         );
-        assert_eq!(State::tool("Bash\n{}\nsearch results"), State::Coding);
-        assert_eq!(State::tool("Task\n{}"), State::Delegating);
         assert_eq!(
-            State::tool("collabAgentToolCall · running\n{}"),
+            State::tool(&call("Bash", "", "search results")),
+            State::Coding
+        );
+        assert_eq!(State::tool(&call("Task", "", "{}")), State::Delegating);
+        assert_eq!(
+            State::tool(&call("collabAgentToolCall", "", "{}")),
             State::Delegating
         );
     }

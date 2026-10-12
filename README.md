@@ -24,7 +24,7 @@ Python runtime. You can switch models and providers mid-session, leave a goal
 running across turns, and pick the session up from your phone.
 
 <p align="center">
-  <img src="docs/images/octet-demo.svg" alt="Octet's offline demo: a prompt and reply in the conversation pane, the workspace panel on the right, the prompt box below">
+  <img src="docs/images/octet-demo.svg" alt="Octet's offline demo: a prompt and reply in the transcript with grouped tool activity, the Task sidebar on the right, the prompt box below">
 </p>
 
 ## Features
@@ -75,16 +75,17 @@ running across turns, and pick the session up from your phone.
   sessions; `--no-plugins` turns them off and `--no-plugin-hooks` only their
   hooks. Hooks that fail, block or answer an approval show in the
   transcript.
-- `/skills` lists every provider's skills; Enter runs one, switching
-  provider first when it is another's. `/NAME args` runs the current
-  provider's skill.
+- `/skills` lists every provider's skills; Enter puts one in the prompt, and
+  sending another provider's skill switches provider first. `/NAME args`
+  runs the current provider's skill.
 
 **Permissions and approvals**
 
 - Four permission modes, mapped onto each vendor's own settings: `ask`,
   `accept-edits`, `auto` (the vendor's reviewer decides) and `full-access`.
   Shift+Tab cycles the first three live; `full-access` has to be typed.
-- The approval dialog shows the whole request: allow once or deny. Expired,
+- The approval dialog leads with the action, the command, the files and the
+  directory, then shows the whole request: allow once or deny. Expired,
   cancelled, oversized and unknown requests are denied, and so is any
   request beyond eight waiting at once. Claude is told why.
 - One reply shows at most 2 MiB, with a note where it is cut.
@@ -120,7 +121,11 @@ running across turns, and pick the session up from your phone.
 - `!git status` runs a command and attaches its output to your next prompt;
   `!!` runs it without attaching. `/copy` (Ctrl+X) puts the last reply on
   the clipboard, even over SSH to a phone.
-- Works down to 38×12 cells; a workspace panel appears from 112 columns.
+- A run of tool calls is one line (`▸ Read 3 files · Ran 1 command`); a
+  failure opens in amber, and Ctrl+O shows every call's detail. Scrolling up
+  keeps the text still while output arrives.
+- Works down to 38×12 cells; a Task sidebar (goal, now, queue) appears from
+  112 columns and F2 hides it; under 30 rows the header is one row.
   Respects `NO_COLOR`.
 - Ctrl+Z suspends to the shell. The terminal is restored on exit, on signals
   and on panic.
@@ -198,7 +203,10 @@ octet --engine codex --cwd /path/to/project      # Codex (the default engine)
 | Shift+Tab | Cycle permission mode: ask → accept-edits → auto |
 | A / D | Allow once / deny a permission request (from 0.4 s after it opens) |
 | PageUp / PageDown | Scroll the conversation |
-| Ctrl+P | Command palette (also offers Ctrl+G, `@` and `!`) |
+| Ctrl+End | Follow the latest output |
+| Ctrl+O | Show or hide every tool call's detail |
+| F2 | Show or hide the Task sidebar |
+| Ctrl+P | Command palette: type to filter (also offers Ctrl+G, `@`, `!` and Ctrl+O) |
 | @ | Mention a file |
 | Tab | Complete a path or command |
 | Ctrl+G | Edit the prompt in $EDITOR |

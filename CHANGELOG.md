@@ -17,8 +17,8 @@ Claude Code and Codex CLIs.
   shown. `--no-plugins` and `--no-plugin-hooks` turn plugins, or only their
   hooks, off on both providers.
 - One skills list: `/skills` shows every provider's skills (cached per
-  workspace in `skills.json`); Enter runs one, switching provider first when
-  it is another's, and `/NAME args` runs the current provider's.
+  workspace in `skills.json`); Enter puts one in the prompt, and `/NAME args`
+  runs the current provider's.
 - One model list across providers: `/model` shows every provider's models,
   fetched from each CLI when missing or a day old (no session, no tokens) and
   cached in `models.json`; `/model refresh` fetches them now. `/model NAME`
@@ -50,7 +50,7 @@ Claude Code and Codex CLIs.
   phone command.
 - A multiline prompt editor with Unicode-aware editing, bracketed paste and
   history; the prompt box grows with the draft.
-- A responsive layout down to 38 × 12 cells with a workspace panel from 112
+- A responsive layout down to 38 × 12 cells with a Task sidebar from 112
   columns, `NO_COLOR` support, suspend with Ctrl+Z, and terminal restoration
   on exit, signals and panic.
 - Octet, the header mascot, whose pose follows the agent's activity.
@@ -87,11 +87,38 @@ Claude Code and Codex CLIs.
 - At most eight approvals wait at once; more are denied with a notice. Claude
   is told why each approval was denied (your refusal, the timeout, the cap,
   a request too large to show, a cancelled turn).
+- Typed tool and approval events: the journal's `tool` records, and the
+  `tool` events of `--output json` and `--rpc`, carry
+  `{id, name, target, phase, detail}` (`phase` is `running`, `done` or
+  `failed`); `approval` records and events gain `summary`
+  `{action, command, files, cwd, scope}`.
+- Grouped tool activity: a run of tool calls is one transcript entry
+  (`▸ Read 3 files · Ran 1 command`), a failed call opens in amber with the
+  last 8 lines of its output, and Ctrl+O shows or hides every call's detail.
+- The approval dialog leads with the action, the `$ command`, the files, the
+  directory and `Allows: This request only, once`, then the full request.
+- One hint row under the prompt for what Enter does now, and a chips row
+  (`+ ls (exit 0) · + image x.png · 2 queued`) for what will go with the
+  next prompt.
+- A Task sidebar (goal, now, queued prompts) from 112 columns; F2 hides it.
+- The command palette filters as you type; Backspace edits the filter.
+- A compact layout under 30 rows: a one-row header, no vertical margin and a
+  standing key hint.
 - Dual licensing under MIT or Apache-2.0.
 - CI on macOS and Ubuntu (`make rust-check`) plus a `cargo audit` job.
 
 ### Changed
 
+- Enter in `/skills` (or Tab) puts `/name ` in the prompt instead of running
+  the skill; nothing runs until it is sent. Sending another provider's skill
+  switches provider first, with its arguments, and an amber hint says so.
+- Scrollback stays still while output arrives; when new rows arrive below,
+  the conversation's bottom border says "New output below · Ctrl+End
+  follows" until you follow.
+- Claude's tool results end its tool calls, so failures show. The headless
+  denial warning names the action and the command's first line.
+- The sidebar shows the task rather than the engine, model and session, which
+  are in the header and `/session`.
 - An approval takes answer keys 0.4 seconds after it opens, so a letter
   typed as it appears cannot allow it.
 - While the interface is briefly behind, Octet stops reading the vendor

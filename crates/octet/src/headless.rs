@@ -24,6 +24,24 @@ pub(crate) fn warn(text: &str) {
     let _ = writeln!(std::io::stderr(), "octet: {text}");
 }
 
+/// `text`'s first line without control characters: vendor text must not steer the terminal.
+fn plain(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+/// What a denied approval was for, as it is safe to print.
+fn denied(summary: &octet_core::ApprovalSummary) -> String {
+    match &summary.command {
+        Some(command) => format!("{}: {}", plain(&summary.action), plain(command)),
+        None => plain(&summary.action),
+    }
+}
+
 /// Runs `prompt` as one turn. Text mode writes the reply to stdout; JSON
 /// mode writes every event as a line. Notices and errors go to stderr.
 /// Exits 0 when the turn completes, 130 when interrupted (even if the vendor
@@ -105,11 +123,11 @@ async fn drive_print(
                     .map_err(|e| e.to_string())?;
             }
             Event::Text(text) if !json => out.text(&text).await?,
-            Event::Approval { id, detail } => {
-                let what = detail.lines().next().unwrap_or_default();
+            Event::Approval { id, summary, .. } => {
                 warn(&format!(
-                    "denied an approval ({what}); print mode cannot ask. \
-                     Use --mode auto or --mode full-access for unattended runs."
+                    "denied an approval ({}); print mode cannot ask. \
+                     Use --mode auto or --mode full-access for unattended runs.",
+                    denied(&summary)
                 ));
                 session
                     .handle
@@ -534,5 +552,16 @@ mod tests {
             Ok("short".to_owned())
         );
         assert_eq!(read_line(&mut reader).await.unwrap(), None);
+    }
+
+    #[test]
+    fn a_denied_approval_names_one_clean_line() {
+        let summary = octet_core::ApprovalSummary {
+            command: Some("echo \u{1b}[2Jhi\rthere\nrm -rf /".into()),
+            ..octet_core::ApprovalSummary::new("Run\u{1b}[31m a shell command\nsecond")
+        };
+        assert_eq!(denied(&summary), "Run[31m a shell command: echo [2Jhithere");
+        let bare = octet_core::ApprovalSummary::new("Approve a Codex request");
+        assert_eq!(denied(&bare), "Approve a Codex request");
     }
 }

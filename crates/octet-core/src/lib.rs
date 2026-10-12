@@ -2,10 +2,10 @@
 //! disk and subscriber failures stop execution instead of losing output silently.
 #![forbid(unsafe_code)]
 pub use octet_engine::live::{
-    APPROVAL_DEMO, Command, Config, DEFAULT_APPROVAL_TIMEOUT, Engine, Event, Handle, HookOutcome,
-    IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment, ImageError, Listing, Mode, Outcome,
-    PROBE_LIMIT, PROMPT_LIMIT, Plugins, SendError, WIRE_LIMIT, check_inline, encoded_len, home_dir,
-    probe, valid_effort,
+    APPROVAL_DEMO, APPROVAL_SCOPE, ApprovalSummary, Command, Config, DEFAULT_APPROVAL_TIMEOUT,
+    Engine, Event, Handle, HookOutcome, IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment,
+    ImageError, Listing, Mode, Outcome, PROBE_LIMIT, PROMPT_LIMIT, Plugins, SendError, ToolCall,
+    ToolPhase, WIRE_LIMIT, check_inline, encoded_len, home_dir, probe, valid_effort,
 };
 use octet_store::Journal;
 use serde_json::{Value, json};
@@ -192,8 +192,22 @@ fn record(event: &Event) -> (&'static str, Value) {
         Event::User(text) => ("user", json!(text)),
         Event::Started => ("started", Value::Null),
         Event::Text(text) => ("text", json!(text)),
-        Event::Tool(text) => ("tool", json!(text)),
-        Event::Approval { id, detail } => ("approval", json!({"id":id,"detail":detail})),
+        Event::Tool(call) => (
+            "tool",
+            json!({
+                "id":call.id,"name":call.name,"target":call.target,
+                "phase":call.phase.as_str(),"detail":call.detail}),
+        ),
+        Event::Approval {
+            id,
+            detail,
+            summary,
+        } => (
+            "approval",
+            json!({"id":id,"detail":detail,"summary":{
+                "action":summary.action,"command":summary.command,"files":summary.files,
+                "cwd":summary.cwd,"scope":summary.scope}}),
+        ),
         Event::ApprovalClosed(id) => ("approval_closed", json!(id)),
         Event::Usage(text) => ("usage", json!(text)),
         Event::Finished { outcome } => ("finished", json!(outcome.as_str())),
@@ -289,6 +303,34 @@ mod tests {
         let ran = event_json(&hook(HookOutcome::Ran));
         assert_eq!(ran["data"]["outcome"], "ran");
         assert!(ran["data"].get("decision").is_none(), "{ran}");
+    }
+
+    #[test]
+    fn a_tool_call_and_an_approval_journal_their_fields() {
+        let call = Event::Tool(ToolCall {
+            id: "t1".into(),
+            name: "Bash".into(),
+            target: "ls".into(),
+            phase: ToolPhase::Failed,
+            detail: "exit 2".into(),
+        });
+        assert_eq!(
+            event_json(&call)["data"],
+            json!({"id":"t1","name":"Bash","target":"ls","phase":"failed","detail":"exit 2"})
+        );
+        let summary = ApprovalSummary {
+            command: Some("ls".into()),
+            ..ApprovalSummary::new("Run a shell command")
+        };
+        let approval = Event::Approval {
+            id: 3,
+            detail: "{}".into(),
+            summary,
+        };
+        let data = &event_json(&approval)["data"];
+        assert_eq!(data["summary"]["action"], "Run a shell command");
+        assert_eq!(data["summary"]["command"], "ls");
+        assert_eq!(data["summary"]["scope"], APPROVAL_SCOPE);
     }
 
     #[tokio::test]

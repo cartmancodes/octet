@@ -1,6 +1,6 @@
 //! Offline demo engine: no vendor process.
 use super::{
-    APPROVAL_DEMO, BUSY, BoxFuture, Channels, Command, Config, DriverError, Event,
+    APPROVAL_DEMO, ApprovalSummary, BUSY, BoxFuture, Channels, Command, Config, DriverError, Event,
     FULL_ACCESS_RECONNECTS, Limits, Mode, NO_TURN, Outcome, Provider, TurnGate, emit,
 };
 use std::time::Duration;
@@ -247,6 +247,10 @@ impl DemoTurn<'_> {
                 id: 1,
                 detail: "Demo only — no command will execute.\n\nWrite a greeting to hello.txt?"
                     .into(),
+                summary: ApprovalSummary {
+                    files: vec!["hello.txt".into()],
+                    ..ApprovalSummary::new("Write 1 file (demo: nothing runs)")
+                },
             },
         )?;
         let expiry = tokio::time::sleep(self.approval);

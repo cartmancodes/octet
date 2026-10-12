@@ -1,5 +1,6 @@
 use super::*;
-use octet_core::Event;
+use crate::test_support::{approval, tool};
+use octet_core::{Event, ToolPhase};
 use ratatui::{Terminal, backend::TestBackend};
 fn screen(width: u16, height: u16, app: &mut App) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -61,31 +62,52 @@ fn the_popup_lists_suggestions_above_the_prompt() {
     assert!(rows.iter().any(|row| row.contains("Indexing files…")));
 }
 #[test]
-fn sidebar_lines_fit_the_panel_without_wrapping() {
-    // Every sidebar line starts with a space; a wrapped remainder would
-    // start in the first column, against the border.
+fn the_task_sidebar_shows_goal_now_and_queue() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
-    let rows = screen(120, 48, &mut app);
-    let title = rows.iter().find(|row| row.contains("╭ Workspace")).unwrap();
-    let border = title.chars().position(|c| c == '╭').unwrap();
-    let first = border + 1;
-    let inside: Vec<&String> = rows
-        .iter()
-        .filter(|row| row.chars().nth(border) == Some('│'))
-        .collect();
-    assert!(inside.len() > 20, "sidebar not drawn");
-    for row in inside {
-        let start = row.chars().nth(first).unwrap();
-        assert_eq!(start, ' ', "wrapped sidebar line: {row}");
+    crate::test_support::idle(&mut app);
+    app.composer
+        .queue
+        .push_back(crate::vendor::Prompt::plain("then add tests\nmore".into()));
+    let rows = screen(120, 40, &mut app);
+    let text = rows.join("\n");
+    assert!(text.contains("╭ Task"), "{text}");
+    for expected in [
+        "GOAL",
+        "No goal · /goal sets one",
+        "NOW",
+        "Idle",
+        "QUEUED",
+        "then add tests",
+    ] {
+        assert!(text.contains(expected), "{expected}\n{text}");
     }
+    for gone in ["ENGINE", "SESSION", "QUICK COMMANDS"] {
+        assert!(!text.contains(gone), "{gone}");
+    }
+    app.sidebar = false;
+    let rows = screen(120, 40, &mut app);
+    assert!(!rows.join("\n").contains("╭ Task"));
+}
+#[test]
+fn the_task_sidebar_shows_the_goal_and_its_turns() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    crate::test_support::idle(&mut app);
+    let goal = octet_core::goal::Goal::new("Make every test pass on Linux and macOS").unwrap();
+    app.goals.set_goal(Some(goal));
+    let text = screen(120, 40, &mut app).join("\n");
+    let turns = format!("/{} turns", octet_core::goal::MAX_GOAL_TURNS);
+    for expected in ["Make every test", "Linux and macOS", turns.as_str()] {
+        assert!(text.contains(expected), "{expected}\n{text}");
+    }
+    assert!(!text.contains("No goal"), "{text}");
 }
 #[test]
 fn an_empty_composer_gives_rows_back_to_the_conversation() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.event(Event::User("hello".into()));
     let rows = screen(44, 16, &mut app);
-    // The composer's top border sits 4 rows above the status line.
-    assert!(rows[16 - 6].starts_with(" ╭ Prompt"), "{}", rows[16 - 6]);
+    // Compact: no bottom margin, so the border sits 4 rows above the status line.
+    assert!(rows[16 - 5].starts_with(" ╭ Prompt"), "{}", rows[16 - 5]);
 }
 #[test]
 fn help_keeps_its_last_line_on_narrow_and_short_terminals() {
@@ -137,6 +159,14 @@ fn the_draft_shows_at_the_minimum_size() {
     }
 }
 #[test]
+fn help_names_the_tool_details_key() {
+    assert!(
+        help_lines()
+            .iter()
+            .any(|l| l.contains("Ctrl+O show or hide tool details"))
+    );
+}
+#[test]
 fn the_palette_shows_every_command_and_its_keys() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.overlay.palette = true;
@@ -164,6 +194,10 @@ fn the_palette_shows_every_command_and_its_keys() {
         "descriptions start in different columns: {columns:?}"
     );
     assert!(rows.iter().any(|row| row.contains("Esc close")));
+    assert!(
+        rows.iter().any(|row| row.contains("Ctrl+O")),
+        "Ctrl+O row missing"
+    );
 }
 #[test]
 fn empty_conversation_leaves_the_centre_blank() {
@@ -186,7 +220,7 @@ fn empty_conversation_leaves_the_centre_blank() {
 #[test]
 fn header_banner_shows_mini_version_mode_activity_and_workspace() {
     let config = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp");
-    for (width, height) in [(160, 42), (80, 24), (60, 20), (40, 12)] {
+    for (width, height) in [(160, 42), (80, 30)] {
         let mut app = App::new(&config, "journal".into());
         app.monochrome = false;
         for event in [
@@ -195,7 +229,7 @@ fn header_banner_shows_mini_version_mode_activity_and_workspace() {
             },
             Event::User("fix the failing test".into()),
             Event::Started,
-            Event::Tool("Bash\n{}".into()),
+            tool("1", "Bash", "", ToolPhase::Running),
         ] {
             app.event(event);
         }
@@ -229,9 +263,9 @@ fn permission_mode_stays_visible_on_narrow_headers() {
         app.monochrome = false;
         let rows = screen(width, 24, &mut app);
         assert!(
-            rows[2].contains("full-access"),
+            rows[0].contains("full-access"),
             "{width} columns: {}",
-            rows[2]
+            rows[0]
         );
     }
 }
@@ -253,17 +287,23 @@ fn status_shows_in_full_on_narrow_terminals() {
             app.event(event);
         }
         let rows = screen(width, 12, &mut app);
-        assert!(rows[1].contains("● interrupted"), "{width}: {}", rows[1]);
+        assert!(rows[0].contains("● interrupted"), "{width}: {}", rows[0]);
     }
 }
 #[test]
 fn no_color_keeps_the_text_header() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.monochrome = true;
-    let rows = screen(80, 24, &mut app);
-    let mark = format!("◇ Octet v{}", env!("CARGO_PKG_VERSION"));
-    assert!(rows[1].contains(&mark), "{}", rows[1]);
-    assert!(!rows[1..4].iter().any(|row| row.contains('▀')));
+    for (height, row) in [(24, 0), (42, 1)] {
+        let rows = screen(80, height, &mut app);
+        let mark = if height < 30 {
+            "◇ Octet".to_owned()
+        } else {
+            format!("◇ Octet v{}", env!("CARGO_PKG_VERSION"))
+        };
+        assert!(rows[row].contains(&mark), "{}", rows[row]);
+        assert!(!rows[..4].iter().any(|row| row.contains('▀')));
+    }
 }
 #[test]
 fn mascot_tracks_activity_and_keeps_errors_visible_after_disconnect() {
@@ -278,21 +318,18 @@ fn mascot_tracks_activity_and_keeps_errors_visible_after_disconnect() {
         ),
         (Event::Started, "THINKING"),
         (
-            Event::Tool("Read\n{\"file_path\":\"src/main.rs\"}".into()),
+            tool("1", "Read", "src/main.rs", ToolPhase::Running),
             "SEARCHING",
         ),
         (
-            Event::Tool("Bash\n{\"command\":\"cargo check\"}".into()),
+            tool("2", "Bash", "cargo check", ToolPhase::Running),
             "CODING",
         ),
-        (Event::Tool("dispatch_subagent\n{}".into()), "DELEGATING"),
         (
-            Event::Approval {
-                id: 1,
-                detail: "Write src/main.rs".into(),
-            },
-            "APPROVAL",
+            tool("3", "dispatch_subagent", "", ToolPhase::Running),
+            "DELEGATING",
         ),
+        (approval(1, "Write src/main.rs"), "APPROVAL"),
         (Event::ApprovalClosed(1), "DELEGATING"),
         (
             Event::Finished {
@@ -328,10 +365,7 @@ fn renders_narrow_wide_and_approval_without_panics() {
         let mut a = App::new(&c, "journal".into());
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, &mut a)).unwrap();
-        a.event(Event::Approval {
-            id: 7,
-            detail: "edit hello.txt".into(),
-        });
+        a.event(approval(7, "edit hello.txt"));
         t.draw(|f| draw(f, &mut a)).unwrap();
     }
 }
@@ -340,12 +374,12 @@ fn renders_narrow_wide_and_approval_without_panics() {
 fn composer_grows_with_the_draft() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     assert_eq!(
-        composer_height(app.composer.editor.layout(draft_width(80)).0.len()),
+        composer_height(app.composer.editor.layout(draft_width(80)).0.len(), false),
         4
     );
     assert!(app.composer.editor.insert("one\ntwo\nthree"));
     assert_eq!(
-        composer_height(app.composer.editor.layout(draft_width(80)).0.len()),
+        composer_height(app.composer.editor.layout(draft_width(80)).0.len(), false),
         6
     );
 }
@@ -355,7 +389,7 @@ fn composer_counts_wrapped_rows() {
     // 80 columns leave 74 for text: 100 characters wrap onto a second row.
     assert!(app.composer.editor.insert(&"x".repeat(100)));
     assert_eq!(
-        composer_height(app.composer.editor.layout(draft_width(80)).0.len()),
+        composer_height(app.composer.editor.layout(draft_width(80)).0.len(), false),
         5
     );
 }
@@ -364,11 +398,146 @@ fn composer_height_is_capped() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     assert!(app.composer.editor.insert(&"line\n".repeat(40)));
     assert_eq!(
-        composer_height(app.composer.editor.layout(draft_width(80)).0.len()),
+        composer_height(app.composer.editor.layout(draft_width(80)).0.len(), false),
         7
     );
 }
-
+#[test]
+fn the_hint_row_matches_what_enter_does() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CODEX);
+    crate::test_support::idle(&mut app);
+    assert_eq!(
+        composer_hint(&app, 100).0,
+        "Enter send · Alt+Enter newline · ↑ history · Ctrl+P commands"
+    );
+    // A phone rarely sends Alt+Enter; Ctrl+J always arrives.
+    assert_eq!(composer_hint(&app, 60).0, "Enter send · Ctrl+J newline");
+    app.event(Event::Started);
+    assert_eq!(
+        composer_hint(&app, 100).0,
+        "Enter queue · Esc cancel turn · Ctrl+P commands"
+    );
+    assert_eq!(composer_hint(&app, 60).0, "Enter queue · Esc cancel turn");
+    let rows = screen(100, 30, &mut app);
+    assert!(
+        rows.iter().any(|r| r.contains("╭ Next prompt ─")),
+        "{}",
+        rows.join("\n")
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("Enter send")),
+        "no contradicting hint"
+    );
+}
+#[test]
+fn the_hint_warns_before_a_provider_switch() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CODEX);
+    crate::test_support::idle(&mut app);
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        octet_core::Engine::CLAUDE,
+        &ws,
+        vec![octet_core::SkillInfo {
+            name: "review".into(),
+            description: String::new(),
+            aliases: Vec::new(),
+            argument_hint: String::new(),
+            path: None,
+        }],
+        std::time::SystemTime::now(),
+    );
+    assert!(app.composer.editor.insert("/review src"));
+    assert_eq!(
+        composer_hint(&app, 100),
+        ("Enter switches to claude, then runs /review".into(), AMBER)
+    );
+}
+#[test]
+fn mid_turn_the_hint_says_the_switch_waits() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CODEX);
+    crate::test_support::idle(&mut app);
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        octet_core::Engine::CLAUDE,
+        &ws,
+        vec![octet_core::SkillInfo {
+            name: "review".into(),
+            description: String::new(),
+            aliases: Vec::new(),
+            argument_hint: String::new(),
+            path: None,
+        }],
+        std::time::SystemTime::now(),
+    );
+    app.event(Event::Started);
+    assert!(app.composer.editor.insert("/review src"));
+    assert_eq!(
+        composer_hint(&app, 100),
+        ("Finish the turn to switch to claude".into(), AMBER)
+    );
+}
+#[test]
+fn chips_have_their_own_row_and_grow_the_box() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    assert_eq!(composer_height(1, false), 4);
+    assert_eq!(composer_height(1, true), 5);
+    app.attach(crate::shell::Ran {
+        command: "ls".into(),
+        status: crate::shell::Status::Exited(0),
+        output: "a\n".into(),
+    });
+    app.composer
+        .queue
+        .push_back(crate::vendor::Prompt::plain("later".into()));
+    assert_eq!(chips(&app).as_deref(), Some("+ ls (exit 0) · 1 queued"));
+    let rows = screen(100, 30, &mut app);
+    let title = rows.iter().position(|r| r.contains("╭ Prompt ─")).unwrap();
+    assert!(
+        rows[title + 2].contains("+ ls (exit 0) · 1 queued"),
+        "{}",
+        rows.join("\n")
+    );
+}
+#[test]
+fn chips_and_hint_fit_at_the_minimum_size() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.composer
+        .queue
+        .push_back(crate::vendor::Prompt::plain("later".into()));
+    assert!(app.composer.editor.insert("draft"));
+    // The compact layout leaves the box room for the draft, the chips and the hint.
+    let text = screen(38, 12, &mut app).join("\n");
+    assert!(text.contains("│ draft"), "{text}");
+    assert!(
+        text.contains("1 queued") && text.contains("Enter send"),
+        "{text}"
+    );
+}
+#[test]
+fn chips_give_way_in_a_box_with_one_inner_row() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.composer
+        .queue
+        .push_back(crate::vendor::Prompt::plain("later".into()));
+    assert!(app.composer.editor.insert("draft"));
+    let draft = app.composer.editor.layout(draft_width(38));
+    let mut terminal = Terminal::new(TestBackend::new(38, 3)).unwrap();
+    terminal
+        .draw(|frame| {
+            composer(frame, frame.area(), 38, &app, draft);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let text: String = (0..3)
+        .flat_map(|y| (0..38).map(move |x| (x, y)))
+        .map(|position| buffer[position].symbol())
+        .collect();
+    assert!(text.contains("draft"), "{text}");
+    assert!(
+        !text.contains("queued") && !text.contains("Enter send"),
+        "{text}"
+    );
+}
 mod model_detail_tests {
     use super::*;
     fn app() -> App {
@@ -540,10 +709,7 @@ fn scrolling_up_keeps_the_view_full() {
 #[test]
 fn approval_scroll_is_clamped() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
-    app.event(Event::Approval {
-        id: 1,
-        detail: "one short line".into(),
-    });
+    app.event(approval(1, "one short line"));
     app.overlay.approval_scroll = 500;
     let rows = screen(100, 30, &mut app);
     assert!(
@@ -551,6 +717,109 @@ fn approval_scroll_is_clamped() {
         "scrolled past its only line"
     );
     assert_eq!(app.overlay.approval_scroll, 0);
+}
+#[test]
+fn the_approval_leads_with_action_command_folder_and_scope() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(crate::test_support::approval(
+        3,
+        "{\n  \"tool_name\": \"Bash\"\n}",
+    ));
+    let rows = screen(100, 30, &mut app);
+    let at = |text: &str| {
+        rows.iter()
+            .position(|r| r.contains(text))
+            .unwrap_or_else(|| panic!("{text}\n{}", rows.join("\n")))
+    };
+    assert!(at("Permission required · #3 · 1 pending") < at("Run a shell command"));
+    assert!(at("Run a shell command") < at("$ cargo test"));
+    assert!(at("$ cargo test") < at("in /tmp"));
+    assert!(at("in /tmp") < at("Allows: This request only, once"));
+    assert!(at("Allows:") < at("Full request · PgUp/PgDn"));
+    assert!(at("Full request") < at("\"tool_name\": \"Bash\""));
+    assert!(rows.iter().any(|r| r.contains("A  Allow once")));
+}
+#[test]
+fn summary_lines_bound_commands_and_files() {
+    let summary = octet_core::ApprovalSummary {
+        command: Some("a\nb\nc\nd".into()),
+        files: (0..9).map(|n| format!("f{n}")).collect(),
+        ..octet_core::ApprovalSummary::new("Edit 9 files")
+    };
+    assert_eq!(
+        summary_lines(&summary),
+        [
+            "Edit 9 files",
+            "$ a",
+            "  b",
+            "  c",
+            "  …",
+            "f0",
+            "f1",
+            "f2",
+            "f3",
+            "f4",
+            "+4 more",
+            "Allows: This request only, once"
+        ]
+    );
+}
+#[test]
+fn a_huge_approval_keeps_its_keys_on_a_small_screen() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(octet_core::Event::Approval {
+        id: 1,
+        detail: "x\n".repeat(500),
+        summary: octet_core::ApprovalSummary {
+            command: Some("y".repeat(5000)),
+            files: (0..100).map(|n| format!("f{n}")).collect(),
+            cwd: Some("/tmp".into()),
+            ..octet_core::ApprovalSummary::new("Edit 100 files")
+        },
+    });
+    for (w, h) in [(40, 12), (38, 12), (80, 24)] {
+        let rows = screen(w, h, &mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("Allow once")),
+            "{w}×{h}\n{}",
+            rows.join("\n")
+        );
+        for kept in [
+            "Allows: This request only, once",
+            "Edit 100 files",
+            "in /tmp",
+        ] {
+            assert!(
+                rows.iter().any(|r| r.contains(kept)),
+                "{kept} at {w}×{h}\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+}
+#[test]
+fn fit_lead_cuts_the_middle_and_keeps_the_first_and_the_tail() {
+    let rows: Vec<String> = (0..8).map(|n| format!("r{n}")).collect();
+    assert_eq!(fit_lead(rows.clone(), 8, 2), rows, "it fits");
+    assert_eq!(fit_lead(rows.clone(), 9, 2), rows, "room to spare");
+    assert_eq!(fit_lead(rows.clone(), 5, 2), ["r0", "r1", "…", "r6", "r7"]);
+    assert_eq!(fit_lead(rows.clone(), 4, 2), ["r0", "…", "r6", "r7"]);
+    assert_eq!(
+        fit_lead(rows.clone(), 3, 2),
+        ["r0", "r6", "r7"],
+        "no room for the mark"
+    );
+    assert_eq!(
+        fit_lead(rows.clone(), 2, 2),
+        ["r6", "r7"],
+        "the tail outranks the first row"
+    );
+    assert_eq!(
+        fit_lead(rows.clone(), 1, 2),
+        ["r7"],
+        "the last row outranks all"
+    );
+    assert!(fit_lead(rows, 0, 2).is_empty());
 }
 #[test]
 fn help_rows_match_what_is_drawn() {
@@ -574,10 +843,7 @@ fn help_rows_match_what_is_drawn() {
 #[test]
 fn an_approval_hidden_behind_help_is_armed_only_once_seen() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
-    app.event(Event::Approval {
-        id: 1,
-        detail: "rm -rf build".into(),
-    });
+    app.event(approval(1, "rm -rf build"));
     // Help covers the dialog while the approval arrives and waits.
     app.overlay.help = true;
     screen(100, 30, &mut app);
@@ -686,4 +952,302 @@ fn a_model_named_like_a_subcommand_gets_the_explicit_line() {
     let text = a.entries_text();
     assert!(text.contains("Select: /model codex list"), "{text}");
     assert!(text.contains("Select: /model codex refresh"), "{text}");
+}
+#[test]
+fn a_palette_with_no_match_says_so() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.overlay.palette = true;
+    app.overlay.palette_query = "qqqq".into();
+    let rows = screen(100, 30, &mut app);
+    assert!(rows.iter().any(|r| r.contains("No matching commands")));
+    assert!(rows.iter().any(|r| r.contains("Commands · \"qqqq\"")));
+}
+#[test]
+fn a_short_terminal_gets_a_one_row_header_and_no_vertical_margin() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.monochrome = false;
+    crate::test_support::idle(&mut app);
+    app.event(Event::User("hi".into()));
+    let rows = screen(100, 24, &mut app);
+    assert!(rows[0].contains("Octet · ask"), "{}", rows[0]);
+    assert!(rows[0].contains("● ready"), "{}", rows[0]);
+    assert!(rows[0].contains("/tmp"), "{}", rows[0]);
+    assert!(rows[1].contains("╭ Conversation"), "{}", rows[1]);
+    // The demo is offline, so its standing hints say so.
+    assert_eq!(rows[23].trim(), "Offline demo · F1 help · Ctrl+C ×2 quit");
+    let transcript_rows = rows.iter().filter(|r| r.starts_with(" │")).count();
+    assert!(
+        transcript_rows >= 16,
+        "{transcript_rows}\n{}",
+        rows.join("\n")
+    );
+}
+#[test]
+fn a_tall_terminal_keeps_the_banner() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.monochrome = false;
+    let rows = screen(100, 30, &mut app);
+    let mini: String = rows[1].chars().skip(1).take(9).collect();
+    assert_eq!(mini, "▀".repeat(9));
+}
+#[test]
+fn a_narrow_short_header_puts_the_workspace_before_the_model() {
+    let config = octet_core::Config {
+        model: Some("a-very-long-model-name-indeed".into()),
+        ..octet_core::Config::new(octet_core::Engine::CODEX, "codex", "/tmp/ws")
+    };
+    let mut app = App::new(&config, "journal".into());
+    let rows = screen(60, 20, &mut app);
+    let ws = rows[0].find("/tmp/ws").expect(&rows[0]);
+    assert!(
+        rows[0].find("a-very").is_none_or(|model| ws < model),
+        "{}",
+        rows[0]
+    );
+}
+#[test]
+fn a_compact_notice_stays_inside_the_side_margin() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.hint("hello");
+    let rows = screen(100, 24, &mut app);
+    assert!(rows[23].starts_with(' '), "{:?}", rows[23]);
+    assert!(rows[23].contains("hello"), "{:?}", rows[23]);
+}
+#[test]
+fn the_compact_status_shows_in_full_and_usage_only_when_it_fits() {
+    for (width, usage_shows) in [(38, false), (60, false), (120, true)] {
+        let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+        app.conn.usage = "$0.1234 session cost".into();
+        app.event(approval(1, "{}"));
+        let rows = screen(width, 20, &mut app);
+        assert!(
+            rows[0].contains("● approval needed"),
+            "{width}: {}",
+            rows[0]
+        );
+        assert_eq!(
+            rows[0].contains("$0.1234 session cost"),
+            usage_shows,
+            "{width}: {}",
+            rows[0]
+        );
+    }
+}
+fn stream_lines(app: &mut App, n: usize) {
+    for i in 0..n {
+        app.event(Event::Text(format!("line {i}\n")));
+    }
+}
+#[test]
+fn scrolled_up_the_view_stays_still_while_output_arrives() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    stream_lines(&mut app, 60);
+    app.scroll_by(20);
+    let before: Vec<String> = app
+        .visible_lines(80, 10)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    stream_lines(&mut app, 5);
+    let after: Vec<String> = app
+        .visible_lines(80, 10)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(before, after);
+    assert!(app.chat.unseen);
+    let rows = screen(100, 30, &mut app);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("New output below · Ctrl+End follows")),
+        "{}",
+        rows.join("\n")
+    );
+    app.follow_latest();
+    assert!(!app.chat.unseen);
+    let rows = screen(100, 30, &mut app);
+    assert!(!rows.iter().any(|r| r.contains("New output below")));
+}
+#[test]
+fn resizing_while_scrolled_reanchors() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    stream_lines(&mut app, 60);
+    app.scroll_by(20);
+    let _ = app.visible_lines(80, 10);
+    let scroll = app.chat.scroll;
+    let _ = app.visible_lines(50, 10);
+    assert_eq!(
+        app.chat.scroll, scroll,
+        "a new width re-anchors without moving"
+    );
+    stream_lines(&mut app, 2);
+    let _ = app.visible_lines(50, 10);
+    assert!(app.chat.scroll > scroll);
+    // The anchor entry is trimmed away: no panic, still bounded.
+    app.chat.entries.pop_front();
+    let _ = app.visible_lines(50, 10);
+}
+#[test]
+fn the_view_stays_still_across_a_reply_drain() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    // Full 100-byte lines (two rows each at 80 columns) until the reply nears its drain point.
+    let drain_at = 64 * 1024 + 16 * 1024;
+    let mut i = 0;
+    while app.chat.entries.back().map_or(0, |e| e.text.len()) < drain_at - 160 {
+        app.event(Event::Text(format!("{i:<98}\n")));
+        i += 1;
+    }
+    // A last line that leaves 60 bytes before the drain point.
+    let len = app.chat.entries.back().map_or(0, |e| e.text.len());
+    app.event(Event::Text(format!(
+        "{}\n",
+        "w".repeat(drain_at - 60 - len - 1)
+    )));
+    app.scroll_by(20);
+    let shown = |app: &mut App| -> Vec<String> {
+        app.visible_lines(80, 10)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    // A partial line, so that the event that crosses the drain adds no row.
+    app.event(Event::Text("y".into()));
+    let before = shown(&mut app);
+    let len = app.chat.entries.back().map_or(0, |e| e.text.len());
+    app.event(Event::Text("z".repeat(drain_at + 1 - len)));
+    let after_drain = shown(&mut app);
+    assert!(
+        app.chat
+            .entries
+            .back()
+            .is_some_and(|e| e.text.len() < drain_at),
+        "the drain ran"
+    );
+    for n in 0..3 {
+        app.event(Event::Text(format!("more {n}\n")));
+        let _ = shown(&mut app);
+    }
+    let end = shown(&mut app);
+    assert_eq!(before.len(), 10);
+    assert_eq!(
+        &before[..8],
+        &after_drain[..8],
+        "unchanged across the drain"
+    );
+    assert_eq!(&before[..8], &end[..8], "and after it");
+    assert!(app.chat.unseen);
+}
+#[test]
+fn trimming_the_anchor_entry_keeps_compensating() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    stream_lines(&mut app, 60);
+    app.scroll_by(3);
+    let _ = app.visible_lines(80, 10);
+    // The anchor entry itself grows, then newer entries arrive after it.
+    stream_lines(&mut app, 15);
+    let _ = app.visible_lines(80, 10);
+    app.note(
+        (0..150)
+            .map(|n| format!("note {n}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let _ = app.visible_lines(80, 10);
+    // The anchor entry is trimmed away from the front.
+    app.chat.entries.pop_front();
+    let _ = app.visible_lines(80, 10);
+    let scroll = app.chat.scroll;
+    stream_lines(&mut app, 4);
+    let _ = app.visible_lines(80, 10);
+    assert!(app.chat.scroll > scroll, "{} > {scroll}", app.chat.scroll);
+}
+#[test]
+fn scrolled_up_the_view_stays_still_as_running_calls_collapse() {
+    let shown = |app: &mut App| -> Vec<String> {
+        app.visible_lines(80, 10)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    // The calls start below the reader, or were already the newest entry when they scrolled up.
+    for before_scroll in [false, true] {
+        let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+        app.event(Event::Started);
+        stream_lines(&mut app, 60);
+        let reads = |app: &mut App, phase| {
+            for n in 1..=4 {
+                app.event(tool(&n.to_string(), "Read", &format!("f{n}.rs"), phase));
+            }
+        };
+        if before_scroll {
+            reads(&mut app, ToolPhase::Running);
+        }
+        app.scroll_by(20);
+        let _ = shown(&mut app);
+        if !before_scroll {
+            reads(&mut app, ToolPhase::Running);
+        }
+        let before = shown(&mut app);
+        reads(&mut app, ToolPhase::Done);
+        assert_eq!(shown(&mut app), before, "before scroll: {before_scroll}");
+    }
+}
+
+#[test]
+fn a_long_approval_keeps_the_full_request_reachable() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Approval {
+        id: 1,
+        detail: "RAW_FULL_REQUEST_MARKER".into(),
+        summary: octet_core::ApprovalSummary {
+            command: Some(format!("echo {}", "long_argument ".repeat(160))),
+            cwd: Some("/work".into()),
+            ..octet_core::ApprovalSummary::new("Run a shell command")
+        },
+    });
+    let mut reachable = false;
+    for scroll in 0..100 {
+        app.overlay.approval_scroll = scroll;
+        let text = screen(80, 24, &mut app).join("\n");
+        reachable |= text.contains("RAW_FULL_REQUEST_MARKER");
+    }
+    assert!(
+        reachable,
+        "full request is inaccessible at every scroll position"
+    );
+}
+
+#[test]
+fn a_late_tool_completion_below_the_view_keeps_scrollback_still() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.note(
+        (0..40)
+            .map(|i| format!("history line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    app.event(Event::Started);
+    app.event(tool("1", "Bash", "cargo test", ToolPhase::Running));
+    app.note("hook notice after tool start");
+    app.chat.scroll = 12;
+    let before = app.visible_lines(80, 6);
+    app.event(Event::Tool(octet_core::ToolCall {
+        id: "1".into(),
+        name: "Bash".into(),
+        target: "cargo test".into(),
+        phase: ToolPhase::Failed,
+        detail: (0..8)
+            .map(|i| format!("error line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }));
+    let after = app.visible_lines(80, 6);
+    assert_eq!(
+        before, after,
+        "tool completion below viewport moved the history"
+    );
 }

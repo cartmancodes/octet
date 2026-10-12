@@ -90,11 +90,24 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
     }
     Some(Action::Continue)
 }
-/// `/NAME` that is no Octet command: the current provider's skill of that
-/// name or alias runs; another provider's gets a hint; anything else the
-/// unknown-command note. `None` leaves the draft to correct.
-fn skill_command(app: &mut App, vendor: &dyn Vendor, name: &str, argument: &str) -> Option<Action> {
+/// Where a typed `/NAME` skill is: the current provider's, or only another's.
+enum Found {
+    Here(octet_core::SkillInfo),
+    There(octet_core::Engine, octet_core::SkillInfo),
+}
+/// The skill `/NAME` names (by name or alias): the one picked in `/skills` when it has that name,
+/// else the current provider's first.
+fn find_skill(app: &App, name: &str) -> Option<Found> {
     let wanted = name.strip_prefix('/').unwrap_or(name);
+    if let Some((engine, skill)) = &app.composer.chosen_skill
+        && skill.name == wanted
+    {
+        return Some(if *engine == app.conn.engine {
+            Found::Here(skill.clone())
+        } else {
+            Found::There(*engine, skill.clone())
+        });
+    }
     let named = |skill: &octet_core::SkillInfo| {
         skill.name == wanted || skill.aliases.iter().any(|alias| alias == wanted)
     };
@@ -103,19 +116,67 @@ fn skill_command(app: &mut App, vendor: &dyn Vendor, name: &str, argument: &str)
         .iter()
         .find(|(engine, skill)| *engine == app.conn.engine && named(skill))
     {
-        // A skill that cannot go leaves the draft, as a prompt does.
-        return crate::input::run_skill(app, vendor, skill, argument).then_some(Action::Continue);
+        return Some(Found::Here(skill.clone()));
     }
-    if let Some((engine, _)) = entries.iter().find(|(_, skill)| named(skill)) {
-        app.note(format!("{name} is a {engine} skill; /skills runs it there"));
+    entries
+        .into_iter()
+        .find(|(_, skill)| named(skill))
+        .map(|(engine, skill)| Found::There(engine, skill))
+}
+/// The provider sending `draft` would switch to: it is `/NAME ...` where NAME is no Octet command
+/// and only another provider's skill.
+pub(crate) fn foreign_skill(app: &App, draft: &str) -> Option<octet_core::Engine> {
+    let name = draft.strip_prefix('/')?.split(char::is_whitespace).next()?;
+    if name.is_empty() || Spec::find(&format!("/{name}")).is_some() {
         return None;
     }
-    app.note(format!(
-        "Unknown command {name}. Use /help, or edit the draft: \
-         only a path such as /usr/lib can start a prompt with a slash. \
-         /skills lists what each provider offers."
-    ));
-    None
+    match find_skill(app, name)? {
+        Found::There(engine, _) => Some(engine),
+        Found::Here(_) => None,
+    }
+}
+/// `/NAME` that is no Octet command: the current provider's skill of that
+/// name or alias runs; another provider's switches there and runs once ready;
+/// anything else the unknown-command note. `None` leaves the draft to correct.
+fn skill_command(app: &mut App, vendor: &dyn Vendor, name: &str, argument: &str) -> Option<Action> {
+    // Sending uses the pick up; a draft that stays (a refusal) keeps it for the next try.
+    let found = find_skill(app, name);
+    let picked = app.composer.chosen_skill.take();
+    let keep = |app: &mut App| app.composer.chosen_skill.clone_from(&picked);
+    match found {
+        // A skill that cannot go leaves the draft, as a prompt does.
+        Some(Found::Here(skill)) => {
+            let ran = crate::input::run_skill(app, vendor, &skill, argument);
+            if !ran {
+                keep(app);
+            }
+            ran.then_some(Action::Continue)
+        }
+        Some(Found::There(engine, skill)) => {
+            if let Err(refusal) = can_reconnect(app) {
+                app.hint(refusal);
+                keep(app);
+                return None;
+            }
+            app.pending_skill = Some(crate::app::SkillRun {
+                engine,
+                skill,
+                args: argument.to_owned(),
+            });
+            Some(Action::Exit(Exit::Model(octet_core::model::Selection {
+                provider: engine,
+                model: None,
+            })))
+        }
+        None => {
+            app.note(format!(
+                "Unknown command {name}. Use /help, or edit the draft: \
+                 only a path such as /usr/lib can start a prompt with a slash. \
+                 /skills lists what each provider offers."
+            ));
+            None
+        }
+    }
 }
 /// `/effort`: show the reasoning effort, or change it. Codex takes it per
 /// turn; Claude takes it at launch, so a change reconnects there.
