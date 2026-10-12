@@ -178,10 +178,18 @@ fn picked_skill(app: &App, item: &str) -> Option<(octet_core::Engine, octet_core
         .find(|(engine, skill)| *engine == provider && skill.name == name)
 }
 /// Enter or Tab on a skills picker line: the draft becomes `/name `, for its arguments.
-/// Nothing runs until the draft is sent.
+/// Nothing runs until the draft is sent. A skill named like an Octet command could never run, so
+/// the draft stays and a hint says why.
 fn choose_skill(app: &mut App, item: Option<String>) {
-    if let Some((_, skill)) = item.and_then(|item| picked_skill(app, &item)) {
-        app.composer.editor.set(format!("/{} ", skill.name));
+    if let Some((engine, skill)) = item.and_then(|item| picked_skill(app, &item)) {
+        if crate::registry::Spec::find(&format!("/{}", skill.name)).is_some() {
+            app.hint(format!(
+                "/{} is an Octet command; the {engine} skill of that name cannot run from Octet",
+                skill.name
+            ));
+        } else {
+            app.composer.editor.set(format!("/{} ", skill.name));
+        }
     }
     app.composer.completion = None;
 }

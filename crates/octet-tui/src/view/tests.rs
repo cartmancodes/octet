@@ -451,6 +451,30 @@ fn the_hint_warns_before_a_provider_switch() {
     );
 }
 #[test]
+fn mid_turn_the_hint_says_the_switch_waits() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CODEX);
+    crate::test_support::idle(&mut app);
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        octet_core::Engine::CLAUDE,
+        &ws,
+        vec![octet_core::SkillInfo {
+            name: "review".into(),
+            description: String::new(),
+            aliases: Vec::new(),
+            argument_hint: String::new(),
+            path: None,
+        }],
+        std::time::SystemTime::now(),
+    );
+    app.event(Event::Started);
+    assert!(app.composer.editor.insert("/review src"));
+    assert_eq!(
+        composer_hint(&app, 100),
+        ("Finish the turn to switch to claude".into(), AMBER)
+    );
+}
+#[test]
 fn chips_have_their_own_row_and_grow_the_box() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     assert_eq!(composer_height(1, false), 4);

@@ -908,6 +908,36 @@ async fn enter_on_another_providers_line_prepares_it_too() {
     assert!(app.pending_skill.is_none());
 }
 #[tokio::test]
+async fn a_picked_skill_named_like_an_octet_command_says_it_cannot_run() {
+    let mut app = skills_app();
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        Engine::CLAUDE,
+        &ws,
+        vec![skill("model", &[], None)],
+        std::time::SystemTime::now(),
+    );
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills model").await;
+    let skills = app.composer.completion.as_ref().expect("picker open");
+    assert!(
+        skills.items[0].starts_with("model · claude"),
+        "{:?}",
+        skills.items
+    );
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert_eq!(
+        app.composer.editor.text(),
+        "/skills model",
+        "the draft stays"
+    );
+    assert_eq!(
+        app.status_line,
+        "/model is an Octet command; the claude skill of that name cannot run from Octet"
+    );
+    assert!(vendor.sent.borrow().is_empty());
+}
+#[tokio::test]
 async fn an_octet_command_never_switches_provider() {
     let mut app = skills_app();
     let ws = app.workspace().to_path_buf();

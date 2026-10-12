@@ -146,8 +146,10 @@ with the draft: 4 rows when empty, up to 7 for a draft of four or more lines
 (one more while the chips row shows), leaving the rest of the screen to the
 conversation. One hint row sits under the draft: `Enter send · Alt+Enter newline · ↑ history · Ctrl+P commands`
 when idle, and `Enter queue · Esc cancel turn · Ctrl+P commands` while a turn
-runs. When the draft names only another provider's skill, the hint turns amber:
-`Enter switches to {provider}, then runs /name`. Above the hint a chips row
+runs.
+When the draft names only another provider's skill, the hint turns amber:
+`Enter switches to {provider}, then runs /name`, or during a turn
+`Finish the turn to switch to {provider}`. Above the hint a chips row
 lists what will go with the next prompt: `+ ls (exit 0) · + image x.png ·
 2 queued`.
 
@@ -495,10 +497,13 @@ bring, and runs them.
   turn, with its arguments. While the draft names only another provider's
   skill, the hint row turns amber: `Enter switches to {provider}, then runs
   /name`. If the switch fails, the skill is not run and a note says so.
-- Typing `/NAME args` runs a skill the current provider lists. Octet's own
-  commands win a clash (`/model` is always Octet's; pick such a skill from
-  `/skills`). Another provider's skill typed by name gets a hint to use
-  `/skills`, and an unknown name the usual error.
+- Typing `/NAME args` runs a skill the current provider lists; typing
+  another provider's skill switches to it on send, as a picked one does
+  (during a turn the hint says `Finish the turn to switch to {provider}`
+  and Enter refuses). An unknown name gets the usual error.
+- Octet's own commands win a clash: `/model` is always Octet's. A skill
+  named like an Octet command cannot run from Octet; picking one in
+  `/skills` leaves the prompt as it was and the status line says so.
 - A skill runs as a turn: it queues behind a running one and can be
   interrupted. Claude receives `/NAME args` as the prompt; Codex a skill
   input naming its `SKILL.md`. The transcript and journal show `/NAME args`.

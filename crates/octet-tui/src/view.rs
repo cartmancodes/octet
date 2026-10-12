@@ -448,11 +448,20 @@ pub(crate) fn chips(app: &App) -> Option<String> {
 pub(crate) fn composer_hint(app: &App, width: u16) -> (String, Color) {
     let draft = app.composer.editor.text();
     if let Some(engine) = crate::commands::foreign_skill(app, draft) {
-        let name = draft.split(char::is_whitespace).next().unwrap_or(draft);
-        return (
-            format!("Enter switches to {engine}, then runs {name}"),
-            AMBER,
-        );
+        // Enter switches only when a reconnect may go; while connecting it says so itself.
+        match crate::commands::can_reconnect(app) {
+            Ok(()) => {
+                let name = draft.split(char::is_whitespace).next().unwrap_or(draft);
+                return (
+                    format!("Enter switches to {engine}, then runs {name}"),
+                    AMBER,
+                );
+            }
+            Err(crate::registry::TURN_OPEN) => {
+                return (format!("Finish the turn to switch to {engine}"), AMBER);
+            }
+            Err(_) => {}
+        }
     }
     let keys: &[&str] = if app.conn.is_running() {
         &["Enter queue", "Esc cancel turn", "Ctrl+P commands"]
