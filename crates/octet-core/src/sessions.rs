@@ -19,14 +19,8 @@ pub struct RecentSession {
     pub summary: JournalSummary,
 }
 
-/// Up to `limit` vendor sessions run in `workspace`, newest first, one entry
-/// per session. Journals of other workspaces, the offline demo, sessions
-/// the vendor never named, and files that are not journals are skipped.
-pub async fn recent_sessions(
-    directory: &Path,
-    workspace: &Path,
-    limit: usize,
-) -> Vec<RecentSession> {
+/// The newest [`SCAN_LIMIT`] journals in `directory`, newest first.
+async fn newest_journals(directory: &Path) -> Vec<PathBuf> {
     let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
         return Vec::new();
     };
@@ -38,8 +32,23 @@ pub async fn recent_sessions(
         }
     }
     journals.sort_unstable_by(|a, b| b.cmp(a));
+    journals
+        .into_iter()
+        .take(SCAN_LIMIT)
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Up to `limit` vendor sessions run in `workspace`, newest first, one entry
+/// per session. Journals of other workspaces, the offline demo, sessions
+/// the vendor never named, and files that are not journals are skipped.
+pub async fn recent_sessions(
+    directory: &Path,
+    workspace: &Path,
+    limit: usize,
+) -> Vec<RecentSession> {
     let mut found: Vec<RecentSession> = Vec::new();
-    for (_, journal) in journals.into_iter().take(SCAN_LIMIT) {
+    for journal in newest_journals(directory).await {
         let Some(summary) = read_summary(&journal).await else {
             continue;
         };
@@ -68,6 +77,19 @@ pub async fn recent_sessions(
             journal,
             summary,
         });
+    }
+    found
+}
+
+/// Workspaces of the newest journals in `directory`, newest first, without repeats.
+pub async fn known_workspaces(directory: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for journal in newest_journals(directory).await {
+        if let Some(summary) = read_summary(&journal).await
+            && !found.contains(&summary.cwd)
+        {
+            found.push(summary.cwd);
+        }
     }
     found
 }
@@ -139,5 +161,23 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn known_workspaces_lists_each_once_newest_first() {
+        let temp = octet_testkit::TempDir::new("octet-core-workspaces");
+        let dir = temp.path();
+        for cwd in ["/a", "/b", "/c", "/b"] {
+            let mut journal = octet_store::Journal::create(dir).await.unwrap();
+            let header =
+                json!({"engine":"codex","cwd":cwd,"resume":null,"model":null,"mode":"ask"});
+            journal.append("session", header, true).await.unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), "not a journal").unwrap();
+        assert_eq!(
+            known_workspaces(dir).await,
+            ["/b", "/c", "/a"].map(PathBuf::from)
+        );
+        assert!(known_workspaces(&dir.join("missing")).await.is_empty());
     }
 }
