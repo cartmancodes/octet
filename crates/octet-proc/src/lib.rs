@@ -433,6 +433,8 @@ impl Drop for Process {
 /// The most frame buffer kept between frames, so one huge frame does not
 /// hold its memory for the rest of the session.
 const FRAME_BUFFER_KEPT: usize = 64 * 1024;
+/// How much of a pipe one read takes, and a new frame buffer's first size.
+const READ_CHUNK: usize = 8192;
 
 async fn read_frames<R: AsyncRead + Unpin>(
     mut stdout: R,
@@ -440,8 +442,8 @@ async fn read_frames<R: AsyncRead + Unpin>(
     permits: Arc<Semaphore>,
     max: usize,
 ) {
-    let mut frame = Vec::with_capacity(max.min(8192));
-    let mut chunk = [0u8; 8192];
+    let mut frame = Vec::with_capacity(max.min(READ_CHUNK));
+    let mut chunk = [0u8; READ_CHUNK];
     loop {
         match stdout.read(&mut chunk).await {
             Ok(0) => {
@@ -513,7 +515,7 @@ async fn read_stderr<R: AsyncRead + Unpin>(
     tail: Arc<Mutex<VecDeque<u8>>>,
     limit: usize,
 ) {
-    let mut chunk = [0u8; 8192];
+    let mut chunk = [0u8; READ_CHUNK];
     loop {
         match stderr.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
