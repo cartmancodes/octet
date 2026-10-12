@@ -2,6 +2,7 @@
 //! A cross-provider switch opens a fresh vendor session; this transcript,
 //! carried inside the first prompt, gives the new model the context.
 use crate::app::{Entry, Role};
+use std::fmt::Write as _;
 
 /// The most transcript text a handoff carries.
 pub(crate) const HANDOFF_BUDGET: usize = 64 * 1024;
@@ -66,14 +67,13 @@ fn block(entry: &Entry) -> Option<String> {
         Role::Assistant if text.trim().is_empty() => return None,
         Role::Assistant => format!("Assistant ({engine}):\n{text}\n"),
         Role::Tool => {
-            let line = text
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(" · ");
-            let line: String = line.chars().take(TOOL_LINE).collect();
-            format!("Tool ({engine}): {line}\n")
+            let mut lines = String::new();
+            for call in &entry.tools {
+                let line = format!("{} · {}", call.name, call.target);
+                let line: String = line.chars().take(TOOL_LINE).collect();
+                let _ = writeln!(lines, "Tool ({engine}): {line}");
+            }
+            lines
         }
         Role::Shell | Role::ShellFailed => {
             let first = text.lines().next().unwrap_or_default();
@@ -173,7 +173,7 @@ pub(crate) fn render<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use octet_core::Engine;
+    use octet_core::{Engine, ToolCall, ToolPhase};
 
     fn entry(role: Role, engine: Engine, text: &str) -> Entry {
         Entry::new(role, engine, text.into())
@@ -198,14 +198,18 @@ mod tests {
 
     #[test]
     fn each_role_renders_as_the_spec_says() {
+        let mut tools = Entry::tools(Engine::CODEX, false);
+        tools.record(ToolCall {
+            id: "1".into(),
+            name: "Bash".into(),
+            target: "cargo build".into(),
+            phase: ToolPhase::Done,
+            detail: String::new(),
+        });
         let entries = [
             user("Fix the build"),
             reply("The import was missing."),
-            entry(
-                Role::Tool,
-                Engine::CODEX,
-                "Bash\n{\"command\":\"cargo build\"}\nmore",
-            ),
+            tools,
             entry(Role::Shell, Engine::CODEX, "$ git status\nclean\nexit 0"),
             entry(Role::Notice, Engine::CODEX, "Model → codex"),
             entry(Role::Error, Engine::CODEX, "boom"),
@@ -217,10 +221,7 @@ mod tests {
             text.contains("Assistant (claude):\nThe import was missing."),
             "{text}"
         );
-        assert!(
-            text.contains("Tool (codex): Bash · {\"command\":\"cargo build\"}"),
-            "{text}"
-        );
+        assert!(text.contains("Tool (codex): Bash · cargo build"), "{text}");
         assert!(text.contains("$ git status · exit 0"), "{text}");
         assert!(
             !text.contains("Model → codex") && !text.contains("boom"),

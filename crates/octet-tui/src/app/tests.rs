@@ -208,3 +208,78 @@ fn only_notable_hooks_reach_the_transcript() {
         app.entries_text()
     );
 }
+
+#[test]
+fn consecutive_calls_share_one_entry_and_ends_replace_starts() {
+    use crate::test_support::tool;
+    use octet_core::ToolPhase::{Done, Running};
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    app.event(tool("1", "Read", "a.rs", Running));
+    app.event(tool("2", "Read", "b.rs", Running));
+    app.event(tool("1", "Read", "a.rs", Done));
+    let entry = app.chat.entries.back().unwrap();
+    assert!(entry.role == Role::Tool);
+    assert_eq!(
+        entry
+            .tools
+            .iter()
+            .map(|c| (c.id.as_str(), c.phase))
+            .collect::<Vec<_>>(),
+        [("1", Done), ("2", Running)]
+    );
+    app.event(Event::Text("then".into()));
+    app.event(tool("3", "Bash", "ls", Running));
+    assert_eq!(
+        app.chat
+            .entries
+            .iter()
+            .filter(|e| e.role == Role::Tool)
+            .count(),
+        2,
+        "text starts a new group"
+    );
+}
+#[test]
+fn an_unmatched_end_is_its_own_call() {
+    use crate::test_support::tool;
+    use octet_core::ToolPhase::{Done, Running};
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(tool("9", "Bash", "ls", Done));
+    app.event(tool("", "Bash", "a", Running));
+    app.event(tool("", "Bash", "a", Done));
+    assert_eq!(
+        app.chat.entries.back().unwrap().tools.len(),
+        3,
+        "an empty ID never pairs"
+    );
+}
+#[test]
+fn cancelled_calls_say_stopped() {
+    use crate::test_support::tool;
+    use octet_core::ToolPhase::Running;
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    app.event(tool("1", "Bash", "sleep 9", Running));
+    app.event(Event::Finished {
+        outcome: octet_core::Outcome::Interrupted,
+    });
+    let rows = app.visible_lines(80, 10);
+    assert!(
+        rows.iter()
+            .any(|r| r.to_string().contains("Bash sleep 9 · stopped")),
+        "{rows:?}"
+    );
+    assert!(app.running_tool().is_none());
+}
+#[test]
+fn tool_bytes_are_counted_and_trimmed() {
+    use crate::test_support::tool;
+    use octet_core::ToolPhase::{Done, Running};
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(tool("1", "Read", "a.rs", Running));
+    let size = app.chat.entries.back().unwrap().size();
+    assert_eq!(app.chat.bytes, size);
+    app.event(tool("1", "Read", "a.rs", Done));
+    assert_eq!(app.chat.bytes, app.chat.entries.back().unwrap().size());
+}
