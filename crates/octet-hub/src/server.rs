@@ -6,10 +6,11 @@
 //! The handshake turns away any request whose `Tailscale-User-Login` header is not exactly the
 //! owner's login (403). A connection then starts unauthenticated and accepts only `hello` (a
 //! device token) and `pair` (a pairing secret); anything else, or a failed `hello` or `pair`,
-//! is refused and the socket closed, as is one silent for 30 seconds. After `hello` it is
-//! authenticated as that device: every frame first checks that the device is still paired (a
-//! revoked one is closed) and takes a token from the device's bucket (60 a minute; an empty
-//! bucket refuses, it does not close).
+//! is refused and the socket closed, as is one silent for 30 seconds; at most 8 may wait at
+//! once. After `hello` it is authenticated as that device: every frame, text or not, first
+//! checks that the device is still paired (a revoked one is dropped at once) and takes a token
+//! from the device's bucket (60 a minute; an empty bucket refuses, it does not close). Every
+//! connection is pinged every 20 seconds, and one that misses two pongs is let go.
 //! Bridge commands go to the session under a hub-wide req and the reply comes back under the
 //! phone's own; one unanswered for 30 seconds is refused for it.
 //!
@@ -21,8 +22,10 @@
 //! resumes from its cursor). When the connection's writer has sent the last replayed frame it
 //! reports the high-water mark, `(index of the journal, seq)` of the last record replayed (or
 //! the cursor, when nothing was), and the hub sends the buffered events past that mark, acks
-//! the subscription and streams live. Live frames go through a queue of 512: a phone that lets
-//! it fill is dropped.
+//! the subscription and streams live. The replay reads files to their end while the tail polls,
+//! so live events at or below the mark can still follow: they are dropped until the first one
+//! past it. Each replay page resumes at the byte where the last stopped. Live frames go through
+//! a queue of 512: a phone that lets it fill is dropped.
 use crate::{
     owner::tailnet_url,
     sessions::{SessionUpdate, Sessions},
@@ -93,6 +96,14 @@ const HANDSHAKE_WITHIN: Duration = Duration::from_secs(10);
 const CLOSE_WITHIN: Duration = Duration::from_secs(2);
 /// Connections open at once; more are turned away at accept.
 const MAX_CONNECTIONS: usize = 64;
+/// Connections that have not said hello yet; more are turned away at accept.
+const MAX_WAITING: usize = 8;
+/// How often a connection is pinged; one that misses two pongs is let go.
+const PING_EVERY: Duration = Duration::from_secs(20);
+/// Unanswered pings after which a connection is let go.
+const MISSED_PONGS: u32 = 2;
+/// How long accepting waits after a failure (out of descriptors, say) before trying again.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Messages from connection tasks waiting for the hub loop.
 const EVENT_QUEUE: usize = 256;
 /// The longest control request, in bytes.
@@ -101,6 +112,8 @@ const CONTROL_LIMIT: u64 = 4096;
 const CONTROL_WITHIN: Duration = Duration::from_secs(5);
 /// The refusal for a device past its bucket.
 const RATE_REFUSED: &str = "Too many commands; wait a minute";
+/// The refusal for a frame that is not text.
+const NOT_TEXT: &str = "Send each message as a text frame";
 /// The refusal for what a later task adds.
 const NOT_YET: &str = "Not yet supported";
 /// The refusal for a command the session did not answer in time.
@@ -111,7 +124,6 @@ const FULL_ACCESS: &str = "Full access needs confirm: \"full access\"";
 const AUDIT_TEXT: usize = 64;
 
 /// What a connection task tells the hub loop.
-#[derive(Debug)]
 enum ConnEvent {
     /// A frame arrived: its text, or `None` for one that is not text.
     Message { conn: u64, text: Option<String> },
@@ -129,12 +141,80 @@ enum ConnEvent {
 }
 
 /// What the hub loop has a connection's writer send, in order.
-#[derive(Debug)]
 enum Out {
     /// A frame.
     Text(String),
     /// The closing handshake, then the end.
     Close,
+}
+
+// A frame can hold a device token, a pairing secret or a `paired` token, so the Debug output
+// of what carries frames shows only their size.
+impl std::fmt::Debug for ConnEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message { conn, text } => f
+                .debug_struct("Message")
+                .field("conn", conn)
+                .field("text", &text.as_ref().map(|t| Redacted(t.len())))
+                .finish(),
+            Self::Replayed {
+                conn,
+                session,
+                generation,
+                last,
+            } => f
+                .debug_struct("Replayed")
+                .field("conn", conn)
+                .field("session", session)
+                .field("generation", generation)
+                .field("last", last)
+                .finish(),
+            Self::Stalled { conn } => f.debug_struct("Stalled").field("conn", conn).finish(),
+            Self::Closed { conn } => f.debug_struct("Closed").field("conn", conn).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Out {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => f.debug_tuple("Text").field(&Redacted(text.len())).finish(),
+            Self::Close => f.write_str("Close"),
+        }
+    }
+}
+
+/// Stands in for a frame in Debug output: its length only.
+struct Redacted(usize);
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
+}
+
+/// Whether a connection still answers pings.
+#[derive(Debug, Default)]
+struct Liveness {
+    /// Pings sent since the last pong.
+    unanswered: u32,
+}
+
+impl Liveness {
+    /// Counts a ping about to be sent; false if too many went unanswered to send another.
+    fn ping(&mut self) -> bool {
+        if self.unanswered >= MISSED_PONGS {
+            return false;
+        }
+        self.unanswered += 1;
+        true
+    }
+
+    /// A pong arrived.
+    fn pong(&mut self) {
+        self.unanswered = 0;
+    }
 }
 
 /// What a replay task has a connection's writer send.
@@ -162,8 +242,33 @@ enum Subscription {
         buffer: Vec<(String, u64, String)>,
         task: AbortHandle,
     },
-    /// Streaming live.
-    Live,
+    /// Streaming live. Until a live event past `mark`, the high-water mark of the replay as
+    /// `(index in journals, seq)`, arrives, events at or below it are repeats of the replay
+    /// (the tail had not read them yet) and are dropped.
+    Live {
+        mark: Option<(usize, u64)>,
+        journals: Vec<String>,
+    },
+}
+
+impl Subscription {
+    /// Whether a live event of `journal` and `seq` goes to the phone; the first past the mark
+    /// clears it.
+    fn admit(&mut self, journal: &str, seq: u64) -> bool {
+        match self {
+            Self::Live { mark, journals } => {
+                let Some(at) = *mark else {
+                    return true;
+                };
+                if !is_past(journals, at, journal, seq) {
+                    return false;
+                }
+                *mark = None;
+                true
+            }
+            Self::Replaying { .. } => false,
+        }
+    }
 }
 
 impl Drop for Subscription {
@@ -307,6 +412,8 @@ impl Hub {
             .map_err(|e| format!("Couldn't read the port: {e}"))?
             .port();
         let (events, mut inbox) = mpsc::channel(EVENT_QUEUE);
+        let (streams, mut accepted) = mpsc::channel(16);
+        let accept_task = tokio::spawn(accept_tcp(listener, streams)).abort_handle();
         let (requests, mut controls) = mpsc::channel(16);
         let control_task = tokio::spawn(serve_control(control, requests)).abort_handle();
         let mut hub = Hub {
@@ -333,11 +440,7 @@ impl Hub {
             // `refresh` is not cancel-safe, so it runs in a handler, never as a branch.
             tokio::select! {
                 () = &mut shutdown => break,
-                accepted = listener.accept() => {
-                    if let Ok((stream, _)) = accepted {
-                        hub.accept(stream);
-                    }
-                }
+                Some(stream) = accepted.recv() => hub.accept(stream),
                 Some(event) = inbox.recv() => hub.on_event(event).await,
                 update = hub.sessions.next() => hub.on_update(update),
                 Some(request) = controls.recv() => hub.on_control(request).await,
@@ -347,6 +450,7 @@ impl Hub {
             }
         }
         control_task.abort();
+        accept_task.abort();
         for (_, conn) in hub.conns.drain() {
             conn.task.abort();
         }
@@ -362,7 +466,8 @@ impl Hub {
 
     /// Starts the task that serves one TCP connection.
     fn accept(&mut self, stream: TcpStream) {
-        if self.conns.len() >= MAX_CONNECTIONS {
+        let waiting = self.conns.values().filter(|c| c.device.is_none()).count();
+        if self.conns.len() >= MAX_CONNECTIONS || waiting >= MAX_WAITING {
             return;
         }
         let conn = self.next_id();
@@ -409,17 +514,13 @@ impl Hub {
         let Some(state) = self.conns.get(&conn) else {
             return;
         };
-        let device = state.device.clone();
-        let Some(text) = text else {
-            self.refuse(conn, 0, "Send each message as a text frame");
-            if device.is_none() {
+        match (state.device.clone(), text) {
+            (None, Some(text)) => self.unauthenticated(conn, &text).await,
+            (None, None) => {
+                self.refuse(conn, 0, NOT_TEXT);
                 self.close(conn);
             }
-            return;
-        };
-        match device {
-            None => self.unauthenticated(conn, &text).await,
-            Some(device) => self.authenticated(conn, &device, &text).await,
+            (Some(device), text) => self.authenticated(conn, &device, text.as_deref()).await,
         }
     }
 
@@ -474,17 +575,23 @@ impl Hub {
     }
 
     /// A frame from a device that said hello.
-    async fn authenticated(&mut self, conn: u64, device: &Device, text: &str) {
+    /// `None` is a frame that was not text: it spends a command and is refused.
+    async fn authenticated(&mut self, conn: u64, device: &Device, text: Option<&str>) {
         self.store.reload_if_changed().await;
         if !self.paired(device) {
-            self.refuse(conn, req_of(text), "This device is no longer paired");
-            self.close(conn);
+            // Revoked: nothing more is written to it.
+            self.drop_conn(conn);
             return;
         }
+        let req = text.map_or(0, req_of);
         if !self.take_token(&device.token_sha256) {
-            self.refuse(conn, req_of(text), RATE_REFUSED);
+            self.refuse(conn, req, RATE_REFUSED);
             return;
         }
+        let Some(text) = text else {
+            self.refuse(conn, 0, NOT_TEXT);
+            return;
+        };
         let (req, command) = match parse_phone(text) {
             Ok(parsed) => parsed,
             Err(reason) => {
@@ -664,9 +771,13 @@ impl Hub {
             return;
         }
         let mark = last.or_else(|| after.take().map(|c| (c.journal, c.seq)));
+        let mark = mark_index(journals, mark);
         let fresh = past_mark(std::mem::take(buffer), journals, mark);
         let req = *req;
-        *subscription = Subscription::Live;
+        *subscription = Subscription::Live {
+            mark,
+            journals: std::mem::take(journals),
+        };
         for frame in fresh {
             self.push(conn, frame);
         }
@@ -726,7 +837,11 @@ impl Hub {
         let (mut live, mut overflowed) = (Vec::new(), Vec::new());
         for (&conn, state) in &mut self.conns {
             match state.subscriptions.get_mut(id) {
-                Some(Subscription::Live) => live.push(conn),
+                Some(live_one @ Subscription::Live { .. }) => {
+                    if live_one.admit(journal, seq) {
+                        live.push(conn);
+                    }
+                }
                 Some(Subscription::Replaying { buffer, .. }) if buffer.len() >= LIVE_BUFFER => {
                     overflowed.push(conn);
                 }
@@ -799,7 +914,7 @@ impl Hub {
             .map(|(&conn, _)| conn)
             .collect();
         for conn in revoked {
-            self.close(conn);
+            self.drop_conn(conn);
         }
     }
 
@@ -891,22 +1006,33 @@ impl Hub {
     }
 }
 
-/// The frames of `buffer`, `(journal, seq, frame)`, that come after `mark`, the last record a
-/// replay of `journals` covered: later in the same journal, or in a later one. An event of a
-/// journal the replay did not know is newer than all it read, and with no mark all are new.
+/// A high-water mark `(journal, seq)` as `(index in journals, seq)`; none for a journal the
+/// replay did not read (or no mark), so that everything counts as past it.
+fn mark_index(journals: &[String], mark: Option<(String, u64)>) -> Option<(usize, u64)> {
+    let (journal, seq) = mark?;
+    Some((journals.iter().position(|j| *j == journal)?, seq))
+}
+
+/// Whether the record `seq` of `journal` comes after `mark` in a replay of `journals`: later
+/// in the same journal, or in a later one. A journal the replay did not know is newer than all
+/// it read.
+fn is_past(journals: &[String], mark: (usize, u64), journal: &str, seq: u64) -> bool {
+    journals
+        .iter()
+        .position(|j| j == journal)
+        .is_none_or(|index| (index, seq) > mark)
+}
+
+/// The frames of `buffer`, `(journal, seq, frame)`, past `mark` (see [`is_past`]); with no
+/// mark, all of them.
 fn past_mark(
     buffer: Vec<(String, u64, String)>,
     journals: &[String],
-    mark: Option<(String, u64)>,
+    mark: Option<(usize, u64)>,
 ) -> Vec<String> {
-    let at = |journal: &str| journals.iter().position(|j| j == journal);
-    let mark = mark.and_then(|(journal, seq)| Some((at(&journal)?, seq)));
     buffer
         .into_iter()
-        .filter(|(journal, seq, _)| match (mark, at(journal)) {
-            (Some(mark), Some(index)) => (index, *seq) > mark,
-            _ => true,
-        })
+        .filter(|(journal, seq, _)| mark.is_none_or(|mark| is_past(journals, mark, journal, *seq)))
         .map(|(_, _, frame)| frame)
         .collect()
 }
@@ -961,6 +1087,21 @@ async fn bind_control(path: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
+/// Accepts TCP connections and hands them to the hub loop.
+async fn accept_tcp(listener: TcpListener, hub: mpsc::Sender<TcpStream>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                if hub.send(stream).await.is_err() {
+                    return;
+                }
+            }
+            // Out of descriptors, say: wait rather than spin.
+            Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
+        }
+    }
+}
+
 /// Accepts control clients, each answered in its own task.
 async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>) {
     loop {
@@ -969,7 +1110,7 @@ async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>) {
                 tokio::spawn(control_client(stream, hub.clone()));
             }
             // Out of descriptors, say: wait rather than spin.
-            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
         }
     }
 }
@@ -1054,8 +1195,11 @@ async fn replay(job: ReplayJob) {
         events,
     } = job;
     let mut last = None;
+    let mut offset = 0;
     loop {
-        let (page, more) = tail::replay(&journals, after.as_ref(), REPLAY_PAGE).await;
+        let (page, more, end) =
+            tail::replay_from(&journals, after.as_ref(), offset, REPLAY_PAGE).await;
+        offset = end;
         let Some((journal, seq, _)) = page.last() else {
             break;
         };
@@ -1151,13 +1295,27 @@ async fn pump(
     events: &mpsc::Sender<ConnEvent>,
 ) {
     let mut replaying = true;
+    let mut alive = Liveness::default();
+    let mut pings = interval_at(Instant::now() + PING_EVERY, PING_EVERY);
+    pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = pings.tick() => {
+                // A connection that stopped answering (a phone gone behind tailscaled) ends.
+                let sent = timeout(WRITE_STALL, ws.send(Message::Ping(Vec::new().into()))).await;
+                if !alive.ping() || !sent.is_ok_and(|sent| sent.is_ok()) {
+                    return;
+                }
+            }
             incoming = ws.next() => {
                 let text = match incoming {
                     Some(Ok(Message::Text(text))) => Some(text.as_str().to_owned()),
                     Some(Ok(Message::Binary(_))) => None,
-                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
+                    Some(Ok(Message::Pong(_))) => {
+                        alive.pong();
+                        continue;
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Frame(_))) => continue,
                     Some(Ok(Message::Close(_)) | Err(_)) | None => return,
                 };
                 if events.send(ConnEvent::Message { conn, text }).await.is_err() {
@@ -1218,15 +1376,20 @@ mod tests {
         let journals = ["a".to_owned(), "b".to_owned()];
         let buffer = || buffered(&[("a", 4), ("a", 5), ("b", 0), ("b", 1), ("c", 0)]);
         // Replayed up to a/5: the rest of a is a repeat; b and the unknown c are new.
-        let kept = past_mark(buffer(), &journals, Some(("a".into(), 5)));
+        let kept = past_mark(buffer(), &journals, Some((0, 5)));
         assert_eq!(kept, ["b0", "b1", "c0"]);
         // Replayed into b: everything of a is older.
-        let kept = past_mark(buffer(), &journals, Some(("b".into(), 0)));
+        let kept = past_mark(buffer(), &journals, Some((1, 0)));
         assert_eq!(kept, ["b1", "c0"]);
         // Nothing replayed and no cursor, or a mark in no journal of the replay: all are new.
         assert_eq!(past_mark(buffer(), &journals, None).len(), 5);
         assert_eq!(
-            past_mark(buffer(), &journals, Some(("gone".into(), 9))).len(),
+            past_mark(
+                buffer(),
+                &journals,
+                mark_index(&journals, Some(("gone".into(), 9)))
+            )
+            .len(),
             5
         );
     }
@@ -1243,5 +1406,60 @@ mod tests {
         assert!(!bucket.take(second));
         let later = second + Duration::from_secs(600);
         assert_eq!((0..100).filter(|_| bucket.take(later)).count(), 60);
+    }
+
+    #[test]
+    fn a_live_subscription_drops_repeats_until_past_its_mark() {
+        // The replay ended at a/5, and the tail had not yet emitted a/4 and a/5.
+        let journals = vec!["a".to_owned(), "b".to_owned()];
+        let mut live = Subscription::Live {
+            mark: Some((0, 5)),
+            journals,
+        };
+        assert!(!live.admit("a", 4));
+        assert!(!live.admit("a", 5));
+        assert!(live.admit("a", 6));
+        // Past the mark once, everything after is new.
+        assert!(live.admit("b", 0));
+        assert!(live.admit("a", 1));
+        // A journal the replay did not know is past the mark.
+        let mut live = Subscription::Live {
+            mark: Some((1, 9)),
+            journals: vec!["a".to_owned(), "b".to_owned()],
+        };
+        assert!(!live.admit("a", 99));
+        assert!(live.admit("c", 0));
+        let mut unmarked = Subscription::Live {
+            mark: None,
+            journals: Vec::new(),
+        };
+        assert!(unmarked.admit("a", 0));
+    }
+
+    #[test]
+    fn a_connection_that_misses_two_pongs_is_let_go() {
+        let mut alive = Liveness::default();
+        assert!(alive.ping(), "first ping");
+        assert!(alive.ping(), "one missed pong is forgiven");
+        assert!(!alive.ping(), "two missed pongs end it");
+        let mut alive = Liveness::default();
+        for _ in 0..10 {
+            assert!(alive.ping());
+            alive.pong();
+        }
+    }
+
+    #[test]
+    fn debug_output_never_shows_what_a_phone_sent_or_was_sent() {
+        let secret = "f00dfeed".repeat(8);
+        let message = ConnEvent::Message {
+            conn: 3,
+            text: Some(format!("{{\"type\":\"hello\",\"token\":\"{secret}\"}}")),
+        };
+        let paired = Out::Text(format!("{{\"type\":\"paired\",\"token\":\"{secret}\"}}"));
+        for shown in [format!("{message:?}"), format!("{paired:?}")] {
+            assert!(!shown.contains(&secret), "{shown}");
+            assert!(shown.contains("bytes"), "{shown}");
+        }
     }
 }

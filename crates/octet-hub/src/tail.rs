@@ -177,11 +177,29 @@ async fn whole_lines_end(path: &Path) -> std::io::Result<u64> {
 /// as the next cursor. No cursor, or a cursor naming no journal here (the phone's list is
 /// stale), gives the newest journal's last `limit` records and `more` false. Journals are read
 /// a line at a time, never whole; unreadable journals and half-written lines are passed over.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the server pages with replay_from")
+)]
 pub(crate) async fn replay(
     journals: &[PathBuf],
     after: Option<&Cursor>,
     limit: usize,
 ) -> (Vec<(String, u64, Value)>, bool) {
+    let (records, more, _) = replay_from(journals, after, 0, limit).await;
+    (records, more)
+}
+
+/// [`replay`], starting the cursor's journal at byte `offset` (the offset a previous page
+/// returned; 0 for the first page), and also returning the offset just past the last record's
+/// line, within that record's journal, so the next page reads on from there instead of from
+/// the start. An offset past the end of the file (a replaced journal) reads it from the start.
+pub(crate) async fn replay_from(
+    journals: &[PathBuf],
+    after: Option<&Cursor>,
+    offset: u64,
+    limit: usize,
+) -> (Vec<(String, u64, Value)>, bool, u64) {
     let found = after.and_then(|cursor| {
         let at = journals
             .iter()
@@ -192,19 +210,54 @@ pub(crate) async fn replay(
     let Some((at, seq)) = found else {
         if let Some(newest) = journals.last() {
             // The deque keeps only the newest `limit`, whatever the journal's length.
-            journal_records(newest, None, limit, true, &mut records).await;
+            let from = Start {
+                after: None,
+                offset: 0,
+            };
+            journal_records(newest, from, limit, true, &mut records).await;
         }
-        return (records.into(), false);
+        let end = records.back().map_or(0, |r: &Found| r.3);
+        return (strip(records), false, end);
     };
     for (n, path) in journals[at..].iter().enumerate() {
-        journal_records(path, (n == 0).then_some(seq), limit, false, &mut records).await;
+        let from = if n == 0 {
+            Start {
+                after: Some(seq),
+                offset,
+            }
+        } else {
+            Start {
+                after: None,
+                offset: 0,
+            }
+        };
+        journal_records(path, from, limit, false, &mut records).await;
         if records.len() > limit {
             break;
         }
     }
     let more = records.len() > limit;
     records.truncate(limit);
-    (records.into(), more)
+    let end = records.back().map_or(offset, |r| r.3);
+    (strip(records), more, end)
+}
+
+/// A record found by a replay, and the byte offset just past its line.
+type Found = (String, u64, Value, u64);
+
+/// Where to start reading one journal: after which `seq`, from which byte.
+#[derive(Debug, Clone, Copy)]
+struct Start {
+    after: Option<u64>,
+    offset: u64,
+}
+
+/// The records without their offsets.
+fn strip(records: VecDeque<Found>) -> Vec<(String, u64, Value)> {
+    records
+        .into_iter()
+        .map(|(journal, seq, event, _)| (journal, seq, event))
+        .collect()
 }
 
 /// A journal's file name; what a cursor calls the journal.
@@ -215,36 +268,48 @@ pub(crate) fn file_name(journal: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Appends to `out` the records of one journal after `after`, a line at a time. With `newest`
+/// Appends to `out` the records of one journal from `from`, a line at a time. With `newest`
 /// the last `keep` records of the whole journal are kept; otherwise it stops once `out` holds
 /// more than `keep`.
 async fn journal_records(
     path: &Path,
-    after: Option<u64>,
+    from: Start,
     keep: usize,
     newest: bool,
-    out: &mut VecDeque<(String, u64, Value)>,
+    out: &mut VecDeque<Found>,
 ) {
-    let Ok(file) = File::open(path).await else {
+    let Ok(mut file) = File::open(path).await else {
         return;
     };
-    if !file.metadata().await.is_ok_and(|m| m.is_file()) {
+    let Ok(meta) = file.metadata().await else {
+        return;
+    };
+    if !meta.is_file() {
+        return;
+    }
+    let mut position = if from.offset <= meta.len() {
+        from.offset
+    } else {
+        0
+    };
+    if file.seek(SeekFrom::Start(position)).await.is_err() {
         return;
     }
     let name = file_name(path);
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
-    while let Some(whole) = next_line(&mut reader, &mut line).await {
+    while let Some((whole, read)) = next_line(&mut reader, &mut line).await {
+        position += read;
         let parsed = whole
             .then(|| serde_json::from_slice::<Value>(&line).ok())
             .flatten();
         let Some((seq, event)) = parsed.as_ref().and_then(event_of) else {
             continue;
         };
-        if after.is_some_and(|after| seq <= after) {
+        if from.after.is_some_and(|after| seq <= after) {
             continue;
         }
-        out.push_back((name.clone(), seq, event));
+        out.push_back((name.clone(), seq, event, position));
         if out.len() > keep {
             if !newest {
                 return;
@@ -254,10 +319,10 @@ async fn journal_records(
     }
 }
 
-/// Reads the next line of `reader` into `line` (newline removed). `Some(true)` is a line to
-/// use, `Some(false)` one passed over because it is over `LINE_CAP`; `None` is the end of the
-/// file, or a last line whose newline has not been written yet.
-async fn next_line(reader: &mut BufReader<File>, line: &mut Vec<u8>) -> Option<bool> {
+/// Reads the next line of `reader` into `line` (newline removed), with the bytes it took.
+/// `true` is a line to use, `false` one passed over because it is over `LINE_CAP`; `None` is
+/// the end of the file, or a last line whose newline has not been written yet.
+async fn next_line(reader: &mut BufReader<File>, line: &mut Vec<u8>) -> Option<(bool, u64)> {
     line.clear();
     let limit = LINE_CAP as u64 + 1;
     let read = (&mut *reader)
@@ -270,12 +335,13 @@ async fn next_line(reader: &mut BufReader<File>, line: &mut Vec<u8>) -> Option<b
     }
     if line.last() == Some(&b'\n') {
         line.pop();
-        return Some(true);
+        return Some((true, read as u64));
     }
     if line.len() as u64 <= LINE_CAP as u64 {
         return None;
     }
     // Over the cap: pass over the rest of the line.
+    let mut taken = read as u64;
     loop {
         let buffered = reader.fill_buf().await.ok()?;
         if buffered.is_empty() {
@@ -283,9 +349,10 @@ async fn next_line(reader: &mut BufReader<File>, line: &mut Vec<u8>) -> Option<b
         }
         if let Some(end) = buffered.iter().position(|&b| b == b'\n') {
             reader.consume(end + 1);
-            return Some(false);
+            return Some((false, taken + end as u64 + 1));
         }
         let all = buffered.len();
+        taken += all as u64;
         reader.consume(all);
     }
 }
@@ -502,5 +569,53 @@ mod tests {
             got,
             vec![serde_json::json!({"seq": 2}), serde_json::json!({"seq": 3})]
         );
+    }
+
+    #[tokio::test]
+    async fn a_page_resumes_at_its_byte_offset() {
+        let dir = temp("octet-hub-resume");
+        let a = journal(dir.path(), "a.jsonl", 0..10);
+        let b = journal(dir.path(), "b.jsonl", 0..3);
+        let line = |seq: u64| {
+            format!(
+                "{{\"format\":\"octet-preview-1\",\"type\":\"t\",\"data\":null,\"seq\":{seq}}}\n"
+            )
+            .len() as u64
+        };
+        let journals = [a.clone(), b];
+        let (page, more, offset) = replay_from(&journals, Some(&after("a.jsonl", 0)), 0, 4).await;
+        assert_eq!(
+            marks(&page),
+            ["a.jsonl1", "a.jsonl2", "a.jsonl3", "a.jsonl4"]
+        );
+        assert!(more);
+        // The offset is just past the last record's line: lines 0..=4 of a.
+        assert_eq!(offset, (0..5).map(line).sum::<u64>());
+        // Resuming there reads on from that byte: a line before it, even with a later seq, is
+        // not read again.
+        let mut text = std::fs::read_to_string(&a).unwrap();
+        let swapped = text.replacen("\"seq\":2}", "\"seq\":99}", 1);
+        assert_ne!(swapped, text);
+        text = swapped;
+        std::fs::write(&a, &text).unwrap();
+        let (page, more, offset) =
+            replay_from(&journals, Some(&after("a.jsonl", 4)), offset, 4).await;
+        assert_eq!(
+            marks(&page),
+            ["a.jsonl5", "a.jsonl6", "a.jsonl7", "a.jsonl8"]
+        );
+        assert!(more);
+        // Across a journal boundary the offset is within the journal of the last record.
+        let (page, more, offset) =
+            replay_from(&journals, Some(&after("a.jsonl", 8)), offset, 2).await;
+        assert_eq!(marks(&page), ["a.jsonl9", "b.jsonl0"]);
+        assert!(more);
+        assert_eq!(offset, line(0));
+        let (page, more, _) = replay_from(&journals, Some(&after("b.jsonl", 0)), offset, 5).await;
+        assert_eq!(marks(&page), ["b.jsonl1", "b.jsonl2"]);
+        assert!(!more);
+        // An offset past the end of a replaced, shorter file starts it over.
+        let (page, _, _) = replay_from(&journals, Some(&after("b.jsonl", 0)), 1 << 40, 5).await;
+        assert_eq!(marks(&page), ["b.jsonl1", "b.jsonl2"]);
     }
 }

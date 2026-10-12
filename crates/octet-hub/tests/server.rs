@@ -145,16 +145,21 @@ impl Env {
 
     /// Pairs a phone called `name` and returns its token.
     async fn pair(&self, name: &str) -> String {
+        let mut phone = connect(self.port, Some(OWNER)).await.expect("connects");
+        self.pair_on(&mut phone, name).await
+    }
+
+    /// Pairs a phone called `name` over `phone` and returns its token.
+    async fn pair_on(&self, phone: &mut Phone, name: &str) -> String {
         let secret = self.control(json!({"type": "pair_secret"})).await;
         let secret = secret["secret"].as_str().expect("a secret").to_owned();
-        let mut phone = connect(self.port, Some(OWNER)).await.expect("connects");
         send(
-            &mut phone,
+            phone,
             json!({"v": 1, "req": 1, "type": "pair", "secret": secret, "name": name,
                 "platform": "ios"}),
         )
         .await;
-        let paired = recv(&mut phone).await;
+        let paired = recv(phone).await;
         assert_eq!(paired["type"], "paired", "{paired}");
         assert_eq!(paired["device"], name);
         paired["token"].as_str().expect("a token").to_owned()
@@ -399,6 +404,22 @@ async fn unauthenticated_and_flooding_clients_are_refused() {
         .count();
     assert!(limited >= 39, "{reasons:?}");
 
+    // Frames that are not text spend the bucket too.
+    let (mut binary, _) = env.phone("Binary phone").await;
+    for _ in 0..60 {
+        binary
+            .send(Message::binary(vec![1, 2, 3]))
+            .await
+            .expect("send");
+    }
+    for _ in 0..60 {
+        let frame = recv_kind(&mut binary, "refused").await;
+        assert_eq!(frame["reason"], "Send each message as a text frame");
+    }
+    send(&mut binary, prompt(7, "nobody")).await;
+    let frame = recv_kind(&mut binary, "refused").await;
+    assert_eq!(frame["reason"], "Too many commands; wait a minute");
+
     // A frame over the limit closes the connection.
     let (mut big, _) = env.phone("Big phone").await;
     let text = "x".repeat(200 * 1024);
@@ -471,6 +492,16 @@ async fn subscribe_replays_then_streams() {
     assert_eq!(recv(&mut fresh).await, ack(5, "Subscribed"));
     send(&mut fresh, subscribe(6, "nobody", None)).await;
     assert_eq!(recv(&mut fresh).await, refused(6, "No such session"));
+
+    // A record the replay reads before the tail does (it polls every 100 ms) arrives once.
+    let (mut racer, _) = hello(env.port, &token).await;
+    env.journal(JOURNAL, 7..8);
+    send(&mut racer, subscribe(7, &bridge.id, Some(6))).await;
+    assert_eq!(recv(&mut racer).await["seq"], 7);
+    assert_eq!(recv(&mut racer).await, ack(7, "Subscribed"));
+    assert!(quiet(&mut racer).await, "the tail's copy of 7 is a repeat");
+    env.journal(JOURNAL, 8..9);
+    assert_eq!(recv(&mut racer).await["seq"], 8);
 }
 
 #[tokio::test]
@@ -680,4 +711,27 @@ async fn a_long_replay_hands_over_to_live_without_gaps_or_repeats() {
         assert_eq!(recv_kind(&mut phone, "ack").await, ack(2, "Subscribed"));
     }
     assert!(quiet(&mut phone).await);
+}
+
+#[tokio::test]
+async fn connections_that_never_say_hello_are_capped() {
+    let mut env = Env::new();
+    env.start().await;
+    let mut waiting = Vec::new();
+    for _ in 0..8 {
+        waiting.push(connect(env.port, Some(OWNER)).await.expect("connects"));
+    }
+    assert!(
+        connect(env.port, Some(OWNER)).await.is_err(),
+        "a ninth silent connection is turned away"
+    );
+    // One that pairs and says hello leaves the waiting room, and another can come in.
+    let token = env.pair_on(&mut waiting[0], "Test phone").await;
+    send(
+        &mut waiting[0],
+        json!({"v": 1, "req": 2, "type": "hello", "token": token}),
+    )
+    .await;
+    assert_eq!(recv(&mut waiting[0]).await["type"], "welcome");
+    assert!(connect(env.port, Some(OWNER)).await.is_ok());
 }
