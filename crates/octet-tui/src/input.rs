@@ -214,26 +214,42 @@ pub(crate) fn run_skill(
     skill: &octet_core::SkillInfo,
     args: &str,
 ) -> bool {
+    if !can_take_a_turn(app) {
+        return false;
+    }
     let prompt = Prompt::skill(skill, args);
-    if app.conn.is_running() {
-        if app.composer.queue.len() >= QUEUE_LIMIT {
-            app.status_line = format!(
-                "The queue is full ({QUEUE_LIMIT} prompts); wait for the turn or press Esc"
-            );
-            return false;
-        }
-        app.composer.queue.push_back(prompt.clone());
-        app.hint(format!("Queued ({} waiting)", app.composer.queue.len()));
-    } else if !app.is_idle() {
+    let display = prompt.display().to_owned();
+    if !send_or_queue(app, vendor, prompt) {
+        return false;
+    }
+    app.remember(display);
+    true
+}
+/// Whether a new turn can go now or wait in the queue; a notice when not
+/// (not connected, or the queue is full).
+fn can_take_a_turn(app: &mut App) -> bool {
+    if !app.is_idle() && !app.conn.is_running() {
         app.hint(crate::registry::NOT_CONNECTED);
         return false;
-    } else if let Err(error) =
-        app.begin_turn(vendor, prompt.clone().into_command(), By::User, "sending")
-    {
+    }
+    if app.conn.is_running() && app.composer.queue.len() >= QUEUE_LIMIT {
+        app.status_line =
+            format!("The queue is full ({QUEUE_LIMIT} prompts); wait for the turn or press Esc");
+        return false;
+    }
+    true
+}
+/// Starts `prompt`'s turn, or queues it while one runs. False, with the
+/// error, when the session refused it.
+fn send_or_queue(app: &mut App, vendor: &dyn Vendor, prompt: Prompt) -> bool {
+    if app.conn.is_running() {
+        // The running turn keeps going; this one goes when it ends.
+        app.composer.queue.push_back(prompt);
+        app.hint(format!("Queued ({} waiting)", app.composer.queue.len()));
+    } else if let Err(error) = app.begin_turn(vendor, prompt.into_command(), By::User, "sending") {
         app.error(error.to_string());
         return false;
     }
-    app.remember(prompt.display);
     true
 }
 /// The model picker is open on a draft that already names a model exactly:
@@ -773,24 +789,17 @@ pub(crate) fn compose(app: &App, draft: &str) -> Result<Prompt, String> {
             octet_core::PROMPT_LIMIT / 1024
         ));
     }
-    Ok(Prompt {
+    Ok(Prompt::Text {
         wire,
         display,
         images: app.composer.images.clone(),
-        skill: None,
     })
 }
 /// Sends `draft` as a prompt, or queues it behind the running turn. Its
 /// attachments go with it, and it joins the history. False, with a notice,
 /// when it could not go.
 pub(crate) fn submit(app: &mut App, vendor: &dyn Vendor, draft: String) -> bool {
-    if !app.is_idle() && !app.conn.is_running() {
-        app.hint(crate::registry::NOT_CONNECTED);
-        return false;
-    }
-    if app.conn.is_running() && app.composer.queue.len() >= QUEUE_LIMIT {
-        app.status_line =
-            format!("The queue is full ({QUEUE_LIMIT} prompts); wait for the turn or press Esc");
+    if !can_take_a_turn(app) {
         return false;
     }
     let prompt = match compose(app, &draft) {
@@ -800,12 +809,7 @@ pub(crate) fn submit(app: &mut App, vendor: &dyn Vendor, draft: String) -> bool 
             return false;
         }
     };
-    if app.conn.is_running() {
-        // The running turn keeps going; this one goes when it ends.
-        app.composer.queue.push_back(prompt);
-        app.hint(format!("Queued ({} waiting)", app.composer.queue.len()));
-    } else if let Err(error) = app.begin_turn(vendor, prompt.into_command(), By::User, "sending") {
-        app.error(error.to_string());
+    if !send_or_queue(app, vendor, prompt) {
         return false;
     }
     app.composer.attachments.clear();

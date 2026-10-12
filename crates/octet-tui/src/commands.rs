@@ -450,7 +450,7 @@ fn queue_command(app: &mut App, argument: &str) {
 
 /// A queued prompt's first line, as the queue lists it.
 fn queued_text(prompt: &crate::vendor::Prompt) -> String {
-    cut(prompt.display.lines().next().unwrap_or(""), 60)
+    cut(prompt.display().lines().next().unwrap_or(""), 60)
 }
 
 fn model_command(app: &mut App, argument: &str) -> Action {

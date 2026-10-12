@@ -347,10 +347,17 @@ async fn image_attaches_and_shows_in_the_title() {
     assert!(app.composer.editor.insert("look"));
     key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
     assert!(app.composer.images.is_empty());
-    let queued = app.composer.queue.front().unwrap();
-    assert_eq!(queued.wire, "look");
-    assert_eq!(queued.display, "look\n[+ image shot.png]");
-    assert_eq!(queued.images.len(), 1);
+    let Some(Prompt::Text {
+        wire,
+        display,
+        images,
+    }) = app.composer.queue.front()
+    else {
+        panic!("a text prompt is queued")
+    };
+    assert_eq!(wire, "look");
+    assert_eq!(display, "look\n[+ image shot.png]");
+    assert_eq!(images.len(), 1);
 }
 #[tokio::test]
 async fn oversized_or_unknown_images_are_refused() {
@@ -863,4 +870,29 @@ async fn a_typed_skill_that_cannot_go_keeps_the_draft() {
         commands::try_command(&mut app, &RecordingVendor::default(), "/imagegen a cat").await;
     assert!(action.is_none(), "the draft stays to send later");
     assert_eq!(app.composer.queue.len(), crate::app::QUEUE_LIMIT);
+}
+#[tokio::test]
+async fn a_skill_typed_during_a_turn_queues_and_goes_when_it_ends() {
+    let mut app = app();
+    crate::test_support::idle(&mut app);
+    app.conn.skills = vec![skill("imagegen", &[], Some("/s/imagegen/SKILL.md"))];
+    app.conn.start_turn();
+    let vendor = RecordingVendor::default();
+    commands::try_command(&mut app, &vendor, "/imagegen a cat").await;
+    assert!(vendor.sent.borrow().is_empty(), "it waits for the turn");
+    assert_eq!(app.composer.queue.len(), 1);
+    crate::session_event(
+        &mut app,
+        &vendor,
+        octet_core::Event::Finished {
+            outcome: octet_core::Outcome::Completed,
+        },
+    )
+    .await;
+    assert!(
+        matches!(&vendor.sent.borrow()[..], [Command::Skill { name, args, path: Some(_), display, .. }]
+            if name == "imagegen" && args == "a cat" && display == "/imagegen a cat"),
+        "{:?}",
+        vendor.sent.borrow()
+    );
 }

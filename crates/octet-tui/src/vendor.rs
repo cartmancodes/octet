@@ -21,32 +21,33 @@ impl Vendor for Handle {
     }
 }
 
-/// A prompt as the user sent it: what the vendor receives, what the
-/// transcript shows, and the images that go with it.
+/// A turn as the user asked for it: typed text, or a skill run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Prompt {
-    pub(crate) wire: String,
-    pub(crate) display: String,
-    pub(crate) images: Vec<ImageAttachment>,
-    /// A skill to run, with `wire` as its arguments.
-    pub(crate) skill: Option<SkillCall>,
-}
-
-/// The skill a queued prompt runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SkillCall {
-    pub(crate) name: String,
-    pub(crate) path: Option<std::path::PathBuf>,
+pub(crate) enum Prompt {
+    /// What the vendor receives, what the transcript shows, and the images
+    /// that go with it.
+    Text {
+        wire: String,
+        display: String,
+        images: Vec<ImageAttachment>,
+    },
+    /// The vendor's skill `name` (at `path`, on Codex) run with `args`,
+    /// shown as `display`.
+    Skill {
+        name: String,
+        path: Option<std::path::PathBuf>,
+        args: String,
+        display: String,
+    },
 }
 
 impl Prompt {
     /// A prompt sent and shown as typed, without images.
     pub(crate) fn plain(text: String) -> Self {
-        Self {
+        Self::Text {
             wire: text.clone(),
             display: text,
             images: Vec::new(),
-            skill: None,
         }
     }
 
@@ -57,35 +58,50 @@ impl Prompt {
         } else {
             format!("/{} {args}", skill.name)
         };
-        Self {
-            wire: args.to_owned(),
+        Self::Skill {
+            name: skill.name.clone(),
+            path: skill.path.clone(),
+            args: args.to_owned(),
             display,
-            images: Vec::new(),
-            skill: Some(SkillCall {
-                name: skill.name.clone(),
-                path: skill.path.clone(),
-            }),
+        }
+    }
+
+    /// What the transcript, the queue and the history show.
+    pub(crate) fn display(&self) -> &str {
+        match self {
+            Self::Text { display, .. } | Self::Skill { display, .. } => display,
         }
     }
 
     /// The command that sends it.
     pub(crate) fn into_command(self) -> Command {
-        if let Some(skill) = self.skill {
-            Command::Skill {
-                name: skill.name,
-                path: skill.path,
-                args: self.wire,
-                display: self.display,
+        match self {
+            Self::Skill {
+                name,
+                path,
+                args,
+                display,
+            } => Command::Skill {
+                name,
+                path,
+                args,
+                display,
                 context: None,
-            }
-        } else if self.wire == self.display && self.images.is_empty() {
-            Command::Prompt(self.wire)
-        } else {
-            Command::PromptWithDisplay {
-                wire: self.wire,
-                display: self.display,
-                images: self.images,
-            }
+            },
+            Self::Text {
+                wire,
+                display,
+                images,
+            } if wire == display && images.is_empty() => Command::Prompt(wire),
+            Self::Text {
+                wire,
+                display,
+                images,
+            } => Command::PromptWithDisplay {
+                wire,
+                display,
+                images,
+            },
         }
     }
 }
