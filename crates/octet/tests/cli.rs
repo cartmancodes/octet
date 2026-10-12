@@ -58,3 +58,13 @@ fn help_lists_version() {
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(help.contains("--version"), "{help}");
 }
+
+#[test]
+fn help_lists_the_remote_switch() {
+    let help = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--no-remote"), "{help}");
+}

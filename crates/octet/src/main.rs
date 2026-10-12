@@ -16,7 +16,7 @@ fn help() -> String {
         "                 [--model MODEL] [--mode MODE] [--resume VENDOR_SESSION_ID]",
         "                 [--binary PATH] [--journal-dir PATH]",
         "                 [--approval-timeout SECONDS] [--effort LEVEL]",
-        "                 [--no-plugins] [--no-plugin-hooks]",
+        "                 [--no-plugins] [--no-plugin-hooks] [--no-remote]",
         "                 [--print PROMPT|- [--output text|json] | --rpc]",
         "       octet --version | --help",
         "",
@@ -29,6 +29,8 @@ fn help() -> String {
         "Defaults: Codex, current directory. Vendor CLI installation and login required.",
         "Modes: ask (default) · accept-edits · auto (vendor auto-review) · full-access",
         "Use --engine demo for an offline interactive preview.",
+        "Remote: the interface shares its session with `octet hub` over a private socket;",
+        "--no-remote turns that off.",
         "Plugins: the vendor's enabled plugins load (Claude's from its settings'",
         "enabledPlugins); --no-plugins turns them off, --no-plugin-hooks only their hooks.",
         "",
@@ -131,10 +133,16 @@ async fn run() -> Result<i32, CliError> {
             CliError::Usage("Set --journal-dir or HOME to choose transcript storage".into())
         })?;
     let result = match args.run {
-        Run::Interface => octet_tui::run(config, directory)
-            .await
-            .map(|()| 0)
-            .map_err(|e| e.to_string()),
+        Run::Interface => octet_tui::run(
+            config,
+            directory,
+            octet_tui::Options {
+                remote: args.remote,
+            },
+        )
+        .await
+        .map(|()| 0)
+        .map_err(|e| e.to_string()),
         Run::Print { prompt, json } => {
             let prompt = match prompt {
                 Prompt::Text(text) => text,

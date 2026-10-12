@@ -67,6 +67,8 @@ pub(crate) struct Args {
     pub(crate) approval_timeout: Duration,
     pub(crate) effort: Option<String>,
     pub(crate) plugins: Plugins,
+    /// Whether the terminal interface shares its session with a hub.
+    pub(crate) remote: bool,
     pub(crate) run: Run,
 }
 
@@ -139,6 +141,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
     let mut approval_timeout = octet_core::DEFAULT_APPROVAL_TIMEOUT;
     let mut effort = None;
     let mut plugins = Plugins::default();
+    let mut remote = true;
     let mut print = None;
     let mut output = None;
     let mut rpc = false;
@@ -160,6 +163,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
             "--rpc" => rpc = true,
             "--no-plugins" => plugins.load = false,
             "--no-plugin-hooks" => plugins.hooks = false,
+            "--no-remote" => remote = false,
             "--engine" => engine = text(&mut args, name)?,
             "--binary" => binary = Some(PathBuf::from(value(&mut args, name)?)),
             "--cwd" => cwd = Some(PathBuf::from(value(&mut args, name)?)),
@@ -237,6 +241,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
         approval_timeout,
         effort,
         plugins,
+        remote,
         run,
     })))
 }
@@ -325,6 +330,11 @@ mod tests {
         let no_hooks = args(&["--no-plugin-hooks"]).plugins;
         assert!(no_hooks.load && !no_hooks.hooks);
         assert!(!args(&["--no-plugins"]).config("/tmp".into()).plugins.load);
+    }
+    #[test]
+    fn remote_control_is_on_unless_turned_off() {
+        assert!(args(&[]).remote);
+        assert!(!args(&["--no-remote"]).remote);
     }
     #[test]
     fn defaults_are_codex_in_ask_mode_with_the_interface() {

@@ -1,6 +1,7 @@
 //! The terminal interface: the session loop that joins keys, vendor events,
 //! `!` commands and the screen.
 mod app;
+mod bridge;
 mod clipboard;
 mod commands;
 mod composer;
@@ -22,6 +23,7 @@ mod text;
 mod vendor;
 mod view;
 use app::App;
+use bridge::Bridge;
 use commands::goal_send_failed;
 use octet_core::goal::Next;
 use octet_core::{Command, Config, Session};
@@ -76,29 +78,27 @@ pub(crate) enum Exit {
 pub fn command_names() -> impl Iterator<Item = &'static str> {
     COMMANDS.iter().map(|spec| spec.name)
 }
+/// What the interface is started with, beyond the session's configuration.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Share the session with a hub over a private socket (off with `--no-remote`).
+    pub remote: bool,
+}
+
 /// Runs the interface until the user quits. When a session ends for a
 /// reconnect (`/new`, `/reconnect`, `/model`, `/mode`, `/effort`, `/fork`,
 /// `/resume`), `reconnect::plan` decides the next one. Journals go in
-/// `directory`.
+/// `directory`, and so does the run directory the bridge listens in.
 ///
 /// # Errors
 ///
 /// Fails if the terminal cannot be set up or read, or a session cannot
 /// start (for example, the journal directory is not writable).
-pub async fn run(mut config: Config, directory: PathBuf) -> io::Result<()> {
-    let old = std::panic::take_hook();
-    let owner = std::thread::current().id();
-    std::panic::set_hook(Box::new(move |info| {
-        if panic_restores_terminal(owner) {
-            TerminalGuard::restore();
-        }
-        old(info);
-    }));
+pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io::Result<()> {
+    restore_terminal_on_panic();
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut retained_app: Option<App> = None;
-    // Shown in a fresh interface, after a switch that drops the transcript.
-    let mut opening_notice: Option<String> = None;
     let mut binaries = std::collections::HashMap::from([(config.engine, config.binary.clone())]);
     let goal_store = octet_core::goal::GoalStore::new(&directory, &config.cwd);
     // Registered once: a signal that arrives while one session ends and the
@@ -108,6 +108,10 @@ pub async fn run(mut config: Config, directory: PathBuf) -> io::Result<()> {
     let mut carried = Carried::default();
     // Ended sessions whose CLIs are still exiting while the next one runs.
     let mut stopping: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Lives across reconnects, and is stopped on every way out of the loop.
+    let mut bridge = Bridge::start(&directory, options.remote).await;
+    // Shown in a fresh interface, after a switch that drops the transcript.
+    let mut opening_notice: Option<String> = bridge.take_note();
     loop {
         stopping.retain(|stop| !stop.is_finished());
         if signals.stop_pending().await {
@@ -121,6 +125,7 @@ pub async fn run(mut config: Config, directory: PathBuf) -> io::Result<()> {
                     .job
                     .take()
                     .or_else(|| retained_app.take().and_then(|mut app| app.job.take()));
+                bridge.stop().await;
                 return Err(open_failed(stopping, job, error).await);
             }
         };
@@ -135,13 +140,20 @@ pub async fn run(mut config: Config, directory: PathBuf) -> io::Result<()> {
         if !app.goals.is_attached() {
             attach_goal_store(&mut app, goal_store.clone()).await;
         }
-        app.connection(&config, session.journal().to_path_buf());
-        let result =
-            event_loop::run_session(&mut terminal, &guard, &mut app, &mut session, &mut signals)
-                .await;
+        connect(&mut app, &mut bridge, &config, session.journal()).await;
+        let result = event_loop::run_session(
+            &mut terminal,
+            &guard,
+            &mut app,
+            &mut session,
+            &mut signals,
+            &mut bridge,
+        )
+        .await;
         let exit = match result {
             Ok(exit) => exit,
             Err(error) => {
+                bridge.stop().await;
                 session.shutdown().await;
                 stopped(stopping).await;
                 jobs::on_quit(app.job.take()).await;
@@ -186,10 +198,30 @@ pub async fn run(mut config: Config, directory: PathBuf) -> io::Result<()> {
         }
         retained_app = plan.keep_app.then_some(app);
     }
+    bridge.stop().await;
     stopped(stopping).await;
     drop(terminal);
     drop(guard);
     Ok(())
+}
+/// Makes a panic on this thread, which runs the event loop, restore the terminal first.
+fn restore_terminal_on_panic() {
+    let old = std::panic::take_hook();
+    let owner = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
+        if panic_restores_terminal(owner) {
+            TerminalGuard::restore();
+        }
+        old(info);
+    }));
+}
+/// Points `app` at a new connection journaling to `journal`, and registers it with the bridge.
+async fn connect(app: &mut App, bridge: &mut Bridge, config: &Config, journal: &std::path::Path) {
+    app.connection(config, journal.to_path_buf());
+    bridge.connected(app, config, journal).await;
+    if let Some(note) = bridge.take_note() {
+        app.note(note);
+    }
 }
 /// A session could not open. An earlier CLI may still be exiting: it is
 /// waited for, and the running job ended, before the error is returned.
