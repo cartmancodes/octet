@@ -58,7 +58,9 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
         Cmd::Sessions => return start_job(app, sessions_job(app)),
         Cmd::Resume => return Some(resume_command(app, argument)),
         Cmd::Steer if argument.is_empty() => app.note("Use /steer <text>"),
-        Cmd::Steer => steer(app, vendor, argument.to_owned()),
+        Cmd::Steer => {
+            steer(app, vendor, argument.to_owned());
+        }
         Cmd::Copy => copy_reply(app),
         Cmd::Model => return Some(model_command(app, argument)),
         Cmd::Skills => {
@@ -257,16 +259,20 @@ fn compact_command(app: &mut App, vendor: &dyn Vendor) {
 
 /// `/steer`: adds `text` to the running turn where the provider can; queues
 /// it as the next prompt where it cannot, or while the turn is stopping; and
-/// sends it as a prompt when idle.
-pub(crate) fn steer(app: &mut App, vendor: &dyn Vendor, text: String) {
+/// sends it as a prompt when idle. Whether it was sent or queued.
+pub(crate) fn steer(app: &mut App, vendor: &dyn Vendor, text: String) -> bool {
     let running = app.conn.is_running();
     if running && app.conn.engine.provider().steer && !app.conn.is_cancelling() {
         if let Err(error) = vendor.send(Command::Steer(text)) {
             app.error(error.to_string());
+            return false;
         }
-        return;
+        return true;
     }
-    if submit(app, vendor, text) && running {
+    if !submit(app, vendor, text) {
+        return false;
+    }
+    if running {
         app.note(if app.conn.is_cancelling() {
             "The turn is stopping; queued the steer as the next prompt".to_owned()
         } else {
@@ -276,6 +282,7 @@ pub(crate) fn steer(app: &mut App, vendor: &dyn Vendor, text: String) {
             )
         });
     }
+    true
 }
 
 /// Switches the permission mode live; the vendor confirms it later.
@@ -514,7 +521,7 @@ fn queued_text(prompt: &crate::vendor::Prompt) -> String {
     cut(prompt.display().lines().next().unwrap_or(""), 60)
 }
 
-fn model_command(app: &mut App, argument: &str) -> Action {
+pub(crate) fn model_command(app: &mut App, argument: &str) -> Action {
     if argument.trim().is_empty() {
         app.show_models(1);
     } else if argument == "list" || argument.starts_with("list ") {
@@ -585,7 +592,7 @@ fn found_note(
         Found::Named | Found::Current => None,
     }
 }
-fn mode_command(app: &mut App, vendor: &dyn Vendor, argument: &str) -> Action {
+pub(crate) fn mode_command(app: &mut App, vendor: &dyn Vendor, argument: &str) -> Action {
     if argument.is_empty() {
         app.note(app.mode_details());
     } else if app.conn.mode_pending.is_some() {

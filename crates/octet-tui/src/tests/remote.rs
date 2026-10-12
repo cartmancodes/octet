@@ -1,0 +1,264 @@
+//! Commands from a hub, run through the interface's own paths.
+use super::*;
+use crate::bridge::Remote;
+use crate::test_support::{approval, idle};
+use octet_core::{Mode, remote::protocol::BridgeCommand};
+
+const CONFIRM: &str = "Full access needs confirm: \"full access\"";
+
+/// Runs `command` as the device "iPhone 15" sent it.
+async fn run(
+    app: &mut App,
+    vendor: &RecordingVendor,
+    command: BridgeCommand,
+) -> (Result<String, String>, Action) {
+    let remote = Remote {
+        peer: 1,
+        req: 5,
+        by: "iPhone 15".into(),
+        command,
+    };
+    crate::bridge::handle_remote(app, vendor, remote).await
+}
+
+fn prompt(text: &str) -> BridgeCommand {
+    BridgeCommand::Prompt { text: text.into() }
+}
+
+fn mode(label: &str, confirm: Option<&str>) -> BridgeCommand {
+    BridgeCommand::SetMode {
+        mode: label.into(),
+        confirm: confirm.map(Into::into),
+    }
+}
+
+#[tokio::test]
+async fn a_remote_prompt_sends_or_queues_like_enter() {
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    let (result, action) = run(&mut app, &vendor, prompt("hello")).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(matches!(action, Action::Continue));
+    assert_eq!(vendor.sent.borrow().len(), 1);
+    assert!(app.conn.is_running());
+    let (result, _) = run(&mut app, &vendor, prompt("next")).await;
+    assert_eq!(result, Ok("Queued (1 waiting)".into()));
+    assert_eq!(app.composer.queue.len(), 1);
+    for _ in 1..crate::app::QUEUE_LIMIT {
+        run(&mut app, &vendor, prompt("more")).await;
+    }
+    let (result, _) = run(&mut app, &vendor, prompt("one too many")).await;
+    let Err(reason) = result else {
+        panic!("a full queue takes no more")
+    };
+    assert!(reason.starts_with("The queue is full"), "{reason}");
+}
+
+#[tokio::test]
+async fn a_slash_prompt_is_refused() {
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    let (result, action) = run(&mut app, &vendor, prompt("/model x")).await;
+    assert_eq!(result, Err("Slash commands run on the desk".into()));
+    assert!(matches!(action, Action::Continue));
+    assert!(vendor.sent.borrow().is_empty());
+    let (result, _) = run(&mut app, &vendor, prompt("!ls")).await;
+    assert!(result.is_ok(), "a bang is plain text: {result:?}");
+}
+
+#[tokio::test]
+async fn a_remote_answer_needs_an_open_approval() {
+    let mut app = app();
+    app.event(approval(1, "first"));
+    app.event(approval(2, "second"));
+    assert!(!app.overlay.approval_armed());
+    let vendor = RecordingVendor::default();
+    let answer = |approval, allow| BridgeCommand::Answer { approval, allow };
+    let (result, _) = run(&mut app, &vendor, answer(2, true)).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(matches!(
+        &vendor.sent.borrow()[..],
+        [Command::Answer { id: 2, allow: true }]
+    ));
+    let ids: Vec<u64> = app.overlay.approvals.iter().map(|asked| asked.id).collect();
+    assert_eq!(ids, [1]);
+    let (result, _) = run(&mut app, &vendor, answer(9, true)).await;
+    assert_eq!(result, Err("No approval 9 is waiting".into()));
+    assert_eq!(vendor.sent.borrow().len(), 1);
+}
+
+#[tokio::test]
+async fn remote_cancel_mirrors_esc() {
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    let (result, _) = run(&mut app, &vendor, BridgeCommand::Cancel).await;
+    assert_eq!(result, Err("No turn is running".into()));
+    assert_eq!(vendor.interrupts.get(), 0);
+    app.conn.start_turn();
+    let (result, _) = run(&mut app, &vendor, BridgeCommand::Cancel).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(vendor.interrupts.get(), 1);
+    assert!(app.conn.is_cancelling());
+    assert_eq!(app.status_line, "Cancelling…");
+}
+
+#[tokio::test]
+async fn remote_steer_mirrors_the_steer_command() {
+    let steer = |text: &str| BridgeCommand::Steer { text: text.into() };
+    let mut app = app();
+    app.conn.start_turn();
+    let vendor = RecordingVendor::default();
+    let (result, _) = run(&mut app, &vendor, steer("look at docs")).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(matches!(
+        &vendor.sent.borrow()[..],
+        [Command::Steer(text)] if text == "look at docs"
+    ));
+    let config = Config::new(Engine::CLAUDE, "claude", "/tmp");
+    let mut app = App::new(&config, "journal".into());
+    app.conn.start_turn();
+    let vendor = RecordingVendor::default();
+    let (result, _) = run(&mut app, &vendor, steer("look at docs")).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(app.composer.queue.len(), 1);
+    assert!(
+        app.entries_text().contains("Claude cannot steer"),
+        "{}",
+        app.entries_text()
+    );
+}
+
+#[tokio::test]
+async fn remote_mode_changes_follow_the_mode_command() {
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    let (result, action) = run(&mut app, &vendor, mode("auto", None)).await;
+    assert_eq!(result, Ok("Switching to auto".into()));
+    assert!(matches!(action, Action::Continue));
+    assert!(matches!(
+        &vendor.sent.borrow()[..],
+        [Command::SetMode(Mode::Auto)]
+    ));
+    let (result, _) = run(&mut app, &vendor, mode("sideways", None)).await;
+    assert!(result.is_err());
+    let mut app = super::app();
+    idle(&mut app);
+    let (result, action) = run(&mut app, &vendor, mode("full-access", None)).await;
+    assert_eq!(result, Err(CONFIRM.into()));
+    assert!(matches!(action, Action::Continue));
+    let (result, _) = run(&mut app, &vendor, mode("full-access", Some("yes"))).await;
+    assert_eq!(result, Err(CONFIRM.into()));
+    let (result, action) = run(&mut app, &vendor, mode("full-access", Some("full access"))).await;
+    assert_eq!(result, Ok("Reconnecting in full-access".into()));
+    assert!(matches!(action, Action::Exit(Exit::Mode(Mode::FullAccess))));
+    app.conn.start_turn();
+    let (result, action) = run(&mut app, &vendor, mode("full-access", Some("full access"))).await;
+    assert_eq!(result, Err(TURN_OPEN.into()));
+    assert!(matches!(action, Action::Continue));
+}
+
+#[tokio::test]
+async fn remote_model_changes_follow_the_model_command() {
+    let select = |selection: &str| BridgeCommand::SetModel {
+        selection: selection.into(),
+    };
+    let listed = octet_core::ModelInfo {
+        selection: "opus".into(),
+        id: Some("opus".into()),
+        name: "opus".into(),
+        description: String::new(),
+    };
+    let mut app = app();
+    idle(&mut app);
+    app.models
+        .catalogs
+        .set(Engine::CLAUDE, vec![listed], std::time::SystemTime::now());
+    let vendor = RecordingVendor::default();
+    for bad in [
+        "",
+        "two words",
+        "tab\tbed",
+        "line\nbreak",
+        "list",
+        "refresh",
+    ] {
+        let (result, action) = run(&mut app, &vendor, select(bad)).await;
+        assert!(result.is_err(), "{bad:?}: {result:?}");
+        assert!(matches!(action, Action::Continue));
+    }
+    app.conn.start_turn();
+    let (result, action) = run(&mut app, &vendor, select("opus")).await;
+    assert_eq!(result, Err(TURN_OPEN.into()));
+    assert!(matches!(action, Action::Continue));
+    idle(&mut app);
+    let (result, action) = run(&mut app, &vendor, select("opus")).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(matches!(
+        action,
+        Action::Exit(Exit::Model(selection)) if selection.provider == Engine::CLAUDE
+    ));
+}
+
+#[tokio::test]
+async fn remote_end_refuses_during_a_turn() {
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    let (result, action) = run(&mut app, &vendor, BridgeCommand::End).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(matches!(action, Action::Exit(Exit::Quit)));
+    app.conn.start_turn();
+    let (result, action) = run(&mut app, &vendor, BridgeCommand::End).await;
+    assert_eq!(result, Err(TURN_OPEN.into()));
+    assert!(matches!(action, Action::Continue));
+}
+
+#[tokio::test]
+async fn remote_actions_are_noted_on_the_desk() {
+    let mut app = app();
+    app.event(approval(1, "first"));
+    let vendor = RecordingVendor::default();
+    let remote = |by: &str, command| Remote {
+        peer: 1,
+        req: 1,
+        by: by.into(),
+        command,
+    };
+    crate::bridge::handle_remote(
+        &mut app,
+        &vendor,
+        remote(
+            "Gemini 10",
+            BridgeCommand::Answer {
+                approval: 1,
+                allow: true,
+            },
+        ),
+    )
+    .await;
+    assert!(
+        app.entries_text().contains("Allowed from Gemini 10"),
+        "{}",
+        app.entries_text()
+    );
+    idle(&mut app);
+    crate::bridge::handle_remote(&mut app, &vendor, remote("Gemini 10", prompt("hi"))).await;
+    assert!(
+        app.entries_text().contains("Prompt from Gemini 10"),
+        "{}",
+        app.entries_text()
+    );
+    crate::bridge::handle_remote(
+        &mut app,
+        &vendor,
+        remote("a\u{1b}[31mb", BridgeCommand::Cancel),
+    )
+    .await;
+    let text = app.entries_text();
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(text.contains("Cancelled from "), "{text}");
+}

@@ -380,6 +380,7 @@ fn one_dropped_prompt_is_singular() {
 }
 
 mod keys;
+mod remote;
 mod slash;
 #[test]
 fn the_panic_hook_restores_only_on_the_loop_thread() {

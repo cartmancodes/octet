@@ -427,6 +427,30 @@ fn help_key(app: &mut App, key: KeyEvent) {
         help.help_scroll = 0;
     }
 }
+/// Answers approval `id` (any open one, not only the front); `Err` when none is open with that id.
+pub(crate) fn answer_approval(
+    app: &mut App,
+    vendor: &dyn Vendor,
+    id: u64,
+    allow: bool,
+) -> Result<(), String> {
+    let Some(at) = app
+        .overlay
+        .approvals
+        .iter()
+        .position(|asked| asked.id == id)
+    else {
+        return Err(format!("No approval {id} is waiting"));
+    };
+    vendor
+        .send(Command::Answer { id, allow })
+        .map_err(|error| error.to_string())?;
+    app.overlay.approvals.remove(at);
+    if at == 0 {
+        app.overlay.front_changed();
+    }
+    Ok(())
+}
 async fn approval_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent, id: u64) {
     let ctrl_c = ctrl(key, 'c');
     let answer = match key.code {
@@ -438,12 +462,8 @@ async fn approval_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent, id: u64
         // Typed as the dialog opened: never an answer.
         app.hint("The approval just opened; press A or D again to answer");
     } else if let Some(allow) = answer {
-        match vendor.send(Command::Answer { id, allow }) {
-            Ok(()) => {
-                app.overlay.approvals.pop_front();
-                app.overlay.front_changed();
-            }
-            Err(error) => app.error(error.to_string()),
+        if let Err(error) = answer_approval(app, vendor, id, allow) {
+            app.error(error);
         }
     } else if key.code == KeyCode::PageDown {
         app.overlay.approval_scroll = app.overlay.approval_scroll.saturating_add(8);

@@ -4,7 +4,7 @@
 use crate::{
     Action, Exit, Signals,
     app::{App, StatusKind},
-    bridge::{Bridge, Remote},
+    bridge::{Bridge, Remote, handle_remote},
     external, files,
     input::{key_action, paste, refresh_completion},
     jobs, session_event, shell, shell_finished,
@@ -212,10 +212,14 @@ impl Loop<'_> {
                 refresh_completion(app);
             }
             Wake::Shell(ran) => shell_finished(app, ran),
-            // Task 4 runs the command; until then every one is refused.
-            Wake::Remote(remote) => self
-                .bridge
-                .reply(remote.req, Err("Not yet supported".into())),
+            Wake::Remote(remote) => {
+                let (peer, req) = (remote.peer, remote.req);
+                let (result, action) = handle_remote(app, &session.handle, remote).await;
+                self.bridge.reply(peer, req, result);
+                if let Some(exit) = self.apply(action, app)? {
+                    return Ok(Some(exit));
+                }
+            }
             Wake::Editor(status) => self.finish_editor(app, &status)?,
             Wake::Input(Some(input)) => return self.input(app, session, input?).await,
             // While an editor waits in cooked mode, Ctrl+C is meant for it.

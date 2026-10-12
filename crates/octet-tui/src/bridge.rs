@@ -3,7 +3,14 @@
 //! and `catalog` frames to every connected hub. It never makes the interface wait: each hub has
 //! a bounded queue, and one that falls behind is disconnected. A bridge that cannot start or
 //! breaks turns itself off with one note; the interface goes on.
-use crate::app::{App, ConnPhase};
+use crate::{
+    Action, Exit,
+    app::{App, CANCELLING, ConnPhase, StatusKind},
+    commands::{mode_command, model_command, steer},
+    input::{answer_approval, cancel_turn, submit},
+    registry::TURN_OPEN,
+    vendor::Vendor,
+};
 use octet_core::remote::{
     protocol::{self, BridgeCommand, MAX_MESSAGE},
     run::{Registration, run_dir},
@@ -48,14 +55,9 @@ const QUEUE_LINE: usize = 200;
 
 /// A command from a hub, for the interface to run.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the interface only refuses commands until it runs them"
-    )
-)]
 pub(crate) struct Remote {
+    /// The connection it came on, which alone gets the reply.
+    pub(crate) peer: u64,
     /// The hub's id for the command, echoed in the reply.
     pub(crate) req: u64,
     /// The device the command came from.
@@ -66,6 +68,7 @@ pub(crate) struct Remote {
 
 /// One connected hub: the queue its writer drains, and its tasks.
 struct Peer {
+    id: u64,
     lines: mpsc::Sender<String>,
     reader: AbortHandle,
     writer: AbortHandle,
@@ -73,12 +76,13 @@ struct Peer {
 
 impl Peer {
     /// Starts the tasks that read commands from `stream` and write the queued lines to it.
-    fn spawn(stream: UnixStream, commands: mpsc::Sender<Remote>) -> Self {
+    fn spawn(stream: UnixStream, id: u64, commands: mpsc::Sender<Remote>) -> Self {
         let (read, write) = stream.into_split();
         let (lines, queue) = mpsc::channel(PEER_QUEUE);
         let writer = tokio::spawn(write_peer(write, queue)).abort_handle();
-        let reader = tokio::spawn(read_peer(read, lines.clone(), commands)).abort_handle();
+        let reader = tokio::spawn(read_peer(read, id, lines.clone(), commands)).abort_handle();
         Self {
+            id,
             lines,
             reader,
             writer,
@@ -108,6 +112,7 @@ async fn write_peer(mut write: OwnedWriteHalf, mut queue: mpsc::Receiver<String>
 /// interface. Ends when the hub goes or sends a message over the limit.
 async fn read_peer(
     read: OwnedReadHalf,
+    peer: u64,
     replies: mpsc::Sender<String>,
     commands: mpsc::Sender<Remote>,
 ) {
@@ -143,7 +148,16 @@ async fn read_peer(
         }
         match protocol::parse_bridge_command(text) {
             Ok((req, by, command)) => {
-                if commands.send(Remote { req, by, command }).await.is_err() {
+                if commands
+                    .send(Remote {
+                        peer,
+                        req,
+                        by,
+                        command,
+                    })
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -158,11 +172,13 @@ async fn accept(
     arrivals: mpsc::Sender<Peer>,
     commands: mpsc::Sender<Remote>,
 ) {
+    let mut next_id = 0;
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                next_id += 1;
                 if arrivals
-                    .send(Peer::spawn(stream, commands.clone()))
+                    .send(Peer::spawn(stream, next_id, commands.clone()))
                     .await
                     .is_err()
                 {
@@ -171,6 +187,137 @@ async fn accept(
             }
             // Out of descriptors, say: try again shortly rather than spin.
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+/// Runs one remote command as the matching key or slash command would; the reply's text, or the
+/// refusal, and what the interface then does.
+pub(crate) async fn handle_remote(
+    app: &mut App,
+    vendor: &dyn Vendor,
+    remote: Remote,
+) -> (Result<String, String>, Action) {
+    let mut action = Action::Continue;
+    let done = run_remote(app, vendor, remote.command, &mut action).await;
+    match done {
+        Ok((what, reply)) => {
+            let by = crate::text::clean(&remote.by);
+            let by = if by.trim().is_empty() {
+                "a remote device"
+            } else {
+                by.trim()
+            };
+            app.note(format!("{what} from {by}"));
+            // The note must not hide that a cancel is under way.
+            if app.conn.is_cancelling() {
+                app.status(StatusKind::Cancelling, CANCELLING);
+            }
+            (Ok(reply), action)
+        }
+        Err(reason) => (Err(reason), Action::Continue),
+    }
+}
+
+/// What a remote command did: `(what the desk note says, the reply)`, or why it was refused.
+async fn run_remote(
+    app: &mut App,
+    vendor: &dyn Vendor,
+    command: BridgeCommand,
+    action: &mut Action,
+) -> Result<(String, String), String> {
+    match command {
+        BridgeCommand::Prompt { text } => {
+            if text.trim().is_empty() {
+                return Err("Nothing to send".into());
+            }
+            if text.starts_with('/') {
+                return Err("Slash commands run on the desk".into());
+            }
+            if submit(app, vendor, text) {
+                Ok(("Prompt".into(), app.status_line.clone()))
+            } else {
+                Err(app.status_line.clone())
+            }
+        }
+        BridgeCommand::Answer { approval, allow } => {
+            answer_approval(app, vendor, approval, allow)?;
+            let what = if allow { "Allowed" } else { "Denied" };
+            Ok((what.into(), what.into()))
+        }
+        BridgeCommand::Cancel => {
+            if !app.is_busy() {
+                return Err("No turn is running".into());
+            }
+            cancel_turn(app, vendor).await;
+            Ok(("Cancelled".into(), "Cancelling".into()))
+        }
+        BridgeCommand::Steer { text } => {
+            if text.trim().is_empty() {
+                return Err("Nothing to send".into());
+            }
+            let waiting = app.composer.queue.len();
+            if !steer(app, vendor, text) {
+                return Err(app.status_line.clone());
+            }
+            let reply = if app.composer.queue.len() > waiting {
+                app.status_line.clone()
+            } else {
+                "Steering".into()
+            };
+            Ok(("Steer".into(), reply))
+        }
+        BridgeCommand::SetMode { mode, confirm } => {
+            let Some(target) = Mode::parse(&mode) else {
+                let shown: String = mode.chars().take(40).collect();
+                return Err(format!(
+                    "Unknown mode {}. Use ask, accept-edits, auto or full-access.",
+                    crate::text::clean(&shown)
+                ));
+            };
+            if !protocol::full_access_confirmed(target.label(), confirm.as_deref()) {
+                return Err(format!(
+                    "Full access needs confirm: \"{}\"",
+                    protocol::FULL_ACCESS_CONFIRM
+                ));
+            }
+            let was_pending = app.conn.mode_pending.is_some();
+            *action = mode_command(app, vendor, target.label());
+            let label = target.label();
+            let reply = match action {
+                Action::Exit(_) => format!("Reconnecting in {label}"),
+                _ if !was_pending && app.conn.mode_pending.is_some() => {
+                    format!("Switching to {label}")
+                }
+                _ => return Err(app.status_line.clone()),
+            };
+            Ok((format!("Mode {label}"), reply))
+        }
+        BridgeCommand::SetModel { selection } => {
+            let one_token = !selection.is_empty()
+                && !selection
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control());
+            // `list` and `refresh` are the desk's own picker commands, not models.
+            if !one_token || matches!(selection.as_str(), "list" | "refresh") {
+                return Err("Name one model, without spaces".into());
+            }
+            *action = model_command(app, &selection);
+            if matches!(action, Action::Exit(_)) {
+                Ok((
+                    format!("Model {selection}"),
+                    format!("Reconnecting with {selection}"),
+                ))
+            } else {
+                Err(app.status_line.clone())
+            }
+        }
+        BridgeCommand::End => {
+            if app.turn_open() {
+                return Err(TURN_OPEN.into());
+            }
+            *action = Action::Exit(Exit::Quit);
+            Ok(("Ended".into(), "Ending".into()))
         }
     }
 }
@@ -415,16 +562,21 @@ impl Bridge {
         }
     }
 
-    /// Tells the hubs how command `req` went: `Ok` carries what was done, `Err` the reason.
-    pub(crate) fn reply(&mut self, req: u64, result: Result<String, String>) {
+    /// Tells hub `peer`, and no other, how its command `req` went: `Ok` carries what was done,
+    /// `Err` the reason.
+    pub(crate) fn reply(&mut self, peer: u64, req: u64, result: Result<String, String>) {
         let Some(live) = self.live.as_mut() else {
             return;
         };
+        // The command may have beaten its hub's adoption.
+        live.adopt_arrivals();
         let frame = match result {
             Ok(message) => protocol::ack(req, &message),
             Err(reason) => protocol::refused(req, &reason),
         };
-        live.broadcast(&frame_line(&frame));
+        let line = frame_line(&frame);
+        live.peers
+            .retain(|hub| hub.id != peer || hub.lines.try_send(line.clone()).is_ok());
     }
 
     /// Closes the socket and removes it and the registration.
@@ -800,8 +952,12 @@ mod tests {
         assert_eq!(remote.req, 7);
         assert_eq!(remote.by, "Gemini 10");
         assert_eq!(remote.command, command);
-        bridge.reply(7, Ok("Sent".into()));
-        bridge.reply(8, Err("A turn is running".into()));
+        // A second hub is connected and sees none of the replies.
+        let (mut other, _other_write) = connect(&regs[0].socket).await;
+        let _ = first_line(&mut bridge, &app, &mut other).await;
+        let _ = next_line(&mut other).await;
+        bridge.reply(remote.peer, 7, Ok("Sent".into()));
+        bridge.reply(remote.peer, 8, Err("A turn is running".into()));
         let ack: Value = serde_json::from_str(&next_line(&mut lines).await).unwrap();
         assert_eq!(
             (ack["type"].as_str(), ack["req"].as_u64()),
@@ -810,6 +966,8 @@ mod tests {
         let refused: Value = serde_json::from_str(&next_line(&mut lines).await).unwrap();
         assert_eq!(refused["type"], "refused");
         assert_eq!(refused["reason"], "A turn is running");
+        let overheard = timeout(Duration::from_millis(100), other.next_line()).await;
+        assert!(overheard.is_err(), "a reply goes to the hub that asked");
         // A bad line is refused by its req, and never reaches the loop.
         write
             .write_all(b"{\"v\":1,\"req\":9,\"type\":\"nope\"}\n")
@@ -841,7 +999,7 @@ mod tests {
         let (app, config) = demo();
         off.connected(&app, &config, &dir.join("j.jsonl")).await;
         off.publish(&app);
-        off.reply(1, Ok("x".into()));
+        off.reply(1, 1, Ok("x".into()));
         assert!(
             timeout(Duration::from_millis(50), off.next_command())
                 .await
