@@ -33,6 +33,16 @@ const COMMAND_QUEUE: usize = 64;
 const WRITE_STALL: Duration = Duration::from_secs(30);
 /// The most a reader takes for one line: a whole message, its newline, and one byte over.
 const LINE_LIMIT: u64 = MAX_MESSAGE as u64 + 2;
+/// The longest an approval's command is in a `state` frame, in bytes.
+const COMMAND_BYTES: usize = 4096;
+/// The longest an approval's working directory is, in bytes.
+const CWD_BYTES: usize = 1024;
+/// How many of an approval's files are listed.
+const FILES_SHOWN: usize = 20;
+/// The longest one listed file is, in bytes.
+const FILE_BYTES: usize = 512;
+/// The longest an approval's action or scope is, in bytes.
+const ACTION_BYTES: usize = 512;
 /// The longest a queued prompt's first line is in a `state` frame, in characters.
 const QUEUE_LINE: usize = 200;
 
@@ -184,6 +194,10 @@ struct Live {
     /// The last `state` and `catalog` lines sent, which a new hub gets at once.
     state: Option<String>,
     catalog: Option<String>,
+    /// The state the `state` line says, to tell a change before formatting anything.
+    state_value: Option<Value>,
+    /// Fingerprint of what the catalog lists, to rebuild it only when that changes.
+    catalog_key: Option<u64>,
 }
 
 impl Live {
@@ -237,6 +251,8 @@ impl Live {
             accepting: tokio::spawn(accept(listener, arrivals_in, commands_in)),
             state: None,
             catalog: None,
+            state_value: None,
+            catalog_key: None,
         })
     }
 
@@ -264,6 +280,15 @@ impl Live {
         }
     }
 
+    /// Removes the socket and the registration files without waiting; the files are gone twice
+    /// over after a normal `shutdown`, which is harmless.
+    fn remove_files(&self) {
+        let pid = self.registration.pid;
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(self.run.join(format!("{pid}.json")));
+        let _ = std::fs::remove_file(self.run.join(format!("{pid}.json.tmp")));
+    }
+
     /// Stops listening and removes the socket and the registration.
     async fn shutdown(self) {
         self.accepting.abort();
@@ -274,6 +299,14 @@ impl Live {
         let pid = self.registration.pid;
         let _ = tokio::fs::remove_file(self.run.join(format!("{pid}.json.tmp"))).await;
         self.registration.remove(&self.run).await;
+    }
+}
+
+impl Drop for Live {
+    /// A panic or an early return that skipped `Bridge::stop` still leaves no stale files.
+    fn drop(&mut self) {
+        self.accepting.abort();
+        self.remove_files();
     }
 }
 
@@ -350,15 +383,21 @@ impl Bridge {
             return;
         };
         live.adopt_arrivals();
-        let state = frame_line(&protocol::bridge_state_frame(&state_json(app)));
-        if live.state.as_ref() != Some(&state) {
-            live.broadcast(&state);
-            live.state = Some(state);
+        let state = state_json(app);
+        if live.state_value.as_ref() != Some(&state) {
+            let line = state_line(&state);
+            live.broadcast(&line);
+            live.state = Some(line);
+            live.state_value = Some(state);
         }
-        let catalog = frame_line(&protocol::bridge_catalog_frame(&catalog_json(app)));
-        if live.catalog.as_ref() != Some(&catalog) {
-            live.broadcast(&catalog);
-            live.catalog = Some(catalog);
+        let key = catalog_key(app);
+        if live.catalog_key != Some(key) {
+            live.catalog_key = Some(key);
+            let line = catalog_line(&catalog_json(app));
+            if live.catalog.as_ref() != Some(&line) {
+                live.broadcast(&line);
+                live.catalog = Some(line);
+            }
         }
     }
 
@@ -420,6 +459,95 @@ fn describe(registration: &mut Registration, app: &App) {
     registration.vendor_session.clone_from(&app.conn.session);
 }
 
+/// `text` cut to at most `max` bytes at a character boundary, ending in "…" when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max.saturating_sub('…'.len_utf8());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// The first files of an approval, each clipped, then "+N more" for the rest, as the dialog says.
+fn clipped_files(files: &[String]) -> Vec<String> {
+    let mut shown: Vec<String> = files
+        .iter()
+        .take(FILES_SHOWN)
+        .map(|file| clip(file, FILE_BYTES))
+        .collect();
+    if files.len() > FILES_SHOWN {
+        shown.push(format!("+{} more", files.len() - FILES_SHOWN));
+    }
+    shown
+}
+
+/// The `state` frame line for `state`. One that would not fit in a message is rebuilt without
+/// the queue, with each approval reduced to its action and scope, and without the goal if
+/// that is still too much, so a hub always accepts it and the approval ids still get through.
+fn state_line(state: &Value) -> String {
+    let line = frame_line(&protocol::bridge_state_frame(state));
+    if line.len() <= MAX_MESSAGE {
+        return line;
+    }
+    let mut reduced = state.clone();
+    reduced["queue"] = json!([]);
+    if let Some(approvals) = reduced["approvals"].as_array_mut() {
+        for approval in approvals {
+            let summary = &approval["summary"];
+            approval["summary"] = json!({"action": summary["action"], "scope": summary["scope"]});
+        }
+    }
+    let mut line = frame_line(&protocol::bridge_state_frame(&reduced));
+    if line.len() > MAX_MESSAGE {
+        if let Some(map) = reduced.as_object_mut() {
+            map.remove("goal");
+        }
+        line = frame_line(&protocol::bridge_state_frame(&reduced));
+    }
+    line
+}
+
+/// The `catalog` frame line for `catalog`; models are dropped from the end until it fits.
+fn catalog_line(catalog: &Value) -> String {
+    let mut catalog = catalog.clone();
+    loop {
+        let line = frame_line(&protocol::bridge_catalog_frame(&catalog));
+        let models = catalog["models"].as_array_mut();
+        match models {
+            Some(models) if line.len() > MAX_MESSAGE && !models.is_empty() => {
+                models.truncate(models.len() / 2);
+            }
+            _ => return line,
+        }
+    }
+}
+
+/// A fingerprint of everything `catalog_json` lists, taken without building it.
+fn catalog_key(app: &App) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let conn = &app.conn;
+    (conn.engine.as_str(), conn.mode.label()).hash(&mut hasher);
+    (&conn.requested_model, &conn.resolved_model).hash(&mut hasher);
+    let listed = |hasher: &mut std::collections::hash_map::DefaultHasher,
+                  models: &[octet_core::ModelInfo]| {
+        models.len().hash(hasher);
+        for model in models {
+            (&model.selection, &model.name, &model.id).hash(hasher);
+        }
+    };
+    listed(&mut hasher, &conn.models);
+    for engine in octet_core::Engine::ALL.iter().filter(|e| e.is_vendor()) {
+        if let Some(cached) = app.models.catalogs.get(*engine) {
+            listed(&mut hasher, &cached.models);
+        }
+    }
+    hasher.finish()
+}
+
 /// The `StateInfo` of `app`: what only the interface knows.
 pub(crate) fn state_json(app: &App) -> Value {
     let phase = match app.conn.phase {
@@ -442,10 +570,13 @@ pub(crate) fn state_json(app: &App) -> Value {
         .approvals
         .iter()
         .map(|asked| {
+            let summary = &asked.summary;
             json!({"id": asked.id, "summary": {
-                "action": asked.summary.action, "command": asked.summary.command,
-                "files": asked.summary.files, "cwd": asked.summary.cwd,
-                "scope": asked.summary.scope}})
+                "action": clip(&summary.action, ACTION_BYTES),
+                "command": summary.command.as_deref().map(|c| clip(c, COMMAND_BYTES)),
+                "files": clipped_files(&summary.files),
+                "cwd": summary.cwd.as_deref().map(|c| clip(c, CWD_BYTES)),
+                "scope": clip(&summary.scope, ACTION_BYTES)}})
         })
         .collect();
     let mut state = json!({
@@ -799,6 +930,120 @@ mod tests {
             catalog["current"],
             json!({"engine": "demo", "selection": "default"})
         );
+    }
+
+    #[test]
+    fn a_huge_approval_is_clipped_so_the_state_line_fits() {
+        let (mut app, _) = demo();
+        crate::test_support::idle(&mut app);
+        app.event(octet_core::Event::Approval {
+            id: 4,
+            detail: "d".into(),
+            summary: octet_core::ApprovalSummary {
+                command: Some("x".repeat(200_000)),
+                files: (0..5_000)
+                    .map(|n| format!("{n}-{}", "f".repeat(2_000)))
+                    .collect(),
+                cwd: Some("/w".repeat(5_000)),
+                ..octet_core::ApprovalSummary::new("Edit 5000 files")
+            },
+        });
+        let state = state_json(&app);
+        let summary = &state["approvals"][0]["summary"];
+        assert!(summary["command"].as_str().unwrap().ends_with('…'));
+        assert!(summary["command"].as_str().unwrap().len() <= 4096);
+        assert!(summary["cwd"].as_str().unwrap().len() <= 1024);
+        let files = summary["files"].as_array().unwrap();
+        assert_eq!(files.len(), 21);
+        assert_eq!(files[20], "+4980 more");
+        assert!(files[..20].iter().all(|f| f.as_str().unwrap().len() <= 512));
+        conforms("StateInfo", &state);
+        let line = state_line(&state);
+        assert!(line.len() <= MAX_MESSAGE, "{}", line.len());
+        assert!(line.contains("\"id\":4") && line.contains("Edit 5000 files"));
+    }
+
+    #[test]
+    fn a_state_that_still_does_not_fit_is_reduced() {
+        let (mut app, _) = demo();
+        crate::test_support::idle(&mut app);
+        for id in 0..40 {
+            app.event(octet_core::Event::Approval {
+                id,
+                detail: String::new(),
+                summary: octet_core::ApprovalSummary {
+                    command: Some("c".repeat(4_000)),
+                    ..octet_core::ApprovalSummary::new("Run a shell command")
+                },
+            });
+        }
+        let state = state_json(&app);
+        assert!(frame_line(&protocol::bridge_state_frame(&state)).len() > MAX_MESSAGE);
+        let line = state_line(&state);
+        assert!(line.len() <= MAX_MESSAGE);
+        let reduced: Value = serde_json::from_str(&line).unwrap();
+        let approvals = reduced["state"]["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), 40);
+        assert_eq!(approvals[3]["summary"]["action"], "Run a shell command");
+        assert!(approvals[3]["summary"].get("command").is_none());
+        conforms("StateInfo", &reduced["state"]);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_bridge_leaves_no_socket_or_registration() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-drop");
+        let dir = temp.path().to_path_buf();
+        let mut bridge = Bridge::start(&dir, true).await;
+        let (app, config) = demo();
+        bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
+        let run = run_dir(&dir);
+        let reg = registrations(&run).await.remove(0);
+        assert!(reg.socket.exists());
+        drop(bridge);
+        assert!(!reg.socket.exists());
+        assert!(registrations(&run).await.is_empty());
+    }
+
+    #[test]
+    fn the_catalog_key_follows_what_the_catalog_lists() {
+        let (mut app, config) = demo();
+        app.connection(&config, "journal".into());
+        let before = catalog_key(&app);
+        assert_eq!(before, catalog_key(&app));
+        app.conn.models = vec![octet_core::ModelInfo {
+            selection: "default".into(),
+            name: "Demo".into(),
+            id: None,
+            description: String::new(),
+        }];
+        let listed = catalog_key(&app);
+        assert_ne!(before, listed);
+        app.conn.mode = octet_core::Mode::AcceptEdits;
+        assert_ne!(listed, catalog_key(&app));
+    }
+
+    #[tokio::test]
+    async fn publish_sends_the_catalog_again_when_the_models_change() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-catalog");
+        let dir = temp.path().to_path_buf();
+        let mut bridge = Bridge::start(&dir, true).await;
+        let (mut app, config) = demo();
+        bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
+        let regs = registrations(&run_dir(&dir)).await;
+        let (mut lines, _write) = connect(&regs[0].socket).await;
+        let _ = first_line(&mut bridge, &app, &mut lines).await;
+        let _ = next_line(&mut lines).await;
+        app.conn.models = vec![octet_core::ModelInfo {
+            selection: "fast".into(),
+            name: "Fast".into(),
+            id: Some("fast-1".into()),
+            description: String::new(),
+        }];
+        bridge.publish(&app);
+        let sent: Value = serde_json::from_str(&next_line(&mut lines).await).unwrap();
+        assert_eq!(sent["type"], "catalog");
+        assert_eq!(sent["catalog"]["models"][0]["selection"], "fast");
+        bridge.stop().await;
     }
 
     /// Checks `value` against the protocol's shape `name`: required fields present, no others.
