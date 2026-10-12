@@ -3,7 +3,9 @@ use octet_store::{create_private, create_private_dir, sync_directory};
 use sha2::{Digest, Sha256};
 use std::{
     io,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -56,7 +58,9 @@ type Stamp = (SystemTime, u64);
 /// A pairing secret as the hub remembers it: its hash and when it was issued.
 #[derive(Debug)]
 struct Secret {
+    /// The hex SHA-256 of the secret; the secret itself is not kept.
     sha256: String,
+    /// When the secret was issued.
     issued: SystemTime,
 }
 
@@ -64,9 +68,13 @@ struct Secret {
 /// `hub-audit.jsonl`, all owner-only.
 #[derive(Debug)]
 pub struct Store {
+    /// The data directory holding the hub's files.
     directory: PathBuf,
+    /// The paired devices, as last read or written.
     devices: Vec<Device>,
+    /// The settings read from `hub.json` when the store opened.
     config: HubConfig,
+    /// Pairing secrets waiting to be used.
     secrets: Vec<Secret>,
     /// The mtime and size of `devices.json` as this store last wrote or read
     /// it; the size catches a change within the clock's granularity.
@@ -78,10 +86,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Fails if the directory cannot be created or `devices.json` or
-    /// `hub.json` cannot be read or are malformed.
+    /// Fails if the directory cannot be created or tightened to 0700, or
+    /// `devices.json` or `hub.json` cannot be read or are malformed.
     pub async fn open(directory: &Path) -> io::Result<Store> {
         create_private_dir(directory).await?;
+        if fs::metadata(directory).await?.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).await?;
+        }
         let (devices, stamp) = read_devices(directory).await?;
         Ok(Store {
             directory: directory.to_owned(),
@@ -134,19 +145,19 @@ impl Store {
             .iter()
             .position(|kept| same(&kept.sha256, &hash) && !expired(kept.issued, now))
             .ok_or(SECRET_REFUSED)?;
-        if name.is_empty() || name.chars().count() > NAME_LIMIT {
-            return Err("Device name must be 1 to 64 characters");
-        }
-        if platform.is_empty() || platform.chars().count() > NAME_LIMIT {
-            return Err("Device platform must be 1 to 64 characters");
-        }
+        let name = checked_text(
+            name,
+            "Device name must be 1 to 64 characters",
+            "Device name can't contain control characters",
+        )?;
+        let platform = checked_text(
+            platform,
+            "Device platform must be 1 to 64 characters",
+            "Device platform can't contain control characters",
+        )?;
         if login.is_empty() {
             return Err("Tailnet login is missing");
         }
-        if self.devices.iter().any(|device| device.name == name) {
-            return Err("A device with that name is already paired");
-        }
-        self.secrets.swap_remove(position);
         let token = random_hex();
         let seconds = seconds(now);
         let device = Device {
@@ -157,11 +168,16 @@ impl Store {
             last_seen: seconds,
             token_sha256: sha256_hex(&token),
         };
-        self.devices.push(device.clone());
-        if self.save().await.is_err() {
-            self.devices.pop();
-            return Err("Could not save the device");
-        }
+        self.update(|devices| {
+            if devices.iter().any(|kept| kept.name == device.name) {
+                return (Err("A device with that name is already paired"), false);
+            }
+            devices.push(device.clone());
+            (Ok(()), true)
+        })
+        .await
+        .map_err(|_| "Could not save the device")??;
+        self.secrets.swap_remove(position);
         Ok((token, device))
     }
 
@@ -186,12 +202,27 @@ impl Store {
             return None;
         }
         let seen = seconds(now).max(device.last_seen);
-        let stale = seen >= device.last_seen + SEEN_WRITE_GAP;
+        let stale = seen >= device.last_seen.saturating_add(SEEN_WRITE_GAP);
         device.last_seen = seen;
         let device = device.clone();
         if stale {
-            // A failed write only leaves the file's last_seen older.
-            let _ = self.save().await;
+            // The write re-reads the file, so a device revoked elsewhere is
+            // refused here; a failed write only leaves last_seen older on disk.
+            let written = self
+                .update(|devices| {
+                    let Some(kept) = devices
+                        .iter_mut()
+                        .find(|kept| kept.token_sha256 == device.token_sha256)
+                    else {
+                        return (false, false);
+                    };
+                    kept.last_seen = kept.last_seen.max(seen);
+                    (true, true)
+                })
+                .await;
+            if matches!(written, Ok(false)) {
+                return None;
+            }
         }
         Some(device)
     }
@@ -199,16 +230,14 @@ impl Store {
     /// Deletes the device called `name`; false if there is none or the file
     /// cannot be written.
     pub async fn revoke(&mut self, name: &str) -> bool {
-        let before = self.devices.clone();
-        self.devices.retain(|device| device.name != name);
-        if self.devices.len() == before.len() {
-            return false;
-        }
-        if self.save().await.is_err() {
-            self.devices = before;
-            return false;
-        }
-        true
+        self.update(|devices| {
+            let before = devices.len();
+            devices.retain(|device| device.name != name);
+            let removed = devices.len() != before;
+            (removed, removed)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// The paired devices.
@@ -267,33 +296,62 @@ impl Store {
         }
     }
 
-    /// Writes `devices.json` through a temp file and a rename.
-    async fn save(&mut self) -> io::Result<()> {
-        let devices: Vec<_> = self
-            .devices
-            .iter()
-            .map(|device| {
-                serde_json::json!({
-                    "name": device.name,
-                    "platform": device.platform,
-                    "login": device.login,
-                    "created": device.created,
-                    "last_seen": device.last_seen,
-                    "token_sha256": device.token_sha256,
+    /// Changes `devices.json` under an exclusive lock on `devices.lock`:
+    /// re-reads the file, applies `change` to what is there, and writes the
+    /// result if `change` says (the second value) it changed something. The
+    /// list in memory becomes what is on disk, so another process's changes
+    /// are never written back over.
+    async fn update<R>(
+        &mut self,
+        change: impl FnOnce(&mut Vec<Device>) -> (R, bool),
+    ) -> io::Result<R> {
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(self.directory.join("devices.lock"))
+            .await?
+            .into_std()
+            .await;
+        // The lock is released when `lock` drops, even if this future does.
+        let lock = tokio::task::spawn_blocking(move || lock.lock().map(|()| lock))
+            .await
+            .map_err(io::Error::other)??;
+        let (mut devices, stamp) = read_devices(&self.directory).await?;
+        let (result, write) = change(&mut devices);
+        if write {
+            let devices: Vec<_> = devices
+                .iter()
+                .map(|device| {
+                    serde_json::json!({
+                        "name": device.name,
+                        "platform": device.platform,
+                        "login": device.login,
+                        "created": device.created,
+                        "last_seen": device.last_seen,
+                        "token_sha256": device.token_sha256,
+                    })
                 })
-            })
-            .collect();
-        let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({ "devices": devices }))?;
-        bytes.push(b'\n');
-        write_private(&self.directory, "devices.json", &bytes).await?;
-        self.stamp = file_stamp(&self.directory.join("devices.json")).await;
-        Ok(())
+                .collect::<Vec<_>>();
+            let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({ "devices": devices }))?;
+            bytes.push(b'\n');
+            write_private(&self.directory, "devices.json", &bytes).await?;
+            self.stamp = file_stamp(&self.directory.join("devices.json")).await;
+        } else {
+            self.stamp = stamp;
+        }
+        self.devices = devices;
+        drop(lock);
+        Ok(result)
     }
 }
 
 /// Writes `name` in `directory` owner-only: a temp file, synced, then renamed.
 async fn write_private(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
-    let temporary = directory.join(format!("{name}.{}.tmp", std::process::id()));
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let count = NEXT.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!("{name}.{}.{count}.tmp", std::process::id()));
     match fs::remove_file(&temporary).await {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
         _ => {}
@@ -317,11 +375,13 @@ async fn write_private(directory: &Path, name: &str, bytes: &[u8]) -> io::Result
     sync_directory(directory).await
 }
 
+/// The mtime and size of `path`, if it exists.
 async fn file_stamp(path: &Path) -> Option<Stamp> {
     let metadata = fs::metadata(path).await.ok()?;
     Some((metadata.modified().ok()?, metadata.len()))
 }
 
+/// An unreadable-data error that says what was wrong.
 fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
 }
@@ -351,6 +411,14 @@ async fn read_devices(directory: &Path) -> io::Result<(Vec<Device>, Option<Stamp
                 created: entry["created"].as_u64()?,
                 last_seen: entry["last_seen"].as_u64()?,
                 token_sha256: text("token_sha256")?,
+            })
+            .filter(|device| {
+                !device.login.is_empty()
+                    && device.token_sha256.len() == 64
+                    && device
+                        .token_sha256
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
             })
         })
         .collect::<Option<Vec<_>>>()
@@ -391,12 +459,31 @@ async fn read_config(directory: &Path) -> io::Result<HubConfig> {
     Ok(config)
 }
 
-/// Whether a secret issued at `issued` is past its 10 minutes at `now`.
+/// Whether a secret issued at `issued` is past its 10 minutes at `now`; a
+/// `now` before `issued` (the clock moved back) counts as expired.
 fn expired(issued: SystemTime, now: SystemTime) -> bool {
-    now.duration_since(issued)
-        .is_ok_and(|age| age > SECRET_LIFETIME)
+    !now.duration_since(issued)
+        .is_ok_and(|age| age <= SECRET_LIFETIME)
 }
 
+/// `text` trimmed, or why it cannot name a device: empty, over 64 characters
+/// (`length`) or holding a control character (`control`).
+fn checked_text<'a>(
+    text: &'a str,
+    length: &'static str,
+    control: &'static str,
+) -> Result<&'a str, &'static str> {
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > NAME_LIMIT {
+        Err(length)
+    } else if text.chars().any(char::is_control) {
+        Err(control)
+    } else {
+        Ok(text)
+    }
+}
+
+/// Whole seconds since the epoch (0 before it).
 fn seconds(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
@@ -409,6 +496,7 @@ fn random_hex() -> String {
     hex(&bytes)
 }
 
+/// Lowercase hex digits of `bytes`.
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::new(), |mut text, byte| {
@@ -417,6 +505,7 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// The hex SHA-256 of `text`.
 fn sha256_hex(text: &str) -> String {
     hex(Sha256::digest(text.as_bytes()).as_slice())
 }
@@ -666,5 +755,125 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join("hub-audit.jsonl")).unwrap();
         assert!(!text.contains(&token));
         assert!(!format!("{store:?}").contains(&token));
+    }
+
+    #[tokio::test]
+    async fn a_stale_store_cannot_bring_back_a_revoked_device() {
+        let dir = TempDir::new("hub-lost");
+        let mut x = store(&dir).await;
+        let _a = paired(&mut x, "A", epoch(100)).await;
+        let b = paired(&mut x, "B", epoch(100)).await;
+        let mut y = Store::open(dir.path()).await.unwrap();
+        assert!(y.revoke("A").await);
+        let device = x.authenticate(&b, LOGIN, epoch(1000)).await.unwrap();
+        assert_eq!(device.last_seen, 1000);
+        let names = |store: &Store| {
+            store
+                .devices()
+                .iter()
+                .map(|d| d.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&x), ["B"]);
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(names(&reopened), ["B"]);
+        assert_eq!(reopened.devices()[0].last_seen, 1000);
+        // A pairing from the stale store keeps the revoke too.
+        let secret = x.pairing_secret(epoch(1000));
+        x.pair(&secret, "C", "ios", LOGIN, epoch(1000))
+            .await
+            .unwrap();
+        assert_eq!(names(&Store::open(dir.path()).await.unwrap()), ["B", "C"]);
+        // And a device revoked elsewhere cannot authenticate when it would write.
+        assert!(y.reload_if_changed().await);
+        assert!(x.revoke("B").await);
+        assert!(y.authenticate(&b, LOGIN, epoch(5000)).await.is_none());
+        assert_eq!(names(&Store::open(dir.path()).await.unwrap()), ["C"]);
+        let lock = dir.path().join("devices.lock");
+        assert_eq!(
+            std::fs::metadata(lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pairing_secret_from_the_future_is_expired() {
+        let dir = TempDir::new("hub-clock");
+        let mut store = store(&dir).await;
+        let secret = store.pairing_secret(epoch(10_000));
+        let earlier = store.pair(&secret, "Phone", "ios", LOGIN, epoch(100)).await;
+        assert_eq!(
+            earlier.map(|_| ()),
+            Err("Pairing code already used or expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn names_are_trimmed_and_free_of_control_characters() {
+        let dir = TempDir::new("hub-names");
+        let mut store = store(&dir).await;
+        let now = epoch(1);
+        let secret = store.pairing_secret(now);
+        for (name, platform) in [
+            ("a\nb", "ios"),
+            ("a\u{1b}[2J", "ios"),
+            ("ok", "i\tos"),
+            ("  ", "ios"),
+        ] {
+            assert!(
+                store
+                    .pair(&secret, name, platform, LOGIN, now)
+                    .await
+                    .is_err(),
+                "{name:?}"
+            );
+        }
+        let long = "x".repeat(65);
+        assert!(store.pair(&secret, &long, "ios", LOGIN, now).await.is_err());
+        let (_, device) = store
+            .pair(&secret, "  Gemini 10 ", " ios ", LOGIN, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            (device.name.as_str(), device.platform.as_str()),
+            ("Gemini 10", "ios")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_directory_is_tightened_to_owner_only() {
+        let dir = TempDir::new("hub-mode");
+        std::fs::create_dir(dir.path()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        store(&dir).await;
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[tokio::test]
+    async fn a_devices_file_that_cannot_be_trusted_is_refused() {
+        let dir = TempDir::new("hub-bad");
+        std::fs::create_dir(dir.path()).unwrap();
+        let hash = "ab".repeat(32);
+        let device = |login: &str, hash: &str| {
+            format!(
+                r#"{{"devices":[{{"name":"n","platform":"p","login":"{login}","created":1,"last_seen":1,"token_sha256":"{hash}"}}]}}"#
+            )
+        };
+        let file = dir.path().join("devices.json");
+        std::fs::write(&file, device(LOGIN, &hash)).unwrap();
+        assert!(Store::open(dir.path()).await.is_ok());
+        for bad in [
+            device("", &hash),
+            device(LOGIN, "abc"),
+            device(LOGIN, &hash.to_uppercase()),
+            device(LOGIN, &"g".repeat(64)),
+        ] {
+            std::fs::write(&file, bad).unwrap();
+            let error = Store::open(dir.path()).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
     }
 }
