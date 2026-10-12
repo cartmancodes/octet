@@ -486,6 +486,22 @@ impl HookOutcome {
     pub fn notable(&self) -> bool {
         !matches!(self, Self::Ran)
     }
+    /// The journal spelling: `ran`, `failed`, `blocked` or `decided`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ran => "ran",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Decided(_) => "decided",
+        }
+    }
+    /// The approval answer of a hook that decided one.
+    pub fn decision(&self) -> Option<&str> {
+        match self {
+            Self::Decided(decision) => Some(decision),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

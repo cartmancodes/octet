@@ -202,10 +202,14 @@ fn record(event: &Event) -> (&'static str, Value) {
             event,
             outcome,
             detail,
-        } => (
-            "hook",
-            json!({"name":name,"event":event,"outcome":format!("{outcome:?}"),"detail":detail}),
-        ),
+        } => {
+            let mut data =
+                json!({"name":name,"event":event,"outcome":outcome.as_str(),"detail":detail});
+            if let Some(decision) = outcome.decision() {
+                data["decision"] = json!(decision);
+            }
+            ("hook", data)
+        }
         Event::Notice(text) => ("notice", json!(text)),
         Event::Error(text) => ("error", json!(text)),
         Event::Stopped => ("stopped", Value::Null),
@@ -270,6 +274,22 @@ pub use octet_engine::live::{ModelInfo, SkillInfo};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_hook_record_names_its_outcome_and_decision() {
+        let hook = |outcome| Event::Hook {
+            name: "PreToolUse:Bash".into(),
+            event: "PreToolUse".into(),
+            outcome,
+            detail: String::new(),
+        };
+        let decided = event_json(&hook(HookOutcome::Decided("allow".into())));
+        assert_eq!(decided["type"], "hook");
+        assert_eq!(decided["data"]["outcome"], "decided");
+        assert_eq!(decided["data"]["decision"], "allow");
+        let ran = event_json(&hook(HookOutcome::Ran));
+        assert_eq!(ran["data"]["outcome"], "ran");
+        assert!(ran["data"].get("decision").is_none(), "{ran}");
+    }
 
     #[tokio::test]
     async fn a_failed_export_leaves_no_file() {
