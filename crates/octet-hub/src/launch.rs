@@ -4,22 +4,29 @@
 //! literal argument each: no shell, no joined strings. Workspaces are checked against an
 //! allow-list of canonical directories.
 use octet_core::{
-    Engine, Mode, recent_sessions,
+    Engine, Mode, recent_sessions_in,
     remote::{known_workspaces, protocol::full_access_confirmed},
 };
 use serde_json::{Value, json};
 use std::{
-    ffi::OsString,
+    collections::VecDeque,
+    ffi::{OsStr, OsString},
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, UNIX_EPOCH},
 };
-use tokio::{process::Command, time::timeout};
+use tokio::{
+    process::Command,
+    time::{Instant, timeout},
+};
 
 /// Sessions started from the phone that may run at once.
 pub(crate) const PHONE_SESSIONS: usize = 8;
 /// How long tmux gets to start a session.
 const LAUNCH_WITHIN: Duration = Duration::from_secs(5);
+/// How long removing a session that took too long to start may take.
+const KILL_WITHIN: Duration = Duration::from_secs(2);
 /// The longest tmux error kept, in characters.
 const TMUX_ERROR: usize = 500;
 /// The longest phone-chosen path echoed back, in characters.
@@ -53,12 +60,14 @@ pub(crate) fn clip(text: &str, chars: usize) -> String {
     text.chars().take(chars).collect()
 }
 
-/// `value` as one plain argument: not empty, no whitespace or control characters, and not
-/// shaped like an option.
+/// `value` as one plain argument: not empty, no whitespace or control characters, no `;` or `#`
+/// (tmux's separator and format character), and not shaped like an option.
 fn token(what: &str, value: &str) -> Result<(), String> {
     let plain = !value.is_empty()
         && !value.starts_with('-')
-        && !value.chars().any(|c| c.is_whitespace() || c.is_control());
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == ';' || c == '#');
     if plain {
         Ok(())
     } else {
@@ -82,6 +91,21 @@ pub(crate) fn check_workspace(requested: &Path, allowed: &[PathBuf]) -> Result<P
         "Workspace not allowed: {}",
         clip(&shown, ECHOED_PATH)
     ))
+}
+
+/// `arg` as tmux takes a command's argument: tmux ends a command at any argument that ends in
+/// `;`, unless that is escaped as `\;`.
+fn tmux_argument(arg: &OsStr) -> OsString {
+    let mut bytes = arg.as_bytes().to_vec();
+    if bytes.ends_with(b";") {
+        bytes.insert(bytes.len() - 1, b'\\');
+    }
+    OsString::from_vec(bytes)
+}
+
+/// `path` as tmux's `-c` takes it: `#` starts a format there, so it is doubled.
+fn tmux_directory(path: &str) -> OsString {
+    tmux_argument(OsStr::new(&path.replace('#', "##")))
 }
 
 /// The tmux arguments for a phone-started interface; Err when the request is not allowed.
@@ -124,13 +148,20 @@ pub(crate) fn start_args(
         return Err("Full access needs confirm: \"full access\"".into());
     }
     let workspace = check_workspace(&request.workspace, allowed)?;
+    let text = workspace
+        .to_str()
+        .ok_or("The workspace path must be UTF-8")?;
     let mut args: Vec<OsString> = ["new-session", "-d", "-s", name, "-c"]
         .map(OsString::from)
         .into();
-    args.push(workspace.into_os_string());
-    args.push(octet.as_os_str().to_owned());
+    args.push(tmux_directory(text));
+    args.push(tmux_argument(octet.as_os_str()));
     args.push("--journal-dir".into());
-    args.push(directory.as_os_str().to_owned());
+    args.push(tmux_argument(directory.as_os_str()));
+    // Octet's own `--cwd` is literal, and refuses what is not a directory, so a path tmux
+    // misread could never leave the session in `$HOME`.
+    args.push("--cwd".into());
+    args.push(tmux_argument(workspace.as_os_str()));
     args.push("--engine".into());
     args.push(engine.as_str().into());
     args.push("--remote-started".into());
@@ -148,19 +179,27 @@ pub(crate) fn start_args(
 }
 
 /// A tmux session name for a new interface: `octet-` and six hex digits.
-pub(crate) fn session_name() -> String {
+///
+/// # Errors
+///
+/// When the operating system gave no random bytes.
+pub(crate) fn session_name() -> Result<String, String> {
     let mut bytes = [0_u8; 3];
-    getrandom::fill(&mut bytes).expect("the operating system gave no random bytes");
-    format!("octet-{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2])
+    getrandom::fill(&mut bytes).map_err(|_| "Couldn't make a session name".to_owned())?;
+    Ok(format!(
+        "octet-{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2]
+    ))
 }
 
-/// Runs tmux with `args`, giving it 5 seconds.
+/// Runs tmux with `args`, which start the session `name`, giving it 5 seconds. A tmux that runs
+/// out of time is stopped, and so is the session, if it got that far.
 ///
 /// # Errors
 ///
 /// Why it did not start a session: tmux is missing, it ran out of time, or what it said on
 /// stderr (clipped).
-pub(crate) async fn launch(args: Vec<OsString>) -> Result<(), String> {
+pub(crate) async fn launch(args: Vec<OsString>, name: &str) -> Result<(), String> {
     let child = Command::new("tmux")
         .args(args)
         .stdin(Stdio::null())
@@ -172,10 +211,10 @@ pub(crate) async fn launch(args: Vec<OsString>) -> Result<(), String> {
             std::io::ErrorKind::NotFound => "tmux isn't installed".to_owned(),
             _ => format!("Couldn't run tmux: {e}"),
         })?;
-    let output = timeout(LAUNCH_WITHIN, child.wait_with_output())
-        .await
-        .map_err(|_| "tmux didn't answer in 5 seconds".to_owned())?
-        .map_err(|e| format!("Couldn't run tmux: {e}"))?;
+    let Ok(output) = timeout(LAUNCH_WITHIN, child.wait_with_output()).await else {
+        return Err(abandon(name).await);
+    };
+    let output = output.map_err(|e| format!("Couldn't run tmux: {e}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -188,6 +227,67 @@ pub(crate) async fn launch(args: Vec<OsString>) -> Result<(), String> {
     })
 }
 
+/// How long an accepted launch counts toward the cap while its interface has not registered.
+const REGISTER_WITHIN: Duration = Duration::from_secs(30);
+
+/// Launches the cap must count beyond the registrations: those tmux is still starting, and those
+/// it started whose interface has not registered yet (up to [`REGISTER_WITHIN`]).
+#[derive(Debug, Default)]
+pub(crate) struct Launches {
+    /// Launches tmux has not answered yet.
+    in_flight: usize,
+    /// When each accepted launch stops counting, oldest first.
+    awaiting: VecDeque<Instant>,
+    /// The phone-started registrations seen last time.
+    seen: usize,
+}
+
+impl Launches {
+    /// A launch begins.
+    pub(crate) fn begin(&mut self) {
+        self.in_flight += 1;
+    }
+
+    /// The launch that began was accepted by tmux at `now`.
+    pub(crate) fn accepted(&mut self, now: Instant) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.awaiting.push_back(now + REGISTER_WITHIN);
+    }
+
+    /// The launch that began did not start a session.
+    pub(crate) fn failed(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+
+    /// How many phone-started sessions exist or are on their way, given the `registered` ones: each
+    /// newly seen registration settles the oldest awaited launch, and a launch not settled within
+    /// [`REGISTER_WITHIN`] stops counting.
+    pub(crate) fn running(&mut self, registered: usize, now: Instant) -> usize {
+        for _ in self.seen..registered {
+            self.awaiting.pop_front();
+        }
+        self.seen = registered;
+        self.awaiting.retain(|deadline| *deadline > now);
+        registered + self.in_flight + self.awaiting.len()
+    }
+}
+
+/// What to tell the phone about a tmux that ran out of time, after trying to remove the session
+/// it may have created.
+async fn abandon(name: &str) -> String {
+    let kill = Command::new("tmux")
+        .args(["kill-session", "-t", name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    match timeout(KILL_WITHIN, kill).await {
+        Ok(Ok(status)) if status.success() => "tmux didn't answer in 5 seconds".to_owned(),
+        _ => "The session may still be starting".to_owned(),
+    }
+}
+
 /// A session tmux started.
 #[derive(Debug)]
 pub(crate) struct Started {
@@ -197,8 +297,8 @@ pub(crate) struct Started {
     pub workspace: PathBuf,
 }
 
-/// Where the canonical workspace sits in [`start_args`]'s result.
-const WORKSPACE_ARG: usize = 5;
+/// Where the literal canonical workspace (the value of `--cwd`) sits in [`start_args`]'s result.
+const WORKSPACE_ARG: usize = 10;
 
 /// Checks `request` against the allowed workspaces and starts it in a new tmux session.
 ///
@@ -213,13 +313,13 @@ pub(crate) async fn start(
 ) -> Result<Started, String> {
     let allowed = allowed_workspaces(directory, configured).await;
     let octet = std::env::current_exe().map_err(|e| format!("Couldn't find octet: {e}"))?;
-    let name = session_name();
+    let name = session_name()?;
     let args = start_args(&octet, directory, request, &allowed, running, &name)?;
     let workspace = args
         .get(WORKSPACE_ARG)
         .map(PathBuf::from)
         .unwrap_or_default();
-    launch(args).await?;
+    launch(args, &name).await?;
     Ok(Started { name, workspace })
 }
 
@@ -255,21 +355,15 @@ pub(crate) async fn recent(
         Some(requested) => vec![check_workspace(requested, allowed)?],
         None => allowed.to_vec(),
     };
-    let mut found = Vec::new();
-    for workspace in &workspaces {
-        for session in recent_sessions(directory, workspace, PER_WORKSPACE).await {
-            found.push((workspace, session));
-        }
-    }
-    found.sort_by_key(|(_, session)| std::cmp::Reverse(session.summary.started));
-    found.truncate(if workspace.is_some() {
+    let limit = if workspace.is_some() {
         PER_WORKSPACE
     } else {
         IN_TOTAL
-    });
+    };
+    let found = recent_sessions_in(directory, &workspaces, PER_WORKSPACE, limit).await;
     Ok(found
         .into_iter()
-        .map(|(workspace, session)| {
+        .map(|session| {
             let summary = session.summary;
             let started = summary
                 .started
@@ -281,7 +375,7 @@ pub(crate) async fn recent(
                 .map_or_else(|| "(no prompt)".to_owned(), |p| clip(p, TITLE_CHARS));
             let mut row = json!({
                 "engine": session.engine.as_str(),
-                "workspace": workspace.to_string_lossy(),
+                "workspace": summary.cwd.to_string_lossy(),
                 "session": summary.session,
                 "title": title,
                 "started": started,
@@ -357,6 +451,8 @@ mod tests {
                 "/bin/octet",
                 "--journal-dir",
                 "/data dir",
+                "--cwd",
+                &hostile_text,
                 "--engine",
                 "demo",
                 "--remote-started",
@@ -398,6 +494,72 @@ mod tests {
     }
 
     #[test]
+    fn tmux_formats_and_separators_in_workspaces_are_escaped_in_the_cwd_flag_only() {
+        for (name, escaped) in [
+            ("C#", "C##"),
+            ("notes#S", "notes##S"),
+            ("a#{b}", "a##{b}"),
+            ("semi;", "semi\\;"),
+            ("odd#;", "odd##\\;"),
+        ] {
+            let (_temp, ws) = workspace(name);
+            let text = ws.to_string_lossy().into_owned();
+            let got = args(&request(&ws), std::slice::from_ref(&ws), 0).unwrap();
+            let want = format!("{}{escaped}", text.strip_suffix(name).unwrap());
+            assert_eq!(got[4], "-c", "{name}");
+            assert_eq!(got[5], want, "{name}");
+            // The flag's value is the path, but a trailing `;` is escaped for tmux there too.
+            let literal = match text.strip_suffix(';') {
+                Some(rest) => format!("{rest}\\;"),
+                None => text.clone(),
+            };
+            assert_eq!(got[9..11], ["--cwd", literal.as_str()], "{name}");
+        }
+        // Any other path argument ending in `;` is escaped the same way.
+        let (_temp, ws) = workspace("w");
+        let got = start_args(
+            Path::new("/bin/octet;"),
+            Path::new("/data;"),
+            &request(&ws),
+            std::slice::from_ref(&ws),
+            0,
+            "octet-abc123",
+        )
+        .unwrap();
+        assert_eq!(got[6], "/bin/octet\\;");
+        assert_eq!(got[8], "/data\\;");
+    }
+
+    #[test]
+    fn launches_count_until_their_interface_registers_or_time_runs_out() {
+        let start = Instant::now();
+        let mut launches = Launches::default();
+        launches.begin();
+        // In flight counts, and so does an accepted launch that has not registered.
+        assert_eq!(launches.running(0, start), 1);
+        launches.accepted(start);
+        assert_eq!(launches.running(0, start), 1);
+        launches.begin();
+        launches.failed();
+        assert_eq!(launches.running(0, start), 1);
+        // Its registration settles it: counted once, not twice.
+        assert_eq!(launches.running(1, start), 1);
+        assert_eq!(launches.running(1, start), 1);
+        // Two more accepted: three in all; one registers, still three.
+        launches.begin();
+        launches.accepted(start);
+        launches.begin();
+        launches.accepted(start);
+        assert_eq!(launches.running(1, start), 3);
+        assert_eq!(launches.running(2, start), 3);
+        // A session that ended does not settle the next launch.
+        assert_eq!(launches.running(1, start), 2);
+        // One that never registers stops counting after 30 seconds.
+        let later = start + REGISTER_WITHIN;
+        assert_eq!(launches.running(1, later), 1);
+    }
+
+    #[test]
     fn engines_tokens_modes_and_the_cap_are_checked() {
         let (_temp, ws) = workspace("w");
         let allowed = vec![ws.clone()];
@@ -413,7 +575,7 @@ mod tests {
         r.mode = Some("accept-edits".into());
         let got = args(&r, &allowed, 0).unwrap();
         assert_eq!(
-            got[12..],
+            got[14..],
             [
                 "--resume",
                 "abc-123",
@@ -423,9 +585,11 @@ mod tests {
                 "accept-edits"
             ]
         );
-        assert_eq!(got[10], "claude");
+        assert_eq!(got[12], "claude");
 
-        for bad in ["", "a b", "a\tb", "a\nb", "a\u{7}b", "--mode", "-x"] {
+        for bad in [
+            "", "a b", "a\tb", "a\nb", "a\u{7}b", "--mode", "-x", "a;b", "a#b",
+        ] {
             for field in 0..2 {
                 let mut r = request(&ws);
                 match field {
@@ -464,10 +628,10 @@ mod tests {
         assert!(octet.exists(), "build octet first: cargo build -p octet");
         let root = PathBuf::from(format!("/tmp/ohl{}", std::process::id()));
         let data = root.join("data");
-        let work = root.join("w");
+        let work = root.join("w#S{x};");
         std::fs::create_dir_all(&work).unwrap();
         let work = std::fs::canonicalize(work).unwrap();
-        let name = session_name();
+        let name = session_name().unwrap();
         let args = start_args(
             &octet,
             &data,
@@ -477,7 +641,7 @@ mod tests {
             &name,
         )
         .unwrap();
-        launch(args).await.unwrap();
+        launch(args, &name).await.unwrap();
         let found = timeout(Duration::from_secs(20), async {
             loop {
                 let registered = std::fs::read_dir(data.join("run")).ok().and_then(|dir| {
@@ -493,10 +657,19 @@ mod tests {
             }
         })
         .await;
+        let cwd = std::process::Command::new("tmux")
+            .args(["display-message", "-p", "-t", &name, "#{pane_current_path}"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
         let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", &name])
             .status();
         let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            cwd.unwrap(),
+            work.to_string_lossy(),
+            "the pane starts in the workspace"
+        );
         let text = found.expect("the interface registers");
         assert!(text.contains("\"engine\":\"demo\""), "{text}");
     }

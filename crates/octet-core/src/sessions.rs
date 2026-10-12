@@ -47,6 +47,18 @@ pub async fn recent_sessions(
     workspace: &Path,
     limit: usize,
 ) -> Vec<RecentSession> {
+    recent_sessions_in(directory, &[workspace.to_path_buf()], limit, limit).await
+}
+
+/// Up to `total` vendor sessions run in any of `workspaces`, at most `per_workspace` in each,
+/// newest first, one entry per session, from one pass over the newest journals. Skips what
+/// [`recent_sessions`] skips.
+pub async fn recent_sessions_in(
+    directory: &Path,
+    workspaces: &[PathBuf],
+    per_workspace: usize,
+    total: usize,
+) -> Vec<RecentSession> {
     let mut found: Vec<RecentSession> = Vec::new();
     for journal in newest_journals(directory).await {
         let Some(summary) = read_summary(&journal).await else {
@@ -55,22 +67,30 @@ pub async fn recent_sessions(
         let Some(engine) = Engine::parse(&summary.engine).filter(|e| e.is_vendor()) else {
             continue;
         };
-        if summary.session.is_empty() || summary.cwd != workspace {
+        if summary.session.is_empty() || !workspaces.contains(&summary.cwd) {
             continue;
         }
         // Reconnects write a journal per connection; the newest stands for
         // the session, and an older one may know its first prompt.
-        if let Some(known) = found
-            .iter_mut()
-            .find(|s| s.engine == engine && s.summary.session == summary.session)
-        {
+        if let Some(known) = found.iter_mut().find(|s| {
+            s.engine == engine
+                && s.summary.session == summary.session
+                && s.summary.cwd == summary.cwd
+        }) {
             if known.summary.first_prompt.is_none() {
                 known.summary.first_prompt = summary.first_prompt;
             }
             continue;
         }
-        if found.len() == limit {
+        if found.len() == total {
             break;
+        }
+        let in_workspace = found
+            .iter()
+            .filter(|s| s.summary.cwd == summary.cwd)
+            .count();
+        if in_workspace == per_workspace {
+            continue;
         }
         found.push(RecentSession {
             engine,
@@ -161,6 +181,34 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn recent_sessions_in_reads_once_for_many_workspaces_with_limits() {
+        let temp = octet_testkit::TempDir::new("octet-core-sessions-in");
+        let dir = temp.path();
+        std::fs::create_dir_all(dir).unwrap();
+        journal(dir, 1, "codex", "/a", "a-1", Some("a one"));
+        journal(dir, 2, "codex", "/a", "a-2", Some("a two"));
+        journal(dir, 3, "claude", "/b", "b-1", Some("b one"));
+        journal(dir, 4, "codex", "/a", "a-3", Some("a three"));
+        journal(dir, 5, "codex", "/c", "c-1", Some("not asked for"));
+        journal(dir, 6, "codex", "/a", "a-2", None);
+        let listed = |found: &[RecentSession]| -> Vec<String> {
+            found.iter().map(|s| s.summary.session.clone()).collect()
+        };
+        let wanted = [PathBuf::from("/a"), PathBuf::from("/b")];
+        // Newest journal first, one entry per session, nothing from /c.
+        let all = recent_sessions_in(dir, &wanted, 20, 20).await;
+        assert_eq!(listed(&all), ["a-2", "a-3", "b-1", "a-1"]);
+        assert_eq!(all[0].summary.first_prompt.as_deref(), Some("a two"));
+        // At most two per workspace.
+        let some = recent_sessions_in(dir, &wanted, 2, 20).await;
+        assert_eq!(listed(&some), ["a-2", "a-3", "b-1"]);
+        // At most three in all.
+        let few = recent_sessions_in(dir, &wanted, 20, 3).await;
+        assert_eq!(listed(&few), ["a-2", "a-3", "b-1"]);
+        assert!(recent_sessions_in(dir, &[], 20, 20).await.is_empty());
     }
 
     #[tokio::test]

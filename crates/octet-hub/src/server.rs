@@ -27,7 +27,7 @@
 //! past it. Each replay page resumes at the byte where the last stopped. Live frames go through
 //! a queue of 512: a phone that lets it fill is dropped.
 use crate::{
-    launch::{self, StartRequest, clip as clip_to},
+    launch::{self, Launches, StartRequest, clip as clip_to},
     owner::tailnet_url,
     sessions::{SessionUpdate, Sessions},
     store::{Device, Store},
@@ -121,6 +121,12 @@ const NOT_YET: &str = "Not yet supported";
 const NO_ANSWER: &str = "The session didn't answer";
 /// The refusal for `full-access` without the typed confirmation.
 const FULL_ACCESS: &str = "Full access needs confirm: \"full access\"";
+/// The refusal for a `recent` while another scan runs.
+const SCAN_RUNNING: &str = "A recent-sessions scan is running; try again";
+/// The refusal for a background job that took too long.
+const JOB_TIMED_OUT: &str = "That took too long; try again";
+/// How long a scan or a start may take in all.
+const JOB_WITHIN: Duration = Duration::from_secs(30);
 /// The longest workspace path kept in an audit line, in characters.
 const AUDIT_PATH: usize = 200;
 /// The longest phone-chosen text (a mode or model name) kept in an audit line, in characters.
@@ -141,8 +147,8 @@ enum ConnEvent {
     Answer {
         conn: u64,
         frame: Value,
-        /// Whether it was a launch, which stops counting as one in flight.
-        launch: bool,
+        /// Which job it was.
+        job: Job,
         /// The audit line to write: device, session and what.
         audit: Option<(String, String, String)>,
     },
@@ -150,6 +156,15 @@ enum ConnEvent {
     Stalled { conn: u64 },
     /// The connection ended.
     Closed { conn: u64 },
+}
+
+/// A background job that answers a phone.
+#[derive(Clone, Copy, Debug)]
+enum Job {
+    /// A scan for `recent`.
+    Scan,
+    /// A tmux launch, and whether tmux accepted it.
+    Launch { accepted: bool },
 }
 
 /// What the hub loop has a connection's writer send, in order.
@@ -185,13 +200,13 @@ impl std::fmt::Debug for ConnEvent {
             Self::Answer {
                 conn,
                 frame,
-                launch,
+                job,
                 audit,
             } => f
                 .debug_struct("Answer")
                 .field("conn", conn)
                 .field("frame", &Redacted(frame.to_string().len()))
-                .field("launch", launch)
+                .field("job", job)
                 .field("audit", &audit.as_ref().map(|(_, session, _)| session))
                 .finish(),
             Self::Stalled { conn } => f.debug_struct("Stalled").field("conn", conn).finish(),
@@ -396,8 +411,10 @@ pub struct Hub {
     listed: Vec<Value>,
     /// The data directory: journals, the run directory and the hub's files.
     directory: PathBuf,
-    /// Launches started and not yet finished; they count toward the phone-started cap.
-    launching: usize,
+    /// Launches that count toward the phone-started cap beyond the registrations.
+    launches: Launches,
+    /// Whether a `recent` scan is running; only one runs at a time.
+    scanning: bool,
     /// Given to each connection and replay task.
     events: mpsc::Sender<ConnEvent>,
     /// The last id given to a connection, hub req or replay.
@@ -448,7 +465,8 @@ impl Hub {
             store,
             sessions: Sessions::new(run),
             directory,
-            launching: 0,
+            launches: Launches::default(),
+            scanning: false,
             owner,
             port,
             conns: HashMap::new(),
@@ -538,11 +556,20 @@ impl Hub {
             ConnEvent::Answer {
                 conn,
                 frame,
-                launch,
+                job,
                 audit,
             } => {
-                if launch {
-                    self.launching = self.launching.saturating_sub(1);
+                match job {
+                    Job::Scan => self.scanning = false,
+                    Job::Launch { accepted } => {
+                        let now = Instant::now();
+                        self.launches.running(self.sessions.phone_started(), now);
+                        if accepted {
+                            self.launches.accepted(now);
+                        } else {
+                            self.launches.failed();
+                        }
+                    }
                 }
                 if let Some((device, session, what)) = audit {
                     self.store.audit(&device, &session, &what).await;
@@ -708,22 +735,32 @@ impl Hub {
             .await;
     }
 
-    /// Lists resumable sessions in the background; the scan reads up to 400 journals.
-    fn recent(&self, conn: u64, req: u64, workspace: Option<String>) {
+    /// Lists resumable sessions in the background; the scan reads up to 400 journals, and only
+    /// one runs at a time.
+    fn recent(&mut self, conn: u64, req: u64, workspace: Option<String>) {
+        if self.scanning {
+            self.refuse(conn, req, SCAN_RUNNING);
+            return;
+        }
+        self.scanning = true;
         let events = self.events.clone();
         let directory = self.directory.clone();
         let configured = self.store.config().workspaces.clone();
         tokio::spawn(async move {
-            let allowed = launch::allowed_workspaces(&directory, &configured).await;
-            let wanted = workspace.as_deref().map(Path::new);
-            let frame = match launch::recent(&directory, &allowed, wanted).await {
-                Ok(items) => recent_frame(&items),
-                Err(reason) => refused(req, &reason),
+            let scan = async {
+                let allowed = launch::allowed_workspaces(&directory, &configured).await;
+                let wanted = workspace.as_deref().map(Path::new);
+                launch::recent(&directory, &allowed, wanted).await
+            };
+            let frame = match timeout(JOB_WITHIN, scan).await {
+                Ok(Ok(items)) => recent_frame(&items),
+                Ok(Err(reason)) => refused(req, &reason),
+                Err(_) => refused(req, JOB_TIMED_OUT),
             };
             let done = ConnEvent::Answer {
                 conn,
                 frame,
-                launch: false,
+                job: Job::Scan,
                 audit: None,
             };
             let _ = events.send(done).await;
@@ -732,37 +769,41 @@ impl Hub {
 
     /// Starts a terminal UI in tmux in the background and answers when tmux has finished.
     fn start(&mut self, conn: u64, device: &str, req: u64, request: StartRequest) {
-        let running = self.sessions.phone_started() + self.launching;
-        self.launching += 1;
+        let registered = self.sessions.phone_started();
+        let running = self.launches.running(registered, Instant::now());
+        self.launches.begin();
         let events = self.events.clone();
         let directory = self.directory.clone();
         let configured = self.store.config().workspaces.clone();
         let device = device.to_owned();
         tokio::spawn(async move {
-            let result = launch::start(&directory, &configured, &request, running).await;
-            let (frame, audit) = match result {
+            let started = launch::start(&directory, &configured, &request, running);
+            let result = timeout(JOB_WITHIN, started)
+                .await
+                .unwrap_or_else(|_| Err(JOB_TIMED_OUT.to_owned()));
+            let (frame, audit, accepted) = match result {
                 Ok(started) => {
                     let place = started.workspace.to_string_lossy();
+                    let resume = if request.resume.is_some() {
+                        "yes"
+                    } else {
+                        "no"
+                    };
                     let what = format!(
-                        "start {} {} resume={} mode={}",
+                        "start {} {} resume={resume} mode={}",
                         request.engine,
                         clip_to(&place, AUDIT_PATH),
-                        if request.resume.is_some() {
-                            "yes"
-                        } else {
-                            "no"
-                        },
                         request.mode.as_deref().unwrap_or("default"),
                     );
                     let text = format!("Starting {} in {place}", started.name);
-                    (ack(req, &text), Some((device, started.name, what)))
+                    (ack(req, &text), Some((device, started.name, what)), true)
                 }
-                Err(reason) => (refused(req, &reason), None),
+                Err(reason) => (refused(req, &reason), None, false),
             };
             let done = ConnEvent::Answer {
                 conn,
                 frame,
-                launch: true,
+                job: Job::Launch { accepted },
                 audit,
             };
             let _ = events.send(done).await;
@@ -1023,6 +1064,7 @@ impl Hub {
     /// connections that never said hello.
     fn sweep(&mut self) {
         let now = Instant::now();
+        self.launches.running(self.sessions.phone_started(), now);
         let silent: Vec<u64> = self
             .conns
             .iter()
