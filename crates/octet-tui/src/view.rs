@@ -210,14 +210,16 @@ fn conversation(frame: &mut Frame, area: Rect, width: u16, app: &mut App) {
     // Before the first message the conversation area stays blank, reserved
     // for what the conversation will fill.
     if !app.chat.entries.is_empty() {
-        let block = card(if app.chat.scroll > 0 {
-            " Conversation · scrollback "
-        } else {
-            " Conversation "
-        });
-        let inner = block.inner(transcript);
-        frame.render_widget(block, transcript);
+        let inner = card(" Conversation ").inner(transcript);
         let lines = app.visible_lines(inner.width.saturating_sub(2), inner.height as usize);
+        let mut block = card(" Conversation ");
+        if app.chat.unseen {
+            block = block.title_bottom(Line::from(Span::styled(
+                " New output below · Ctrl+End follows ",
+                Style::default().fg(ACCENT),
+            )));
+        }
+        frame.render_widget(block, transcript);
         frame.render_widget(
             Paragraph::new(lines),
             Rect {

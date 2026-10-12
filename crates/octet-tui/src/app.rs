@@ -26,7 +26,7 @@ const MAX_ENTRIES: usize = 160;
 /// Models listed per `/model` page.
 pub(crate) const CATALOG_PAGE: usize = 20;
 /// The farthest the conversation scrolls back, in rows.
-const MAX_SCROLL: usize = 65_536;
+pub(crate) const MAX_SCROLL: usize = 65_536;
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Role {
     User,
@@ -217,6 +217,14 @@ impl Connection {
     }
 }
 
+/// Where the reader was on scrolling up: the newest entry, its rows then, the width, and rows added since.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Anchor {
+    pub(crate) seq: u64,
+    pub(crate) rows: usize,
+    pub(crate) width: u16,
+    pub(crate) added: usize,
+}
 /// The conversation: entries, scroll and the copyable reply.
 pub(crate) struct Transcript {
     pub(crate) entries: VecDeque<Entry>,
@@ -235,6 +243,10 @@ pub(crate) struct Transcript {
     pub(crate) tools_expanded: bool,
     /// The sequence number the next entry takes.
     pub(crate) next_seq: u64,
+    /// Where the scrolled-up reader is, so rows added below do not move the view.
+    pub(crate) anchor: Option<Anchor>,
+    /// Output arrived below the scrolled-up view.
+    pub(crate) unseen: bool,
 }
 /// A prompt as history keeps it: its text and the images sent with it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -370,6 +382,8 @@ impl App {
                 reply_stale: false,
                 tools_expanded: false,
                 next_seq: 0,
+                anchor: None,
+                unseen: false,
             },
             composer: Composer {
                 editor: Editor::default(),
@@ -791,6 +805,7 @@ impl App {
     pub(crate) fn toggle_tool_details(&mut self) {
         let expanded = !self.chat.tools_expanded;
         self.chat.tools_expanded = expanded;
+        self.chat.anchor = None;
         for entry in self
             .chat
             .entries
@@ -870,6 +885,8 @@ impl App {
             Event::User(text) => {
                 self.add(Role::User, &text);
                 self.chat.scroll = 0;
+                self.chat.anchor = None;
+                self.chat.unseen = false;
             }
             Event::Started => {
                 self.conn.start_turn();
@@ -1081,6 +1098,8 @@ impl App {
     pub(crate) fn follow_latest(&mut self) {
         self.chat.scroll = 0;
         self.chat.catalog_focus = None;
+        self.chat.anchor = None;
+        self.chat.unseen = false;
     }
     /// Scrolls the conversation by `rows`, up when positive.
     pub(crate) fn scroll_by(&mut self, rows: isize) {

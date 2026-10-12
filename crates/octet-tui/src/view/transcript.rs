@@ -1,11 +1,55 @@
 //! The conversation as wrapped, coloured lines, cached per entry and width.
 use super::{ACCENT, AMBER, FG, MUTED};
-use crate::app::{App, Role};
+use crate::app::{App, MAX_SCROLL, Role};
 use ratatui::prelude::*;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 impl App {
+    /// Scrolled up, rows added below push the scroll by as many, so the view stays still.
+    fn anchor_scroll(&mut self, width: u16) {
+        if self.chat.scroll == 0 {
+            self.chat.anchor = None;
+            self.chat.unseen = false;
+            return;
+        }
+        let anchor = match self.chat.anchor {
+            Some(anchor) if anchor.width == width => anchor,
+            _ => {
+                // New, or a new width: anchor here without moving.
+                self.chat.anchor = self
+                    .chat
+                    .entries
+                    .back_mut()
+                    .map(|entry| crate::app::Anchor {
+                        seq: entry.seq,
+                        rows: entry.rows(width).len(),
+                        width,
+                        added: 0,
+                    });
+                return;
+            }
+        };
+        let mut grown = 0usize;
+        for entry in self.chat.entries.iter_mut().rev() {
+            if entry.seq < anchor.seq {
+                break;
+            }
+            let rows = entry.rows(width).len();
+            grown += if entry.seq == anchor.seq {
+                rows.saturating_sub(anchor.rows)
+            } else {
+                rows
+            };
+        }
+        if grown > anchor.added {
+            self.chat.scroll = (self.chat.scroll + grown - anchor.added).min(MAX_SCROLL);
+            self.chat.unseen = true;
+            if let Some(kept) = &mut self.chat.anchor {
+                kept.added = grown;
+            }
+        }
+    }
     pub(crate) fn visible_lines(&mut self, width: u16, height: usize) -> Vec<Line<'static>> {
         if let Some(entries) = self.chat.catalog_focus.take() {
             let mut rows = 0usize;
@@ -13,7 +57,9 @@ impl App {
                 rows += entry.rows(width).len();
             }
             self.chat.scroll = rows.saturating_sub(height);
+            self.chat.anchor = None;
         }
+        self.anchor_scroll(width);
         let needed = self.chat.scroll.saturating_add(height);
         // First bring the caches up to date as far back as the view reaches,
         // then borrow rows from them and clone only those on screen.

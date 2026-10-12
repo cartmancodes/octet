@@ -1007,3 +1007,59 @@ fn the_compact_status_shows_in_full_and_usage_only_when_it_fits() {
         );
     }
 }
+fn stream_lines(app: &mut App, n: usize) {
+    for i in 0..n {
+        app.event(Event::Text(format!("line {i}\n")));
+    }
+}
+#[test]
+fn scrolled_up_the_view_stays_still_while_output_arrives() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    stream_lines(&mut app, 60);
+    app.scroll_by(20);
+    let before: Vec<String> = app
+        .visible_lines(80, 10)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    stream_lines(&mut app, 5);
+    let after: Vec<String> = app
+        .visible_lines(80, 10)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(before, after);
+    assert!(app.chat.unseen);
+    let rows = screen(100, 30, &mut app);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("New output below · Ctrl+End follows")),
+        "{}",
+        rows.join("\n")
+    );
+    app.follow_latest();
+    assert!(!app.chat.unseen);
+    let rows = screen(100, 30, &mut app);
+    assert!(!rows.iter().any(|r| r.contains("New output below")));
+}
+#[test]
+fn resizing_while_scrolled_reanchors() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    stream_lines(&mut app, 60);
+    app.scroll_by(20);
+    let _ = app.visible_lines(80, 10);
+    let scroll = app.chat.scroll;
+    let _ = app.visible_lines(50, 10);
+    assert_eq!(
+        app.chat.scroll, scroll,
+        "a new width re-anchors without moving"
+    );
+    stream_lines(&mut app, 2);
+    let _ = app.visible_lines(50, 10);
+    assert!(app.chat.scroll > scroll);
+    // The anchor entry is trimmed away: no panic, still bounded.
+    app.chat.entries.pop_front();
+    let _ = app.visible_lines(50, 10);
+}
