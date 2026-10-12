@@ -261,6 +261,16 @@ fn compact_command(app: &mut App, vendor: &dyn Vendor) {
 /// it as the next prompt where it cannot, or while the turn is stopping; and
 /// sends it as a prompt when idle. Whether it was sent or queued.
 pub(crate) fn steer(app: &mut App, vendor: &dyn Vendor, text: String) -> bool {
+    steer_with(app, vendor, text, submit)
+}
+
+/// [`steer`], with `send` taking the text where it goes as a prompt.
+pub(crate) fn steer_with(
+    app: &mut App,
+    vendor: &dyn Vendor,
+    text: String,
+    send: fn(&mut App, &dyn Vendor, String) -> bool,
+) -> bool {
     let running = app.conn.is_running();
     if running && app.conn.engine.provider().steer && !app.conn.is_cancelling() {
         if let Err(error) = vendor.send(Command::Steer(text)) {
@@ -269,7 +279,7 @@ pub(crate) fn steer(app: &mut App, vendor: &dyn Vendor, text: String) -> bool {
         }
         return true;
     }
-    if !submit(app, vendor, text) {
+    if !send(app, vendor, text) {
         return false;
     }
     if running {

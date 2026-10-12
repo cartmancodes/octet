@@ -262,3 +262,105 @@ async fn remote_actions_are_noted_on_the_desk() {
     assert!(!text.contains('\u{1b}'), "{text:?}");
     assert!(text.contains("Cancelled from "), "{text}");
 }
+
+#[tokio::test]
+async fn a_remote_prompt_leaves_the_desks_attachments_and_history_alone() {
+    let dir = image_workspace("octet-remote-image", &["draft.png"]);
+    let mut app = app();
+    idle(&mut app);
+    app.remember("earlier".into());
+    app.attach(crate::shell::Ran {
+        command: "git status".into(),
+        status: crate::shell::Status::Exited(0),
+        output: "clean\n".into(),
+    });
+    let image = octet_core::ImageAttachment::open(&dir.path().join("draft.png")).unwrap();
+    app.composer.images.push(image);
+    let vendor = RecordingVendor::default();
+    let (result, _) = run(&mut app, &vendor, prompt("from the phone")).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(matches!(
+        &vendor.sent.borrow()[..],
+        [Command::Prompt(text)] if text == "from the phone"
+    ));
+    assert_eq!(app.composer.attachments.len(), 1);
+    assert_eq!(app.composer.images.len(), 1);
+    assert_eq!(app.composer.history.len(), 1);
+    // A steer that falls back to a prompt does the same.
+    let config = Config::new(Engine::CLAUDE, "claude", "/tmp");
+    let mut claude = App::new(&config, "journal".into());
+    claude.attach(crate::shell::Ran {
+        command: "git status".into(),
+        status: crate::shell::Status::Exited(0),
+        output: "clean\n".into(),
+    });
+    claude.conn.start_turn();
+    let steer = BridgeCommand::Steer {
+        text: "look".into(),
+    };
+    let (result, _) = run(&mut claude, &vendor, steer).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(claude.composer.queue.len(), 1);
+    assert_eq!(claude.composer.attachments.len(), 1);
+    assert!(claude.composer.history.is_empty());
+}
+
+#[tokio::test]
+async fn slash_text_is_refused_for_prompts_and_steers() {
+    let mut app = app();
+    app.conn.start_turn();
+    let vendor = RecordingVendor::default();
+    for text in ["/model x", "  \t/model x", "\n/quit"] {
+        let steer = BridgeCommand::Steer { text: text.into() };
+        for command in [prompt(text), steer] {
+            let (result, _) = run(&mut app, &vendor, command).await;
+            assert_eq!(
+                result,
+                Err("Slash commands run on the desk".into()),
+                "{text:?}"
+            );
+        }
+    }
+    assert!(vendor.sent.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn device_names_are_one_short_line_in_desk_notes() {
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    let remote = |by: &str| Remote {
+        peer: 1,
+        req: 1,
+        by: by.into(),
+        command: BridgeCommand::Cancel,
+    };
+    app.conn.start_turn();
+    crate::bridge::handle_remote(&mut app, &vendor, remote("My\niPhone \n\n  15")).await;
+    assert!(
+        app.entries_text().contains("Cancelled from My iPhone 15"),
+        "{}",
+        app.entries_text()
+    );
+    let mut app = super::app();
+    app.conn.start_turn();
+    crate::bridge::handle_remote(&mut app, &vendor, remote(&"é".repeat(500))).await;
+    let text = app.entries_text();
+    let name = text.strip_prefix("Cancelled from ").expect(&text);
+    assert_eq!(name.chars().count(), 40, "{name}");
+    assert!(name.ends_with('…'));
+}
+
+#[tokio::test]
+async fn full_access_from_a_phone_leaves_a_warning_note() {
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    let (result, _) = run(&mut app, &vendor, mode("full-access", Some("full access"))).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        app.entries_text().contains("⚠ Full access from iPhone 15"),
+        "{}",
+        app.entries_text()
+    );
+}

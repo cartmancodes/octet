@@ -6,8 +6,8 @@
 use crate::{
     Action, Exit,
     app::{App, CANCELLING, ConnPhase, StatusKind},
-    commands::{mode_command, model_command, steer},
-    input::{answer_approval, cancel_turn, submit},
+    commands::{mode_command, model_command, steer_with},
+    input::{answer_approval, cancel_turn, send_remote_prompt},
     registry::TURN_OPEN,
     vendor::Vendor,
 };
@@ -50,6 +50,8 @@ const FILES_SHOWN: usize = 20;
 const FILE_BYTES: usize = 512;
 /// The longest an approval's action or scope is, in bytes.
 const ACTION_BYTES: usize = 512;
+/// The longest a device's name is in a desk note, in characters.
+const DEVICE_NAME: usize = 40;
 /// The longest a queued prompt's first line is in a `state` frame, in characters.
 const QUEUE_LINE: usize = 200;
 
@@ -202,12 +204,7 @@ pub(crate) async fn handle_remote(
     let done = run_remote(app, vendor, remote.command, &mut action).await;
     match done {
         Ok((what, reply)) => {
-            let by = crate::text::clean(&remote.by);
-            let by = if by.trim().is_empty() {
-                "a remote device"
-            } else {
-                by.trim()
-            };
+            let by = device_name(&remote.by);
             app.note(format!("{what} from {by}"));
             // The note must not hide that a cancel is under way.
             if app.conn.is_cancelling() {
@@ -219,6 +216,34 @@ pub(crate) async fn handle_remote(
     }
 }
 
+/// `text` is something to send as a prompt, not blank and not a slash command.
+fn plain_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        Err("Nothing to send".into())
+    } else if text.trim_start().starts_with('/') {
+        Err("Slash commands run on the desk".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// A hub-supplied device name made safe for a desk note: one line, at most [`DEVICE_NAME`] characters.
+fn device_name(name: &str) -> String {
+    let one_line = crate::text::clean(name)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if one_line.is_empty() {
+        return "a remote device".into();
+    }
+    if one_line.chars().count() <= DEVICE_NAME {
+        return one_line;
+    }
+    let mut cut: String = one_line.chars().take(DEVICE_NAME - 1).collect();
+    cut.push('…');
+    cut
+}
+
 /// What a remote command did: `(what the desk note says, the reply)`, or why it was refused.
 async fn run_remote(
     app: &mut App,
@@ -228,13 +253,8 @@ async fn run_remote(
 ) -> Result<(String, String), String> {
     match command {
         BridgeCommand::Prompt { text } => {
-            if text.trim().is_empty() {
-                return Err("Nothing to send".into());
-            }
-            if text.starts_with('/') {
-                return Err("Slash commands run on the desk".into());
-            }
-            if submit(app, vendor, text) {
+            plain_text(&text)?;
+            if send_remote_prompt(app, vendor, text) {
                 Ok(("Prompt".into(), app.status_line.clone()))
             } else {
                 Err(app.status_line.clone())
@@ -253,11 +273,9 @@ async fn run_remote(
             Ok(("Cancelled".into(), "Cancelling".into()))
         }
         BridgeCommand::Steer { text } => {
-            if text.trim().is_empty() {
-                return Err("Nothing to send".into());
-            }
+            plain_text(&text)?;
             let waiting = app.composer.queue.len();
-            if !steer(app, vendor, text) {
+            if !steer_with(app, vendor, text, send_remote_prompt) {
                 return Err(app.status_line.clone());
             }
             let reply = if app.composer.queue.len() > waiting {
@@ -291,7 +309,12 @@ async fn run_remote(
                 }
                 _ => return Err(app.status_line.clone()),
             };
-            Ok((format!("Mode {label}"), reply))
+            let what = if target == Mode::FullAccess {
+                "⚠ Full access".into()
+            } else {
+                format!("Mode {label}")
+            };
+            Ok((what, reply))
         }
         BridgeCommand::SetModel { selection } => {
             let one_token = !selection.is_empty()
