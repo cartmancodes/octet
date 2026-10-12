@@ -278,6 +278,7 @@ pub use error::{ExportError, GoalError, SelectionError, SessionError};
 pub mod catalog;
 pub mod goal;
 pub mod model;
+pub mod remote;
 pub mod sessions;
 pub mod skills;
 pub use octet_store::JournalSummary;
