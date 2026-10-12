@@ -371,8 +371,8 @@ struct Live {
 }
 
 impl Live {
-    /// Makes the run directory and listens on `<run>/<pid>.sock`.
-    async fn open(directory: &Path) -> std::io::Result<Self> {
+    /// Makes the run directory and listens on `<run>/<pid>.sock`; `from_phone` is registered.
+    async fn open(directory: &Path, from_phone: bool) -> std::io::Result<Self> {
         let run = run_dir(directory);
         tokio::fs::DirBuilder::new()
             .recursive(true)
@@ -411,7 +411,7 @@ impl Live {
                 mode: String::new(),
                 vendor_session: String::new(),
                 journals: Vec::new(),
-                from_phone: false,
+                from_phone,
             },
             run,
             socket,
@@ -489,15 +489,16 @@ pub(crate) struct Bridge {
 
 impl Bridge {
     /// Listens for hubs under `directory`, unless `enabled` is false. A failure leaves a bridge
-    /// that is off, with a note saying why.
-    pub(crate) async fn start(directory: &Path, enabled: bool) -> Bridge {
+    /// that is off, with a note saying why. `from_phone` marks the registration as started by
+    /// a hub.
+    pub(crate) async fn start(directory: &Path, enabled: bool, from_phone: bool) -> Bridge {
         if !enabled {
             return Bridge {
                 live: None,
                 note: None,
             };
         }
-        match Live::open(directory).await {
+        match Live::open(directory, from_phone).await {
             Ok(live) => Bridge {
                 live: Some(live),
                 note: None,
@@ -843,7 +844,7 @@ mod tests {
     async fn a_bridge_registers_listens_and_cleans_up() {
         let temp = octet_testkit::TempDir::new("octet-bridge");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true).await;
+        let mut bridge = Bridge::start(&dir, true, false).await;
         let (app, config) = demo();
         bridge
             .connected(&app, &config, &dir.join("session-1.jsonl"))
@@ -870,10 +871,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_interface_started_from_the_phone_registers_as_such() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-phone");
+        let dir = temp.path().to_path_buf();
+        let mut bridge = Bridge::start(&dir, true, true).await;
+        let (app, config) = demo();
+        bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
+        let regs = registrations(&run_dir(&dir)).await;
+        assert_eq!(regs.len(), 1);
+        assert!(regs[0].from_phone);
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
     async fn reconnecting_keeps_one_registration_and_lists_every_journal() {
         let temp = octet_testkit::TempDir::new("octet-bridge-journals");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true).await;
+        let mut bridge = Bridge::start(&dir, true, false).await;
         let (app, config) = demo();
         for name in ["a.jsonl", "b.jsonl", "b.jsonl"] {
             bridge.connected(&app, &config, &dir.join(name)).await;
@@ -888,7 +902,7 @@ mod tests {
     async fn state_frames_go_only_when_state_changes() {
         let temp = octet_testkit::TempDir::new("octet-bridge-changes");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true).await;
+        let mut bridge = Bridge::start(&dir, true, false).await;
         let (mut app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;
@@ -917,7 +931,7 @@ mod tests {
     async fn a_hub_that_stops_reading_is_dropped() {
         let temp = octet_testkit::TempDir::new("octet-bridge-slow");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true).await;
+        let mut bridge = Bridge::start(&dir, true, false).await;
         let (mut app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;
@@ -956,7 +970,7 @@ mod tests {
     async fn commands_arrive_and_replies_go_back() {
         let temp = octet_testkit::TempDir::new("octet-bridge-commands");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true).await;
+        let mut bridge = Bridge::start(&dir, true, false).await;
         let (app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;
@@ -1016,7 +1030,7 @@ mod tests {
     async fn a_bridge_that_cannot_start_or_is_off_stays_out_of_the_way() {
         let temp = octet_testkit::TempDir::new("octet-bridge-off");
         let dir = temp.path().to_path_buf();
-        let mut off = Bridge::start(&dir, false).await;
+        let mut off = Bridge::start(&dir, false, false).await;
         assert!(off.take_note().is_none());
         assert!(!run_dir(&dir).exists());
         let (app, config) = demo();
@@ -1033,7 +1047,7 @@ mod tests {
         let blocked = dir.join("blocked");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&blocked, "").unwrap();
-        let mut broken = Bridge::start(&blocked, true).await;
+        let mut broken = Bridge::start(&blocked, true, false).await;
         let note = broken.take_note().expect("a note says why");
         assert!(note.starts_with("Remote control is off: "), "{note}");
         assert!(broken.take_note().is_none());
@@ -1174,7 +1188,7 @@ mod tests {
     async fn a_dropped_bridge_leaves_no_socket_or_registration() {
         let temp = octet_testkit::TempDir::new("octet-bridge-drop");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true).await;
+        let mut bridge = Bridge::start(&dir, true, false).await;
         let (app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let run = run_dir(&dir);
@@ -1207,7 +1221,7 @@ mod tests {
     async fn publish_sends_the_catalog_again_when_the_models_change() {
         let temp = octet_testkit::TempDir::new("octet-bridge-catalog");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true).await;
+        let mut bridge = Bridge::start(&dir, true, false).await;
         let (mut app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;

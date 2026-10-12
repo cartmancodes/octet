@@ -69,6 +69,8 @@ pub(crate) struct Args {
     pub(crate) plugins: Plugins,
     /// Whether the terminal interface shares its session with a hub.
     pub(crate) remote: bool,
+    /// Whether a hub's `start` launched this interface (the hidden `--remote-started`).
+    pub(crate) from_phone: bool,
     pub(crate) run: Run,
 }
 
@@ -142,6 +144,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
     let mut effort = None;
     let mut plugins = Plugins::default();
     let mut remote = true;
+    let mut from_phone = false;
     let mut print = None;
     let mut output = None;
     let mut rpc = false;
@@ -164,6 +167,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
             "--no-plugins" => plugins.load = false,
             "--no-plugin-hooks" => plugins.hooks = false,
             "--no-remote" => remote = false,
+            "--remote-started" => from_phone = true,
             "--engine" => engine = text(&mut args, name)?,
             "--binary" => binary = Some(PathBuf::from(value(&mut args, name)?)),
             "--cwd" => cwd = Some(PathBuf::from(value(&mut args, name)?)),
@@ -242,6 +246,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
         effort,
         plugins,
         remote,
+        from_phone,
         run,
     })))
 }
@@ -335,6 +340,11 @@ mod tests {
     fn remote_control_is_on_unless_turned_off() {
         assert!(args(&[]).remote);
         assert!(!args(&["--no-remote"]).remote);
+    }
+    #[test]
+    fn the_hidden_flag_marks_an_interface_started_from_the_phone() {
+        assert!(!args(&[]).from_phone);
+        assert!(args(&["--remote-started"]).from_phone);
     }
     #[test]
     fn defaults_are_codex_in_ask_mode_with_the_interface() {

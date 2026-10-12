@@ -121,6 +121,16 @@ impl Env {
 
     /// A fake bridge for `pid`: its journal (records `seqs`), its socket and its registration.
     async fn bridge(&self, pid: u32, seqs: std::ops::Range<u64>) -> Bridge {
+        self.bridge_started(pid, seqs, false).await
+    }
+
+    /// Like [`bridge`](Self::bridge), registered as started from the phone or not.
+    async fn bridge_started(
+        &self,
+        pid: u32,
+        seqs: std::ops::Range<u64>,
+        from_phone: bool,
+    ) -> Bridge {
         self.journal(JOURNAL, seqs);
         let registration = Registration {
             id: format!("{pid}-1790000000"),
@@ -133,7 +143,7 @@ impl Env {
             mode: "ask".into(),
             vendor_session: String::new(),
             journals: vec![self.root.join(JOURNAL)],
-            from_phone: false,
+            from_phone,
         };
         let listener = UnixListener::bind(&registration.socket).expect("bridge socket");
         registration.write(&self.run).await.expect("registration");
@@ -734,4 +744,155 @@ async fn connections_that_never_say_hello_are_capped() {
     .await;
     assert_eq!(recv(&mut waiting[0]).await["type"], "welcome");
     assert!(connect(env.port, Some(OWNER)).await.is_ok());
+}
+
+/// A journal in `env`'s data directory for a Claude session `session` in `cwd`.
+fn recorded(env: &Env, stamp: u64, cwd: &std::path::Path, session: &str, prompt: &str) {
+    let header = json!({"engine": "claude", "cwd": cwd, "resume": null, "model": "opus",
+        "mode": "ask"});
+    let records = [
+        ("session", header),
+        ("ready", json!(session)),
+        ("user", json!(prompt)),
+    ];
+    octet_testkit::write_journal(&env.root, stamp, &records, "");
+}
+
+#[tokio::test]
+async fn recent_lists_the_journals_sessions() {
+    let mut env = Env::new();
+    let workspace = env.root.join("w");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonical workspace");
+    let elsewhere = env.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("workspace");
+    let elsewhere = std::fs::canonicalize(elsewhere).expect("canonical workspace");
+    recorded(&env, 1_000_000_000, &workspace, "older", "first thing");
+    recorded(
+        &env,
+        2_000_000_000,
+        &workspace,
+        "newer",
+        &"long ".repeat(40),
+    );
+    recorded(&env, 3_000_000_000, &elsewhere, "other", "somewhere else");
+    env.start().await;
+    let (mut phone, _) = env.phone("Pixel").await;
+    let shown = workspace.to_string_lossy();
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 5, "type": "recent", "workspace": shown}),
+    )
+    .await;
+    let recent = recv_kind(&mut phone, "recent").await;
+    let items = recent["items"].as_array().expect("items");
+    let sessions: Vec<&str> = items.iter().filter_map(|i| i["session"].as_str()).collect();
+    assert_eq!(sessions, ["newer", "older"], "{recent}");
+    assert_eq!(items[0]["engine"], "claude");
+    assert_eq!(items[0]["workspace"], json!(shown));
+    assert_eq!(items[0]["model"], "opus");
+    assert_eq!(
+        items[0]["title"].as_str().expect("a title").chars().count(),
+        60
+    );
+    assert_eq!(items[1]["title"], "first thing");
+    assert_eq!(items[1]["started"], 1);
+
+    // Without a workspace every known one is listed, newest first.
+    send(&mut phone, json!({"v": 1, "req": 6, "type": "recent"})).await;
+    let all = recv_kind(&mut phone, "recent").await;
+    let sessions: Vec<&str> = all["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|i| i["session"].as_str())
+        .collect();
+    assert_eq!(sessions, ["other", "newer", "older"], "{all}");
+
+    // A workspace that is not allowed is refused.
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 7, "type": "recent", "workspace": "/"}),
+    )
+    .await;
+    let refusal = recv_kind(&mut phone, "refused").await;
+    assert!(
+        refusal["reason"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("Workspace not allowed")),
+        "{refusal}"
+    );
+}
+
+#[tokio::test]
+async fn end_reaches_the_bridge_and_start_is_refused_when_not_allowed() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5020, 0..1).await;
+    env.start().await;
+    let (mut read, mut write) = bridge.accept().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 3, "type": "end", "session": bridge.id}),
+    )
+    .await;
+    let line = bridge_line(&mut read).await;
+    assert_eq!(line["type"], "end");
+    assert_eq!(line["by"], "Test phone");
+    let (hub_req, _, _) = parse_bridge_command(&line.to_string()).expect("a bridge command");
+    bridge_write(&mut write, refused(hub_req, "A turn is running")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(3, "A turn is running")
+    );
+
+    let start = |req: u64, engine: &str, workspace: &str| {
+        json!({"v": 1, "req": req, "type": "start", "engine": engine,
+            "workspace": workspace})
+    };
+    send(&mut phone, start(4, "claude", "/")).await;
+    let reason = recv_kind(&mut phone, "refused").await;
+    assert!(
+        reason["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("Workspace not allowed: /"))
+    );
+    send(&mut phone, start(5, "claude", "/no/such/workspace")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(5, "No such workspace")
+    );
+}
+
+#[tokio::test]
+async fn at_most_eight_phone_started_sessions_run() {
+    let mut env = Env::new();
+    let workspace = env.root.join("w");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonical workspace");
+    let mut bridges = Vec::new();
+    for pid in 5030..5038 {
+        bridges.push(env.bridge_started(pid, 0..1, true).await);
+    }
+    // A session started at the desk does not count.
+    bridges.push(env.bridge(5040, 0..1).await);
+    std::fs::write(
+        env.root.join("hub.json"),
+        json!({"workspaces": [workspace]}).to_string(),
+    )
+    .expect("hub.json");
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 6, "type": "start", "engine": "demo", "workspace": workspace}),
+    )
+    .await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(
+            6,
+            "8 sessions started from the phone are running; end one first"
+        )
+    );
 }

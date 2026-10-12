@@ -27,6 +27,7 @@
 //! past it. Each replay page resumes at the byte where the last stopped. Live frames go through
 //! a queue of 512: a phone that lets it fill is dropped.
 use crate::{
+    launch::{self, StartRequest, clip as clip_to},
     owner::tailnet_url,
     sessions::{SessionUpdate, Sessions},
     store::{Device, Store},
@@ -36,8 +37,8 @@ use futures_util::{SinkExt, StreamExt};
 use octet_core::remote::{
     protocol::{
         BridgeCommand, Cursor, MAX_MESSAGE, PhoneCommand, ack, catalog_frame, event_frame,
-        full_access_confirmed, paired, parse_phone, refused, req_of, sessions_frame, state_frame,
-        welcome,
+        full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of, sessions_frame,
+        state_frame, welcome,
     },
     run::run_dir,
 };
@@ -120,6 +121,8 @@ const NOT_YET: &str = "Not yet supported";
 const NO_ANSWER: &str = "The session didn't answer";
 /// The refusal for `full-access` without the typed confirmation.
 const FULL_ACCESS: &str = "Full access needs confirm: \"full access\"";
+/// The longest workspace path kept in an audit line, in characters.
+const AUDIT_PATH: usize = 200;
 /// The longest phone-chosen text (a mode or model name) kept in an audit line, in characters.
 const AUDIT_TEXT: usize = 64;
 
@@ -133,6 +136,15 @@ enum ConnEvent {
         session: String,
         generation: u64,
         last: Option<(String, u64)>,
+    },
+    /// A background job (a scan or a launch) finished: `frame` is the answer for `conn`.
+    Answer {
+        conn: u64,
+        frame: Value,
+        /// Whether it was a launch, which stops counting as one in flight.
+        launch: bool,
+        /// The audit line to write: device, session and what.
+        audit: Option<(String, String, String)>,
     },
     /// A replay found no room for too long.
     Stalled { conn: u64 },
@@ -169,6 +181,18 @@ impl std::fmt::Debug for ConnEvent {
                 .field("session", session)
                 .field("generation", generation)
                 .field("last", last)
+                .finish(),
+            Self::Answer {
+                conn,
+                frame,
+                launch,
+                audit,
+            } => f
+                .debug_struct("Answer")
+                .field("conn", conn)
+                .field("frame", &Redacted(frame.to_string().len()))
+                .field("launch", launch)
+                .field("audit", &audit.as_ref().map(|(_, session, _)| session))
                 .finish(),
             Self::Stalled { conn } => f.debug_struct("Stalled").field("conn", conn).finish(),
             Self::Closed { conn } => f.debug_struct("Closed").field("conn", conn).finish(),
@@ -370,6 +394,10 @@ pub struct Hub {
     buckets: HashMap<String, Bucket>,
     /// The session rows phones were last sent.
     listed: Vec<Value>,
+    /// The data directory: journals, the run directory and the hub's files.
+    directory: PathBuf,
+    /// Launches started and not yet finished; they count toward the phone-started cap.
+    launching: usize,
     /// Given to each connection and replay task.
     events: mpsc::Sender<ConnEvent>,
     /// The last id given to a connection, hub req or replay.
@@ -419,6 +447,8 @@ impl Hub {
         let mut hub = Hub {
             store,
             sessions: Sessions::new(run),
+            directory,
+            launching: 0,
             owner,
             port,
             conns: HashMap::new(),
@@ -505,6 +535,20 @@ impl Hub {
                 generation,
                 last,
             } => self.on_replayed(conn, &session, generation, last),
+            ConnEvent::Answer {
+                conn,
+                frame,
+                launch,
+                audit,
+            } => {
+                if launch {
+                    self.launching = self.launching.saturating_sub(1);
+                }
+                if let Some((device, session, what)) = audit {
+                    self.store.audit(&device, &session, &what).await;
+                }
+                self.send(conn, &frame);
+            }
             ConnEvent::Stalled { conn } | ConnEvent::Closed { conn } => self.drop_conn(conn),
         }
     }
@@ -624,9 +668,27 @@ impl Hub {
                 self.refuse(conn, req, FULL_ACCESS);
                 return;
             }
-            // Task 8 answers these.
-            PhoneCommand::Recent { .. } | PhoneCommand::Start { .. } | PhoneCommand::End { .. } => {
-                self.refuse(conn, req, NOT_YET);
+            PhoneCommand::Recent { workspace } => {
+                self.recent(conn, req, workspace);
+                return;
+            }
+            PhoneCommand::Start {
+                engine,
+                workspace,
+                resume,
+                model,
+                mode,
+                confirm,
+            } => {
+                let request = StartRequest {
+                    engine,
+                    workspace: PathBuf::from(workspace),
+                    resume,
+                    model,
+                    mode,
+                    confirm,
+                };
+                self.start(conn, &device.name, req, request);
                 return;
             }
             PhoneCommand::SetMode { mode, confirm, .. }
@@ -635,37 +697,76 @@ impl Hub {
                 self.refuse(conn, req, FULL_ACCESS);
                 return;
             }
-            PhoneCommand::Prompt { session, text } => {
-                (session, BridgeCommand::Prompt { text }, "prompt".to_owned())
-            }
-            PhoneCommand::Answer {
-                session,
-                approval,
-                allow,
-            } => {
-                let verdict = if allow { "allow" } else { "deny" };
-                let what = format!("answer {approval} {verdict}");
-                (session, BridgeCommand::Answer { approval, allow }, what)
-            }
-            PhoneCommand::Cancel { session } => (session, BridgeCommand::Cancel, "cancel".into()),
-            PhoneCommand::Steer { session, text } => {
-                (session, BridgeCommand::Steer { text }, "steer".into())
-            }
-            PhoneCommand::SetMode {
-                session,
-                mode,
-                confirm,
-            } => {
-                let what = format!("set_mode {}", clip(&mode));
-                (session, BridgeCommand::SetMode { mode, confirm }, what)
-            }
-            PhoneCommand::SetModel { session, selection } => {
-                let what = format!("set_model {}", clip(&selection));
-                (session, BridgeCommand::SetModel { selection }, what)
+            command => {
+                let Some(parts) = bridge_command(command) else {
+                    return;
+                };
+                parts
             }
         };
         self.route(conn, device, req, &session, &command, &what)
             .await;
+    }
+
+    /// Lists resumable sessions in the background; the scan reads up to 400 journals.
+    fn recent(&self, conn: u64, req: u64, workspace: Option<String>) {
+        let events = self.events.clone();
+        let directory = self.directory.clone();
+        let configured = self.store.config().workspaces.clone();
+        tokio::spawn(async move {
+            let allowed = launch::allowed_workspaces(&directory, &configured).await;
+            let wanted = workspace.as_deref().map(Path::new);
+            let frame = match launch::recent(&directory, &allowed, wanted).await {
+                Ok(items) => recent_frame(&items),
+                Err(reason) => refused(req, &reason),
+            };
+            let done = ConnEvent::Answer {
+                conn,
+                frame,
+                launch: false,
+                audit: None,
+            };
+            let _ = events.send(done).await;
+        });
+    }
+
+    /// Starts a terminal UI in tmux in the background and answers when tmux has finished.
+    fn start(&mut self, conn: u64, device: &str, req: u64, request: StartRequest) {
+        let running = self.sessions.phone_started() + self.launching;
+        self.launching += 1;
+        let events = self.events.clone();
+        let directory = self.directory.clone();
+        let configured = self.store.config().workspaces.clone();
+        let device = device.to_owned();
+        tokio::spawn(async move {
+            let result = launch::start(&directory, &configured, &request, running).await;
+            let (frame, audit) = match result {
+                Ok(started) => {
+                    let place = started.workspace.to_string_lossy();
+                    let what = format!(
+                        "start {} {} resume={} mode={}",
+                        request.engine,
+                        clip_to(&place, AUDIT_PATH),
+                        if request.resume.is_some() {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                        request.mode.as_deref().unwrap_or("default"),
+                    );
+                    let text = format!("Starting {} in {place}", started.name);
+                    (ack(req, &text), Some((device, started.name, what)))
+                }
+                Err(reason) => (refused(req, &reason), None),
+            };
+            let done = ConnEvent::Answer {
+                conn,
+                frame,
+                launch: true,
+                audit,
+            };
+            let _ = events.send(done).await;
+        });
     }
 
     /// Sends `command` to `session` under a fresh hub req, and audits it once it is on its way.
@@ -1003,6 +1104,42 @@ impl Hub {
         let state = self.conns.remove(&conn)?;
         self.pending.retain(|_, pending| pending.conn != conn);
         Some(state)
+    }
+}
+
+/// The session, the command and the audit text of a phone command that a terminal UI runs.
+fn bridge_command(command: PhoneCommand) -> Option<(String, BridgeCommand, String)> {
+    match command {
+        PhoneCommand::End { session } => Some((session, BridgeCommand::End, "end".into())),
+        PhoneCommand::Prompt { session, text } => {
+            Some((session, BridgeCommand::Prompt { text }, "prompt".to_owned()))
+        }
+        PhoneCommand::Answer {
+            session,
+            approval,
+            allow,
+        } => {
+            let verdict = if allow { "allow" } else { "deny" };
+            let what = format!("answer {approval} {verdict}");
+            Some((session, BridgeCommand::Answer { approval, allow }, what))
+        }
+        PhoneCommand::Cancel { session } => Some((session, BridgeCommand::Cancel, "cancel".into())),
+        PhoneCommand::Steer { session, text } => {
+            Some((session, BridgeCommand::Steer { text }, "steer".into()))
+        }
+        PhoneCommand::SetMode {
+            session,
+            mode,
+            confirm,
+        } => {
+            let what = format!("set_mode {}", clip(&mode));
+            Some((session, BridgeCommand::SetMode { mode, confirm }, what))
+        }
+        PhoneCommand::SetModel { session, selection } => {
+            let what = format!("set_model {}", clip(&selection));
+            Some((session, BridgeCommand::SetModel { selection }, what))
+        }
+        _ => None,
     }
 }
 

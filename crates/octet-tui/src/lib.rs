@@ -83,6 +83,8 @@ pub fn command_names() -> impl Iterator<Item = &'static str> {
 pub struct Options {
     /// Share the session with a hub over a private socket (off with `--no-remote`).
     pub remote: bool,
+    /// A hub's `start` launched this interface, so its registration says so.
+    pub from_phone: bool,
 }
 
 /// Runs the interface until the user quits. When a session ends for a
@@ -109,7 +111,7 @@ pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io
     // Ended sessions whose CLIs are still exiting while the next one runs.
     let mut stopping: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // Lives across reconnects, and is stopped on every way out of the loop.
-    let mut bridge = Bridge::start(&directory, options.remote).await;
+    let mut bridge = Bridge::start(&directory, options.remote, options.from_phone).await;
     // Shown in a fresh interface, after a switch that drops the transcript.
     let mut opening_notice: Option<String> = bridge.take_note();
     loop {

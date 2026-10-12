@@ -138,6 +138,7 @@ async fn run() -> Result<i32, CliError> {
             directory,
             octet_tui::Options {
                 remote: args.remote,
+                from_phone: args.from_phone,
             },
         )
         .await

@@ -300,6 +300,14 @@ impl Sessions {
         self.live.iter().map(Live::row).collect()
     }
 
+    /// How many sessions the hub's `start` launched are registered.
+    pub(crate) fn phone_started(&self) -> usize {
+        self.live
+            .iter()
+            .filter(|l| l.registration.from_phone)
+            .count()
+    }
+
     /// The journals of session `id`, oldest first.
     pub(crate) fn journals(&self, id: &str) -> Option<Vec<PathBuf>> {
         Some(self.find(id)?.registration.journals.clone())
