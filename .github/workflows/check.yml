@@ -52,3 +52,17 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check licenses bans sources
+  # Dependencies a crate lists but never uses. The tool's version is pinned
+  # here (the cargo-machete action fetches its latest release instead), and
+  # --locked builds it with the lock file it was released with.
+  machete:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # rustup installs the toolchain that rust-toolchain.toml pins.
+      - run: rustup show active-toolchain || rustup toolchain install
+      # Also keeps the installed tool (~/.cargo/bin) between runs.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo install cargo-machete --version 0.9.2 --locked
+      - run: cargo machete

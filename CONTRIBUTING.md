@@ -40,7 +40,10 @@ This is the gate every change must pass. It runs, in order:
 4. `cargo test --locked --workspace`
 
 CI also checks licences, banned crates and sources with `cargo-deny`
-(`deny.toml`), and audits dependencies weekly.
+(`deny.toml`), audits dependencies weekly, and fails on a dependency a crate
+lists but never uses (`cargo-machete`). A dependency it misreads as unused
+(one used only through a macro, say) goes in that crate's `Cargo.toml` under
+`[package.metadata.cargo-machete] ignored = ["name"]`.
 
 Clippy also enforces the house Rust rules, set as workspace lints in
 `Cargo.toml`: no `unwrap()` outside tests (use `?` or `expect` with the reason
