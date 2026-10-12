@@ -217,17 +217,17 @@ impl Connection {
     }
 }
 
-/// Where the reader was at the last frame, to tell how many rows arrived below since.
+/// Where the reader's view ends, so the rows below it can be counted again each frame.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Anchor {
-    /// The newest entry when the reader scrolled up.
+    /// The entry holding the view's bottom row.
     pub(crate) seq: u64,
-    /// The width the rows below were counted at.
+    /// The width its rows were counted at.
     pub(crate) width: u16,
-    /// The anchor entry's rows at the last frame.
-    pub(crate) entry_rows: usize,
-    /// The total rows of the entries newer than the anchor at the last frame.
-    pub(crate) newer_rows: usize,
+    /// Its rows at or above the view's bottom edge; the rest, and every newer entry, are below.
+    pub(crate) above: usize,
+    /// The scroll it last gave: any other scroll means the reader moved.
+    pub(crate) scroll: usize,
 }
 /// The conversation: entries, scroll and the copyable reply.
 pub(crate) struct Transcript {
@@ -283,6 +283,9 @@ pub(crate) struct Composer {
     pub(crate) listing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Prompts sent while a turn ran, sent in order as turns finish.
     pub(crate) queue: VecDeque<crate::vendor::Prompt>,
+    /// The skill picked in `/skills`, with its provider, while the draft still starts with its
+    /// `/name`: sending runs that provider's, even when the other lists the same name.
+    pub(crate) chosen_skill: Option<(octet_core::Engine, octet_core::SkillInfo)>,
 }
 /// An approval waiting for the user.
 pub(crate) struct Asked {
@@ -404,6 +407,7 @@ impl App {
                 completion: None,
                 files: crate::files::Files::Unbuilt,
                 queue: VecDeque::new(),
+                chosen_skill: None,
             },
             overlay: Overlays {
                 approvals: VecDeque::new(),

@@ -189,9 +189,27 @@ fn choose_skill(app: &mut App, item: Option<String>) {
             ));
         } else {
             app.composer.editor.set(format!("/{} ", skill.name));
+            app.composer.chosen_skill = Some((engine, skill));
         }
     }
     app.composer.completion = None;
+}
+/// The picked skill is forgotten once the draft no longer starts with its `/name`.
+fn forget_stale_skill(app: &mut App) {
+    let draft = app.composer.editor.text();
+    let still = app
+        .composer
+        .chosen_skill
+        .as_ref()
+        .is_some_and(|(_, skill)| {
+            draft
+                .strip_prefix('/')
+                .and_then(|rest| rest.split(char::is_whitespace).next())
+                == Some(skill.name.as_str())
+        });
+    if !still {
+        app.composer.chosen_skill = None;
+    }
 }
 /// Runs `skill` with `args` as a turn, or queues it behind the running one,
 /// as a typed prompt goes. False, with a notice, when it could not go.
@@ -747,6 +765,7 @@ async fn composer_key(
     refresh_completion(app);
     refresh_model_picker(app);
     refresh_skill_picker(app);
+    forget_stale_skill(app);
     Action::Continue
 }
 /// Interrupts the turn; a goal working on it is paused first, and prompts

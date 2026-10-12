@@ -1133,3 +1133,49 @@ async fn f2_on_a_narrow_terminal_says_when_the_sidebar_shows() {
         assert_eq!(app.status_line, hint, "{width} columns");
     }
 }
+
+#[tokio::test]
+async fn a_picked_skill_keeps_its_provider_when_both_have_the_name() {
+    let mut app = skills_app();
+    app.conn.skills = vec![skill("brainstorming", &[], Some("/s/codex/SKILL.md"))];
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Down)).await;
+    let selected = &app.composer.completion.as_ref().unwrap().items[1];
+    assert!(selected.contains("claude"), "{selected}");
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    type_keys(&mut app, &vendor, "the cache").await;
+    let action = key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(
+        matches!(action, Action::Exit(Exit::Model(s)) if s.provider == Engine::CLAUDE),
+        "selected Claude but sent to current provider: {:?}",
+        vendor.sent.borrow()
+    );
+}
+#[tokio::test]
+async fn a_picked_skill_shows_its_switch_and_is_forgotten_when_the_draft_changes() {
+    let mut app = skills_app();
+    app.conn.skills = vec![skill("brainstorming", &[], Some("/s/codex/SKILL.md"))];
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Down)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    // The current provider has the name too, but the pick was Claude's: the hint says so.
+    assert_eq!(
+        crate::commands::foreign_skill(&app, app.composer.editor.text()),
+        Some(Engine::CLAUDE)
+    );
+    key_action(&mut app, &vendor, ctrl('u')).await;
+    assert!(
+        app.composer.chosen_skill.is_none(),
+        "an emptied draft forgets the pick"
+    );
+    type_keys(&mut app, &vendor, "/brainstorming").await;
+    assert_eq!(
+        crate::commands::foreign_skill(&app, app.composer.editor.text()),
+        None,
+        "typed again by hand, the current provider's runs"
+    );
+}

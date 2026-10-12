@@ -498,6 +498,9 @@ bring, and runs them.
   turn, with its arguments. While the draft names only another provider's
   skill, the hint row turns amber: `Enter switches to {provider}, then runs
   /name`. If the switch fails, the skill is not run and a note says so.
+  When both providers list the same name, the one you picked is the one that
+  runs, for as long as the draft still starts with its `/name`; typed by
+  hand (or recalled from history), the current provider's runs.
 - Typing `/NAME args` runs a skill the current provider lists; typing
   another provider's skill switches to it on send, as a picked one does
   (during a turn the hint says `Finish the turn to switch to {provider}`

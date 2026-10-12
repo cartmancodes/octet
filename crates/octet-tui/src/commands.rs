@@ -95,9 +95,19 @@ enum Found {
     Here(octet_core::SkillInfo),
     There(octet_core::Engine, octet_core::SkillInfo),
 }
-/// The skill `/NAME` names (by name or alias), the current provider's first.
+/// The skill `/NAME` names (by name or alias): the one picked in `/skills` when it has that name,
+/// else the current provider's first.
 fn find_skill(app: &App, name: &str) -> Option<Found> {
     let wanted = name.strip_prefix('/').unwrap_or(name);
+    if let Some((engine, skill)) = &app.composer.chosen_skill
+        && skill.name == wanted
+    {
+        return Some(if *engine == app.conn.engine {
+            Found::Here(skill.clone())
+        } else {
+            Found::There(*engine, skill.clone())
+        });
+    }
     let named = |skill: &octet_core::SkillInfo| {
         skill.name == wanted || skill.aliases.iter().any(|alias| alias == wanted)
     };
@@ -129,14 +139,23 @@ pub(crate) fn foreign_skill(app: &App, draft: &str) -> Option<octet_core::Engine
 /// name or alias runs; another provider's switches there and runs once ready;
 /// anything else the unknown-command note. `None` leaves the draft to correct.
 fn skill_command(app: &mut App, vendor: &dyn Vendor, name: &str, argument: &str) -> Option<Action> {
-    match find_skill(app, name) {
+    // Sending uses the pick up; a draft that stays (a refusal) keeps it for the next try.
+    let found = find_skill(app, name);
+    let picked = app.composer.chosen_skill.take();
+    let keep = |app: &mut App| app.composer.chosen_skill.clone_from(&picked);
+    match found {
         // A skill that cannot go leaves the draft, as a prompt does.
         Some(Found::Here(skill)) => {
-            crate::input::run_skill(app, vendor, &skill, argument).then_some(Action::Continue)
+            let ran = crate::input::run_skill(app, vendor, &skill, argument);
+            if !ran {
+                keep(app);
+            }
+            ran.then_some(Action::Continue)
         }
         Some(Found::There(engine, skill)) => {
             if let Err(refusal) = can_reconnect(app) {
                 app.hint(refusal);
+                keep(app);
                 return None;
             }
             app.pending_skill = Some(crate::app::SkillRun {

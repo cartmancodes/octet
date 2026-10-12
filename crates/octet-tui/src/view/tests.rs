@@ -1196,3 +1196,58 @@ fn scrolled_up_the_view_stays_still_as_running_calls_collapse() {
         assert_eq!(shown(&mut app), before, "before scroll: {before_scroll}");
     }
 }
+
+#[test]
+fn a_long_approval_keeps_the_full_request_reachable() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Approval {
+        id: 1,
+        detail: "RAW_FULL_REQUEST_MARKER".into(),
+        summary: octet_core::ApprovalSummary {
+            command: Some(format!("echo {}", "long_argument ".repeat(160))),
+            cwd: Some("/work".into()),
+            ..octet_core::ApprovalSummary::new("Run a shell command")
+        },
+    });
+    let mut reachable = false;
+    for scroll in 0..100 {
+        app.overlay.approval_scroll = scroll;
+        let text = screen(80, 24, &mut app).join("\n");
+        reachable |= text.contains("RAW_FULL_REQUEST_MARKER");
+    }
+    assert!(
+        reachable,
+        "full request is inaccessible at every scroll position"
+    );
+}
+
+#[test]
+fn a_late_tool_completion_below_the_view_keeps_scrollback_still() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.note(
+        (0..40)
+            .map(|i| format!("history line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    app.event(Event::Started);
+    app.event(tool("1", "Bash", "cargo test", ToolPhase::Running));
+    app.note("hook notice after tool start");
+    app.chat.scroll = 12;
+    let before = app.visible_lines(80, 6);
+    app.event(Event::Tool(octet_core::ToolCall {
+        id: "1".into(),
+        name: "Bash".into(),
+        target: "cargo test".into(),
+        phase: ToolPhase::Failed,
+        detail: (0..8)
+            .map(|i| format!("error line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }));
+    let after = app.visible_lines(80, 6);
+    assert_eq!(
+        before, after,
+        "tool completion below viewport moved the history"
+    );
+}

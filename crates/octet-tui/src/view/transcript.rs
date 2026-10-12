@@ -6,60 +6,72 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 impl App {
-    /// Scrolled up, rows added or removed below move the scroll by as many, so the view stays
-    /// still; it stays in scrollback.
+    /// Scrolled up, the scroll is the rows below the view, counted again each frame from the
+    /// entry holding the view's bottom row: whatever grows or goes below (a reply, a call that
+    /// finished in an older entry) moves the scroll by as much, so the view stays still. It stays
+    /// in scrollback.
     fn anchor_scroll(&mut self, width: u16) {
         if self.chat.scroll == 0 {
             self.chat.anchor = None;
             self.chat.unseen = false;
             return;
         }
-        let Some(anchor) = self.chat.anchor.filter(|anchor| anchor.width == width) else {
-            // New, or a new width: anchor at the newest entry without moving.
-            self.chat.anchor = self
-                .chat
-                .entries
-                .back_mut()
-                .map(|entry| crate::app::Anchor {
-                    seq: entry.seq,
-                    width,
-                    entry_rows: entry.rows(width).len(),
-                    newer_rows: 0,
-                });
+        let scroll = self.chat.scroll;
+        // New, a new width, or the reader moved: anchor where the view ends, without moving.
+        let Some(anchor) = self
+            .chat
+            .anchor
+            .filter(|anchor| anchor.width == width && anchor.scroll == scroll)
+        else {
+            self.chat.anchor = self.anchor_at(width, scroll);
             return;
         };
-        let mut anchor_now = None;
-        let mut newer_now = 0usize;
+        let mut below = 0usize;
+        let mut found = false;
         for entry in self.chat.entries.iter_mut().rev() {
             if entry.seq < anchor.seq {
                 break;
             }
             let rows = entry.rows(width).len();
             if entry.seq == anchor.seq {
-                anchor_now = Some(rows);
+                below += rows.saturating_sub(anchor.above);
+                found = true;
             } else {
-                newer_now += rows;
+                below += rows;
             }
         }
-        let signed = |now: usize, then: usize| {
-            isize::try_from(now).unwrap_or(isize::MAX) - isize::try_from(then).unwrap_or(isize::MAX)
-        };
-        let delta = signed(newer_now, anchor.newer_rows)
-            + anchor_now.map_or(0, |rows| signed(rows, anchor.entry_rows));
-        self.chat.scroll = self
-            .chat
-            .scroll
-            .saturating_add_signed(delta)
-            .clamp(1, MAX_SCROLL);
-        if delta > 0 {
+        if !found {
+            // The entry the view ended in was trimmed: anchor again where it ends now.
+            self.chat.anchor = self.anchor_at(width, scroll);
+            return;
+        }
+        let below = below.clamp(1, MAX_SCROLL);
+        if below > scroll {
             self.chat.unseen = true;
         }
-        // Always re-base, so a shrink never masks later growth.
+        self.chat.scroll = below;
         self.chat.anchor = Some(crate::app::Anchor {
-            entry_rows: anchor_now.unwrap_or(0),
-            newer_rows: newer_now,
+            scroll: below,
             ..anchor
         });
+    }
+    /// The anchor for a view whose bottom edge is `scroll` rows above the newest row: the entry
+    /// holding that edge and its rows at or above it. `None` past the oldest row.
+    fn anchor_at(&mut self, width: u16, scroll: usize) -> Option<crate::app::Anchor> {
+        let mut after = 0usize;
+        for entry in self.chat.entries.iter_mut().rev() {
+            let rows = entry.rows(width).len();
+            if after + rows > scroll {
+                return Some(crate::app::Anchor {
+                    seq: entry.seq,
+                    width,
+                    above: rows - (scroll - after),
+                    scroll,
+                });
+            }
+            after += rows;
+        }
+        None
     }
     pub(crate) fn visible_lines(&mut self, width: u16, height: usize) -> Vec<Line<'static>> {
         if let Some(entries) = self.chat.catalog_focus.take() {
@@ -71,7 +83,7 @@ impl App {
             self.chat.anchor = None;
         }
         self.anchor_scroll(width);
-        let needed = self.chat.scroll.saturating_add(height);
+        let mut needed = self.chat.scroll.saturating_add(height);
         // First bring the caches up to date as far back as the view reaches,
         // then borrow rows from them and clone only those on screen.
         let mut available = 0usize;
@@ -79,6 +91,21 @@ impl App {
             available += entry.rows(width).len();
             if available >= needed {
                 break;
+            }
+        }
+        // History shorter than the view needs: scroll no further than a full page from its
+        // start, rather than showing emptiness below; the anchor follows, so the next frame
+        // still counts the rows that arrive.
+        if available < needed {
+            let top = available.saturating_sub(height);
+            if self.chat.scroll > top {
+                self.chat.scroll = top;
+                self.chat.anchor = if top == 0 {
+                    None
+                } else {
+                    self.anchor_at(width, top)
+                };
+                needed = top + height;
             }
         }
         let lines: Vec<&Line<'static>> = self
@@ -89,11 +116,6 @@ impl App {
             .flat_map(|entry| entry.cache.iter().rev())
             .take(needed)
             .collect();
-        // History shorter than the view needs: scroll no further than a
-        // full page from its start, rather than showing emptiness below.
-        if lines.len() < needed {
-            self.chat.scroll = self.chat.scroll.min(lines.len().saturating_sub(height));
-        }
         lines
             .into_iter()
             .skip(self.chat.scroll)

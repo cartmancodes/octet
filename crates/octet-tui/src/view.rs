@@ -782,6 +782,8 @@ fn fit_lead(rows: Vec<String>, room: usize, tail: usize) -> Vec<String> {
     fitted.extend_from_slice(&rows[rows.len() - tail..]);
     fitted
 }
+/// The fewest rows the approval's full request keeps: its borders and one line.
+const REQUEST_ROWS: u16 = 3;
 fn approval(
     frame: &mut Frame,
     area: Rect,
@@ -800,9 +802,11 @@ fn approval(
         width,
     )
     .len();
+    // The heading, the keys and the smallest request box (a border and one line) keep their
+    // rows, so the full request can always be scrolled to before it is allowed.
     let lead = fit_lead(
         wrapped(&lines, width),
-        usize::from(area.height.saturating_sub(3)),
+        usize::from(area.height.saturating_sub(3 + REQUEST_ROWS)),
         kept,
     );
     // The keys keep their rows; the lead comes next; the full request takes what is left.
@@ -834,7 +838,7 @@ fn approval(
     let rows = wrapped(&asked.detail.lines().collect::<Vec<_>>(), inner);
     let visible = request.height.saturating_sub(2);
     *scroll = (*scroll).min(cells(rows.len()).saturating_sub(visible));
-    if request.height >= 3 {
+    if request.height >= REQUEST_ROWS {
         frame.render_widget(
             Paragraph::new(rows.join("\n"))
                 .scroll((*scroll, 0))
