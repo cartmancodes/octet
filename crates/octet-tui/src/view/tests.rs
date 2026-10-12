@@ -347,12 +347,12 @@ fn renders_narrow_wide_and_approval_without_panics() {
 fn composer_grows_with_the_draft() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     assert_eq!(
-        composer_height(app.composer.editor.layout(draft_width(80)).0.len()),
+        composer_height(app.composer.editor.layout(draft_width(80)).0.len(), false),
         4
     );
     assert!(app.composer.editor.insert("one\ntwo\nthree"));
     assert_eq!(
-        composer_height(app.composer.editor.layout(draft_width(80)).0.len()),
+        composer_height(app.composer.editor.layout(draft_width(80)).0.len(), false),
         6
     );
 }
@@ -362,7 +362,7 @@ fn composer_counts_wrapped_rows() {
     // 80 columns leave 74 for text: 100 characters wrap onto a second row.
     assert!(app.composer.editor.insert(&"x".repeat(100)));
     assert_eq!(
-        composer_height(app.composer.editor.layout(draft_width(80)).0.len()),
+        composer_height(app.composer.editor.layout(draft_width(80)).0.len(), false),
         5
     );
 }
@@ -371,11 +371,96 @@ fn composer_height_is_capped() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     assert!(app.composer.editor.insert(&"line\n".repeat(40)));
     assert_eq!(
-        composer_height(app.composer.editor.layout(draft_width(80)).0.len()),
+        composer_height(app.composer.editor.layout(draft_width(80)).0.len(), false),
         7
     );
 }
-
+#[test]
+fn the_hint_row_matches_what_enter_does() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CODEX);
+    crate::test_support::idle(&mut app);
+    assert_eq!(
+        composer_hint(&app, 100).0,
+        "Enter send · Alt+Enter newline · ↑ history · Ctrl+P commands"
+    );
+    assert_eq!(composer_hint(&app, 60).0, "Enter send · Alt+Enter newline");
+    app.event(Event::Started);
+    assert_eq!(
+        composer_hint(&app, 100).0,
+        "Enter queue · Esc cancel turn · Ctrl+P commands"
+    );
+    let rows = screen(100, 30, &mut app);
+    assert!(
+        rows.iter().any(|r| r.contains("╭ Next prompt ─")),
+        "{}",
+        rows.join("\n")
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("Enter send")),
+        "no contradicting hint"
+    );
+}
+#[test]
+fn the_hint_warns_before_a_provider_switch() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CODEX);
+    crate::test_support::idle(&mut app);
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        octet_core::Engine::CLAUDE,
+        &ws,
+        vec![octet_core::SkillInfo {
+            name: "review".into(),
+            description: String::new(),
+            aliases: Vec::new(),
+            argument_hint: String::new(),
+            path: None,
+        }],
+        std::time::SystemTime::now(),
+    );
+    assert!(app.composer.editor.insert("/review src"));
+    assert_eq!(
+        composer_hint(&app, 100),
+        ("Enter switches to claude, then runs /review".into(), AMBER)
+    );
+}
+#[test]
+fn chips_have_their_own_row_and_grow_the_box() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    assert_eq!(composer_height(1, false), 4);
+    assert_eq!(composer_height(1, true), 5);
+    app.attach(crate::shell::Ran {
+        command: "ls".into(),
+        status: crate::shell::Status::Exited(0),
+        output: "a\n".into(),
+    });
+    app.composer
+        .queue
+        .push_back(crate::vendor::Prompt::plain("later".into()));
+    assert_eq!(chips(&app).as_deref(), Some("+ ls (exit 0) · 1 queued"));
+    let rows = screen(100, 30, &mut app);
+    let title = rows.iter().position(|r| r.contains("╭ Prompt ─")).unwrap();
+    assert!(
+        rows[title + 2].contains("+ ls (exit 0) · 1 queued"),
+        "{}",
+        rows.join("\n")
+    );
+}
+#[test]
+fn chips_give_way_at_the_minimum_size() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.composer
+        .queue
+        .push_back(crate::vendor::Prompt::plain("later".into()));
+    assert!(app.composer.editor.insert("draft"));
+    // The box gets one inner row here: the draft keeps it; hint and chips give way.
+    let rows = screen(38, 12, &mut app);
+    let text = rows.join("\n");
+    assert!(text.contains("│ draft"), "{text}");
+    assert!(
+        !text.contains("queued") && !text.contains("Enter send"),
+        "{text}"
+    );
+}
 mod model_detail_tests {
     use super::*;
     fn app() -> App {

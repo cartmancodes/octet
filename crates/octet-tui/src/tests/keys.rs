@@ -391,7 +391,7 @@ async fn enter_while_running_queues_the_prompt() {
     key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
     assert_eq!(app.composer.queue.len(), 1);
     assert!(app.composer.editor.text().is_empty());
-    assert!(crate::view::composer_title(&app).contains("+1 queued"));
+    assert_eq!(crate::view::chips(&app).as_deref(), Some("1 queued"));
 }
 #[tokio::test]
 async fn cancel_drops_the_queue() {

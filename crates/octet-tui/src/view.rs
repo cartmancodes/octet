@@ -81,7 +81,7 @@ fn paint(frame: &mut Frame, app: &mut App) {
     let regions = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(3),
-        Constraint::Length(composer_height(draft.0.len())),
+        Constraint::Length(composer_height(draft.0.len(), chips(app).is_some())),
         Constraint::Length(1),
     ])
     .margin(1)
@@ -170,21 +170,18 @@ fn composer(
     app: &App,
     draft: (Vec<String>, (usize, usize)),
 ) -> (u16, u16) {
-    let title = composer_title(app);
-    let composer = card(&title).border_style(Style::default().fg(if app.conn.is_running() {
-        EDGE
-    } else {
-        ACCENT
-    }));
+    let composer = card(composer_title(app))
+        .border_style(Style::default().fg(if app.conn.is_running() { EDGE } else { ACCENT }));
     let inner = composer.inner(area);
     frame.render_widget(composer, area);
-    // The hint line takes the last row only when the draft keeps one; at
-    // the minimum height the box has a single row and the draft gets it.
+    let chips = chips(app);
+    // At the minimum height the draft keeps its row; the hint, then the chips, give way.
     let hint_rows = u16::from(inner.height >= 2);
+    let chip_rows = u16::from(chips.is_some() && inner.height >= 3);
     let input = Rect {
         x: inner.x + 1,
         width: inner.width.saturating_sub(2),
-        height: inner.height - hint_rows,
+        height: inner.height - hint_rows - chip_rows,
         ..inner
     };
     let (lines, (col, row)) = draft;
@@ -208,20 +205,25 @@ fn composer(
             input,
         );
     }
-    let hints = Rect {
-        x: input.x,
-        y: inner.bottom().saturating_sub(1),
-        width: input.width,
-        height: hint_rows,
-    };
+    if let Some(chips) = chips.filter(|_| chip_rows == 1) {
+        frame.render_widget(
+            Paragraph::new(chips).style(Style::default().fg(ACCENT)),
+            Rect {
+                y: input.bottom(),
+                height: 1,
+                ..input
+            },
+        );
+    }
+    let (hint, color) = composer_hint(app, width);
     frame.render_widget(
-        Paragraph::new(if width >= 80 {
-            "Enter send   Alt+Enter newline   ↑ history   Ctrl+P commands   Esc cancel"
-        } else {
-            "Enter send · Ctrl+J newline · F1 help"
-        })
-        .style(Style::default().fg(MUTED)),
-        hints,
+        Paragraph::new(hint).style(Style::default().fg(color)),
+        Rect {
+            x: input.x,
+            y: inner.bottom().saturating_sub(1),
+            width: input.width,
+            height: hint_rows,
+        },
     );
     completion_popup(frame, area, app);
     (
@@ -337,33 +339,60 @@ fn completion_popup(frame: &mut Frame, composer: Rect, app: &App) {
         area,
     );
 }
-/// The prompt box's title: what Enter will do, then what waits to go.
-pub(crate) fn composer_title(app: &App) -> String {
-    let mut parts = vec![if app.conn.is_running() {
-        "Next prompt · Enter queues it · Esc cancels the turn".to_owned()
+/// The prompt box's title: whether this prompt goes now or after the turn.
+pub(crate) fn composer_title(app: &App) -> &'static str {
+    if app.conn.is_running() {
+        " Next prompt "
     } else {
-        "Prompt".to_owned()
-    }];
-    parts.extend(crate::composer::chip(&app.composer.attachments));
+        " Prompt "
+    }
+}
+/// What waits to go with the next prompt: attachments, images, the queue.
+pub(crate) fn chips(app: &App) -> Option<String> {
+    let mut parts: Vec<String> = crate::composer::chip(&app.composer.attachments)
+        .into_iter()
+        .collect();
     match app.composer.images.as_slice() {
         [] => {}
         [one] => parts.push(format!("+ image {}", one.name)),
         many => parts.push(format!("+{} images", many.len())),
     }
     if !app.composer.queue.is_empty() {
-        parts.push(format!("+{} queued", app.composer.queue.len()));
+        parts.push(format!("{} queued", app.composer.queue.len()));
     }
-    format!(" {} ", parts.join(" · "))
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+/// The hint row: what Enter does now, then the next keys that fit.
+pub(crate) fn composer_hint(app: &App, width: u16) -> (String, Color) {
+    let draft = app.composer.editor.text();
+    if let Some(engine) = crate::commands::foreign_skill(app, draft) {
+        let name = draft.split(char::is_whitespace).next().unwrap_or(draft);
+        return (
+            format!("Enter switches to {engine}, then runs {name}"),
+            AMBER,
+        );
+    }
+    let keys: &[&str] = if app.conn.is_running() {
+        &["Enter queue", "Esc cancel turn", "Ctrl+P commands"]
+    } else {
+        &[
+            "Enter send",
+            "Alt+Enter newline",
+            "↑ history",
+            "Ctrl+P commands",
+        ]
+    };
+    let shown = if width >= 80 { keys.len() } else { 2 };
+    (keys[..shown].join(" · "), MUTED)
 }
 /// The width the draft wraps at: margin, border and padding take three
 /// columns on each side.
 fn draft_width(terminal_width: u16) -> usize {
     terminal_width.saturating_sub(6) as usize
 }
-/// The composer's height from the draft's wrapped rows: borders, 1–4 draft
-/// rows, and the hint row. An empty prompt takes 4 rows, a long draft 7.
-fn composer_height(draft_rows: usize) -> u16 {
-    2 + cells(draft_rows.clamp(1, 4)) + 1
+/// The composer's height: borders, 1–4 draft rows, the chips row when there is one, the hint row.
+fn composer_height(draft_rows: usize, chips: bool) -> u16 {
+    2 + cells(draft_rows.clamp(1, 4)) + u16::from(chips) + 1
 }
 /// The top-left banner, after Claude Code's: the mini Octet (or a text mark
 /// without colour) beside three lines. The permission mode leads its line so

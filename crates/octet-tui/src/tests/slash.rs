@@ -343,7 +343,10 @@ async fn image_attaches_and_shows_in_the_title() {
     app.composer.root = dir.path().to_path_buf();
     command(&mut app, "/image shot.png").await;
     assert_eq!(app.composer.images.len(), 1);
-    assert!(crate::view::composer_title(&app).contains("+ image shot.png"));
+    assert_eq!(
+        crate::view::chips(&app).as_deref(),
+        Some("+ image shot.png")
+    );
     let vendor = RecordingVendor::default();
     app.conn.start_turn();
     assert!(app.composer.editor.insert("look"));
@@ -389,7 +392,7 @@ async fn oversized_or_unknown_images_are_refused() {
         app.entries_text()
             .contains("A prompt takes at most 4 images")
     );
-    assert!(crate::view::composer_title(&app).contains("+4 images"));
+    assert_eq!(crate::view::chips(&app).as_deref(), Some("+4 images"));
     // Esc on an empty prompt drops them.
     let vendor = RecordingVendor::default();
     key_action(&mut app, &vendor, key(KeyCode::Esc)).await;
@@ -493,7 +496,10 @@ async fn up_recalls_a_prompt_with_its_images() {
     app.recall(true);
     assert_eq!(app.composer.editor.text(), "look");
     assert_eq!(app.composer.images.len(), 1);
-    assert!(crate::view::composer_title(&app).contains("+ image shot.png"));
+    assert_eq!(
+        crate::view::chips(&app).as_deref(),
+        Some("+ image shot.png · 1 queued")
+    );
     // Back down: the empty draft, without the recalled images.
     app.recall(false);
     assert!(app.composer.editor.text().is_empty());

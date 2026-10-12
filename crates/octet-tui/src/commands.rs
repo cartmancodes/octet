@@ -115,10 +115,6 @@ fn find_skill(app: &App, name: &str) -> Option<Found> {
 }
 /// The provider sending `draft` would switch to: it is `/NAME ...` where NAME is no Octet command
 /// and only another provider's skill.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the composer hint draws it in a later task")
-)]
 pub(crate) fn foreign_skill(app: &App, draft: &str) -> Option<octet_core::Engine> {
     let name = draft.strip_prefix('/')?.split(char::is_whitespace).next()?;
     if name.is_empty() || Spec::find(&format!("/{name}")).is_some() {
