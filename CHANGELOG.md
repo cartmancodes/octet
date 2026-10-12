@@ -50,7 +50,7 @@ Claude Code and Codex CLIs.
   phone command.
 - A multiline prompt editor with Unicode-aware editing, bracketed paste and
   history; the prompt box grows with the draft.
-- A responsive layout down to 38 × 12 cells with a workspace panel from 112
+- A responsive layout down to 38 × 12 cells with a Task sidebar from 112
   columns, `NO_COLOR` support, suspend with Ctrl+Z, and terminal restoration
   on exit, signals and panic.
 - Octet, the header mascot, whose pose follows the agent's activity.
@@ -111,8 +111,9 @@ Claude Code and Codex CLIs.
 - Enter in `/skills` (or Tab) puts `/name ` in the prompt instead of running
   the skill; nothing runs until it is sent. Sending another provider's skill
   switches provider first, with its arguments, and an amber hint says so.
-- Scrollback stays still while output arrives; the conversation's bottom
-  border says "New output below · Ctrl+End follows" until Ctrl+End follows.
+- Scrollback stays still while output arrives; when new rows arrive below,
+  the conversation's bottom border says "New output below · Ctrl+End
+  follows" until you follow.
 - Claude's tool results end its tool calls, so failures show. The headless
   denial warning names the action and the command's first line.
 - The sidebar shows the task rather than the engine, model and session, which

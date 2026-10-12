@@ -276,8 +276,8 @@ never the image. Esc on an empty prompt drops attached images and `!` output.
 per call. Collapsed, it reads `▸ Read 3 files · Ran 1 command   Ctrl+O
 details`; while a call runs it shows `… Bash cargo test`. A failed call opens
 in amber: `✗ Bash …` with the last 8 lines of its output and `+N more lines ·
-Ctrl+O` when there are more. A turn that is cancelled marks calls it cut short
-`· stopped`. Ctrl+O shows or hides the detail of every call at once.
+Ctrl+O` when there are more. A call still running when its turn ends (cancelled
+or otherwise) is marked `· stopped`. Ctrl+O shows or hides the detail of every call at once.
 
 **Approvals.** The dialog leads with what is being asked: the action (for
 example `Edit 2 files`), the command as `$ command`, the files (five at most,
@@ -287,8 +287,8 @@ the vendor sent it, then the keys row. Headless, the denial warning names the
 action and the command's first line.
 
 **Scrollback.** Scrolling up with PageUp/PageDown stops following: the text
-stays where you put it while output arrives, and the conversation's bottom
-border says "New output below · Ctrl+End follows". Ctrl+End returns to the
+stays where you put it, and when new rows arrive below, the conversation's
+bottom border says "New output below · Ctrl+End follows". Ctrl+End returns to the
 latest output.
 
 ## Permission modes

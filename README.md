@@ -24,7 +24,7 @@ Python runtime. You can switch models and providers mid-session, leave a goal
 running across turns, and pick the session up from your phone.
 
 <p align="center">
-  <img src="docs/images/octet-demo.svg" alt="Octet's offline demo: a prompt and reply in the conversation pane, the workspace panel on the right, the prompt box below">
+  <img src="docs/images/octet-demo.svg" alt="Octet's offline demo: a prompt and reply in the transcript with grouped tool activity, the Task sidebar on the right, the prompt box below">
 </p>
 
 ## Features
