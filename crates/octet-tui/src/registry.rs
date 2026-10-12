@@ -105,8 +105,8 @@ pub(crate) const COMMANDS: &[Spec] = &[
     spec(
         Cmd::Skills,
         "/skills",
-        "/skills [filter] · Up/Down choose, Enter runs",
-        "Run a skill from any provider",
+        "/skills [filter] · Up/Down choose, Enter puts it in the prompt",
+        "Choose a skill from any provider",
     ),
     spec(
         Cmd::Mode,
