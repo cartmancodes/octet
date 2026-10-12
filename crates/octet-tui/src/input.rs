@@ -109,79 +109,63 @@ pub(crate) fn refresh_completion(app: &mut App) {
         _ => app.composer.completion = None,
     }
 }
-/// Opens, refilters or closes the model picker as the draft is, or stops
-/// being, `/model <word>`.
-pub(crate) fn refresh_model_picker(app: &mut App) {
-    let text = app.composer.editor.text();
-    match composer::model_query(text, app.composer.editor.cursor()) {
-        Some((start, query)) => {
-            let query = query.to_owned();
-            let entries = app.model_entries();
-            let current = app.current_model();
-            let (items, mut selected) = composer::picker_items(
-                &entries,
-                current.as_ref().map(|(engine, s)| (*engine, s.as_str())),
-                &query,
-            );
-            // The same list: keep the highlight where the arrows left it.
-            if let Some(open) =
-                app.composer.completion.as_ref().filter(|c| {
-                    c.kind == composer::Kind::Model && c.start == start && c.items == items
-                })
-            {
-                selected = open.selected;
-            }
-            app.composer.completion = Some(composer::Completion {
-                kind: composer::Kind::Model,
-                items,
-                selected,
-                start,
-            });
+/// Opens, refilters or closes the picker `kind` as the draft is, or stops
+/// being, `command <word>`. `items` gives its lines for the word, and the
+/// one to highlight when the list is new.
+fn refresh_picker(
+    app: &mut App,
+    kind: composer::Kind,
+    command: &str,
+    items: impl FnOnce(&App, &str) -> (Vec<String>, usize),
+) {
+    let Some((start, query)) = composer::argument_query(
+        app.composer.editor.text(),
+        app.composer.editor.cursor(),
+        command,
+    ) else {
+        if app
+            .composer
+            .completion
+            .as_ref()
+            .is_some_and(|c| c.kind == kind)
+        {
+            app.composer.completion = None;
         }
-        None => {
-            if app
-                .composer
-                .completion
-                .as_ref()
-                .is_some_and(|c| c.kind == composer::Kind::Model)
-            {
-                app.composer.completion = None;
-            }
-        }
+        return;
+    };
+    let (items, mut selected) = items(app, query);
+    // The same list: keep the highlight where the arrows left it.
+    if let Some(open) = app
+        .composer
+        .completion
+        .as_ref()
+        .filter(|c| c.kind == kind && c.start == start && c.items == items)
+    {
+        selected = open.selected;
     }
+    app.composer.completion = Some(composer::Completion {
+        kind,
+        items,
+        selected,
+        start,
+    });
 }
-/// Opens, refilters or closes the skills picker as the draft is, or stops
-/// being, `/skills <word>`.
+/// The model picker, as the draft is or stops being `/model <word>`.
+pub(crate) fn refresh_model_picker(app: &mut App) {
+    refresh_picker(app, composer::Kind::Model, "/model", |app, query| {
+        let current = app.current_model();
+        composer::picker_items(
+            &app.model_entries(),
+            current.as_ref().map(|(engine, s)| (*engine, s.as_str())),
+            query,
+        )
+    });
+}
+/// The skills picker, as the draft is or stops being `/skills <word>`.
 pub(crate) fn refresh_skill_picker(app: &mut App) {
-    let text = app.composer.editor.text();
-    match composer::skills_query(text, app.composer.editor.cursor()) {
-        Some((start, query)) => {
-            let items = composer::skill_items(&app.skill_entries(), query);
-            // The same list: keep the highlight where the arrows left it.
-            let selected = app
-                .composer
-                .completion
-                .as_ref()
-                .filter(|c| c.kind == composer::Kind::Skill && c.start == start && c.items == items)
-                .map_or(0, |open| open.selected);
-            app.composer.completion = Some(composer::Completion {
-                kind: composer::Kind::Skill,
-                items,
-                selected,
-                start,
-            });
-        }
-        None => {
-            if app
-                .composer
-                .completion
-                .as_ref()
-                .is_some_and(|c| c.kind == composer::Kind::Skill)
-            {
-                app.composer.completion = None;
-            }
-        }
-    }
+    refresh_picker(app, composer::Kind::Skill, "/skills", |app, query| {
+        (composer::skill_items(&app.skill_entries(), query), 0)
+    });
 }
 /// The skill a picker line (`name · provider …`) names, and its provider.
 fn picked_skill(app: &App, item: &str) -> Option<(octet_core::Engine, octet_core::SkillInfo)> {
@@ -263,9 +247,11 @@ fn typed_a_model(app: &App) -> bool {
     {
         return false;
     }
-    let Some((_, query)) =
-        composer::model_query(app.composer.editor.text(), app.composer.editor.cursor())
-    else {
+    let Some((_, query)) = composer::argument_query(
+        app.composer.editor.text(),
+        app.composer.editor.cursor(),
+        "/model",
+    ) else {
         return false;
     };
     query == "default"

@@ -478,60 +478,44 @@ impl App {
     /// listed them (else as cached), then each other's cached for this
     /// workspace.
     pub(crate) fn skill_entries(&self) -> Vec<(octet_core::Engine, octet_core::SkillInfo)> {
-        let active = self.conn.engine;
         let workspace = self.workspace();
-        let first = if self.conn.skills.is_empty() {
-            self.models.skills(active, workspace).to_vec()
-        } else {
-            self.conn.skills.clone()
-        };
-        first
-            .into_iter()
-            .map(|skill| (active, skill))
-            .chain(
-                octet_core::Engine::ALL
-                    .iter()
-                    .copied()
-                    .filter(|engine| engine.is_vendor() && *engine != active)
-                    .flat_map(|engine| {
-                        self.models
-                            .skills(engine, workspace)
-                            .iter()
-                            .cloned()
-                            .map(move |skill| (engine, skill))
-                    }),
-            )
-            .collect()
+        self.by_provider(&self.conn.skills, |engine| {
+            self.models.skills(engine, workspace).to_vec()
+        })
     }
+    /// Every provider's models for `/model`, ordered as `skill_entries`.
     pub(crate) fn model_entries(&self) -> Vec<(octet_core::Engine, octet_core::ModelInfo)> {
-        let active = self.conn.engine;
-        let first = if self.conn.models.is_empty() {
+        self.by_provider(&self.conn.models, |engine| {
             self.models
                 .catalogs
-                .get(active)
+                .get(engine)
                 .map(|listed| listed.models.clone())
                 .unwrap_or_default()
+        })
+    }
+    /// The current provider's `live` list (its `cached` one while that is
+    /// empty), then each other vendor provider's `cached` list, in table
+    /// order; each item with its provider.
+    fn by_provider<T: Clone>(
+        &self,
+        live: &[T],
+        cached: impl Fn(octet_core::Engine) -> Vec<T>,
+    ) -> Vec<(octet_core::Engine, T)> {
+        let active = self.conn.engine;
+        let first = if live.is_empty() {
+            cached(active)
         } else {
-            self.conn.models.clone()
+            live.to_vec()
         };
+        let others = octet_core::Engine::ALL
+            .iter()
+            .copied()
+            .filter(|engine| engine.is_vendor() && *engine != active)
+            .flat_map(|engine| cached(engine).into_iter().map(move |item| (engine, item)));
         first
             .into_iter()
-            .map(|model| (active, model))
-            .chain(
-                octet_core::Engine::ALL
-                    .iter()
-                    .copied()
-                    .filter(|engine| engine.is_vendor() && *engine != active)
-                    .flat_map(|engine| {
-                        self.models
-                            .catalogs
-                            .get(engine)
-                            .map(|listed| listed.models.clone())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(move |model| (engine, model))
-                    }),
-            )
+            .map(|item| (active, item))
+            .chain(others)
             .collect()
     }
     /// `/model <selection>` when that resolves to `engine`, else the

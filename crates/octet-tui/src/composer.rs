@@ -101,23 +101,17 @@ pub(crate) fn tab(text: &str, cursor: usize, root: &Path, home: Option<&Path>) -
     Tab::Nothing
 }
 
-/// The `/model` argument being typed, when the draft is `/model <word>` with
-/// the cursor at its end: where the word starts, and the word.
-pub(crate) fn model_query(text: &str, cursor: usize) -> Option<(usize, &str)> {
+/// The argument being typed after `command` (`/model`, `/skills`), when the
+/// draft is `command <word>` with the cursor at its end: where the word
+/// starts, and the word.
+pub(crate) fn argument_query<'a>(
+    text: &'a str,
+    cursor: usize,
+    command: &str,
+) -> Option<(usize, &'a str)> {
     let start = word_start(text, cursor);
     let before = &text[..start];
-    (before.trim_end() == "/model"
-        && before.ends_with(char::is_whitespace)
-        && text[cursor..].trim().is_empty())
-    .then(|| (start, &text[start..cursor]))
-}
-
-/// The `/skills` filter being typed, when the draft is `/skills <word>`
-/// with the cursor at its end: where the word starts, and the word.
-pub(crate) fn skills_query(text: &str, cursor: usize) -> Option<(usize, &str)> {
-    let start = word_start(text, cursor);
-    let before = &text[..start];
-    (before.trim_end() == "/skills"
+    (before.trim_end() == command
         && before.ends_with(char::is_whitespace)
         && text[cursor..].trim().is_empty())
     .then(|| (start, &text[start..cursor]))
