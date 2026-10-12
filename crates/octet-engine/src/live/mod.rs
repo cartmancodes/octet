@@ -340,17 +340,62 @@ pub struct Listing {
     pub skills: Vec<SkillInfo>,
 }
 
+/// The most skills one list keeps, live or cached.
+pub const MAX_SKILLS: usize = 512;
+/// The most aliases one skill keeps.
+const MAX_ALIASES: usize = 16;
+/// The most bytes of a skill's description or hint kept.
+const SKILL_TEXT: usize = 1024;
+
 /// Whether `name` can be a skill's name: an identifier with no whitespace,
 /// so `/name args` splits back into it.
 fn skill_name(name: &str) -> bool {
     valid_identifier(name) && !name.chars().any(char::is_whitespace)
 }
-
 /// A skill's description or hint, bounded and on one line.
 fn skill_text(value: &Value) -> String {
     let text = value.as_str().unwrap_or("");
-    let end = text.floor_char_boundary(1024);
+    let end = text.floor_char_boundary(SKILL_TEXT);
     text[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+impl SkillInfo {
+    /// A skill from its JSON form, `{"name", "description", "aliases",
+    /// "argumentHint", "path"}`: the shape Claude's commands use, which a
+    /// Codex skill and the cache share. Every field but the name is
+    /// optional; a name that `/name args` could not carry gives `None`.
+    /// Text is bounded and put on one line, and unusable aliases dropped.
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let name = value["name"].as_str().filter(|name| skill_name(name))?;
+        Some(Self {
+            name: name.to_owned(),
+            description: skill_text(&value["description"]),
+            aliases: value["aliases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|alias| skill_name(alias))
+                .take(MAX_ALIASES)
+                .map(str::to_owned)
+                .collect(),
+            argument_hint: skill_text(&value["argumentHint"]),
+            path: value["path"]
+                .as_str()
+                .filter(|path| valid_identifier(path))
+                .map(PathBuf::from),
+        })
+    }
+    /// The JSON form `from_json` reads.
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "name": self.name,
+            "description": self.description,
+            "aliases": self.aliases,
+            "argumentHint": self.argument_hint,
+            "path": self.path,
+        })
+    }
 }
 
 /// Provider-owned picker metadata; selection and resolved ID can differ.
@@ -952,6 +997,30 @@ pub fn spawn_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_skill_round_trips_through_json_and_bad_ones_are_skipped() {
+        let skill = SkillInfo {
+            name: "superpowers:brainstorming".into(),
+            description: "Use before   creative\nwork".into(),
+            aliases: vec!["brainstorming".into()],
+            argument_hint: "[topic]".into(),
+            path: Some("/s/SKILL.md".into()),
+        };
+        let parsed = SkillInfo::from_json(&skill.to_json()).unwrap();
+        assert_eq!(parsed.description, "Use before creative work", "one line");
+        assert_eq!(parsed.aliases, skill.aliases);
+        assert_eq!(parsed.argument_hint, skill.argument_hint);
+        assert_eq!(parsed.path, skill.path);
+        for bad in [
+            serde_json::json!({"name": "two words"}),
+            serde_json::json!({"name": 7}),
+            serde_json::json!({}),
+        ] {
+            assert!(SkillInfo::from_json(&bad).is_none(), "{bad}");
+        }
+        let aliases = serde_json::json!({"name":"x","aliases":["ok", "no good", 3]});
+        assert_eq!(SkillInfo::from_json(&aliases).unwrap().aliases, ["ok"]);
+    }
     #[test]
     fn home_is_only_an_absolute_path() {
         assert_eq!(

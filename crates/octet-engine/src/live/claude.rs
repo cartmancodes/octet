@@ -616,25 +616,8 @@ fn commands(value: &Value) -> Vec<SkillInfo> {
         .as_array()
         .into_iter()
         .flatten()
-        .take(512)
-        .filter_map(|v| {
-            let name = v["name"].as_str().filter(|name| super::skill_name(name))?;
-            Some(SkillInfo {
-                name: name.to_owned(),
-                description: super::skill_text(&v["description"]),
-                aliases: v["aliases"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .filter(|alias| super::skill_name(alias))
-                    .take(16)
-                    .map(str::to_owned)
-                    .collect(),
-                argument_hint: super::skill_text(&v["argumentHint"]),
-                path: None,
-            })
-        })
+        .take(super::MAX_SKILLS)
+        .filter_map(SkillInfo::from_json)
         .collect()
 }
 

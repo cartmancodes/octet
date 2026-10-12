@@ -3,8 +3,9 @@
 //! can offer every provider's. Saved and merged as `catalog` saves models.
 use crate::{
     Engine, SkillInfo,
-    catalog::{cached_text, fetched_at, seconds, write_private},
+    catalog::{fetched_at, seconds, write_private},
 };
+use octet_engine::live::MAX_SKILLS;
 use serde_json::{Map, Value, json};
 use std::{
     collections::HashMap,
@@ -15,8 +16,6 @@ use std::{
 
 /// The cache file's name, in Octet's data directory.
 pub const FILE: &str = "skills.json";
-/// The most skills kept per list, as the drivers cap a live one.
-const MAX_SKILLS: usize = 512;
 
 /// Every provider's last skills list, per workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -49,7 +48,7 @@ impl SkillCatalogs {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(skill_from_json)
+                .filter_map(SkillInfo::from_json)
                 .take(MAX_SKILLS)
                 .collect();
             lists.insert((engine, PathBuf::from(workspace)), (skills, fetched));
@@ -75,7 +74,7 @@ impl SkillCatalogs {
             let Some(workspace) = workspace.to_str() else {
                 continue;
             };
-            let skills: Vec<Value> = skills.iter().map(skill_to_json).collect();
+            let skills: Vec<Value> = skills.iter().map(SkillInfo::to_json).collect();
             root.insert(
                 format!("{}\t{workspace}", engine.as_str()),
                 json!({"fetched": seconds(*fetched), "skills": skills}),
@@ -111,43 +110,6 @@ impl SkillCatalogs {
             .get(&(engine, workspace.to_path_buf()))
             .map(|(skills, _)| skills.as_slice())
     }
-}
-
-/// A cached skill, if it is a usable one: a name that splits back out of
-/// `/name args`.
-fn skill_from_json(value: &Value) -> Option<SkillInfo> {
-    let usable = |name: &&str| {
-        octet_engine::live::valid_identifier(name) && !name.chars().any(char::is_whitespace)
-    };
-    let name = value["name"].as_str().filter(usable)?;
-    Some(SkillInfo {
-        name: name.to_owned(),
-        description: cached_text(&value["description"], 2048),
-        aliases: value["aliases"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .filter(usable)
-            .take(16)
-            .map(str::to_owned)
-            .collect(),
-        argument_hint: cached_text(&value["argumentHint"], 512),
-        path: value["path"]
-            .as_str()
-            .filter(|path| octet_engine::live::valid_identifier(path))
-            .map(PathBuf::from),
-    })
-}
-
-fn skill_to_json(skill: &SkillInfo) -> Value {
-    json!({
-        "name": skill.name,
-        "description": skill.description,
-        "aliases": skill.aliases,
-        "argumentHint": skill.argument_hint,
-        "path": skill.path,
-    })
 }
 
 #[cfg(test)]

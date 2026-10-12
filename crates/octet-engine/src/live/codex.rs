@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     fmt::Write as _,
-    path::{Path, PathBuf},
+    path::Path,
     time::Duration,
 };
 
@@ -569,20 +569,8 @@ fn skills(data: &Value) -> Vec<SkillInfo> {
         .flatten()
         .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
         .filter(|v| v["enabled"] == true)
-        .filter_map(|v| {
-            let name = v["name"].as_str().filter(|name| super::skill_name(name))?;
-            Some(SkillInfo {
-                name: name.to_owned(),
-                description: super::skill_text(&v["description"]),
-                aliases: Vec::new(),
-                argument_hint: String::new(),
-                path: v["path"]
-                    .as_str()
-                    .filter(|path| valid_identifier(path))
-                    .map(PathBuf::from),
-            })
-        })
-        .take(512)
+        .filter_map(SkillInfo::from_json)
+        .take(super::MAX_SKILLS)
         .collect()
 }
 
