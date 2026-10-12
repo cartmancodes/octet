@@ -281,7 +281,7 @@ impl Models {
                 format!("unavailable: {}", error.lines().next().unwrap_or_default())
             }
             (None, None) => "not fetched".into(),
-            (Some(listed), _) => format!("cached {}", ago(now, listed.fetched)),
+            (Some(listed), _) => format!("cached {}", crate::text::ago(now, listed.fetched)),
         }
     }
 
@@ -314,17 +314,6 @@ fn others(active: Engine) -> impl Iterator<Item = Engine> {
         .iter()
         .copied()
         .filter(move |engine| engine.is_vendor() && *engine != active)
-}
-
-/// "just now", "5 min ago", "2 h ago", "3 days ago".
-fn ago(now: SystemTime, then: SystemTime) -> String {
-    let seconds = now.duration_since(then).map_or(0, |age| age.as_secs());
-    match seconds {
-        0..60 => "just now".into(),
-        60..3600 => format!("{} min ago", seconds / 60),
-        3600..86_400 => format!("{} h ago", seconds / 3600),
-        _ => format!("{} days ago", seconds / 86_400),
-    }
 }
 
 #[cfg(test)]

@@ -361,7 +361,7 @@ pub(crate) fn show_sessions(app: &mut App, listed: Vec<octet_core::RecentSession
                 entry.engine,
                 summary.session,
                 summary.model.as_deref().unwrap_or("default model"),
-                age(now, summary.started),
+                crate::text::ago(now, summary.started),
             )
         })
         .collect();
@@ -409,17 +409,6 @@ fn cut(text: &str, limit: usize) -> String {
         line
     } else {
         format!("{}…", line.chars().take(limit).collect::<String>())
-    }
-}
-
-/// How long ago `then` was, in the largest whole unit.
-fn age(now: std::time::SystemTime, then: std::time::SystemTime) -> String {
-    let seconds = now.duration_since(then).map_or(0, |d| d.as_secs());
-    match seconds {
-        0..60 => "just now".into(),
-        60..3_600 => format!("{} min ago", seconds / 60),
-        3_600..86_400 => format!("{} h ago", seconds / 3_600),
-        _ => format!("{} d ago", seconds / 86_400),
     }
 }
 

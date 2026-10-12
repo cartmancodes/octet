@@ -98,9 +98,31 @@ pub(crate) fn strip(text: &str) -> String {
 pub(crate) fn clean(text: &str) -> String {
     Sanitizer::default().push(text)
 }
+/// How long ago `then` was, in the largest whole unit: "just now",
+/// "5 min ago", "2 h ago", "3 d ago". A time ahead of the clock is "just now".
+pub(crate) fn ago(now: std::time::SystemTime, then: std::time::SystemTime) -> String {
+    let seconds = now.duration_since(then).map_or(0, |age| age.as_secs());
+    match seconds {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{} min ago", seconds / 60),
+        3_600..86_400 => format!("{} h ago", seconds / 3_600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ago_says_the_largest_whole_unit() {
+        let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let at = |seconds| then + std::time::Duration::from_secs(seconds);
+        assert_eq!(ago(at(59), then), "just now");
+        assert_eq!(ago(at(300), then), "5 min ago");
+        assert_eq!(ago(at(7_200), then), "2 h ago");
+        assert_eq!(ago(at(3 * 86_400), then), "3 d ago");
+        assert_eq!(ago(then, at(60)), "just now", "a time ahead of the clock");
+    }
     #[test]
     fn strips_split_osc_and_csi() {
         let mut s = Sanitizer::default();
