@@ -1,17 +1,11 @@
-//! The phone hub's private state: paired devices, pairing secrets, the
-//! tailnet owner and an audit log of remote actions.
+//! The phone hub: an authenticated WebSocket API for phones on `127.0.0.1`, over the
+//! sessions it finds, with paired devices, pairing secrets, the tailnet owner and an audit log.
 #![forbid(unsafe_code)]
 mod owner;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the hub server, the next task, is the caller")
-)]
+mod server;
 mod sessions;
 mod store;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the hub server, the next task, is the caller")
-)]
 mod tail;
 pub use owner::{owner_login, tailnet_url};
+pub use server::Hub;
 pub use store::{Device, HubConfig, Store};

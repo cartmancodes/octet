@@ -69,6 +69,10 @@ impl Tail {
     }
 
     /// How many unparsable lines this tail has skipped.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "only the tests read the count so far")
+    )]
     pub(crate) fn skipped(&self) -> u64 {
         self.skipped
     }

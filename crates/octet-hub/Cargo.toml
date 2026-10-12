@@ -13,9 +13,12 @@ tokio.workspace = true
 serde_json.workspace = true
 getrandom = "0.4.3"
 sha2 = "0.11.1"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 
 [dev-dependencies]
 octet-testkit.workspace = true
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
 
 [lints]
 workspace = true
