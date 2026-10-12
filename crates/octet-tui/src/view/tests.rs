@@ -106,8 +106,8 @@ fn an_empty_composer_gives_rows_back_to_the_conversation() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.event(Event::User("hello".into()));
     let rows = screen(44, 16, &mut app);
-    // The composer's top border sits 4 rows above the status line.
-    assert!(rows[16 - 6].starts_with(" ╭ Prompt"), "{}", rows[16 - 6]);
+    // Compact: no bottom margin, so the border sits 4 rows above the status line.
+    assert!(rows[16 - 5].starts_with(" ╭ Prompt"), "{}", rows[16 - 5]);
 }
 #[test]
 fn help_keeps_its_last_line_on_narrow_and_short_terminals() {
@@ -220,7 +220,7 @@ fn empty_conversation_leaves_the_centre_blank() {
 #[test]
 fn header_banner_shows_mini_version_mode_activity_and_workspace() {
     let config = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp");
-    for (width, height) in [(160, 42), (80, 24), (60, 20), (40, 12)] {
+    for (width, height) in [(160, 42), (80, 30)] {
         let mut app = App::new(&config, "journal".into());
         app.monochrome = false;
         for event in [
@@ -263,9 +263,9 @@ fn permission_mode_stays_visible_on_narrow_headers() {
         app.monochrome = false;
         let rows = screen(width, 24, &mut app);
         assert!(
-            rows[2].contains("full-access"),
+            rows[0].contains("full-access"),
             "{width} columns: {}",
-            rows[2]
+            rows[0]
         );
     }
 }
@@ -287,17 +287,23 @@ fn status_shows_in_full_on_narrow_terminals() {
             app.event(event);
         }
         let rows = screen(width, 12, &mut app);
-        assert!(rows[1].contains("● interrupted"), "{width}: {}", rows[1]);
+        assert!(rows[0].contains("● interrupted"), "{width}: {}", rows[0]);
     }
 }
 #[test]
 fn no_color_keeps_the_text_header() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.monochrome = true;
-    let rows = screen(80, 24, &mut app);
-    let mark = format!("◇ Octet v{}", env!("CARGO_PKG_VERSION"));
-    assert!(rows[1].contains(&mark), "{}", rows[1]);
-    assert!(!rows[1..4].iter().any(|row| row.contains('▀')));
+    for (height, row) in [(24, 0), (42, 1)] {
+        let rows = screen(80, height, &mut app);
+        let mark = if height < 30 {
+            "◇ Octet".to_owned()
+        } else {
+            format!("◇ Octet v{}", env!("CARGO_PKG_VERSION"))
+        };
+        assert!(rows[row].contains(&mark), "{}", rows[row]);
+        assert!(!rows[..4].iter().any(|row| row.contains('▀')));
+    }
 }
 #[test]
 fn mascot_tracks_activity_and_keeps_errors_visible_after_disconnect() {
@@ -467,16 +473,40 @@ fn chips_have_their_own_row_and_grow_the_box() {
     );
 }
 #[test]
-fn chips_give_way_at_the_minimum_size() {
+fn chips_and_hint_fit_at_the_minimum_size() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.composer
         .queue
         .push_back(crate::vendor::Prompt::plain("later".into()));
     assert!(app.composer.editor.insert("draft"));
-    // The box gets one inner row here: the draft keeps it; hint and chips give way.
-    let rows = screen(38, 12, &mut app);
-    let text = rows.join("\n");
+    // The compact layout leaves the box room for the draft, the chips and the hint.
+    let text = screen(38, 12, &mut app).join("\n");
     assert!(text.contains("│ draft"), "{text}");
+    assert!(
+        text.contains("1 queued") && text.contains("Enter send"),
+        "{text}"
+    );
+}
+#[test]
+fn chips_give_way_in_a_box_with_one_inner_row() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.composer
+        .queue
+        .push_back(crate::vendor::Prompt::plain("later".into()));
+    assert!(app.composer.editor.insert("draft"));
+    let draft = app.composer.editor.layout(draft_width(38));
+    let mut terminal = Terminal::new(TestBackend::new(38, 3)).unwrap();
+    terminal
+        .draw(|frame| {
+            composer(frame, frame.area(), 38, &app, draft);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let text: String = (0..3)
+        .flat_map(|y| (0..38).map(move |x| (x, y)))
+        .map(|position| buffer[position].symbol())
+        .collect();
+    assert!(text.contains("draft"), "{text}");
     assert!(
         !text.contains("queued") && !text.contains("Enter send"),
         "{text}"
@@ -905,4 +935,50 @@ fn a_palette_with_no_match_says_so() {
     let rows = screen(100, 30, &mut app);
     assert!(rows.iter().any(|r| r.contains("No matching commands")));
     assert!(rows.iter().any(|r| r.contains("Commands · \"qqqq\"")));
+}
+#[test]
+fn a_short_terminal_gets_a_one_row_header_and_no_vertical_margin() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.monochrome = false;
+    crate::test_support::idle(&mut app);
+    app.event(Event::User("hi".into()));
+    let rows = screen(100, 24, &mut app);
+    assert!(rows[0].contains("Octet · ask"), "{}", rows[0]);
+    assert!(rows[0].contains("● ready"), "{}", rows[0]);
+    assert!(rows[0].contains("/tmp"), "{}", rows[0]);
+    assert!(rows[1].contains("╭ Conversation"), "{}", rows[1]);
+    // The demo is offline, so its standing hints say so.
+    assert_eq!(
+        rows[23].trim_end(),
+        " Offline demo · F1 help · Ctrl+C ×2 quit"
+    );
+    let transcript_rows = rows.iter().filter(|r| r.starts_with(" │")).count();
+    assert!(
+        transcript_rows >= 16,
+        "{transcript_rows}\n{}",
+        rows.join("\n")
+    );
+}
+#[test]
+fn a_tall_terminal_keeps_the_banner() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.monochrome = false;
+    let rows = screen(100, 30, &mut app);
+    let mini: String = rows[1].chars().skip(1).take(9).collect();
+    assert_eq!(mini, "▀".repeat(9));
+}
+#[test]
+fn a_narrow_short_header_puts_the_workspace_before_the_model() {
+    let config = octet_core::Config {
+        model: Some("a-very-long-model-name-indeed".into()),
+        ..octet_core::Config::new(octet_core::Engine::CODEX, "codex", "/tmp/ws")
+    };
+    let mut app = App::new(&config, "journal".into());
+    let rows = screen(60, 20, &mut app);
+    let ws = rows[0].find("/tmp/ws").expect(&rows[0]);
+    assert!(
+        rows[0].find("a-very").is_none_or(|model| ws < model),
+        "{}",
+        rows[0]
+    );
 }

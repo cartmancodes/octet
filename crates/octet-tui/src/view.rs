@@ -78,30 +78,113 @@ fn paint(frame: &mut Frame, app: &mut App) {
     // Laid out once per frame: its row count sizes the composer, and its
     // lines and cursor are drawn there.
     let draft = app.composer.editor.layout(draft_width(area.width));
+    let compact = compact(area);
     let regions = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(if compact { 1 } else { 3 }),
         Constraint::Min(3),
         Constraint::Length(composer_height(draft.0.len(), chips(app).is_some())),
         Constraint::Length(1),
     ])
-    .margin(1)
+    .horizontal_margin(1)
+    .vertical_margin(u16::from(!compact))
     .split(area);
-    header(frame, regions[0], app);
+    if compact {
+        header_line(frame, regions[0], app);
+    } else {
+        header(frame, regions[0], app);
+    }
     conversation(frame, regions[1], area.width, app);
     let cursor = composer(frame, regions[2], area.width, app, draft);
-    status_line(frame, regions[3], app);
+    // Compact hints start under the box's left edge, in the margin's column.
+    let status_area = if compact {
+        Rect {
+            x: 0,
+            width: area.width,
+            ..regions[3]
+        }
+    } else {
+        regions[3]
+    };
+    status_line(frame, status_area, app, compact);
     overlays(frame, area, app, cursor);
 }
-/// Banner on the left, status and usage on the right.
-fn header(frame: &mut Frame, area: Rect, app: &App) {
-    let status = format!(
+/// Below this many rows the header is one row and the layout has no vertical margin.
+pub(crate) const COMPACT_BELOW: u16 = 30;
+/// Short terminals trade the banner for transcript rows.
+fn compact(area: Rect) -> bool {
+    area.height < COMPACT_BELOW
+}
+/// The one-cell mark's colour: the mascot's state at a glance.
+fn mark_color(state: mascot::State) -> Color {
+    match state {
+        mascot::State::Approval | mascot::State::Error => AMBER,
+        mascot::State::Idle | mascot::State::Sleeping => MUTED,
+        _ => ACCENT,
+    }
+}
+/// The connection's status, or the pending approval, with its dot.
+fn status_text(app: &App) -> String {
+    format!(
         "● {}",
         if app.overlay.approvals.is_empty() {
             app.conn.status.as_str()
         } else {
             "approval needed"
         }
+    )
+}
+/// Amber for an approval, muted once stopped, else the accent.
+fn status_color(app: &App) -> Color {
+    if !app.overlay.approvals.is_empty() {
+        AMBER
+    } else if app.conn.is_stopped() {
+        MUTED
+    } else {
+        ACCENT
+    }
+}
+/// The compact header: mark, name, mode, model and workspace on the left; status and usage right.
+fn header_line(frame: &mut Frame, area: Rect, app: &App) {
+    let status = status_text(app);
+    let right = if app.conn.usage.is_empty() {
+        status
+    } else {
+        format!("{status} · {}", app.conn.usage)
+    };
+    let right_width = cells(right.width()).min(area.width / 2);
+    let [left, right_area] =
+        Layout::horizontal([Constraint::Min(6), Constraint::Length(right_width)])
+            .spacing(1)
+            .areas(area);
+    let mark = if app.monochrome { "◇" } else { "◆" };
+    let model = format!("{} / {}", app.conn.engine, app.conn.model);
+    let (first, second) = if area.width < 80 {
+        (&app.conn.workspace, &model)
+    } else {
+        (&model, &app.conn.workspace)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{mark} "),
+                Style::default().fg(mark_color(app.mascot_state())),
+            ),
+            Span::styled("Octet", Style::default().fg(ACCENT).bold()),
+            Span::styled(" · ", Style::default().fg(MUTED)),
+            mode_chip(app),
+            Span::styled(format!(" · {first}  {second}"), Style::default().fg(MUTED)),
+        ])),
+        left,
     );
+    frame.render_widget(
+        Paragraph::new(Span::styled(right, Style::default().fg(status_color(app))))
+            .alignment(Alignment::Right),
+        right_area,
+    );
+}
+/// Banner on the left, status and usage on the right.
+fn header(frame: &mut Frame, area: Rect, app: &App) {
+    let status = status_text(app);
     // Status and usage keep the right edge, sized to their text so a narrow
     // terminal never cuts them; the banner takes the rest.
     let status_width = cells(status.width().max(app.conn.usage.width())).clamp(12, 22);
@@ -109,16 +192,9 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
         .spacing(1)
         .split(area);
     banner(frame, header[0], app);
-    let status_color = if !app.overlay.approvals.is_empty() {
-        AMBER
-    } else if app.conn.is_stopped() {
-        MUTED
-    } else {
-        ACCENT
-    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(status, Style::default().fg(status_color))),
+            Line::from(Span::styled(status, Style::default().fg(status_color(app)))),
             Line::from(Span::styled(
                 app.conn.usage.clone(),
                 Style::default().fg(MUTED),
@@ -232,10 +308,16 @@ fn composer(
     )
 }
 /// The bottom line: the latest notice, or the standing hints.
-fn status_line(frame: &mut Frame, area: Rect, app: &App) {
+fn status_line(frame: &mut Frame, area: Rect, app: &App, compact: bool) {
     frame.render_widget(
         Paragraph::new(if app.status_line.is_empty() {
-            if app.conn.engine.offline() {
+            if compact {
+                if app.conn.engine.offline() {
+                    " Offline demo · F1 help · Ctrl+C ×2 quit".into()
+                } else {
+                    " F1 help · Ctrl+C ×2 quit".into()
+                }
+            } else if app.conn.engine.offline() {
                 " Offline demo · no model calls   |   Ctrl+C twice to quit".into()
             } else {
                 " Journal saved locally   |   F1 help   |   Ctrl+C twice to quit".into()
