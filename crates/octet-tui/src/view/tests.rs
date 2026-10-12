@@ -1,5 +1,6 @@
 use super::*;
-use octet_core::Event;
+use crate::test_support::{approval, tool};
+use octet_core::{Event, ToolPhase};
 use ratatui::{Terminal, backend::TestBackend};
 fn screen(width: u16, height: u16, app: &mut App) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -195,7 +196,7 @@ fn header_banner_shows_mini_version_mode_activity_and_workspace() {
             },
             Event::User("fix the failing test".into()),
             Event::Started,
-            Event::Tool("Bash\n{}".into()),
+            tool("1", "Bash", "", ToolPhase::Running),
         ] {
             app.event(event);
         }
@@ -278,21 +279,18 @@ fn mascot_tracks_activity_and_keeps_errors_visible_after_disconnect() {
         ),
         (Event::Started, "THINKING"),
         (
-            Event::Tool("Read\n{\"file_path\":\"src/main.rs\"}".into()),
+            tool("1", "Read", "src/main.rs", ToolPhase::Running),
             "SEARCHING",
         ),
         (
-            Event::Tool("Bash\n{\"command\":\"cargo check\"}".into()),
+            tool("2", "Bash", "cargo check", ToolPhase::Running),
             "CODING",
         ),
-        (Event::Tool("dispatch_subagent\n{}".into()), "DELEGATING"),
         (
-            Event::Approval {
-                id: 1,
-                detail: "Write src/main.rs".into(),
-            },
-            "APPROVAL",
+            tool("3", "dispatch_subagent", "", ToolPhase::Running),
+            "DELEGATING",
         ),
+        (approval(1, "Write src/main.rs"), "APPROVAL"),
         (Event::ApprovalClosed(1), "DELEGATING"),
         (
             Event::Finished {
@@ -328,10 +326,7 @@ fn renders_narrow_wide_and_approval_without_panics() {
         let mut a = App::new(&c, "journal".into());
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, &mut a)).unwrap();
-        a.event(Event::Approval {
-            id: 7,
-            detail: "edit hello.txt".into(),
-        });
+        a.event(approval(7, "edit hello.txt"));
         t.draw(|f| draw(f, &mut a)).unwrap();
     }
 }
@@ -540,10 +535,7 @@ fn scrolling_up_keeps_the_view_full() {
 #[test]
 fn approval_scroll_is_clamped() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
-    app.event(Event::Approval {
-        id: 1,
-        detail: "one short line".into(),
-    });
+    app.event(approval(1, "one short line"));
     app.overlay.approval_scroll = 500;
     let rows = screen(100, 30, &mut app);
     assert!(
@@ -574,10 +566,7 @@ fn help_rows_match_what_is_drawn() {
 #[test]
 fn an_approval_hidden_behind_help_is_armed_only_once_seen() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
-    app.event(Event::Approval {
-        id: 1,
-        detail: "rm -rf build".into(),
-    });
+    app.event(approval(1, "rm -rf build"));
     // Help covers the dialog while the approval arrives and waits.
     app.overlay.help = true;
     screen(100, 30, &mut app);

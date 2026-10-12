@@ -105,8 +105,11 @@ async fn drive_print(
                     .map_err(|e| e.to_string())?;
             }
             Event::Text(text) if !json => out.text(&text).await?,
-            Event::Approval { id, detail } => {
-                let what = detail.lines().next().unwrap_or_default();
+            Event::Approval { id, summary, .. } => {
+                let what = match &summary.command {
+                    Some(command) => format!("{}: {command}", summary.action),
+                    None => summary.action.clone(),
+                };
                 warn(&format!(
                     "denied an approval ({what}); print mode cannot ask. \
                      Use --mode auto or --mode full-access for unattended runs."

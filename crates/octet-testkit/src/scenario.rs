@@ -34,6 +34,8 @@ pub const SLOW: &str = "slow";
 pub const PARAMS: &str = "params";
 /// Claude: one tool use.
 pub const TOOL: &str = "tool";
+/// Claude: one tool use whose result is an error.
+pub const TOOL_FAIL: &str = "tool-fail";
 /// Claude: a failed result with error details.
 pub const ERRORS: &str = "errors";
 /// Claude: echo the launch arguments.

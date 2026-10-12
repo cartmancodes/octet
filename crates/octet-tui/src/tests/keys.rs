@@ -485,10 +485,7 @@ async fn one_tab_listing_at_a_time() {
 async fn an_answer_key_right_after_an_approval_is_ignored() {
     let mut app = app();
     let vendor = RecordingVendor::default();
-    app.event(octet_core::Event::Approval {
-        id: 7,
-        detail: "rm -rf build".into(),
-    });
+    app.event(crate::test_support::approval(7, "rm -rf build"));
     // A letter typed as the dialog opens must not answer it.
     key_action(&mut app, &vendor, key(KeyCode::Char('a'))).await;
     assert!(

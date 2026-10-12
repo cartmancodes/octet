@@ -1,15 +1,22 @@
 //! Claude Code stream-json protocol: launch arguments, control requests and
 //! the frame handler.
 use super::{
-    BoxFuture, Channels, Config, DriverError, Event, HookOutcome, ImageAttachment, Limits, Mode,
-    ModelInfo, Outcome, Provider, SkillInfo, check_inline, deadline_after, limited,
+    ApprovalSummary, BoxFuture, Channels, Config, DriverError, Event, HookOutcome, ImageAttachment,
+    Limits, Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
+    activity::{input_target, one_line},
+    check_inline, deadline_after, limited,
     mode::confirm_mode,
     model_catalog_with,
     protocol::{Core, Phase, Protocol},
     push_bounded, valid_identifier,
 };
 use serde_json::{Value, json};
-use std::{collections::VecDeque, ffi::OsString, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::OsString,
+    path::Path,
+    time::Duration,
+};
 use tokio::{sync::mpsc, time::Instant};
 
 /// Claude Code's row in the provider table.
@@ -152,6 +159,8 @@ pub(super) struct ClaudeProtocol {
     mode_seq: u64,
     /// A session ID that failed `valid_identifier` was reported once.
     odd_session_noted: bool,
+    /// Tool calls announced and not yet ended this turn: their names and targets, for the results.
+    tools: HashMap<String, (String, String)>,
 }
 
 impl Protocol for ClaudeProtocol {
@@ -339,7 +348,8 @@ impl Protocol for ClaudeProtocol {
                 v.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool");
             if permission && core.phase == Phase::InTurn {
                 let detail = serde_json::to_string_pretty(&v["request"]).unwrap_or_default();
-                return core.queue_approval(v, detail).await;
+                let summary = claude_approval_summary(&v["request"], &core.config.cwd);
+                return core.queue_approval(v, detail, summary).await;
             }
             if let Some(reply) = stray(&v) {
                 core.send(reply).await?;
@@ -382,15 +392,18 @@ impl Protocol for ClaudeProtocol {
                         core.emit(Event::Text(text.into()))?;
                     }
                     if block["type"] == "tool_use" {
-                        let name = block["name"].as_str().unwrap_or("tool");
-                        core.emit(Event::Tool(format!("{name}\n{}", block["input"])))?;
+                        self.tool_started(core, block)?;
                     }
                 }
                 if !subagent {
                     self.streamed = false;
                 }
             }
-            "result" => Self::result(core, &v)?,
+            "user" => self.tool_results(core, &v)?,
+            "result" => {
+                self.tools.clear();
+                Self::result(core, &v)?;
+            }
             _ => {}
         }
         Ok(())
@@ -398,6 +411,52 @@ impl Protocol for ClaudeProtocol {
 }
 
 impl ClaudeProtocol {
+    /// A `tool_use` block: announces the call and remembers it for its result.
+    fn tool_started(&mut self, core: &Core, block: &Value) -> Result<(), DriverError> {
+        let name = one_line(block["name"].as_str().unwrap_or("tool"));
+        let id = one_line(block["id"].as_str().unwrap_or_default());
+        let target = input_target(&block["input"]);
+        if !id.is_empty() && self.tools.len() < 256 {
+            self.tools
+                .insert(id.clone(), (name.clone(), target.clone()));
+        }
+        core.emit(Event::Tool(ToolCall {
+            id,
+            name: name.clone(),
+            target,
+            phase: ToolPhase::Running,
+            detail: format!("{name}\n{}", block["input"]),
+        }))
+    }
+    /// The `tool_result` blocks of a `"user"` frame: each ends its call.
+    fn tool_results(&mut self, core: &Core, v: &Value) -> Result<(), DriverError> {
+        for block in v
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| block["type"] == "tool_result")
+        {
+            let id = one_line(block["tool_use_id"].as_str().unwrap_or_default());
+            let (name, target) = self
+                .tools
+                .remove(&id)
+                .unwrap_or_else(|| ("tool".into(), String::new()));
+            let phase = if block["is_error"].as_bool() == Some(true) {
+                ToolPhase::Failed
+            } else {
+                ToolPhase::Done
+            };
+            core.emit(Event::Tool(ToolCall {
+                id,
+                name,
+                target,
+                phase,
+                detail: result_text(&block["content"]),
+            }))?;
+        }
+        Ok(())
+    }
     /// Reports a mode switch Claude did not confirm in time.
     fn report_late_mode(&mut self, core: &Core) -> Result<(), DriverError> {
         if let Some(request) = self
@@ -535,6 +594,44 @@ pub(super) fn switch_reply_mode(
 /// The Claude catalog: `value` selects, `resolvedModel` is the full ID.
 fn catalog(value: &Value) -> Vec<ModelInfo> {
     model_catalog_with(value, "value", "resolvedModel")
+}
+
+/// What a `can_use_tool` request would do, for the dialog. Claude runs tools in the session's
+/// folder, `cwd`.
+pub(super) fn claude_approval_summary(request: &Value, cwd: &Path) -> ApprovalSummary {
+    let tool = request["tool_name"].as_str().unwrap_or("a tool");
+    let input = &request["input"];
+    let mut summary = ApprovalSummary::new(match tool {
+        "Bash" => "Run a shell command".to_owned(),
+        "Edit" | "MultiEdit" | "NotebookEdit" => "Edit 1 file".to_owned(),
+        "Write" => "Write 1 file".to_owned(),
+        _ if tool.starts_with("mcp__") => {
+            format!("Use MCP tool {}", tool.rsplit("__").next().unwrap_or(tool))
+        }
+        _ => format!("Use {}", one_line(tool)),
+    });
+    summary.command = input["command"].as_str().map(str::to_owned);
+    summary.files = ["file_path", "notebook_path"]
+        .iter()
+        .filter_map(|key| input[key].as_str())
+        .map(str::to_owned)
+        .take(1)
+        .collect();
+    summary.cwd = Some(cwd.display().to_string());
+    summary
+}
+
+/// A `tool_result` block's content as text: a string, or the text of its parts.
+fn result_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 /// Reply to a Claude control request the driver will not put in front of the
@@ -802,5 +899,50 @@ mod tests {
             claude_result_error(&json!({"is_error":true,"subtype":"error_max_turns"})),
             "Claude returned an error (error_max_turns)"
         );
+    }
+    #[test]
+    fn a_bash_request_is_summarised_with_its_command_and_folder() {
+        let request =
+            json!({"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo test"}});
+        let summary = claude_approval_summary(&request, Path::new("/work"));
+        assert_eq!(summary.action, "Run a shell command");
+        assert_eq!(summary.command.as_deref(), Some("cargo test"));
+        assert_eq!(summary.cwd.as_deref(), Some("/work"));
+        assert!(summary.files.is_empty());
+    }
+    #[test]
+    fn edit_write_and_mcp_requests_say_what_they_touch() {
+        let edit = json!({"tool_name":"Edit","input":{"file_path":"src/a.rs"}});
+        let summary = claude_approval_summary(&edit, Path::new("/w"));
+        assert_eq!(
+            (summary.action.as_str(), summary.files.as_slice()),
+            ("Edit 1 file", &["src/a.rs".to_owned()][..])
+        );
+        let write = json!({"tool_name":"Write","input":{"file_path":"new.txt"}});
+        assert_eq!(
+            claude_approval_summary(&write, Path::new("/w")).action,
+            "Write 1 file"
+        );
+        let mcp = json!({"tool_name":"mcp__fixture__fixture_echo","input":{}});
+        assert_eq!(
+            claude_approval_summary(&mcp, Path::new("/w")).action,
+            "Use MCP tool fixture_echo"
+        );
+        let other = json!({"tool_name":"WebFetch","input":{"url":"https://x.test"}});
+        assert_eq!(
+            claude_approval_summary(&other, Path::new("/w")).action,
+            "Use WebFetch"
+        );
+    }
+    #[test]
+    fn tool_result_text_joins_its_parts() {
+        assert_eq!(result_text(&json!("plain")), "plain");
+        assert_eq!(
+            result_text(
+                &json!([{"type":"text","text":"a"},{"type":"image"},{"type":"text","text":"b"}])
+            ),
+            "a\nb"
+        );
+        assert_eq!(result_text(&json!(null)), "");
     }
 }

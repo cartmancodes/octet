@@ -18,7 +18,12 @@ fn copy_takes_the_whole_reply_with_its_tabs() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.event(Event::Started);
     app.event(Event::Text("one".into()));
-    app.event(Event::Tool("Read\nsrc/main.rs".into()));
+    app.event(crate::test_support::tool(
+        "1",
+        "Read",
+        "src/main.rs",
+        octet_core::ToolPhase::Running,
+    ));
     app.event(Event::Text("two\tcolumns".into()));
     assert_eq!(app.last_reply(), Some("one\n\ntwo\tcolumns"));
     app.attach(crate::shell::Ran {

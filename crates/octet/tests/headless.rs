@@ -91,6 +91,16 @@ fn print_denies_approvals_and_says_why() {
 }
 
 #[test]
+fn print_names_the_denied_command() {
+    let (code, _, stderr) = run(&["--engine", "claude", "--print", "approval"], "");
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("denied an approval (Run a shell command: echo fixture)"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn print_failed_turn_exits_one() {
     let (code, _, stderr) = run(&["--print", "fail"], "");
     assert_eq!(code, 1, "{stderr}");

@@ -1,8 +1,10 @@
 //! Codex app-server JSON-RPC protocol: session setup, the model catalog,
 //! server requests and turn notifications.
 use super::{
-    BoxFuture, Channels, Config, DriverError, EVENT_BYTES, Event, ImageAttachment, Limits, Mode,
-    ModelInfo, Outcome, Provider, SkillInfo, limited, model_catalog_with,
+    ApprovalSummary, BoxFuture, Channels, Config, DriverError, EVENT_BYTES, Event, ImageAttachment,
+    Limits, Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
+    activity::one_line,
+    limited, model_catalog_with,
     protocol::{Core, Phase, Protocol},
     push_bounded, short, valid_identifier,
 };
@@ -255,12 +257,7 @@ impl Protocol for CodexProtocol {
                         }
                     }
                     "commandExecution" | "fileChange" | "mcpToolCall" => {
-                        let phase = if method == "item/started" {
-                            "running"
-                        } else {
-                            "finished"
-                        };
-                        core.emit(Event::Tool(codex_tool_detail(item, phase)))?;
+                        core.emit(Event::Tool(codex_tool_call(item, method == "item/started")))?;
                     }
                     _ => {}
                 }
@@ -528,7 +525,9 @@ impl CodexProtocol {
             && v.pointer("/params/turnId").and_then(Value::as_str) == self.turn.as_deref();
         if approval && core.phase == Phase::InTurn && this_turn {
             let detail = serde_json::to_string_pretty(&v["params"]).unwrap_or_default();
-            return core.queue_approval(v, detail).await;
+            return core
+                .queue_approval(v, detail, ApprovalSummary::new("Approve a Codex request"))
+                .await;
         }
         if let Some(reply) = stray(&v) {
             let notice = format!("Request declined: {}", short(method));
@@ -628,6 +627,21 @@ pub(super) fn codex_tool_detail(item: &Value, phase: &str) -> String {
         }
     }
     limited(&text)
+}
+/// An `item` as a tool call, started or completed.
+fn codex_tool_call(item: &Value, started: bool) -> ToolCall {
+    let (phase, label) = if started {
+        (ToolPhase::Running, "running")
+    } else {
+        (ToolPhase::Done, "finished")
+    };
+    ToolCall {
+        id: one_line(item["id"].as_str().unwrap_or_default()),
+        name: one_line(item["type"].as_str().unwrap_or("tool")),
+        target: String::new(),
+        phase,
+        detail: codex_tool_detail(item, label),
+    }
 }
 /// The reply to a Codex request Octet will not put in front of the user:
 /// approvals outside a turn are declined, anything else is unsupported.

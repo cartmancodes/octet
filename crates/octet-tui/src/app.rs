@@ -749,12 +749,12 @@ impl App {
                 }
                 self.trim();
             }
-            Event::Tool(text) => {
+            Event::Tool(call) => {
                 self.chat.reply_break = true;
-                self.conn.activity = State::tool(&text);
-                self.add(Role::Tool, &text);
+                self.conn.activity = State::tool(&call);
+                self.add(Role::Tool, &format!("{}\n{}", call.name, call.detail));
             }
-            Event::Approval { id, detail } => {
+            Event::Approval { id, detail, .. } => {
                 let first = self.overlay.approvals.is_empty();
                 self.overlay.approvals.push_back((id, clean(&detail)));
                 if first {

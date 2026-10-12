@@ -5,8 +5,8 @@
     reason = "test code: an unwrap that fails is the test failing"
 )]
 use octet_engine::live::{
-    Command, Config, Engine, Event, ImageAttachment, Limits, Mode, Outcome, PROBE_LIMIT, probe,
-    spawn, spawn_with_limits,
+    Command, Config, Engine, Event, ImageAttachment, Limits, Mode, Outcome, PROBE_LIMIT, ToolCall,
+    ToolPhase, probe, spawn, spawn_with_limits,
 };
 use octet_testkit::scenario;
 use std::{fmt::Write as _, time::Duration};
@@ -779,9 +779,9 @@ async fn large_tool_item_is_bounded_and_the_turn_completes() {
     let mut tool = String::new();
     loop {
         match next(&mut events).await {
-            Event::Tool(text) => {
-                tool_bytes += text.len();
-                tool = text;
+            Event::Tool(call) => {
+                tool_bytes += call.detail.len();
+                tool = call.detail;
             }
             Event::Finished { outcome } => {
                 assert_eq!(outcome, Outcome::Completed);
@@ -844,27 +844,48 @@ async fn claude_result_errors_are_shown() {
     assert_eq!(error, "Fixture failure detail");
     stop(&handle, task).await;
 }
-#[tokio::test]
-async fn claude_tool_is_announced_once_with_its_input() {
-    let c = claude();
-    let (handle, mut events, task) = spawn(c);
+async fn claude_tool_calls(prompt: &str) -> Vec<ToolCall> {
+    let (handle, mut events, task) = spawn(claude());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
-    handle.send(Command::Prompt(scenario::TOOL.into())).unwrap();
+    handle.send(Command::Prompt(prompt.into())).unwrap();
     let mut tools = Vec::new();
     loop {
         match next(&mut events).await {
-            Event::Tool(text) => tools.push(text),
+            Event::Tool(call) => tools.push(call),
             Event::Finished { .. } => break,
             Event::Error(error) => panic!("{error}"),
             _ => {}
         }
     }
-    assert_eq!(tools.len(), 1, "{tools:?}");
-    assert!(
-        tools[0].starts_with("Bash") && tools[0].contains("echo fixture"),
-        "{tools:?}"
-    );
     stop(&handle, task).await;
+    tools
+}
+#[tokio::test]
+async fn claude_tool_starts_with_its_target_and_ends_with_its_result() {
+    let tools = claude_tool_calls(scenario::TOOL).await;
+    assert_eq!(tools.len(), 2, "{tools:?}");
+    assert_eq!(
+        (
+            tools[0].phase,
+            tools[0].name.as_str(),
+            tools[0].target.as_str()
+        ),
+        (ToolPhase::Running, "Bash", "echo fixture")
+    );
+    assert_eq!(
+        (tools[1].phase, tools[1].id.as_str(), tools[1].name.as_str()),
+        (ToolPhase::Done, "toolu_1", "Bash")
+    );
+    assert_eq!(tools[1].target, "echo fixture");
+    assert_eq!(tools[1].detail, "fixture\n");
+}
+#[tokio::test]
+async fn claude_tool_error_is_a_failed_call() {
+    let tools = claude_tool_calls(scenario::TOOL_FAIL).await;
+    assert_eq!(
+        tools.last().map(|t| (t.phase, t.detail.as_str())),
+        Some((ToolPhase::Failed, "exit 1"))
+    );
 }
 #[tokio::test]
 async fn active_turn_outlives_the_idle_limit() {
@@ -1611,7 +1632,7 @@ async fn claude_subagent_text_is_not_the_reply() {
     );
     assert!(
         seen.iter()
-            .any(|e| matches!(e, Event::Tool(t) if t.starts_with("Read"))),
+            .any(|e| matches!(e, Event::Tool(t) if t.name == "Read")),
         "the subagent's tool activity still shows: {seen:?}"
     );
     stop(&handle, task).await;

@@ -8,6 +8,7 @@ use tokio::{
     time::timeout,
 };
 
+mod activity;
 mod claude;
 mod claude_settings;
 mod codex;
@@ -16,6 +17,7 @@ mod driver;
 mod image;
 mod mode;
 mod protocol;
+pub use activity::{APPROVAL_SCOPE, ApprovalSummary, ToolCall, ToolPhase};
 pub use claude::claude_stray_reply;
 pub use codex::codex_stray_reply;
 pub use image::{
@@ -581,13 +583,15 @@ pub enum Event {
     /// Streamed reply text.
     Text(String),
     /// A tool call or result, as a preview.
-    Tool(String),
+    Tool(ToolCall),
     /// The vendor asks to run something and waits for the user.
     Approval {
         /// Octet's ID for answering it.
         id: u64,
         /// The full request, as shown to the user.
         detail: String,
+        /// What it would do, for the dialog's first lines.
+        summary: ApprovalSummary,
     },
     /// An approval was answered, timed out or withdrawn.
     ApprovalClosed(u64),
@@ -811,9 +815,10 @@ fn emit(tx: &mpsc::Sender<Event>, event: Event) -> Result<(), DriverError> {
         Event::Text(text) => text,
         // Tool detail is a preview: megabytes of command output must not flood
         // the queue, so it is cut to one event.
-        Event::Tool(text) => {
+        Event::Tool(mut call) => {
+            call.detail = limited(&call.detail);
             return tx
-                .try_send(Event::Tool(limited(&text)))
+                .try_send(Event::Tool(call))
                 .map_err(|_| DriverError::ConsumerOverloaded);
         }
         event => {

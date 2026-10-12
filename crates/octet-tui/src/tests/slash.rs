@@ -679,10 +679,7 @@ async fn reconnecting_commands_share_one_guard() {
     for line in ["/model other", "/effort high", "/mode full-access"] {
         let mut busy = app();
         busy.conn.engine = Engine::CLAUDE;
-        busy.event(octet_core::Event::Approval {
-            id: 1,
-            detail: "x".into(),
-        });
+        busy.event(crate::test_support::approval(1, "x"));
         command(&mut busy, line).await;
         assert_eq!(busy.status_line, TURN_OPEN, "{line}");
         let mut connecting = app();
