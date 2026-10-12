@@ -1139,3 +1139,34 @@ fn trimming_the_anchor_entry_keeps_compensating() {
     let _ = app.visible_lines(80, 10);
     assert!(app.chat.scroll > scroll, "{} > {scroll}", app.chat.scroll);
 }
+#[test]
+fn scrolled_up_the_view_stays_still_as_running_calls_collapse() {
+    let shown = |app: &mut App| -> Vec<String> {
+        app.visible_lines(80, 10)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    // The calls start below the reader, or were already the newest entry when they scrolled up.
+    for before_scroll in [false, true] {
+        let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+        app.event(Event::Started);
+        stream_lines(&mut app, 60);
+        let reads = |app: &mut App, phase| {
+            for n in 1..=4 {
+                app.event(tool(&n.to_string(), "Read", &format!("f{n}.rs"), phase));
+            }
+        };
+        if before_scroll {
+            reads(&mut app, ToolPhase::Running);
+        }
+        app.scroll_by(20);
+        let _ = shown(&mut app);
+        if !before_scroll {
+            reads(&mut app, ToolPhase::Running);
+        }
+        let before = shown(&mut app);
+        reads(&mut app, ToolPhase::Done);
+        assert_eq!(shown(&mut app), before, "before scroll: {before_scroll}");
+    }
+}

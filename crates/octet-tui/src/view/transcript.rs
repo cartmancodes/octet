@@ -6,7 +6,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 impl App {
-    /// Scrolled up, rows added below push the scroll by as many, so the view stays still.
+    /// Scrolled up, rows added or removed below move the scroll by as many, so the view stays
+    /// still; it stays in scrollback.
     fn anchor_scroll(&mut self, width: u16) {
         if self.chat.scroll == 0 {
             self.chat.anchor = None;
@@ -40,10 +41,17 @@ impl App {
                 newer_now += rows;
             }
         }
-        let grown = newer_now.saturating_sub(anchor.newer_rows)
-            + anchor_now.map_or(0, |rows| rows.saturating_sub(anchor.entry_rows));
-        if grown > 0 {
-            self.chat.scroll = (self.chat.scroll + grown).min(MAX_SCROLL);
+        let signed = |now: usize, then: usize| {
+            isize::try_from(now).unwrap_or(isize::MAX) - isize::try_from(then).unwrap_or(isize::MAX)
+        };
+        let delta = signed(newer_now, anchor.newer_rows)
+            + anchor_now.map_or(0, |rows| signed(rows, anchor.entry_rows));
+        self.chat.scroll = self
+            .chat
+            .scroll
+            .saturating_add_signed(delta)
+            .clamp(1, MAX_SCROLL);
+        if delta > 0 {
             self.chat.unseen = true;
         }
         // Always re-base, so a shrink never masks later growth.
