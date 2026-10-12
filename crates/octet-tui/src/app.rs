@@ -217,13 +217,17 @@ impl Connection {
     }
 }
 
-/// Where the reader was on scrolling up: the newest entry, its rows then, the width, and rows added since.
+/// Where the reader was at the last frame, to tell how many rows arrived below since.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Anchor {
+    /// The newest entry when the reader scrolled up.
     pub(crate) seq: u64,
-    pub(crate) rows: usize,
+    /// The width the rows below were counted at.
     pub(crate) width: u16,
-    pub(crate) added: usize,
+    /// The anchor entry's rows at the last frame.
+    pub(crate) entry_rows: usize,
+    /// The total rows of the entries newer than the anchor at the last frame.
+    pub(crate) newer_rows: usize,
 }
 /// The conversation: entries, scroll and the copyable reply.
 pub(crate) struct Transcript {
@@ -919,8 +923,10 @@ impl App {
                     let remove = e.text.ceil_char_boundary(e.text.len() - BLOCK_BYTES);
                     e.text.drain(..remove);
                     self.chat.bytes -= remove;
-                    // Its start moved: the next paint wraps it whole.
+                    // Its start moved: the next paint wraps it whole, and a
+                    // scrolled-up reader re-anchors there without moving.
                     e.invalidate();
+                    self.chat.anchor = None;
                 }
                 self.trim();
             }

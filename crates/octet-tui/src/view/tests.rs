@@ -1063,3 +1063,79 @@ fn resizing_while_scrolled_reanchors() {
     app.chat.entries.pop_front();
     let _ = app.visible_lines(50, 10);
 }
+#[test]
+fn the_view_stays_still_across_a_reply_drain() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    // Full 100-byte lines (two rows each at 80 columns) until the reply nears its drain point.
+    let drain_at = 64 * 1024 + 16 * 1024;
+    let mut i = 0;
+    while app.chat.entries.back().map_or(0, |e| e.text.len()) < drain_at - 160 {
+        app.event(Event::Text(format!("{i:<98}\n")));
+        i += 1;
+    }
+    // A last line that leaves 60 bytes before the drain point.
+    let len = app.chat.entries.back().map_or(0, |e| e.text.len());
+    app.event(Event::Text(format!(
+        "{}\n",
+        "w".repeat(drain_at - 60 - len - 1)
+    )));
+    app.scroll_by(20);
+    let shown = |app: &mut App| -> Vec<String> {
+        app.visible_lines(80, 10)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    // A partial line, so that the event that crosses the drain adds no row.
+    app.event(Event::Text("y".into()));
+    let before = shown(&mut app);
+    let len = app.chat.entries.back().map_or(0, |e| e.text.len());
+    app.event(Event::Text("z".repeat(drain_at + 1 - len)));
+    let after_drain = shown(&mut app);
+    assert!(
+        app.chat
+            .entries
+            .back()
+            .is_some_and(|e| e.text.len() < drain_at),
+        "the drain ran"
+    );
+    for n in 0..3 {
+        app.event(Event::Text(format!("more {n}\n")));
+        let _ = shown(&mut app);
+    }
+    let end = shown(&mut app);
+    assert_eq!(before.len(), 10);
+    assert_eq!(
+        &before[..8],
+        &after_drain[..8],
+        "unchanged across the drain"
+    );
+    assert_eq!(&before[..8], &end[..8], "and after it");
+    assert!(app.chat.unseen);
+}
+#[test]
+fn trimming_the_anchor_entry_keeps_compensating() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    stream_lines(&mut app, 60);
+    app.scroll_by(3);
+    let _ = app.visible_lines(80, 10);
+    // The anchor entry itself grows, then newer entries arrive after it.
+    stream_lines(&mut app, 15);
+    let _ = app.visible_lines(80, 10);
+    app.note(
+        (0..150)
+            .map(|n| format!("note {n}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let _ = app.visible_lines(80, 10);
+    // The anchor entry is trimmed away from the front.
+    app.chat.entries.pop_front();
+    let _ = app.visible_lines(80, 10);
+    let scroll = app.chat.scroll;
+    stream_lines(&mut app, 4);
+    let _ = app.visible_lines(80, 10);
+    assert!(app.chat.scroll > scroll, "{} > {scroll}", app.chat.scroll);
+}

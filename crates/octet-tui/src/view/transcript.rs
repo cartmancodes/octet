@@ -13,42 +13,45 @@ impl App {
             self.chat.unseen = false;
             return;
         }
-        let anchor = match self.chat.anchor {
-            Some(anchor) if anchor.width == width => anchor,
-            _ => {
-                // New, or a new width: anchor here without moving.
-                self.chat.anchor = self
-                    .chat
-                    .entries
-                    .back_mut()
-                    .map(|entry| crate::app::Anchor {
-                        seq: entry.seq,
-                        rows: entry.rows(width).len(),
-                        width,
-                        added: 0,
-                    });
-                return;
-            }
+        let Some(anchor) = self.chat.anchor.filter(|anchor| anchor.width == width) else {
+            // New, or a new width: anchor at the newest entry without moving.
+            self.chat.anchor = self
+                .chat
+                .entries
+                .back_mut()
+                .map(|entry| crate::app::Anchor {
+                    seq: entry.seq,
+                    width,
+                    entry_rows: entry.rows(width).len(),
+                    newer_rows: 0,
+                });
+            return;
         };
-        let mut grown = 0usize;
+        let mut anchor_now = None;
+        let mut newer_now = 0usize;
         for entry in self.chat.entries.iter_mut().rev() {
             if entry.seq < anchor.seq {
                 break;
             }
             let rows = entry.rows(width).len();
-            grown += if entry.seq == anchor.seq {
-                rows.saturating_sub(anchor.rows)
+            if entry.seq == anchor.seq {
+                anchor_now = Some(rows);
             } else {
-                rows
-            };
-        }
-        if grown > anchor.added {
-            self.chat.scroll = (self.chat.scroll + grown - anchor.added).min(MAX_SCROLL);
-            self.chat.unseen = true;
-            if let Some(kept) = &mut self.chat.anchor {
-                kept.added = grown;
+                newer_now += rows;
             }
         }
+        let grown = newer_now.saturating_sub(anchor.newer_rows)
+            + anchor_now.map_or(0, |rows| rows.saturating_sub(anchor.entry_rows));
+        if grown > 0 {
+            self.chat.scroll = (self.chat.scroll + grown).min(MAX_SCROLL);
+            self.chat.unseen = true;
+        }
+        // Always re-base, so a shrink never masks later growth.
+        self.chat.anchor = Some(crate::app::Anchor {
+            entry_rows: anchor_now.unwrap_or(0),
+            newer_rows: newer_now,
+            ..anchor
+        });
     }
     pub(crate) fn visible_lines(&mut self, width: u16, height: usize) -> Vec<Line<'static>> {
         if let Some(entries) = self.chat.catalog_focus.take() {
