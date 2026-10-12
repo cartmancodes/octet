@@ -611,6 +611,7 @@ fn a_huge_approval_keeps_its_keys_on_a_small_screen() {
         summary: octet_core::ApprovalSummary {
             command: Some("y".repeat(5000)),
             files: (0..100).map(|n| format!("f{n}")).collect(),
+            cwd: Some("/tmp".into()),
             ..octet_core::ApprovalSummary::new("Edit 100 files")
         },
     });
@@ -621,7 +622,42 @@ fn a_huge_approval_keeps_its_keys_on_a_small_screen() {
             "{w}×{h}\n{}",
             rows.join("\n")
         );
+        for kept in [
+            "Allows: This request only, once",
+            "Edit 100 files",
+            "in /tmp",
+        ] {
+            assert!(
+                rows.iter().any(|r| r.contains(kept)),
+                "{kept} at {w}×{h}\n{}",
+                rows.join("\n")
+            );
+        }
     }
+}
+#[test]
+fn fit_lead_cuts_the_middle_and_keeps_the_first_and_the_tail() {
+    let rows: Vec<String> = (0..8).map(|n| format!("r{n}")).collect();
+    assert_eq!(fit_lead(rows.clone(), 8, 2), rows, "it fits");
+    assert_eq!(fit_lead(rows.clone(), 9, 2), rows, "room to spare");
+    assert_eq!(fit_lead(rows.clone(), 5, 2), ["r0", "r1", "…", "r6", "r7"]);
+    assert_eq!(fit_lead(rows.clone(), 4, 2), ["r0", "…", "r6", "r7"]);
+    assert_eq!(
+        fit_lead(rows.clone(), 3, 2),
+        ["r0", "r6", "r7"],
+        "no room for the mark"
+    );
+    assert_eq!(
+        fit_lead(rows.clone(), 2, 2),
+        ["r6", "r7"],
+        "the tail outranks the first row"
+    );
+    assert_eq!(
+        fit_lead(rows.clone(), 1, 2),
+        ["r7"],
+        "the last row outranks all"
+    );
+    assert!(fit_lead(rows, 0, 2).is_empty());
 }
 #[test]
 fn help_rows_match_what_is_drawn() {

@@ -611,6 +611,22 @@ pub(crate) fn summary_lines(summary: &octet_core::ApprovalSummary) -> Vec<String
     lines.push(format!("Allows: {}", summary.scope));
     lines
 }
+/// `rows` within `room`: the head, one `…` for the cut middle and the last `tail` rows; a tight room drops the
+/// mark, then the head, then the tail's own first rows, so the last row always stays.
+fn fit_lead(rows: Vec<String>, room: usize, tail: usize) -> Vec<String> {
+    if rows.len() <= room {
+        return rows;
+    }
+    let tail = tail.min(room);
+    let free = room - tail;
+    let head = if free > 1 { free - 1 } else { free };
+    let mut fitted: Vec<String> = rows[..head].to_vec();
+    if free > 1 {
+        fitted.push("…".into());
+    }
+    fitted.extend_from_slice(&rows[rows.len() - tail..]);
+    fitted
+}
 fn approval(
     frame: &mut Frame,
     area: Rect,
@@ -622,11 +638,22 @@ fn approval(
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(Style::default().bg(PANEL)), area);
     let width = usize::from(area.width.saturating_sub(2));
-    let lead = wrapped(&summary_lines(&asked.summary), width);
+    let lines = summary_lines(&asked.summary);
+    // The folder (when there is one) and the grant are the rows that must stay.
+    let kept = wrapped(
+        &lines[lines.len() - 1 - usize::from(asked.summary.cwd.is_some())..],
+        width,
+    )
+    .len();
+    let lead = fit_lead(
+        wrapped(&lines, width),
+        usize::from(area.height.saturating_sub(3)),
+        kept,
+    );
     // The keys keep their rows; the lead comes next; the full request takes what is left.
     let [heading, lead_area, request, keys] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(cells(lead.len()).min(area.height.saturating_sub(3))),
+        Constraint::Length(cells(lead.len())),
         Constraint::Min(0),
         Constraint::Length(2),
     ])
