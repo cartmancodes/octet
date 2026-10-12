@@ -61,3 +61,12 @@ pub(crate) fn approval(id: u64, detail: &str) -> octet_core::Event {
         },
     }
 }
+
+/// A waiting approval for `id` with a plain summary.
+pub(crate) fn asked(id: u64, detail: &str) -> crate::app::Asked {
+    crate::app::Asked {
+        id,
+        detail: detail.into(),
+        summary: octet_core::ApprovalSummary::new("Run a shell command"),
+    }
+}

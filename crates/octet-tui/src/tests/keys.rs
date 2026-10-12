@@ -278,7 +278,9 @@ async fn ctrl_c_in_approval_dialog_pauses_the_active_goal() {
     ));
     app.goals.goal_prompt_sent();
     app.conn.start_turn();
-    app.overlay.approvals.push_back((1, "command".into()));
+    app.overlay
+        .approvals
+        .push_back(crate::test_support::asked(1, "command"));
     let temp = octet_testkit::TempDir::new("octet-goal-cancel");
     let directory = temp.path().to_path_buf();
     let config = Config::new(Engine::DEMO, "demo", directory.clone());

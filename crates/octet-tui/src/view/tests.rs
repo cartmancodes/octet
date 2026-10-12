@@ -557,6 +557,73 @@ fn approval_scroll_is_clamped() {
     assert_eq!(app.overlay.approval_scroll, 0);
 }
 #[test]
+fn the_approval_leads_with_action_command_folder_and_scope() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(crate::test_support::approval(
+        3,
+        "{\n  \"tool_name\": \"Bash\"\n}",
+    ));
+    let rows = screen(100, 30, &mut app);
+    let at = |text: &str| {
+        rows.iter()
+            .position(|r| r.contains(text))
+            .unwrap_or_else(|| panic!("{text}\n{}", rows.join("\n")))
+    };
+    assert!(at("Permission required · #3 · 1 pending") < at("Run a shell command"));
+    assert!(at("Run a shell command") < at("$ cargo test"));
+    assert!(at("$ cargo test") < at("in /tmp"));
+    assert!(at("in /tmp") < at("Allows: This request only, once"));
+    assert!(at("Allows:") < at("Full request · PgUp/PgDn"));
+    assert!(at("Full request") < at("\"tool_name\": \"Bash\""));
+    assert!(rows.iter().any(|r| r.contains("A  Allow once")));
+}
+#[test]
+fn summary_lines_bound_commands_and_files() {
+    let summary = octet_core::ApprovalSummary {
+        command: Some("a\nb\nc\nd".into()),
+        files: (0..9).map(|n| format!("f{n}")).collect(),
+        ..octet_core::ApprovalSummary::new("Edit 9 files")
+    };
+    assert_eq!(
+        summary_lines(&summary),
+        [
+            "Edit 9 files",
+            "$ a",
+            "  b",
+            "  c",
+            "  …",
+            "f0",
+            "f1",
+            "f2",
+            "f3",
+            "f4",
+            "+4 more",
+            "Allows: This request only, once"
+        ]
+    );
+}
+#[test]
+fn a_huge_approval_keeps_its_keys_on_a_small_screen() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(octet_core::Event::Approval {
+        id: 1,
+        detail: "x\n".repeat(500),
+        summary: octet_core::ApprovalSummary {
+            command: Some("y".repeat(5000)),
+            files: (0..100).map(|n| format!("f{n}")).collect(),
+            ..octet_core::ApprovalSummary::new("Edit 100 files")
+        },
+    });
+    for (w, h) in [(40, 12), (38, 12), (80, 24)] {
+        let rows = screen(w, h, &mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("Allow once")),
+            "{w}×{h}\n{}",
+            rows.join("\n")
+        );
+    }
+}
+#[test]
 fn help_rows_match_what_is_drawn() {
     let last = help_lines()
         .into_iter()

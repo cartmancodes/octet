@@ -401,8 +401,8 @@ pub(crate) async fn key_action(app: &mut App, vendor: &dyn Vendor, key: KeyEvent
         return Action::Continue;
     }
     // Approval keys never leak into the composer. A queued modal takes priority.
-    if let Some((id, _)) = app.overlay.approvals.front() {
-        let id = *id;
+    if let Some(asked) = app.overlay.approvals.front() {
+        let id = asked.id;
         approval_key(app, vendor, key, id).await;
         return Action::Continue;
     }

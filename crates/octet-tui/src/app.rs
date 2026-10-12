@@ -268,9 +268,15 @@ pub(crate) struct Composer {
     /// Prompts sent while a turn ran, sent in order as turns finish.
     pub(crate) queue: VecDeque<crate::vendor::Prompt>,
 }
+/// An approval waiting for the user.
+pub(crate) struct Asked {
+    pub(crate) id: u64,
+    pub(crate) detail: String,
+    pub(crate) summary: octet_core::ApprovalSummary,
+}
 /// Dialogs over the screen: help, the palette and approvals.
 pub(crate) struct Overlays {
-    pub(crate) approvals: VecDeque<(u64, String)>,
+    pub(crate) approvals: VecDeque<Asked>,
     pub(crate) approval_scroll: u16,
     /// When the front approval was last drawn after being hidden (it
     /// arrived, or help, the palette or the editor covered it); `None` while
@@ -875,16 +881,31 @@ impl App {
                 self.conn.activity = State::tool(&call);
                 self.tool(call);
             }
-            Event::Approval { id, detail, .. } => {
+            Event::Approval {
+                id,
+                detail,
+                summary,
+            } => {
                 let first = self.overlay.approvals.is_empty();
-                self.overlay.approvals.push_back((id, clean(&detail)));
+                let summary = octet_core::ApprovalSummary {
+                    action: clean(&summary.action),
+                    command: summary.command.as_deref().map(clean),
+                    files: summary.files.iter().map(|f| clean(f)).collect(),
+                    cwd: summary.cwd.as_deref().map(clean),
+                    scope: clean(&summary.scope),
+                };
+                self.overlay.approvals.push_back(Asked {
+                    id,
+                    detail: clean(&detail),
+                    summary,
+                });
                 if first {
                     self.overlay.front_changed();
                 }
             }
             Event::ApprovalClosed(id) => {
-                let front = self.overlay.approvals.front().map(|(key, _)| *key);
-                self.overlay.approvals.retain(|(key, _)| *key != id);
+                let front = self.overlay.approvals.front().map(|asked| asked.id);
+                self.overlay.approvals.retain(|asked| asked.id != id);
                 if front == Some(id) {
                     self.overlay.front_changed();
                 }

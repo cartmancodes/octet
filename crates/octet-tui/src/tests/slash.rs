@@ -193,7 +193,9 @@ async fn full_access_requires_idle_ready_session() {
         Action::Continue
     ));
     crate::test_support::idle(&mut app);
-    app.overlay.approvals.push_back((1, "x".into()));
+    app.overlay
+        .approvals
+        .push_back(crate::test_support::asked(1, "x"));
     assert!(matches!(
         command(&mut app, "/mode full-access").await,
         Action::Continue
@@ -524,7 +526,9 @@ async fn every_command_needing_no_open_turn_refuses_the_same_way() {
             if open == "running" {
                 app.conn.start_turn();
             } else {
-                app.overlay.approvals.push_back((1, "x".into()));
+                app.overlay
+                    .approvals
+                    .push_back(crate::test_support::asked(1, "x"));
             }
             let vendor = RecordingVendor::default();
             let action = commands::command(&mut app, &vendor, &format!("{} 1", spec.name)).await;

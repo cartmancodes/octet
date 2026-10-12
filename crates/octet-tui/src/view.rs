@@ -255,16 +255,9 @@ fn overlays(frame: &mut Frame, area: Rect, app: &mut App, cursor: (u16, u16)) {
     } else if app.overlay.palette {
         app.overlay.approval_hidden();
         palette(frame, area, app.overlay.selection);
-    } else if let Some((id, detail)) = app.overlay.approvals.front() {
+    } else if let Some(asked) = app.overlay.approvals.front() {
         let count = app.overlay.approvals.len();
-        approval(
-            frame,
-            area,
-            *id,
-            detail,
-            &mut app.overlay.approval_scroll,
-            count,
-        );
+        approval(frame, area, asked, &mut app.overlay.approval_scroll, count);
         app.overlay.approval_drawn();
     } else {
         frame.set_cursor_position(cursor);
@@ -595,38 +588,83 @@ fn wrapped<S: AsRef<str>>(lines: &[S], width: usize) -> Vec<String> {
         .flat_map(|line| transcript::wrap(line.as_ref(), width))
         .collect()
 }
-fn approval(frame: &mut Frame, area: Rect, id: u64, detail: &str, scroll: &mut u16, count: usize) {
+/// The approval's lead: what it would do, its command (3 lines at most), its files (5 at most),
+/// where, and what allowing grants.
+pub(crate) fn summary_lines(summary: &octet_core::ApprovalSummary) -> Vec<String> {
+    let mut lines = vec![summary.action.clone()];
+    if let Some(command) = &summary.command {
+        let all: Vec<&str> = command.lines().collect();
+        for (n, line) in all.iter().take(3).enumerate() {
+            lines.push(format!("{} {line}", if n == 0 { "$" } else { " " }));
+        }
+        if all.len() > 3 {
+            lines.push("  …".into());
+        }
+    }
+    lines.extend(summary.files.iter().take(5).cloned());
+    if summary.files.len() > 5 {
+        lines.push(format!("+{} more", summary.files.len() - 5));
+    }
+    if let Some(cwd) = &summary.cwd {
+        lines.push(format!("in {cwd}"));
+    }
+    lines.push(format!("Allows: {}", summary.scope));
+    lines
+}
+fn approval(
+    frame: &mut Frame,
+    area: Rect,
+    asked: &crate::app::Asked,
+    scroll: &mut u16,
+    count: usize,
+) {
     let area = modal(area, 86, 24);
     frame.render_widget(Clear, area);
-    let parts = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(2),
-        Constraint::Length(3),
+    frame.render_widget(Block::default().style(Style::default().bg(PANEL)), area);
+    let width = usize::from(area.width.saturating_sub(2));
+    let lead = wrapped(&summary_lines(&asked.summary), width);
+    // The keys keep their rows; the lead comes next; the full request takes what is left.
+    let [heading, lead_area, request, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(cells(lead.len()).min(area.height.saturating_sub(3))),
+        Constraint::Min(0),
+        Constraint::Length(2),
     ])
-    .split(area);
-    let heading = format!(
-        "Permission required  #{id}   ·   {count} pending\nReview the requested action before allowing it."
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            " Permission required · #{} · {count} pending",
+            asked.id
+        ))
+        .style(Style::default().fg(AMBER).bg(PANEL).bold()),
+        heading,
     );
     frame.render_widget(
-        Paragraph::new(heading).style(Style::default().fg(AMBER).bg(PANEL)),
-        parts[0],
+        Paragraph::new(
+            lead.iter()
+                .map(|l| Line::from(format!(" {l}")))
+                .collect::<Vec<_>>(),
+        )
+        .style(Style::default().fg(FG).bg(PANEL)),
+        lead_area,
     );
-    // Wrapped here so the scroll can stop at the last row.
-    let inner = usize::from(parts[1].width.saturating_sub(2));
-    let rows = wrapped(&detail.lines().collect::<Vec<_>>(), inner);
-    let visible = parts[1].height.saturating_sub(2);
+    let inner = usize::from(request.width.saturating_sub(2));
+    let rows = wrapped(&asked.detail.lines().collect::<Vec<_>>(), inner);
+    let visible = request.height.saturating_sub(2);
     *scroll = (*scroll).min(cells(rows.len()).saturating_sub(visible));
-    frame.render_widget(
-        Paragraph::new(rows.join("\n"))
-            .scroll((*scroll, 0))
-            .block(card(" Request details · PgUp/PgDn "))
-            .style(Style::default().bg(PANEL).fg(FG)),
-        parts[1],
-    );
+    if request.height >= 3 {
+        frame.render_widget(
+            Paragraph::new(rows.join("\n"))
+                .scroll((*scroll, 0))
+                .block(card(" Full request · PgUp/PgDn "))
+                .style(Style::default().bg(PANEL).fg(MUTED)),
+            request,
+        );
+    }
     frame.render_widget(
         Paragraph::new("\n A  Allow once     D / Esc  Deny     Ctrl+C  Cancel turn")
             .style(Style::default().fg(AMBER).bg(PANEL)),
-        parts[2],
+        keys,
     );
 }
 
