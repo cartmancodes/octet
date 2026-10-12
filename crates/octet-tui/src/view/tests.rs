@@ -948,10 +948,7 @@ fn a_short_terminal_gets_a_one_row_header_and_no_vertical_margin() {
     assert!(rows[0].contains("/tmp"), "{}", rows[0]);
     assert!(rows[1].contains("╭ Conversation"), "{}", rows[1]);
     // The demo is offline, so its standing hints say so.
-    assert_eq!(
-        rows[23].trim_end(),
-        " Offline demo · F1 help · Ctrl+C ×2 quit"
-    );
+    assert_eq!(rows[23].trim(), "Offline demo · F1 help · Ctrl+C ×2 quit");
     let transcript_rows = rows.iter().filter(|r| r.starts_with(" │")).count();
     assert!(
         transcript_rows >= 16,
@@ -981,4 +978,32 @@ fn a_narrow_short_header_puts_the_workspace_before_the_model() {
         "{}",
         rows[0]
     );
+}
+#[test]
+fn a_compact_notice_stays_inside_the_side_margin() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.hint("hello");
+    let rows = screen(100, 24, &mut app);
+    assert!(rows[23].starts_with(' '), "{:?}", rows[23]);
+    assert!(rows[23].contains("hello"), "{:?}", rows[23]);
+}
+#[test]
+fn the_compact_status_shows_in_full_and_usage_only_when_it_fits() {
+    for (width, usage_shows) in [(38, false), (60, false), (120, true)] {
+        let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+        app.conn.usage = "$0.1234 session cost".into();
+        app.event(approval(1, "{}"));
+        let rows = screen(width, 20, &mut app);
+        assert!(
+            rows[0].contains("● approval needed"),
+            "{width}: {}",
+            rows[0]
+        );
+        assert_eq!(
+            rows[0].contains("$0.1234 session cost"),
+            usage_shows,
+            "{width}: {}",
+            rows[0]
+        );
+    }
 }

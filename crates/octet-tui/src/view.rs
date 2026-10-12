@@ -95,17 +95,7 @@ fn paint(frame: &mut Frame, app: &mut App) {
     }
     conversation(frame, regions[1], area.width, app);
     let cursor = composer(frame, regions[2], area.width, app, draft);
-    // Compact hints start under the box's left edge, in the margin's column.
-    let status_area = if compact {
-        Rect {
-            x: 0,
-            width: area.width,
-            ..regions[3]
-        }
-    } else {
-        regions[3]
-    };
-    status_line(frame, status_area, app, compact);
+    status_line(frame, regions[3], app, compact);
     overlays(frame, area, app, cursor);
 }
 /// Below this many rows the header is one row and the layout has no vertical margin.
@@ -146,12 +136,15 @@ fn status_color(app: &App) -> Color {
 /// The compact header: mark, name, mode, model and workspace on the left; status and usage right.
 fn header_line(frame: &mut Frame, area: Rect, app: &App) {
     let status = status_text(app);
-    let right = if app.conn.usage.is_empty() {
-        status
+    // The status always shows in full; the usage joins it only where there is room.
+    let room = (area.width / 2).max(cells(status.width()));
+    let with_usage = format!("{status} · {}", app.conn.usage);
+    let right = if !app.conn.usage.is_empty() && cells(with_usage.width()) <= room {
+        with_usage
     } else {
-        format!("{status} · {}", app.conn.usage)
+        status
     };
-    let right_width = cells(right.width()).min(area.width / 2);
+    let right_width = cells(right.width());
     let [left, right_area] =
         Layout::horizontal([Constraint::Min(6), Constraint::Length(right_width)])
             .spacing(1)
