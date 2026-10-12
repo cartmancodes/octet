@@ -54,6 +54,12 @@ export interface ModelInfo {
   id: string;
 }
 
+/** A journal record's kind and data; the frame carries its `seq`. */
+export interface JournalEvent {
+  type: string;
+  data: unknown;
+}
+
 /** The model a session is using now. */
 export interface ModelRef {
   engine: string;
@@ -107,7 +113,7 @@ export interface EventFrame {
   session: string;
   journal: string;
   seq: number;
-  event: unknown;
+  event: JournalEvent;
 }
 
 /** A session's terminal UI state. */

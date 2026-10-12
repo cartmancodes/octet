@@ -171,6 +171,11 @@ pub static OBJECTS: &[Shape] = &[
         doc: "One model a session can switch to.",
     },
     Shape {
+        name: "JournalEvent",
+        fields: &[req("type", Str), req("data", Json)],
+        doc: "A journal record's kind and data; the frame carries its `seq`.",
+    },
+    Shape {
         name: "ModelRef",
         fields: &[req("engine", Str), req("selection", Str)],
         doc: "The model a session is using now.",
@@ -226,7 +231,7 @@ pub static MESSAGES: &[Message] = &[
             req("session", Str),
             req("journal", Str),
             req("seq", U64),
-            req("event", Json),
+            req("event", Object("JournalEvent")),
         ],
         "One journal record of a session, live or replayed.",
     ),
@@ -637,7 +642,7 @@ fn check_fields(
         .keys()
         .find(|k| !common.contains(&k.as_str()) && !fields.iter().any(|f| f.name == k.as_str()))
     {
-        Some(key) => Err(format!("Unexpected field {}", at(key))),
+        Some(key) => Err(format!("Unexpected field {}", at(&clip(key)))),
         None => Ok(()),
     }
 }
@@ -672,9 +677,39 @@ fn parse_message(
     let message = MESSAGES
         .iter()
         .find(|m| m.direction == direction && m.kind == kind)
-        .ok_or_else(|| format!("Unknown message {kind}"))?;
+        .ok_or_else(|| format!("Unknown message {}", clip(kind)))?;
     check_fields(&map, message.fields, COMMON, "")?;
     Ok((req, message, map))
+}
+
+/// At most 64 characters of an attacker-supplied name, for an error message.
+fn clip(name: &str) -> String {
+    const LIMIT: usize = 64;
+    if name.chars().count() <= LIMIT {
+        return name.to_owned();
+    }
+    name.chars()
+        .take(LIMIT)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+/// The `req` of a message, so a refusal can name the request even when the rest is malformed;
+/// 0 when the text is too large, not a JSON object, or has no whole-number `req`.
+pub fn req_of(text: &str) -> u64 {
+    if text.len() > MAX_MESSAGE {
+        return 0;
+    }
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| value.get("req")?.as_u64())
+        .unwrap_or_default()
+}
+
+/// Whether a mode change (or start) may go ahead: any mode but `full-access`, or `full-access`
+/// with exactly [`FULL_ACCESS_CONFIRM`] typed.
+pub fn full_access_confirmed(mode: &str, confirm: Option<&str>) -> bool {
+    mode != "full-access" || confirm == Some(FULL_ACCESS_CONFIRM)
 }
 
 fn text(map: &Map<String, Value>, key: &str) -> String {
@@ -760,7 +795,7 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
         "end" => PhoneCommand::End {
             session: text(m, "session"),
         },
-        other => return Err(format!("Unknown message {other}")),
+        other => return Err(format!("Unknown message {}", clip(other))),
     };
     Ok((req, command))
 }
@@ -820,7 +855,7 @@ pub fn parse_bridge_command(line: &str) -> Result<(u64, String, BridgeCommand), 
             selection: text(m, "selection"),
         },
         "end" => BridgeCommand::End,
-        other => return Err(format!("Unknown message {other}")),
+        other => return Err(format!("Unknown message {}", clip(other))),
     };
     Ok((req, text(m, "by"), command))
 }
@@ -845,11 +880,15 @@ pub fn paired(token: &str, device: &str) -> Value {
 pub fn sessions_frame(sessions: &[Value]) -> Value {
     frame("sessions", json!({ "sessions": sessions }))
 }
-/// The `event` frame for one journal record (`event` is the record, as the journal wrote it).
-pub fn event_frame(session: &str, journal: &str, seq: u64, event: &Value) -> Value {
+/// The `event` frame for the journal record `seq` of `journal`: `kind` and `data` are the
+/// record's `type` and `data` (its `format` and `seq` stay out; `seq` rides on the frame).
+pub fn event_frame(session: &str, journal: &str, seq: u64, kind: &str, data: &Value) -> Value {
     frame(
         "event",
-        json!({ "session": session, "journal": journal, "seq": seq, "event": event }),
+        json!({
+            "session": session, "journal": journal, "seq": seq,
+            "event": { "type": kind, "data": data },
+        }),
     )
 }
 /// The `state` frame: a session's `StateInfo`.
@@ -1171,14 +1210,13 @@ mod tests {
             "current": {"engine": "claude", "selection": "opus"},
         });
         let recent = json!({"engine": "codex", "workspace": "/w", "session": "s", "title": "t", "started": 5});
-        let record =
-            json!({"format": "octet-preview-1", "seq": 3, "type": "text", "data": {"text": "hi"}});
+        let data = json!({"text": "hi"});
         for (frame, direction) in [
             (welcome("Gemini 10"), Direction::ToPhone),
             (paired("tok", "Gemini 10"), Direction::ToPhone),
             (sessions_frame(&[session]), Direction::ToPhone),
             (
-                event_frame("1-2", "session-1.jsonl", 3, &record),
+                event_frame("1-2", "session-1.jsonl", 3, "text", &data),
                 Direction::ToPhone,
             ),
             (state_frame("1-2", &state), Direction::ToPhone),
@@ -1210,6 +1248,71 @@ mod tests {
         assert!(
             check_fields(bad.as_object().unwrap(), message.fields, &["v", "type"], "").is_err()
         );
+    }
+
+    #[test]
+    fn a_refusal_can_name_the_request() {
+        assert_eq!(
+            req_of(r#"{"v":1,"req":5,"type":"prompt","session":"s"}"#),
+            5
+        );
+        assert_eq!(req_of(r#"{"v":9,"req":6,"type":"launch"}"#), 6);
+        for unusable in [
+            "not json",
+            "[1]",
+            r#"{"req":"x"}"#,
+            r#"{"v":1}"#,
+            r#"{"req":-1}"#,
+            "",
+        ] {
+            assert_eq!(req_of(unusable), 0, "{unusable}");
+        }
+        let big = format!(r#"{{"req":5,"text":"{}"}}"#, "x".repeat(MAX_MESSAGE));
+        assert_eq!(req_of(&big), 0);
+    }
+
+    #[test]
+    fn full_access_needs_the_exact_confirmation() {
+        assert!(full_access_confirmed("ask", None));
+        assert!(full_access_confirmed("auto", Some("anything")));
+        assert!(!full_access_confirmed("full-access", None));
+        assert!(!full_access_confirmed("full-access", Some("Full Access")));
+        assert!(!full_access_confirmed("full-access", Some("full access ")));
+        assert!(full_access_confirmed(
+            "full-access",
+            Some(FULL_ACCESS_CONFIRM)
+        ));
+    }
+
+    #[test]
+    fn every_named_shape_exists() {
+        let named = |fields: &'static [Field]| {
+            fields.iter().filter_map(|f| match f.ty {
+                Ty::Object(n) | Ty::ObjectList(n) => Some(n),
+                _ => None,
+            })
+        };
+        let all = MESSAGES
+            .iter()
+            .map(|m| m.fields)
+            .chain(OBJECTS.iter().map(|o| o.fields));
+        for name in all.flat_map(named) {
+            assert!(OBJECTS.iter().any(|o| o.name == name), "no shape {name}");
+        }
+    }
+
+    #[test]
+    fn echoed_names_are_clipped() {
+        let long = "z".repeat(500);
+        let kind = parse_phone(&format!(r#"{{"v":1,"req":1,"type":"{long}"}}"#)).unwrap_err();
+        let field = parse_phone(&format!(
+            r#"{{"v":1,"req":1,"type":"hello","token":"t","{long}":1}}"#
+        ))
+        .unwrap_err();
+        for error in [kind, field] {
+            assert!(error.len() < 120, "{error}");
+            assert!(error.contains(&"z".repeat(60)), "{error}");
+        }
     }
 
     #[test]
