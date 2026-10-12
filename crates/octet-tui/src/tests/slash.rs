@@ -827,7 +827,7 @@ async fn an_alias_runs_its_skill_and_octet_commands_win() {
     assert_eq!(vendor.sent.borrow().len(), before);
 }
 #[tokio::test]
-async fn another_providers_skill_typed_gives_the_hint() {
+async fn another_providers_skill_typed_switches() {
     let mut app = app(); // Codex
     let ws = app.workspace().to_path_buf();
     app.models.skill_catalogs.set(
@@ -836,15 +836,33 @@ async fn another_providers_skill_typed_gives_the_hint() {
         vec![skill("brainstorming", &[], None)],
         std::time::SystemTime::now(),
     );
+    let action = commands::try_command(
+        &mut app,
+        &RecordingVendor::default(),
+        "/brainstorming the cache",
+    )
+    .await;
+    assert!(matches!(action, Some(Action::Exit(Exit::Model(s))) if s.provider == Engine::CLAUDE));
+    let run = app.pending_skill.as_ref().expect("waits for the switch");
+    assert_eq!(run.args, "the cache");
+}
+#[tokio::test]
+async fn another_providers_skill_typed_during_a_turn_is_refused() {
+    let mut app = app(); // Codex
+    crate::test_support::idle(&mut app);
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        Engine::CLAUDE,
+        &ws,
+        vec![skill("brainstorming", &[], None)],
+        std::time::SystemTime::now(),
+    );
+    app.event(octet_core::Event::Started);
     let action =
         commands::try_command(&mut app, &RecordingVendor::default(), "/brainstorming").await;
     assert!(action.is_none(), "the draft stays");
-    assert!(
-        app.entries_text()
-            .contains("/brainstorming is a claude skill; /skills runs it there"),
-        "{}",
-        app.entries_text()
-    );
+    assert!(app.pending_skill.is_none());
+    assert_eq!(app.status_line, crate::registry::TURN_OPEN);
 }
 #[tokio::test]
 async fn an_unknown_name_still_gets_the_helpful_error() {

@@ -825,7 +825,7 @@ fn skills_app() -> App {
     app
 }
 #[tokio::test]
-async fn the_skills_picker_lists_both_providers_and_enter_runs() {
+async fn enter_in_the_skills_picker_prepares_the_skill() {
     let mut app = skills_app();
     let vendor = RecordingVendor::default();
     type_keys(&mut app, &vendor, "/skills").await;
@@ -843,11 +843,18 @@ async fn the_skills_picker_lists_both_providers_and_enter_runs() {
         picker.items
     );
     key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert_eq!(app.composer.editor.text(), "/imagegen ");
+    assert!(app.composer.completion.is_none());
+    assert!(
+        vendor.sent.borrow().is_empty(),
+        "nothing runs until the draft is sent"
+    );
+    type_keys(&mut app, &vendor, "a cat").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
     assert!(matches!(
         &vendor.sent.borrow()[0],
-        Command::Skill { name, path: Some(_), .. } if name == "imagegen"
+        Command::Skill { name, args, .. } if name == "imagegen" && args == "a cat"
     ));
-    assert!(app.composer.editor.text().is_empty());
 }
 #[tokio::test]
 async fn the_skills_picker_filters_and_tab_inserts() {
@@ -862,15 +869,74 @@ async fn the_skills_picker_filters_and_tab_inserts() {
     assert!(vendor.sent.borrow().is_empty());
 }
 #[tokio::test]
-async fn picking_another_providers_skill_switches_then_runs() {
+async fn another_providers_skill_is_prepared_then_switches_with_its_arguments() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Down)).await;
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    assert_eq!(
+        app.composer.editor.text(),
+        "/brainstorming ",
+        "Tab prepares another provider's too"
+    );
+    type_keys(&mut app, &vendor, "the cache").await;
+    assert_eq!(
+        crate::commands::foreign_skill(&app, app.composer.editor.text()),
+        Some(Engine::CLAUDE)
+    );
+    let action = key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(matches!(&action, Action::Exit(Exit::Model(s)) if s.provider == Engine::CLAUDE));
+    let run = app.pending_skill.as_ref().expect("waits for the switch");
+    assert_eq!(
+        (run.skill.name.as_str(), run.args.as_str()),
+        ("brainstorming", "the cache")
+    );
+    assert!(app.composer.editor.text().is_empty());
+}
+#[tokio::test]
+async fn enter_on_another_providers_line_prepares_it_too() {
     let mut app = skills_app();
     let vendor = RecordingVendor::default();
     type_keys(&mut app, &vendor, "/skills").await;
     key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
     key_action(&mut app, &vendor, key(KeyCode::Down)).await;
     let action = key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
-    assert!(matches!(&action, Action::Exit(Exit::Model(s)) if s.provider == Engine::CLAUDE));
-    assert!(app.pending_skill.is_some());
+    assert!(matches!(action, Action::Continue));
+    assert_eq!(app.composer.editor.text(), "/brainstorming ");
+    assert!(app.pending_skill.is_none());
+}
+#[tokio::test]
+async fn an_octet_command_never_switches_provider() {
+    let mut app = skills_app();
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        Engine::CLAUDE,
+        &ws,
+        vec![skill("model", &[], None)],
+        std::time::SystemTime::now(),
+    );
+    assert_eq!(crate::commands::foreign_skill(&app, "/model list"), None);
+    assert_eq!(
+        crate::commands::foreign_skill(&app, "/imagegen x"),
+        None,
+        "the current provider's"
+    );
+    assert_eq!(
+        crate::commands::foreign_skill(&app, "hello /brainstorming"),
+        None,
+        "not a slash draft"
+    );
+}
+#[tokio::test]
+async fn a_pending_skill_runs_once_the_switch_is_ready() {
+    let mut app = skills_app();
+    app.pending_skill = Some(crate::app::SkillRun {
+        engine: Engine::CLAUDE,
+        skill: skill("brainstorming", &[], None),
+        args: "the cache".into(),
+    });
     // The kept interface connects to Claude; on ready, the skill runs there.
     app.connection(
         &octet_core::Config::new(Engine::CLAUDE, "claude", "/tmp"),
@@ -887,7 +953,7 @@ async fn picking_another_providers_skill_switches_then_runs() {
     .await;
     assert!(matches!(
         &claude.sent.borrow()[0],
-        Command::Skill { name, .. } if name == "brainstorming"
+        Command::Skill { name, args, .. } if name == "brainstorming" && args == "the cache"
     ));
     assert!(app.pending_skill.is_none());
 }
@@ -932,17 +998,6 @@ async fn a_failed_switch_drops_the_pending_skill() {
     )
     .await;
     assert!(claude.sent.borrow().is_empty());
-}
-#[tokio::test]
-async fn a_picked_skill_that_cannot_go_keeps_the_picker_draft() {
-    let mut app = skills_app();
-    let vendor = RecordingVendor::default();
-    type_keys(&mut app, &vendor, "/skills image").await;
-    // The session drops while the picker is open.
-    app.conn.phase = crate::app::ConnPhase::Connecting;
-    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
-    assert!(vendor.sent.borrow().is_empty());
-    assert_eq!(app.composer.editor.text(), "/skills image");
 }
 #[tokio::test]
 async fn ctrl_o_flips_tool_details_for_every_tools_entry() {

@@ -177,35 +177,13 @@ fn picked_skill(app: &App, item: &str) -> Option<(octet_core::Engine, octet_core
         .into_iter()
         .find(|(engine, skill)| *engine == provider && skill.name == name)
 }
-/// Enter on a skills picker line: runs it here, or, for another provider's,
-/// switches there and runs it once that session is ready.
-fn pick_skill(app: &mut App, vendor: &dyn Vendor, item: Option<String>) -> Action {
-    let Some((engine, skill)) = item.and_then(|item| picked_skill(app, &item)) else {
-        return Action::Continue;
-    };
-    if engine == app.conn.engine {
-        // The picker and its draft stay when the skill cannot go.
-        if run_skill(app, vendor, &skill, "") {
-            app.composer.completion = None;
-            app.composer.editor.take();
-        }
-        return Action::Continue;
-    }
-    if let Err(refusal) = crate::commands::can_reconnect(app) {
-        app.hint(refusal);
-        return Action::Continue;
+/// Enter or Tab on a skills picker line: the draft becomes `/name `, for its arguments.
+/// Nothing runs until the draft is sent.
+fn choose_skill(app: &mut App, item: Option<String>) {
+    if let Some((_, skill)) = item.and_then(|item| picked_skill(app, &item)) {
+        app.composer.editor.set(format!("/{} ", skill.name));
     }
     app.composer.completion = None;
-    app.composer.editor.take();
-    app.pending_skill = Some(crate::app::SkillRun {
-        engine,
-        skill,
-        args: String::new(),
-    });
-    Action::Exit(Exit::Model(octet_core::model::Selection {
-        provider: engine,
-        model: None,
-    }))
 }
 /// Runs `skill` with `args` as a turn, or queues it behind the running one,
 /// as a typed prompt goes. False, with a notice, when it could not go.
@@ -299,17 +277,8 @@ pub(crate) fn accept_completion(app: &mut App) {
         composer::Kind::Command => format!("{item} "),
         composer::Kind::Model => model_text(app, item),
         composer::Kind::Skill => {
-            // Tab on a skill puts its name in the draft, to add arguments.
-            match picked_skill(app, item) {
-                Some((engine, skill)) if engine == app.conn.engine => {
-                    app.composer.editor.set(format!("/{} ", skill.name));
-                }
-                Some((engine, skill)) => app.hint(format!(
-                    "/{} is a {engine} skill; Enter on it switches there",
-                    skill.name
-                )),
-                None => {}
-            }
+            let item = Some(item.clone());
+            choose_skill(app, item);
             return;
         }
     };
@@ -409,7 +378,7 @@ pub(crate) async fn key_action(app: &mut App, vendor: &dyn Vendor, key: KeyEvent
     if app.overlay.palette {
         return palette_press(app, vendor, key).await;
     }
-    if let Some(action) = completion_key(app, vendor, key) {
+    if let Some(action) = completion_key(app, key) {
         return action;
     }
     composer_key(app, vendor, key, quit_armed).await
@@ -483,7 +452,7 @@ async fn palette_press(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Act
     Action::Continue
 }
 /// Keys an open popup takes; `None` lets the key reach the draft.
-fn completion_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Option<Action> {
+fn completion_key(app: &mut App, key: KeyEvent) -> Option<Action> {
     if key.code == KeyCode::Enter && typed_a_model(app) {
         // An exact name, or `default`, means what typing it always meant:
         // the draft goes as typed, resolved like any `/model NAME`.
@@ -493,7 +462,8 @@ fn completion_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Option<A
     let completion = app.composer.completion.as_mut()?;
     if key.code == KeyCode::Enter && completion.kind == composer::Kind::Skill {
         let item = completion.items.get(completion.selected).cloned();
-        return Some(pick_skill(app, vendor, item));
+        choose_skill(app, item);
+        return Some(Action::Continue);
     }
     if key.code == KeyCode::Enter && completion.kind == composer::Kind::Model {
         // Enter on a model switches to it: the draft becomes its explicit

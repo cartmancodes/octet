@@ -313,7 +313,7 @@ fn completion_popup(frame: &mut Frame, composer: Rect, app: &App) {
         crate::composer::Kind::Path => " Paths ",
         crate::composer::Kind::Command => " Commands ",
         crate::composer::Kind::Model => " Models ",
-        crate::composer::Kind::Skill => " Skills · Enter runs · Tab inserts ",
+        crate::composer::Kind::Skill => " Skills · Enter choose ",
     };
     // On a short screen the popup is clipped; scroll so the selected row
     // stays in sight.
