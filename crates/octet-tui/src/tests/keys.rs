@@ -1078,3 +1078,13 @@ async fn opening_the_palette_starts_unfiltered() {
     .await;
     assert!(app.overlay.palette_query.is_empty());
 }
+#[tokio::test]
+async fn f2_hides_and_shows_the_task_sidebar() {
+    let mut app = app();
+    let vendor = RecordingVendor::default();
+    assert!(app.sidebar);
+    key_action(&mut app, &vendor, key(KeyCode::F(2))).await;
+    assert!(!app.sidebar);
+    key_action(&mut app, &vendor, key(KeyCode::F(2))).await;
+    assert!(app.sidebar);
+}

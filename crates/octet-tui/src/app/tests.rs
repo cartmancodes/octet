@@ -283,3 +283,39 @@ fn tool_bytes_are_counted_and_trimmed() {
     app.event(tool("1", "Read", "a.rs", Done));
     assert_eq!(app.chat.bytes, app.chat.entries.back().unwrap().size());
 }
+#[test]
+fn now_says_what_is_happening() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    assert_eq!(app.now_line(), "Connecting");
+    crate::test_support::idle(&mut app);
+    assert_eq!(app.now_line(), "Idle");
+    app.event(Event::Started);
+    assert_eq!(app.now_line(), "Thinking");
+    app.event(Event::Text("x".into()));
+    assert_eq!(app.now_line(), "Writing reply");
+    app.event(crate::test_support::tool(
+        "1",
+        "commandExecution",
+        "cargo test",
+        octet_core::ToolPhase::Running,
+    ));
+    assert_eq!(app.now_line(), "Running Bash cargo test");
+    app.event(crate::test_support::approval(1, "{}"));
+    assert_eq!(app.now_line(), "Waiting for approval");
+}
+#[test]
+fn now_ignores_stopped_calls() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    crate::test_support::idle(&mut app);
+    app.event(Event::Started);
+    app.event(crate::test_support::tool(
+        "1",
+        "Bash",
+        "sleep 9",
+        octet_core::ToolPhase::Running,
+    ));
+    app.event(Event::Finished {
+        outcome: octet_core::Outcome::Interrupted,
+    });
+    assert_eq!(app.now_line(), "Idle");
+}

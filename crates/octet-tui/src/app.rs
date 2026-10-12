@@ -344,6 +344,8 @@ pub(crate) struct App {
     /// Another provider's skill, picked in `/skills`: it runs once the
     /// switch to that provider is ready.
     pub(crate) pending_skill: Option<SkillRun>,
+    /// Whether the Task sidebar shows on wide terminals; F2 flips it.
+    pub(crate) sidebar: bool,
 }
 /// A skill to run on a provider the interface is switching to.
 #[derive(Debug, Clone)]
@@ -403,6 +405,7 @@ impl App {
             models: crate::models::Models::default(),
             pending_handoff: None,
             pending_skill: None,
+            sidebar: true,
         }
     }
     pub(crate) fn connection(&mut self, config: &octet_core::Config, journal: PathBuf) {
@@ -711,10 +714,6 @@ impl App {
         self.trim();
     }
     /// The newest call still running, in a turn that has not ended.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the status line draws it in a later task")
-    )]
     pub(crate) fn running_tool(&self) -> Option<&octet_core::ToolCall> {
         self.chat
             .entries
@@ -723,6 +722,35 @@ impl App {
             .filter(|e| e.role == Role::Tool && !e.turn_over)
             .flat_map(|e| e.tools.iter().rev())
             .find(|c| c.phase == octet_core::ToolPhase::Running)
+    }
+    /// What is happening now, for the sidebar.
+    pub(crate) fn now_line(&self) -> String {
+        if !self.overlay.approvals.is_empty() {
+            return "Waiting for approval".into();
+        }
+        match self.conn.phase {
+            ConnPhase::Connecting => "Connecting".into(),
+            ConnPhase::Stopped => "Stopped".into(),
+            ConnPhase::Idle => "Idle".into(),
+            ConnPhase::Running { .. } => match self.running_tool() {
+                Some(call) => format!(
+                    "Running {} {}",
+                    crate::view::transcript::label(&call.name),
+                    call.target
+                )
+                .trim_end()
+                .to_owned(),
+                None if self
+                    .chat
+                    .entries
+                    .back()
+                    .is_some_and(|e| e.role == Role::Assistant) =>
+                {
+                    "Writing reply".into()
+                }
+                None => "Thinking".into(),
+            },
+        }
     }
     fn trim(&mut self) {
         while self.chat.bytes > MAX_BYTES || self.chat.entries.len() > MAX_ENTRIES {

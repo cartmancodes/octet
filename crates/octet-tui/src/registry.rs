@@ -1,4 +1,4 @@
-//! Every slash command, once. The palette, help, Tab, the sidebar and the
+//! Every slash command, once. The palette, help, Tab and the
 //! CLI help are built from this table, and each row says what the session
 //! must be doing for the command to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,8 +33,6 @@ pub(crate) struct Spec {
     pub usage: &'static str,
     /// The palette's description.
     pub summary: &'static str,
-    /// The sidebar's short label, for the commands it lists.
-    pub quick: Option<&'static str>,
     /// What the session must be doing for the command to run.
     pub requires: Requires,
 }
@@ -62,18 +60,11 @@ const fn spec(id: Cmd, name: &'static str, usage: &'static str, summary: &'stati
         aliases: &[],
         usage,
         summary,
-        quick: None,
         requires: Requires::Nothing,
     }
 }
 
 impl Spec {
-    const fn quick(self, label: &'static str) -> Spec {
-        Spec {
-            quick: Some(label),
-            ..self
-        }
-    }
     const fn requires(self, requires: Requires) -> Spec {
         Spec { requires, ..self }
     }
@@ -100,8 +91,7 @@ pub(crate) const COMMANDS: &[Spec] = &[
         "/model",
         "/model [provider] <name> · /model default · /model refresh",
         "Switch model or provider",
-    )
-    .quick("Switch model"),
+    ),
     spec(
         Cmd::Skills,
         "/skills",
@@ -113,8 +103,7 @@ pub(crate) const COMMANDS: &[Spec] = &[
         "/mode",
         "/mode [ask|accept-edits|auto|full-access] · Shift+Tab cycles",
         "Permission mode: ask, accept-edits, auto, full-access",
-    )
-    .quick("Permissions"),
+    ),
     spec(
         Cmd::Goal,
         "/goal",
@@ -126,15 +115,13 @@ pub(crate) const COMMANDS: &[Spec] = &[
         "/session",
         "/session: session ID and journal path",
         "Session ID and journal path",
-    )
-    .quick("Session info"),
+    ),
     spec(
         Cmd::Export,
         "/export",
         "/export [path]: copy the journal to a new file",
         "Export journal to a new file",
     )
-    .quick("Save journal")
     .requires(Requires::NoTurn),
     spec(
         Cmd::Copy,
@@ -148,7 +135,6 @@ pub(crate) const COMMANDS: &[Spec] = &[
         "/new: start a fresh conversation",
         "Start a fresh conversation",
     )
-    .quick("Fresh context")
     .requires(Requires::NoTurn),
     spec(
         Cmd::Reconnect,
@@ -156,7 +142,6 @@ pub(crate) const COMMANDS: &[Spec] = &[
         "/reconnect: resume the vendor session",
         "Reconnect to the vendor session",
     )
-    .quick("Resume vendor")
     .requires(Requires::NoTurn),
     spec(
         Cmd::RemoteControl,

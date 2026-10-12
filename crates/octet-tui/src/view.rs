@@ -130,7 +130,7 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
 }
 /// The transcript, and the sidebar on wide terminals.
 fn conversation(frame: &mut Frame, area: Rect, width: u16, app: &mut App) {
-    let columns = Layout::horizontal(if width >= 112 {
+    let columns = Layout::horizontal(if width >= 112 && app.sidebar {
         vec![Constraint::Min(40), Constraint::Length(29)]
     } else {
         vec![Constraint::Min(20)]
@@ -443,53 +443,56 @@ fn banner(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(mark), mark_area);
     frame.render_widget(Paragraph::new(lines), text);
 }
+/// The Task card: the goal, what is happening now, and what is queued.
 fn sidebar(frame: &mut Frame, area: Rect, app: &App) {
-    let block = card(" Workspace ");
+    let block = card(" Task ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let id = if app.conn.session.is_empty() {
-        "Waiting for session…"
-    } else {
-        app.conn.session.as_str()
+    let width = usize::from(inner.width.saturating_sub(1)).max(1);
+    let head = |text: &'static str| {
+        Line::from(Span::styled(format!(" {text}"), Style::default().fg(MUTED)))
     };
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled(" ENGINE", Style::default().fg(MUTED))),
-        Line::from(format!(" {}", app.conn.engine)),
-        Line::default(),
-        Line::from(Span::styled(" MODEL", Style::default().fg(MUTED))),
-        Line::from(format!(" {}", app.conn.model)),
-        Line::from(" /session for full details"),
-        Line::default(),
-        Line::from(Span::styled(" SESSION", Style::default().fg(MUTED))),
-        Line::from(format!(" {id}")),
-        Line::default(),
-        Line::from(Span::styled(" GOAL", Style::default().fg(MUTED))),
-        Line::from(match app.goals.goal() {
-            Some(goal) => format!(
-                " {} · {}/{} turns",
-                goal.status(),
-                goal.turns(),
-                octet_core::goal::MAX_GOAL_TURNS
-            ),
-            None => " No active goal".into(),
-        }),
-        Line::default(),
-        Line::from(Span::styled(" QUICK COMMANDS", Style::default().fg(MUTED))),
-    ];
+    let body = |text: String| Line::from(format!(" {text}"));
+    let mut lines = vec![Line::default(), head("GOAL")];
+    match app.goals.goal() {
+        Some(goal) => {
+            let mut rows = transcript::wrap(&crate::text::clean(goal.objective()), width);
+            if rows.len() > 4 {
+                rows.truncate(4);
+                rows[3].push('…');
+            }
+            lines.extend(rows.into_iter().map(body));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {} · {}/{} turns",
+                    goal.status(),
+                    goal.turns(),
+                    octet_core::goal::MAX_GOAL_TURNS
+                ),
+                Style::default().fg(MUTED),
+            )));
+        }
+        None => lines.push(body("No goal · /goal sets one".into())),
+    }
+    lines.extend([Line::default(), head("NOW")]);
     lines.extend(
-        COMMANDS
-            .iter()
-            .filter_map(|spec| Some(Line::from(format!(" {:<11} {}", spec.name, spec.quick?)))),
+        transcript::wrap(&app.now_line(), width)
+            .into_iter()
+            .take(2)
+            .map(body),
     );
-    lines.extend([
-        Line::default(),
-        Line::from(Span::styled(" CONTROL", Style::default().fg(MUTED))),
-        Line::from(" Esc         Cancel turn"),
-        Line::from(" PgUp/PgDn   Read history"),
-        Line::from(" Ctrl+C ×2   Save and quit"),
-    ]);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines.extend([Line::default(), head("QUEUED")]);
+    if app.composer.queue.is_empty() {
+        lines.push(body("Nothing queued".into()));
+    }
+    for prompt in app.composer.queue.iter().take(3) {
+        let first = crate::text::clean(prompt.display().lines().next().unwrap_or_default());
+        lines.push(body(transcript::wrap(&first, width).swap_remove(0)));
+    }
+    if app.composer.queue.len() > 3 {
+        lines.push(body(format!("+{} more", app.composer.queue.len() - 3)));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 fn modal(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(4));
@@ -513,6 +516,7 @@ pub(crate) fn help_lines() -> Vec<String> {
         "Ctrl+C twice quit · Ctrl+Z suspend (return with fg)",
         "Ctrl+P commands · Ctrl+G write the prompt in $EDITOR",
         "Ctrl+O show or hide tool details",
+        "F2 show or hide the Task sidebar",
         "!cmd run and attach output · !!cmd run only · Esc stops",
         "@ mention a file · Tab completes paths and /commands",
         "",

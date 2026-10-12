@@ -62,23 +62,44 @@ fn the_popup_lists_suggestions_above_the_prompt() {
     assert!(rows.iter().any(|row| row.contains("Indexing files…")));
 }
 #[test]
-fn sidebar_lines_fit_the_panel_without_wrapping() {
-    // Every sidebar line starts with a space; a wrapped remainder would
-    // start in the first column, against the border.
+fn the_task_sidebar_shows_goal_now_and_queue() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
-    let rows = screen(120, 48, &mut app);
-    let title = rows.iter().find(|row| row.contains("╭ Workspace")).unwrap();
-    let border = title.chars().position(|c| c == '╭').unwrap();
-    let first = border + 1;
-    let inside: Vec<&String> = rows
-        .iter()
-        .filter(|row| row.chars().nth(border) == Some('│'))
-        .collect();
-    assert!(inside.len() > 20, "sidebar not drawn");
-    for row in inside {
-        let start = row.chars().nth(first).unwrap();
-        assert_eq!(start, ' ', "wrapped sidebar line: {row}");
+    crate::test_support::idle(&mut app);
+    app.composer
+        .queue
+        .push_back(crate::vendor::Prompt::plain("then add tests\nmore".into()));
+    let rows = screen(120, 40, &mut app);
+    let text = rows.join("\n");
+    assert!(text.contains("╭ Task"), "{text}");
+    for expected in [
+        "GOAL",
+        "No goal · /goal sets one",
+        "NOW",
+        "Idle",
+        "QUEUED",
+        "then add tests",
+    ] {
+        assert!(text.contains(expected), "{expected}\n{text}");
     }
+    for gone in ["ENGINE", "SESSION", "QUICK COMMANDS"] {
+        assert!(!text.contains(gone), "{gone}");
+    }
+    app.sidebar = false;
+    let rows = screen(120, 40, &mut app);
+    assert!(!rows.join("\n").contains("╭ Task"));
+}
+#[test]
+fn the_task_sidebar_shows_the_goal_and_its_turns() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    crate::test_support::idle(&mut app);
+    let goal = octet_core::goal::Goal::new("Make every test pass on Linux and macOS").unwrap();
+    app.goals.set_goal(Some(goal));
+    let text = screen(120, 40, &mut app).join("\n");
+    let turns = format!("/{} turns", octet_core::goal::MAX_GOAL_TURNS);
+    for expected in ["Make every test", "Linux and macOS", turns.as_str()] {
+        assert!(text.contains(expected), "{expected}\n{text}");
+    }
+    assert!(!text.contains("No goal"), "{text}");
 }
 #[test]
 fn an_empty_composer_gives_rows_back_to_the_conversation() {
