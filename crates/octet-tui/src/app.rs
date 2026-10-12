@@ -362,6 +362,8 @@ pub(crate) struct App {
     pub(crate) pending_skill: Option<SkillRun>,
     /// Whether the Task sidebar shows on wide terminals; F2 flips it.
     pub(crate) sidebar: bool,
+    /// The terminal's width at the last frame, for F2 to say when the sidebar can show.
+    pub(crate) last_width: u16,
 }
 /// A skill to run on a provider the interface is switching to.
 #[derive(Debug, Clone)]
@@ -424,6 +426,7 @@ impl App {
             pending_handoff: None,
             pending_skill: None,
             sidebar: true,
+            last_width: 0,
         }
     }
     pub(crate) fn connection(&mut self, config: &octet_core::Config, journal: PathBuf) {

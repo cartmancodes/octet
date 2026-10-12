@@ -146,7 +146,8 @@ with the draft: 4 rows when empty, up to 7 for a draft of four or more lines
 (one more while the chips row shows), leaving the rest of the screen to the
 conversation. One hint row sits under the draft: `Enter send · Alt+Enter newline · ↑ history · Ctrl+P commands`
 when idle, and `Enter queue · Esc cancel turn · Ctrl+P commands` while a turn
-runs.
+runs; under 80 columns, `Enter send · Ctrl+J newline` (a phone rarely sends
+Alt+Enter) and `Enter queue · Esc cancel turn`.
 When the draft names only another provider's skill, the hint turns amber:
 `Enter switches to {provider}, then runs /name`, or during a turn
 `Finish the turn to switch to {provider}`. Above the hint a chips row

@@ -1118,3 +1118,18 @@ async fn f2_hides_and_shows_the_task_sidebar() {
     key_action(&mut app, &vendor, key(KeyCode::F(2))).await;
     assert!(app.sidebar);
 }
+#[tokio::test]
+async fn f2_on_a_narrow_terminal_says_when_the_sidebar_shows() {
+    let vendor = RecordingVendor::default();
+    for (width, hint) in [(100, "The Task sidebar shows from 112 columns"), (120, "")] {
+        let mut app = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::view::draw(frame, &mut app))
+            .unwrap();
+        key_action(&mut app, &vendor, key(KeyCode::F(2))).await;
+        assert!(!app.sidebar, "the state flips either way");
+        assert_eq!(app.status_line, hint, "{width} columns");
+    }
+}

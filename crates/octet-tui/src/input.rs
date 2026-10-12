@@ -680,7 +680,15 @@ async fn composer_key(
         || (ctrl && key.code == KeyCode::Char('j'));
     match key.code {
         KeyCode::F(1) => app.overlay.help = true,
-        KeyCode::F(2) => app.sidebar = !app.sidebar,
+        KeyCode::F(2) => {
+            app.sidebar = !app.sidebar;
+            if app.last_width < crate::view::SIDEBAR_FROM {
+                app.hint(format!(
+                    "The Task sidebar shows from {} columns",
+                    crate::view::SIDEBAR_FROM
+                ));
+            }
+        }
         KeyCode::BackTab => return cycle_mode(app, vendor),
         KeyCode::Char('p') if ctrl => {
             app.overlay.palette = true;

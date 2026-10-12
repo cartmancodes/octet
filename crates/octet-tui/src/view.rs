@@ -46,6 +46,7 @@ fn mode_chip(app: &App) -> Span<'static> {
     Span::styled(text, Style::default().fg(color).bold())
 }
 pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
+    app.last_width = frame.area().width;
     paint(frame, app);
     if app.monochrome {
         without_colour(frame.buffer_mut());
@@ -197,9 +198,11 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
         header[1],
     );
 }
+/// The narrowest terminal that shows the Task sidebar.
+pub(crate) const SIDEBAR_FROM: u16 = 112;
 /// The transcript, and the sidebar on wide terminals.
 fn conversation(frame: &mut Frame, area: Rect, width: u16, app: &mut App) {
-    let columns = Layout::horizontal(if width >= 112 && app.sidebar {
+    let columns = Layout::horizontal(if width >= SIDEBAR_FROM && app.sidebar {
         vec![Constraint::Min(40), Constraint::Length(29)]
     } else {
         vec![Constraint::Min(20)]
@@ -465,6 +468,9 @@ pub(crate) fn composer_hint(app: &App, width: u16) -> (String, Color) {
     }
     let keys: &[&str] = if app.conn.is_running() {
         &["Enter queue", "Esc cancel turn", "Ctrl+P commands"]
+    } else if width < 80 {
+        // A narrow screen is often a phone, which rarely sends Alt+Enter.
+        &["Enter send", "Ctrl+J newline"]
     } else {
         &[
             "Enter send",

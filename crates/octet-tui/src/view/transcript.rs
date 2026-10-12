@@ -291,8 +291,8 @@ fn wrapped(role: Role, text: &str, width: u16) -> (Vec<Line<'static>>, Tail) {
     let (label, color) = match role {
         Role::User => ("YOU", ACCENT),
         Role::Assistant => ("OCTET", FG),
-        Role::Tool => ("TOOL", MUTED),
-        Role::Notice => ("NOTE", MUTED),
+        // Tools entries draw their own rows (`Entry::rows`) and never come here.
+        Role::Tool | Role::Notice => ("NOTE", MUTED),
         Role::Error => ("ERROR", AMBER),
         Role::Shell => ("SHELL", MUTED),
         Role::ShellFailed => ("SHELL", AMBER),
@@ -337,7 +337,7 @@ fn body(
         } else {
             let style = if role == Role::Error {
                 Style::default().fg(AMBER)
-            } else if role == Role::Tool || code {
+            } else if code {
                 Style::default().fg(MUTED)
             } else if line.starts_with('#') {
                 Style::default().fg(ACCENT).bold()

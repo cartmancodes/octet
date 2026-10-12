@@ -410,12 +410,14 @@ fn the_hint_row_matches_what_enter_does() {
         composer_hint(&app, 100).0,
         "Enter send · Alt+Enter newline · ↑ history · Ctrl+P commands"
     );
-    assert_eq!(composer_hint(&app, 60).0, "Enter send · Alt+Enter newline");
+    // A phone rarely sends Alt+Enter; Ctrl+J always arrives.
+    assert_eq!(composer_hint(&app, 60).0, "Enter send · Ctrl+J newline");
     app.event(Event::Started);
     assert_eq!(
         composer_hint(&app, 100).0,
         "Enter queue · Esc cancel turn · Ctrl+P commands"
     );
+    assert_eq!(composer_hint(&app, 60).0, "Enter queue · Esc cancel turn");
     let rows = screen(100, 30, &mut app);
     assert!(
         rows.iter().any(|r| r.contains("╭ Next prompt ─")),

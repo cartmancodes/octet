@@ -87,9 +87,10 @@ Claude Code and Codex CLIs.
 - At most eight approvals wait at once; more are denied with a notice. Claude
   is told why each approval was denied (your refusal, the timeout, the cap,
   a request too large to show, a cancelled turn).
-- Typed tool and approval events: the journal's `tool` records carry
+- Typed tool and approval events: the journal's `tool` records, and the
+  `tool` events of `--output json` and `--rpc`, carry
   `{id, name, target, phase, detail}` (`phase` is `running`, `done` or
-  `failed`) and `approval` records gain `summary`
+  `failed`); `approval` records and events gain `summary`
   `{action, command, files, cwd, scope}`.
 - Grouped tool activity: a run of tool calls is one transcript entry
   (`▸ Read 3 files · Ran 1 command`), a failed call opens in amber with the
