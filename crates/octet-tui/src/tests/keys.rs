@@ -942,3 +942,44 @@ async fn a_picked_skill_that_cannot_go_keeps_the_picker_draft() {
     assert!(vendor.sent.borrow().is_empty());
     assert_eq!(app.composer.editor.text(), "/skills image");
 }
+#[tokio::test]
+async fn ctrl_o_flips_tool_details_for_every_tools_entry() {
+    let mut app = app();
+    let vendor = RecordingVendor::default();
+    app.event(crate::test_support::tool(
+        "1",
+        "Read",
+        "a.rs",
+        octet_core::ToolPhase::Done,
+    ));
+    app.event(octet_core::Event::Text("x".into()));
+    app.event(crate::test_support::tool(
+        "2",
+        "Read",
+        "b.rs",
+        octet_core::ToolPhase::Done,
+    ));
+    key_action(&mut app, &vendor, ctrl('o')).await;
+    assert!(app.chat.tools_expanded);
+    assert!(
+        app.chat
+            .entries
+            .iter()
+            .filter(|e| e.role == crate::app::Role::Tool)
+            .all(|e| e.expanded)
+    );
+    assert_eq!(app.status_line, "Tool details shown");
+    key_action(&mut app, &vendor, ctrl('o')).await;
+    assert!(!app.chat.tools_expanded);
+    assert_eq!(app.status_line, "Tool details hidden");
+    app.event(crate::test_support::tool(
+        "3",
+        "Read",
+        "c.rs",
+        octet_core::ToolPhase::Done,
+    ));
+    assert!(
+        !app.chat.entries.back().unwrap().expanded,
+        "a new entry follows the setting"
+    );
+}

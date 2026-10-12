@@ -53,6 +53,7 @@ pub(crate) fn palette_key(app: &mut App, key: &str) -> Action {
             app.composer.completion = None;
             return Action::ExternalEditor;
         }
+        "Ctrl+O" => app.toggle_tool_details(),
         "@" => {
             let after_word = app.composer.editor.text()[..app.composer.editor.cursor()]
                 .chars()
@@ -695,6 +696,7 @@ async fn composer_key(
         KeyCode::BackTab => return cycle_mode(app, vendor),
         KeyCode::Char('p') if ctrl => app.overlay.palette = true,
         KeyCode::Char('x') if ctrl => copy_reply(app),
+        KeyCode::Char('o') if ctrl => app.toggle_tool_details(),
         KeyCode::Char('g') if ctrl => {
             // The edited draft must not meet a popup about the old one.
             app.composer.completion = None;

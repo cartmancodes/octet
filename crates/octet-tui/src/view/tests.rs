@@ -138,6 +138,14 @@ fn the_draft_shows_at_the_minimum_size() {
     }
 }
 #[test]
+fn help_names_the_tool_details_key() {
+    assert!(
+        help_lines()
+            .iter()
+            .any(|l| l.contains("Ctrl+O show or hide tool details"))
+    );
+}
+#[test]
 fn the_palette_shows_every_command_and_its_keys() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.overlay.palette = true;
@@ -165,6 +173,10 @@ fn the_palette_shows_every_command_and_its_keys() {
         "descriptions start in different columns: {columns:?}"
     );
     assert!(rows.iter().any(|row| row.contains("Esc close")));
+    assert!(
+        rows.iter().any(|row| row.contains("Ctrl+O")),
+        "Ctrl+O row missing"
+    );
 }
 #[test]
 fn empty_conversation_leaves_the_centre_blank() {

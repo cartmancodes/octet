@@ -485,6 +485,7 @@ pub(crate) fn help_lines() -> Vec<String> {
         "Ctrl+End follow · Esc/Ctrl+C cancel turn",
         "Ctrl+C twice quit · Ctrl+Z suspend (return with fg)",
         "Ctrl+P commands · Ctrl+G write the prompt in $EDITOR",
+        "Ctrl+O show or hide tool details",
         "!cmd run and attach output · !!cmd run only · Esc stops",
         "@ mention a file · Tab completes paths and /commands",
         "",
@@ -533,10 +534,11 @@ fn help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
     );
 }
 /// Keys the palette also offers, after the commands.
-pub(crate) const PALETTE_KEYS: [(&str, &str); 3] = [
+pub(crate) const PALETTE_KEYS: [(&str, &str); 4] = [
     ("Ctrl+G", "Write the prompt in $EDITOR"),
     ("@", "Mention a file"),
     ("!", "Run a shell command"),
+    ("Ctrl+O", "Show or hide tool details"),
 ];
 /// The palette's rows: every command, then the keys it also offers.
 pub(crate) fn palette_entries() -> impl Iterator<Item = (&'static str, &'static str)> {

@@ -750,6 +750,25 @@ impl App {
     pub(crate) fn turn_open(&self) -> bool {
         self.conn.is_running() || !self.overlay.approvals.is_empty()
     }
+    /// Ctrl+O: every tools entry is drawn in full, or collapsed again.
+    pub(crate) fn toggle_tool_details(&mut self) {
+        let expanded = !self.chat.tools_expanded;
+        self.chat.tools_expanded = expanded;
+        for entry in self
+            .chat
+            .entries
+            .iter_mut()
+            .filter(|e| e.role == Role::Tool)
+        {
+            entry.expanded = expanded;
+            entry.invalidate();
+        }
+        self.hint(if expanded {
+            "Tool details shown"
+        } else {
+            "Tool details hidden"
+        });
+    }
     /// A refusal or a passing hint, on the status line only.
     pub(crate) fn hint(&mut self, text: impl Into<String>) {
         self.status(StatusKind::Plain, &text.into());
