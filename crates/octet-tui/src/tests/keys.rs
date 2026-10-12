@@ -1040,3 +1040,41 @@ async fn ctrl_o_flips_tool_details_for_every_tools_entry() {
         "a new entry follows the setting"
     );
 }
+#[tokio::test]
+async fn typing_filters_the_palette_and_enter_runs_the_match() {
+    let mut app = app();
+    let vendor = RecordingVendor::default();
+    key_action(
+        &mut app,
+        &vendor,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    )
+    .await;
+    type_keys(&mut app, &vendor, "edit").await;
+    assert_eq!(app.overlay.palette_query, "edit");
+    let names: Vec<&str> = view::palette_matches(&app.overlay.palette_query)
+        .into_iter()
+        .map(|i| view::palette_entries().nth(i).unwrap().0)
+        .collect();
+    assert!(names.contains(&"Ctrl+G"), "{names:?}");
+    assert!(names.iter().all(|n| {
+        let (name, summary) = view::palette_entries().find(|(k, _)| k == n).unwrap();
+        format!("{name} {summary}").to_lowercase().contains("edit")
+    }));
+    key_action(&mut app, &vendor, key(KeyCode::Backspace)).await;
+    assert_eq!(app.overlay.palette_query, "edi");
+    assert_eq!(app.overlay.selection, 0, "a change selects the first match");
+}
+#[tokio::test]
+async fn opening_the_palette_starts_unfiltered() {
+    let mut app = app();
+    let vendor = RecordingVendor::default();
+    app.overlay.palette_query = "zz".into();
+    key_action(
+        &mut app,
+        &vendor,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    )
+    .await;
+    assert!(app.overlay.palette_query.is_empty());
+}

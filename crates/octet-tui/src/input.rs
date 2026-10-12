@@ -429,23 +429,32 @@ async fn approval_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent, id: u64
 }
 async fn palette_press(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Action {
     let ctrl_c = ctrl(key, 'c');
+    let matches = view::palette_matches(&app.overlay.palette_query);
     match key.code {
         _ if ctrl_c => app.overlay.palette = false,
         KeyCode::Esc => app.overlay.palette = false,
         KeyCode::Up => app.overlay.selection = app.overlay.selection.saturating_sub(1),
         KeyCode::Down => {
             app.overlay.selection =
-                (app.overlay.selection + 1).min(view::palette_entries().count() - 1);
+                (app.overlay.selection + 1).min(matches.len().saturating_sub(1));
+        }
+        KeyCode::Backspace => {
+            app.overlay.palette_query.pop();
+            app.overlay.selection = 0;
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.overlay.palette_query.push(c);
+            app.overlay.selection = 0;
         }
         KeyCode::Enter => {
+            let Some(&index) = matches.get(app.overlay.selection) else {
+                return Action::Continue;
+            };
             app.overlay.palette = false;
-            if let Some(spec) = COMMANDS.get(app.overlay.selection) {
+            if let Some(spec) = COMMANDS.get(index) {
                 return command(app, vendor, spec.name).await;
             }
-            return palette_key(
-                app,
-                view::PALETTE_KEYS[app.overlay.selection - COMMANDS.len()].0,
-            );
+            return palette_key(app, view::PALETTE_KEYS[index - COMMANDS.len()].0);
         }
         _ => {}
     }
@@ -664,7 +673,11 @@ async fn composer_key(
     match key.code {
         KeyCode::F(1) => app.overlay.help = true,
         KeyCode::BackTab => return cycle_mode(app, vendor),
-        KeyCode::Char('p') if ctrl => app.overlay.palette = true,
+        KeyCode::Char('p') if ctrl => {
+            app.overlay.palette = true;
+            app.overlay.palette_query.clear();
+            app.overlay.selection = 0;
+        }
         KeyCode::Char('x') if ctrl => copy_reply(app),
         KeyCode::Char('o') if ctrl => app.toggle_tool_details(),
         KeyCode::Char('g') if ctrl => {

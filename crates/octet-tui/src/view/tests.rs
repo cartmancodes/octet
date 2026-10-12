@@ -876,3 +876,12 @@ fn a_model_named_like_a_subcommand_gets_the_explicit_line() {
     assert!(text.contains("Select: /model codex list"), "{text}");
     assert!(text.contains("Select: /model codex refresh"), "{text}");
 }
+#[test]
+fn a_palette_with_no_match_says_so() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.overlay.palette = true;
+    app.overlay.palette_query = "qqqq".into();
+    let rows = screen(100, 30, &mut app);
+    assert!(rows.iter().any(|r| r.contains("No matching commands")));
+    assert!(rows.iter().any(|r| r.contains("Commands · \"qqqq\"")));
+}

@@ -287,6 +287,8 @@ pub(crate) struct Overlays {
     /// Lines scrolled past at the top of the help screen.
     pub(crate) help_scroll: u16,
     pub(crate) palette: bool,
+    /// What the palette is filtered by.
+    pub(crate) palette_query: String,
     pub(crate) selection: usize,
 }
 /// How long answer keys wait after an approval is shown.
@@ -388,6 +390,7 @@ impl App {
                 help: false,
                 help_scroll: 0,
                 palette: false,
+                palette_query: String::new(),
                 selection: 0,
             },
             monochrome: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),

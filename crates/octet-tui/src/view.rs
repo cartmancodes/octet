@@ -256,7 +256,12 @@ fn overlays(frame: &mut Frame, area: Rect, app: &mut App, cursor: (u16, u16)) {
         help(frame, area, &mut app.overlay.help_scroll);
     } else if app.overlay.palette {
         app.overlay.approval_hidden();
-        palette(frame, area, app.overlay.selection);
+        palette(
+            frame,
+            area,
+            app.overlay.selection,
+            &app.overlay.palette_query,
+        );
     } else if let Some(asked) = app.overlay.approvals.front() {
         let count = app.overlay.approvals.len();
         approval(frame, area, asked, &mut app.overlay.approval_scroll, count);
@@ -569,7 +574,16 @@ pub(crate) fn palette_entries() -> impl Iterator<Item = (&'static str, &'static 
         .map(|spec| (spec.name, spec.summary))
         .chain(PALETTE_KEYS.iter().copied())
 }
-fn palette(frame: &mut Frame, area: Rect, selected: usize) {
+/// The palette rows whose name or summary contains `query`, ignoring case.
+pub(crate) fn palette_matches(query: &str) -> Vec<usize> {
+    let query = query.to_lowercase();
+    palette_entries()
+        .enumerate()
+        .filter(|(_, (name, summary))| format!("{name} {summary}").to_lowercase().contains(&query))
+        .map(|(index, _)| index)
+        .collect()
+}
+fn palette(frame: &mut Frame, area: Rect, selected: usize, query: &str) {
     let name_width = palette_entries()
         .map(|(name, _)| name.len())
         .max()
@@ -579,33 +593,49 @@ fn palette(frame: &mut Frame, area: Rect, selected: usize) {
         .max()
         .unwrap_or(0);
     // Width: borders, the marker and spaces around each column. Height:
-    // borders and a blank line above and below the list.
+    // borders and a blank line above and below the list. The height is the
+    // full list's, so the modal does not jump as the filter narrows it.
     let area = modal(
         area,
         cells(name_width + description_width + 7),
         cells(palette_entries().count()).saturating_add(4),
     );
     frame.render_widget(Clear, area);
+    let matches = palette_matches(query);
     // On a short screen the list scrolls to keep the selected row in sight.
     let window = usize::from(area.height.saturating_sub(4)).max(1);
     let first = selected.saturating_sub(window - 1);
     let mut lines = vec![Line::default()];
-    for (index, (command, description)) in palette_entries().enumerate().skip(first).take(window) {
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   No matching commands",
+            Style::default().fg(MUTED).bg(PANEL),
+        )));
+    }
+    let entries: Vec<(&str, &str)> = palette_entries().collect();
+    for (row, &index) in matches.iter().enumerate().skip(first).take(window) {
+        let (command, description) = entries[index];
+        let chosen = row == selected;
         lines.push(Line::from(Span::styled(
             format!(
                 " {} {:<name_width$} {}",
-                if index == selected { "›" } else { " " },
+                if chosen { "›" } else { " " },
                 command,
                 description
             ),
             Style::default()
-                .fg(if index == selected { ACCENT } else { FG })
-                .bg(if index == selected { SELECTED } else { PANEL }),
+                .fg(if chosen { ACCENT } else { FG })
+                .bg(if chosen { SELECTED } else { PANEL }),
         )));
     }
+    let title = if query.is_empty() {
+        " Commands · ↑ ↓ choose · Enter run · Esc close ".to_owned()
+    } else {
+        format!(" Commands · \"{query}\" · ↑ ↓ · Enter run · Esc close ")
+    };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(card(" Commands · ↑ ↓ choose · Enter run · Esc close "))
+            .block(card(&title))
             .style(Style::default().bg(PANEL)),
         area,
     );
