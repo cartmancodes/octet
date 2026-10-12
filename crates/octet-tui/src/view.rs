@@ -200,6 +200,16 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
 }
 /// The narrowest terminal that shows the Task sidebar.
 pub(crate) const SIDEBAR_FROM: u16 = 112;
+/// The columns of text the transcript holds at terminal `width`, as `conversation` lays it out; None before a frame.
+pub(crate) fn transcript_room(width: u16, sidebar: bool) -> Option<u16> {
+    // Margins 2, border 2, padding 2; the sidebar takes 29 and a 2-column gap.
+    let frame = if width >= SIDEBAR_FROM && sidebar {
+        37
+    } else {
+        6
+    };
+    (width > 0).then(|| width.saturating_sub(frame))
+}
 /// The transcript, and the sidebar on wide terminals.
 fn conversation(frame: &mut Frame, area: Rect, width: u16, app: &mut App) {
     let columns = Layout::horizontal(if width >= SIDEBAR_FROM && app.sidebar {

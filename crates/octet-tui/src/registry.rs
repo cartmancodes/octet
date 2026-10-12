@@ -146,8 +146,8 @@ pub(crate) const COMMANDS: &[Spec] = &[
     spec(
         Cmd::RemoteControl,
         "/remote-control",
-        "/remote-control: check phone access setup",
-        "Check phone access (tmux, Tailscale, mosh)",
+        "/remote-control · /remote-control pair: check phone access, or pair a phone",
+        "Check phone access, or pair a phone by QR",
     ),
     spec(
         Cmd::Queue,

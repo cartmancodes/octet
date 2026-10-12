@@ -70,3 +70,24 @@ pub(crate) fn asked(id: u64, detail: &str) -> crate::app::Asked {
         summary: octet_core::ApprovalSummary::new("Run a shell command"),
     }
 }
+
+/// A stand-in hub on `<run>/hub.sock` answering one request with `reply`; resolves to the request line.
+pub(crate) fn serve_hub(
+    run: &std::path::Path,
+    reply: &'static str,
+) -> tokio::task::JoinHandle<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    std::fs::create_dir_all(run).unwrap();
+    let listener = tokio::net::UnixListener::bind(run.join("hub.sock")).unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut request = String::new();
+        BufReader::new(read).read_line(&mut request).await.unwrap();
+        write
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+        request
+    })
+}

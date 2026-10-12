@@ -825,6 +825,10 @@ impl App {
         self.status(StatusKind::Plain, &text);
         self.add(Role::Notice, &text);
     }
+    /// Adds a notice to the transcript without touching the status line, for text like a pairing secret.
+    pub(crate) fn note_apart(&mut self, text: impl Into<String>) {
+        self.add(Role::Notice, &text.into());
+    }
     /// The goal file could not be saved; `paused` when the goal was paused
     /// because of it.
     pub(crate) fn goal_save_failed(&mut self, error: impl std::fmt::Display, paused: bool) {

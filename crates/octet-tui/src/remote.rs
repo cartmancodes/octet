@@ -2,16 +2,19 @@
 //! phone over tmux, Tailscale SSH and mosh. Nothing here changes system,
 //! tmux or tailnet settings. Setup guide: docs/remote-control.md; the
 //! evaluation behind it: docs/rust/remote-control-ssh.md.
-use std::{process::Stdio, time::Duration};
+use qrcode::{QrCode, render::unicode::Dense1x2};
+use serde_json::Value;
+use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{
-    net::TcpStream,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpStream, UnixStream},
     process::Command,
     time::{Instant, timeout, timeout_at},
 };
 
 /// All commands share one deadline, so the interface waits at most this
 /// long for them, plus `SSH_TIMEOUT` for the connection check after.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 /// The SSH check connects to this host's own tailnet address.
 const SSH_TIMEOUT: Duration = Duration::from_millis(500);
 const SESSION: &str = "octet";
@@ -48,6 +51,132 @@ pub(crate) struct Checks {
     pub tailscale_ssh: bool,
     /// mosh-server's version; None when it isn't installed.
     pub mosh: Option<(u32, u32, u32)>,
+    /// What the hub's control socket says; None when no hub answers.
+    pub hub: Option<HubStatus>,
+}
+
+/// What `octet hub` reports about itself.
+pub(crate) struct HubStatus {
+    /// The loopback port it listens on.
+    pub port: u16,
+    /// Whether `tailscale serve` publishes it on the tailnet.
+    pub published: bool,
+    /// Its tailnet address, when published.
+    pub url: Option<String>,
+    /// How many phones are paired.
+    pub devices: usize,
+}
+
+/// The most of one hub reply read; the hub's own replies are far shorter.
+const HUB_REPLY_LIMIT: u64 = 4096;
+
+/// Why the hub gave no reply.
+enum HubError {
+    /// Nothing listens on `hub.sock`.
+    NotRunning,
+    /// It was reached but gave no usable reply in time.
+    NoAnswer,
+}
+
+/// Sends the hub's control socket one request line and reads its one reply line, all within `within`.
+async fn hub_call(run: &Path, request: &str, within: Duration) -> Result<Value, HubError> {
+    let call = async {
+        let mut stream = UnixStream::connect(run.join("hub.sock"))
+            .await
+            .map_err(|_| HubError::NotRunning)?;
+        stream
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .map_err(|_| HubError::NoAnswer)?;
+        let mut line = String::new();
+        BufReader::new(stream.take(HUB_REPLY_LIMIT))
+            .read_line(&mut line)
+            .await
+            .map_err(|_| HubError::NoAnswer)?;
+        serde_json::from_str(&line).map_err(|_| HubError::NoAnswer)
+    };
+    timeout(within, call)
+        .await
+        .unwrap_or(Err(HubError::NoAnswer))
+}
+
+/// The hub's state from its control socket; None when it isn't running or doesn't answer.
+async fn hub_status(run: &Path, within: Duration) -> Option<HubStatus> {
+    let reply = hub_call(run, r#"{"type":"status"}"#, within).await.ok()?;
+    let url = reply["url"].as_str().map(str::to_owned);
+    Some(HubStatus {
+        port: u16::try_from(reply["port"].as_u64()?).ok()?,
+        published: reply["published"].as_bool()? && url.is_some(),
+        url,
+        devices: usize::try_from(reply["devices"].as_u64()?).ok()?,
+    })
+}
+
+/// What asking the hub for a pairing secret came to.
+pub(crate) enum Pairing {
+    /// No hub is running.
+    NoHub,
+    /// The hub didn't give a secret, with why.
+    Failed(String),
+    /// The hub has no tailnet address, so a phone could not reach it.
+    NoTailnet,
+    /// A single-use secret and the hub's address.
+    Ready { url: String, secret: String },
+}
+
+/// Asks the hub in `run` for a pairing secret.
+pub(crate) async fn pairing(run: &Path, within: Duration) -> Pairing {
+    let reply = match hub_call(run, r#"{"type":"pair_secret"}"#, within).await {
+        Ok(reply) => reply,
+        Err(HubError::NotRunning) => return Pairing::NoHub,
+        Err(HubError::NoAnswer) => {
+            return Pairing::Failed(
+                "The hub didn't answer. Try again, or restart it: octet hub".into(),
+            );
+        }
+    };
+    if let Some(error) = reply["error"].as_str() {
+        return Pairing::Failed(format!("The hub refused: {error}"));
+    }
+    let Some(secret) = reply["secret"].as_str().filter(|secret| !secret.is_empty()) else {
+        return Pairing::Failed("The hub gave no pairing code".into());
+    };
+    match reply["url"].as_str() {
+        Some(url) => Pairing::Ready {
+            url: url.to_owned(),
+            secret: secret.to_owned(),
+        },
+        None => Pairing::NoTailnet,
+    }
+}
+
+/// The QR code of `link` as equal-width rows, dark modules on a light quiet zone; None when `link` is too long.
+fn qr_rows(link: &str) -> Option<Vec<String>> {
+    let image = QrCode::new(link.as_bytes())
+        .ok()?
+        .render::<Dense1x2>()
+        .dark_color(Dense1x2::Light)
+        .light_color(Dense1x2::Dark)
+        .build();
+    Some(image.lines().map(str::to_owned).collect())
+}
+
+/// The pairing note: the QR code if `room` columns fit it (None: any), the link, and what to do with them.
+pub(crate) fn pair_report(url: &str, secret: &str, room: Option<usize>) -> String {
+    let link = format!("{}/#pair={secret}", url.trim_end_matches('/'));
+    let mut lines = vec!["Pair a phone".to_owned(), String::new()];
+    match qr_rows(&link) {
+        Some(rows) if room.is_none_or(|room| rows[0].chars().count() <= room) => {
+            lines.extend(rows);
+            lines.push(String::new());
+        }
+        Some(_) => lines.push("Widen the terminal to show the QR code".into()),
+        None => lines.push("The link is too long for a QR code".into()),
+    }
+    lines.push(link);
+    lines.push("Expires in 10 minutes · works once".into());
+    lines.push("On the phone: open the Octet app → Pair → scan".into());
+    lines.join("\n")
 }
 
 /// Runs one read-only check with its own timeout.
@@ -174,7 +303,7 @@ const PROGRAMS: Programs<'static> = Programs {
 };
 
 /// Runs every check concurrently, each bounded by the check timeout.
-pub(crate) async fn probe() -> Checks {
+pub(crate) async fn probe(directory: &Path) -> Checks {
     probe_with(
         &PROGRAMS,
         std::env::var_os("TMUX").is_some(),
@@ -182,6 +311,7 @@ pub(crate) async fn probe() -> Checks {
             check: CHECK_TIMEOUT,
             ssh: SSH_TIMEOUT,
         },
+        &octet_core::remote::run::run_dir(directory),
     )
     .await
 }
@@ -193,7 +323,12 @@ struct Limits {
     ssh: Duration,
 }
 
-async fn probe_with(programs: &Programs<'_>, inside_tmux: bool, limits: Limits) -> Checks {
+async fn probe_with(
+    programs: &Programs<'_>,
+    inside_tmux: bool,
+    limits: Limits,
+    run: &Path,
+) -> Checks {
     let deadline = Instant::now() + limits.check;
     let tmux = async {
         if !inside_tmux {
@@ -236,7 +371,8 @@ async fn probe_with(programs: &Programs<'_>, inside_tmux: bool, limits: Limits) 
             .as_deref()
             .and_then(parse_mosh_version)
     };
-    let ((tmux, tmux_rgb), tailnet, mosh) = tokio::join!(tmux, tailnet, mosh);
+    let hub = hub_status(run, limits.check);
+    let ((tmux, tmux_rgb), tailnet, mosh, hub) = tokio::join!(tmux, tailnet, mosh, hub);
     // Both SSH checks share the half-second budget after the commands above.
     let (ssh, tailscale_ssh) = match &tailnet {
         Some((tailnet, program)) => {
@@ -274,6 +410,7 @@ async fn probe_with(programs: &Programs<'_>, inside_tmux: bool, limits: Limits) 
         ssh,
         tailscale_ssh,
         mosh,
+        hub,
     }
 }
 
@@ -285,6 +422,27 @@ fn mark(ok: bool, text: &str) -> String {
 pub(crate) struct Report {
     pub text: String,
     pub problems: usize,
+}
+
+/// The hub's line of the report.
+fn hub_line(hub: Option<&HubStatus>) -> String {
+    match hub {
+        None => {
+            "Hub: not running · start it with `octet hub` (or `octet hub install` later)".into()
+        }
+        Some(HubStatus {
+            url: Some(url),
+            published: true,
+            devices,
+            ..
+        }) => format!(
+            "Hub: {url} · {devices} paired device{}",
+            if *devices == 1 { "" } else { "s" }
+        ),
+        Some(HubStatus { port, .. }) => format!(
+            "Hub: running on 127.0.0.1:{port} · not on the tailnet yet: tailscale serve --bg {port}"
+        ),
+    }
 }
 
 /// The checks as notice text: one line per check, each problem with its fix,
@@ -359,6 +517,8 @@ pub(crate) fn report(checks: &Checks) -> Report {
         ),
         None => mark(false, "mosh-server isn't installed: brew install mosh"),
     });
+    // The hub is optional (the phone can use SSH alone), so no state of it is a failed check.
+    lines.push(hub_line(checks.hub.as_ref()));
     if let (Some(tailnet), true) = (&checks.tailnet, checks.ssh || checks.tailscale_ssh) {
         // Run now, the command would open a new, empty session, not this one.
         if matches!(checks.tmux, Tmux::Outside) {
@@ -408,7 +568,192 @@ mod tests {
             ssh: true,
             tailscale_ssh: false,
             mosh: Some((1, 4, 0)),
+            hub: None,
         }
+    }
+    fn hub(published: bool, devices: usize) -> HubStatus {
+        HubStatus {
+            port: 47823,
+            published,
+            url: published.then(|| "https://mac.ts.net".to_owned()),
+            devices,
+        }
+    }
+    #[test]
+    fn the_report_names_the_hub_state() {
+        let none = report_text(&Checks {
+            hub: None,
+            ..ready()
+        });
+        assert!(
+            none.contains(
+                "Hub: not running · start it with `octet hub` (or `octet hub install` later)"
+            ),
+            "{none}"
+        );
+        let local = report_text(&Checks {
+            hub: Some(hub(false, 0)),
+            ..ready()
+        });
+        assert!(
+            local.contains("Hub: running on 127.0.0.1:47823 · not on the tailnet yet: tailscale serve --bg 47823"),
+            "{local}"
+        );
+        let shared = report_text(&Checks {
+            hub: Some(hub(true, 2)),
+            ..ready()
+        });
+        assert!(
+            shared.contains("Hub: https://mac.ts.net · 2 paired devices"),
+            "{shared}"
+        );
+        let one = report_text(&Checks {
+            hub: Some(hub(true, 1)),
+            ..ready()
+        });
+        assert!(
+            one.contains("Hub: https://mac.ts.net · 1 paired device\n"),
+            "{one}"
+        );
+        // The hub is optional: none of its states is a failed check.
+        for text in [none, local, shared] {
+            assert!(!text.contains("[!!]"), "{text}");
+        }
+    }
+    /// The QR rows of a pairing note: the lines made only of block characters and spaces.
+    fn qr_rows(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|line| line.contains('█') || line.contains('▀') || line.contains('▄'))
+            .collect()
+    }
+    #[test]
+    fn pairing_shows_a_qr_and_the_link() {
+        let text = pair_report("https://mac.ts.net", "abcd", None);
+        assert!(text.contains("https://mac.ts.net/#pair=abcd"), "{text}");
+        assert!(
+            text.contains("Expires in 10 minutes · works once"),
+            "{text}"
+        );
+        assert!(
+            text.contains("On the phone: open the Octet app → Pair → scan"),
+            "{text}"
+        );
+        let rows = qr_rows(&text);
+        assert!(rows.len() >= 10, "{text}");
+        assert!(
+            rows.iter()
+                .all(|row| row.chars().all(|c| "█▀▄ ".contains(c))),
+            "{text}"
+        );
+        let width = rows[0].chars().count();
+        assert!(
+            rows.iter().all(|row| row.chars().count() == width),
+            "{text}"
+        );
+        // A trailing slash on the hub's address doesn't double up.
+        assert!(pair_report("https://mac.ts.net/", "abcd", None).contains("net/#pair=abcd"));
+    }
+    #[test]
+    fn the_qr_keeps_one_width_through_the_transcripts_wrapping() {
+        let text = pair_report("https://mac.ts.net", "ab".repeat(32).as_str(), None);
+        let rows = qr_rows(&text);
+        let width = rows[0].chars().count();
+        for room in [width, width + 40] {
+            for row in &rows {
+                let wrapped = crate::view::transcript::wrap(row, room);
+                assert_eq!(wrapped, [(*row).to_owned()], "room {room}");
+            }
+        }
+    }
+    #[test]
+    fn a_narrow_transcript_gets_the_link_and_no_qr() {
+        let wide = pair_report("https://mac.ts.net", "abcd", None);
+        let width = qr_rows(&wide)[0].chars().count();
+        let text = pair_report("https://mac.ts.net", "abcd", Some(width - 1));
+        assert!(
+            text.contains("Widen the terminal to show the QR code"),
+            "{text}"
+        );
+        assert!(text.contains("https://mac.ts.net/#pair=abcd"), "{text}");
+        assert!(qr_rows(&text).is_empty(), "{text}");
+        assert!(!pair_report("https://mac.ts.net", "abcd", Some(width)).contains("Widen"));
+    }
+    #[tokio::test]
+    async fn the_hub_status_comes_from_its_socket() {
+        let dir = octet_testkit::TempDir::new("octet-rc-status");
+        let run = dir.path().join("run");
+        assert!(hub_status(&run, CHECK_TIMEOUT).await.is_none(), "no socket");
+        let served = crate::test_support::serve_hub(
+            &run,
+            r#"{"port":47823,"published":true,"url":"https://mac.ts.net","devices":2}"#,
+        );
+        let status = hub_status(&run, CHECK_TIMEOUT).await.unwrap();
+        assert_eq!(served.await.unwrap().trim(), r#"{"type":"status"}"#);
+        assert_eq!(status.port, 47823);
+        assert!(status.published);
+        assert_eq!(status.url.as_deref(), Some("https://mac.ts.net"));
+        assert_eq!(status.devices, 2);
+    }
+    #[tokio::test]
+    async fn a_hub_that_answers_nonsense_or_nothing_is_not_running() {
+        let dir = octet_testkit::TempDir::new("octet-rc-junk");
+        let run = dir.path().join("run");
+        let served = crate::test_support::serve_hub(&run, "not json");
+        assert!(hub_status(&run, CHECK_TIMEOUT).await.is_none());
+        served.await.unwrap();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_hub_that_never_answers_is_given_up_on() {
+        let dir = octet_testkit::TempDir::new("octet-rc-mute");
+        let run = dir.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let listener = tokio::net::UnixListener::bind(run.join("hub.sock")).unwrap();
+        let _held = tokio::spawn(async move {
+            let _stream = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            pairing(&run, CHECK_TIMEOUT).await,
+            Pairing::Failed(_)
+        ));
+        assert!(started.elapsed() <= CHECK_TIMEOUT + Duration::from_millis(50));
+    }
+    #[tokio::test]
+    async fn pairing_asks_the_hub_for_a_secret_and_its_address() {
+        let dir = octet_testkit::TempDir::new("octet-rc-pair");
+        let run = dir.path().join("run");
+        assert!(matches!(pairing(&run, CHECK_TIMEOUT).await, Pairing::NoHub));
+        let served = crate::test_support::serve_hub(
+            &run,
+            r#"{"secret":"s3cret","url":"https://mac.ts.net"}"#,
+        );
+        let Pairing::Ready { url, secret } = pairing(&run, CHECK_TIMEOUT).await else {
+            panic!("the hub gave a secret and an address")
+        };
+        assert_eq!(
+            (url.as_str(), secret.as_str()),
+            ("https://mac.ts.net", "s3cret")
+        );
+        assert_eq!(served.await.unwrap().trim(), r#"{"type":"pair_secret"}"#);
+    }
+    #[tokio::test]
+    async fn pairing_without_the_tailnet_or_with_a_refusal_shows_no_secret() {
+        let dir = octet_testkit::TempDir::new("octet-rc-nonet");
+        let run = dir.path().join("run");
+        let served = crate::test_support::serve_hub(&run, r#"{"secret":"s3cret","url":null}"#);
+        assert!(matches!(
+            pairing(&run, CHECK_TIMEOUT).await,
+            Pairing::NoTailnet
+        ));
+        served.await.unwrap();
+        std::fs::remove_file(run.join("hub.sock")).unwrap();
+        let served = crate::test_support::serve_hub(&run, r#"{"error":"The hub is stopping"}"#);
+        let Pairing::Failed(why) = pairing(&run, CHECK_TIMEOUT).await else {
+            panic!("an error reply is a failure")
+        };
+        assert!(why.contains("The hub is stopping"), "{why}");
+        served.await.unwrap();
     }
     #[test]
     fn tailscale_ssh_counts_even_though_the_mac_cannot_reach_itself() {
@@ -627,7 +972,7 @@ mod tests {
             check: CHECK_TIMEOUT,
             ssh: SSH_TIMEOUT,
         };
-        let checks = probe_with(&programs, true, limits).await;
+        let checks = probe_with(&programs, true, limits, dir.path()).await;
         let elapsed = started.elapsed();
         assert!(
             // "Bounded", not "fast": a busy machine may add a second or so.
@@ -669,7 +1014,7 @@ esac
             ssh: SSH_TIMEOUT,
         };
         let started = std::time::Instant::now();
-        let checks = probe_with(&programs, true, limits).await;
+        let checks = probe_with(&programs, true, limits, dir.path()).await;
         let elapsed = started.elapsed();
         assert!(checks.tailnet.is_some(), "tailscale answered");
         assert!(!checks.ssh && !checks.tailscale_ssh);

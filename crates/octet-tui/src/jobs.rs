@@ -13,6 +13,8 @@ pub(crate) const GRACE: Duration = Duration::from_secs(5);
 /// What a finished job reports.
 pub(crate) enum Done {
     Remote(remote::Checks),
+    /// A pairing code asked of the hub; the secret is shown once and kept out of logs.
+    Pair(remote::Pairing),
     Sessions(Vec<RecentSession>),
     Exported {
         path: PathBuf,
@@ -31,11 +33,22 @@ pub(crate) struct Job {
 
 impl Job {
     /// The `/remote-control` checks.
-    pub(crate) fn remote() -> Self {
+    pub(crate) fn remote(directory: PathBuf) -> Self {
         Self {
             label: "Checking phone access…",
             must_finish: false,
-            work: Box::pin(async { Done::Remote(remote::probe().await) }),
+            work: Box::pin(async move { Done::Remote(remote::probe(&directory).await) }),
+        }
+    }
+    /// A pairing secret from the hub, for `/remote-control pair`.
+    pub(crate) fn pair(directory: PathBuf) -> Self {
+        Self {
+            label: "Asking the hub for a pairing code…",
+            must_finish: false,
+            work: Box::pin(async move {
+                let run = octet_core::remote::run::run_dir(&directory);
+                Done::Pair(remote::pairing(&run, remote::CHECK_TIMEOUT).await)
+            }),
         }
     }
     /// The journals beside this one, for `/sessions`.
@@ -135,6 +148,7 @@ pub(crate) fn apply(app: &mut App, ended: Ended) {
             // The status line, one row high, gets the count of problems.
             app.hint(remote::summary(&report));
         }
+        Done::Pair(pairing) => crate::commands::show_pairing(app, pairing),
         Done::Sessions(listed) => crate::commands::show_sessions(app, listed),
         Done::Exported { path, result } => match result {
             Ok(()) => app.note(format!("Exported journal to {}", path.display())),

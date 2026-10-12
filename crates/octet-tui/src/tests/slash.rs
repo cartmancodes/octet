@@ -123,6 +123,118 @@ async fn remote_control_reports_without_changing_the_session() {
     );
     assert_eq!(app.conn.session, "thread-1");
 }
+/// An interface whose data directory is `dir`, as the journal's parent decides it.
+fn app_in(dir: &std::path::Path) -> App {
+    let mut app = app();
+    app.conn.journal = dir.join("journal.jsonl");
+    app
+}
+#[tokio::test]
+async fn remote_control_pair_without_a_hub_says_how_to_start_one() {
+    let dir = octet_testkit::TempDir::new("octet-rc-nohub");
+    let mut app = app_in(dir.path());
+    let action = command(&mut app, "/remote-control pair").await;
+    assert!(
+        matches!(&action, Action::Job(job) if job.label == "Asking the hub for a pairing code…")
+    );
+    run_job(&mut app, action).await;
+    let text = app.entries_text();
+    assert!(text.contains("Start the hub first: octet hub"), "{text}");
+}
+#[tokio::test]
+async fn remote_control_pair_shows_the_qr_and_keeps_the_secret_off_the_status_line() {
+    let dir = octet_testkit::TempDir::new("octet-rc-qr");
+    let served = crate::test_support::serve_hub(
+        &octet_core::remote::run::run_dir(dir.path()),
+        r#"{"secret":"s3cretvalue","url":"https://mac.ts.net"}"#,
+    );
+    let mut app = app_in(dir.path());
+    let action = command(&mut app, "/remote-control pair").await;
+    run_job(&mut app, action).await;
+    served.await.unwrap();
+    let text = app.entries_text();
+    assert!(
+        text.contains("https://mac.ts.net/#pair=s3cretvalue"),
+        "{text}"
+    );
+    assert!(text.contains("█"), "{text}");
+    assert!(
+        text.contains("Expires in 10 minutes · works once"),
+        "{text}"
+    );
+    assert!(
+        !app.status_line.contains("s3cretvalue"),
+        "{}",
+        app.status_line
+    );
+    assert!(
+        app.status_line.contains("Pairing code"),
+        "{}",
+        app.status_line
+    );
+}
+#[tokio::test]
+async fn remote_control_pair_on_a_narrow_terminal_asks_to_widen_it() {
+    let dir = octet_testkit::TempDir::new("octet-rc-narrow");
+    let served = crate::test_support::serve_hub(
+        &octet_core::remote::run::run_dir(dir.path()),
+        r#"{"secret":"s3cretvalue","url":"https://mac.ts.net"}"#,
+    );
+    let mut app = app_in(dir.path());
+    app.last_width = 40;
+    let action = command(&mut app, "/remote-control pair").await;
+    run_job(&mut app, action).await;
+    served.await.unwrap();
+    let text = app.entries_text();
+    assert!(
+        text.contains("Widen the terminal to show the QR code"),
+        "{text}"
+    );
+    assert!(text.contains("#pair=s3cretvalue"), "{text}");
+    assert!(!text.contains("█"), "{text}");
+}
+#[tokio::test]
+async fn remote_control_pair_without_tailscale_shows_no_secret() {
+    let dir = octet_testkit::TempDir::new("octet-rc-nots");
+    let served = crate::test_support::serve_hub(
+        &octet_core::remote::run::run_dir(dir.path()),
+        r#"{"secret":"s3cretvalue","url":null}"#,
+    );
+    let mut app = app_in(dir.path());
+    let action = command(&mut app, "/remote-control pair").await;
+    run_job(&mut app, action).await;
+    served.await.unwrap();
+    let text = app.entries_text();
+    assert!(text.contains("Tailscale isn't connected"), "{text}");
+    assert!(!text.contains("s3cretvalue") && !app.status_line.contains("s3cretvalue"));
+}
+#[tokio::test]
+async fn remote_control_names_the_hub_in_its_report() {
+    let dir = octet_testkit::TempDir::new("octet-rc-rep");
+    let served = crate::test_support::serve_hub(
+        &octet_core::remote::run::run_dir(dir.path()),
+        r#"{"port":47823,"published":true,"url":"https://mac.ts.net","devices":1}"#,
+    );
+    let mut app = app_in(dir.path());
+    let action = command(&mut app, "/remote-control").await;
+    run_job(&mut app, action).await;
+    served.await.unwrap();
+    let text = app.entries_text();
+    assert!(
+        text.contains("Hub: https://mac.ts.net · 1 paired device"),
+        "{text}"
+    );
+}
+#[tokio::test]
+async fn remote_control_with_an_unknown_argument_lists_what_it_takes() {
+    let mut app = app();
+    assert!(matches!(
+        command(&mut app, "/remote-control bogus").await,
+        Action::Continue
+    ));
+    let text = app.entries_text();
+    assert!(text.contains("/remote-control pair"), "{text}");
+}
 #[tokio::test]
 async fn goal_commands_start_pause_resume_and_clear_without_a_vendor_turn() {
     let mut app = app();

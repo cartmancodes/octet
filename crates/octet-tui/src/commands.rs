@@ -85,8 +85,9 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
         )),
         Cmd::Goal => goal_command(app, vendor, argument).await,
         Cmd::RemoteControl => match argument {
-            "" | "status" => return start_job(app, Job::remote()),
-            _ => app.note("Use /remote-control or /remote-control status"),
+            "" | "status" => return start_job(app, Job::remote(data_directory(app))),
+            "pair" => return start_job(app, Job::pair(data_directory(app))),
+            _ => app.note("Use /remote-control, /remote-control status or /remote-control pair"),
         },
         Cmd::Export => return start_job(app, export_job(app, argument)),
     }
@@ -400,13 +401,37 @@ fn start_job(app: &mut App, job: Job) -> Option<Action> {
 /// `/sessions`: this workspace's recent vendor sessions, from the journals
 /// beside this one.
 fn sessions_job(app: &App) -> Job {
-    let directory = app
-        .conn
+    Job::sessions(
+        data_directory(app),
+        app.composer.root.clone(),
+        SESSIONS_LISTED,
+    )
+}
+
+/// The directory this interface keeps its journals in, which is also where the hub's run directory is.
+fn data_directory(app: &App) -> std::path::PathBuf {
+    app.conn
         .journal
         .parent()
         .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    Job::sessions(directory, app.composer.root.clone(), SESSIONS_LISTED)
+        .unwrap_or_default()
+}
+
+/// Shows what asking the hub for a pairing code came to; the secret goes only into the transcript note.
+pub(crate) fn show_pairing(app: &mut App, pairing: crate::remote::Pairing) {
+    use crate::remote::Pairing;
+    match pairing {
+        Pairing::NoHub => app.note("Start the hub first: octet hub"),
+        Pairing::Failed(why) => app.error(why),
+        Pairing::NoTailnet => app.note(
+            "Tailscale isn't connected, so a phone can't reach the hub. Run tailscale up, then /remote-control pair",
+        ),
+        Pairing::Ready { url, secret } => {
+            let room = crate::view::transcript_room(app.last_width, app.sidebar);
+            app.note_apart(crate::remote::pair_report(&url, &secret, room.map(usize::from)));
+            app.hint("Pairing code shown above · it works once");
+        }
+    }
 }
 
 /// Lists what `/sessions` found, keeping it for `/resume N`.
