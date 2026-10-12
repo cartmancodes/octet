@@ -1047,6 +1047,45 @@ async fn codex_fork_opens_a_new_thread() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn codex_failed_command_is_a_failed_call() {
+    let (handle, mut events, task) = spawn(config());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::TOOL_FAIL.into()))
+        .unwrap();
+    let mut calls = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Tool(call) => calls.push(call),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        calls.iter().map(|c| c.phase).collect::<Vec<_>>(),
+        [ToolPhase::Running, ToolPhase::Failed]
+    );
+    assert_eq!(calls[1].target, "false");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn codex_file_approval_names_the_items_files() {
+    let (handle, mut events, task) = spawn(config());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::FILE_APPROVAL.into()))
+        .unwrap();
+    let Event::Approval { id, summary, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(summary.action, "Edit 2 files");
+    assert_eq!(summary.files, ["a.rs", "b.rs"]);
+    handle.send(Command::Answer { id, allow: false }).unwrap();
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn codex_compact_runs_as_a_turn() {
     let (handle, mut events, task) = spawn(config());
     wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;

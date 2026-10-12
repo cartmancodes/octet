@@ -169,6 +169,23 @@ impl CodexFixture {
             scenario::APPROVAL => emit(
                 &json!({"id":"permission","method":"item/commandExecution/requestApproval","params":{"threadId":"fixture-thread","turnId":active,"command":"echo fixture"}}),
             ),
+            scenario::TOOL_FAIL => {
+                emit(
+                    &json!({"method":"item/started","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"cmd-9","type":"commandExecution","command":"false","status":"inProgress"}}}),
+                );
+                emit(
+                    &json!({"method":"item/completed","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"cmd-9","type":"commandExecution","command":"false","status":"failed","exitCode":1,"aggregatedOutput":"boom"}}}),
+                );
+                done();
+            }
+            scenario::FILE_APPROVAL => {
+                emit(
+                    &json!({"method":"item/started","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"fc-1","type":"fileChange","status":"inProgress","changes":[{"path":"a.rs","kind":"update","diff":""},{"path":"b.rs","kind":"add","diff":""}]}}}),
+                );
+                emit(
+                    &json!({"id":"permission","method":"item/fileChange/requestApproval","params":{"threadId":"fixture-thread","turnId":active,"itemId":"fc-1"}}),
+                );
+            }
             scenario::BIGTOOL => {
                 // One completed command whose output is far larger than the event queue.
                 let output = "x".repeat(6 * 1024 * 1024);
