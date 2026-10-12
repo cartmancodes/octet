@@ -1,14 +1,35 @@
 //! `octet`: parses the command line and starts the terminal interface, or
 //! runs headless (`--print`, `--rpc`).
 #![forbid(unsafe_code)]
-use args::{CliError, Parsed, Prompt, Run};
+use args::{CliError, HubAction, Parsed, Prompt, Run};
 use std::{io::IsTerminal, path::PathBuf};
 mod args;
 mod headless;
+mod hub;
 
 /// Where journals and goals go under the data directory. Named when the Rust
 /// port was a preview; kept so existing journals and goals are still found.
 const JOURNAL_DIR: &str = "octet/rust-preview";
+
+/// `octet hub --help`.
+fn hub_help() -> &'static str {
+    "Octet hub — your terminal sessions on your phone, over your tailnet\n\
+\n\
+Usage: octet hub [ACTION] [--journal-dir PATH] [--port N] [--owner LOGIN]\n\
+\n\
+Actions:\n\
+  serve          Run the hub on 127.0.0.1 until interrupted (the default)\n\
+  devices        List the paired phones\n\
+  revoke NAME    Unpair the phone called NAME (a running hub drops it within 2 s)\n\
+  watch          Print what every session is doing until Ctrl+C\n\
+\n\
+Options:\n\
+  --port N       serve: the loopback port (default: hub.json's, else 47823)\n\
+  --owner LOGIN  serve: the tailnet login that may connect (default: this Mac's, from Tailscale)\n\
+  --journal-dir PATH  Where journals and the hub's files live\n\
+\n\
+Publish the hub to your tailnet with: tailscale serve --bg <port>\n"
+}
 
 /// `--help`: fixed usage and keys, then every command from the registry.
 fn help() -> String {
@@ -18,6 +39,7 @@ fn help() -> String {
         "                 [--approval-timeout SECONDS] [--effort LEVEL]",
         "                 [--no-plugins] [--no-plugin-hooks] [--no-remote]",
         "                 [--print PROMPT|- [--output text|json] | --rpc]",
+        "       octet hub [serve|devices|revoke NAME|watch] (the phone hub; octet hub --help)",
         "       octet --version | --help",
         "",
         "Headless: --print (-p) runs one prompt and writes the reply; - reads it",
@@ -83,6 +105,21 @@ async fn main() -> std::process::ExitCode {
     };
     std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
+/// Where journals and the hub's files go: `journal_dir`, else `$XDG_DATA_HOME`, else `~/.local/share`.
+fn data_dir(journal_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    journal_dir
+        .or_else(|| {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|p| p.join(JOURNAL_DIR))
+        })
+        .or_else(|| octet_core::home_dir().map(|p| p.join(".local/share").join(JOURNAL_DIR)))
+        .ok_or_else(|| {
+            CliError::Usage("Set --journal-dir or HOME to choose transcript storage".into())
+        })
+}
+
 /// Reads the options and runs; the process's exit code.
 async fn run() -> Result<i32, CliError> {
     let args = match args::parse_args(std::env::args_os().skip(1))? {
@@ -93,6 +130,19 @@ async fn run() -> Result<i32, CliError> {
         Parsed::Version => {
             println!("octet {}", env!("CARGO_PKG_VERSION"));
             return Ok(0);
+        }
+        Parsed::HubHelp => {
+            print!("{}", hub_help());
+            return Ok(0);
+        }
+        Parsed::Hub(args) => {
+            let directory = data_dir(args.journal_dir)?;
+            return match args.action {
+                HubAction::Serve => hub::serve(directory, args.port, args.owner).await,
+                HubAction::Devices => hub::devices(&directory).await,
+                HubAction::Revoke(name) => hub::revoke(&directory, &name).await,
+                HubAction::Watch => hub::watch(&directory).await,
+            };
         }
         Parsed::Run(args) => args,
     };
@@ -119,19 +169,7 @@ async fn run() -> Result<i32, CliError> {
         None => std::env::current_dir().map_err(|e| CliError::Run(e.to_string()))?,
     };
     let config = args.config(args::workspace(&cwd)?);
-    let directory = args
-        .journal_dir
-        .clone()
-        .or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .map(|p| p.join(JOURNAL_DIR))
-        })
-        .or_else(|| octet_core::home_dir().map(|p| p.join(".local/share").join(JOURNAL_DIR)))
-        .ok_or_else(|| {
-            CliError::Usage("Set --journal-dir or HOME to choose transcript storage".into())
-        })?;
+    let directory = data_dir(args.journal_dir.clone())?;
     let result = match args.run {
         Run::Interface => octet_tui::run(
             config,

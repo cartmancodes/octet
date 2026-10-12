@@ -33,6 +33,17 @@ pub async fn tailnet_url() -> Option<String> {
     parse_tailnet_url(&status().await?)
 }
 
+/// The `https://<name>` URL `tailscale serve` already publishes for loopback `port`, if any.
+pub async fn published_url(port: u16) -> Option<String> {
+    let deadline = Instant::now() + TIMEOUT;
+    for program in PROGRAMS {
+        if let Some(json) = run_until(deadline, program, &["serve", "status", "--json"]).await {
+            return parse_published(&json, port);
+        }
+    }
+    None
+}
+
 /// `tailscale status --json` from the first Tailscale CLI that answers.
 async fn status() -> Option<String> {
     let deadline = Instant::now() + TIMEOUT;
@@ -88,9 +99,59 @@ fn parse_tailnet_url(status_json: &str) -> Option<String> {
     (!name.is_empty()).then(|| format!("https://{name}"))
 }
 
+/// The HTTPS URL of the first `serve status --json` handler that proxies to loopback `port`.
+fn parse_published(serve_json: &str, port: u16) -> Option<String> {
+    let status: serde_json::Value = serde_json::from_str(serve_json).ok()?;
+    let proxies_here = |proxy: &str| {
+        let rest = proxy.split_once("://").map_or(proxy, |(_, rest)| rest);
+        let host = rest.split('/').next().unwrap_or_default();
+        host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")
+    };
+    for (host, web) in status["Web"].as_object()? {
+        let Some((name, at)) = host.rsplit_once(':') else {
+            continue;
+        };
+        let https = status["TCP"][at]["HTTPS"].as_bool() == Some(true);
+        let proxied = web["Handlers"].as_object().is_some_and(|handlers| {
+            handlers
+                .values()
+                .any(|handler| handler["Proxy"].as_str().is_some_and(proxies_here))
+        });
+        if https && proxied && !name.is_empty() {
+            return Some(if at == "443" {
+                format!("https://{name}")
+            } else {
+                format!("https://{name}:{at}")
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SERVED: &str = r#"{"TCP":{"443":{"HTTPS":true},"8443":{"HTTPS":true}},
+        "Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:47823"}}},
+               "mac.tail1234.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}"#;
+
+    #[test]
+    fn a_served_port_is_found_in_the_serve_status() {
+        assert_eq!(
+            parse_published(SERVED, 47823).as_deref(),
+            Some("https://mac.tail1234.ts.net")
+        );
+        assert_eq!(
+            parse_published(SERVED, 3000).as_deref(),
+            Some("https://mac.tail1234.ts.net:8443")
+        );
+        assert_eq!(parse_published(SERVED, 47824), None);
+        let plain_http = SERVED.replace(r#""443":{"HTTPS":true}"#, r#""443":{"HTTP":true}"#);
+        assert_eq!(parse_published(&plain_http, 47823), None);
+        assert_eq!(parse_published("{}", 47823), None);
+        assert_eq!(parse_published("not json", 47823), None);
+    }
 
     const RUNNING: &str = r#"{"BackendState":"Running","Self":{"UserID":123,"DNSName":"mac.tail1234.ts.net."},
         "User":{"123":{"LoginName":"me@example.com","DisplayName":"Me"},"456":{"LoginName":"other@example.com"}}}"#;

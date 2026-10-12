@@ -342,9 +342,6 @@ async fn pair_then_hello_lists_sessions() {
         secret["url"].is_null() || secret["url"].is_string(),
         "{secret}"
     );
-    // Task 9 adds `watch`; until then it is refused, like anything unknown.
-    let watch = env.control(json!({"type": "watch"})).await;
-    assert_eq!(watch["error"], "Not yet supported");
     assert!(env.control(json!({"type": "nope"})).await["error"].is_string());
 
     let token = env.pair("Test phone").await;
@@ -658,6 +655,70 @@ async fn state_and_catalog_follow_subscriptions() {
     bridge_write(&mut write, bridge_catalog_frame(&catalog("ask"))).await;
     env.journal(JOURNAL, 1..2);
     assert!(quiet(&mut phone).await);
+}
+
+/// The next line a watching control client gets, parsed.
+async fn watch_line(read: &mut BufReader<OwnedReadHalf>) -> Value {
+    let mut line = String::new();
+    timeout(WAIT, read.read_line(&mut line))
+        .await
+        .expect("the watcher gets a line")
+        .expect("read");
+    serde_json::from_str(&line).expect("a JSON line")
+}
+
+/// The next watch frame of `kind`, skipping others.
+async fn watch_kind(read: &mut BufReader<OwnedReadHalf>, kind: &str) -> Value {
+    loop {
+        let frame = watch_line(read).await;
+        if frame["type"] == kind {
+            return frame;
+        }
+    }
+}
+
+#[tokio::test]
+async fn watch_streams_sessions_and_live_events() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5010, 0..2).await;
+    env.start().await;
+    let (_read, mut write) = bridge.accept().await;
+    let stream = UnixStream::connect(env.run.join("hub.sock"))
+        .await
+        .expect("the control socket");
+    let (read, mut out) = stream.into_split();
+    let mut read = BufReader::new(read);
+    out.write_all(b"{\"type\":\"watch\"}\n")
+        .await
+        .expect("watch");
+    // The rows as they stand, with no replay of the history.
+    let first = watch_line(&mut read).await;
+    assert_eq!(first["type"], "sessions", "{first}");
+    assert_eq!(first["sessions"][0]["id"], bridge.id);
+    // A row follows the state, and carries its NOW line.
+    let state = json!({"phase": "running", "queue": [], "queued": 0, "mode": "ask",
+        "now": "Running Bash cargo test", "approvals": []});
+    bridge_write(&mut write, bridge_state_frame(&state)).await;
+    loop {
+        let sessions = watch_kind(&mut read, "sessions").await;
+        if sessions["sessions"][0]["now"] == "Running Bash cargo test" {
+            assert_eq!(sessions["sessions"][0]["phase"], "running");
+            break;
+        }
+    }
+    // Live events for every session, no subscribe needed.
+    env.journal(JOURNAL, 2..3);
+    let event = watch_kind(&mut read, "event").await;
+    assert_eq!(
+        (event["session"].clone(), event["seq"].clone()),
+        (json!(bridge.id), json!(2))
+    );
+    // A phone's view of the rows has no NOW line.
+    let token = env.pair("Test phone").await;
+    let (_phone, sessions) = hello(env.port, &token).await;
+    assert!(sessions["sessions"][0].get("now").is_none(), "{sessions}");
+    // Control requests still work next to a watcher.
+    assert_eq!(env.control(json!({"type": "status"})).await["devices"], 1);
 }
 
 #[tokio::test]

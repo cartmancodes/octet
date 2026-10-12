@@ -52,7 +52,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, UnixListener, UnixStream},
+    net::{TcpListener, TcpStream, UnixListener, UnixStream, unix::OwnedWriteHalf},
     sync::{mpsc, oneshot},
     task::AbortHandle,
     time::{Instant, Interval, MissedTickBehavior, interval_at, timeout},
@@ -67,6 +67,10 @@ use tokio_tungstenite::{
     },
 };
 
+/// Frames waiting for one `octet hub watch`; a watcher that lets it fill is dropped.
+const WATCH_QUEUE: usize = 256;
+/// How many `octet hub watch` clients may be attached at once.
+const MAX_WATCHERS: usize = 8;
 /// Live frames waiting to be written to one phone; a phone that lets it fill is dropped.
 const OUTBOUND_QUEUE: usize = 512;
 /// Replayed frames waiting to be written to one phone; a replay waits for room.
@@ -115,8 +119,6 @@ const CONTROL_WITHIN: Duration = Duration::from_secs(5);
 const RATE_REFUSED: &str = "Too many commands; wait a minute";
 /// The refusal for a frame that is not text.
 const NOT_TEXT: &str = "Send each message as a text frame";
-/// The refusal for what a later task adds.
-const NOT_YET: &str = "Not yet supported";
 /// The refusal for a command the session did not answer in time.
 const NO_ANSWER: &str = "The session didn't answer";
 /// The refusal for `full-access` without the typed confirmation.
@@ -388,6 +390,8 @@ enum Control {
     PairSecret(oneshot::Sender<String>),
     /// The port and the number of paired devices.
     Status(oneshot::Sender<(u16, usize)>),
+    /// A watcher: the lines it is to be sent, first the rows as they stand.
+    Watch(mpsc::Sender<String>),
 }
 
 /// The running hub: its files, its sessions and every phone connection.
@@ -409,6 +413,10 @@ pub struct Hub {
     buckets: HashMap<String, Bucket>,
     /// The session rows phones were last sent.
     listed: Vec<Value>,
+    /// Control clients running `watch`.
+    watchers: Vec<mpsc::Sender<String>>,
+    /// The rows with NOW lines the watchers were last sent.
+    watched: Vec<Value>,
     /// The data directory: journals, the run directory and the hub's files.
     directory: PathBuf,
     /// Launches that count toward the phone-started cap beyond the registrations.
@@ -433,6 +441,22 @@ impl Hub {
         port: u16,
         owner: String,
         shutdown: impl Future<Output = ()>,
+    ) -> Result<(), String> {
+        Self::serve_notify(directory, port, owner, shutdown, oneshot::channel().0).await
+    }
+
+    /// Like [`serve`](Self::serve), and sends the bound port on `ready` once the hub is
+    /// answering (it is dropped unsent when the hub fails to start).
+    ///
+    /// # Errors
+    ///
+    /// The same as [`serve`](Self::serve).
+    pub async fn serve_notify(
+        directory: PathBuf,
+        port: u16,
+        owner: String,
+        shutdown: impl Future<Output = ()>,
+        ready: oneshot::Sender<u16>,
     ) -> Result<(), String> {
         if owner.is_empty() {
             return Err("The tailnet owner's login is unknown".into());
@@ -473,6 +497,8 @@ impl Hub {
             pending: HashMap::new(),
             buckets: HashMap::new(),
             listed: Vec::new(),
+            watchers: Vec::new(),
+            watched: Vec::new(),
             events,
             ids: 0,
         };
@@ -484,6 +510,7 @@ impl Hub {
             every(SWEEP_EVERY),
         );
         let mut shutdown = std::pin::pin!(shutdown);
+        let _ = ready.send(port);
         loop {
             // `refresh` is not cancel-safe, so it runs in a handler, never as a branch.
             tokio::select! {
@@ -976,6 +1003,7 @@ impl Hub {
     /// A live journal record: streamed to live subscribers, buffered for replaying ones.
     fn on_journal_event(&mut self, id: &str, journal: &str, seq: u64, record: &Value) {
         let frame = event_text(id, journal, seq, record);
+        broadcast(&mut self.watchers, &frame);
         let (mut live, mut overflowed) = (Vec::new(), Vec::new());
         for (&conn, state) in &mut self.conns {
             match state.subscriptions.get_mut(id) {
@@ -1016,6 +1044,7 @@ impl Hub {
 
     /// Sends the `sessions` frame to every authenticated phone if the rows changed.
     fn relist(&mut self) {
+        self.relist_watchers();
         let list = self.sessions.list();
         if list == self.listed {
             return;
@@ -1033,6 +1062,53 @@ impl Hub {
         }
     }
 
+    /// The `sessions` frame for watchers if the rows, with their NOW lines, changed.
+    fn relist_watchers(&mut self) {
+        if self.watchers.is_empty() {
+            return;
+        }
+        let rows = self.watch_rows();
+        if rows == self.watched {
+            return;
+        }
+        broadcast(&mut self.watchers, &sessions_frame(&rows).to_string());
+        self.watched = rows;
+    }
+
+    /// The session rows, each with the NOW line of its state when it has one.
+    fn watch_rows(&self) -> Vec<Value> {
+        let mut rows = self.sessions.list();
+        for row in &mut rows {
+            let now = row
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| self.sessions.state(id))
+                .and_then(|state| state.get("now"))
+                .filter(|now| now.is_string())
+                .cloned();
+            if let Some(now) = now {
+                row["now"] = now;
+            }
+        }
+        rows
+    }
+
+    /// Attaches a watcher, or turns it away when too many are attached.
+    fn watch(&mut self, watcher: mpsc::Sender<String>) {
+        self.watchers.retain(|w| !w.is_closed());
+        if self.watchers.len() >= MAX_WATCHERS {
+            let _ = watcher.try_send(json!({"error": "Too many watchers"}).to_string());
+            return;
+        }
+        if self.watchers.is_empty() {
+            self.watched = self.watch_rows();
+        }
+        let rows = sessions_frame(&self.watched).to_string();
+        if watcher.try_send(rows).is_ok() {
+            self.watchers.push(watcher);
+        }
+    }
+
     /// Answers a control-socket request.
     async fn on_control(&mut self, request: Control) {
         match request {
@@ -1043,6 +1119,7 @@ impl Hub {
                 self.store.reload_if_changed().await;
                 let _ = reply.send((self.port, self.store.devices().len()));
             }
+            Control::Watch(watcher) => self.watch(watcher),
         }
     }
 
@@ -1238,6 +1315,11 @@ fn clip(text: &str) -> String {
     text.chars().take(AUDIT_TEXT).collect()
 }
 
+/// Queues `frame` for every watcher; one whose queue is full or gone is dropped, never waited for.
+fn broadcast(watchers: &mut Vec<mpsc::Sender<String>>, frame: &str) {
+    watchers.retain(|watcher| watcher.try_send(frame.to_owned()).is_ok());
+}
+
 /// Creates `run` owner-only, and tightens it to 0700 if it exists with more.
 async fn private_dir(run: &Path) -> std::io::Result<()> {
     octet_store::create_private_dir(run).await?;
@@ -1305,6 +1387,10 @@ async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>) {
     {
         return;
     }
+    if request_kind(&line) == "watch" {
+        watch_stream(&mut reader, &mut write, &hub).await;
+        return;
+    }
     let answer = control_answer(&line, &hub).await;
     let _ = timeout(
         CONTROL_WITHIN,
@@ -1313,15 +1399,51 @@ async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>) {
     .await;
 }
 
+/// The `type` of a control request line; empty when it has none.
+fn request_kind(line: &str) -> String {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|request| request.get("type")?.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Writes the hub's watch lines to a control client until it leaves, falls behind or the hub
+/// stops.
+async fn watch_stream(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    write: &mut OwnedWriteHalf,
+    hub: &mpsc::Sender<Control>,
+) {
+    let (watcher, mut lines) = mpsc::channel(WATCH_QUEUE);
+    if hub.send(Control::Watch(watcher)).await.is_err() {
+        return;
+    }
+    let mut ignored = [0u8; 64];
+    loop {
+        tokio::select! {
+            line = lines.recv() => {
+                let Some(line) = line else { return };
+                let sent = timeout(WRITE_STALL, write.write_all(format!("{line}\n").as_bytes())).await;
+                if !sent.is_ok_and(|sent| sent.is_ok()) {
+                    return;
+                }
+            }
+            // The client sends nothing more; a read that ends means it left.
+            read = reader.read(&mut ignored) => {
+                if read.is_ok_and(|n| n > 0) {
+                    continue;
+                }
+                return;
+            }
+        }
+    }
+}
+
 /// The answer to one control request.
 async fn control_answer(line: &str, hub: &mpsc::Sender<Control>) -> Value {
-    let request = serde_json::from_str::<Value>(line).ok();
-    let kind = request
-        .as_ref()
-        .and_then(|r| r.get("type")?.as_str())
-        .unwrap_or_default();
+    let kind = request_kind(line);
     let gone = || json!({"error": "The hub is stopping"});
-    match kind {
+    match kind.as_str() {
         "pair_secret" => {
             let (reply, secret) = oneshot::channel();
             if hub.send(Control::PairSecret(reply)).await.is_err() {
@@ -1343,8 +1465,6 @@ async fn control_answer(line: &str, hub: &mpsc::Sender<Control>) -> Value {
             let url = tailnet_url().await;
             json!({"port": port, "published": url.is_some(), "url": url, "devices": devices})
         }
-        // Task 9: `watch` streams sessions and events to `octet hub watch`.
-        "watch" => json!({"error": NOT_YET}),
         _ => json!({"error": "Unknown request"}),
     }
 }
@@ -1571,6 +1691,28 @@ mod tests {
             .len(),
             5
         );
+    }
+
+    #[test]
+    fn a_watcher_that_falls_behind_or_leaves_is_dropped_without_waiting() {
+        let (slow, mut slow_lines) = mpsc::channel(2);
+        let (quick, mut quick_lines) = mpsc::channel(8);
+        let (gone, gone_lines) = mpsc::channel(8);
+        drop(gone_lines);
+        let mut watchers = vec![slow, quick, gone];
+        broadcast(&mut watchers, "one");
+        assert_eq!(watchers.len(), 2, "the departed watcher is dropped");
+        broadcast(&mut watchers, "two");
+        broadcast(&mut watchers, "three");
+        assert_eq!(
+            watchers.len(),
+            1,
+            "the watcher with a full queue is dropped"
+        );
+        let got: Vec<String> = std::iter::from_fn(|| quick_lines.try_recv().ok()).collect();
+        assert_eq!(got, ["one", "two", "three"]);
+        let kept: Vec<String> = std::iter::from_fn(|| slow_lines.try_recv().ok()).collect();
+        assert_eq!(kept, ["one", "two"], "what it had is still there to read");
     }
 
     #[test]

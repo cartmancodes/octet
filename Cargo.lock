@@ -533,6 +533,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "octet-core",
+ "octet-hub",
  "octet-testkit",
  "octet-tui",
  "serde_json",
