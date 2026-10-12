@@ -4,19 +4,18 @@ use serde_json::Value;
 use std::{
     collections::VecDeque,
     io::SeekFrom,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
 };
 
 /// The most one `read` takes from the file.
 const READ_CAP: u64 = 8 * 1024 * 1024;
 /// The longest line kept while waiting for its newline; a longer one is skipped.
 const LINE_CAP: usize = 16 * 1024 * 1024;
-/// A resuming phone without a usable cursor gets this many of the newest records.
-const REPLAY_LAST: usize = 500;
 
 /// Reads whole new lines from a growing file.
 #[derive(Debug)]
@@ -30,6 +29,8 @@ pub(crate) struct Tail {
     skipped: u64,
     /// An oversize line is being passed over, up to its newline.
     discarding: bool,
+    /// `(device, inode)` of the file last read: another one is a replaced file.
+    identity: Option<(u64, u64)>,
 }
 
 impl Tail {
@@ -41,6 +42,7 @@ impl Tail {
             partial: Vec::new(),
             skipped: 0,
             discarding: false,
+            identity: None,
         }
     }
 
@@ -48,6 +50,10 @@ impl Tail {
     /// is written from here on; a file that cannot be read starts at its beginning.
     pub(crate) async fn at_end(path: PathBuf) -> Self {
         let mut tail = Self::new(path);
+        tail.identity = tokio::fs::metadata(&tail.path)
+            .await
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()));
         tail.offset = whole_lines_end(&tail.path).await.unwrap_or(0);
         tail
     }
@@ -68,24 +74,37 @@ impl Tail {
     }
 
     /// The records of every whole line written since the last call (at most `READ_CAP` bytes'
-    /// worth; call again for more). A file shorter than before was truncated: the tail starts
-    /// over at its beginning. Cancel-safe: the tail changes only after the last await.
+    /// worth; call again for more). The file is statted first, and left unopened when it has
+    /// not grown. A file shorter than before was truncated, and one with another inode was
+    /// replaced: either way the tail starts over at its beginning. Only a regular file is read.
+    /// Cancel-safe: the tail changes only after the last await.
     ///
     /// # Errors
     ///
-    /// Fails if the file cannot be opened or read.
+    /// Fails if the file cannot be opened or read, or is not a regular file.
     pub(crate) async fn read(&mut self) -> std::io::Result<Vec<Value>> {
+        let meta = tokio::fs::metadata(&self.path).await?;
+        let identity = Some((meta.dev(), meta.ino()));
+        if meta.len() == self.offset && self.identity == identity {
+            return Ok(Vec::new());
+        }
         let mut file = File::open(&self.path).await?;
-        let len = file.metadata().await?.len();
-        let truncated = len < self.offset;
-        let from = if truncated { 0 } else { self.offset };
+        let meta = file.metadata().await?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        let identity = Some((meta.dev(), meta.ino()));
+        let restart =
+            meta.len() < self.offset || self.identity.is_some_and(|old| Some(old) != identity);
+        let from = if restart { 0 } else { self.offset };
         file.seek(SeekFrom::Start(from)).await?;
         let mut fresh = Vec::new();
         (&mut file).take(READ_CAP).read_to_end(&mut fresh).await?;
-        if truncated {
+        if restart {
             self.partial.clear();
             self.discarding = false;
         }
+        self.identity = identity;
         self.offset = from + fresh.len() as u64;
         Ok(self.lines(&fresh))
     }
@@ -148,30 +167,40 @@ async fn whole_lines_end(path: &Path) -> std::io::Result<u64> {
     Ok(0)
 }
 
-/// Every record of `journals` (oldest first) after `after`, as `(journal file name, seq,
-/// event)`. A cursor names a journal and a `seq`: the rest of that journal, then every later
-/// journal. No cursor, or a cursor naming no journal here (the phone's list is stale), gives
-/// the newest journal's last 500 records. Unreadable journals and half-written lines are
-/// passed over.
+/// Up to `limit` records of `journals` (oldest first) after `after`, as `(journal file name,
+/// seq, event)`, and whether more follow. A cursor names a journal and a `seq`: the rest of
+/// that journal, then every later journal; the caller pages by passing the last record it got
+/// as the next cursor. No cursor, or a cursor naming no journal here (the phone's list is
+/// stale), gives the newest journal's last `limit` records and `more` false. Journals are read
+/// a line at a time, never whole; unreadable journals and half-written lines are passed over.
 pub(crate) async fn replay(
     journals: &[PathBuf],
     after: Option<&Cursor>,
-) -> Vec<(String, u64, Value)> {
+    limit: usize,
+) -> (Vec<(String, u64, Value)>, bool) {
     let found = after.and_then(|cursor| {
         let at = journals
             .iter()
             .position(|j| file_name(j) == cursor.journal)?;
         Some((at, cursor.seq))
     });
-    let mut records = Vec::new();
-    if let Some((at, seq)) = found {
-        for (n, path) in journals[at..].iter().enumerate() {
-            records.extend(journal_records(path, (n == 0).then_some(seq), usize::MAX).await);
+    let mut records = VecDeque::new();
+    let Some((at, seq)) = found else {
+        if let Some(newest) = journals.last() {
+            // The deque keeps only the newest `limit`, whatever the journal's length.
+            journal_records(newest, None, limit, true, &mut records).await;
         }
-    } else if let Some(newest) = journals.last() {
-        records.extend(journal_records(newest, None, REPLAY_LAST).await);
+        return (records.into(), false);
+    };
+    for (n, path) in journals[at..].iter().enumerate() {
+        journal_records(path, (n == 0).then_some(seq), limit, false, &mut records).await;
+        if records.len() > limit {
+            break;
+        }
     }
-    records
+    let more = records.len() > limit;
+    records.truncate(limit);
+    (records.into(), more)
 }
 
 /// A journal's file name; what a cursor calls the journal.
@@ -182,33 +211,79 @@ pub(crate) fn file_name(journal: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// The records of one journal after `after`, the last `keep` of them.
+/// Appends to `out` the records of one journal after `after`, a line at a time. With `newest`
+/// the last `keep` records of the whole journal are kept; otherwise it stops once `out` holds
+/// more than `keep`.
 async fn journal_records(
     path: &Path,
     after: Option<u64>,
     keep: usize,
-) -> VecDeque<(String, u64, Value)> {
+    newest: bool,
+    out: &mut VecDeque<(String, u64, Value)>,
+) {
+    let Ok(file) = File::open(path).await else {
+        return;
+    };
+    if !file.metadata().await.is_ok_and(|m| m.is_file()) {
+        return;
+    }
     let name = file_name(path);
-    let mut tail = Tail::new(path.to_owned());
-    let mut kept = VecDeque::new();
-    loop {
-        let before = tail.offset;
-        let Ok(records) = tail.read().await else {
-            break;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    while let Some(whole) = next_line(&mut reader, &mut line).await {
+        let parsed = whole
+            .then(|| serde_json::from_slice::<Value>(&line).ok())
+            .flatten();
+        let Some((seq, event)) = parsed.as_ref().and_then(event_of) else {
+            continue;
         };
-        for (seq, event) in records.iter().filter_map(event_of) {
-            if after.is_none_or(|after| seq > after) {
-                kept.push_back((name.clone(), seq, event));
-                if kept.len() > keep {
-                    kept.pop_front();
-                }
-            }
+        if after.is_some_and(|after| seq <= after) {
+            continue;
         }
-        if tail.offset <= before {
-            break;
+        out.push_back((name.clone(), seq, event));
+        if out.len() > keep {
+            if !newest {
+                return;
+            }
+            out.pop_front();
         }
     }
-    kept
+}
+
+/// Reads the next line of `reader` into `line` (newline removed). `Some(true)` is a line to
+/// use, `Some(false)` one passed over because it is over `LINE_CAP`; `None` is the end of the
+/// file, or a last line whose newline has not been written yet.
+async fn next_line(reader: &mut BufReader<File>, line: &mut Vec<u8>) -> Option<bool> {
+    line.clear();
+    let limit = LINE_CAP as u64 + 1;
+    let read = (&mut *reader)
+        .take(limit)
+        .read_until(b'\n', line)
+        .await
+        .ok()?;
+    if read == 0 {
+        return None;
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        return Some(true);
+    }
+    if line.len() as u64 <= LINE_CAP as u64 {
+        return None;
+    }
+    // Over the cap: pass over the rest of the line.
+    loop {
+        let buffered = reader.fill_buf().await.ok()?;
+        if buffered.is_empty() {
+            return None;
+        }
+        if let Some(end) = buffered.iter().position(|&b| b == b'\n') {
+            reader.consume(end + 1);
+            return Some(false);
+        }
+        let all = buffered.len();
+        reader.consume(all);
+    }
 }
 
 /// A journal record as the phone sees it: its `seq` and the event `{type, data}`.
@@ -276,42 +351,44 @@ mod tests {
         records.iter().map(|(j, s, _)| format!("{j}{s}")).collect()
     }
 
+    const ALL: usize = usize::MAX;
+
+    fn after(journal: &str, seq: u64) -> Cursor {
+        Cursor {
+            journal: journal.into(),
+            seq,
+        }
+    }
+
     #[tokio::test]
     async fn replay_starts_after_the_cursor_and_crosses_journals() {
         let dir = temp("octet-hub-replay");
         let a = journal(dir.path(), "a.jsonl", 0..4);
         let b = journal(dir.path(), "b.jsonl", 0..3);
         let journals = [a, b.clone()];
-        let after = |journal: &str, seq| {
-            Some(Cursor {
-                journal: journal.into(),
-                seq,
-            })
-        };
-        let got = replay(&journals, after("a.jsonl", 1).as_ref()).await;
+        let (got, more) = replay(&journals, Some(&after("a.jsonl", 1)), 500).await;
         assert_eq!(
             marks(&got),
             ["a.jsonl2", "a.jsonl3", "b.jsonl0", "b.jsonl1", "b.jsonl2"]
         );
+        assert!(!more);
         assert_eq!(got[0].2, serde_json::json!({"type": "t", "data": null}));
         // No cursor: the newest journal only. A stale cursor: the same.
         let newest = ["b.jsonl0", "b.jsonl1", "b.jsonl2"];
-        assert_eq!(marks(&replay(&journals, None).await), newest);
+        assert_eq!(marks(&replay(&journals, None, 500).await.0), newest);
+        let stale = after("gone.jsonl", 9);
+        assert_eq!(marks(&replay(&journals, Some(&stale), 500).await.0), newest);
+        let end = after("b.jsonl", 2);
         assert_eq!(
-            marks(&replay(&journals, after("gone.jsonl", 9).as_ref()).await),
-            newest
+            replay(&journals, Some(&end), 500).await,
+            (Vec::new(), false)
         );
-        assert!(
-            replay(&journals, after("b.jsonl", 2).as_ref())
-                .await
-                .is_empty()
-        );
-        assert!(replay(&[], None).await.is_empty());
+        assert_eq!(replay(&[], None, 500).await, (Vec::new(), false));
         // A journal that is missing or half written does not stop the rest.
         let half = dir.path().join("c.jsonl");
         std::fs::write(&half, "{\"seq\":0,\"type\":\"t\"}\n{\"seq\":1,\"ty").unwrap();
         let all = [dir.path().join("none.jsonl"), b, half];
-        let got = replay(&all, after("b.jsonl", 1).as_ref()).await;
+        let (got, _) = replay(&all, Some(&after("b.jsonl", 1)), 500).await;
         assert_eq!(marks(&got), ["b.jsonl2", "c.jsonl0"]);
     }
 
@@ -319,10 +396,89 @@ mod tests {
     async fn replay_without_a_cursor_keeps_the_last_500_records() {
         let dir = temp("octet-hub-replay-long");
         let long = journal(dir.path(), "a.jsonl", 0..1200);
-        let got = replay(&[long], None).await;
+        let (got, more) = replay(&[long], None, 500).await;
         assert_eq!(got.len(), 500);
+        assert!(!more);
         assert_eq!(got.first().map(|r| r.1), Some(700));
         assert_eq!(got.last().map(|r| r.1), Some(1199));
+    }
+
+    #[tokio::test]
+    async fn pages_of_a_replay_add_up_to_one_replay() {
+        let dir = temp("octet-hub-pages");
+        let journals = [
+            journal(dir.path(), "a.jsonl", 0..7),
+            journal(dir.path(), "b.jsonl", 0..4),
+            journal(dir.path(), "c.jsonl", 0..6),
+        ];
+        let first = after("a.jsonl", 0);
+        let (whole, more) = replay(&journals, Some(&first), ALL).await;
+        assert_eq!((whole.len(), more), (16, false));
+        let mut paged = Vec::new();
+        let mut cursor = Some(first);
+        loop {
+            let (page, more) = replay(&journals, cursor.as_ref(), 5).await;
+            assert!(page.len() <= 5);
+            let Some(last) = page.last() else { break };
+            cursor = Some(after(&last.0, last.1));
+            paged.extend(page);
+            assert!(
+                more || paged.len() == whole.len(),
+                "a short page says there is more"
+            );
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(marks(&paged), marks(&whole));
+        // A page that ends exactly at the end of the records has nothing more.
+        let (page, more) = replay(&journals, Some(&after("a.jsonl", 0)), 16).await;
+        assert_eq!((page.len(), more), (16, false));
+    }
+
+    #[tokio::test]
+    async fn a_long_journal_replays_in_pages() {
+        let dir = temp("octet-hub-50k");
+        let long = journal(dir.path(), "a.jsonl", 0..50_000);
+        let journals = [long];
+        let (page, more) = replay(&journals, Some(&after("a.jsonl", 0)), 500).await;
+        assert_eq!((page.len(), more), (500, true));
+        assert_eq!(page.first().map(|r| r.1), Some(1));
+        let (page, more) = replay(&journals, Some(&after("a.jsonl", 40_000)), 500).await;
+        assert_eq!((page.len(), more), (500, true));
+        assert_eq!(page.last().map(|r| r.1), Some(40_500));
+        let (page, more) = replay(&journals, Some(&after("a.jsonl", 49_700)), 500).await;
+        assert_eq!((page.len(), more), (299, false));
+        // No cursor: the last 500, however long the journal.
+        let (page, more) = replay(&journals, None, 500).await;
+        assert_eq!((page.len(), more), (500, false));
+        assert_eq!(page.first().map(|r| r.1), Some(49_500));
+    }
+
+    #[tokio::test]
+    async fn a_replaced_file_is_read_from_its_start() {
+        let dir = temp("octet-hub-replaced");
+        let path = dir.path().join("a.jsonl");
+        std::fs::write(&path, "{\"seq\":0}\n").unwrap();
+        let mut tail = Tail::new(path.clone());
+        assert_eq!(tail.read().await.unwrap().len(), 1);
+        assert!(
+            tail.read().await.unwrap().is_empty(),
+            "unchanged: nothing to read"
+        );
+        // Another file, longer than the old one, takes its place.
+        let other = dir.path().join("other.jsonl");
+        std::fs::write(&other, "{\"seq\":10}\n{\"seq\":11}\n{\"seq\":12}\n").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        let got = tail.read().await.unwrap();
+        let seqs: Vec<_> = got.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, [10, 11, 12]);
+    }
+
+    #[tokio::test]
+    async fn a_tail_does_not_read_what_is_not_a_regular_file() {
+        let mut tail = Tail::new(PathBuf::from("/dev/null"));
+        assert!(tail.read().await.is_err());
     }
 
     #[tokio::test]

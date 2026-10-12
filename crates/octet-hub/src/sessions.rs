@@ -6,11 +6,14 @@
 //! A session's one [`Tail`] is the source of truth for live events. It starts at the last whole
 //! line of the newest journal when the hub first sees the session (older history is for
 //! [`replay`](crate::tail::replay)), and moves to each later journal from its first byte, after
-//! the old journal's remaining whole lines are emitted. A client that subscribes registers
-//! first, then replays, buffers live [`SessionUpdate::Event`]s meanwhile, and drops any event
-//! whose `(journal, seq)` the replay already delivered. Everything the tail emits after the
-//! subscription is therefore either in the replay or delivered live, so nothing is lost and
-//! nothing repeats.
+//! the old journal's remaining whole lines are emitted. Journals and their records are emitted
+//! in order, so a client's position is a high-water mark: `(index of the journal in the
+//! registration's list, seq)`, see [`Sessions::journals`]. A client that subscribes registers
+//! first, then replays page by page (each page's last record is the next cursor), meanwhile
+//! buffering live [`SessionUpdate::Event`]s in a capped buffer (a client that overflows it is
+//! dropped, and resumes from its cursor), and then drops every buffered event at or below its
+//! high-water mark. Everything the tail emits after the subscription is either in the replay
+//! or delivered live, so nothing is lost and nothing repeats.
 use crate::tail::{Tail, event_of, file_name};
 use octet_core::remote::{
     protocol::{BridgeCommand, MAX_MESSAGE, VERSION, bridge_command_json},
@@ -200,7 +203,13 @@ impl Sessions {
     /// directory and really a socket), and the socket connects. A registration that fails goes
     /// away, with its `.json` (and its socket, when it was the connection that failed). Sessions
     /// whose registration is gone are dropped, linked ones whose link broke are linked again,
-    /// and a session that gained a journal moves its tail there.
+    /// and a session that gained a journal moves its tail there. Every journal it lists must be
+    /// a regular file (no symlink, FIFO or device) named like a journal, directly in the data
+    /// directory (the run directory's parent); a registration with another is refused and its
+    /// `.json` removed, and one whose journal does not exist yet waits.
+    ///
+    /// Not cancel-safe: call it from the server loop that also drives [`next`](Self::next),
+    /// never as a branch of a `select!` that can drop it half done.
     pub(crate) async fn refresh(&mut self) {
         let home = tokio::fs::canonicalize(&self.run).await.ok();
         let mut changed = false;
@@ -209,6 +218,29 @@ impl Sessions {
             if !vetted(home.as_deref(), &file, &registration).await {
                 let _ = tokio::fs::remove_file(&file).await;
                 continue;
+            }
+            match check_journals(
+                home.as_deref().and_then(Path::parent),
+                &registration.journals,
+            )
+            .await
+            {
+                Journals::Fine => {}
+                Journals::Refused => {
+                    let _ = tokio::fs::remove_file(&file).await;
+                    continue;
+                }
+                Journals::Missing => {
+                    // Not trusted yet, but not wrong either: a session already known stays.
+                    if self
+                        .live
+                        .iter()
+                        .any(|l| l.registration.id == registration.id)
+                    {
+                        present.push(registration.id.clone());
+                    }
+                    continue;
+                }
             }
             let known = self
                 .live
@@ -266,6 +298,11 @@ impl Sessions {
     /// The `sessions` frame's rows, oldest session first.
     pub(crate) fn list(&self) -> Vec<Value> {
         self.live.iter().map(Live::row).collect()
+    }
+
+    /// The journals of session `id`, oldest first.
+    pub(crate) fn journals(&self, id: &str) -> Option<Vec<PathBuf>> {
+        Some(self.find(id)?.registration.journals.clone())
     }
 
     /// The last state session `id` sent; none while it has no link.
@@ -456,7 +493,8 @@ fn emit(pending: &mut VecDeque<SessionUpdate>, id: &str, journal: &str, records:
 }
 
 /// Moves `live`'s tail to the newest of `journals`. What the old journal has left is emitted
-/// first, then every journal in between whole, and the tail starts the newest from its first byte.
+/// first, then every journal between whole (every earlier one when it had no tail or its journal
+/// left the list), and the tail starts the newest from its first byte.
 async fn follow(live: &mut Live, journals: &[PathBuf], pending: &mut VecDeque<SessionUpdate>) {
     let Some(newest) = journals.last() else {
         return;
@@ -469,10 +507,12 @@ async fn follow(live: &mut Live, journals: &[PathBuf], pending: &mut VecDeque<Se
     if let Some(tail) = live.tail.as_mut() {
         drain(tail, &id, pending).await;
     }
-    let between = match current.and_then(|c| journals.iter().position(|j| *j == c)) {
-        Some(at) => &journals[at + 1..journals.len() - 1],
-        None => &[],
-    };
+    // Journals before the newest that this tail has not passed come whole: all of the new
+    // ones when it had none or its journal left the list, those after its journal otherwise.
+    let start = current
+        .and_then(|c| journals.iter().position(|j| *j == c))
+        .map_or(0, |at| at + 1);
+    let between = journals.get(start..journals.len() - 1).unwrap_or_default();
     for path in between {
         drain(&mut Tail::new(path.clone()), &id, pending).await;
     }
@@ -516,6 +556,10 @@ async fn scan(run: &Path) -> Vec<(PathBuf, Registration)> {
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
+        // A symlink, FIFO or directory named like a registration is not one.
+        if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
+            continue;
+        }
         let Ok(file) = tokio::fs::File::open(&path).await else {
             continue;
         };
@@ -552,6 +596,52 @@ async fn vetted(home: Option<&Path>, file: &Path, registration: &Registration) -
         && registration.id == format!("{pid}-{}", registration.started)
         && socket.file_name().and_then(|n| n.to_str()) == Some(&format!("{pid}.sock"))
         && in_home
+}
+
+/// What the journals a registration lists amount to.
+#[derive(Debug, PartialEq, Eq)]
+enum Journals {
+    /// Every one is a regular file the hub may read.
+    Fine,
+    /// One is not a journal of this data directory, or not a regular file.
+    Refused,
+    /// One does not exist (yet).
+    Missing,
+}
+
+/// Whether `journals` are all regular files (not symlinks) named like journals, directly in
+/// `data`, the canonical data directory: the hub reads nothing else, and opens nothing that
+/// could block, such as a FIFO.
+async fn check_journals(data: Option<&Path>, journals: &[PathBuf]) -> Journals {
+    let Some(data) = data else {
+        return Journals::Refused;
+    };
+    let mut verified: Option<&Path> = None;
+    let mut missing = false;
+    for journal in journals {
+        let Some(parent) = journal.parent() else {
+            return Journals::Refused;
+        };
+        if octet_store::journal_stamp(journal).is_none() {
+            return Journals::Refused;
+        }
+        if verified != Some(parent) {
+            match tokio::fs::canonicalize(parent).await {
+                Ok(canonical) if canonical == data => verified = Some(parent),
+                _ => return Journals::Refused,
+            }
+        }
+        match tokio::fs::symlink_metadata(journal).await {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = true,
+            _ => return Journals::Refused,
+        }
+    }
+    if missing {
+        Journals::Missing
+    } else {
+        Journals::Fine
+    }
 }
 
 /// Reads the bridge's lines and forwards its frames, until the link ends.
@@ -740,8 +830,8 @@ mod tests {
     #[tokio::test]
     async fn a_reconnect_continues_into_the_next_journal() {
         let env = Env::new();
-        env.journal("a.jsonl", 0..2);
-        let one = env.registration(4001, &["a.jsonl"]);
+        env.journal("session-1-1.jsonl", 0..2);
+        let one = env.registration(4001, &["session-1-1.jsonl"]);
         let _bridge = Env::listen(&one);
         one.write(&env.run).await.unwrap();
         let mut sessions = Sessions::new(env.run.clone());
@@ -749,13 +839,13 @@ mod tests {
         assert_eq!(sessions.list().len(), 1);
         assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
         // History before the hub looked is for replay, not for the live tail.
-        env.journal("a.jsonl", 2..4);
-        assert_eq!(event(&next(&mut sessions).await), ("a.jsonl", 2));
-        assert_eq!(event(&next(&mut sessions).await), ("a.jsonl", 3));
+        env.journal("session-1-1.jsonl", 2..4);
+        assert_eq!(event(&next(&mut sessions).await), ("session-1-1.jsonl", 2));
+        assert_eq!(event(&next(&mut sessions).await), ("session-1-1.jsonl", 3));
         // The terminal UI reconnects: a record lands in `a` just before, then `b` begins.
-        env.journal("a.jsonl", 4..5);
-        env.journal("b.jsonl", 0..2);
-        let two = env.registration(4001, &["a.jsonl", "b.jsonl"]);
+        env.journal("session-1-1.jsonl", 4..5);
+        env.journal("session-2-1.jsonl", 0..2);
+        let two = env.registration(4001, &["session-1-1.jsonl", "session-2-1.jsonl"]);
         two.write(&env.run).await.unwrap();
         sessions.refresh().await;
         let got = [
@@ -763,11 +853,11 @@ mod tests {
             next(&mut sessions).await,
             next(&mut sessions).await,
         ];
-        assert_eq!(event(&got[0]), ("a.jsonl", 4));
-        assert_eq!(event(&got[1]), ("b.jsonl", 0));
-        assert_eq!(event(&got[2]), ("b.jsonl", 1));
-        env.journal("b.jsonl", 2..3);
-        assert_eq!(event(&next(&mut sessions).await), ("b.jsonl", 2));
+        assert_eq!(event(&got[0]), ("session-1-1.jsonl", 4));
+        assert_eq!(event(&got[1]), ("session-2-1.jsonl", 0));
+        assert_eq!(event(&got[2]), ("session-2-1.jsonl", 1));
+        env.journal("session-2-1.jsonl", 2..3);
+        assert_eq!(event(&next(&mut sessions).await), ("session-2-1.jsonl", 2));
     }
 
     #[tokio::test]
@@ -780,19 +870,26 @@ mod tests {
         sessions.refresh().await;
         assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
         // The first journal appears after the hub looked: all of it is new.
-        env.journal("a.jsonl", 0..2);
-        env.registration(4050, &["a.jsonl"])
+        env.journal("session-1-1.jsonl", 0..2);
+        env.registration(4050, &["session-1-1.jsonl"])
             .write(&env.run)
             .await
             .unwrap();
         sessions.refresh().await;
-        assert_eq!(event(&next(&mut sessions).await), ("a.jsonl", 0));
-        assert_eq!(event(&next(&mut sessions).await), ("a.jsonl", 1));
+        assert_eq!(event(&next(&mut sessions).await), ("session-1-1.jsonl", 0));
+        assert_eq!(event(&next(&mut sessions).await), ("session-1-1.jsonl", 1));
         // Two reconnects between passes: `a`'s rest, all of `b`, then `c` as it is written.
-        env.journal("a.jsonl", 2..3);
-        env.journal("b.jsonl", 0..2);
-        env.journal("c.jsonl", 0..1);
-        let three = env.registration(4050, &["a.jsonl", "b.jsonl", "c.jsonl"]);
+        env.journal("session-1-1.jsonl", 2..3);
+        env.journal("session-2-1.jsonl", 0..2);
+        env.journal("session-3-1.jsonl", 0..1);
+        let three = env.registration(
+            4050,
+            &[
+                "session-1-1.jsonl",
+                "session-2-1.jsonl",
+                "session-3-1.jsonl",
+            ],
+        );
         three.write(&env.run).await.unwrap();
         sessions.refresh().await;
         let mut got = Vec::new();
@@ -801,12 +898,114 @@ mod tests {
             got.push((event(&update).0.to_owned(), event(&update).1));
         }
         let expected = [
-            ("a.jsonl", 2),
-            ("b.jsonl", 0),
-            ("b.jsonl", 1),
-            ("c.jsonl", 0),
+            ("session-1-1.jsonl", 2),
+            ("session-2-1.jsonl", 0),
+            ("session-2-1.jsonl", 1),
+            ("session-3-1.jsonl", 0),
         ];
         assert_eq!(got, expected.map(|(j, s)| (j.to_owned(), s)));
+    }
+
+    #[tokio::test]
+    async fn journals_that_are_not_the_hubs_to_read_are_refused() {
+        let env = Env::new();
+        let outside = Env::new();
+        let fifo = env.root.join("session-9-1.jsonl");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|status| status.success()) {
+            return;
+        }
+        env.journal("notes.jsonl", 0..1);
+        env.journal("real-session-1-1.jsonl", 0..1);
+        outside.journal("session-8-1.jsonl", 0..1);
+        env.journal("session-7-1.jsonl", 0..1);
+        std::os::unix::fs::symlink(
+            env.root.join("session-7-1.jsonl"),
+            env.root.join("session-6-1.jsonl"),
+        )
+        .unwrap();
+        let cases = [
+            (4060, vec![fifo]),
+            (4061, vec![outside.root.join("session-8-1.jsonl")]),
+            (4062, vec![env.root.join("notes.jsonl")]),
+            (4063, vec![env.root.join("session-6-1.jsonl")]),
+            (
+                4064,
+                vec![
+                    env.root.join("session-7-1.jsonl"),
+                    env.root.join("session-5-1.jsonl"),
+                ],
+            ),
+            (4065, vec![env.root.join("sub/../session-7-1.jsonl")]),
+        ];
+        let mut keep = Vec::new();
+        for (pid, journals) in cases {
+            let mut registration = env.registration(pid, &[]);
+            registration.journals = journals;
+            keep.push(Env::listen(&registration));
+            registration.write(&env.run).await.unwrap();
+        }
+        // The good one, beside them.
+        env.journal("session-4-1.jsonl", 0..1);
+        let good = env.registration(4066, &["session-4-1.jsonl"]);
+        keep.push(Env::listen(&good));
+        good.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        timeout(Duration::from_secs(5), sessions.refresh())
+            .await
+            .expect("a journal that is not a file does not wedge the hub");
+        let ids: Vec<_> = sessions
+            .list()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!("4066-1790000000")]);
+        for pid in [4060, 4061, 4062, 4063, 4065] {
+            assert!(!env.run.join(format!("{pid}.json")).exists(), "{pid} stays");
+        }
+        // A journal that does not exist yet is not wrong: the registration waits for it.
+        assert!(env.run.join("4064.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_session_that_gains_journals_loses_none_of_their_records() {
+        let env = Env::new();
+        let none = env.registration(4070, &[]);
+        let _bridge = Env::listen(&none);
+        none.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        env.journal("session-1-1.jsonl", 0..2);
+        env.journal("session-2-1.jsonl", 0..1);
+        let two = env.registration(4070, &["session-1-1.jsonl", "session-2-1.jsonl"]);
+        two.write(&env.run).await.unwrap();
+        sessions.refresh().await;
+        for want in [
+            ("session-1-1.jsonl", 0),
+            ("session-1-1.jsonl", 1),
+            ("session-2-1.jsonl", 0),
+        ] {
+            assert_eq!(event(&next(&mut sessions).await), want);
+        }
+        assert_eq!(
+            sessions.journals("4070-1790000000"),
+            Some(two.journals.clone())
+        );
+        // The journal it followed leaves the list: the earlier ones in the new list come whole.
+        env.journal("session-3-1.jsonl", 0..2);
+        env.journal("session-4-1.jsonl", 0..1);
+        let moved = env.registration(4070, &["session-3-1.jsonl", "session-4-1.jsonl"]);
+        moved.write(&env.run).await.unwrap();
+        sessions.refresh().await;
+        for want in [
+            ("session-3-1.jsonl", 0),
+            ("session-3-1.jsonl", 1),
+            ("session-4-1.jsonl", 0),
+        ] {
+            assert_eq!(event(&next(&mut sessions).await), want);
+        }
+        assert_eq!(sessions.journals("nobody"), None);
     }
 
     #[tokio::test]
@@ -865,8 +1064,8 @@ mod tests {
     #[tokio::test]
     async fn bridge_frames_and_replies_reach_the_hub() {
         let env = Env::new();
-        env.journal("a.jsonl", 0..1);
-        let registration = env.registration(4010, &["a.jsonl"]);
+        env.journal("session-1-1.jsonl", 0..1);
+        let registration = env.registration(4010, &["session-1-1.jsonl"]);
         let bridge = Env::listen(&registration);
         registration.write(&env.run).await.unwrap();
         let mut sessions = Sessions::new(env.run.clone());
@@ -910,7 +1109,7 @@ mod tests {
         assert_eq!(sessions.catalog(&id), Some(&json!({"modes": ["ask"]})));
         let rows = sessions.list();
         assert_eq!(rows.len(), 1);
-        let mtime = std::fs::metadata(env.root.join("a.jsonl"))
+        let mtime = std::fs::metadata(env.root.join("session-1-1.jsonl"))
             .unwrap()
             .modified()
             .unwrap()
