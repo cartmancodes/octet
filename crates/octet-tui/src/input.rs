@@ -16,7 +16,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use octet_core::Command;
 use std::fmt::Write as _;
 use std::{
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -644,7 +643,7 @@ async fn tab_key(app: &mut App) {
         apply_tab(app, tab);
         return;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = octet_core::home_dir();
     app.composer.listing.store(true, Ordering::SeqCst);
     let listing = Listing(Arc::clone(&app.composer.listing));
     let (text, cursor, root) = (

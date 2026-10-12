@@ -387,6 +387,17 @@ pub fn valid_identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
+/// The user's home directory: `$HOME`, when it is an absolute path. A
+/// relative or empty one would resolve against whatever folder Octet runs in.
+pub fn home_dir() -> Option<PathBuf> {
+    home_from(std::env::var_os("HOME"))
+}
+
+/// `home_dir` from `$HOME`'s value.
+fn home_from(value: Option<OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|home| home.is_absolute())
+}
+
 /// A vendor catalog: `selection_key` names what to pass the vendor,
 /// `id_key` the full model ID it resolves to.
 fn model_catalog_with(value: &Value, selection_key: &str, id_key: &str) -> Vec<ModelInfo> {
@@ -941,6 +952,16 @@ pub fn spawn_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn home_is_only_an_absolute_path() {
+        assert_eq!(
+            home_from(Some("/home/me".into())),
+            Some(PathBuf::from("/home/me"))
+        );
+        assert_eq!(home_from(Some("relative/home".into())), None);
+        assert_eq!(home_from(Some("".into())), None);
+        assert_eq!(home_from(None), None);
+    }
     #[test]
     fn claude_has_time_to_exit_on_its_own() {
         let process = |engine| vendor_process(engine, "cli".into(), Vec::new(), ".".into());

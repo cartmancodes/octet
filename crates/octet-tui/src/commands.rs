@@ -282,7 +282,7 @@ async fn image_command(app: &mut App, argument: &str) -> bool {
 /// relative path is in the workspace. A path dragged into the terminal
 /// arrives quoted or with backslash escapes; both are undone.
 pub(crate) fn resolve_path(root: &std::path::Path, argument: &str) -> std::path::PathBuf {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = octet_core::home_dir();
     path_in(root, home.as_deref(), argument)
 }
 

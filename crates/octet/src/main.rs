@@ -126,12 +126,7 @@ async fn run() -> Result<i32, CliError> {
                 .filter(|p| p.is_absolute())
                 .map(|p| p.join(JOURNAL_DIR))
         })
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .map(|p| p.join(".local/share").join(JOURNAL_DIR))
-        })
+        .or_else(|| octet_core::home_dir().map(|p| p.join(".local/share").join(JOURNAL_DIR)))
         .ok_or_else(|| {
             CliError::Usage("Set --journal-dir or HOME to choose transcript storage".into())
         })?;

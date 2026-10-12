@@ -12,18 +12,15 @@ use std::{
 /// Claude's user configuration folder, as Claude finds it:
 /// `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
 pub(crate) fn user_dir() -> Option<PathBuf> {
-    config_dir(
-        std::env::var_os("CLAUDE_CONFIG_DIR"),
-        std::env::var_os("HOME"),
-    )
+    config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"), super::home_dir())
 }
 
-/// `user_dir` from the two variables' values; an empty one is unset.
-fn config_dir(claude: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    let set = |value: Option<OsString>| value.filter(|value| !value.is_empty());
-    set(claude)
+/// `user_dir` from `$CLAUDE_CONFIG_DIR` (empty is unset) and the home folder.
+fn config_dir(claude: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    claude
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| set(home).map(|home| PathBuf::from(home).join(".claude")))
+        .or_else(|| home.map(|home| home.join(".claude")))
 }
 
 /// The enabled plugin names (sorted), and a warning for each file that exists
