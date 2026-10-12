@@ -439,9 +439,22 @@ impl App {
             ..Connection::new(config, journal)
         };
         self.chat.catalog_focus = None;
+        self.calls_over();
         self.overlay.approvals.clear();
         self.overlay.approval_scroll = 0;
         self.goals.reset_turn();
+    }
+    /// The turn ended, finished or not: its calls still running were stopped.
+    fn calls_over(&mut self) {
+        for entry in self
+            .chat
+            .entries
+            .iter_mut()
+            .filter(|e| e.role == Role::Tool && !e.turn_over)
+        {
+            entry.turn_over = true;
+            entry.invalidate();
+        }
     }
     /// Another provider takes over: renders the conversation so far to go
     /// with the next prompt. Whether there was anything to carry.
@@ -696,7 +709,9 @@ impl App {
         self.chat.entries.push_back(entry);
         self.trim();
     }
-    /// A tool call joins the newest entry when that is a tools entry, else starts one.
+    /// An end goes to the current turn's call with its ID, wherever other entries put it; any other
+    /// call joins the newest entry when that is an open tools entry under `BLOCK_BYTES`, else
+    /// starts one.
     fn tool(&mut self, mut call: octet_core::ToolCall) {
         call.name = clean(&call.name);
         call.target = clean(&call.target);
@@ -710,22 +725,30 @@ impl App {
                 &call.detail[start..]
             );
         }
-        if self
-            .chat
-            .entries
-            .back()
-            .is_none_or(|e| e.role != Role::Tool || e.turn_over)
-        {
-            let mut entry = Entry::tools(self.conn.engine, self.chat.tools_expanded);
-            self.chat.next_seq += 1;
-            entry.seq = self.chat.next_seq;
-            self.chat.entries.push_back(entry);
-        }
-        let entry = self
-            .chat
-            .entries
-            .back_mut()
-            .expect("a tools entry was just ensured");
+        let paired = (call.phase != octet_core::ToolPhase::Running && !call.id.is_empty())
+            .then(|| {
+                self.chat.entries.iter().rposition(|e| {
+                    e.role == Role::Tool && !e.turn_over && e.tools.iter().any(|c| c.id == call.id)
+                })
+            })
+            .flatten();
+        let index = if let Some(index) = paired {
+            index
+        } else {
+            if self
+                .chat
+                .entries
+                .back()
+                .is_none_or(|e| e.role != Role::Tool || e.turn_over || e.size() > BLOCK_BYTES)
+            {
+                let mut entry = Entry::tools(self.conn.engine, self.chat.tools_expanded);
+                self.chat.next_seq += 1;
+                entry.seq = self.chat.next_seq;
+                self.chat.entries.push_back(entry);
+            }
+            self.chat.entries.len() - 1
+        };
+        let entry = &mut self.chat.entries[index];
         let before = entry.size();
         entry.record(call);
         self.chat.bytes = self.chat.bytes - before + entry.size();
@@ -966,15 +989,7 @@ impl App {
             }
             Event::Usage(text) => self.conn.usage = clean(&text),
             Event::Finished { outcome } => {
-                for entry in self
-                    .chat
-                    .entries
-                    .iter_mut()
-                    .filter(|e| e.role == Role::Tool && !e.turn_over)
-                {
-                    entry.turn_over = true;
-                    entry.invalidate();
-                }
+                self.calls_over();
                 self.conn.end_turn();
                 self.clear_status(StatusKind::Cancelling);
                 self.conn.status = clean(outcome.as_str());
@@ -1025,6 +1040,7 @@ impl App {
             }
             Event::Stopped => {
                 // A cancelled connection stops without finishing a turn.
+                self.calls_over();
                 self.clear_status(StatusKind::Cancelling);
                 if self.conn.activity != State::Error {
                     self.conn.activity = State::Sleeping;
