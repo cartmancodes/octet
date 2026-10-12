@@ -517,6 +517,7 @@ name = "octet-hub"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "octet-core",
  "octet-store",
  "octet-testkit",
  "serde_json",
