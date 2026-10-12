@@ -122,12 +122,7 @@ impl Models {
         let Some(prober) = &self.prober else {
             return false;
         };
-        self.skill_catalogs
-            .fetched(engine, &prober.cwd)
-            .is_none_or(|fetched| {
-                now.duration_since(fetched)
-                    .map_or(true, |age| age >= catalog::STALE_AFTER)
-            })
+        catalog::is_stale(self.skill_catalogs.fetched(engine, &prober.cwd), now)
     }
 
     /// `/model refresh`: probes every other provider now, forgetting any

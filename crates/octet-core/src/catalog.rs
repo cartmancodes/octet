@@ -117,10 +117,7 @@ impl Catalogs {
     /// Whether `engine`'s list is missing or older than `STALE_AFTER` (a
     /// time in the future, from a changed clock, counts as stale).
     pub fn stale(&self, engine: Engine, now: SystemTime) -> bool {
-        self.get(engine).is_none_or(|listed| {
-            now.duration_since(listed.fetched)
-                .map_or(true, |age| age >= STALE_AFTER)
-        })
+        is_stale(self.get(engine).map(|listed| listed.fetched), now)
     }
 
     /// The providers whose list has `name` as a selection or full ID.
@@ -156,6 +153,16 @@ impl Catalogs {
             })
             .collect()
     }
+}
+
+/// Whether a list fetched at `fetched` (`None`: never) should be fetched
+/// again: missing, older than [`STALE_AFTER`], or from a time ahead of the
+/// clock (a changed clock).
+pub fn is_stale(fetched: Option<SystemTime>, now: SystemTime) -> bool {
+    fetched.is_none_or(|fetched| {
+        now.duration_since(fetched)
+            .map_or(true, |age| age >= STALE_AFTER)
+    })
 }
 
 /// Writes `bytes` to `path` through a private (0600) temporary file renamed
