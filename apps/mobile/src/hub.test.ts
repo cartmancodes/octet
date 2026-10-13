@@ -373,6 +373,9 @@ describe("the app's lifecycle", () => {
     expect(r.sockets.all).toHaveLength(2);
     r.hub.setForeground(true); // the app is active again
     expect(r.sockets.all).toHaveLength(3);
+    expect(r.clock.delays).not.toContain(500); // the backoff timer was cancelled, not left to connect again
+    r.clock.advance(500);
+    expect(r.sockets.all).toHaveLength(3);
     expect(r.sockets.last).not.toBe(dropped);
     r.sockets.last.open();
     expect(r.sockets.last.commandsOf("hello")).toHaveLength(1);

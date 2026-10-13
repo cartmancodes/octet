@@ -155,6 +155,8 @@ export class HubClient {
   private cancelPing: (() => void) | null = null;
   /** The req of the ping awaiting its answer; null between pings. */
   private pingReq: number | null = null;
+  /** When a frame last came in on the current socket. */
+  private lastHeard = 0;
 
   private readonly wanted = new Set<string>();
   private readonly pending = new Map<number, Pending>();
@@ -455,13 +457,22 @@ export class HubClient {
     this.retryTimers.clear();
   }
 
-  /** Arms the next ping, `PING_INTERVAL_MS` from now. */
-  private armPing(): void {
+  /** Arms the keepalive: a ping when the link has been silent for `delay` (the full interval after
+   * a welcome or an answer). Any inbound frame is proof of life, so a link that spoke since is not
+   * pinged yet, and one that spoke since a ping went out is not dead: a pong queued behind a heavy
+   * replay is no reason to drop the link. */
+  private armPing(delay = PING_INTERVAL_MS): void {
     this.cancelPing?.();
     const socket = this.socket;
     this.cancelPing = this.schedule(() => {
       this.cancelPing = null;
       if (this.socket !== socket) return;
+      const quiet = this.now() - this.lastHeard;
+      if (quiet < PING_INTERVAL_MS) {
+        this.armPing(PING_INTERVAL_MS - quiet);
+        return;
+      }
+      const sentAt = this.now();
       this.pingReq = this.send({ type: "ping" });
       if (this.pingReq === null) {
         this.lost(); // a socket that cannot send is as good as dead
@@ -470,9 +481,11 @@ export class HubClient {
       this.cancelPing = this.schedule(() => {
         this.cancelPing = null;
         this.pingReq = null;
-        if (this.socket === socket) this.lost();
+        if (this.socket !== socket) return;
+        if (this.lastHeard > sentAt) this.armPing();
+        else this.lost();
       }, PING_TIMEOUT_MS);
-    }, PING_INTERVAL_MS);
+    }, delay);
   }
 
   /** True when `req` answers the ping in flight (and then the next one is armed). */
@@ -508,6 +521,7 @@ export class HubClient {
   // Frames
 
   private handle(text: string): void {
+    this.lastHeard = this.now();
     const frame = parseFrame(text);
     if (!frame) {
       this.garbage += 1;

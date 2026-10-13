@@ -76,6 +76,17 @@ describe("approvals", () => {
     expect(v.journals).toEqual(["j1", "j2"]);
   });
 
+  it("a late event from an older journal keeps the closed", () => {
+    const stale = state({ approvals: [{ id: 3, summary: summary("stale") }] });
+    let v = view([{ op: "journals", journals: ["j1"] }, approval(1), closed(1)]);
+    v = view([{ op: "journals", journals: ["j1", "j2"] }, { op: "event", ev: { type: "text", data: "n" }, journal: "j2" }, approval(3), closed(3)], v);
+    expect(v.closed).toEqual([3]);
+    v = view([{ op: "event", ev: { type: "text", data: "late" }, journal: "j1" }, { op: "state", state: stale }], v);
+    expect(v.closed).toEqual([3]);
+    expect(ids(v)).toEqual([]); // the stale approval does not come back
+    expect(v.journals).toEqual(["j1", "j2"]);
+  });
+
   it("remember only the last 256 closed", () => {
     const ops: Op[] = [];
     for (let i = 0; i < 300; i++) ops.push(approval(i), closed(i));

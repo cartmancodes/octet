@@ -707,6 +707,29 @@ describe("keepalive", () => {
     expect(pings(r.sockets.last)).toHaveLength(0);
   });
 
+  it("any inbound frame is proof of life: a pong that is slow behind a replay does not drop the link", () => {
+    const r = rig();
+    welcomed(r);
+    r.client.subscribe("s1");
+    const socket = r.sockets.last;
+    socket.receive({ type: "subscribed", session: "s1", from: "start", journals: ["a"] });
+    r.clock.advance(PING_INTERVAL_MS);
+    expect(pings(socket)).toHaveLength(1);
+    // The replay streams on for 15 s, well past the ping's 10 s, with the pong still queued behind it.
+    for (let seq = 1; seq <= 5; seq++) {
+      r.clock.advance(3_000);
+      socket.receive(event("s1", "a", seq));
+    }
+    expect(socket.closed).toBe(false);
+    expect(r.states.at(-1)).toBe("ready");
+    r.clock.advance(PING_TIMEOUT_MS); // the old deadline passes: the link spoke since the ping
+    socket.receive({ type: "ack", req: pings(socket)[0]?.req, message: "pong" }); // the late pong is dropped
+    expect(socket.closed).toBe(false);
+    // Silence from here on is dead again, a full interval and deadline later.
+    r.clock.advance(PING_INTERVAL_MS + PING_TIMEOUT_MS);
+    expect(socket.closed).toBe(true);
+  });
+
   it("a link that drops leaves no keepalive timer behind", () => {
     const r = rig();
     welcomed(r);
@@ -980,7 +1003,9 @@ describe("a refused subscribe", () => {
     for (let n = 0; n < 3; n++) {
       refuse(r, code, n);
       expect(failed).toHaveLength(0);
-      expect(r.clock.delays[0]).toBe(5000);
+      // The keepalive started 50 ms before this (ready's flush), and has run 5 s per round since.
+      const keepalive = PING_INTERVAL_MS - 50 - n * 5000;
+      expect(r.clock.delays.filter((d) => d !== keepalive)).toEqual([5000]);
       r.clock.advance(4999);
       expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(n + 1);
       r.clock.advance(1);
@@ -1159,7 +1184,7 @@ describe("batching", () => {
     expect(eventSeqs(delivered(r))).toEqual(Array.from({ length: 150 }, (_, i) => `a:${i + 1}`));
   });
 
-  it("an idle client has no timer", () => {
+  it("an idle ready client has only the keepalive timer", () => {
     const r = rig();
     ready(r);
     flush(r);
