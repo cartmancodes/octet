@@ -56,11 +56,26 @@ describe("starting", () => {
     expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null, client: null });
   });
 
-  it("is unpaired with a token but no hub address", async () => {
+  it("is unpaired, and drops the token, with a token but no hub address", async () => {
     await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
     const r = rig();
     await r.hub.init();
     expect(r.hub.snapshot().status).toBe("unpaired");
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(r.sockets.all).toHaveLength(0);
+  });
+
+  it("does not trust a saved hub address that is not a pairing host: unpaired, token dropped", async () => {
+    for (const hubUrl of ["ws://mac.ts.net/", "wss://evil.example/path", "https://mac.ts.net/", "wss://mac.ts.net:99999/"]) {
+      await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
+      await saveSettings({ hubUrl });
+      const r = rig();
+      r.hub.setForeground(true);
+      await r.hub.init();
+      expect(r.hub.snapshot().status).toBe("unpaired");
+      expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+      expect(r.sockets.all).toHaveLength(0);
+    }
   });
 
   it("connects with the saved token and hub address, when the app is in the foreground", async () => {
@@ -140,7 +155,7 @@ describe("pairing", () => {
     const r = rig();
     await r.hub.init();
     const result = await r.hub.pair("https://example.com/", "iPhone");
-    expect(result).toEqual({ ok: false, message: "That isn't an Octet pairing link" });
+    expect(result).toEqual({ ok: false, message: "That isn't an Octet pairing link", clear: false });
     expect(r.sockets.all).toHaveLength(0);
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
   });
@@ -153,7 +168,7 @@ describe("pairing", () => {
     socket.open();
     const [command] = socket.commandsOf("pair");
     socket.receive({ type: "refused", req: command?.req, reason: "That pairing code has expired", code: "invalid" });
-    expect(await pending).toEqual({ ok: false, message: "That pairing code has expired" });
+    expect(await pending).toEqual({ ok: false, message: "That pairing code has expired", clear: true });
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
     expect(r.hub.snapshot().status).toBe("unpaired");
   });
@@ -163,7 +178,7 @@ describe("pairing", () => {
     await r.hub.init();
     const pending = r.hub.pair(LINK, "iPhone");
     r.sockets.last.drop();
-    expect(await pending).toEqual({ ok: false, message: "Can't reach your Mac" });
+    expect(await pending).toEqual({ ok: false, message: "Can't reach your Mac", clear: false });
   });
 
   it("falls back to the platform's name for a blank device name", async () => {
@@ -174,14 +189,67 @@ describe("pairing", () => {
     expect(r.sockets.last.commandsOf("pair")).toEqual([expect.objectContaining({ name: "iPhone" })]);
   });
 
-  it("does not go on when the keychain refuses the token", async () => {
+  it("keeps the token on this phone only: it never rides a backup to another handset", async () => {
+    const only = { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY };
+    const r = rig();
+    r.hub.setForeground(true);
+    await r.hub.init();
+    const pending = r.hub.pair(LINK, "iPhone");
+    accept(r);
+    await pending;
+    expect(SecureStore.setItemAsync).toHaveBeenCalledWith(TOKEN_KEY, TOKEN, only);
+    // Read and delete name the same options, so they reach the same keychain item.
+    expect(SecureStore.getItemAsync).toHaveBeenCalledWith(TOKEN_KEY, only);
+    r.sockets.last.open();
+    r.sockets.last.receive({ type: "refused", req: 0, reason: "revoked", code: "revoked" });
+    await new Promise((done) => setImmediate(done));
+    expect(SecureStore.deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY, only);
+  });
+
+  it("clears and retries the keychain write once", async () => {
     jest.mocked(SecureStore.setItemAsync).mockRejectedValueOnce(new Error("locked"));
     const r = rig();
     await r.hub.init();
     const pending = r.hub.pair(LINK, "iPhone");
     accept(r);
+    expect(await pending).toEqual({ ok: true });
+    expect(SecureStore.setItemAsync).toHaveBeenCalledTimes(2);
+    expect(SecureStore.deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY, expect.anything());
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+    expect(r.hub.snapshot().status).toBe("paired");
+  });
+
+  it("tells the user how to recover when the keychain refuses the token twice", async () => {
+    jest.mocked(SecureStore.setItemAsync).mockRejectedValueOnce(new Error("locked")).mockRejectedValueOnce(new Error("locked"));
+    const r = rig();
+    await r.hub.init();
+    const pending = r.hub.pair(LINK, "Work phone");
+    accept(r);
+    expect(await pending).toEqual({
+      ok: false,
+      message:
+        "This phone paired but couldn't save it. On the Mac run `octet hub revoke Work phone`, then pair again with a new code.",
+      clear: true,
+    });
+    expect(SecureStore.setItemAsync).toHaveBeenCalledTimes(2);
+    expect(r.hub.snapshot().status).toBe("unpaired");
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+  });
+
+  it("treats a hub address that cannot be saved like a keychain failure", async () => {
+    jest.mocked(AsyncStorage.setItem).mockRejectedValueOnce(new Error("full"));
+    const r = rig();
+    await r.hub.init();
+    const pending = r.hub.pair(LINK, "iPhone");
+    accept(r);
     const result = await pending;
-    expect(result.ok).toBe(false);
+    expect(result).toEqual({
+      ok: false,
+      message:
+        "This phone paired but couldn't save it. On the Mac run `octet hub revoke iPhone`, then pair again with a new code.",
+      clear: true,
+    });
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
     expect(r.hub.snapshot().status).toBe("unpaired");
   });
 
@@ -189,7 +257,7 @@ describe("pairing", () => {
     const r = rig();
     await r.hub.init();
     const first = r.hub.pair(LINK, "iPhone");
-    expect(await r.hub.pair(LINK, "iPhone")).toEqual({ ok: false, message: "Already pairing" });
+    expect(await r.hub.pair(LINK, "iPhone")).toEqual({ ok: false, message: "Already pairing", clear: false });
     expect(r.sockets.all).toHaveLength(1);
     accept(r);
     await first;

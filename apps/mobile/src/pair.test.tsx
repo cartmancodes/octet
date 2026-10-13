@@ -80,29 +80,49 @@ describe("the Pair screen", () => {
     expect(mockCamera.props?.barcodeScannerSettings).toEqual({ barcodeTypes: ["qr"] });
   });
 
-  it("a scanned link pairs, keeps the token in the keychain and goes to Sessions", async () => {
+  it("a scanned link asks which Mac before it pairs, and pairs only after the tap", async () => {
     const rig = await open();
     await scan(LINK);
+    expect(screen.getByText("Pair with mac.tail1234.ts.net?")).toBeTruthy();
+    expect(screen.getByLabelText("Pairing link").props.value).toBe(LINK);
+    expect(rig.sockets.all).toHaveLength(0);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
     expect((await loadSettings()).hubUrl).toBe("wss://mac.tail1234.ts.net/");
   });
 
-  it("a pasted link pairs with the Pair button", async () => {
+  it("Cancel drops a scanned link without pairing", async () => {
     const rig = await open();
+    await scan(LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText("Pair with mac.tail1234.ts.net?")).toBeNull();
+    expect(screen.getByLabelText("Pairing link").props.value).toBe("");
+    expect(rig.sockets.all).toHaveLength(0);
+    // The camera still sees the same code: it does not ask again until it sees another.
+    await scan(LINK);
+    expect(screen.queryByText("Pair with mac.tail1234.ts.net?")).toBeNull();
+  });
+
+  it("a pasted link shows its host, and Pair is off until there is a valid link", async () => {
+    const rig = await open();
+    expect(screen.getByRole("button", { name: "Pair" }).props.accessibilityState.disabled).toBe(true);
     await fireEvent.changeText(screen.getByLabelText("Pairing link"), LINK);
+    expect(screen.getByText("Pair with mac.tail1234.ts.net?")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Pair" }).props.accessibilityState.disabled).toBe(false);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
   });
 
-  it("an invalid pasted link says so and opens nothing", async () => {
+  it("an invalid pasted link says so, keeps Pair off and opens nothing", async () => {
     const { sockets } = await open();
     await fireEvent.changeText(screen.getByLabelText("Pairing link"), "https://example.com/");
+    expect(screen.getByText("That isn't an Octet pairing link")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Pair" }).props.accessibilityState.disabled).toBe(true);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    expect(await screen.findByText("That isn't an Octet pairing link")).toBeTruthy();
     expect(sockets.all).toHaveLength(0);
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
@@ -111,20 +131,49 @@ describe("the Pair screen", () => {
     const { sockets } = await open();
     await scan("WIFI:S:cafe;;");
     await scan("WIFI:S:cafe;;");
-    expect(await screen.findByText("That isn't an Octet pairing link")).toBeTruthy();
+    expect(screen.getAllByText("That isn't an Octet pairing link")).toHaveLength(1);
+    expect(screen.queryByText(/^Pair with .*\?$/)).toBeNull();
     expect(sockets.all).toHaveLength(0);
   });
 
-  it("a refused scan is not tried again while the camera still sees it", async () => {
+  it("after a refusal the link and the scan are forgotten, and the same code asks again", async () => {
     const rig = await open();
     await scan(LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     rig.sockets.last.open();
     const [command] = rig.sockets.last.commandsOf("pair");
     rig.sockets.last.receive({ type: "refused", req: command?.req, reason: "That pairing code has expired", code: "invalid" });
     expect(await screen.findByText("That pairing code has expired")).toBeTruthy();
+    expect(screen.getByLabelText("Pairing link").props.value).toBe("");
+    expect(screen.queryByText("Pair with mac.tail1234.ts.net?")).toBeNull();
     await scan(LINK);
-    await scan(LINK);
-    expect(rig.sockets.all).toHaveLength(1);
+    expect(screen.getByText("Pair with mac.tail1234.ts.net?")).toBeTruthy();
+    expect(rig.sockets.all).toHaveLength(1); // asked, not tried
+  });
+
+  it("tells how to recover when the phone cannot keep the token, and forgets the link", async () => {
+    jest.mocked(SecureStore.setItemAsync).mockRejectedValueOnce(new Error("locked")).mockRejectedValueOnce(new Error("locked"));
+    const rig = await open();
+    await fireEvent.changeText(screen.getByLabelText("Pairing link"), LINK);
+    await fireEvent.changeText(screen.getByLabelText("Device name"), "Work phone");
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    accept(rig);
+    expect(
+      await screen.findByText(
+        "This phone paired but couldn't save it. On the Mac run `octet hub revoke Work phone`, then pair again with a new code.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByLabelText("Pairing link").props.value).toBe("");
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it("keeps the link when the Mac could not be reached", async () => {
+    const rig = await open();
+    await fireEvent.changeText(screen.getByLabelText("Pairing link"), LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    rig.sockets.last.drop();
+    expect(await screen.findByText("Can't reach your Mac")).toBeTruthy();
+    expect(screen.getByLabelText("Pairing link").props.value).toBe(LINK);
   });
 
   it("shows the hub's words when it refuses", async () => {

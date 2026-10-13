@@ -37,7 +37,8 @@ describe("settings", () => {
     jest.mocked(AsyncStorage.getItem).mockRejectedValueOnce(new Error("disk"));
     expect(await loadSettings()).toEqual(DEFAULT_SETTINGS);
     jest.mocked(AsyncStorage.setItem).mockRejectedValueOnce(new Error("full"));
-    await expect(saveSettings({ faceId: false })).resolves.toBeUndefined();
+    await expect(saveSettings({ faceId: false })).resolves.toBe(false);
+    await expect(saveSettings({ faceId: false })).resolves.toBe(true);
   });
 
   it("two saves at once both land", async () => {

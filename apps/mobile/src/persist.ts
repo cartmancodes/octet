@@ -39,22 +39,25 @@ export async function loadSettings(): Promise<Settings> {
 }
 
 /** Saves wait their turn: a patch reads what the one before wrote. */
-let saving: Promise<void> = Promise.resolve();
+let saving: Promise<boolean> = Promise.resolve(true);
 
-/** Saves `patch` over what is saved. A failed write is dropped: settings are a convenience. */
-export function saveSettings(patch: Partial<Settings>): Promise<void> {
+/** Saves `patch` over what is saved. A failed write is dropped (settings are a convenience) and
+ * reported as false, for the few callers that cannot go on without it. */
+export function saveSettings(patch: Partial<Settings>): Promise<boolean> {
   saving = saving.then(() => write(patch));
   return saving;
 }
 
-async function write(patch: Partial<Settings>): Promise<void> {
+async function write(patch: Partial<Settings>): Promise<boolean> {
   try {
     const next: Settings = { ...(await loadSettings()), ...patch };
     await AsyncStorage.setItem(
       SETTINGS_KEY,
       JSON.stringify({ deviceName: next.deviceName, faceId: next.faceId, hubUrl: next.hubUrl }),
     );
+    return true;
   } catch {
     // The next change tries again.
+    return false;
   }
 }

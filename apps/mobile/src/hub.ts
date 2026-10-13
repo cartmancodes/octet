@@ -5,7 +5,7 @@ import { createContext, useContext, useSyncExternalStore } from "react";
 import { Platform } from "react-native";
 
 import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from "./client/HubClient";
-import { parsePairLink } from "./client/link";
+import { isHubUrl, parsePairLink } from "./client/link";
 import { webSocketFactory } from "./client/socket";
 import { loadSettings, saveSettings } from "./persist";
 import { connectStore, octetStore, type OctetStore } from "./store";
@@ -15,7 +15,10 @@ export const TOKEN_KEY = "octet.token";
 
 export const NOT_A_LINK = "That isn't an Octet pairing link";
 export const UNPAIRED_NOTICE = "This phone was unpaired on the Mac";
-const KEYCHAIN_FAILED = "Couldn't keep the pairing in this phone's keychain";
+/** The Mac took the pairing (its secret is spent and the name is registered) but the phone could
+ * not keep the token: only revoking on the Mac frees the name. */
+const unsaved = (name: string): string =>
+  `This phone paired but couldn't save it. On the Mac run \`octet hub revoke ${name}\`, then pair again with a new code.`;
 
 /** `loading` until the saved token is read; `paired` has a client; `unpaired` shows Pair. */
 export type HubStatus = "loading" | "unpaired" | "paired";
@@ -28,7 +31,9 @@ export interface HubSnapshot {
   client: HubClient | null;
 }
 
-export type PairResult = { ok: true } | { ok: false; message: string };
+/** A failed pairing: `clear` says the link is no good any more (the Mac answered, or took the
+ * secret), so the screen forgets it; a link that is invalid or never reached the Mac is kept for editing. */
+export type PairResult = { ok: true } | { ok: false; message: string; clear: boolean };
 
 export interface TokenStore {
   load(): Promise<string | null>;
@@ -36,10 +41,16 @@ export interface TokenStore {
   clear(): Promise<void>;
 }
 
+/** expo-secure-store's iOS default is a migratable item: it travels in encrypted backups to
+ * another handset, where "revoke this phone" would no longer mean this phone. This-device-only
+ * keeps the token in this phone's keychain, readable while unlocked. Reads and deletes name the
+ * same options so they reach the same item. */
+const KEYCHAIN = { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY };
+
 const keychain: TokenStore = {
-  load: () => SecureStore.getItemAsync(TOKEN_KEY),
-  save: (token) => SecureStore.setItemAsync(TOKEN_KEY, token),
-  clear: () => SecureStore.deleteItemAsync(TOKEN_KEY),
+  load: () => SecureStore.getItemAsync(TOKEN_KEY, KEYCHAIN),
+  save: (token) => SecureStore.setItemAsync(TOKEN_KEY, token, KEYCHAIN),
+  clear: () => SecureStore.deleteItemAsync(TOKEN_KEY, KEYCHAIN),
 };
 
 export interface HubControllerOptions {
@@ -107,10 +118,15 @@ export class HubController {
   private async load(): Promise<void> {
     const [token, settings] = await Promise.all([this.tokens.load().catch(() => null), loadSettings()]);
     this.savedName = settings.deviceName;
-    if (token !== null && token !== "" && settings.hubUrl !== null) {
-      this.adopt(new HubClient({ ...this.clientOptions, url: settings.hubUrl, token, factory: this.factory }));
-    } else {
+    if (token === null || token === "") {
       this.set({ status: "unpaired" });
+    } else if (settings.hubUrl === null || !isHubUrl(settings.hubUrl)) {
+      // A token with no usable address (killed between the two saves, or a tampered value) can
+      // reach nowhere it should: drop it and pair again.
+      await this.tokens.clear().catch(() => undefined);
+      this.set({ status: "unpaired" });
+    } else {
+      this.adopt(new HubClient({ ...this.clientOptions, url: settings.hubUrl, token, factory: this.factory }));
     }
   }
 
@@ -128,29 +144,44 @@ export class HubController {
   /** Pairs with the Mac the link names. On success the token is in the keychain, the hub address
    * in settings, and the connection is up. Failures come back as the words to show. */
   async pair(link: string, name: string): Promise<PairResult> {
-    if (this.pairing) return { ok: false, message: "Already pairing" };
+    if (this.pairing) return { ok: false, message: "Already pairing", clear: false };
     const parsed = parsePairLink(link);
-    if (!parsed) return { ok: false, message: NOT_A_LINK };
+    if (!parsed) return { ok: false, message: NOT_A_LINK, clear: false };
     const deviceName = name.trim() === "" ? this.defaultName() : name.trim();
     const client = new HubClient({ ...this.clientOptions, url: parsed.url, token: null, factory: this.factory });
     this.pairing = client;
     if (this.current.notice !== null) this.set({ notice: null });
     try {
       const { token } = await client.pair(parsed.secret, deviceName, this.platform);
-      try {
-        await this.tokens.save(token);
-      } catch {
-        return { ok: false, message: KEYCHAIN_FAILED };
+      if (!(await this.keep(token, parsed.url, deviceName))) {
+        await this.tokens.clear().catch(() => undefined);
+        return { ok: false, message: unsaved(deviceName), clear: true };
       }
-      await saveSettings({ hubUrl: parsed.url, deviceName });
       this.savedName = deviceName;
       this.adopt(client);
       return { ok: true };
     } catch (error) {
-      return { ok: false, message: error instanceof Refusal ? error.message : "Pairing failed" };
+      if (!(error instanceof Refusal)) return { ok: false, message: "Pairing failed", clear: false };
+      return { ok: false, message: error.message, clear: error.code !== "unsent" && error.code !== "lost" };
     } finally {
       this.pairing = null;
     }
+  }
+
+  /** Writes the token to the keychain (a second try after clearing, once) and the address to
+   * settings. False when either could not be kept. */
+  private async keep(token: string, url: string, deviceName: string): Promise<boolean> {
+    try {
+      await this.tokens.save(token);
+    } catch {
+      try {
+        await this.tokens.clear();
+        await this.tokens.save(token);
+      } catch {
+        return false;
+      }
+    }
+    return saveSettings({ hubUrl: url, deviceName });
   }
 
   // Internals

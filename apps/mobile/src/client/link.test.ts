@@ -1,4 +1,4 @@
-import { parsePairLink } from "./link";
+import { hubHost, isHubUrl, parsePairLink } from "./link";
 
 const SECRET = "0123456789abcdef".repeat(4);
 
@@ -43,5 +43,40 @@ describe("parsePairLink", () => {
       "",
     ];
     for (const text of refused) expect([text, parsePairLink(text)]).toEqual([text, null]);
+  });
+});
+
+describe("isHubUrl", () => {
+  it("accepts what parsePairLink makes, and nothing else", () => {
+    for (const link of [
+      `https://mac.tail1234.ts.net/#pair=${SECRET}`,
+      `https://100.64.0.7:8443/#pair=${SECRET}`,
+      `https://MAC.example.net:0443#pair=${SECRET}`,
+    ]) {
+      const url = parsePairLink(link)?.url ?? "";
+      expect(isHubUrl(url)).toBe(true);
+    }
+    const refused = [
+      "",
+      "https://mac.ts.net/",
+      "ws://mac.ts.net/",
+      "wss://mac.ts.net", // no trailing slash
+      "wss://mac.ts.net/path",
+      "wss://mac.ts.net/?x=1",
+      "wss://user@mac.ts.net/",
+      "wss://mac.ts.net:0/",
+      "wss://mac.ts.net:70000/",
+      "wss://MAC.ts.net/", // not the saved form
+      "wss://mac.ts.net:08443/",
+      "wss://-bad.ts.net/",
+      "wss://mac.ts.net/\n",
+      "javascript:alert(1)",
+    ];
+    for (const url of refused) expect(isHubUrl(url)).toBe(false);
+  });
+
+  it("hubHost shows the host and port", () => {
+    expect(hubHost("wss://mac.tail1234.ts.net/")).toBe("mac.tail1234.ts.net");
+    expect(hubHost("wss://100.64.0.7:8443/")).toBe("100.64.0.7:8443");
   });
 });

@@ -1,9 +1,10 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { useRouter } from "expo-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 
-import { useHubController, useHubSnapshot } from "../src/hub";
+import { hubHost, parsePairLink } from "../src/client/link";
+import { NOT_A_LINK, useHubController, useHubSnapshot } from "../src/hub";
 import { Mascot } from "../src/mascot/Mascot";
 import { radius, spacing, type, useTheme } from "../src/theme";
 
@@ -32,39 +33,58 @@ export default function Pair() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permission?.status]);
 
-  const attempt = useCallback(
-    async (text: string) => {
-      if (attempting.current) return;
-      attempting.current = true;
-      setBusy(true);
-      setError(null);
-      try {
-        const result = await hub.pair(text, name);
-        if (result.ok) router.replace("/");
-        else setError(result.message);
-      } finally {
-        attempting.current = false;
-        setBusy(false);
+  const parsed = useMemo(() => parsePairLink(link), [link]);
+  const pasted = link.trim() !== "";
+  const shownError = error ?? (pasted && parsed === null ? NOT_A_LINK : null);
+
+  const pair = useCallback(async () => {
+    if (attempting.current || parsed === null) return;
+    attempting.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await hub.pair(link, name);
+      if (result.ok) {
+        router.replace("/");
+        return;
       }
-    },
-    [hub, name, router],
-  );
+      setError(result.message);
+      if (result.clear) {
+        // The secret is spent or refused: forget it, so that the camera can offer the next code.
+        setLink("");
+        lastScan.current = null;
+      }
+    } finally {
+      attempting.current = false;
+      setBusy(false);
+    }
+  }, [hub, link, name, parsed, router]);
+  // Not the promise itself: a press handler's returned promise would be awaited by the caller.
+  const onPair = useCallback(() => void pair(), [pair]);
 
-  const onScan = useCallback(
-    ({ data }: { data: string }) => {
-      // The camera reports the same code many times a second: one look at each.
-      if (attempting.current || data === lastScan.current) return;
-      lastScan.current = data;
-      setLink(data);
-      void attempt(data);
-    },
-    [attempt],
-  );
+  const onScan = useCallback(({ data }: { data: string }) => {
+    // The camera reports the same code many times a second: one look at each. A code only
+    // fills the field; the user confirms the Mac it names, and pairing waits for the tap.
+    if (attempting.current || data === lastScan.current) return;
+    lastScan.current = data;
+    if (parsePairLink(data) === null) {
+      setError(NOT_A_LINK);
+      return;
+    }
+    setError(null);
+    setLink(data);
+  }, []);
 
-  const onPair = useCallback(() => void attempt(link), [attempt, link]);
   const onLink = useCallback((text: string) => {
     lastScan.current = null;
+    setError(null);
     setLink(text);
+  }, []);
+
+  // The scan stays remembered: the camera still sees the code that was just cancelled.
+  const onCancel = useCallback(() => {
+    setError(null);
+    setLink("");
   }, []);
 
   const cameraOn = permission?.granted === true;
@@ -127,22 +147,36 @@ export default function Pair() {
           accessibilityLabel="Device name"
         />
 
-        {error !== null && (
+        {parsed !== null && (
+          <Text style={[type.title, { color: theme.fg }]}>{`Pair with ${hubHost(parsed.url)}?`}</Text>
+        )}
+
+        {shownError !== null && (
           <Text accessibilityRole="alert" style={[type.body, { color: theme.accent }]}>
-            {error}
+            {shownError}
           </Text>
         )}
 
         <Pressable
           onPress={onPair}
-          disabled={busy}
+          disabled={busy || parsed === null}
           accessibilityRole="button"
           accessibilityLabel="Pair"
-          accessibilityState={{ disabled: busy, busy }}
-          style={[styles.button, { backgroundColor: theme.accent, opacity: busy ? 0.6 : 1 }]}
+          accessibilityState={{ disabled: busy || parsed === null, busy }}
+          style={[styles.button, { backgroundColor: theme.accent, opacity: busy || parsed === null ? 0.5 : 1 }]}
         >
           <Text style={[type.body, { color: theme.bg, fontWeight: "600" }]}>{busy ? "Pairing…" : "Pair"}</Text>
         </Pressable>
+        {pasted && !busy && (
+          <Pressable
+            onPress={onCancel}
+            accessibilityRole="button"
+            accessibilityLabel="Cancel"
+            style={[styles.button, { borderColor: theme.edge, borderWidth: 1 }]}
+          >
+            <Text style={[type.body, { color: theme.fg }]}>Cancel</Text>
+          </Pressable>
+        )}
       </ScrollView>
     </KeyboardAvoidingView>
   );
