@@ -385,6 +385,8 @@ tailscale serve --bg 47823
 
 Only devices on your tailnet can open that address. Use `tailscale serve
 status` to see it, and `tailscale serve --https=443 off` to take it down.
+Never publish the hub with `tailscale funnel`: Funnel puts it on the public
+internet, and the hub is for your tailnet only.
 
 ### Pair a phone
 
@@ -399,7 +401,9 @@ The code works once and expires after 10 minutes. If the hub isn't running,
 Octet says `Start the hub first: octet hub`; if it isn't published yet, Octet
 makes no code and says `Publish it first: tailscale serve --bg 47823`.
 Plain `/remote-control` also reports the hub: whether it is running, whether
-it is published, and how many phones are paired.
+it is published, and how many phones are paired. The hub checks Tailscale when
+it starts and every 10 seconds after, so a `tailscale serve` you just ran can
+take that long to show.
 
 To list the paired phones, or remove one:
 

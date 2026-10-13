@@ -115,6 +115,22 @@ Rejected alternatives:
 **Unchanged:** `octet-core`, `octet-engine`, vendor login, and workspace access (only the Mac
 reads files).
 
+*Amended 2026-10-13, as built:*
+
+- The bridge does not forward events. The hub tails each session's journals, which the
+  registration lists oldest first, so the journal is the one source of events; the bridge
+  sends only `state`, `catalog` and command replies.
+- Remote actions are audited in `<data dir>/hub-audit.jsonl` (time, device, session, command,
+  never prompt text) and noted in the desk transcript. Session journals are not written to.
+- `hub.json` lives in the data directory, beside `devices.json` and the journals.
+- `RecentInfo` carries `started` (Unix seconds) as the last-activity time.
+- `start` also passes `--remote-started <tmux session>` and `--remote-by <device>` (hidden
+  flags; the device name one clean line of at most 40 characters). The registration and the
+  `sessions` row name the tmux session, and a phone-started interface in `full-access` notes
+  "⚠ Started in full access from <device>" on the desk.
+- While the desk's external editor is open or a `!` command runs, the bridge refuses `end`,
+  `set_model` and a `set_mode` that would reconnect.
+
 ### 2. Protocol
 
 Both links use JSON messages `{ "v": 1, "type": …, … }`: bridge ↔ hub over the Unix socket,
@@ -130,18 +146,19 @@ approval as `approval`; and the run directory is `<data dir>/run/`.
 
 | Frame | Contents |
 |---|---|
-| `sessions` | Live sessions: id, engine, model, workspace, phase, pending-approval count, last activity, goal one-liner, started-from-phone flag. Sent on connect and on any change. |
+| `sessions` | Live sessions: id, engine, model, workspace, phase, pending-approval count, last activity, goal one-liner, NOW line (`now`), started-from-phone flag and its tmux session (`tmux`). Sent on connect and on any change. |
+| `subscribed` | `{session, from: "cursor" \| "start", journals}`: sent before a replay. `from` says whether it starts after the phone's cursor or from the start of the session's first journal; `journals` lists the journal file names, oldest first, so the app can notice a reset. |
 | `event` | `{session, journal, seq, event: {type, data}}`. `event` is exactly the journal record's type and data: text, `tool {id,name,target,phase,detail}`, `approval {id,detail,summary}`, `approval_closed`, `finished`, notices, errors, usage, mode, model. **The journal format is the wire format.** |
 | `state` | Terminal UI–only state: queue (first lines, count), goal (objective, status, turns/max), NOW line, mode, pending approvals with summaries. |
 | `catalog` | Modes, and every provider's models (the terminal UI's `model_entries()`), current one marked. |
-| `recent` | Recent sessions for `recent {workspace?}`: vendor, workspace, id, title, last activity (the listing `/sessions` uses). |
-| `ack` / `refused` | The outcome of each command by its `req` id. `refused` carries the terminal UI's real reason ("A turn is running", "The queue is full (8)", "The approval just opened"). |
+| `recent` | Recent sessions for `recent {workspace?}`, with that command's `req`: vendor, workspace, id, title, last activity (the listing `/sessions` uses). |
+| `ack` / `refused` | The outcome of each command by its `req` id. `refused` carries the terminal UI's real reason ("A turn is running", "The queue is full (8)", "The approval just opened") and a machine-readable `code`: one of `unpaired`, `revoked`, `rate_limited`, `not_allowed`, `turn_open`, `not_connected`, `invalid`, `unavailable`, `busy`, `too_large`, `timeout`. |
 
 **Phone → hub commands.** Each carries a `req` id.
 
 | Command | Effect |
 |---|---|
-| `subscribe {session, after: Cursor{journal, seq}}` | Replays from the journals after `after` (cursors cross journals; `after` omitted or null replays from the start), then streams live. No gaps, no duplicates. |
+| `subscribe {session, after: Cursor{journal, seq}}` | Replays from the journals after `after` (cursors cross journals; `after` omitted or null, or naming a journal the session does not list, replays from the start of its first journal, paged), then streams live. A `subscribed` frame comes first. No gaps, no duplicates: the app dedupes by `(journal, seq)`, and a late record of an older journal (the old session's last words after a reconnect) arrives once. |
 | `unsubscribe {session}` | Stops the stream. |
 | `prompt {session, text}` | Sends, or queues while a turn runs. |
 | `answer {session, approval, allow}` | Allows once, or denies. |
@@ -172,6 +189,9 @@ approval as `approval`; and the run directory is `<data dir>/run/`.
   screen dismisses it.
 - Frames are bounded as the engine bounds events (32 KiB tool detail, 64 KiB prompts). The hub
   caps commands per device per minute. Malformed or unknown commands are refused, never acted on.
+  Prompt and steer text over 64 KiB is refused with `too_large`.
+- A command waiting on a session whose link closed, or that went away, is refused at once with
+  "The session ended" (`unavailable`).
 
 **Schema.** Message types are defined once in `octet-hub` (Rust). A test regenerates
 `apps/mobile/src/protocol.ts` and fails when the checked-in copy differs.
