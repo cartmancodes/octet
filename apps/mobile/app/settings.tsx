@@ -4,6 +4,7 @@ import { Alert, Pressable, StyleSheet, Switch, Text, View } from "react-native";
 
 import { confirmBiometric } from "../src/auth";
 import { hubHost } from "../src/client/link";
+import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { useHubController, useHubSnapshot } from "../src/hub";
 import { NO_PROJECT_ID, projectId } from "../src/notifications";
@@ -107,6 +108,7 @@ export default function Settings() {
     working === "on" ? "Turning on…" : working === "off" ? "Turning off…" : (pushError ?? (hasProject ? pushNotice : NO_PROJECT_ID));
   return (
     <View style={[styles.screen, { backgroundColor: theme.bg }]}>
+      <DevBuildBanner />
       <View style={[styles.card, { backgroundColor: theme.panel, borderColor: theme.edge }]}>
         <Line label="Mac" value={saved.hubUrl === null ? "Not paired" : hubHost(saved.hubUrl)} />
         <Line label="This phone" value={saved.deviceName ?? hub.initialName()} />

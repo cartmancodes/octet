@@ -6,6 +6,7 @@ import { Platform } from "react-native";
 
 import Pair from "../app/pair";
 import { FakeClock, Sockets } from "./client/fakes";
+import { DEV_BUILD_WARNING } from "./components/DevBuildBanner";
 import { HubContext, HubController, TOKEN_KEY } from "./hub";
 import { loadSettings } from "./persist";
 import { createOctetStore } from "./store";
@@ -86,6 +87,21 @@ beforeEach(async () => {
 });
 
 describe("the Pair screen", () => {
+  it("warns in a development build, and says nothing in a release build", async () => {
+    const g = globalThis as { __DEV__?: boolean };
+    const dev = g.__DEV__;
+    try {
+      g.__DEV__ = true;
+      await open();
+      expect(screen.getByText(DEV_BUILD_WARNING)).toBeTruthy();
+      g.__DEV__ = false;
+      await open();
+      expect(screen.queryByText(DEV_BUILD_WARNING)).toBeNull();
+    } finally {
+      g.__DEV__ = dev;
+    }
+  });
+
   it("scans only QR codes", async () => {
     await open();
     expect(screen.getByTestId("camera")).toBeTruthy();

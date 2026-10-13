@@ -22,8 +22,9 @@ npx expo start
 ```
 
 Expo Go cannot run this app: it uses the camera, secure storage and biometrics through native
-modules that need a development build (below). `npm start` still serves the bundle to a
-development build.
+modules that need a build of its own (below). `npm start` serves the bundle to a development
+build. Never pair a development build with the Mac you use every day: see
+[Which build](#which-build).
 
 | Script | What it does |
 | --- | --- |
@@ -50,27 +51,52 @@ test in its own `contract` job.
 
 ## Building the app for a phone
 
-Both builds need your own accounts and tooling, and nothing here creates one. The repository
+The builds need your own accounts and tooling, and nothing here creates one. The repository
 holds no EAS project id: `eas init` adds yours to `app.json` the first time you run it.
+`eas.json` names three profiles: `preview`, `development` and `production`.
+
+### Which build
+
+**For daily use, on both phones, install the `preview` build.** It is a release build: it runs
+only the JavaScript inside it, and it has no development launcher.
+
+**Use `development` only while you work on the app, and never pair it with the Mac you use every
+day.** If you did pair one, unpair it and revoke it on the Mac (`octet hub revoke NAME`).
+
+A development build runs whatever JavaScript it is pointed at, and that code holds the device
+token:
+
+- With `expo-dev-client`, a tapped `exp+octet://` link can load a bundle from anywhere.
+- A Debug build fetches its bundle from Metro over plain HTTP, so anyone on the same Wi-Fi can
+  replace it.
+
+Either way, that code can do everything the token allows, without Face ID: start a session in
+full access, or allow an approval. Every check of the phone's own is in JavaScript, so none of them
+stops it.
+
+A development build says so: it shows an amber "Development build — don't pair with your everyday
+Mac" on Pair, Sessions and Settings. It also keeps its token under its own keychain item
+(`octet.token.dev`), so it never picks up the pairing of a release build on the same phone.
 
 ### iPhone
 
-A development build needs an Apple developer account (the paid program, for a device build).
+You need an Apple developer account: the paid program, which a device build requires.
 
 ```sh
 npm install --global eas-cli
 cd apps/mobile
 eas login
 eas init
-eas build --profile development --platform ios
+eas device:create                                  # register the iPhone for internal builds
+eas build --profile preview --platform ios
 ```
 
-`eas build` asks to create the `development` profile (`eas.json`) on first use: choose a
-development client for devices. A development profile also needs `expo-dev-client`, which the
-project does not include: `eas build --profile development` asks to install it, and whether to is
-your choice (it adds the dev menu and launcher to that build). Install the build on your phone
-from the link EAS gives you (register the phone first when asked), then run `npx expo start` and
-open it from the app.
+Install the build on your phone from the link EAS gives you.
+
+To develop on the iPhone instead, run `eas build --profile development --platform ios`, then
+`npx expo start`. The `development` profile needs `expo-dev-client`, which the project does not
+include. `eas build` asks to install it, and whether to is up to you. It adds the dev menu and
+launcher to that build.
 
 ### Android
 
@@ -78,9 +104,12 @@ An APK, built by EAS or locally.
 
 ```sh
 cd apps/mobile
-eas build --profile development --platform android      # EAS: gives you an APK link
-npx expo run:android                                     # or locally: needs the Android SDK and a device or emulator
+eas build --profile preview --platform android     # EAS: a release APK, and a link to it
+npx expo run:android --variant release             # or locally: needs the Android SDK and a device
 ```
+
+To develop instead, build with `eas build --profile development --platform android` or `npx expo
+run:android`. The same rule applies: never pair that build with your everyday Mac.
 
 ## Pairing
 
@@ -112,7 +141,7 @@ Set it up with your own accounts (nothing here creates one):
 
 1. `eas init` in `apps/mobile`, if you have not (it adds the project id to `app.json`).
 2. iPhone: register the iPhone with EAS before the first build (`eas device:create`), then run
-   `eas build --profile development --platform ios`. When the build asks "Setup Push Notifications
+   `eas build --profile preview --platform ios`. When the build asks "Setup Push Notifications
    for your project" / "Generate a new Apple Push Notifications service key", answer yes. The manual
    route is `eas credentials`. This needs the paid Apple developer account that the device build
    already needs.
@@ -124,11 +153,11 @@ Set it up with your own accounts (nothing here creates one):
      only public identifiers, so it may be committed.
    - In the Firebase console go to Project settings, Service accounts, "Generate new private key".
      This FCM V1 service-account key is a secret: **never commit it** (add it to `.gitignore`).
-   - Upload it: `eas credentials`, then Android, the build profile (for example `development`),
+   - Upload it: `eas credentials`, then Android, the build profile (`preview`),
      Google Service Account, "Manage your Google Service Account Key for Push Notifications (FCM
      V1)", "Set up a Google Service Account Key for Push Notifications (FCM V1)", "Upload a new
      service account key". The same page is on expo.dev under Credentials, Service credentials.
-4. Build again (`eas build --profile development --platform ios` or `android`) and install it.
+4. Build again (`eas build --profile preview --platform ios` or `android`) and install it.
 
 Turn it on in the step after pairing or in **Settings**: the app asks the phone for permission,
 then registers its token with the Mac. Turning it off, or unpairing, tells the Mac to stop; an
@@ -141,8 +170,8 @@ finished`; what the hub sends, where, and when is in [the guide](../../docs/remo
 
 ## Device pass
 
-The tests cannot cover a real phone. Run this on the iPhone 15 and on the Gemini 10 with a build
-from your own EAS project, against real Claude and Codex with tiny prompts in a throwaway
+The tests cannot cover a real phone. Run this on the iPhone 15 and on the Gemini 10 with a `preview`
+build from your own EAS project, against real Claude and Codex with tiny prompts in a throwaway
 workspace. Tick each one on each phone.
 
 - [ ] Pair the phone (QR code, and the pasted link).

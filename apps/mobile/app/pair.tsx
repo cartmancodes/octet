@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 
 import { hubHost, parsePairLink } from "../src/client/link";
+import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { NOT_A_LINK, useHubController, useHubSnapshot } from "../src/hub";
 import { Mascot } from "../src/mascot/Mascot";
@@ -98,6 +99,7 @@ export default function Pair() {
   return (
     <KeyboardAvoidingView style={{ flex: 1, backgroundColor: theme.bg }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        <DevBuildBanner />
         <Mascot pose="idle" size={118} />
         <Text accessibilityRole="header" style={[type.display, { color: theme.fg }]}>
           Pair with your Mac

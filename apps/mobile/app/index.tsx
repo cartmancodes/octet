@@ -3,6 +3,7 @@ import { Stack, useIsFocused, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
+import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { HubBanner } from "../src/components/HubBanner";
 import { SessionCard } from "../src/components/SessionCard";
 import { useHubClient } from "../src/hub";
@@ -121,6 +122,7 @@ export default function Sessions() {
         <Mascot pose={pose} size={MASCOT} />
         <Text style={[type.body, { color: theme.muted }]}>{summary(sessions.length, waiting)}</Text>
       </View>
+      <DevBuildBanner inset />
       <HubBanner state={hub} announce={focused} />
       <FlashList
         testID="sessions-list"

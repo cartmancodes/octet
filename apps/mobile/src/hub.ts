@@ -7,12 +7,16 @@ import { Platform } from "react-native";
 import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from "./client/HubClient";
 import { isHubUrl, parsePairLink } from "./client/link";
 import { webSocketFactory } from "./client/socket";
+import { isDevBuild } from "./build";
 import { NOT_SAVED, loadSettings, saveSettings } from "./persist";
 import { DENIED, askForToken, currentToken, dropPushRegistration, onTokenChange, projectId } from "./notifications";
 import { connectStore, octetStore, type OctetStore } from "./store";
 
-/** The keychain item holding the device token: the only place it is kept. */
-export const TOKEN_KEY = "octet.token";
+/** The keychain item holding the device token. A development build keeps its own, so that it
+ * never inherits (and so can never leak) the pairing a release build on the same phone made. */
+export const tokenKey = (dev: boolean): string => (dev ? "octet.token.dev" : "octet.token");
+/** The keychain item holding this build's device token: the only place it is kept. */
+export const TOKEN_KEY = tokenKey(isDevBuild());
 
 export const NOT_A_LINK = "That isn't an Octet pairing link";
 export const UNPAIRED_NOTICE = "This phone was unpaired on the Mac";
