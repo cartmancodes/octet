@@ -17,7 +17,10 @@
 //! or below what it has of that event's journal. Everything the tail emits after the
 //! subscription is either in the replay or delivered live, so nothing is lost and nothing
 //! repeats.
-use crate::tail::{Tail, event_of, file_name};
+use crate::{
+    push::Snapshot,
+    tail::{Tail, event_of, file_name},
+};
 use octet_core::remote::{
     protocol::{BridgeCommand, Code, MAX_BRIDGE_LINE, VERSION, bridge_command_json},
     run::Registration,
@@ -322,6 +325,27 @@ impl Sessions {
     /// The `sessions` frame's rows, oldest session first.
     pub(crate) fn list(&self) -> Vec<Value> {
         self.live.iter().map(Live::row).collect()
+    }
+
+    /// What each session looks like to the pusher: its journals, phase and open approval ids.
+    pub(crate) fn snapshots(&self) -> Vec<Snapshot> {
+        self.live
+            .iter()
+            .map(|live| {
+                let state = live.state.as_ref();
+                Snapshot {
+                    id: live.registration.id.clone(),
+                    journals: live.registration.journals.clone(),
+                    phase: state
+                        .and_then(|s| s.get("phase")?.as_str())
+                        .map(str::to_owned),
+                    approvals: state
+                        .and_then(|s| s.get("approvals")?.as_array())
+                        .map(|list| list.iter().filter_map(|a| a.get("id")?.as_u64()).collect())
+                        .unwrap_or_default(),
+                }
+            })
+            .collect()
     }
 
     /// How many sessions the hub's `start` launched are registered.

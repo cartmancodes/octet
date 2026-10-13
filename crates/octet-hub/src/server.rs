@@ -33,6 +33,7 @@
 use crate::{
     launch::{self, Launches, StartRequest, clip as clip_to},
     owner::published_url,
+    push::{self, Pusher},
     sessions::{SessionUpdate, Sessions},
     store::{Device, SECRET_REFUSED, Store},
     tail::{self, file_name},
@@ -149,6 +150,8 @@ const SCAN_RUNNING: &str = "A recent-sessions scan is running; try again";
 const JOB_TIMED_OUT: &str = "That took too long; try again";
 /// The refusal for a push registration that could not be written.
 const PUSH_NOT_SAVED: &str = "Could not save the notification setting; try again";
+/// Reports of dead push tokens waiting for the hub loop.
+const PUSH_QUEUE: usize = 16;
 /// How long a scan or a start may take in all.
 const JOB_WITHIN: Duration = Duration::from_secs(30);
 /// The longest workspace path kept in an audit line, in characters.
@@ -463,6 +466,12 @@ pub struct Hub {
     scanning: Arc<AtomicBool>,
     /// Given to each connection and replay task.
     events: mpsc::Sender<ConnEvent>,
+    /// What to push, and when.
+    pusher: Pusher,
+    /// Where pushes are posted.
+    push_endpoint: String,
+    /// Given to each send: the push tokens Expo said are dead.
+    dead_tokens: mpsc::Sender<Vec<String>>,
     /// The last id given to a connection, hub req or replay.
     ids: u64,
 }
@@ -547,6 +556,7 @@ impl Hub {
             .map_err(|e| format!("Couldn't read the port: {e}"))?
             .port();
         let (events, mut inbox) = mpsc::channel(EVENT_QUEUE);
+        let (dead_tokens, mut dead) = mpsc::channel(PUSH_QUEUE);
         let (streams, mut accepted) = mpsc::channel(16);
         let accept_task = tokio::spawn(accept_tcp(listener, streams)).abort_handle();
         let (requests, mut controls) = mpsc::channel(16);
@@ -569,6 +579,9 @@ impl Hub {
             watchers: Vec::new(),
             watched: Vec::new(),
             events,
+            pusher: Pusher::default(),
+            push_endpoint: push::endpoint(),
+            dead_tokens,
             ids: 0,
         };
         hub.sessions.refresh().await;
@@ -590,7 +603,11 @@ impl Hub {
                 Some(request) = controls.recv() => hub.on_control(request).await,
                 _ = refresh.tick() => hub.sessions.refresh().await,
                 _ = reload.tick() => hub.reload().await,
-                _ = sweep.tick() => hub.sweep(),
+                _ = sweep.tick() => {
+                    hub.sweep();
+                    hub.flush_push();
+                }
+                Some(tokens) = dead.recv() => hub.drop_push_tokens(&tokens).await,
             }
         }
         control_task.abort();
@@ -1102,6 +1119,7 @@ impl Hub {
                 }
                 // A row shows the state's phase, mode and approvals.
                 self.relist();
+                self.observe_push();
             }
             SessionUpdate::Catalog { id } => {
                 if let Some(catalog) = self.sessions.catalog(&id) {
@@ -1133,6 +1151,7 @@ impl Hub {
             SessionUpdate::Changed => {
                 self.refuse_ended();
                 self.relist();
+                self.observe_push();
             }
         }
     }
@@ -1370,6 +1389,88 @@ impl Hub {
     }
 
     /// Ends `conn` now.
+    /// Hands the pusher what the sessions look like; what it finds new waits in a window for
+    /// each device with a push token (whether it is connected is judged when the window closes).
+    fn observe_push(&mut self) {
+        let notices = self.pusher.observe(&self.sessions.snapshots());
+        let now = Instant::now();
+        for device in self.store.devices() {
+            if device.push_token.is_some() {
+                self.pusher.offer(&device.token_sha256, &notices, now);
+            }
+        }
+    }
+
+    /// Posts the pushes whose windows have closed, in the background. A device with a phone
+    /// connected right now is looked at, so it gets none.
+    fn flush_push(&mut self) {
+        let now = Instant::now();
+        let mut batch = Vec::new();
+        for key in self.pusher.waiting() {
+            let token = self
+                .store
+                .devices()
+                .iter()
+                .find(|device| device.token_sha256 == key)
+                .and_then(|device| device.push_token.clone());
+            let connected = token.is_none()
+                || self.conns.values().any(|conn| {
+                    conn.device
+                        .as_ref()
+                        .is_some_and(|device| device.token_sha256 == key)
+                });
+            if let (Some(due), Some(token)) = (self.pusher.due_for(&key, connected, now), token) {
+                batch.push((token, due));
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let endpoint = self.push_endpoint.clone();
+        let dead = self.dead_tokens.clone();
+        tokio::spawn(async move {
+            let messages: Vec<Value> = batch
+                .iter()
+                .map(|(token, due)| due.message(token))
+                .collect();
+            let outcomes = push::send(&endpoint, &messages).await;
+            push::report(&outcomes);
+            let gone: Vec<String> = batch
+                .into_iter()
+                .zip(outcomes)
+                .filter(|(_, outcome)| *outcome == push::Outcome::Dead)
+                .map(|((token, _), _)| token)
+                .collect();
+            if !gone.is_empty() {
+                let _ = dead.send(gone).await;
+            }
+        });
+    }
+
+    /// Clears push tokens Expo says no device has, from `devices.json` and the connections'
+    /// copies of their devices.
+    async fn drop_push_tokens(&mut self, tokens: &[String]) {
+        for token in tokens {
+            match self.store.drop_push_token(token).await {
+                Ok(Some(name)) => self.store.audit(&name, "", "push dropped").await,
+                Ok(None) => {}
+                Err(error) => {
+                    // The error names a path and a kind, never a token.
+                    eprintln!("Couldn't clear a dead push token: {}", error.kind());
+                }
+            }
+            for state in self.conns.values_mut() {
+                if let Some(held) = state
+                    .device
+                    .as_mut()
+                    .filter(|held| held.push_token.as_ref() == Some(token))
+                {
+                    held.push_token = None;
+                }
+            }
+        }
+    }
+
     fn drop_conn(&mut self, conn: u64) {
         if let Some(state) = self.forget(conn) {
             state.task.abort();

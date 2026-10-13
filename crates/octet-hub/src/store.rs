@@ -298,6 +298,28 @@ impl Store {
         .await
     }
 
+    /// Clears the push token `token` from the device holding it, in the locked write; returns
+    /// that device's name, or none if no device holds it. For a token Expo says is dead.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
+    pub(crate) async fn drop_push_token(&mut self, token: &str) -> io::Result<Option<String>> {
+        self.update(|devices| {
+            let mut dropped = None;
+            for device in devices
+                .iter_mut()
+                .filter(|device| device.push_token.as_deref() == Some(token))
+            {
+                device.push_token = None;
+                dropped = Some(device.name.clone());
+            }
+            let changed = dropped.is_some();
+            (dropped, changed)
+        })
+        .await
+    }
+
     /// The paired devices.
     pub fn devices(&self) -> &[Device] {
         &self.devices
@@ -976,6 +998,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dead_push_token_is_cleared_by_value_and_only_that_one() {
+        let dir = TempDir::new("hub-dead");
+        let mut store = store(&dir).await;
+        let mut hashes = Vec::new();
+        for name in ["One", "Two"] {
+            let secret = store.pairing_secret(epoch(1));
+            let (_, device) = store
+                .pair(&secret, name, "ios", LOGIN, epoch(1))
+                .await
+                .unwrap();
+            hashes.push(device.token_sha256);
+        }
+        let other = "ExpoPushToken[other]";
+        store
+            .set_push_token(&hashes[0], Some(PUSH.into()))
+            .await
+            .unwrap();
+        store
+            .set_push_token(&hashes[1], Some(other.into()))
+            .await
+            .unwrap();
+        // Not a token anyone holds: nothing changes.
+        assert_eq!(
+            store
+                .drop_push_token("ExpoPushToken[nobody]")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.drop_push_token(PUSH).await.unwrap().as_deref(),
+            Some("One")
+        );
+        let held: Vec<_> = Store::open(dir.path())
+            .await
+            .unwrap()
+            .devices()
+            .iter()
+            .map(|d| d.push_token.clone())
+            .collect();
+        assert_eq!(held, [None, Some(other.to_owned())]);
+        let text = std::fs::read_to_string(dir.path().join("devices.json")).unwrap();
+        assert!(!text.contains(PUSH), "{text}");
+        // Once cleared, a second report of the same token finds no one.
+        assert_eq!(store.drop_push_token(PUSH).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn a_failed_push_write_is_an_error_that_names_no_token() {
         let dir = TempDir::new("hub-pushfail");
         let mut store = store(&dir).await;
@@ -985,6 +1055,12 @@ mod tests {
             .await
             .unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root (a container) writes into a read-only directory, so there is nothing to test.
+        let probe = dir.path().join("probe");
+        if std::fs::write(&probe, b"x").is_ok() {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
         let result = store
             .set_push_token(&device.token_sha256, Some(PUSH.into()))
             .await;
