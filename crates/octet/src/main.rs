@@ -6,6 +6,7 @@ use std::{io::IsTerminal, path::PathBuf};
 mod args;
 mod headless;
 mod hub;
+mod service;
 
 /// Where journals and goals go under the data directory. Named when the Rust
 /// port was a preview; kept so existing journals and goals are still found.
@@ -15,18 +16,21 @@ const JOURNAL_DIR: &str = "octet/rust-preview";
 fn hub_help() -> &'static str {
     "Octet hub — your terminal sessions on your phone, over your tailnet\n\
 \n\
-Usage: octet hub [ACTION] [--journal-dir PATH] [--port N] [--owner LOGIN]\n\
+Usage: octet hub [ACTION] [--journal-dir PATH] [--port N] [--owner LOGIN] [--print]\n\
 \n\
 Actions:\n\
   serve          Run the hub on 127.0.0.1 until interrupted (the default)\n\
   devices        List the paired phones\n\
   revoke NAME    Unpair the phone called NAME (a running hub drops it within 2 s)\n\
   watch          Print what every session is doing until Ctrl+C\n\
+  install        Keep the hub running: a launchd agent (macOS) or systemd user unit (Linux)\n\
+  uninstall      Stop that service and remove it\n\
 \n\
 Options:\n\
   --port N       serve: the loopback port (default: hub.json's, else 47823)\n\
   --owner LOGIN  serve: the tailnet login that may connect (default: this Mac's, from Tailscale)\n\
-  --journal-dir PATH  Where journals and the hub's files live\n\
+  --print        install: show the service file without installing it\n\
+  --journal-dir PATH  Where journals and the hub's files live (install keeps it)\n\
 \n\
 Publish the hub to your tailnet with: tailscale serve --bg <port>\n"
 }
@@ -39,7 +43,7 @@ fn help() -> String {
         "                 [--approval-timeout SECONDS] [--effort LEVEL]",
         "                 [--no-plugins] [--no-plugin-hooks] [--no-remote]",
         "                 [--print PROMPT|- [--output text|json] | --rpc]",
-        "       octet hub [serve|devices|revoke NAME|watch] (the phone hub; octet hub --help)",
+        "       octet hub [serve|devices|revoke NAME|watch|install|uninstall] (the phone hub; octet hub --help)",
         "       octet --version | --help",
         "",
         "Headless: --print (-p) runs one prompt and writes the reply; - reads it",
@@ -136,12 +140,15 @@ async fn run() -> Result<i32, CliError> {
             return Ok(0);
         }
         Parsed::Hub(args) => {
+            let journal_dir = args.journal_dir.clone();
             let directory = data_dir(args.journal_dir)?;
             return match args.action {
                 HubAction::Serve => hub::serve(directory, args.port, args.owner).await,
                 HubAction::Devices => hub::devices(&directory).await,
                 HubAction::Revoke(name) => hub::revoke(&directory, &name).await,
                 HubAction::Watch => hub::watch(&directory).await,
+                HubAction::Install { print } => hub::install(directory, journal_dir, print).await,
+                HubAction::Uninstall => hub::uninstall(directory).await,
             };
         }
         Parsed::Run(args) => args,

@@ -49,6 +49,10 @@ pub(crate) enum HubAction {
     Revoke(String),
     /// Print every session's activity until interrupted.
     Watch,
+    /// Keep the hub running as a per-user service; with `print`, only show the unit.
+    Install { print: bool },
+    /// Remove that service.
+    Uninstall,
 }
 
 /// The options of `octet hub`.
@@ -291,6 +295,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
 fn parse_hub(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
     let mut args = args;
     let (mut action, mut journal_dir, mut port, mut owner) = (None, None, None, None);
+    let mut print = false;
     while let Some(arg) = args.next() {
         let arg = arg.into_string().map_err(|arg| {
             usage(format!(
@@ -318,7 +323,13 @@ fn parse_hub(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
                 owner = Some(text(&mut args, &arg)?);
                 continue;
             }
+            "--print" => {
+                print = true;
+                continue;
+            }
             "serve" => HubAction::Serve,
+            "install" => HubAction::Install { print: false },
+            "uninstall" => HubAction::Uninstall,
             "devices" => HubAction::Devices,
             "watch" => HubAction::Watch,
             "revoke" => {
@@ -336,9 +347,15 @@ fn parse_hub(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
             return Err(usage("Name one hub action. Use hub --help."));
         }
     }
-    let action = action.unwrap_or(HubAction::Serve);
-    if action != HubAction::Serve && (port.is_some() || owner.is_some()) {
+    let mut action = action.unwrap_or(HubAction::Serve);
+    if !matches!(action, HubAction::Serve) && (port.is_some() || owner.is_some()) {
         return Err(usage("--port and --owner apply to serve"));
+    }
+    if print {
+        match &mut action {
+            HubAction::Install { print } => *print = true,
+            _ => return Err(usage("--print applies to install")),
+        }
     }
     Ok(Parsed::Hub(HubArgs {
         action,
@@ -481,6 +498,25 @@ mod tests {
     }
 
     #[test]
+    fn hub_installs_and_uninstalls_the_service() {
+        assert_eq!(
+            hub(&["install"]).action,
+            HubAction::Install { print: false }
+        );
+        assert_eq!(
+            hub(&["install", "--print"]).action,
+            HubAction::Install { print: true }
+        );
+        assert_eq!(
+            hub(&["--print", "install"]).action,
+            HubAction::Install { print: true }
+        );
+        assert_eq!(hub(&["uninstall"]).action, HubAction::Uninstall);
+        let carried = hub(&["--journal-dir", "/d", "install"]);
+        assert_eq!(carried.journal_dir, Some(PathBuf::from("/d")));
+    }
+
+    #[test]
     fn hub_usage_errors_name_the_problem() {
         for (list, message) in [
             (
@@ -523,6 +559,19 @@ mod tests {
                 &["hub", "devices", "--owner", "x"][..],
                 "--port and --owner apply to serve",
             ),
+            (
+                &["hub", "install", "--port", "5"][..],
+                "--port and --owner apply to serve",
+            ),
+            (
+                &["hub", "uninstall", "--print"][..],
+                "--print applies to install",
+            ),
+            (
+                &["hub", "serve", "--print"][..],
+                "--print applies to install",
+            ),
+            (&["hub", "--print"][..], "--print applies to install"),
         ] {
             assert_eq!(error(list), message, "{list:?}");
         }

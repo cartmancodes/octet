@@ -1,4 +1,5 @@
-//! `octet hub`: serving the phone hub, listing and revoking its devices, and watching sessions.
+//! `octet hub`: serving the phone hub, listing and revoking its devices, watching sessions, and
+//! installing it as a service.
 use crate::args::CliError;
 use octet_hub::{Device, Hub, Store, plain};
 use std::{
@@ -115,6 +116,30 @@ pub(crate) async fn watch(directory: &Path) -> Result<i32, CliError> {
         result = printing => result.map(|()| 0).map_err(failed),
         _ = tokio::signal::ctrl_c() => Ok(0),
     }
+}
+
+/// Keeps the hub running as a per-user service, or with `print` only shows the unit.
+pub(crate) async fn install(
+    directory: PathBuf,
+    journal_dir: Option<PathBuf>,
+    print: bool,
+) -> Result<i32, CliError> {
+    blocking(move || crate::service::install_here(&directory, journal_dir.as_deref(), print)).await
+}
+
+/// Stops and removes that service.
+pub(crate) async fn uninstall(directory: PathBuf) -> Result<i32, CliError> {
+    blocking(move || crate::service::uninstall_here(&directory)).await
+}
+
+/// Runs `work` (which waits on child processes) off the async workers; success is exit code 0.
+async fn blocking(
+    work: impl FnOnce() -> Result<(), CliError> + Send + 'static,
+) -> Result<i32, CliError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| failed(e.to_string()))?
+        .map(|()| 0)
 }
 
 /// One device as a line: name, platform, when it paired and when it was last seen.

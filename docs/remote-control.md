@@ -381,6 +381,36 @@ octet hub watch
 It prints one line per session event (tool calls, approvals, finished turns)
 until you press Ctrl+C. It shows the same thing the phone would see.
 
+### Keep the hub running
+
+To have the hub start at login and come back if it stops, install it as a
+per-user service:
+
+```sh
+octet hub install
+```
+
+On macOS that writes a launchd agent, `~/Library/LaunchAgents/dev.octet.hub.plist`.
+On Linux it writes a systemd user unit, `~/.config/systemd/user/octet-hub.service`,
+and enables it. Either way the service runs the `octet` you ran this from, as
+`octet hub` (with your `--journal-dir`, if you gave one), and its `PATH` includes
+the directory where `tmux` was found, so the hub can start sessions from a
+launchd agent's bare environment. The service doesn't use `--port` or
+`--owner`; set the port in `hub.json`.
+
+- **Logs.** On macOS the hub's output goes to `hub.log` in the data directory
+  (`~/.local/share/octet/rust-preview/hub.log` unless you chose another); read it with
+  `tail -f`. On Linux use `journalctl --user -u octet-hub.service -f`.
+- **See the file first.** `octet hub install --print` writes the file to the
+  terminal and changes nothing.
+- **Move or upgrade `octet`.** The service holds the program's path, so run
+  `octet hub install` again after moving or reinstalling it. A file already at
+  that path that isn't Octet's is never replaced.
+- **Remove it.** `octet hub uninstall` stops the service and deletes the file.
+  It says "Not installed" if there is nothing to remove.
+- **Linux without a login session.** A systemd user service stops when you log
+  out unless lingering is on: `loginctl enable-linger "$USER"`.
+
 ### Put it on your tailnet
 
 The hub never listens on the network. Publish it with Tailscale, which adds
@@ -474,7 +504,7 @@ or `~/.local/share/octet/rust-preview`. `--journal-dir PATH` chooses another.
 - Quit Octet with Ctrl+C twice, or `tmux kill-session -t octet`.
 - Turn off **Remote Login** in System Settings, or run `sudo tailscale set --ssh=false`.
 - Disconnect the Mac in the Tailscale app.
-- Stop the hub with Ctrl+C, and take it off the tailnet with `tailscale serve --https=443 off`.
+- Stop the hub with Ctrl+C (or `octet hub uninstall`, if you installed it as a service), and take it off the tailnet with `tailscale serve --https=443 off`.
 
 ## Security notes
 
