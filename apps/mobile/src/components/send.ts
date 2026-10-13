@@ -61,8 +61,20 @@ export function utf8Bytes(text: string): number {
   return bytes;
 }
 
-/** Text that starts with `/` is a slash command, which only the terminal UI runs. */
-export const isSlash = (text: string): boolean => text.trimStart().startsWith("/");
+/** The approval demo, which the desk sends as a prompt (`APPROVAL_DEMO`,
+ * crates/octet-engine/src/live/mod.rs, re-exported by octet-core). */
+export const APPROVAL_DEMO = "/approval-demo";
+
+/** A slash command, which only the terminal UI runs: the desk's own rule (`is_command_line`,
+ * crates/octet-tui/src/input.rs), which the bridge applies to the phone's text too. The trimmed
+ * text starts with `/`, is not the approval demo, and its first word names a command: one with
+ * a `/` in it is a path ("/usr/lib is broken"), so the text is a prompt. */
+export function isSlash(text: string): boolean {
+  const line = text.trim();
+  if (!line.startsWith("/") || line === APPROVAL_DEMO) return false;
+  const first = line.split(/\s/, 1)[0] ?? "";
+  return !first.slice(1).includes("/");
+}
 
 /** Whether the part of the screen is still there, for a result that comes after it left. */
 export function useAlive(): () => boolean {

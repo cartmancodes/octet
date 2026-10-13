@@ -67,8 +67,8 @@ export const hintFor = (phase: Phase, queued: number): string =>
 
 /**
  * The prompt box. The text is cleared only when the Mac acks it, so a refusal or a lost
- * connection never costs the user their words. `/…` is not sent: slash commands are the
- * terminal UI's.
+ * connection never costs the user their words. A slash command (`isSlash`: the desk's rule, so
+ * "/usr/lib is broken" is a prompt) is not sent: slash commands are the terminal UI's.
  */
 export const Composer = memo(function Composer({ session, phase, queued, send, offline = false }: ComposerProps) {
   const theme = useTheme();

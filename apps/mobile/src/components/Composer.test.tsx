@@ -5,6 +5,7 @@ import { StyleSheet } from "react-native";
 import { Refusal, type RequestBody } from "../client/HubClient";
 import { dark, light } from "../theme";
 import { Composer } from "./Composer";
+import { APPROVAL_DEMO, isSlash } from "./send";
 
 function rig() {
   const sent: RequestBody[] = [];
@@ -56,6 +57,36 @@ describe("the composer", () => {
     expect(r.send).not.toHaveBeenCalled();
     await fireEvent.changeText(input(), "fix the bug");
     expect(screen.queryByText("Slash commands run on the desk")).toBeNull();
+  });
+
+  it("follows the desk's rule for what is a slash command (crates/octet-tui/src/input.rs is_command_line)", () => {
+    expect(isSlash("/model x")).toBe(true);
+    expect(isSlash("  /help")).toBe(true);
+    expect(isSlash("/compact\n")).toBe(true);
+    expect(isSlash("/usr/lib is broken")).toBe(false); // a path, not a command name
+    expect(isSlash("  /etc/hosts looks wrong")).toBe(false);
+    expect(isSlash(APPROVAL_DEMO)).toBe(false); // the desk sends it as a prompt
+    expect(APPROVAL_DEMO).toBe("/approval-demo");
+    expect(isSlash(" /approval-demo ")).toBe(false);
+    expect(isSlash("/approval-demo now")).toBe(true);
+    expect(isSlash("fix /usr/lib")).toBe(false);
+  });
+
+  it("sends text that only starts like a path, and refuses a slash command even after spaces", async () => {
+    const r = rig();
+    await render(<Composer session="s" phase="idle" queued={0} send={r.send} />);
+    await fireEvent.changeText(input(), "  /help");
+    expect(screen.getByText("Slash commands run on the desk")).toBeTruthy();
+    expect(disabled(sendButton())).toBe(true);
+    await fireEvent.changeText(input(), "/model x");
+    expect(screen.getByText("Slash commands run on the desk")).toBeTruthy();
+    expect(disabled(sendButton())).toBe(true);
+    await fireEvent.press(sendButton());
+    expect(r.send).not.toHaveBeenCalled();
+    await fireEvent.changeText(input(), "/usr/lib is broken");
+    expect(screen.queryByText("Slash commands run on the desk")).toBeNull();
+    await fireEvent.press(sendButton());
+    expect(r.sent).toEqual([{ type: "prompt", session: "s", text: "/usr/lib is broken" }]);
   });
 
   it("sends the prompt with a light tap, and clears the text only after the ack", async () => {

@@ -71,6 +71,20 @@ describe("the session controls", () => {
     expect(button("Send steer")).toBeNull(); // the field closes
   });
 
+  it("steer sends path-like text, and refuses a slash command", async () => {
+    const r = rig();
+    await render(controls("running", "codex", r.send));
+    await fireEvent.press(button("Steer") as never);
+    await fireEvent.changeText(screen.getByLabelText("Steer message"), "/model x");
+    expect(screen.getByText("Slash commands run on the desk")).toBeTruthy();
+    await fireEvent.press(screen.getByRole("button", { name: "Send steer" }));
+    expect(r.send).not.toHaveBeenCalled();
+    await fireEvent.changeText(screen.getByLabelText("Steer message"), "/usr/lib is broken");
+    expect(screen.queryByText("Slash commands run on the desk")).toBeNull();
+    await fireEvent.press(screen.getByRole("button", { name: "Send steer" }));
+    expect(r.sent).toEqual([{ type: "steer", session: "s", text: "/usr/lib is broken" }]);
+  });
+
   it("steer keeps the text on a refusal, and offers Try again only for an unsent one", async () => {
     const r = rig();
     await render(controls("running", "codex", r.send));
