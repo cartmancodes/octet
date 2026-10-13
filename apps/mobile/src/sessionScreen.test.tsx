@@ -612,6 +612,24 @@ describe("the Session screen", () => {
       expect(screen.getByText("An approval is waiting \u2014 close this to answer it.")).toBeTruthy();
     });
 
+    it("an approval that came under the mode sheet arms 400 ms after the sheet closes", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), {
+        type: "catalog",
+        session: "a",
+        catalog: { modes: ["ask", "auto"], current_mode: "ask", models: [], current: null },
+      });
+      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
+      await feed(rig, approvalEvent(1, "Run tests"));
+      await wait(1_000);
+      await fireEvent.press(screen.getByTestId("scrim"));
+      const deny = () => screen.getByRole("button", { name: "Deny" });
+      expect(deny().props.accessibilityState?.disabled).toBe(true);
+      await wait(400);
+      expect(deny().props.accessibilityState?.disabled).toBe(false);
+    });
+
     it("has none of them for a session that is gone", async () => {
       await launch([info("a")], "/session/zzz");
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();
@@ -661,6 +679,9 @@ describe("the Session screen", () => {
         });
         expect(screen.queryByText("Waiting for your Mac…")).toBeNull();
         expect(screen.getByLabelText("Message").props.value).toBe("half a thought");
+        // The approval arms 400 ms after the link is back, as after it first came.
+        expect(isOff("Deny")).toBe(true);
+        await wait(400);
         for (const name of ["Allow", "Deny", "Send", "End session", "Mode and model"]) expect(isOff(name)).toBe(false);
         expect(rig.sockets.all.flatMap((s) => s.commandsOf("prompt").concat(s.commandsOf("answer")))).toEqual([]);
       });

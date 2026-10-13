@@ -1,5 +1,5 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { RequestBody } from "../client/HubClient";
@@ -236,6 +236,8 @@ interface ModeModelSheetProps {
   offline?: boolean;
   /** The session has an approval waiting, which the open sheet would hide. */
   approval?: boolean;
+  /** Told when the sheet opens and closes (the approval sheet under it waits). Must be stable. */
+  onVisible?: (visible: boolean) => void;
 }
 
 /**
@@ -251,6 +253,7 @@ export const ModeModelSheet = memo(function ModeModelSheet({
   send,
   offline = false,
   approval = false,
+  onVisible,
 }: ModeModelSheetProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
@@ -258,6 +261,7 @@ export const ModeModelSheet = memo(function ModeModelSheet({
   const [visible, setVisible] = useState(false);
   const [asking, setAsking] = useState<string | null>(null);
   const [pending, setPending] = useState<string | null>(null);
+  useEffect(() => onVisible?.(visible), [visible, onVisible]);
 
   const items = useMemo(() => (catalog ? itemsOf(catalog) : []), [catalog]);
   const currentMode = catalog?.current_mode;

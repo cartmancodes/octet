@@ -2,7 +2,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import * as Haptics from "expo-haptics";
 import * as LocalAuthentication from "expo-local-authentication";
-import { StyleSheet } from "react-native";
+import { AccessibilityInfo, StyleSheet } from "react-native";
 
 import { Refusal } from "../client/HubClient";
 import { EMPTY_VIEW, reduceView, type PendingApproval } from "../model/session";
@@ -166,6 +166,55 @@ describe("approvals_queue_and_close_elsewhere", () => {
     expect(disabled(deny())).toBe(false);
   });
 
+  it("arms again, 400 ms on, when the link comes back: a tap in that frame answers nothing", async () => {
+    const r = rig();
+    const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} offline />);
+    await settle(1_000);
+    await view.rerender(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} offline={false} />);
+    expect(disabled(deny())).toBe(true);
+    await fireEvent.press(deny());
+    expect(r.send).not.toHaveBeenCalled();
+    await settle(399);
+    expect(disabled(deny())).toBe(true);
+    await settle(1);
+    expect(disabled(deny())).toBe(false);
+    expect(disabled(allow())).toBe(false);
+  });
+
+  it("arms again, 400 ms on, when the sheet over it closes", async () => {
+    const r = rig();
+    const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} covered />);
+    await settle(1_000);
+    expect(disabled(deny())).toBe(true);
+    await view.rerender(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} covered={false} />);
+    expect(disabled(deny())).toBe(true);
+    await settle(399);
+    expect(disabled(allow())).toBe(true);
+    await settle(1);
+    expect(disabled(allow())).toBe(false);
+    // Covered again, it is dead again.
+    await view.rerender(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} covered />);
+    expect(disabled(allow())).toBe(true);
+  });
+
+  it("tells VoiceOver once when a new approval comes to the front", async () => {
+    const say = jest.spyOn(AccessibilityInfo, "announceForAccessibility").mockImplementation(() => undefined);
+    say.mockClear(); // React Native's mock is one jest.fn for every test
+    try {
+      const r = rig();
+      const view = await render(<ApprovalSheet session="s" approvals={[approval(1, { command: null }), approval(2)]} send={r.send} />);
+      expect(say.mock.calls).toEqual([["Approval waiting"]]);
+      // The same one, filled in by its journal record: no news.
+      await view.rerender(<ApprovalSheet session="s" approvals={[approval(1), approval(2)]} send={r.send} />);
+      expect(say).toHaveBeenCalledTimes(1);
+      // The next one at the front is.
+      await view.rerender(<ApprovalSheet session="s" approvals={[approval(2)]} send={r.send} />);
+      expect(say.mock.calls).toEqual([["Approval waiting"], ["Approval waiting"]]);
+    } finally {
+      say.mockRestore();
+    }
+  });
+
   it("shows an approval whose id comes back after it was answered and closed: it is a new one", async () => {
     const r = rig();
     const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
@@ -235,6 +284,7 @@ describe("approvals_queue_and_close_elsewhere", () => {
       const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} offline />);
       await settle(400);
       await view.rerender(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} offline={false} />);
+      await settle(400); // armed again 400 ms after the link is back
       expect(disabled(allow())).toBe(false);
       await fireEvent.press(deny());
       expect(r.sent).toEqual([{ type: "answer", session: "s", approval: 1, allow: false }]);

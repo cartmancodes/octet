@@ -135,6 +135,8 @@ export default function Session() {
   const header = useMemo(() => ({ title, headerRight: () => <HeaderMascot pose={pose} /> }), [title, pose]);
   // The home indicator's room is only needed under the composer; the keyboard covers it.
   const [offset, setOffset] = useState(0);
+  // The Mode and model sheet covers the approval sheet: it waits until the sheet is gone.
+  const [sheetOpen, setSheetOpen] = useState(false);
   const root = useRef<View>(null);
   const measure = useCallback(() => root.current?.measureInWindow((_x, y) => setOffset(y)), []);
 
@@ -195,7 +197,7 @@ export default function Session() {
             {live ? (
               <>
                 {offline ? <Text style={[type.caption, styles.waiting, { color: theme.muted }]}>{WAITING}</Text> : null}
-                <ApprovalSheet session={id} approvals={approvals} send={send} offline={offline} />
+                <ApprovalSheet session={id} approvals={approvals} send={send} offline={offline} covered={sheetOpen} />
                 <SessionControls
                   session={id}
                   phase={phase}
@@ -209,6 +211,7 @@ export default function Session() {
                   send={send}
                   offline={offline}
                   approval={approvals.length > 0}
+                  onVisible={setSheetOpen}
                 />
                 <View style={{ paddingBottom: Math.max(insets.bottom, spacing.sm) }}>
                   <Composer session={id} phase={phase} queued={queued} send={send} offline={offline} />

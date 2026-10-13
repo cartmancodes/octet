@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { AccessibilityInfo, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 import { confirmBiometric } from "../auth";
 import { successTap } from "../haptics";
@@ -17,6 +17,8 @@ export const ARM_MS = 400;
 /** Files listed before "+N more". */
 export const FILES_SHOWN = 5;
 export const NO_FACE_ID = "Face ID isn't set up on this phone. Turn it off in Settings to allow from here.";
+/** What VoiceOver says when a request comes to the front. */
+export const ANNOUNCED = "Approval waiting";
 /** The system prompt's sentence is short; the action can be long. */
 const REASON_CHARS = 80;
 /** Said when the command or the request is not whole on the phone: Allow runs the Mac's. */
@@ -32,6 +34,9 @@ interface ApprovalSheetProps {
   send: Send;
   /** The Mac can't be reached: the request stays on screen and nothing can be answered. */
   offline?: boolean;
+  /** Another sheet (Mode and model) is over this one: nothing can be answered, and the arm
+   * delay starts again once it is gone, so a tap that closed it answers nothing. */
+  covered?: boolean;
 }
 
 function makeStyles(theme: Theme) {
@@ -88,7 +93,13 @@ const POSE = poseFor({ kind: "approval" });
  * another device closed disappears (the store drops it); one answered here goes at once. The sheet
  * is the only amber thing on the screen. The screen does not mount it for a session that ended.
  */
-export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, send, offline = false }: ApprovalSheetProps) {
+export const ApprovalSheet = memo(function ApprovalSheet({
+  session,
+  approvals,
+  send,
+  offline = false,
+  covered = false,
+}: ApprovalSheetProps) {
   // Answered here and not closed by the Mac yet: hidden. Only ids still listed are kept, so an id
   // that left and came back is a new request (a vendor numbers its approvals from 1 again after a
   // provider switch or a reconnect), shown and answerable.
@@ -106,6 +117,12 @@ export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, s
   const isOpen = useCallback((id: number) => open.current.includes(id), []);
   const waiting = approvals.filter((a) => !listed.includes(a.id));
   const front = waiting[0];
+  // A new request at the front is news. Android speaks the live region; iOS has none, so it is
+  // announced there (both would speak twice). Its record filling in later is the same request.
+  const frontId = front?.id;
+  useEffect(() => {
+    if (frontId !== undefined && Platform.OS === "ios") AccessibilityInfo.announceForAccessibility(ANNOUNCED);
+  }, [frontId]);
   if (!front) return null;
   // Keyed by the id and what it asks: each request, and the same one once its content is filled
   // in (the journal record after the state frame), starts unarmed, closed and with no old error.
@@ -118,6 +135,7 @@ export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, s
       more={waiting.length - 1}
       send={send}
       offline={offline}
+      covered={covered}
       onAnswered={onAnswered}
     />
   );
@@ -129,12 +147,13 @@ interface RequestProps {
   more: number;
   send: Send;
   offline: boolean;
+  covered: boolean;
   /** Whether the approval is still open: it may have been closed elsewhere while Face ID was up. */
   isOpen: (id: number) => boolean;
   onAnswered: (id: number) => void;
 }
 
-function Request({ session, approval, more, send, offline, isOpen, onAnswered }: RequestProps) {
+function Request({ session, approval, more, send, offline, covered, isOpen, onAnswered }: RequestProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const alive = useAlive();
@@ -151,10 +170,15 @@ function Request({ session, approval, more, send, offline, isOpen, onAnswered }:
     down.current = offline;
   });
 
+  // The delay counts from when the request can be seen and answered: its arrival, the link
+  // coming back, or the sheet over it closing. Hidden or offline, it is dead.
+  const reachable = !offline && !covered;
+  if (!reachable && armed) setArmed(false);
   useEffect(() => {
+    if (!reachable) return;
     const timer = setTimeout(() => setArmed(true), ARM_MS);
     return () => clearTimeout(timer);
-  }, []);
+  }, [reachable]);
 
   const { summary, detail, id } = approval;
   const answer = useCallback(
@@ -199,7 +223,7 @@ function Request({ session, approval, more, send, offline, isOpen, onAnswered }:
   const toggle = useCallback(() => setFull((open) => !open), []);
 
   const busy = stage !== null;
-  const canAnswer = armed && !busy && !offline;
+  const canAnswer = armed && !busy && reachable;
   const files = summary.files.slice(0, FILES_SHOWN);
   const rest = summary.files.length - files.length;
   const command = summary.command ? foldCommand(summary.command) : null;
