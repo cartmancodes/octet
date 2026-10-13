@@ -25,3 +25,17 @@ jest.mock("@shopify/flash-list/dist/recyclerview/utils/measureLayout", () => ({
   measureFirstChildLayout: jest.fn(() => ({ x: 0, y: 0, width: 400, height: 900 })),
   measureItemLayout: jest.fn(() => ({ x: 0, y: 0, width: 400, height: 100 })),
 }));
+
+// Biometrics succeed by default; a test that needs a failure sets it. Haptics do nothing.
+jest.mock("expo-local-authentication", () => ({
+  hasHardwareAsync: jest.fn(async () => true),
+  isEnrolledAsync: jest.fn(async () => true),
+  authenticateAsync: jest.fn(async (_options?: object) => ({ success: true })),
+}));
+
+jest.mock("expo-haptics", () => ({
+  ImpactFeedbackStyle: { Light: "light", Medium: "medium", Heavy: "heavy" },
+  NotificationFeedbackType: { Success: "success", Warning: "warning", Error: "error" },
+  impactAsync: jest.fn(async () => undefined),
+  notificationAsync: jest.fn(async () => undefined),
+}));

@@ -1,0 +1,232 @@
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+
+import { confirmBiometric } from "../auth";
+import { successTap } from "../haptics";
+import { Mascot } from "../mascot/Mascot";
+import { poseFor } from "../mascot/state";
+import type { PendingApproval } from "../model/session";
+import { loadSettings } from "../persist";
+import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
+import { failure, useAlive, type Send } from "./send";
+
+/** Allow stays dead this long after a request comes to the front: a tap meant for the one before
+ * (or a thumb already on its way) must not approve the next. */
+export const ARM_MS = 400;
+/** Files listed before "+N more". */
+export const FILES_SHOWN = 5;
+export const NO_FACE_ID = "Face ID isn't set up on this phone. Turn it off in Settings to allow from here.";
+/** The system prompt's sentence is short; the action can be long. */
+const REASON_CHARS = 80;
+/** Answered approvals remembered, so one the Mac has not closed yet does not come back. */
+const ANSWERED_KEPT = 32;
+
+interface ApprovalSheetProps {
+  session: string;
+  /** The session's pending approvals, oldest first. The store fills them in place. */
+  approvals: PendingApproval[];
+  /** Must be stable. */
+  send: Send;
+}
+
+function makeStyles(theme: Theme) {
+  return StyleSheet.create({
+    sheet: {
+      backgroundColor: theme.panel,
+      borderTopColor: theme.amber,
+      borderTopWidth: 2,
+      paddingHorizontal: spacing.lg,
+      paddingVertical: spacing.md,
+      gap: spacing.sm,
+    },
+    head: { flexDirection: "row", alignItems: "center", gap: spacing.md },
+    headText: { flex: 1, gap: 2 },
+    kicker: { ...type.caption, color: theme.amber, fontWeight: "700" },
+    action: { ...type.body, color: theme.amber, fontWeight: "600" },
+    waiting: { ...type.caption, color: theme.muted },
+    body: { maxHeight: 220 },
+    bodyContent: { gap: spacing.xs },
+    command: { ...type.mono, color: theme.fg },
+    file: { ...type.mono, color: theme.fg },
+    more: { ...type.caption, color: theme.muted },
+    where: { ...type.caption, color: theme.muted },
+    scope: { ...type.caption, color: theme.fg },
+    detail: { ...type.mono, color: theme.muted },
+    toggle: { minHeight: 44, justifyContent: "center", alignSelf: "flex-start" },
+    toggleText: { ...type.body, color: theme.fg, textDecorationLine: "underline" },
+    status: { ...type.caption, color: theme.muted },
+    error: { ...type.caption, color: theme.amber },
+    buttons: { flexDirection: "row", gap: spacing.md },
+    button: {
+      flex: 1,
+      minHeight: 48,
+      alignItems: "center",
+      justifyContent: "center",
+      borderRadius: radius.md,
+      borderColor: theme.edge,
+      borderWidth: 1,
+    },
+    allow: { backgroundColor: theme.accent, borderColor: theme.accent },
+    off: { opacity: 0.4 },
+    denyLabel: { ...type.body, color: theme.fg, fontWeight: "600" },
+    allowLabel: { ...type.body, color: theme.bg, fontWeight: "600" },
+  });
+}
+const DARK = makeStyles(dark);
+const LIGHT = makeStyles(light);
+
+const POSE = poseFor({ kind: "approval" });
+
+/**
+ * Pending approvals, one at a time: the oldest comes first, the others wait behind it. A request
+ * another device closed disappears (the store drops it); one answered here goes at once. The sheet
+ * is the only amber thing on the screen. The screen does not mount it for a session that ended.
+ */
+export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, send }: ApprovalSheetProps) {
+  const [answered, setAnswered] = useState<readonly number[]>([]);
+  const onAnswered = useCallback(
+    (id: number) => setAnswered((prev) => (prev.includes(id) ? prev : [...prev, id].slice(-ANSWERED_KEPT))),
+    [],
+  );
+  const waiting = approvals.filter((a) => !answered.includes(a.id));
+  const front = waiting[0];
+  if (!front) return null;
+  // Keyed: each request starts unarmed, closed and with no old error.
+  return (
+    <Request
+      key={front.id}
+      session={session}
+      approval={front}
+      more={waiting.length - 1}
+      send={send}
+      onAnswered={onAnswered}
+    />
+  );
+});
+
+interface RequestProps {
+  session: string;
+  approval: PendingApproval;
+  more: number;
+  send: Send;
+  onAnswered: (id: number) => void;
+}
+
+function Request({ session, approval, more, send, onAnswered }: RequestProps) {
+  const theme = useTheme();
+  const s = theme === light ? LIGHT : DARK;
+  const alive = useAlive();
+  const [armed, setArmed] = useState(false);
+  const [full, setFull] = useState(false);
+  // "checking": the biometric prompt is up. "sending": the answer is out, waiting for its ack.
+  const [stage, setStage] = useState<"checking" | "sending" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const out = useRef(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setArmed(true), ARM_MS);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const { summary, detail, id } = approval;
+  const answer = useCallback(
+    async (allow: boolean) => {
+      if (out.current || (allow && !armed)) return;
+      out.current = true;
+      setError(null);
+      setStage("checking");
+      try {
+        if (allow) {
+          // Read now, not at mount: a change in Settings counts at once.
+          const { faceId } = await loadSettings();
+          if (faceId) {
+            const reason = `Allow: ${summary.action.slice(0, REASON_CHARS)}`;
+            const checked = await confirmBiometric(reason);
+            if (checked === "unavailable") {
+              if (alive()) setError(NO_FACE_ID);
+              return;
+            }
+            if (checked === "failed") return; // cancelled or no match: nothing is sent
+          }
+        }
+        if (alive()) setStage("sending");
+        await send({ type: "answer", session, approval: id, allow });
+        if (allow) successTap();
+        onAnswered(id);
+      } catch (e) {
+        if (alive()) setError(failure(e).text);
+      } finally {
+        out.current = false;
+        if (alive()) setStage(null);
+      }
+    },
+    [armed, summary.action, session, id, send, onAnswered, alive],
+  );
+  const allow = useCallback(() => void answer(true), [answer]);
+  const deny = useCallback(() => void answer(false), [answer]);
+  const toggle = useCallback(() => setFull((open) => !open), []);
+
+  const busy = stage !== null;
+  const canAllow = armed && !busy;
+  const files = summary.files.slice(0, FILES_SHOWN);
+  const rest = summary.files.length - files.length;
+  return (
+    <View style={s.sheet} accessibilityLiveRegion="polite">
+      <View style={s.head}>
+        <Mascot pose={POSE} size={59} />
+        <View style={s.headText}>
+          <Text style={s.kicker}>Approval needed</Text>
+          <Text style={s.action}>{summary.action}</Text>
+          {more > 0 ? <Text style={s.waiting}>{`${more} more waiting`}</Text> : null}
+        </View>
+      </View>
+      <ScrollView style={s.body} contentContainerStyle={s.bodyContent}>
+        {summary.command ? <Text style={s.command}>{`$ ${summary.command}`}</Text> : null}
+        {files.map((file, i) => (
+          <Text key={`${i}:${file}`} style={s.file}>
+            {file}
+          </Text>
+        ))}
+        {rest > 0 ? <Text style={s.more}>{`+${rest} more`}</Text> : null}
+        {summary.cwd ? <Text style={s.where}>{`in ${summary.cwd}`}</Text> : null}
+        <Text style={s.scope}>{`Allows: ${summary.scope}`}</Text>
+        {full ? <Text style={s.detail}>{detail}</Text> : null}
+      </ScrollView>
+      {detail !== "" ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={full ? "Hide full request" : "Show full request"}
+          accessibilityState={{ expanded: full }}
+          onPress={toggle}
+          style={s.toggle}
+        >
+          <Text style={s.toggleText}>{full ? "Hide full request" : "Show full request"}</Text>
+        </Pressable>
+      ) : null}
+      {stage === "sending" ? <Text style={s.status}>Sending…</Text> : null}
+      {error ? <Text style={s.error}>{error}</Text> : null}
+      <View style={s.buttons}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Deny"
+          accessibilityState={{ disabled: busy, busy }}
+          disabled={busy}
+          onPress={deny}
+          style={[s.button, busy && s.off]}
+        >
+          <Text style={s.denyLabel}>Deny</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Allow"
+          accessibilityState={{ disabled: !canAllow, busy }}
+          disabled={!canAllow}
+          onPress={allow}
+          style={[s.button, s.allow, !canAllow && s.off]}
+        >
+          <Text style={s.allowLabel}>Allow</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}

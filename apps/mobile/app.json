@@ -17,6 +17,12 @@
       "expo-router",
       "expo-secure-store",
       [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Octet uses Face ID before allowing an agent's action or turning on full access."
+        }
+      ],
+      [
         "expo-camera",
         {
           "cameraPermission": "Octet uses the camera to scan the pairing code shown on your Mac.",

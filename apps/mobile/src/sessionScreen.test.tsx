@@ -470,4 +470,75 @@ describe("the Session screen", () => {
     expect(octetStore.getState().bySession.get("b")?.transcript.entries).toHaveLength(1);
     expect(rows).not.toHaveBeenCalled();
   });
+
+  describe("approvals, the composer and the controls", () => {
+    const approvalEvent = (id: number, action: string) =>
+      ev({ type: "approval", data: { id, detail: `full ${id}`, summary: { action, command: "make test", files: [], cwd: "/w", scope: "once" } } });
+    const lastCommand = (rig: Rig, type: string) => rig.sockets.last.commandsOf(type).at(-1);
+    // renderRouter runs on fake timers.
+    const wait = (ms: number) => act(async () => void jest.advanceTimersByTime(ms));
+
+    it("a live session has the composer and, idle, End; a running one has Cancel", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+      expect(screen.getByLabelText("Message")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "End session" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+      await feed(rig, stateFrame({ phase: "running", queued: 2 }));
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+      expect(screen.getByText("Queue · 2 queued")).toBeTruthy();
+    });
+
+    it("sends a prompt over the wire and clears the box when the Mac acks", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+      await fireEvent.changeText(screen.getByLabelText("Message"), "fix the hub");
+      await fireEvent.press(screen.getByRole("button", { name: "Send" }));
+      const sent = lastCommand(rig, "prompt");
+      expect(sent).toMatchObject({ session: "a", text: "fix the hub" });
+      expect(screen.getByLabelText("Message").props.value).toBe("fix the hub");
+      await feed(rig, { type: "ack", req: sent?.req, message: "sent" });
+      expect(screen.getByLabelText("Message").props.value).toBe("");
+    });
+
+    it("shows an approval, answers it over the wire, and drops one closed elsewhere", async () => {
+      await saveSettings({ faceId: false });
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"), approvalEvent(2, "Edit config"));
+      expect(screen.getByText("Run tests")).toBeTruthy();
+      expect(screen.getByText("$ make test")).toBeTruthy();
+      await wait(450);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow" }));
+      await act(async () => {});
+      const answer = lastCommand(rig, "answer");
+      expect(answer).toMatchObject({ session: "a", approval: 1, allow: true });
+      await feed(rig, { type: "ack", req: answer?.req, message: "ok" });
+      expect(screen.getByText("Edit config")).toBeTruthy();
+      await feed(rig, ev({ type: "approval_closed", data: 2 }));
+      expect(screen.queryByText("Edit config")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Allow" })).toBeNull();
+    });
+
+    it("hides the composer, the controls and the approvals once the session has ended", async () => {
+      const rig = await launch([info("a", { phase: "idle" }), info("b")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), approvalEvent(1, "Run tests"));
+      expect(screen.getByText("Run tests")).toBeTruthy();
+      await feed(rig, { type: "sessions", sessions: [info("b")] });
+      expect(screen.getByText("This session ended")).toBeTruthy();
+      expect(screen.queryByLabelText("Message")).toBeNull();
+      expect(screen.queryByRole("button", { name: "End session" })).toBeNull();
+      expect(screen.queryByText("Run tests")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Allow" })).toBeNull();
+    });
+
+    it("has none of them for a session that is gone", async () => {
+      await launch([info("a")], "/session/zzz");
+      expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();
+      expect(screen.queryByLabelText("Message")).toBeNull();
+    });
+  });
 });

@@ -1,20 +1,27 @@
 import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
 import { Stack, useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useRef, useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { KeyboardAvoidingView, Pressable, StyleSheet, Text, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { Refusal } from "../../src/client/HubClient";
+import { ApprovalSheet } from "../../src/components/ApprovalSheet";
+import { Composer } from "../../src/components/Composer";
 import { useFollow } from "../../src/components/follow";
 import { HubBanner } from "../../src/components/HubBanner";
+import type { Send } from "../../src/components/send";
+import { SessionControls } from "../../src/components/SessionControls";
 import { TaskStrip } from "../../src/components/TaskStrip";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
 import { useHubClient } from "../../src/hub";
 import type { Entry } from "../../src/model/transcript";
-import { nowLine } from "../../src/session";
+import { nowLine, queueWords } from "../../src/session";
 import { sessionName } from "../../src/sessions";
 import {
   octetStore,
   releaseSession,
   unwatch,
+  useApprovals,
   useEntries,
   useHub,
   useListed,
@@ -52,6 +59,8 @@ export default function Session() {
   const listed = useListed();
   const hub = useHub();
   const taskOpen = useTaskOpen();
+  const approvals = useApprovals(id);
+  const insets = useSafeAreaInsets();
   const setTaskOpen = octetStore.getState().setTaskOpen;
 
   useFocusEffect(
@@ -104,60 +113,86 @@ export default function Session() {
   const gone = info === undefined && ((listed && !status.known) || (status.failed !== null && entries.length === 0));
   const now = nowLine(state, info);
 
+  // Commands go to the Mac through the one client; with none (not paired yet) they are unsent.
+  const send = useCallback<Send>(
+    (body) => (client ? client.request(body) : Promise.reject(new Refusal("unsent", "Can't reach your Mac"))),
+    [client],
+  );
+  // Only a live session takes commands: not an ended one, one the hub refused, or one that is gone.
+  const live = !gone && !status.ended && status.failed === null;
+  const phase = state?.phase ?? info?.phase ?? "idle";
+  const queued = queueWords(state).count;
+  // The home indicator's room is only needed under the composer; the keyboard covers it.
+  const [offset, setOffset] = useState(0);
+  const root = useRef<View>(null);
+  const measure = useCallback(() => root.current?.measureInWindow((_x, y) => setOffset(y)), []);
+
   return (
-    <View style={[styles.screen, { backgroundColor: theme.bg }]}>
-      <Stack.Screen options={{ title }} />
-      <HubBanner state={hub} announce={focused} />
-      {gone ? (
-        <View style={styles.gone}>
-          <Text style={[type.body, styles.center, { color: theme.muted }]}>This session isn&apos;t running anymore</Text>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Back to sessions"
-            onPress={back}
-            style={[styles.button, { borderColor: theme.accent }]}
-          >
-            <Text style={[type.body, { color: theme.accent }]}>Back to sessions</Text>
-          </Pressable>
-        </View>
-      ) : (
-        <>
-          {status.ended ? <Notice text="This session ended" /> : null}
-          {status.failed !== null ? <Notice text={status.failed} /> : null}
-          <TaskStrip state={state} now={now} goal={info?.goal ?? null} open={taskOpen} onOpen={setTaskOpen} />
-          <View style={styles.transcript}>
-            <FlashList
-              ref={list}
-              testID="transcript"
-              data={entries}
-              extraData={open}
-              renderItem={renderItem}
-              keyExtractor={keyOf}
-              getItemType={typeOf}
-              maintainVisibleContentPosition={KEEP_POSITION}
-              onScroll={follow.onScroll}
-              onScrollBeginDrag={follow.onScrollBeginDrag}
-              onScrollEndDrag={follow.onScrollEndDrag}
-              onMomentumScrollBegin={follow.onMomentumScrollBegin}
-              onMomentumScrollEnd={follow.onMomentumScrollEnd}
-              onContentSizeChange={follow.onContentSizeChange}
-              scrollEventThrottle={32}
-              contentContainerStyle={styles.list}
-            />
-            {follow.below ? (
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="New output below"
-                onPress={follow.jump}
-                style={[styles.pill, { backgroundColor: theme.selected, borderColor: theme.accent }]}
-              >
-                <Text style={[type.caption, { color: theme.fg }]}>New output below ↓</Text>
-              </Pressable>
-            ) : null}
+    <View ref={root} onLayout={measure} style={[styles.screen, { backgroundColor: theme.bg }]}>
+      <KeyboardAvoidingView behavior="padding" keyboardVerticalOffset={offset} style={styles.screen}>
+        <Stack.Screen options={{ title }} />
+        <HubBanner state={hub} announce={focused} />
+        {gone ? (
+          <View style={styles.gone}>
+            <Text style={[type.body, styles.center, { color: theme.muted }]}>
+              This session isn&apos;t running anymore
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Back to sessions"
+              onPress={back}
+              style={[styles.button, { borderColor: theme.accent }]}
+            >
+              <Text style={[type.body, { color: theme.accent }]}>Back to sessions</Text>
+            </Pressable>
           </View>
-          {/* The composer (Task 8) goes here, shown only while the session is live. */}
-        </>
-      )}
+        ) : (
+          <>
+            {status.ended ? <Notice text="This session ended" /> : null}
+            {status.failed !== null ? <Notice text={status.failed} /> : null}
+            <TaskStrip state={state} now={now} goal={info?.goal ?? null} open={taskOpen} onOpen={setTaskOpen} />
+            <View style={styles.transcript}>
+              <FlashList
+                ref={list}
+                testID="transcript"
+                data={entries}
+                extraData={open}
+                renderItem={renderItem}
+                keyExtractor={keyOf}
+                getItemType={typeOf}
+                maintainVisibleContentPosition={KEEP_POSITION}
+                onScroll={follow.onScroll}
+                onScrollBeginDrag={follow.onScrollBeginDrag}
+                onScrollEndDrag={follow.onScrollEndDrag}
+                onMomentumScrollBegin={follow.onMomentumScrollBegin}
+                onMomentumScrollEnd={follow.onMomentumScrollEnd}
+                onContentSizeChange={follow.onContentSizeChange}
+                scrollEventThrottle={32}
+                contentContainerStyle={styles.list}
+              />
+              {follow.below ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="New output below"
+                  onPress={follow.jump}
+                  style={[styles.pill, { backgroundColor: theme.selected, borderColor: theme.accent }]}
+                >
+                  <Text style={[type.caption, { color: theme.fg }]}>New output below ↓</Text>
+                </Pressable>
+              ) : null}
+            </View>
+            {live ? (
+              <>
+                <ApprovalSheet session={id} approvals={approvals} send={send} />
+                <SessionControls session={id} phase={phase} engine={info?.engine ?? "claude"} send={send} />
+                <View style={{ paddingBottom: Math.max(insets.bottom, spacing.sm) }}>
+                  <Composer session={id} phase={phase} queued={queued} send={send} />
+                </View>
+              </>
+            ) : null}
+          </>
+        )}
+      </KeyboardAvoidingView>
     </View>
   );
 }
