@@ -1,6 +1,6 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
 import { memo, useCallback, useMemo, useState } from "react";
-import { KeyboardAvoidingView, Modal, Pressable, StyleSheet, Text, View } from "react-native";
+import { KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { RequestBody } from "../client/HubClient";
 import type { CatalogInfo, Engine, Mode, ModelInfo } from "../protocol";
@@ -384,7 +384,7 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
         <Text style={s.label}>Mode and model</Text>
       </Pressable>
       <Modal testID="sheet" visible={visible} transparent animationType="slide" onRequestClose={close}>
-        <KeyboardAvoidingView behavior="padding" style={s.root}>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={s.root}>
           <View style={s.scrim} />
           <Pressable
             testID="scrim"

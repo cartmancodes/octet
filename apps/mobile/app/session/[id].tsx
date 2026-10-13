@@ -1,7 +1,7 @@
 import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
 import { Stack, useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useRef, useState } from "react";
-import { KeyboardAvoidingView, Pressable, StyleSheet, Text, View } from "react-native";
+import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Refusal } from "../../src/client/HubClient";
@@ -132,7 +132,7 @@ export default function Session() {
 
   return (
     <View ref={root} onLayout={measure} style={[styles.screen, { backgroundColor: theme.bg }]}>
-      <KeyboardAvoidingView behavior="padding" keyboardVerticalOffset={offset} style={styles.screen}>
+      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={offset} style={styles.screen}>
         <Stack.Screen options={{ title }} />
         <HubBanner state={hub} announce={focused} />
         {gone ? (

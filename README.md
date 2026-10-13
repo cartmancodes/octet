@@ -248,6 +248,7 @@ Start at the [documentation index](docs/README.md). The main guides:
 - [Using the terminal UI](docs/tui.md): keys, commands, modes, models,
   journals and limits
 - [Use Octet from your phone](docs/remote-control.md)
+- [The phone app](apps/mobile/README.md): build, pair, troubleshoot
 - [Persistent goals](docs/rust/goals.md)
 
 ## Project layout

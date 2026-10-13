@@ -18,6 +18,14 @@ Claude Code and Codex CLIs.
   Each interface shares its session through a private socket in `run/`; a
   device token and your tailnet login are both required, every remote action
   is audited, and full access needs a typed confirmation.
+- A phone app (`apps/mobile`, Expo and React Native): it pairs by QR code or
+  link, lists your sessions with what each is doing, streams transcripts,
+  sends prompts, answers approvals (Face ID or fingerprint first), changes
+  mode and model, resumes recent sessions and starts new ones in a workspace
+  you choose. The device token lives in the phone's secure storage, and a
+  revoked phone is told to pair again. A contract test (`make mobile-contract`)
+  runs the app's hub client against the real `octet hub`. Build and
+  troubleshooting notes are in `apps/mobile/README.md`.
 - `/remote-control pair` shows a QR code and link that pair a phone with the
   hub (single use, 10 minutes); `/remote-control` also reports the hub.
 - `octet hub devices`, `octet hub revoke NAME` and `octet hub watch` list

@@ -352,6 +352,12 @@ You need the Mac side of Tailscale (step 3), and `tmux` if the phone should
 start sessions (step 1). The phone app itself is a separate download and
 needs no SSH setup.
 
+The app is an Expo (React Native) project in
+[`apps/mobile`](../apps/mobile/README.md). Its README covers building it for
+an iPhone or an Android phone, working on it, pairing, and what to check when
+the app can't reach the Mac, says it is unpaired, or doesn't show a session
+you started.
+
 ### Start the hub
 
 ```sh

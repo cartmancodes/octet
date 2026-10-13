@@ -1,4 +1,4 @@
-.PHONY: help mobile-check mobile-export rust-check rust-build tui tui-demo gate
+.PHONY: help mobile-check mobile-contract mobile-export rust-check rust-build tui tui-demo gate
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?##' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?##"}{printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -11,6 +11,9 @@ rust-check: ## Check formatting, lint, docs and tests for the Rust workspace
 
 mobile-check: ## Type-check, lint and test the mobile app (needs Node 22)
 	cd apps/mobile && npm ci && npm run typecheck && npm run lint && npm test -- --ci
+
+mobile-contract: ## Run the app's hub client against the real octet hub (build it first: cargo build -p octet)
+	cd apps/mobile && npm run contract
 
 mobile-export: ## Bundle the mobile app for iOS and Android (no native build)
 	cd apps/mobile && npm run export:check
