@@ -11,6 +11,17 @@ Claude Code and Codex CLIs.
 
 ### Added
 
+- Push for the phone app, and a hub that keeps itself running: the hub tells a
+  phone that is not looking at the app when an approval is waiting or a turn
+  finished, through Expo's push service. The message is only `Octet` and
+  `Approval waiting` or `Turn finished` plus an opaque session id, sent with
+  `curl` (the token never in a command line or a log) to phones that turned it
+  on and have no open connection, at most six a minute each; a tap opens that
+  session. The app pings the hub to notice a dead link and reconnects at once
+  on returning to the foreground. `octet hub install` and `octet hub uninstall`
+  run the hub as a launchd agent (macOS) or a systemd user unit (Linux). The
+  contract test (`ping`, `register_push` and the push itself) now runs in CI,
+  and `apps/mobile/README.md` has the push setup and a device-pass checklist.
 - A phone hub and a bridge in every terminal interface: `octet hub` serves
   your running sessions to a phone app over your tailnet (loopback only,
   published with `tailscale serve`), with transcripts, prompts, approvals,

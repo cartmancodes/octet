@@ -7,9 +7,13 @@
 //   `/Applications/Tailscale.app/...` if `tailscale` on PATH fails (crates/octet-hub/src/owner.rs), so
 //   the stand-in logs every call it gets and the test asserts the lookup reached it and nothing else
 //   was asked of it; a stand-in that fails would fall through to the real app, and so fails the test.
+// - `OCTET_HUB_PUSH_URL` points the hub's pushes at a local HTTP server instead of exp.host (the
+//   hub honours it only for `http://127.0.0.1:<port>`). The hub posts with `curl`, so the real
+//   one stays on its PATH behind the stand-in directory. Nothing here reaches Expo.
 // - the WebSocket factory sets `Tailscale-User-Login`, which `tailscale serve` adds in real life.
 //   The app itself never sends that header.
 import { type ChildProcess, spawn } from "node:child_process";
+import http from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, appendFileSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -25,6 +29,7 @@ const BINARY = path.resolve(__dirname, "../../../target/debug/octet");
 const OWNER = "test@example";
 const PHONE = "Contract phone";
 const JOURNAL = "session-1-1.jsonl";
+const PUSH_TOKEN = "ExponentPushToken[contract-test-token]";
 const run = existsSync(BINARY) ? describe : describe.skip;
 
 type Obj = Record<string, unknown>;
@@ -72,6 +77,48 @@ function control(socket: string, request: Obj): Promise<Obj> {
   });
 }
 
+/** A local stand-in for Expo's push endpoint: keeps every body posted and answers `ok`. */
+class PushFake {
+  readonly bodies: string[] = [];
+  readonly server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk: Buffer) => (body += chunk.toString()));
+    req.on("end", () => {
+      this.bodies.push(body);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ data: [{ status: "ok", id: "ticket" }] }));
+    });
+  });
+
+  listen(port: number): Promise<void> {
+    return new Promise((resolve) => this.server.listen(port, "127.0.0.1", resolve));
+  }
+
+  close(): void {
+    this.server.closeAllConnections();
+    this.server.close();
+  }
+}
+
+/** The bridge's `state` frame: the phase and the approvals open now. The hub's pusher reads these,
+ * not the journal, and the summary here is what a push must never carry. */
+function bridgeState(approvals: number[]): Obj {
+  return {
+    v: 1,
+    type: "state",
+    state: {
+      phase: "idle",
+      queue: [],
+      queued: 0,
+      mode: "ask",
+      approvals: approvals.map((id) => ({
+        id,
+        summary: { action: "Run rm -rf /secret-dir", files: ["/work/private.txt"], scope: "This request only, once" },
+      })),
+    },
+  };
+}
+
 /** The fake terminal UI's end of the hub's link: records what the hub sends, answers it. */
 class FakeBridge {
   readonly lines: Obj[] = [];
@@ -103,6 +150,11 @@ class FakeBridge {
     return new Promise((resolve) => this.server.listen(this.socketPath, resolve));
   }
 
+  /** A frame the bridge sends on its own, as the terminal UI does when its state changes. */
+  send(frame: Obj): void {
+    for (const conn of this.conns) conn.write(`${JSON.stringify(frame)}\n`);
+  }
+
   close(): void {
     for (const conn of this.conns) conn.destroy();
     this.server.close();
@@ -118,6 +170,7 @@ run("the app's hub client against the real octet hub", () => {
   let port = 0;
   let sessionId = "";
   let bridge: FakeBridge | null = null;
+  let pushFake: PushFake | null = null;
   let seq = 0;
   let client: HubClient | null = null;
   const sockets: WebSocket[] = [];
@@ -184,8 +237,16 @@ run("the app's hub client against the real octet hub", () => {
       }),
     );
 
+    pushFake = new PushFake();
+    await pushFake.listen(await freePort());
+    const pushPort = (pushFake.server.address() as net.AddressInfo).port;
+
     hub = spawn(BINARY, ["hub", "--journal-dir", root, "--port", String(port), "--owner", OWNER], {
-      env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        OCTET_HUB_PUSH_URL: `http://127.0.0.1:${pushPort}/--/api/v2/push/send`,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     process.once("exit", () => hub?.kill("SIGKILL"));
@@ -204,6 +265,7 @@ run("the app's hub client against the real octet hub", () => {
     client?.stop();
     for (const ws of sockets) ws.terminate();
     bridge?.close();
+    pushFake?.close();
     if (hub && hub.exitCode === null) {
       const exited = new Promise<void>((resolve) => hub?.once("exit", () => resolve()));
       hub.kill("SIGTERM");
@@ -306,6 +368,48 @@ run("the app's hub client against the real octet hub", () => {
     expect(eventSeqs()).toEqual([0, 1, 2, 3, 4, 5, 6]);
     expect(client?.duplicateEvents).toBe(0);
     expect(frames("subscribed").map((f) => (f.type === "subscribed" ? f.from : ""))).toEqual(["start", "cursor"]);
+  });
+
+  it("answers a ping with pong", async () => {
+    const ack = await client?.request({ type: "ping" });
+    expect(ack).toMatchObject({ type: "ack", message: "pong" });
+  });
+
+  it("turns notifications on, and pushes a content-free message once the phone is in the background", async () => {
+    const on = await client?.request({ type: "register_push", token: PUSH_TOKEN });
+    expect(on).toMatchObject({ type: "ack", message: "Notifications on" });
+
+    // The app closes its socket in the background; the hub pushes only to a phone it cannot reach.
+    client?.stop();
+    await sleep(500);
+    // The first state seeds what the hub has seen; the approval after it is news.
+    bridge?.send(bridgeState([]));
+    bridge?.send(bridgeState([8]));
+    const body = await until("the push at the local fake", () => pushFake?.bodies[0], 15_000);
+    expect(JSON.parse(body)).toEqual([
+      {
+        to: PUSH_TOKEN,
+        title: "Octet",
+        body: "Approval waiting",
+        data: { session: sessionId },
+        sound: "default",
+        priority: "high",
+        channelId: "approvals",
+      },
+    ]);
+    // Nothing of the approval, the workspace, the model or the engine is in it, and it came once.
+    for (const secret of ["/work", "rm -rf", "secret-dir", "private", "opus", "claude"]) {
+      expect(body).not.toContain(secret);
+    }
+    await sleep(3500);
+    expect(pushFake?.bodies).toHaveLength(1);
+  });
+
+  it("turns notifications off", async () => {
+    client?.start();
+    await until("the client to be ready", () => client?.state === "ready");
+    const off = await client?.request({ type: "register_push", token: null });
+    expect(off).toMatchObject({ type: "ack", message: "Notifications off" });
   });
 
   it("is unpaired once the Mac revokes the phone", async () => {

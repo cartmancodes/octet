@@ -49,6 +49,28 @@ jobs:
       # Proves both bundles compile (no native build): `make mobile-check` has installed the modules.
       - run: npm run export:check
         working-directory: apps/mobile
+  # The app's hub client against the real `octet hub` binary (apps/mobile/contract). The hub posts
+  # push with `curl`, which ubuntu-latest has; the test points it at a local fake, never at Expo.
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # rustup installs the toolchain that rust-toolchain.toml pins.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build -p octet
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+      - run: npm ci
+        working-directory: apps/mobile
+      - run: npm run contract
+        working-directory: apps/mobile
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 30

@@ -40,11 +40,13 @@ development build.
 `npm run contract` (or `make mobile-contract`) starts `target/debug/octet hub` on a free port with
 a fake session (a Unix socket, a registration and a journal in a temp directory), pairs, and drives
 `HubClient` through hello, sessions, subscribe, replay, a live event, a prompt, an approval
-answer, a dropped connection with a cursor (no duplicates), and a revoke. It builds nothing:
+answer, a dropped connection with a cursor (no duplicates), a ping, notifications on (a push to a
+local fake, never to Expo, with the exact content-free body), notifications off, and a revoke. It builds nothing:
 run `scripts/rust-env.sh cargo build -p octet` first. Without that binary it skips. It never
 touches Tailscale: the hub is given a stand-in `tailscale` on its `PATH`, and the test's socket
 adds the `Tailscale-User-Login` header that `tailscale serve` adds in real life. The app never
-sends that header.
+sends that header. The hub posts push with `curl`, so `curl` must be on the `PATH`. CI runs this
+test in its own `contract` job.
 
 ## Building the app for a phone
 
@@ -106,9 +108,42 @@ Settings is off and says so, and pairing skips the notifications step. On iOS, E
 Apple push credentials for the build; on Android, push needs a Firebase (FCM) credential added to
 the EAS project. Neither is in this repository.
 
+Set it up with your own accounts (nothing here creates one):
+
+1. `eas init` in `apps/mobile`, if you have not (it adds the project id to `app.json`).
+2. iPhone: `eas credentials`, choose iOS, and let EAS create or upload an APNs key for push. This
+   needs the paid Apple developer account that the device build already needs.
+3. Android: create a Firebase project, add the Android app (package `app.json` names), then give
+   EAS its FCM V1 service-account key under `eas credentials`, Android, Google Service Account
+   Key for push notifications (FCM V1). Put the `google-services.json` where the Expo guide for
+   push notifications says.
+4. Build again (`eas build --profile development --platform ios` or `android`) and install it.
+
 Turn it on in the step after pairing or in **Settings**: the app asks the phone for permission,
 then registers its token with the Mac. Turning it off, or unpairing, tells the Mac to stop. Tapping
-a notification opens that session.
+a notification opens that session. A push says only `Octet` and `Approval waiting` or `Turn
+finished`; what the hub sends, where, and when is in [the guide](../../docs/remote-control.md#push-notifications).
+
+## Device pass
+
+The tests cannot cover a real phone. Run this on the iPhone 15 and on the Gemini 10 with a build
+from your own EAS project, against real Claude and Codex with tiny prompts in a throwaway
+workspace. Tick each one on each phone.
+
+- [ ] Pair the phone (QR code, and the pasted link).
+- [ ] Notifications on, then a push on a locked phone: start a turn that needs approval, lock the
+      phone, and the push arrives reading `Octet` / `Approval waiting`.
+- [ ] Tap that push: the app opens on that session (from locked, from the background, and from a
+      closed app).
+- [ ] Allow behind biometrics: the approval needs Face ID or the fingerprint, and the turn goes on.
+- [ ] A finished turn on a locked phone pushes `Turn finished`; with the app open, nothing does.
+- [ ] Switch from Wi-Fi to cellular mid-turn: the transcript resumes with nothing missing or doubled.
+- [ ] Answer an approval on one phone: it closes on the other phone and on the desk.
+- [ ] Change the model and the mode; full access asks for the typed confirmation.
+- [ ] Resume a recent session and start a new one, then join it from the desk with `tmux attach`.
+- [ ] Return to the app after a long background: it reconnects at once, without a pull to refresh.
+- [ ] Notifications off in Settings: no more pushes. Revoke the phone on the Mac
+      (`octet hub revoke`): the app says it is unpaired.
 
 ## Performance notes
 

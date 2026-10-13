@@ -370,7 +370,9 @@ It listens on `127.0.0.1` port 47823 (`--port N` or `hub.json` changes it)
 and says where it is. Only the Mac itself can reach that port. The tailnet
 login that may connect is yours, read from Tailscale (`--owner LOGIN` sets
 another). Leave the hub running in its own terminal or tmux window; running
-Octet sessions carry on if it stops, and the phone just can't reach them.
+Octet sessions carry on if it stops, and the phone just can't reach them. To have
+it start at login and come back if it stops, see [Keep the hub
+running](#keep-the-hub-running).
 
 To see what every session is doing, in another terminal:
 
@@ -413,6 +415,38 @@ launchd agent's bare environment. The service doesn't use `--port` or
   It says "Not installed" if there is nothing to remove.
 - **Linux without a login session.** A systemd user service stops when you log
   out unless lingering is on: `loginctl enable-linger "$USER"`.
+
+### Push notifications
+
+When an agent needs your approval, or finishes a turn, the hub can tell a phone
+that isn't looking at the app. The phone turns this on itself (Settings in the
+app, or the step after pairing; [the app's
+README](../apps/mobile/README.md#notifications) covers the one-time setup with
+your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
+
+- **What is sent.** Exactly this and nothing else: the title `Octet`, the body
+  `Approval waiting` or `Turn finished`, and `data` holding the hub's opaque
+  session id so a tap opens that session. No prompt, command, file name,
+  workspace, model or reply text ever goes in a push, so the push services
+  never see what you are working on.
+- **Where it goes.** The hub posts each push to Expo's push service, `https://exp.host/--/api/v2/push/send`,
+  which hands it to Apple or Google. That request is the only thing the hub
+  sends outside your Mac and your tailnet, and it carries the phone's Expo
+  push token, which the hub keeps in `devices.json` (readable by you alone)
+  and never writes to logs, journals, the audit file or a command line.
+  Expo, Apple and Google see that a push for that token happened, and when.
+- **Which phones.** A phone gets a push only if it turned notifications on and
+  has no open connection to the hub. The app closes its connection when it goes
+  to the background, so a phone you are holding with the app open gets
+  nothing.
+- **How often.** One push per approval, however often it is shown again; one per
+  finished turn. Pushes to a phone collect for about two seconds and go out as
+  one (an approval wins over a finished turn), and a phone gets at most six
+  in any minute. A phone Expo reports as gone has its token cleared.
+- **Turn it off.** Switch **Notifications** off in the app's Settings (the
+  hub forgets the token at once). Unpairing the phone, or `octet hub revoke
+  "NAME"` on the Mac, removes its token as well. Stopping the hub stops
+  every push.
 
 ### Put it on your tailnet
 
