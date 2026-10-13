@@ -28,7 +28,7 @@ use tokio::{
         UnixListener, UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::{AbortHandle, JoinHandle},
 };
 
@@ -89,8 +89,11 @@ impl Peer {
     fn spawn(stream: UnixStream, id: u64, commands: mpsc::Sender<Remote>) -> Self {
         let (read, write) = stream.into_split();
         let (lines, queue) = mpsc::channel(PEER_QUEUE);
-        let writer = tokio::spawn(write_peer(write, queue)).abort_handle();
-        let reader = tokio::spawn(read_peer(read, id, lines.clone(), commands)).abort_handle();
+        // Dropped when the reader ends, however it ends: the writer then closes the link.
+        let (reading, reader_gone) = oneshot::channel::<()>();
+        let writer = tokio::spawn(write_peer(write, queue, reader_gone)).abort_handle();
+        let reader = tokio::spawn(read_peer(read, id, lines.clone(), commands, reading));
+        let reader = reader.abort_handle();
         Self {
             id,
             lines,
@@ -108,24 +111,63 @@ impl Drop for Peer {
     }
 }
 
-/// Writes queued lines until the queue closes, the hub goes, or a write stalls.
-async fn write_peer(mut write: OwnedWriteHalf, mut queue: mpsc::Receiver<String>) {
-    while let Some(line) = queue.recv().await {
+/// Writes queued lines until the queue closes, the hub goes, or a write stalls. Once the hub's
+/// reader has ended (it went, or sent a line over the limit), the lines already queued, such as
+/// that refusal, are written and the connection closes, so the hub knows to connect again rather
+/// than send commands nobody reads.
+async fn write_peer(
+    mut write: OwnedWriteHalf,
+    mut queue: mpsc::Receiver<String>,
+    mut reader_gone: oneshot::Receiver<()>,
+) {
+    let send = async |write: &mut OwnedWriteHalf, line: String| {
         let written = tokio::time::timeout(WRITE_STALL, write.write_all(line.as_bytes())).await;
-        if !matches!(written, Ok(Ok(()))) {
-            break;
+        matches!(written, Ok(Ok(())))
+    };
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut reader_gone => {
+                while let Ok(line) = queue.try_recv() {
+                    if !send(&mut write, line).await {
+                        return;
+                    }
+                }
+                let _ = write.shutdown().await;
+                return;
+            }
+            line = queue.recv() => {
+                let Some(line) = line else { return };
+                if !send(&mut write, line).await {
+                    return;
+                }
+            }
         }
     }
 }
 
+/// The `req` of a line the bridge could not use, so the refusal names it; 0 when there is none.
+/// [`protocol::req_of`] stops at a phone message's size, and a hub's line may be a little longer.
+fn bad_line_req(text: &str) -> u64 {
+    if text.len() <= MAX_MESSAGE {
+        return protocol::req_of(text);
+    }
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| value.get("req")?.as_u64())
+        .unwrap_or_default()
+}
+
 /// Reads a hub's command lines. A bad line is refused to that hub alone; a good one goes to the
-/// interface. Ends when the hub goes or sends a message over the limit.
+/// interface. Ends when the hub goes or sends a message over the limit; `reading` is dropped then.
 async fn read_peer(
     read: OwnedReadHalf,
     peer: u64,
     replies: mpsc::Sender<String>,
     commands: mpsc::Sender<Remote>,
+    reading: oneshot::Sender<()>,
 ) {
+    let _reading = reading;
     let refuse = |req: u64, code: Code, reason: &str| {
         let _ = replies.try_send(frame_line(&protocol::refused(req, code, reason)));
     };
@@ -172,7 +214,7 @@ async fn read_peer(
                     return;
                 }
             }
-            Err(reason) => refuse(protocol::req_of(text), Code::Invalid, &reason),
+            Err(reason) => refuse(bad_line_req(text), Code::Invalid, &reason),
         }
     }
 }
@@ -1183,6 +1225,70 @@ mod tests {
         assert_eq!(
             (worse["type"].as_str(), worse["req"].as_u64()),
             (Some("refused"), Some(0))
+        );
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_sends_an_oversized_line_is_disconnected() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-oversized");
+        let dir = temp.path().to_path_buf();
+        let mut bridge = Bridge::start(&dir, true, None).await;
+        let (mut app, config) = demo();
+        bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
+        let regs = registrations(&run_dir(&dir)).await;
+        let (mut lines, mut write) = connect(&regs[0].socket).await;
+        let _ = first_line(&mut bridge, &app, &mut lines).await;
+        let _ = next_line(&mut lines).await;
+        write
+            .write_all(&vec![b'x'; MAX_BRIDGE_LINE + 10])
+            .await
+            .unwrap();
+        let refused: Value = serde_json::from_str(&next_line(&mut lines).await).unwrap();
+        assert_eq!(refused["code"], "too_large", "{refused}");
+        // The state keeps changing, but the link is closed: the hub sees the end and reconnects.
+        let ended = async {
+            for n in 0.. {
+                app.composer.queue.clear();
+                app.composer
+                    .queue
+                    .push_back(crate::vendor::Prompt::plain(format!("{n}")));
+                bridge.publish(&app);
+                if let Ok(Ok(None) | Err(_)) =
+                    timeout(Duration::from_millis(20), lines.next_line()).await
+                {
+                    return;
+                }
+            }
+        };
+        timeout(Duration::from_secs(2), ended)
+            .await
+            .expect("the bridge closes the link");
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_bad_line_over_a_phone_message_is_refused_by_its_req() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-bad-long");
+        let dir = temp.path().to_path_buf();
+        let mut bridge = Bridge::start(&dir, true, None).await;
+        let (app, config) = demo();
+        bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
+        let regs = registrations(&run_dir(&dir)).await;
+        let (mut lines, mut write) = connect(&regs[0].socket).await;
+        let _ = first_line(&mut bridge, &app, &mut lines).await;
+        let _ = next_line(&mut lines).await;
+        let line = format!(
+            "{}\n",
+            json!({"v": 1, "req": 7, "type": "nope", "pad": "p".repeat(MAX_MESSAGE + 200)})
+        );
+        assert!(line.len() > MAX_MESSAGE && line.len() < MAX_BRIDGE_LINE);
+        write.write_all(line.as_bytes()).await.unwrap();
+        let refused: Value = serde_json::from_str(&next_line(&mut lines).await).unwrap();
+        assert_eq!(
+            (refused["type"].as_str(), refused["req"].as_u64()),
+            (Some("refused"), Some(7)),
+            "{refused}"
         );
         bridge.stop().await;
     }
