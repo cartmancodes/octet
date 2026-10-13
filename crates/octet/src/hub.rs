@@ -18,15 +18,19 @@ fn failed(message: impl Into<String>) -> CliError {
     CliError::Run(message.into())
 }
 
-/// Resolves on SIGINT or SIGTERM.
-async fn interrupted() -> Result<(), CliError> {
-    let mut term = signal(SignalKind::terminate()).map_err(|e| failed(e.to_string()))?;
-    let mut int = signal(SignalKind::interrupt()).map_err(|e| failed(e.to_string()))?;
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+/// Resolves on SIGINT or SIGTERM. Both are registered at the call, as `headless` does, so one
+/// that arrives before the future is first awaited still counts.
+fn interrupted() -> impl std::future::Future<Output = Result<(), CliError>> {
+    let registered = signal(SignalKind::terminate())
+        .and_then(|term| Ok((term, signal(SignalKind::interrupt())?)));
+    async move {
+        let (mut term, mut int) = registered.map_err(|e| failed(e.to_string()))?;
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Runs the hub until SIGINT or SIGTERM, saying where it listens and whether it is published.
@@ -159,6 +163,20 @@ fn date(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_signal_before_the_wait_begins_is_not_lost() {
+        // Tokio handles SIGTERM in this process from here on, so the test survives it.
+        let _guard = signal(SignalKind::terminate()).unwrap();
+        let stop = interrupted();
+        let sent = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status();
+        assert!(sent.is_ok_and(|status| status.success()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stopped = tokio::time::timeout(Duration::from_secs(2), stop).await;
+        assert!(matches!(stopped, Ok(Ok(()))), "the signal was lost");
+    }
 
     #[test]
     fn dates_are_calendar_days_in_utc() {

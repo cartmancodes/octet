@@ -38,6 +38,7 @@ use crate::{
     tail::{self, file_name},
 };
 use futures_util::{SinkExt, StreamExt};
+use octet_core::PROMPT_LIMIT;
 use octet_core::remote::{
     protocol::{
         BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, ack, catalog_frame, event_frame,
@@ -53,12 +54,16 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, UnixListener, UnixStream, unix::OwnedWriteHalf},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::AbortHandle,
     time::{Instant, Interval, MissedTickBehavior, interval_at, timeout},
 };
@@ -102,6 +107,8 @@ const SWEEP_EVERY: Duration = Duration::from_secs(1);
 const HELLO_WITHIN: Duration = Duration::from_secs(30);
 /// How long the WebSocket handshake may take.
 const HANDSHAKE_WITHIN: Duration = Duration::from_secs(10);
+/// How often the hub asks Tailscale again whether it is published.
+const PUBLISH_EVERY: Duration = Duration::from_secs(10);
 /// How long the closing handshake may take.
 const CLOSE_WITHIN: Duration = Duration::from_secs(2);
 /// Connections open at once; more are turned away at accept.
@@ -124,8 +131,12 @@ const CONTROL_WITHIN: Duration = Duration::from_secs(5);
 const RATE_REFUSED: &str = "Too many commands; wait a minute";
 /// The refusal for a frame that is not text.
 const NOT_TEXT: &str = "Send each message as a text frame";
+/// The refusal for a command whose session ended before it answered.
+const SESSION_ENDED: &str = "The session ended";
 /// The refusal for a command the session did not answer in time.
 const NO_ANSWER: &str = "The session didn't answer";
+/// The refusal for a prompt or steer over [`PROMPT_LIMIT`].
+const TOO_LONG: &str = "The text is over 64 KiB";
 /// The refusal for `full-access` without the typed confirmation.
 const FULL_ACCESS: &str = "Full access needs confirm: \"full access\"";
 /// The refusal for a `recent` while another scan runs.
@@ -163,6 +174,26 @@ enum ConnEvent {
     Stalled { conn: u64 },
     /// The connection ended.
     Closed { conn: u64 },
+}
+
+/// The one running `recent` scan: holding it keeps the flag up, and dropping it, even in a scan
+/// that panicked, puts it down.
+#[derive(Debug)]
+struct Scanning(Arc<AtomicBool>);
+
+impl Scanning {
+    /// Raises `flag` for a new scan; `None` while another runs.
+    fn begin(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Arc::clone(flag)))
+    }
+}
+
+impl Drop for Scanning {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// A background job that answers a phone.
@@ -422,8 +453,8 @@ pub struct Hub {
     directory: PathBuf,
     /// Launches that count toward the phone-started cap beyond the registrations.
     launches: Launches,
-    /// Whether a `recent` scan is running; only one runs at a time.
-    scanning: bool,
+    /// Whether a `recent` scan is running; only one runs at a time (see [`Scanning`]).
+    scanning: Arc<AtomicBool>,
     /// Given to each connection and replay task.
     events: mpsc::Sender<ConnEvent>,
     /// The last id given to a connection, hub req or replay.
@@ -468,11 +499,13 @@ impl Hub {
         shutdown: impl Future<Output = ()>,
         ready: oneshot::Sender<u16>,
     ) -> Result<(), String> {
-        Self::serve_with(directory, port, owner, shutdown, ready, tailscale_publisher).await
+        let publishing = (tailscale_publisher as Publisher, PUBLISH_EVERY);
+        Self::serve_with(directory, port, owner, shutdown, ready, publishing).await
     }
 
     /// Like [`serve_notify`](Self::serve_notify), asking `publisher` instead of Tailscale whether
-    /// the hub is published (for tests, which cannot depend on the machine's Tailscale).
+    /// the hub is published, at start and then every `recheck` (for tests, which cannot depend
+    /// on the machine's Tailscale).
     ///
     /// # Errors
     ///
@@ -483,7 +516,7 @@ impl Hub {
         owner: String,
         shutdown: impl Future<Output = ()>,
         ready: oneshot::Sender<u16>,
-        publisher: Publisher,
+        (publisher, recheck): (Publisher, Duration),
     ) -> Result<(), String> {
         if owner.is_empty() {
             return Err("The tailnet owner's login is unknown".into());
@@ -511,13 +544,16 @@ impl Hub {
         let (streams, mut accepted) = mpsc::channel(16);
         let accept_task = tokio::spawn(accept_tcp(listener, streams)).abort_handle();
         let (requests, mut controls) = mpsc::channel(16);
-        let control_task = tokio::spawn(serve_control(control, requests, publisher)).abort_handle();
+        let (published_in, published) = watch::channel(Publication::Unknown);
+        let publish_task =
+            tokio::spawn(watch_published(port, publisher, recheck, published_in)).abort_handle();
+        let control_task = tokio::spawn(serve_control(control, requests, published)).abort_handle();
         let mut hub = Hub {
             store,
             sessions: Sessions::new(run),
             directory,
             launches: Launches::default(),
-            scanning: false,
+            scanning: Arc::new(AtomicBool::new(false)),
             owner,
             port,
             conns: HashMap::new(),
@@ -552,6 +588,7 @@ impl Hub {
             }
         }
         control_task.abort();
+        publish_task.abort();
         accept_task.abort();
         for (_, conn) in hub.conns.drain() {
             conn.task.abort();
@@ -614,7 +651,8 @@ impl Hub {
                 audit,
             } => {
                 match job {
-                    Job::Scan => self.scanning = false,
+                    // The scan's own guard put its flag down.
+                    Job::Scan => {}
                     Job::Launch { accepted } => {
                         let now = Instant::now();
                         self.launches.running(self.sessions.phone_started(), now);
@@ -665,7 +703,11 @@ impl Hub {
             PhoneCommand::Hello { token } => {
                 // A revoke by the CLI must be seen before the token is believed.
                 self.store.reload_if_changed().await;
-                let Some(device) = self.store.authenticate(&token, &self.owner, now).await else {
+                let Some(device) = self
+                    .store
+                    .authenticate(token.expose(), &self.owner, now)
+                    .await
+                else {
                     self.refuse(conn, req, Code::Unpaired, "Unknown device; pair it again");
                     self.close(conn);
                     return;
@@ -683,7 +725,7 @@ impl Hub {
                 platform,
             } => match self
                 .store
-                .pair(&secret, &name, &platform, &self.owner, now)
+                .pair(secret.expose(), &name, &platform, &self.owner, now)
                 .await
             {
                 Ok((token, device)) => self.send(conn, &paired(&token, &device.name)),
@@ -783,6 +825,12 @@ impl Hub {
                 self.refuse(conn, req, Code::NotAllowed, FULL_ACCESS);
                 return;
             }
+            PhoneCommand::Prompt { text, .. } | PhoneCommand::Steer { text, .. }
+                if text.len() > PROMPT_LIMIT =>
+            {
+                self.refuse(conn, req, Code::TooLarge, TOO_LONG);
+                return;
+            }
             command => {
                 let Some(parts) = bridge_command(command) else {
                     return;
@@ -797,11 +845,10 @@ impl Hub {
     /// Lists resumable sessions in the background; the scan reads up to 400 journals, and only
     /// one runs at a time.
     fn recent(&mut self, conn: u64, req: u64, workspace: Option<String>) {
-        if self.scanning {
+        let Some(scanning) = Scanning::begin(&self.scanning) else {
             self.refuse(conn, req, Code::Busy, SCAN_RUNNING);
             return;
-        }
-        self.scanning = true;
+        };
         let events = self.events.clone();
         let directory = self.directory.clone();
         let configured = self.store.config().workspaces.clone();
@@ -816,6 +863,8 @@ impl Hub {
                 Ok(Err((code, reason))) => refused(req, code, &reason),
                 Err(_) => refused(req, Code::Timeout, JOB_TIMED_OUT),
             };
+            // Before the answer, so the phone may scan again as soon as it has it.
+            drop(scanning);
             let done = ConnEvent::Answer {
                 conn,
                 frame,
@@ -1028,7 +1077,26 @@ impl Hub {
                 };
                 self.send(pending.conn, &frame);
             }
-            SessionUpdate::Changed => self.relist(),
+            SessionUpdate::Changed => {
+                self.refuse_ended();
+                self.relist();
+            }
+        }
+    }
+
+    /// Refuses at once the commands waiting on a session whose link closed or that went away:
+    /// no answer can come.
+    fn refuse_ended(&mut self) {
+        let ended: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| !self.sessions.linked(&pending.session))
+            .map(|(&req, _)| req)
+            .collect();
+        for req in ended {
+            if let Some(pending) = self.pending.remove(&req) {
+                self.refuse(pending.conn, pending.req, Code::Unavailable, SESSION_ENDED);
+            }
         }
     }
 
@@ -1356,12 +1424,54 @@ async fn accept_tcp(listener: TcpListener, hub: mpsc::Sender<TcpStream>) {
     }
 }
 
+/// Where the hub is published, as Tailscale last said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Publication {
+    /// Not asked yet.
+    Unknown,
+    /// Not published.
+    Nowhere,
+    /// Published at this HTTPS URL.
+    At(String),
+}
+
+/// The hub's [`Publication`], as last asked.
+type Published = watch::Receiver<Publication>;
+
+/// Asks `publisher` where `port` is published, now and then every `recheck`, so that control
+/// requests answer from what it last said and never wait on Tailscale.
+async fn watch_published(
+    port: u16,
+    publisher: Publisher,
+    recheck: Duration,
+    published: watch::Sender<Publication>,
+) {
+    loop {
+        let url = publisher(port).await;
+        published.send_replace(url.map_or(Publication::Nowhere, Publication::At));
+        tokio::time::sleep(recheck).await;
+    }
+}
+
+/// Where the hub is published, as last asked; waits for the first answer, for at most
+/// [`CONTROL_WITHIN`].
+async fn last_published(published: &mut Published) -> Option<String> {
+    let known = published.wait_for(|state| *state != Publication::Unknown);
+    match timeout(CONTROL_WITHIN, known).await {
+        Ok(Ok(state)) => match &*state {
+            Publication::At(url) => Some(url.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Accepts control clients, each answered in its own task.
-async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>, publisher: Publisher) {
+async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>, published: Published) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(control_client(stream, hub.clone(), publisher));
+                tokio::spawn(control_client(stream, hub.clone(), published.clone()));
             }
             // Out of descriptors, say: wait rather than spin.
             Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
@@ -1370,7 +1480,7 @@ async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>, publi
 }
 
 /// Reads one request line from a control client and writes one answer line.
-async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>, publisher: Publisher) {
+async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>, mut published: Published) {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     let mut reader = BufReader::new(read.take(CONTROL_LIMIT));
@@ -1384,7 +1494,7 @@ async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>, publishe
         watch_stream(&mut reader, &mut write, &hub).await;
         return;
     }
-    let answer = control_answer(&line, &hub, publisher).await;
+    let answer = control_answer(&line, &hub, &mut published).await;
     let _ = timeout(
         CONTROL_WITHIN,
         write.write_all(format!("{answer}\n").as_bytes()),
@@ -1440,7 +1550,11 @@ async fn hub_status(hub: &mpsc::Sender<Control>) -> Option<(u16, usize)> {
 }
 
 /// The answer to one control request.
-async fn control_answer(line: &str, hub: &mpsc::Sender<Control>, publisher: Publisher) -> Value {
+async fn control_answer(
+    line: &str,
+    hub: &mpsc::Sender<Control>,
+    published: &mut Published,
+) -> Value {
     let kind = request_kind(line);
     let gone = || json!({"error": "The hub is stopping"});
     match kind.as_str() {
@@ -1449,7 +1563,7 @@ async fn control_answer(line: &str, hub: &mpsc::Sender<Control>, publisher: Publ
             let Some((port, _)) = hub_status(hub).await else {
                 return gone();
             };
-            let Some(url) = publisher(port).await else {
+            let Some(url) = last_published(published).await else {
                 return json!({"secret": null, "url": null,
                     "reason": format!("Publish it first: tailscale serve --bg {port}")});
             };
@@ -1466,7 +1580,7 @@ async fn control_answer(line: &str, hub: &mpsc::Sender<Control>, publisher: Publ
             let Some((port, devices)) = hub_status(hub).await else {
                 return gone();
             };
-            let url = publisher(port).await;
+            let url = last_published(published).await;
             json!({"port": port, "published": url.is_some(), "url": url, "devices": devices})
         }
         _ => json!({"error": "Unknown request"}),
@@ -1754,6 +1868,22 @@ mod tests {
         assert!(!bucket.take(second));
         let later = second + Duration::from_secs(600);
         assert_eq!((0..100).filter(|_| bucket.take(later)).count(), 60);
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_panics_still_lets_the_next_one_run() {
+        let scanning = Arc::new(AtomicBool::new(false));
+        let guard = Scanning::begin(&scanning).expect("no scan runs");
+        assert!(Scanning::begin(&scanning).is_none(), "one at a time");
+        let task = tokio::spawn(async move {
+            let _scanning = guard;
+            panic!("the scan failed");
+        });
+        assert!(task.await.is_err());
+        assert!(
+            Scanning::begin(&scanning).is_some(),
+            "the flag was put down"
+        );
     }
 
     #[test]

@@ -194,7 +194,7 @@ async fn remote_control_pair_on_a_narrow_terminal_asks_to_widen_it() {
     assert!(!text.contains("█"), "{text}");
 }
 #[tokio::test]
-async fn remote_control_pair_without_tailscale_shows_no_secret() {
+async fn remote_control_pair_without_an_address_shows_no_secret() {
     let dir = octet_testkit::TempDir::new("octet-rc-nots");
     let served = crate::test_support::serve_hub(
         &octet_core::remote::run::run_dir(dir.path()),
@@ -205,7 +205,7 @@ async fn remote_control_pair_without_tailscale_shows_no_secret() {
     run_job(&mut app, action).await;
     served.await.unwrap();
     let text = app.entries_text();
-    assert!(text.contains("Tailscale isn't connected"), "{text}");
+    assert!(text.contains("The hub gave no address"), "{text}");
     assert!(!text.contains("s3cretvalue") && !app.status_line.contains("s3cretvalue"));
 }
 #[tokio::test]

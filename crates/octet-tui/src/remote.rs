@@ -51,8 +51,18 @@ pub(crate) struct Checks {
     pub tailscale_ssh: bool,
     /// mosh-server's version; None when it isn't installed.
     pub mosh: Option<(u32, u32, u32)>,
-    /// What the hub's control socket says; None when no hub answers.
-    pub hub: Option<HubStatus>,
+    /// What the hub's control socket says.
+    pub hub: HubState,
+}
+
+/// Whether a hub runs, and what it says.
+pub(crate) enum HubState {
+    /// Nothing listens on `hub.sock`.
+    NotRunning,
+    /// Something listens there but gave no usable reply in time.
+    NotAnswering,
+    /// It answered.
+    Running(HubStatus),
 }
 
 /// What `octet hub` reports about itself.
@@ -83,7 +93,7 @@ async fn hub_call(run: &Path, request: &str, within: Duration) -> Result<Value, 
     let call = async {
         let mut stream = UnixStream::connect(run.join("hub.sock"))
             .await
-            .map_err(|_| HubError::NotRunning)?;
+            .map_err(|e| connect_error(&e))?;
         stream
             .write_all(format!("{request}\n").as_bytes())
             .await
@@ -100,16 +110,34 @@ async fn hub_call(run: &Path, request: &str, within: Duration) -> Result<Value, 
         .unwrap_or(Err(HubError::NoAnswer))
 }
 
-/// The hub's state from its control socket; None when it isn't running or doesn't answer.
-async fn hub_status(run: &Path, within: Duration) -> Option<HubStatus> {
-    let reply = hub_call(run, r#"{"type":"status"}"#, within).await.ok()?;
+/// What a failed connect to `hub.sock` means: no socket, or one nobody listens on, is no hub;
+/// anything else is a hub that could not be asked.
+fn connect_error(error: &std::io::Error) -> HubError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+            HubError::NotRunning
+        }
+        _ => HubError::NoAnswer,
+    }
+}
+
+/// The hub's state from its control socket.
+async fn hub_status(run: &Path, within: Duration) -> HubState {
+    let reply = match hub_call(run, r#"{"type":"status"}"#, within).await {
+        Ok(reply) => reply,
+        Err(HubError::NotRunning) => return HubState::NotRunning,
+        Err(HubError::NoAnswer) => return HubState::NotAnswering,
+    };
     let url = reply["url"].as_str().map(str::to_owned);
-    Some(HubStatus {
-        port: u16::try_from(reply["port"].as_u64()?).ok()?,
-        published: reply["published"].as_bool()? && url.is_some(),
-        url,
-        devices: usize::try_from(reply["devices"].as_u64()?).ok()?,
-    })
+    let status = || {
+        Some(HubStatus {
+            port: u16::try_from(reply["port"].as_u64()?).ok()?,
+            published: reply["published"].as_bool()? && url.is_some(),
+            url: url.clone(),
+            devices: usize::try_from(reply["devices"].as_u64()?).ok()?,
+        })
+    };
+    status().map_or(HubState::NotAnswering, HubState::Running)
 }
 
 /// What asking the hub for a pairing secret came to.
@@ -118,8 +146,6 @@ pub(crate) enum Pairing {
     NoHub,
     /// The hub didn't give a secret, with why.
     Failed(String),
-    /// The hub has no tailnet address, so a phone could not reach it.
-    NoTailnet,
     /// The hub is not published on the tailnet, so it gave no secret; the text says what to do.
     NotPublished(String),
     /// A single-use secret and the hub's address.
@@ -148,12 +174,13 @@ pub(crate) async fn pairing(run: &Path, within: Duration) -> Pairing {
     let Some(secret) = reply["secret"].as_str().filter(|secret| !secret.is_empty()) else {
         return Pairing::Failed("The hub gave no pairing code".into());
     };
+    // A hub mints a secret only when it is published, so it always gives its address too.
     match reply["url"].as_str() {
         Some(url) => Pairing::Ready {
             url: url.to_owned(),
             secret: secret.to_owned(),
         },
-        None => Pairing::NoTailnet,
+        None => Pairing::Failed("The hub gave no address".into()),
     }
 }
 
@@ -432,12 +459,13 @@ pub(crate) struct Report {
 }
 
 /// The hub's line of the report.
-fn hub_line(hub: Option<&HubStatus>) -> String {
+fn hub_line(hub: &HubState) -> String {
     match hub {
-        None => {
+        HubState::NotRunning => {
             "Hub: not running · start it with `octet hub` (or `octet hub install` later)".into()
         }
-        Some(HubStatus {
+        HubState::NotAnswering => "Hub: not answering · restart it: octet hub".into(),
+        HubState::Running(HubStatus {
             url: Some(url),
             published: true,
             devices,
@@ -446,7 +474,7 @@ fn hub_line(hub: Option<&HubStatus>) -> String {
             "Hub: {url} · {devices} paired device{}",
             if *devices == 1 { "" } else { "s" }
         ),
-        Some(HubStatus { port, .. }) => format!(
+        HubState::Running(HubStatus { port, .. }) => format!(
             "Hub: running on 127.0.0.1:{port} · not on the tailnet yet: tailscale serve --bg {port}"
         ),
     }
@@ -525,7 +553,7 @@ pub(crate) fn report(checks: &Checks) -> Report {
         None => mark(false, "mosh-server isn't installed: brew install mosh"),
     });
     // The hub is optional (the phone can use SSH alone), so no state of it is a failed check.
-    lines.push(hub_line(checks.hub.as_ref()));
+    lines.push(hub_line(&checks.hub));
     if let (Some(tailnet), true) = (&checks.tailnet, checks.ssh || checks.tailscale_ssh) {
         // Run now, the command would open a new, empty session, not this one.
         if matches!(checks.tmux, Tmux::Outside) {
@@ -575,7 +603,7 @@ mod tests {
             ssh: true,
             tailscale_ssh: false,
             mosh: Some((1, 4, 0)),
-            hub: None,
+            hub: HubState::NotRunning,
         }
     }
     fn hub(published: bool, devices: usize) -> HubStatus {
@@ -589,7 +617,7 @@ mod tests {
     #[test]
     fn the_report_names_the_hub_state() {
         let none = report_text(&Checks {
-            hub: None,
+            hub: HubState::NotRunning,
             ..ready()
         });
         assert!(
@@ -599,7 +627,7 @@ mod tests {
             "{none}"
         );
         let local = report_text(&Checks {
-            hub: Some(hub(false, 0)),
+            hub: HubState::Running(hub(false, 0)),
             ..ready()
         });
         assert!(
@@ -607,7 +635,7 @@ mod tests {
             "{local}"
         );
         let shared = report_text(&Checks {
-            hub: Some(hub(true, 2)),
+            hub: HubState::Running(hub(true, 2)),
             ..ready()
         });
         assert!(
@@ -615,15 +643,23 @@ mod tests {
             "{shared}"
         );
         let one = report_text(&Checks {
-            hub: Some(hub(true, 1)),
+            hub: HubState::Running(hub(true, 1)),
             ..ready()
         });
         assert!(
             one.contains("Hub: https://mac.ts.net · 1 paired device\n"),
             "{one}"
         );
+        let mute = report_text(&Checks {
+            hub: HubState::NotAnswering,
+            ..ready()
+        });
+        assert!(
+            mute.contains("Hub: not answering · restart it: octet hub"),
+            "{mute}"
+        );
         // The hub is optional: none of its states is a failed check.
-        for text in [none, local, shared] {
+        for text in [none, local, shared, mute] {
             assert!(!text.contains("[!!]"), "{text}");
         }
     }
@@ -689,12 +725,17 @@ mod tests {
     async fn the_hub_status_comes_from_its_socket() {
         let dir = octet_testkit::TempDir::new("octet-rc-status");
         let run = dir.path().join("run");
-        assert!(hub_status(&run, CHECK_TIMEOUT).await.is_none(), "no socket");
+        assert!(
+            matches!(hub_status(&run, CHECK_TIMEOUT).await, HubState::NotRunning),
+            "no socket"
+        );
         let served = crate::test_support::serve_hub(
             &run,
             r#"{"port":47823,"published":true,"url":"https://mac.ts.net","devices":2}"#,
         );
-        let status = hub_status(&run, CHECK_TIMEOUT).await.unwrap();
+        let HubState::Running(status) = hub_status(&run, CHECK_TIMEOUT).await else {
+            panic!("the hub answered")
+        };
         assert_eq!(served.await.unwrap().trim(), r#"{"type":"status"}"#);
         assert_eq!(status.port, 47823);
         assert!(status.published);
@@ -702,12 +743,50 @@ mod tests {
         assert_eq!(status.devices, 2);
     }
     #[tokio::test]
-    async fn a_hub_that_answers_nonsense_or_nothing_is_not_running() {
+    async fn a_hub_that_answers_nonsense_is_not_answering() {
         let dir = octet_testkit::TempDir::new("octet-rc-junk");
         let run = dir.path().join("run");
         let served = crate::test_support::serve_hub(&run, "not json");
-        assert!(hub_status(&run, CHECK_TIMEOUT).await.is_none());
+        assert!(matches!(
+            hub_status(&run, CHECK_TIMEOUT).await,
+            HubState::NotAnswering
+        ));
         served.await.unwrap();
+        // A socket nobody listens on is a hub that is not running.
+        std::fs::remove_file(run.join("hub.sock")).unwrap();
+        drop(tokio::net::UnixListener::bind(run.join("hub.sock")).unwrap());
+        assert!(matches!(
+            hub_status(&run, CHECK_TIMEOUT).await,
+            HubState::NotRunning
+        ));
+    }
+    #[test]
+    fn only_a_missing_or_refusing_socket_means_no_hub() {
+        use std::io::ErrorKind;
+        for (kind, running) in [
+            (ErrorKind::NotFound, false),
+            (ErrorKind::ConnectionRefused, false),
+            (ErrorKind::PermissionDenied, true),
+            (ErrorKind::TimedOut, true),
+        ] {
+            let error = connect_error(&std::io::Error::from(kind));
+            assert_eq!(matches!(error, HubError::NoAnswer), running, "{kind:?}");
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_hub_that_answers_late_is_not_answering() {
+        let dir = octet_testkit::TempDir::new("octet-rc-late");
+        let run = dir.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let listener = tokio::net::UnixListener::bind(run.join("hub.sock")).unwrap();
+        let _held = tokio::spawn(async move {
+            let _stream = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+        assert!(matches!(
+            hub_status(&run, CHECK_TIMEOUT).await,
+            HubState::NotAnswering
+        ));
     }
     #[tokio::test(start_paused = true)]
     async fn a_hub_that_never_answers_is_given_up_on() {
@@ -745,14 +824,14 @@ mod tests {
         assert_eq!(served.await.unwrap().trim(), r#"{"type":"pair_secret"}"#);
     }
     #[tokio::test]
-    async fn pairing_without_the_tailnet_or_with_a_refusal_shows_no_secret() {
+    async fn pairing_without_an_address_or_with_a_refusal_shows_no_secret() {
         let dir = octet_testkit::TempDir::new("octet-rc-nonet");
         let run = dir.path().join("run");
         let served = crate::test_support::serve_hub(&run, r#"{"secret":"s3cret","url":null}"#);
-        assert!(matches!(
-            pairing(&run, CHECK_TIMEOUT).await,
-            Pairing::NoTailnet
-        ));
+        let Pairing::Failed(why) = pairing(&run, CHECK_TIMEOUT).await else {
+            panic!("a secret without an address is no pairing")
+        };
+        assert_eq!(why, "The hub gave no address");
         served.await.unwrap();
         std::fs::remove_file(run.join("hub.sock")).unwrap();
         let served = crate::test_support::serve_hub(&run, r#"{"error":"The hub is stopping"}"#);

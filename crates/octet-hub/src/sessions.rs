@@ -391,6 +391,11 @@ impl Sessions {
         Err(failed)
     }
 
+    /// Whether session `id` is there and its bridge linked.
+    pub(crate) fn linked(&self, id: &str) -> bool {
+        self.find(id).is_some_and(|live| live.link.is_some())
+    }
+
     /// The next thing that happened. Cancel-safe: nothing is lost if the future is dropped.
     pub(crate) async fn next(&mut self) -> SessionUpdate {
         loop {

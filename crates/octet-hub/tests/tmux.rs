@@ -165,7 +165,10 @@ fn a_started_session_counts_until_it_registers() {
                 OWNER.to_owned(),
                 shutdown,
                 oneshot::channel().0,
-                |_| Box::pin(async { Some("https://mac.tail1234.ts.net".to_owned()) }),
+                (
+                    |_| Box::pin(async { Some("https://mac.tail1234.ts.net".to_owned()) }),
+                    Duration::from_secs(10),
+                ),
             )
             .await
         });

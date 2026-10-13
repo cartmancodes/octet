@@ -47,11 +47,24 @@ type Phone = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const SERVED_URL: &str = "https://mac.tail1234.ts.net";
 /// Ports whose hub the fake `tailscale serve` does not publish.
 static UNPUBLISHED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+/// The port of every question the fake `tailscale serve` was asked.
+static ASKED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+/// How often a test hub asks the fake `tailscale serve` again.
+const RECHECK: Duration = Duration::from_secs(10);
 
 /// A stand-in for asking Tailscale: every hub is published, except those in [`UNPUBLISHED`].
 fn fake_publisher(port: u16) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+    ASKED.lock().expect("lock").push(port);
     let hidden = UNPUBLISHED.lock().expect("lock").contains(&port);
     Box::pin(async move { (!hidden).then(|| SERVED_URL.to_owned()) })
+}
+
+/// A loopback port nothing listens on now.
+async fn free_port() -> u16 {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a free port");
+    probe.local_addr().expect("an address").port()
 }
 
 /// A data directory under `/tmp` (socket paths are limited to about 104 bytes), and the hub
@@ -81,6 +94,12 @@ impl Env {
 
     /// Starts the hub on a free port and waits until its control socket answers.
     async fn start(&mut self) {
+        self.start_with(0, RECHECK).await;
+    }
+
+    /// Starts the hub on `port` (0 for any), asking Tailscale again every `recheck`, and waits
+    /// until its control socket answers.
+    async fn start_with(&mut self, port: u16, recheck: Duration) {
         let (stop, stopped) = oneshot::channel::<()>();
         let directory = self.root.clone();
         tokio::spawn(async move {
@@ -89,11 +108,11 @@ impl Env {
             };
             Hub::serve_with(
                 directory,
-                0,
+                port,
                 OWNER.to_owned(),
                 shutdown,
                 oneshot::channel().0,
-                fake_publisher,
+                (fake_publisher, recheck),
             )
             .await
         });
@@ -380,10 +399,31 @@ async fn pair_then_hello_lists_sessions() {
 }
 
 #[tokio::test]
-async fn an_unpublished_hub_mints_no_pairing_secret() {
+async fn the_hub_asks_tailscale_at_start_and_then_every_so_often_not_per_request() {
     let mut env = Env::new();
     env.start().await;
-    UNPUBLISHED.lock().expect("lock").push(env.port);
+    for _ in 0..5 {
+        assert_eq!(
+            env.control(json!({"type": "status"})).await["published"],
+            true
+        );
+        assert!(env.control(json!({"type": "pair_secret"})).await["secret"].is_string());
+    }
+    let asked = ASKED
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|p| **p == env.port)
+        .count();
+    assert_eq!(asked, 1, "asked once, at start");
+}
+
+#[tokio::test]
+async fn an_unpublished_hub_mints_no_pairing_secret() {
+    let mut env = Env::new();
+    let port = free_port().await;
+    UNPUBLISHED.lock().expect("lock").push(port);
+    env.start_with(port, Duration::from_millis(100)).await;
     let status = env.control(json!({"type": "status"})).await;
     assert_eq!(status["published"], false, "{status}");
     assert!(status["url"].is_null(), "{status}");
@@ -395,13 +435,23 @@ async fn an_unpublished_hub_mints_no_pairing_secret() {
         refusal["reason"],
         format!("Publish it first: tailscale serve --bg {}", env.port)
     );
-    // Once published, the secret is minted and pairs a phone.
+    // Once published, the hub sees it at its next look, and the secret pairs a phone.
     UNPUBLISHED
         .lock()
         .expect("lock")
         .retain(|port| *port != env.port);
-    let status = env.control(json!({"type": "status"})).await;
-    assert_eq!(status["published"], true, "{status}");
+    let status = timeout(WAIT, async {
+        loop {
+            let status = env.control(json!({"type": "status"})).await;
+            if status["published"] == true {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the hub looks again");
+    assert_eq!(status["url"], SERVED_URL, "{status}");
     let token = env.pair("Test phone").await;
     assert_eq!(token.len(), 64);
 }
@@ -750,6 +800,58 @@ async fn commands_reach_the_bridge_and_replies_come_back() {
     // A reply to a req the hub never sent goes nowhere.
     bridge_write(&mut write, ack(999_999, "stray")).await;
     assert!(quiet(&mut phone).await);
+}
+
+#[tokio::test]
+async fn prompts_and_steers_over_the_prompt_limit_are_refused() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5009, 0..1).await;
+    env.start().await;
+    let (mut read, _write) = bridge.accept().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let long = "x".repeat(octet_core::PROMPT_LIMIT + 1);
+    for (req, kind) in [(1, "prompt"), (2, "steer")] {
+        send(
+            &mut phone,
+            json!({"v": 1, "req": req, "type": kind, "session": bridge.id, "text": long}),
+        )
+        .await;
+        let refusal = recv_kind(&mut phone, "refused").await;
+        assert_eq!(refusal["req"], req, "{refusal}");
+        assert_eq!(refusal["code"], "too_large", "{refusal}");
+        assert_eq!(refusal["reason"], "The text is over 64 KiB");
+    }
+    assert!(bridge_quiet(&mut read).await, "the bridge receives nothing");
+    // At the limit, it goes through.
+    let most = "x".repeat(octet_core::PROMPT_LIMIT);
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 3, "type": "prompt", "session": bridge.id, "text": most}),
+    )
+    .await;
+    assert_eq!(bridge_line(&mut read).await["type"], "prompt");
+}
+
+#[tokio::test]
+async fn a_command_to_a_session_that_ends_is_refused_at_once() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5011, 0..1).await;
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let prompt = |req: u64| json!({"v": 1, "req": req, "type": "prompt", "session": bridge.id, "text": "hi"});
+    let ended = |req: u64| refused(req, Code::Unavailable, "The session ended");
+    // The bridge's link closes with the command unanswered.
+    let (mut read, write) = bridge.accept().await;
+    send(&mut phone, prompt(1)).await;
+    assert_eq!(bridge_line(&mut read).await["type"], "prompt");
+    drop((read, write));
+    assert_eq!(recv_kind(&mut phone, "refused").await, ended(1));
+    // The hub links again; then the session goes away with a command unanswered.
+    let (mut read, _write) = bridge.accept().await;
+    send(&mut phone, prompt(2)).await;
+    assert_eq!(bridge_line(&mut read).await["type"], "prompt");
+    std::fs::remove_file(env.run.join("5011.json")).expect("unregister");
+    assert_eq!(recv_kind(&mut phone, "refused").await, ended(2));
 }
 
 #[tokio::test]

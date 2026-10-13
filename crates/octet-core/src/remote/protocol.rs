@@ -720,18 +720,36 @@ impl Code {
     }
 }
 
+/// Text that must never be shown, such as a device token: its Debug output says only that it
+/// was redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// The text itself, for the one place that checks it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// A phone → hub command, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhoneCommand {
     /// Connect with a device token.
     Hello {
         /// The device token.
-        token: String,
+        token: Secret,
     },
     /// Pair a new device.
     Pair {
         /// The single-use pairing secret.
-        secret: String,
+        secret: Secret,
         /// The device's name.
         name: String,
         /// `ios` or `android`.
@@ -1045,10 +1063,10 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
     let m = &map;
     let command = match message.kind {
         "hello" => PhoneCommand::Hello {
-            token: text(m, "token"),
+            token: Secret(text(m, "token")),
         },
         "pair" => PhoneCommand::Pair {
-            secret: text(m, "secret"),
+            secret: Secret(text(m, "secret")),
             name: text(m, "name"),
             platform: text(m, "platform"),
         },
@@ -1863,6 +1881,33 @@ mod tests {
             parse_phone(r#"{"v":1,"req":1,"type":"set_mode","session":"s","mode":"sideways"}"#)
                 .unwrap();
         assert!(matches!(command, PhoneCommand::SetMode { mode, .. } if mode == "sideways"));
+    }
+
+    #[test]
+    fn debug_output_never_shows_a_token_or_a_pairing_secret() {
+        let secret = "f00dfeed".repeat(8);
+        let hello = format!(r#"{{"v":1,"req":1,"type":"hello","token":"{secret}"}}"#);
+        let pair = format!(
+            r#"{{"v":1,"req":2,"type":"pair","secret":"{secret}","name":"Gemini 10","platform":"android"}}"#
+        );
+        for text in [hello, pair] {
+            let (_, command) = parse_phone(&text).unwrap();
+            let shown = format!("{command:?}");
+            assert!(!shown.contains(&secret), "{shown}");
+            assert!(shown.contains("redacted"), "{shown}");
+        }
+        let (_, command) = parse_phone(&format!(
+            r#"{{"v":1,"req":2,"type":"pair","secret":"{secret}","name":"Gemini 10","platform":"android"}}"#
+        ))
+        .unwrap();
+        assert!(
+            format!("{command:?}").contains("Gemini 10"),
+            "the name is not a secret"
+        );
+        let PhoneCommand::Pair { secret: kept, .. } = command else {
+            panic!("a pair")
+        };
+        assert_eq!(kept.expose(), secret);
     }
 
     #[test]
