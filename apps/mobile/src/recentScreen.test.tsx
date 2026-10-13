@@ -480,6 +480,31 @@ describe("New", () => {
     expect(rig.view.getPathname()).toBe("/session/fresh");
   });
 
+  it("takes no action while the Mac can't be reached: Resume and Start are off, and nothing asks for Face ID", async () => {
+    const rig = await openNew([item("one")]);
+    await choose(/^Full access/);
+    await act(async () => {
+      rig.sockets.last.drop();
+    });
+    const off = (name: string | RegExp) => button(name)?.props.accessibilityState?.disabled === true;
+    expect(off("Start session")).toBe(true);
+    await press("Start session");
+    expect(auth.authenticateAsync).not.toHaveBeenCalled();
+    await tab("Recent");
+    expect(off(/^Resume/)).toBe(true);
+    await press(/^Resume/);
+    expect(rig.sockets.all.flatMap((sock) => sock.commandsOf("start"))).toEqual([]);
+    // Back online, they are live again.
+    await act(async () => {
+      rig.clock.advance(1_000);
+      rig.sockets.last.open();
+      rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+      rig.clock.advance(50);
+    });
+    await answer(rig, [item("one")]);
+    expect(off(/^Resume/)).toBe(false);
+  });
+
   describe("full access", () => {
     const FULL = /^Full access/;
     const typed = () => screen.queryByLabelText("Type full access to confirm");

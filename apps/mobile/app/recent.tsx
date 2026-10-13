@@ -85,7 +85,9 @@ export default function RecentAndNew() {
     if (hub === "ready") load();
   }, [hub, load]);
 
-  const locked = busy || (launch !== null && launch.tmux !== null && !launch.late);
+  // Nothing can be resumed or started while the Mac can't be reached, as on the Session screen:
+  // a Start would ask for Face ID and the typed words only to fail.
+  const locked = busy || hub !== "ready" || (launch !== null && launch.tmux !== null && !launch.late);
 
   const started = useCallback((ack: unknown) => setLaunch({ tmux: tmuxOfAck(ack), late: false }), []);
   const onResume = useCallback(
