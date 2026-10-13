@@ -79,12 +79,14 @@ pub fn command_names() -> impl Iterator<Item = &'static str> {
     COMMANDS.iter().map(|spec| spec.name)
 }
 /// What the interface is started with, beyond the session's configuration.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Options {
     /// Share the session with a hub over a private socket (off with `--no-remote`).
     pub remote: bool,
-    /// A hub's `start` launched this interface, so its registration says so.
-    pub from_phone: bool,
+    /// The tmux session a hub's `start` launched this interface in, which its registration names.
+    pub tmux: Option<String>,
+    /// The device that asked the hub to start it.
+    pub started_by: Option<String>,
 }
 
 /// Runs the interface until the user quits. When a session ends for a
@@ -111,7 +113,9 @@ pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io
     // Ended sessions whose CLIs are still exiting while the next one runs.
     let mut stopping: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // Lives across reconnects, and is stopped on every way out of the loop.
-    let mut bridge = Bridge::start(&directory, options.remote, options.from_phone).await;
+    // Shown once, in the first interface.
+    let mut started = started_note(&options, &config);
+    let mut bridge = Bridge::start(&directory, options.remote, options.tmux).await;
     // Shown in a fresh interface, after a switch that drops the transcript.
     let mut opening_notice: Option<String> = bridge.take_note();
     loop {
@@ -134,7 +138,7 @@ pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io
         let mut app = retained_app
             .take()
             .unwrap_or_else(|| App::new(&config, session.journal().to_path_buf()));
-        if let Some(notice) = opening_notice.take() {
+        for notice in opening_notice.take().into_iter().chain(started.take()) {
             app.note(notice);
         }
         carried.give(&mut app);
@@ -205,6 +209,11 @@ pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io
     drop(terminal);
     drop(guard);
     Ok(())
+}
+/// The desk note for an interface a phone started in full access, if this is one.
+fn started_note(options: &Options, config: &Config) -> Option<String> {
+    let (tmux, by) = (options.tmux.as_deref(), options.started_by.as_deref());
+    bridge::started_note(tmux, by, config.mode)
 }
 /// Makes a panic on this thread, which runs the event loop, restore the terminal first.
 fn restore_terminal_on_panic() {

@@ -267,7 +267,12 @@ fn a_started_session_counts_until_it_registers() {
                         place.as_str()
                     ]
                 );
-                assert!(lines.contains(&"--remote-started"), "{lines:?}");
+                let flag = lines.iter().position(|l| *l == "--remote-started");
+                let flag = flag.unwrap_or_else(|| panic!("{lines:?}"));
+                assert_eq!(
+                    lines[flag + 1..flag + 4],
+                    [name.as_str(), "--remote-by", "Pixel"]
+                );
                 let audit = std::fs::read_to_string(root.join("hub-audit.jsonl")).expect("audit");
                 let line: Value =
                     serde_json::from_str(audit.lines().last().expect("a line")).expect("json");
@@ -293,6 +298,7 @@ fn a_started_session_counts_until_it_registers() {
             vendor_session: String::new(),
             journals: vec![root.join("session-1-1.jsonl")],
             from_phone: true,
+            tmux: Some("octet-000001".into()),
         };
         let _listener = UnixListener::bind(&registration.socket).expect("bridge socket");
         registration.write(&run).await.expect("registration");
@@ -311,6 +317,7 @@ fn a_started_session_counts_until_it_registers() {
         let ninth = start(&mut phone, 21, &place).await;
         assert_eq!(ninth["type"], "refused", "{ninth}");
         assert_eq!(ninth["reason"], CAP);
+        assert_eq!(ninth["code"], "busy");
         let _ = stop.send(());
     });
     let _ = std::fs::remove_dir_all(&root);

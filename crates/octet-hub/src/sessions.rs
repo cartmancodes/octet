@@ -16,7 +16,7 @@
 //! or delivered live, so nothing is lost and nothing repeats.
 use crate::tail::{Tail, event_of, file_name};
 use octet_core::remote::{
-    protocol::{BridgeCommand, MAX_BRIDGE_LINE, VERSION, bridge_command_json},
+    protocol::{BridgeCommand, Code, MAX_BRIDGE_LINE, VERSION, bridge_command_json},
     run::Registration,
 };
 use serde_json::{Value, json};
@@ -69,12 +69,14 @@ pub(crate) enum SessionUpdate {
     State { id: String },
     /// The session's catalog arrived: see [`Sessions::catalog`].
     Catalog { id: String },
-    /// The bridge answered command `req`: `ok` is false for a refusal, whose reason is `message`.
+    /// The bridge answered command `req`: `ok` is false for a refusal, whose reason is `message`
+    /// and code `code` (when the bridge gave a known one).
     Reply {
         id: String,
         req: u64,
         ok: bool,
         message: String,
+        code: Option<Code>,
     },
     /// Sessions came, went or changed what a `sessions` row shows.
     Changed,
@@ -85,7 +87,12 @@ pub(crate) enum SessionUpdate {
 enum Frame {
     State(Value),
     Catalog(Value),
-    Reply { req: u64, ok: bool, message: String },
+    Reply {
+        req: u64,
+        ok: bool,
+        message: String,
+        code: Option<Code>,
+    },
     Closed,
 }
 
@@ -161,6 +168,8 @@ impl Live {
             ),
             ("last_activity", self.last_activity.map(|t| json!(t))),
             ("goal", goal.map(|g| json!(g))),
+            ("now", text("now").map(|now| json!(now))),
+            ("tmux", registration.tmux.as_ref().map(|t| json!(t))),
         ];
         for (key, value) in optional {
             if let Some(value) = value {
@@ -329,7 +338,8 @@ impl Sessions {
     ///
     /// # Errors
     ///
-    /// Why the command was not queued: no such session, no link, or a bridge too slow.
+    /// Why the command was not queued, with its code: no such session, no link, or a bridge too
+    /// slow.
     #[expect(
         clippy::unused_async,
         clippy::unused_async_trait_impl,
@@ -341,22 +351,29 @@ impl Sessions {
         req: u64,
         by: &str,
         command: &BridgeCommand,
-    ) -> Result<(), String> {
+    ) -> Result<(), (Code, &'static str)> {
         let live = self
             .live
             .iter_mut()
             .find(|l| l.registration.id == id)
-            .ok_or("No such session")?;
-        let link = live.link.as_ref().ok_or("The session is not connected")?;
+            .ok_or((Code::Unavailable, "No such session"))?;
+        let link = live
+            .link
+            .as_ref()
+            .ok_or((Code::NotConnected, "The session is not connected"))?;
         let line = format!("{}\n", bridge_command_json(req, by, command));
         let failed = match link.lines.try_send(line) {
             Ok(()) => return Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => "The session is not keeping up",
-            Err(mpsc::error::TrySendError::Closed(_)) => "The session disconnected",
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                (Code::Busy, "The session is not keeping up")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                (Code::NotConnected, "The session disconnected")
+            }
         };
         live.lose_link();
         self.push_changed();
-        Err(failed.to_owned())
+        Err(failed)
     }
 
     /// The next thing that happened. Cancel-safe: nothing is lost if the future is dropped.
@@ -409,11 +426,17 @@ impl Sessions {
                 live.catalog = Some(catalog);
                 SessionUpdate::Catalog { id: session }
             }
-            Frame::Reply { req, ok, message } => SessionUpdate::Reply {
+            Frame::Reply {
+                req,
+                ok,
+                message,
+                code,
+            } => SessionUpdate::Reply {
                 id: session,
                 req,
                 ok,
                 message,
+                code,
             },
             Frame::Closed => {
                 live.lose_link();
@@ -477,12 +500,14 @@ fn shows_differently(old: &Registration, new: &Registration) -> bool {
         &old.workspace,
         &old.mode,
         old.from_phone,
+        &old.tmux,
     ) != (
         &new.engine,
         &new.model,
         &new.workspace,
         &new.mode,
         new.from_phone,
+        &new.tmux,
     )
 }
 
@@ -737,11 +762,13 @@ fn parse_frame(line: &[u8]) -> Result<Option<Frame>, ()> {
             req,
             ok: true,
             message: text("message").unwrap_or_default(),
+            code: None,
         }),
         Some("refused") => req.map(|req| Frame::Reply {
             req,
             ok: false,
             message: text("reason").unwrap_or_default(),
+            code: text("code").as_deref().and_then(Code::parse),
         }),
         _ => None,
     })
@@ -795,6 +822,7 @@ mod tests {
                 vendor_session: String::new(),
                 journals: journals.iter().map(|j| self.root.join(j)).collect(),
                 from_phone: false,
+                tmux: None,
             }
         }
 
@@ -1087,7 +1115,7 @@ mod tests {
             bridge_state_frame(&state),
             bridge_catalog_frame(&json!({"modes": ["ask"]})),
             ack(7, "queued"),
-            refused(8, "busy"),
+            refused(8, Code::Busy, "busy"),
         ];
         for line in lines {
             write
@@ -1105,14 +1133,18 @@ mod tests {
             next(&mut sessions).await,
             SessionUpdate::Catalog { id: id.clone() }
         );
-        let reply = |req, ok: bool, message: &str| SessionUpdate::Reply {
+        let reply = |req, ok: bool, message: &str, code| SessionUpdate::Reply {
             id: id.clone(),
             req,
             ok,
             message: message.into(),
+            code,
         };
-        assert_eq!(next(&mut sessions).await, reply(7, true, "queued"));
-        assert_eq!(next(&mut sessions).await, reply(8, false, "busy"));
+        assert_eq!(next(&mut sessions).await, reply(7, true, "queued", None));
+        assert_eq!(
+            next(&mut sessions).await,
+            reply(8, false, "busy", Some(Code::Busy))
+        );
         assert_eq!(sessions.state(&id), Some(&state));
         assert_eq!(sessions.catalog(&id), Some(&json!({"modes": ["ask"]})));
         let rows = sessions.list();
@@ -1142,6 +1174,33 @@ mod tests {
             Ok((11, "phone".into(), command.clone()))
         );
         assert!(sessions.send("nobody", 1, "phone", &command).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_row_carries_the_now_line_and_the_tmux_session() {
+        let env = Env::new();
+        let mut registration = env.registration(4011, &[]);
+        registration.from_phone = true;
+        registration.tmux = Some("octet-abc123".into());
+        let bridge = Env::listen(&registration);
+        registration.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        let (stream, _) = bridge.accept().await.unwrap();
+        let (_read, mut write) = stream.into_split();
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        let row = &sessions.list()[0];
+        assert_eq!(row["tmux"], "octet-abc123");
+        assert!(row.get("now").is_none(), "{row}");
+        let state = json!({"phase": "running", "queue": [], "queued": 0, "mode": "ask",
+            "now": "Running Bash cargo test", "approvals": []});
+        write
+            .write_all(format!("{}\n", bridge_state_frame(&state)).as_bytes())
+            .await
+            .unwrap();
+        let id = "4011-1790000000".to_owned();
+        assert_eq!(next(&mut sessions).await, SessionUpdate::State { id });
+        assert_eq!(sessions.list()[0]["now"], "Running Bash cargo test");
     }
 
     #[tokio::test]

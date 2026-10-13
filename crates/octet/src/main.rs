@@ -176,7 +176,8 @@ async fn run() -> Result<i32, CliError> {
             directory,
             octet_tui::Options {
                 remote: args.remote,
-                from_phone: args.from_phone,
+                tmux: args.remote_started.clone(),
+                started_by: args.remote_by.clone(),
             },
         )
         .await

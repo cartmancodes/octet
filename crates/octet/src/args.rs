@@ -97,8 +97,10 @@ pub(crate) struct Args {
     pub(crate) plugins: Plugins,
     /// Whether the terminal interface shares its session with a hub.
     pub(crate) remote: bool,
-    /// Whether a hub's `start` launched this interface (the hidden `--remote-started`).
-    pub(crate) from_phone: bool,
+    /// The tmux session a hub's `start` launched this interface in (the hidden `--remote-started`).
+    pub(crate) remote_started: Option<String>,
+    /// The device that asked for it (the hidden `--remote-by`).
+    pub(crate) remote_by: Option<String>,
     pub(crate) run: Run,
 }
 
@@ -175,7 +177,8 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
     let mut effort = None;
     let mut plugins = Plugins::default();
     let mut remote = true;
-    let mut from_phone = false;
+    let mut remote_started = None;
+    let mut remote_by = None;
     let mut print = None;
     let mut output = None;
     let mut rpc = false;
@@ -198,7 +201,8 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
             "--no-plugins" => plugins.load = false,
             "--no-plugin-hooks" => plugins.hooks = false,
             "--no-remote" => remote = false,
-            "--remote-started" => from_phone = true,
+            "--remote-started" => remote_started = Some(text(&mut args, name)?),
+            "--remote-by" => remote_by = Some(text(&mut args, name)?),
             "--engine" => engine = text(&mut args, name)?,
             "--binary" => binary = Some(PathBuf::from(value(&mut args, name)?)),
             "--cwd" => cwd = Some(PathBuf::from(value(&mut args, name)?)),
@@ -277,7 +281,8 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
         effort,
         plugins,
         remote,
-        from_phone,
+        remote_started,
+        remote_by,
         run,
     })))
 }
@@ -529,9 +534,21 @@ mod tests {
         assert!(!args(&["--no-remote"]).remote);
     }
     #[test]
-    fn the_hidden_flag_marks_an_interface_started_from_the_phone() {
-        assert!(!args(&[]).from_phone);
-        assert!(args(&["--remote-started"]).from_phone);
+    fn the_hidden_flags_name_the_tmux_session_and_device_a_phone_started() {
+        let desk = args(&[]);
+        assert_eq!((desk.remote_started, desk.remote_by), (None, None));
+        let phone = args(&[
+            "--remote-started",
+            "octet-abc123",
+            "--remote-by",
+            "Gemini 10",
+        ]);
+        assert_eq!(phone.remote_started.as_deref(), Some("octet-abc123"));
+        assert_eq!(phone.remote_by.as_deref(), Some("Gemini 10"));
+        assert!(matches!(
+            parse_args(["--remote-started".into()]),
+            Err(CliError::Usage(_))
+        ));
     }
     #[test]
     fn defaults_are_codex_in_ask_mode_with_the_interface() {

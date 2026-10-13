@@ -24,7 +24,7 @@ const NAME_LIMIT: usize = 64;
 /// How stale `last_seen` may get on disk before a connection rewrites it.
 const SEEN_WRITE_GAP: u64 = 60;
 /// Shown when a pairing secret is wrong, used or old.
-const SECRET_REFUSED: &str = "Pairing code already used or expired";
+pub(crate) const SECRET_REFUSED: &str = "Pairing code already used or expired";
 
 /// A paired phone.
 #[derive(Clone, Debug, PartialEq, Eq)]

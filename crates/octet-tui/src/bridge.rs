@@ -12,7 +12,7 @@ use crate::{
     vendor::Vendor,
 };
 use octet_core::remote::{
-    protocol::{self, BridgeCommand, MAX_BRIDGE_LINE, MAX_MESSAGE},
+    protocol::{self, BridgeCommand, Code, MAX_BRIDGE_LINE, MAX_MESSAGE},
     run::{Registration, run_dir},
 };
 use octet_core::{Config, Mode};
@@ -122,8 +122,8 @@ async fn read_peer(
     replies: mpsc::Sender<String>,
     commands: mpsc::Sender<Remote>,
 ) {
-    let refuse = |req: u64, reason: &str| {
-        let _ = replies.try_send(frame_line(&protocol::refused(req, reason)));
+    let refuse = |req: u64, code: Code, reason: &str| {
+        let _ = replies.try_send(frame_line(&protocol::refused(req, code, reason)));
     };
     let mut reader = BufReader::new(read);
     let mut buffer = Vec::new();
@@ -140,12 +140,13 @@ async fn read_peer(
         if buffer.last() != Some(&b'\n') && buffer.len() > MAX_BRIDGE_LINE {
             refuse(
                 0,
+                Code::TooLarge,
                 &format!("Message too large; the limit is {MAX_BRIDGE_LINE} bytes"),
             );
             return;
         }
         let Ok(text) = std::str::from_utf8(&buffer) else {
-            refuse(0, "Message must be UTF-8 text");
+            refuse(0, Code::Invalid, "Message must be UTF-8 text");
             continue;
         };
         let text = text.trim();
@@ -167,7 +168,7 @@ async fn read_peer(
                     return;
                 }
             }
-            Err(reason) => refuse(protocol::req_of(text), &reason),
+            Err(reason) => refuse(protocol::req_of(text), Code::Invalid, &reason),
         }
     }
 }
@@ -239,6 +240,37 @@ fn plain_text(text: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// The code of a refusal, from its words: each is one of the interface's own refusals.
+fn refusal_code(reason: &str) -> Code {
+    if reason == TURN_OPEN {
+        Code::TurnOpen
+    } else if reason == crate::registry::NOT_CONNECTED {
+        Code::NotConnected
+    } else if reason == DESK_EDITING
+        || reason == DESK_SHELL
+        || reason.starts_with("The queue is full")
+        || reason.starts_with("Mode change pending")
+    {
+        Code::Busy
+    } else if reason.starts_with("Full access needs confirm") {
+        Code::NotAllowed
+    } else if reason.starts_with("Message too large") {
+        Code::TooLarge
+    } else {
+        Code::Invalid
+    }
+}
+
+/// The desk note for an interface a phone started in full access (spec §3); `None` otherwise.
+pub(crate) fn started_note(tmux: Option<&str>, by: Option<&str>, mode: Mode) -> Option<String> {
+    (tmux.is_some() && mode == Mode::FullAccess).then(|| {
+        format!(
+            "⚠ Started in full access from {}",
+            device_name(by.unwrap_or_default())
+        )
+    })
 }
 
 /// A hub-supplied device name made safe for a desk note: one line, at most [`DEVICE_NAME`] characters.
@@ -417,8 +449,9 @@ struct Live {
 }
 
 impl Live {
-    /// Makes the run directory and listens on `<run>/<pid>.sock`; `from_phone` is registered.
-    async fn open(directory: &Path, from_phone: bool) -> std::io::Result<Self> {
+    /// Makes the run directory and listens on `<run>/<pid>.sock`; `tmux`, the session a phone
+    /// started this interface in, is registered.
+    async fn open(directory: &Path, tmux: Option<String>) -> std::io::Result<Self> {
         let run = run_dir(directory);
         tokio::fs::DirBuilder::new()
             .recursive(true)
@@ -457,7 +490,8 @@ impl Live {
                 mode: String::new(),
                 vendor_session: String::new(),
                 journals: Vec::new(),
-                from_phone,
+                from_phone: tmux.is_some(),
+                tmux,
             },
             run,
             socket,
@@ -535,16 +569,16 @@ pub(crate) struct Bridge {
 
 impl Bridge {
     /// Listens for hubs under `directory`, unless `enabled` is false. A failure leaves a bridge
-    /// that is off, with a note saying why. `from_phone` marks the registration as started by
-    /// a hub.
-    pub(crate) async fn start(directory: &Path, enabled: bool, from_phone: bool) -> Bridge {
+    /// that is off, with a note saying why. `tmux` names the tmux session a hub's `start`
+    /// launched this interface in.
+    pub(crate) async fn start(directory: &Path, enabled: bool, tmux: Option<String>) -> Bridge {
         if !enabled {
             return Bridge {
                 live: None,
                 note: None,
             };
         }
-        match Live::open(directory, from_phone).await {
+        match Live::open(directory, tmux).await {
             Ok(live) => Bridge {
                 live: Some(live),
                 note: None,
@@ -642,7 +676,7 @@ impl Bridge {
         live.adopt_arrivals();
         let frame = match result {
             Ok(message) => protocol::ack(req, &message),
-            Err(reason) => protocol::refused(req, &reason),
+            Err(reason) => protocol::refused(req, refusal_code(&reason), &reason),
         };
         let line = frame_line(&frame);
         live.peers
@@ -719,7 +753,8 @@ fn state_line(state: &Value) -> String {
     if let Some(approvals) = reduced["approvals"].as_array_mut() {
         for approval in approvals {
             let summary = &approval["summary"];
-            approval["summary"] = json!({"action": summary["action"], "scope": summary["scope"]});
+            approval["summary"] =
+                json!({"action": summary["action"], "files": [], "scope": summary["scope"]});
         }
     }
     let mut line = frame_line(&protocol::bridge_state_frame(&reduced));
@@ -890,7 +925,7 @@ mod tests {
     async fn a_bridge_registers_listens_and_cleans_up() {
         let temp = octet_testkit::TempDir::new("octet-bridge");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true, false).await;
+        let mut bridge = Bridge::start(&dir, true, None).await;
         let (app, config) = demo();
         bridge
             .connected(&app, &config, &dir.join("session-1.jsonl"))
@@ -920,20 +955,70 @@ mod tests {
     async fn an_interface_started_from_the_phone_registers_as_such() {
         let temp = octet_testkit::TempDir::new("octet-bridge-phone");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true, true).await;
+        let mut bridge = Bridge::start(&dir, true, Some("octet-abc123".into())).await;
         let (app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;
         assert_eq!(regs.len(), 1);
         assert!(regs[0].from_phone);
+        assert_eq!(regs[0].tmux.as_deref(), Some("octet-abc123"));
         bridge.stop().await;
+    }
+
+    #[test]
+    fn full_access_started_from_a_phone_is_noted_on_the_desk() {
+        let full = octet_core::Mode::FullAccess;
+        assert_eq!(
+            started_note(Some("octet-abc123"), Some("Gemini\u{1b}[2J 10"), full).as_deref(),
+            Some("⚠ Started in full access from Gemini 10")
+        );
+        assert_eq!(
+            started_note(Some("octet-abc123"), None, full).as_deref(),
+            Some("⚠ Started in full access from a remote device")
+        );
+        assert!(started_note(Some("octet-abc123"), Some("p"), octet_core::Mode::Ask).is_none());
+        assert!(
+            started_note(None, Some("p"), full).is_none(),
+            "a desk start says nothing"
+        );
+    }
+
+    #[test]
+    fn refusals_carry_the_code_a_phone_acts_on() {
+        use protocol::Code;
+        for (reason, code) in [
+            (TURN_OPEN, Code::TurnOpen),
+            (crate::registry::NOT_CONNECTED, Code::NotConnected),
+            (DESK_EDITING, Code::Busy),
+            (DESK_SHELL, Code::Busy),
+            (
+                "The queue is full (8 prompts); wait for the turn or press Esc",
+                Code::Busy,
+            ),
+            (
+                "Mode change pending; wait for the vendor to confirm",
+                Code::Busy,
+            ),
+            (
+                "Full access needs confirm: \"full access\"",
+                Code::NotAllowed,
+            ),
+            (
+                "Message too large; the limit is 99328 bytes",
+                Code::TooLarge,
+            ),
+            ("No approval 9 is waiting", Code::Invalid),
+            ("Slash commands run on the desk", Code::Invalid),
+        ] {
+            assert_eq!(refusal_code(reason), code, "{reason}");
+        }
     }
 
     #[tokio::test]
     async fn reconnecting_keeps_one_registration_and_lists_every_journal() {
         let temp = octet_testkit::TempDir::new("octet-bridge-journals");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true, false).await;
+        let mut bridge = Bridge::start(&dir, true, None).await;
         let (app, config) = demo();
         for name in ["a.jsonl", "b.jsonl", "b.jsonl"] {
             bridge.connected(&app, &config, &dir.join(name)).await;
@@ -948,7 +1033,7 @@ mod tests {
     async fn state_frames_go_only_when_state_changes() {
         let temp = octet_testkit::TempDir::new("octet-bridge-changes");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true, false).await;
+        let mut bridge = Bridge::start(&dir, true, None).await;
         let (mut app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;
@@ -977,7 +1062,7 @@ mod tests {
     async fn a_hub_that_stops_reading_is_dropped() {
         let temp = octet_testkit::TempDir::new("octet-bridge-slow");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true, false).await;
+        let mut bridge = Bridge::start(&dir, true, None).await;
         let (mut app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;
@@ -1016,7 +1101,7 @@ mod tests {
     async fn commands_arrive_and_replies_go_back() {
         let temp = octet_testkit::TempDir::new("octet-bridge-commands");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true, false).await;
+        let mut bridge = Bridge::start(&dir, true, None).await;
         let (app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;
@@ -1040,7 +1125,7 @@ mod tests {
         let _ = first_line(&mut bridge, &app, &mut other).await;
         let _ = next_line(&mut other).await;
         bridge.reply(remote.peer, 7, Ok("Sent".into()));
-        bridge.reply(remote.peer, 8, Err("A turn is running".into()));
+        bridge.reply(remote.peer, 8, Err(TURN_OPEN.into()));
         let ack: Value = serde_json::from_str(&next_line(&mut lines).await).unwrap();
         assert_eq!(
             (ack["type"].as_str(), ack["req"].as_u64()),
@@ -1048,7 +1133,8 @@ mod tests {
         );
         let refused: Value = serde_json::from_str(&next_line(&mut lines).await).unwrap();
         assert_eq!(refused["type"], "refused");
-        assert_eq!(refused["reason"], "A turn is running");
+        assert_eq!(refused["reason"], TURN_OPEN);
+        assert_eq!(refused["code"], "turn_open");
         let overheard = timeout(Duration::from_millis(100), other.next_line()).await;
         assert!(overheard.is_err(), "a reply goes to the hub that asked");
         // A bad line is refused by its req, and never reaches the loop.
@@ -1064,6 +1150,7 @@ mod tests {
             (bad["type"].as_str(), bad["req"].as_u64()),
             (Some("refused"), Some(9))
         );
+        assert_eq!(bad["code"], "invalid");
         let worse: Value = serde_json::from_str(&next_line(&mut lines).await).unwrap();
         assert_eq!(
             (worse["type"].as_str(), worse["req"].as_u64()),
@@ -1076,7 +1163,7 @@ mod tests {
     async fn a_command_a_little_over_a_phone_message_still_arrives() {
         let temp = octet_testkit::TempDir::new("octet-bridge-slack");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true, false).await;
+        let mut bridge = Bridge::start(&dir, true, None).await;
         let (app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;
@@ -1104,7 +1191,7 @@ mod tests {
     async fn a_bridge_that_cannot_start_or_is_off_stays_out_of_the_way() {
         let temp = octet_testkit::TempDir::new("octet-bridge-off");
         let dir = temp.path().to_path_buf();
-        let mut off = Bridge::start(&dir, false, false).await;
+        let mut off = Bridge::start(&dir, false, None).await;
         assert!(off.take_note().is_none());
         assert!(!run_dir(&dir).exists());
         let (app, config) = demo();
@@ -1121,7 +1208,7 @@ mod tests {
         let blocked = dir.join("blocked");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&blocked, "").unwrap();
-        let mut broken = Bridge::start(&blocked, true, false).await;
+        let mut broken = Bridge::start(&blocked, true, None).await;
         let note = broken.take_note().expect("a note says why");
         assert!(note.starts_with("Remote control is off: "), "{note}");
         assert!(broken.take_note().is_none());
@@ -1256,13 +1343,14 @@ mod tests {
         assert_eq!(approvals[3]["summary"]["action"], "Run a shell command");
         assert!(approvals[3]["summary"].get("command").is_none());
         conforms("StateInfo", &reduced["state"]);
+        conforms("ApprovalSummary", &approvals[3]["summary"]);
     }
 
     #[tokio::test]
     async fn a_dropped_bridge_leaves_no_socket_or_registration() {
         let temp = octet_testkit::TempDir::new("octet-bridge-drop");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true, false).await;
+        let mut bridge = Bridge::start(&dir, true, None).await;
         let (app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let run = run_dir(&dir);
@@ -1295,7 +1383,7 @@ mod tests {
     async fn publish_sends_the_catalog_again_when_the_models_change() {
         let temp = octet_testkit::TempDir::new("octet-bridge-catalog");
         let dir = temp.path().to_path_buf();
-        let mut bridge = Bridge::start(&dir, true, false).await;
+        let mut bridge = Bridge::start(&dir, true, None).await;
         let (mut app, config) = demo();
         bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
         let regs = registrations(&run_dir(&dir)).await;
@@ -1315,7 +1403,8 @@ mod tests {
         bridge.stop().await;
     }
 
-    /// Checks `value` against the protocol's shape `name`: required fields present, no others.
+    /// Checks `value` against the protocol's shape `name`: required fields present, no others,
+    /// and a closed set's values from that set.
     fn conforms(name: &str, value: &Value) {
         let shape = protocol::OBJECTS.iter().find(|s| s.name == name).unwrap();
         let map = value.as_object().unwrap();
@@ -1325,6 +1414,29 @@ mod tests {
                 "{name} lacks {}",
                 field.name
             );
+            let choices = |set: &str| {
+                protocol::CHOICES
+                    .iter()
+                    .find(|c| c.name == set)
+                    .unwrap()
+                    .values
+            };
+            match (field.ty, map.get(field.name)) {
+                (protocol::Ty::Choice(set), Some(Value::String(text))) => {
+                    assert!(
+                        choices(set).contains(&text.as_str()),
+                        "{name}.{}",
+                        field.name
+                    );
+                }
+                (protocol::Ty::ChoiceList(set), Some(Value::Array(list))) => {
+                    for item in list {
+                        let text = item.as_str().unwrap_or_default();
+                        assert!(choices(set).contains(&text), "{name}.{}", field.name);
+                    }
+                }
+                _ => {}
+            }
         }
         for key in map.keys() {
             assert!(

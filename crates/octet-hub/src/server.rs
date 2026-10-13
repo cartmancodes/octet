@@ -30,13 +30,13 @@ use crate::{
     launch::{self, Launches, StartRequest, clip as clip_to},
     owner::published_url,
     sessions::{SessionUpdate, Sessions},
-    store::{Device, Store},
+    store::{Device, SECRET_REFUSED, Store},
     tail::{self, file_name},
 };
 use futures_util::{SinkExt, StreamExt};
 use octet_core::remote::{
     protocol::{
-        BridgeCommand, Cursor, MAX_MESSAGE, PhoneCommand, ack, catalog_frame, event_frame,
+        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, ack, catalog_frame, event_frame,
         full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of, sessions_frame,
         state_frame, welcome,
     },
@@ -642,7 +642,7 @@ impl Hub {
         match (state.device.clone(), text) {
             (None, Some(text)) => self.unauthenticated(conn, &text).await,
             (None, None) => {
-                self.refuse(conn, 0, NOT_TEXT);
+                self.refuse(conn, 0, Code::Invalid, NOT_TEXT);
                 self.close(conn);
             }
             (Some(device), text) => self.authenticated(conn, &device, text.as_deref()).await,
@@ -655,7 +655,7 @@ impl Hub {
         let (req, command) = match parse_phone(text) {
             Ok(parsed) => parsed,
             Err(reason) => {
-                self.refuse(conn, req_of(text), &reason);
+                self.refuse(conn, req_of(text), Code::Invalid, &reason);
                 self.close(conn);
                 return;
             }
@@ -666,7 +666,7 @@ impl Hub {
                 // A revoke by the CLI must be seen before the token is believed.
                 self.store.reload_if_changed().await;
                 let Some(device) = self.store.authenticate(&token, &self.owner, now).await else {
-                    self.refuse(conn, req, "Unknown device; pair it again");
+                    self.refuse(conn, req, Code::Unpaired, "Unknown device; pair it again");
                     self.close(conn);
                     return;
                 };
@@ -688,12 +688,17 @@ impl Hub {
             {
                 Ok((token, device)) => self.send(conn, &paired(&token, &device.name)),
                 Err(reason) => {
-                    self.refuse(conn, req, reason);
+                    let code = if reason == SECRET_REFUSED {
+                        Code::Unpaired
+                    } else {
+                        Code::Invalid
+                    };
+                    self.refuse(conn, req, code, reason);
                     self.close(conn);
                 }
             },
             _ => {
-                self.refuse(conn, req, "Say hello first");
+                self.refuse(conn, req, Code::Unpaired, "Say hello first");
                 self.close(conn);
             }
         }
@@ -710,23 +715,23 @@ impl Hub {
         }
         let req = text.map_or(0, req_of);
         if !self.take_token(&device.token_sha256) {
-            self.refuse(conn, req, RATE_REFUSED);
+            self.refuse(conn, req, Code::RateLimited, RATE_REFUSED);
             return;
         }
         let Some(text) = text else {
-            self.refuse(conn, 0, NOT_TEXT);
+            self.refuse(conn, 0, Code::Invalid, NOT_TEXT);
             return;
         };
         let (req, command) = match parse_phone(text) {
             Ok(parsed) => parsed,
             Err(reason) => {
-                self.refuse(conn, req_of(text), &reason);
+                self.refuse(conn, req_of(text), Code::Invalid, &reason);
                 return;
             }
         };
         let (session, command, what) = match command {
             PhoneCommand::Hello { .. } | PhoneCommand::Pair { .. } => {
-                self.refuse(conn, req, "Already connected");
+                self.refuse(conn, req, Code::Invalid, "Already connected");
                 return;
             }
             PhoneCommand::Subscribe { session, after } => {
@@ -746,7 +751,7 @@ impl Hub {
                     confirm.as_deref(),
                 ) =>
             {
-                self.refuse(conn, req, FULL_ACCESS);
+                self.refuse(conn, req, Code::NotAllowed, FULL_ACCESS);
                 return;
             }
             PhoneCommand::Recent { workspace } => {
@@ -775,7 +780,7 @@ impl Hub {
             PhoneCommand::SetMode { mode, confirm, .. }
                 if !full_access_confirmed(&mode, confirm.as_deref()) =>
             {
-                self.refuse(conn, req, FULL_ACCESS);
+                self.refuse(conn, req, Code::NotAllowed, FULL_ACCESS);
                 return;
             }
             command => {
@@ -793,7 +798,7 @@ impl Hub {
     /// one runs at a time.
     fn recent(&mut self, conn: u64, req: u64, workspace: Option<String>) {
         if self.scanning {
-            self.refuse(conn, req, SCAN_RUNNING);
+            self.refuse(conn, req, Code::Busy, SCAN_RUNNING);
             return;
         }
         self.scanning = true;
@@ -807,9 +812,9 @@ impl Hub {
                 launch::recent(&directory, &allowed, wanted).await
             };
             let frame = match timeout(JOB_WITHIN, scan).await {
-                Ok(Ok(items)) => recent_frame(&items),
-                Ok(Err(reason)) => refused(req, &reason),
-                Err(_) => refused(req, JOB_TIMED_OUT),
+                Ok(Ok(items)) => recent_frame(req, &items),
+                Ok(Err((code, reason))) => refused(req, code, &reason),
+                Err(_) => refused(req, Code::Timeout, JOB_TIMED_OUT),
             };
             let done = ConnEvent::Answer {
                 conn,
@@ -831,10 +836,10 @@ impl Hub {
         let configured = self.store.config().workspaces.clone();
         let device = device.to_owned();
         tokio::spawn(async move {
-            let started = launch::start(&directory, &configured, &request, running);
+            let started = launch::start(&directory, &configured, &request, (running, &device));
             let result = timeout(JOB_WITHIN, started)
                 .await
-                .unwrap_or_else(|_| Err(JOB_TIMED_OUT.to_owned()));
+                .unwrap_or_else(|_| Err((Code::Timeout, JOB_TIMED_OUT.to_owned())));
             let (frame, audit, accepted) = match result {
                 Ok(started) => {
                     let place = started.workspace.to_string_lossy();
@@ -852,7 +857,7 @@ impl Hub {
                     let text = format!("Starting {} in {place}", started.name);
                     (ack(req, &text), Some((device, started.name, what)), true)
                 }
-                Err(reason) => (refused(req, &reason), None, false),
+                Err((code, reason)) => (refused(req, code, &reason), None, false),
             };
             let done = ConnEvent::Answer {
                 conn,
@@ -890,14 +895,14 @@ impl Hub {
                 self.pending.insert(hub_req, pending);
                 self.store.audit(&device.name, session, what).await;
             }
-            Err(reason) => self.refuse(conn, req, &reason),
+            Err((code, reason)) => self.refuse(conn, req, code, reason),
         }
     }
 
     /// Starts a subscription: the last state and catalog now, then the replay in its own task.
     fn subscribe(&mut self, conn: u64, req: u64, session: String, after: Option<Cursor>) {
         let Some(journals) = self.sessions.journals(&session) else {
-            self.refuse(conn, req, "No such session");
+            self.refuse(conn, req, Code::Unavailable, "No such session");
             return;
         };
         let generation = self.next_id();
@@ -1008,6 +1013,7 @@ impl Hub {
                 req,
                 ok,
                 message,
+                code,
             } => {
                 // Only the session the command went to may answer it.
                 if self.pending.get(&req).is_none_or(|p| p.session != id) {
@@ -1019,7 +1025,7 @@ impl Hub {
                 let frame = if ok {
                     ack(pending.req, &message)
                 } else {
-                    refused(pending.req, &message)
+                    refused(pending.req, code.unwrap_or(Code::Invalid), &message)
                 };
                 self.send(pending.conn, &frame);
             }
@@ -1089,35 +1095,17 @@ impl Hub {
         }
     }
 
-    /// The `sessions` frame for watchers if the rows, with their NOW lines, changed.
+    /// The `sessions` frame for watchers if the rows changed.
     fn relist_watchers(&mut self) {
         if self.watchers.is_empty() {
             return;
         }
-        let rows = self.watch_rows();
+        let rows = self.sessions.list();
         if rows == self.watched {
             return;
         }
         broadcast(&mut self.watchers, &sessions_frame(&rows).to_string());
         self.watched = rows;
-    }
-
-    /// The session rows, each with the NOW line of its state when it has one.
-    fn watch_rows(&self) -> Vec<Value> {
-        let mut rows = self.sessions.list();
-        for row in &mut rows {
-            let now = row
-                .get("id")
-                .and_then(Value::as_str)
-                .and_then(|id| self.sessions.state(id))
-                .and_then(|state| state.get("now"))
-                .filter(|now| now.is_string())
-                .cloned();
-            if let Some(now) = now {
-                row["now"] = now;
-            }
-        }
-        rows
     }
 
     /// Attaches a watcher, or turns it away when too many are attached.
@@ -1128,7 +1116,7 @@ impl Hub {
             return;
         }
         if self.watchers.is_empty() {
-            self.watched = self.watch_rows();
+            self.watched = self.sessions.list();
         }
         let rows = sessions_frame(&self.watched).to_string();
         if watcher.try_send(rows).is_ok() {
@@ -1186,7 +1174,7 @@ impl Hub {
             .collect();
         for req in expired {
             if let Some(pending) = self.pending.remove(&req) {
-                self.refuse(pending.conn, pending.req, NO_ANSWER);
+                self.refuse(pending.conn, pending.req, Code::Timeout, NO_ANSWER);
             }
         }
     }
@@ -1208,9 +1196,9 @@ impl Hub {
             .take(now)
     }
 
-    /// Queues a refusal of `req` for `conn`.
-    fn refuse(&mut self, conn: u64, req: u64, reason: &str) {
-        self.send(conn, &refused(req, reason));
+    /// Queues a refusal of `req` for `conn`, with its code.
+    fn refuse(&mut self, conn: u64, req: u64, code: Code, reason: &str) {
+        self.send(conn, &refused(req, code, reason));
     }
 
     /// Queues `frame` for `conn`.

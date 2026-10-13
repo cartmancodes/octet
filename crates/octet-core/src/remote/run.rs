@@ -35,13 +35,15 @@ pub struct Registration {
     pub journals: Vec<PathBuf>,
     /// Whether the hub's `start` launched it.
     pub from_phone: bool,
+    /// The tmux session the hub's `start` launched it in.
+    pub tmux: Option<String>,
 }
 
 impl Registration {
     /// The registration as the JSON object written to `<pid>.json`.
     pub fn to_json(&self) -> Value {
         let path = |p: &Path| p.to_string_lossy().into_owned();
-        json!({
+        let mut value = json!({
             "id": self.id,
             "pid": self.pid,
             "started": self.started,
@@ -53,7 +55,11 @@ impl Registration {
             "vendor_session": self.vendor_session,
             "journals": self.journals.iter().map(|j| path(j)).collect::<Vec<_>>(),
             "from_phone": self.from_phone,
-        })
+        });
+        if let Some(tmux) = &self.tmux {
+            value["tmux"] = json!(tmux);
+        }
+        value
     }
 
     /// The registration `value` describes; `None` if a field is missing or mistyped.
@@ -65,6 +71,10 @@ impl Registration {
             .iter()
             .map(|j| j.as_str().map(PathBuf::from))
             .collect::<Option<Vec<_>>>()?;
+        let tmux = match value.get("tmux") {
+            None | Some(Value::Null) => None,
+            Some(name) => Some(name.as_str()?.to_owned()),
+        };
         Some(Self {
             id: text("id")?,
             pid: u32::try_from(value.get("pid")?.as_u64()?).ok()?,
@@ -77,6 +87,7 @@ impl Registration {
             vendor_session: text("vendor_session")?,
             journals,
             from_phone: value.get("from_phone")?.as_bool()?,
+            tmux,
         })
     }
 
@@ -149,6 +160,7 @@ mod tests {
             vendor_session: "c-1".into(),
             journals: vec!["/j/a.jsonl".into(), "/j/b.jsonl".into()],
             from_phone: true,
+            tmux: Some("octet-abc123".into()),
         }
     }
 
@@ -182,7 +194,7 @@ mod tests {
     fn from_json_rejects_missing_and_mistyped_fields() {
         let good = sample().to_json();
         assert_eq!(Registration::from_json(&good), Some(sample()));
-        for key in good.as_object().unwrap().keys() {
+        for key in good.as_object().unwrap().keys().filter(|k| *k != "tmux") {
             let mut missing = good.clone();
             missing.as_object_mut().unwrap().remove(key);
             assert_eq!(Registration::from_json(&missing), None, "{key} missing");
@@ -190,5 +202,21 @@ mod tests {
             mistyped[key] = json!(null);
             assert_eq!(Registration::from_json(&mistyped), None, "{key} null");
         }
+    }
+
+    #[test]
+    fn the_tmux_session_is_optional_but_must_be_text() {
+        let mut desk = sample();
+        desk.tmux = None;
+        let json = desk.to_json();
+        assert!(json.get("tmux").is_none(), "{json}");
+        assert_eq!(Registration::from_json(&json), Some(desk.clone()));
+        let mut null = sample().to_json();
+        null["tmux"] = json!(null);
+        assert_eq!(Registration::from_json(&null), Some(desk));
+        let mut mistyped = sample().to_json();
+        mistyped["tmux"] = json!(7);
+        assert_eq!(Registration::from_json(&mistyped), None);
+        assert_eq!(sample().to_json()["tmux"], "octet-abc123");
     }
 }

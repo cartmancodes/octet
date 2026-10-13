@@ -2,7 +2,9 @@
 //! real journal files, and phones connecting over loopback.
 use futures_util::{SinkExt, StreamExt};
 use octet_core::remote::{
-    protocol::{ack, bridge_catalog_frame, bridge_state_frame, parse_bridge_command, refused},
+    protocol::{
+        Code, ack, bridge_catalog_frame, bridge_state_frame, parse_bridge_command, refused,
+    },
     run::Registration,
 };
 use octet_hub::{Hub, Store};
@@ -168,6 +170,7 @@ impl Env {
             vendor_session: String::new(),
             journals: vec![self.root.join(JOURNAL)],
             from_phone,
+            tmux: from_phone.then(|| format!("octet-{pid}")),
         };
         let listener = UnixListener::bind(&registration.socket).expect("bridge socket");
         registration.write(&self.run).await.expect("registration");
@@ -421,6 +424,7 @@ async fn unauthenticated_and_flooding_clients_are_refused() {
     let refusal = recv(&mut stranger).await;
     assert_eq!(refusal["type"], "refused", "{refusal}");
     assert_eq!(refusal["req"], 41);
+    assert_eq!(refusal["code"], "unpaired");
     assert!(closes(&mut stranger).await);
     // A bad token: refused and closed too.
     let mut liar = connect(env.port, Some(OWNER)).await.expect("connects");
@@ -429,7 +433,11 @@ async fn unauthenticated_and_flooding_clients_are_refused() {
         json!({"v": 1, "req": 3, "type": "hello", "token": "0".repeat(64)}),
     )
     .await;
-    assert_eq!(recv(&mut liar).await["type"], "refused");
+    let refusal = recv(&mut liar).await;
+    assert_eq!(
+        (refusal["type"].as_str(), refusal["code"].as_str()),
+        (Some("refused"), Some("unpaired"))
+    );
     assert!(closes(&mut liar).await);
 
     // Another tailnet login, or none: turned away during the handshake.
@@ -448,6 +456,11 @@ async fn unauthenticated_and_flooding_clients_are_refused() {
     let mut reasons = Vec::new();
     for _ in 100..200 {
         let frame = recv_kind(&mut flood, "refused").await;
+        let code = match frame["reason"].as_str() {
+            Some("No such session") => "unavailable",
+            _ => "rate_limited",
+        };
+        assert_eq!(frame["code"], code, "{frame}");
         reasons.push(frame["reason"].as_str().expect("a reason").to_owned());
     }
     assert!(
@@ -471,6 +484,7 @@ async fn unauthenticated_and_flooding_clients_are_refused() {
     for _ in 0..60 {
         let frame = recv_kind(&mut binary, "refused").await;
         assert_eq!(frame["reason"], "Send each message as a text frame");
+        assert_eq!(frame["code"], "invalid");
     }
     send(&mut binary, prompt(7, "nobody")).await;
     let frame = recv_kind(&mut binary, "refused").await;
@@ -547,7 +561,10 @@ async fn subscribe_replays_then_streams() {
     }
     assert_eq!(recv(&mut fresh).await, ack(5, "Subscribed"));
     send(&mut fresh, subscribe(6, "nobody", None)).await;
-    assert_eq!(recv(&mut fresh).await, refused(6, "No such session"));
+    assert_eq!(
+        recv(&mut fresh).await,
+        refused(6, Code::Unavailable, "No such session")
+    );
 
     // A record the replay reads before the tail does (it polls every 100 ms) arrives once.
     let (mut racer, _) = hello(env.port, &token).await;
@@ -591,10 +608,14 @@ async fn commands_reach_the_bridge_and_replies_come_back() {
     assert_eq!(line["type"], "cancel");
     let second = line["req"].as_u64().expect("a req");
     assert_ne!(second, hub_req);
-    bridge_write(&mut write, refused(second, "No turn is running")).await;
+    bridge_write(
+        &mut write,
+        refused(second, Code::Invalid, "No turn is running"),
+    )
+    .await;
     assert_eq!(
         recv_kind(&mut phone, "refused").await,
-        refused(1000, "No turn is running")
+        refused(1000, Code::Invalid, "No turn is running")
     );
     // A reply to a req the hub never sent goes nowhere.
     bridge_write(&mut write, ack(999_999, "stray")).await;
@@ -614,21 +635,21 @@ async fn full_access_needs_the_confirm_here_too() {
         json!({"v": 1, "req": 7, "type": "set_mode", "session": bridge.id, "mode": "full-access"}),
     )
     .await;
-    assert_eq!(recv(&mut phone).await, refused(7, reason));
+    assert_eq!(recv(&mut phone).await, refused(7, Code::NotAllowed, reason));
     send(
         &mut phone,
         json!({"v": 1, "req": 8, "type": "set_mode", "session": bridge.id, "mode": "full-access",
             "confirm": "yes"}),
     )
     .await;
-    assert_eq!(recv(&mut phone).await, refused(8, reason));
+    assert_eq!(recv(&mut phone).await, refused(8, Code::NotAllowed, reason));
     send(
         &mut phone,
         json!({"v": 1, "req": 9, "type": "start", "engine": "claude", "workspace": "/work",
             "mode": "full-access"}),
     )
     .await;
-    assert_eq!(recv(&mut phone).await, refused(9, reason));
+    assert_eq!(recv(&mut phone).await, refused(9, Code::NotAllowed, reason));
     assert!(bridge_quiet(&mut read).await, "the bridge receives nothing");
     // Confirmed, it goes through.
     send(
@@ -762,10 +783,13 @@ async fn watch_streams_sessions_and_live_events() {
         (event["session"].clone(), event["seq"].clone()),
         (json!(bridge.id), json!(2))
     );
-    // A phone's view of the rows has no NOW line.
+    // A phone's view of the rows has the NOW line too.
     let token = env.pair("Test phone").await;
     let (_phone, sessions) = hello(env.port, &token).await;
-    assert!(sessions["sessions"][0].get("now").is_none(), "{sessions}");
+    assert_eq!(
+        sessions["sessions"][0]["now"], "Running Bash cargo test",
+        "{sessions}"
+    );
     // Control requests still work next to a watcher.
     assert_eq!(env.control(json!({"type": "status"})).await["devices"], 1);
 }
@@ -895,6 +919,7 @@ async fn recent_lists_the_journals_sessions() {
     )
     .await;
     let recent = recv_kind(&mut phone, "recent").await;
+    assert_eq!(recent["req"], 5, "{recent}");
     let items = recent["items"].as_array().expect("items");
     let sessions: Vec<&str> = items.iter().filter_map(|i| i["session"].as_str()).collect();
     assert_eq!(sessions, ["newer", "older"], "{recent}");
@@ -911,6 +936,7 @@ async fn recent_lists_the_journals_sessions() {
     // Without a workspace every known one is listed, newest first.
     send(&mut phone, json!({"v": 1, "req": 6, "type": "recent"})).await;
     let all = recv_kind(&mut phone, "recent").await;
+    assert_eq!(all["req"], 6, "{all}");
     let sessions: Vec<&str> = all["items"]
         .as_array()
         .expect("items")
@@ -932,6 +958,7 @@ async fn recent_lists_the_journals_sessions() {
             .is_some_and(|m| m.starts_with("Workspace not allowed")),
         "{refusal}"
     );
+    assert_eq!(refusal["code"], "not_allowed");
 }
 
 #[tokio::test]
@@ -950,10 +977,28 @@ async fn end_reaches_the_bridge_and_start_is_refused_when_not_allowed() {
     assert_eq!(line["type"], "end");
     assert_eq!(line["by"], "Test phone");
     let (hub_req, _, _) = parse_bridge_command(&line.to_string()).expect("a bridge command");
-    bridge_write(&mut write, refused(hub_req, "A turn is running")).await;
+    bridge_write(
+        &mut write,
+        refused(hub_req, Code::TurnOpen, "A turn is running"),
+    )
+    .await;
     assert_eq!(
         recv_kind(&mut phone, "refused").await,
-        refused(3, "A turn is running")
+        refused(3, Code::TurnOpen, "A turn is running")
+    );
+    // A bridge's refusal without a known code still reaches the phone, as invalid.
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 30, "type": "end", "session": bridge.id}),
+    )
+    .await;
+    let line = bridge_line(&mut read).await;
+    let hub_req = line["req"].as_u64().expect("a req");
+    let bare = json!({"v": 1, "type": "refused", "req": hub_req, "reason": "No", "code": "?"});
+    bridge_write(&mut write, bare).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(30, Code::Invalid, "No")
     );
 
     let start = |req: u64, engine: &str, workspace: &str| {
@@ -967,10 +1012,11 @@ async fn end_reaches_the_bridge_and_start_is_refused_when_not_allowed() {
             .as_str()
             .is_some_and(|r| r.starts_with("Workspace not allowed: /"))
     );
+    assert_eq!(reason["code"], "not_allowed");
     send(&mut phone, start(5, "claude", "/no/such/workspace")).await;
     assert_eq!(
         recv_kind(&mut phone, "refused").await,
-        refused(5, "No such workspace")
+        refused(5, Code::Invalid, "No such workspace")
     );
 }
 
@@ -1002,6 +1048,7 @@ async fn at_most_eight_phone_started_sessions_run() {
         recv_kind(&mut phone, "refused").await,
         refused(
             6,
+            Code::Busy,
             "8 sessions started from the phone are running; end one first"
         )
     );

@@ -40,6 +40,19 @@ pub enum Ty {
     Json,
     /// A list of strings.
     StrList,
+    /// A string from the named closed set (a row of [`CHOICES`]). The parser takes any string, so
+    /// a value outside the set is refused in the receiver's own words.
+    Choice(&'static str),
+    /// A list of strings from the named closed set.
+    ChoiceList(&'static str),
+    /// JSON `null` (a journal record with no data).
+    Null,
+    /// Any JSON object.
+    Map,
+    /// Any JSON list.
+    List,
+    /// A journal record's `{type, data}`, typed by [`EVENTS`].
+    Event,
     /// An object of the named shape (a row of [`OBJECTS`]).
     Object(&'static str),
     /// A list of objects of the named shape.
@@ -68,6 +81,26 @@ pub struct Message {
     pub fields: &'static [Field],
     /// One line saying what it is for.
     pub doc: &'static str,
+}
+
+/// A closed set of strings, named for the TypeScript.
+#[derive(Debug, Clone, Copy)]
+pub struct Choices {
+    /// The set's name (its TypeScript type).
+    pub name: &'static str,
+    /// Every value, in order.
+    pub values: &'static [&'static str],
+    /// One line saying what it is for.
+    pub doc: &'static str,
+}
+
+/// One kind of journal record and the shape of its data.
+#[derive(Debug, Clone, Copy)]
+pub struct EventKind {
+    /// The record's `type`.
+    pub kind: &'static str,
+    /// What its `data` is.
+    pub data: Ty,
 }
 
 /// One named object shape that frames embed.
@@ -110,7 +143,125 @@ const fn message(
 }
 
 use Direction::{FromBridge, FromPhone, ToBridge, ToPhone};
-use Ty::{Bool, Json, Object, ObjectList, Str, StrList, U64};
+use Ty::{Bool, Choice, ChoiceList, Json, List, Null, Object, ObjectList, Str, StrList, U64};
+
+/// The closed sets of strings, in the order the TypeScript declares them.
+pub static CHOICES: &[Choices] = &[
+    Choices {
+        name: "Engine",
+        values: &["claude", "codex", "demo"],
+        doc: "A provider.",
+    },
+    Choices {
+        name: "Mode",
+        values: &["ask", "accept-edits", "auto", "full-access"],
+        doc: "A permission mode.",
+    },
+    Choices {
+        name: "Phase",
+        values: &["connecting", "idle", "running", "stopped"],
+        doc: "Where a session's connection is.",
+    },
+    Choices {
+        name: "ToolPhase",
+        values: &["running", "done", "failed"],
+        doc: "Where a tool call is.",
+    },
+    Choices {
+        name: "RefusalCode",
+        values: &[
+            "unpaired",
+            "revoked",
+            "rate_limited",
+            "not_allowed",
+            "turn_open",
+            "not_connected",
+            "invalid",
+            "unavailable",
+            "busy",
+            "too_large",
+            "timeout",
+        ],
+        doc: "Why a command was refused, for a client to act on; `reason` is the words to show.",
+    },
+];
+
+/// Every kind of journal record (the session's `record()`, and the journal's `session` header),
+/// with its data. The TypeScript adds a catch-all for kinds a later version adds.
+pub static EVENTS: &[EventKind] = &[
+    EventKind {
+        kind: "text",
+        data: Str,
+    },
+    EventKind {
+        kind: "user",
+        data: Str,
+    },
+    EventKind {
+        kind: "finished",
+        data: Str,
+    },
+    EventKind {
+        kind: "mode",
+        data: Str,
+    },
+    EventKind {
+        kind: "model_selected",
+        data: Str,
+    },
+    EventKind {
+        kind: "usage",
+        data: Str,
+    },
+    EventKind {
+        kind: "notice",
+        data: Str,
+    },
+    EventKind {
+        kind: "error",
+        data: Str,
+    },
+    EventKind {
+        kind: "tool",
+        data: Object("ToolData"),
+    },
+    EventKind {
+        kind: "approval",
+        data: Object("ApprovalData"),
+    },
+    EventKind {
+        kind: "approval_closed",
+        data: U64,
+    },
+    EventKind {
+        kind: "started",
+        data: Null,
+    },
+    EventKind {
+        kind: "stopped",
+        data: Null,
+    },
+    EventKind {
+        kind: "hook",
+        data: Object("HookData"),
+    },
+    EventKind {
+        kind: "ready",
+        data: Str,
+    },
+    EventKind {
+        kind: "session",
+        data: Ty::Map,
+    },
+    EventKind {
+        kind: "models",
+        data: List,
+    },
+    EventKind {
+        kind: "skills",
+        data: List,
+    },
+];
 
 /// The object shapes frames embed, in the order the TypeScript declares them.
 pub static OBJECTS: &[Shape] = &[
@@ -123,17 +274,62 @@ pub static OBJECTS: &[Shape] = &[
         name: "SessionInfo",
         fields: &[
             req("id", Str),
-            req("engine", Str),
+            req("engine", Choice("Engine")),
             opt("model", Str),
             req("workspace", Str),
-            req("mode", Str),
-            req("phase", Str),
+            req("mode", Choice("Mode")),
+            req("phase", Choice("Phase")),
             req("approvals", U64),
             opt("last_activity", U64),
             opt("goal", Str),
+            opt("now", Str),
             req("from_phone", Bool),
+            opt("tmux", Str),
         ],
-        doc: "One live session; `last_activity` is Unix seconds, `goal` a one-liner.",
+        doc: "One live session; `last_activity` is Unix seconds, `goal` a one-liner, `now` the \
+              NOW line, `tmux` the tmux session a phone started it in.",
+    },
+    Shape {
+        name: "ApprovalSummary",
+        fields: &[
+            req("action", Str),
+            opt("command", Str),
+            req("files", StrList),
+            opt("cwd", Str),
+            req("scope", Str),
+        ],
+        doc: "What an approval would do, as the dialog leads with it.",
+    },
+    Shape {
+        name: "ToolData",
+        fields: &[
+            req("id", Str),
+            req("name", Str),
+            req("target", Str),
+            req("phase", Choice("ToolPhase")),
+            req("detail", Str),
+        ],
+        doc: "A `tool` record: one tool call or its result, as a preview.",
+    },
+    Shape {
+        name: "ApprovalData",
+        fields: &[
+            req("id", U64),
+            req("detail", Str),
+            req("summary", Object("ApprovalSummary")),
+        ],
+        doc: "An `approval` record: the vendor waits for an answer.",
+    },
+    Shape {
+        name: "HookData",
+        fields: &[
+            req("name", Str),
+            req("event", Str),
+            req("outcome", Str),
+            req("detail", Str),
+            opt("decision", Str),
+        ],
+        doc: "A `hook` record: a plugin or settings hook ran.",
     },
     Shape {
         name: "GoalInfo",
@@ -147,18 +343,18 @@ pub static OBJECTS: &[Shape] = &[
     },
     Shape {
         name: "ApprovalInfo",
-        fields: &[req("id", U64), req("summary", Json)],
+        fields: &[req("id", U64), req("summary", Object("ApprovalSummary"))],
         doc: "An approval waiting for an answer, with its summary as the journal records it.",
     },
     Shape {
         name: "StateInfo",
         fields: &[
-            req("phase", Str),
+            req("phase", Choice("Phase")),
             req("queue", StrList),
             req("queued", U64),
             opt("goal", Object("GoalInfo")),
             opt("now", Str),
-            req("mode", Str),
+            req("mode", Choice("Mode")),
             req("approvals", ObjectList("ApprovalInfo")),
         ],
         doc: "What only the terminal UI knows: queue, goal, NOW line, mode and pending approvals.",
@@ -166,7 +362,7 @@ pub static OBJECTS: &[Shape] = &[
     Shape {
         name: "ModelInfo",
         fields: &[
-            req("engine", Str),
+            req("engine", Choice("Engine")),
             req("selection", Str),
             req("name", Str),
             req("id", Str),
@@ -174,20 +370,15 @@ pub static OBJECTS: &[Shape] = &[
         doc: "One model a session can switch to.",
     },
     Shape {
-        name: "JournalEvent",
-        fields: &[req("type", Str), req("data", Json)],
-        doc: "A journal record's kind and data; the frame carries its `seq`.",
-    },
-    Shape {
         name: "ModelRef",
-        fields: &[req("engine", Str), req("selection", Str)],
+        fields: &[req("engine", Choice("Engine")), req("selection", Str)],
         doc: "The model a session is using now.",
     },
     Shape {
         name: "CatalogInfo",
         fields: &[
-            req("modes", StrList),
-            req("current_mode", Str),
+            req("modes", ChoiceList("Mode")),
+            req("current_mode", Choice("Mode")),
             req("models", ObjectList("ModelInfo")),
             opt("current", Object("ModelRef")),
         ],
@@ -196,7 +387,7 @@ pub static OBJECTS: &[Shape] = &[
     Shape {
         name: "RecentInfo",
         fields: &[
-            req("engine", Str),
+            req("engine", Choice("Engine")),
             req("workspace", Str),
             req("session", Str),
             req("title", Str),
@@ -234,7 +425,7 @@ pub static MESSAGES: &[Message] = &[
             req("session", Str),
             req("journal", Str),
             req("seq", U64),
-            req("event", Object("JournalEvent")),
+            req("event", Ty::Event),
         ],
         "One journal record of a session, live or replayed.",
     ),
@@ -253,8 +444,8 @@ pub static MESSAGES: &[Message] = &[
     message(
         "recent",
         ToPhone,
-        &[req("items", ObjectList("RecentInfo"))],
-        "Recent sessions that can be resumed.",
+        &[req("req", U64), req("items", ObjectList("RecentInfo"))],
+        "Recent sessions that can be resumed, answering the `recent` command `req`.",
     ),
     message(
         "ack",
@@ -265,7 +456,11 @@ pub static MESSAGES: &[Message] = &[
     message(
         "refused",
         ToPhone,
-        &[req("req", U64), req("reason", Str)],
+        &[
+            req("req", U64),
+            req("reason", Str),
+            opt("code", Choice("RefusalCode")),
+        ],
         "A command was refused, with the reason.",
     ),
     message(
@@ -323,7 +518,11 @@ pub static MESSAGES: &[Message] = &[
     message(
         "set_mode",
         FromPhone,
-        &[req("session", Str), req("mode", Str), opt("confirm", Str)],
+        &[
+            req("session", Str),
+            req("mode", Choice("Mode")),
+            opt("confirm", Str),
+        ],
         "Change the permission mode; full-access needs `confirm`.",
     ),
     message(
@@ -342,11 +541,11 @@ pub static MESSAGES: &[Message] = &[
         "start",
         FromPhone,
         &[
-            req("engine", Str),
+            req("engine", Choice("Engine")),
             req("workspace", Str),
             opt("resume", Str),
             opt("model", Str),
-            opt("mode", Str),
+            opt("mode", Choice("Mode")),
             opt("confirm", Str),
         ],
         "Start or resume a terminal UI in tmux.",
@@ -384,7 +583,11 @@ pub static MESSAGES: &[Message] = &[
     message(
         "set_mode",
         ToBridge,
-        &[req("by", Str), req("mode", Str), opt("confirm", Str)],
+        &[
+            req("by", Str),
+            req("mode", Choice("Mode")),
+            opt("confirm", Str),
+        ],
         "Change the mode.",
     ),
     message(
@@ -415,7 +618,11 @@ pub static MESSAGES: &[Message] = &[
     message(
         "refused",
         FromBridge,
-        &[req("req", U64), req("reason", Str)],
+        &[
+            req("req", U64),
+            req("reason", Str),
+            opt("code", Choice("RefusalCode")),
+        ],
         "A command was refused, with the reason.",
     ),
 ];
@@ -427,6 +634,73 @@ pub struct Cursor {
     pub journal: String,
     /// The record's sequence number within it.
     pub seq: u64,
+}
+
+/// Why a command was refused, for a client to act on; the reason stays the words to show. The
+/// spellings are [`CHOICES`]' `RefusalCode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Code {
+    /// The device is not paired, or has not said hello.
+    Unpaired,
+    /// The device was unpaired.
+    Revoked,
+    /// The device sent too many commands; it may try again in a minute.
+    RateLimited,
+    /// The command is understood but not allowed (a workspace, full access unconfirmed).
+    NotAllowed,
+    /// A turn is running; finish or cancel it first.
+    TurnOpen,
+    /// The session is not connected to its vendor, or the hub to it.
+    NotConnected,
+    /// The command is malformed, or names something that is not there to act on.
+    Invalid,
+    /// The session ended, or what the command needs is missing.
+    Unavailable,
+    /// Something is in the way for now (the desk, a full queue, a scan, the session cap).
+    Busy,
+    /// The text is over its limit.
+    TooLarge,
+    /// No answer came in time.
+    Timeout,
+}
+
+impl Code {
+    /// Every code, in [`CHOICES`]' order.
+    pub const ALL: [Code; 11] = [
+        Code::Unpaired,
+        Code::Revoked,
+        Code::RateLimited,
+        Code::NotAllowed,
+        Code::TurnOpen,
+        Code::NotConnected,
+        Code::Invalid,
+        Code::Unavailable,
+        Code::Busy,
+        Code::TooLarge,
+        Code::Timeout,
+    ];
+
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Code::Unpaired => "unpaired",
+            Code::Revoked => "revoked",
+            Code::RateLimited => "rate_limited",
+            Code::NotAllowed => "not_allowed",
+            Code::TurnOpen => "turn_open",
+            Code::NotConnected => "not_connected",
+            Code::Invalid => "invalid",
+            Code::Unavailable => "unavailable",
+            Code::Busy => "busy",
+            Code::TooLarge => "too_large",
+            Code::Timeout => "timeout",
+        }
+    }
+
+    /// The code spelled `text`, if there is one.
+    pub fn parse(text: &str) -> Option<Code> {
+        Code::ALL.into_iter().find(|code| code.as_str() == text)
+    }
 }
 
 /// A phone → hub command, checked.
@@ -572,12 +846,14 @@ const COMMON: &[&str] = &["v", "req", "type"];
 
 fn type_name(ty: Ty) -> &'static str {
     match ty {
-        Ty::Str => "string",
+        Ty::Str | Ty::Choice(_) => "string",
         Ty::U64 => "non-negative number",
         Ty::Bool => "boolean",
         Ty::Json => "JSON value",
-        Ty::StrList => "list of strings",
-        Ty::Object(_) => "object",
+        Ty::StrList | Ty::ChoiceList(_) => "list of strings",
+        Ty::Null => "null",
+        Ty::List => "list",
+        Ty::Map | Ty::Event | Ty::Object(_) => "object",
         Ty::ObjectList(_) => "list of objects",
     }
 }
@@ -589,15 +865,25 @@ fn shape(name: &str) -> &'static [Field] {
         .map_or(&[], |s| s.fields)
 }
 
+/// What every journal event is: its kind, and data that the kind decides (null for some).
+const EVENT_FIELDS: &[Field] = &[req("type", Str), opt("data", Json)];
+
 /// Checks `value` against `ty`; `name` is the dotted path for messages.
 fn check_value(value: &Value, ty: Ty, name: &str) -> Result<(), String> {
     let wrong = || format!("{name} must be a {}", type_name(ty));
     match ty {
         Ty::Json => Ok(()),
-        Ty::Str if value.is_string() => Ok(()),
+        Ty::Str | Ty::Choice(_) if value.is_string() => Ok(()),
         Ty::U64 if value.is_u64() => Ok(()),
         Ty::Bool if value.is_boolean() => Ok(()),
-        Ty::StrList
+        Ty::Null if value.is_null() => Ok(()),
+        Ty::Map if value.is_object() => Ok(()),
+        Ty::List if value.is_array() => Ok(()),
+        Ty::Event => {
+            let map = value.as_object().ok_or_else(wrong)?;
+            check_fields(map, EVENT_FIELDS, &[], name)
+        }
+        Ty::StrList | Ty::ChoiceList(_)
             if value
                 .as_array()
                 .is_some_and(|l| l.iter().all(Value::is_string)) =>
@@ -903,17 +1189,21 @@ pub fn state_frame(session: &str, state: &Value) -> Value {
 pub fn catalog_frame(session: &str, catalog: &Value) -> Value {
     frame("catalog", json!({ "session": session, "catalog": catalog }))
 }
-/// The `recent` frame: each row is a `RecentInfo`.
-pub fn recent_frame(items: &[Value]) -> Value {
-    frame("recent", json!({ "items": items }))
+/// The `recent` frame answering the command `req`: each row is a `RecentInfo`.
+pub fn recent_frame(req: u64, items: &[Value]) -> Value {
+    frame("recent", json!({ "req": req, "items": items }))
 }
 /// The `ack` frame (hub → phone, or bridge → hub) for the command `req`.
 pub fn ack(req: u64, message: &str) -> Value {
     frame("ack", json!({ "req": req, "message": message }))
 }
-/// The `refused` frame (hub → phone, or bridge → hub) for the command `req`, with the reason.
-pub fn refused(req: u64, reason: &str) -> Value {
-    frame("refused", json!({ "req": req, "reason": reason }))
+/// The `refused` frame (hub → phone, or bridge → hub) for the command `req`, with its code and
+/// the reason.
+pub fn refused(req: u64, code: Code, reason: &str) -> Value {
+    frame(
+        "refused",
+        json!({ "req": req, "code": code.as_str(), "reason": reason }),
+    )
 }
 /// The bridge → hub `state` frame: the terminal UI's `StateInfo`.
 pub fn bridge_state_frame(state: &Value) -> Value {
@@ -953,22 +1243,57 @@ fn ts_type(ty: Ty) -> String {
         Ty::Bool => "boolean".into(),
         Ty::Json => "unknown".into(),
         Ty::StrList => "string[]".into(),
-        Ty::Object(name) => name.into(),
-        Ty::ObjectList(name) => format!("{name}[]"),
+        Ty::Null => "null".into(),
+        Ty::Map => "Record<string, unknown>".into(),
+        Ty::List => "unknown[]".into(),
+        Ty::Event => "JournalEvent".into(),
+        Ty::Choice(name) | Ty::Object(name) => name.into(),
+        Ty::ChoiceList(name) | Ty::ObjectList(name) => format!("{name}[]"),
     }
 }
 
+/// The fields of an interface; an optional one may also be null, as the parser takes it.
 fn ts_fields(out: &mut String, fields: &[Field]) {
     for field in fields {
-        let mark = if field.optional { "?" } else { "" };
-        let _ = writeln!(out, "  {}{mark}: {};", field.name, ts_type(field.ty));
+        let (mark, null) = if field.optional {
+            ("?", " | null")
+        } else {
+            ("", "")
+        };
+        let _ = writeln!(out, "  {}{mark}: {}{null};", field.name, ts_type(field.ty));
     }
+}
+
+/// The `JournalEvent` union: one member per record kind, then any other kind.
+fn ts_events(out: &mut String) {
+    out.push_str("\n/** A journal record's kind and data; the frame carries its `seq`. */\n");
+    out.push_str("export type JournalEvent =\n");
+    for event in EVENTS {
+        let _ = writeln!(
+            out,
+            "  | {{ type: \"{}\"; data: {} }}",
+            event.kind,
+            ts_type(event.data)
+        );
+    }
+    out.push_str("  | { type: string; data: unknown };\n");
 }
 
 /// The checked-in TypeScript for the app, generated from [`MESSAGES`] and [`OBJECTS`].
 pub fn typescript() -> String {
     let mut out = String::from("// Generated by octet-core (remote::protocol). Do not edit.\n");
     let _ = writeln!(out, "export const PROTOCOL_VERSION = {VERSION};");
+    for choices in CHOICES {
+        let values: Vec<String> = choices.values.iter().map(|v| format!("\"{v}\"")).collect();
+        let _ = writeln!(
+            out,
+            "\n/** {} */\nexport type {} = {};",
+            choices.doc,
+            choices.name,
+            values.join(" | ")
+        );
+    }
+    ts_events(&mut out);
     for object in OBJECTS {
         let _ = writeln!(
             out,
@@ -1206,7 +1531,8 @@ mod tests {
             "phase": "running", "queue": ["next"], "queued": 1,
             "goal": {"objective": "Ship", "status": "active", "turns": 1, "max": 5},
             "now": "Reading", "mode": "ask",
-            "approvals": [{"id": 1, "summary": {"action": "Run a shell command"}}],
+            "approvals": [{"id": 1, "summary": {"action": "Run a shell command", "files": [],
+                "scope": "This request only, once"}}],
         });
         let catalog = json!({
             "modes": ["ask"], "current_mode": "ask",
@@ -1225,13 +1551,16 @@ mod tests {
             ),
             (state_frame("1-2", &state), Direction::ToPhone),
             (catalog_frame("1-2", &catalog), Direction::ToPhone),
-            (recent_frame(&[recent]), Direction::ToPhone),
+            (recent_frame(4, &[recent]), Direction::ToPhone),
             (ack(1, "Sent"), Direction::ToPhone),
-            (refused(1, "A turn is running"), Direction::ToPhone),
+            (
+                refused(1, Code::TurnOpen, "A turn is running"),
+                Direction::ToPhone,
+            ),
             (bridge_state_frame(&state), Direction::FromBridge),
             (bridge_catalog_frame(&catalog), Direction::FromBridge),
             (ack(1, "Sent"), Direction::FromBridge),
-            (refused(1, "no"), Direction::FromBridge),
+            (refused(1, Code::Busy, "no"), Direction::FromBridge),
         ] {
             let map = frame.as_object().unwrap();
             assert_eq!(map["v"], 1, "{frame}");
@@ -1343,10 +1672,167 @@ mod tests {
             assert!(ts.contains(&format!("export type {union} =")), "{union}");
         }
         assert!(ts.contains("export interface Cursor {"));
-        assert!(ts.contains("after?: Cursor;"));
+        assert!(ts.contains("after?: Cursor | null;"));
         assert!(ts.contains("approvals: ApprovalInfo[];"));
         assert!(ts.contains("approval: number;"));
         assert!(ts.contains("type: \"set_mode\";"));
+    }
+
+    #[test]
+    fn the_typescript_types_events_closed_sets_and_nulls() {
+        let ts = typescript();
+        for wanted in [
+            "export type Engine = \"claude\" | \"codex\" | \"demo\";",
+            "export type Mode = \"ask\" | \"accept-edits\" | \"auto\" | \"full-access\";",
+            "export type Phase = \"connecting\" | \"idle\" | \"running\" | \"stopped\";",
+            "export type ToolPhase = \"running\" | \"done\" | \"failed\";",
+            "export type JournalEvent =",
+            "  | { type: \"text\"; data: string }",
+            "  | { type: \"tool\"; data: ToolData }",
+            "  | { type: \"approval\"; data: ApprovalData }",
+            "  | { type: \"approval_closed\"; data: number }",
+            "  | { type: \"started\"; data: null }",
+            "  | { type: \"hook\"; data: HookData }",
+            "  | { type: \"session\"; data: Record<string, unknown> }",
+            "  | { type: \"models\"; data: unknown[] }",
+            "  | { type: string; data: unknown };",
+            "export interface ApprovalSummary {",
+            "  summary: ApprovalSummary;",
+            "  phase: ToolPhase;",
+            "  decision?: string | null;",
+            "  engine: Engine;",
+            "  mode: Mode;",
+            "  phase: Phase;",
+            "  modes: Mode[];",
+            "  model?: string | null;",
+            "  now?: string | null;",
+            "  tmux?: string | null;",
+            "  code?: RefusalCode | null;",
+        ] {
+            assert!(ts.contains(wanted), "no {wanted:?} in\n{ts}");
+        }
+        // The recent frame names the request it answers.
+        let recent = ts.split("export interface RecentFrame {").nth(1).unwrap();
+        assert!(recent.split('}').next().unwrap().contains("req: number;"));
+    }
+
+    #[test]
+    fn every_journal_record_kind_has_a_typed_shape() {
+        use octet_engine::live::{
+            ApprovalSummary, Event, HookOutcome, ModelInfo, Outcome, SkillInfo, ToolCall, ToolPhase,
+        };
+        let events = [
+            Event::Ready {
+                session: "s".into(),
+            },
+            Event::Models(vec![ModelInfo {
+                selection: "opus".into(),
+                id: None,
+                name: "Opus".into(),
+                description: String::new(),
+            }]),
+            Event::ModelSelected("opus".into()),
+            Event::ModeChanged(octet_engine::live::Mode::Auto),
+            Event::User("hi".into()),
+            Event::Started,
+            Event::Text("hello".into()),
+            Event::Tool(ToolCall {
+                id: "t1".into(),
+                name: "Bash".into(),
+                target: "ls".into(),
+                phase: ToolPhase::Done,
+                detail: "ok".into(),
+            }),
+            Event::Approval {
+                id: 3,
+                detail: "d".into(),
+                summary: ApprovalSummary::new("Run a shell command"),
+            },
+            Event::ApprovalClosed(3),
+            Event::Usage("1k tokens".into()),
+            Event::Finished {
+                outcome: Outcome::Completed,
+            },
+            Event::Skills(vec![SkillInfo {
+                name: "x".into(),
+                description: String::new(),
+                aliases: Vec::new(),
+                argument_hint: String::new(),
+                path: None,
+            }]),
+            Event::Hook {
+                name: "PreToolUse:Bash".into(),
+                event: "PreToolUse".into(),
+                outcome: HookOutcome::Decided("allow".into()),
+                detail: String::new(),
+            },
+            Event::Notice("n".into()),
+            Event::Error("e".into()),
+            Event::Stopped,
+        ];
+        let mut seen = vec!["session"];
+        for event in &events {
+            let record = crate::event_json(event);
+            let kind = record["type"].as_str().unwrap();
+            let shape = EVENTS
+                .iter()
+                .find(|e| e.kind == kind)
+                .unwrap_or_else(|| panic!("no shape for {kind}"));
+            check_value(&record["data"], shape.data, kind).unwrap_or_else(|e| panic!("{e}"));
+            seen.push(shape.kind);
+        }
+        for shape in EVENTS {
+            assert!(
+                seen.contains(&shape.kind),
+                "{} is never recorded",
+                shape.kind
+            );
+        }
+    }
+
+    #[test]
+    fn the_closed_sets_match_the_engines_modes_and_refusal_codes() {
+        let values = |name: &str| CHOICES.iter().find(|c| c.name == name).unwrap().values;
+        let engines: Vec<&str> = octet_engine::live::Engine::ALL
+            .iter()
+            .map(|e| e.as_str())
+            .collect();
+        let mut sorted = engines.clone();
+        sorted.sort_unstable();
+        assert_eq!(values("Engine"), sorted);
+        let modes: Vec<&str> = octet_engine::live::Mode::ALL
+            .iter()
+            .map(|m| m.label())
+            .collect();
+        assert_eq!(values("Mode"), modes);
+        let codes: Vec<&str> = Code::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(values("RefusalCode"), codes);
+        for code in Code::ALL {
+            assert_eq!(Code::parse(code.as_str()), Some(code));
+        }
+        assert_eq!(Code::parse("nope"), None);
+        let every_choice = |fields: &'static [Field]| {
+            fields.iter().filter_map(|f| match f.ty {
+                Ty::Choice(n) | Ty::ChoiceList(n) => Some(n),
+                _ => None,
+            })
+        };
+        let all = MESSAGES
+            .iter()
+            .map(|m| m.fields)
+            .chain(OBJECTS.iter().map(|o| o.fields));
+        for name in all.flat_map(every_choice) {
+            assert!(CHOICES.iter().any(|c| c.name == name), "no choice {name}");
+        }
+    }
+
+    #[test]
+    fn closed_sets_do_not_narrow_what_the_parser_takes() {
+        // The phone's TypeScript is typed; the hub still refuses an unknown mode in its own words.
+        let (_, command) =
+            parse_phone(r#"{"v":1,"req":1,"type":"set_mode","session":"s","mode":"sideways"}"#)
+                .unwrap();
+        assert!(matches!(command, PhoneCommand::SetMode { mode, .. } if mode == "sideways"));
     }
 
     #[test]

@@ -5,7 +5,10 @@
 //! allow-list of canonical directories.
 use octet_core::{
     Engine, Mode, recent_sessions_in,
-    remote::{known_workspaces, protocol::full_access_confirmed},
+    remote::{
+        known_workspaces,
+        protocol::{Code, full_access_confirmed},
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -38,6 +41,12 @@ const PER_WORKSPACE: usize = 20;
 /// Recent sessions listed across all workspaces.
 const IN_TOTAL: usize = 40;
 
+/// Why a phone's request was refused: its code, and the words to show.
+pub(crate) type Refusal = (Code, String);
+
+/// The longest device name passed to a started interface, in characters.
+const DEVICE_CHARS: usize = 40;
+
 /// What a phone asked `start` for.
 #[derive(Debug, Clone)]
 pub(crate) struct StartRequest {
@@ -62,7 +71,7 @@ pub(crate) fn clip(text: &str, chars: usize) -> String {
 
 /// `value` as one plain argument: not empty, no whitespace or control characters, no `;` or `#`
 /// (tmux's separator and format character), and not shaped like an option.
-fn token(what: &str, value: &str) -> Result<(), String> {
+fn token(what: &str, value: &str) -> Result<(), Refusal> {
     let plain = !value.is_empty()
         && !value.starts_with('-')
         && !value
@@ -71,7 +80,7 @@ fn token(what: &str, value: &str) -> Result<(), String> {
     if plain {
         Ok(())
     } else {
-        Err(format!("Invalid {what}"))
+        Err((Code::Invalid, format!("Invalid {what}")))
     }
 }
 
@@ -81,16 +90,30 @@ fn token(what: &str, value: &str) -> Result<(), String> {
 ///
 /// "No such workspace" when it cannot be resolved, and "Workspace not allowed" when it is not
 /// in the list.
-pub(crate) fn check_workspace(requested: &Path, allowed: &[PathBuf]) -> Result<PathBuf, String> {
-    let real = std::fs::canonicalize(requested).map_err(|_| "No such workspace".to_owned())?;
+pub(crate) fn check_workspace(requested: &Path, allowed: &[PathBuf]) -> Result<PathBuf, Refusal> {
+    let real = std::fs::canonicalize(requested)
+        .map_err(|_| (Code::Invalid, "No such workspace".to_owned()))?;
     if allowed.contains(&real) {
         return Ok(real);
     }
     let shown = requested.to_string_lossy();
-    Err(format!(
-        "Workspace not allowed: {}",
-        clip(&shown, ECHOED_PATH)
+    Err((
+        Code::NotAllowed,
+        format!("Workspace not allowed: {}", clip(&shown, ECHOED_PATH)),
     ))
+}
+
+/// A device's name as the started interface's `--remote-by`: one line without control
+/// characters, not shaped like an option, at most [`DEVICE_CHARS`] characters; `None` if
+/// nothing is left.
+fn device_argument(name: &str) -> Option<String> {
+    let line = name
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line = clip(line.trim_start_matches('-').trim_start(), DEVICE_CHARS);
+    (!line.is_empty()).then_some(line)
 }
 
 /// `arg` as tmux takes a command's argument: tmux ends a command at any argument that ends in
@@ -111,22 +134,28 @@ fn tmux_directory(path: &str) -> OsString {
 /// The tmux arguments for a phone-started interface; Err when the request is not allowed.
 ///
 /// `allowed` holds canonical directories, `running` is how many phone-started sessions exist,
-/// and `name` is the tmux session's name. Each choice of the phone is one argument.
+/// `name` is the tmux session's name and `by` the device asking. Each choice of the phone is
+/// one argument.
 pub(crate) fn start_args(
     octet: &Path,
     directory: &Path,
     request: &StartRequest,
     allowed: &[PathBuf],
     running: usize,
-    name: &str,
-) -> Result<Vec<OsString>, String> {
+    (name, by): (&str, &str),
+) -> Result<Vec<OsString>, Refusal> {
     if running >= PHONE_SESSIONS {
-        return Err(format!(
-            "{PHONE_SESSIONS} sessions started from the phone are running; end one first"
+        return Err((
+            Code::Busy,
+            format!("{PHONE_SESSIONS} sessions started from the phone are running; end one first"),
         ));
     }
-    let engine = Engine::parse(&request.engine)
-        .ok_or_else(|| format!("Unknown engine {}", clip(&request.engine, 32)))?;
+    let engine = Engine::parse(&request.engine).ok_or_else(|| {
+        (
+            Code::Invalid,
+            format!("Unknown engine {}", clip(&request.engine, 32)),
+        )
+    })?;
     for (what, value) in [
         ("session to resume", &request.resume),
         ("model", &request.model),
@@ -137,20 +166,24 @@ pub(crate) fn start_args(
         }
     }
     let mode = match &request.mode {
-        Some(text) => {
-            Some(Mode::parse(text).ok_or_else(|| format!("Unknown mode {}", clip(text, 32)))?)
-        }
+        Some(text) => Some(
+            Mode::parse(text)
+                .ok_or_else(|| (Code::Invalid, format!("Unknown mode {}", clip(text, 32))))?,
+        ),
         None => None,
     };
     if let Some(mode) = mode
         && !full_access_confirmed(mode.label(), request.confirm.as_deref())
     {
-        return Err("Full access needs confirm: \"full access\"".into());
+        return Err((
+            Code::NotAllowed,
+            "Full access needs confirm: \"full access\"".into(),
+        ));
     }
     let workspace = check_workspace(&request.workspace, allowed)?;
     let text = workspace
         .to_str()
-        .ok_or("The workspace path must be UTF-8")?;
+        .ok_or((Code::Invalid, "The workspace path must be UTF-8".to_owned()))?;
     let mut args: Vec<OsString> = ["new-session", "-d", "-s", name, "-c"]
         .map(OsString::from)
         .into();
@@ -165,6 +198,11 @@ pub(crate) fn start_args(
     args.push("--engine".into());
     args.push(engine.as_str().into());
     args.push("--remote-started".into());
+    args.push(name.into());
+    if let Some(device) = device_argument(by) {
+        args.push("--remote-by".into());
+        args.push(tmux_argument(OsStr::new(&device)));
+    }
     for (flag, value) in [
         ("--resume", request.resume.as_deref()),
         ("--model", request.model.as_deref()),
@@ -183,9 +221,10 @@ pub(crate) fn start_args(
 /// # Errors
 ///
 /// When the operating system gave no random bytes.
-pub(crate) fn session_name() -> Result<String, String> {
+pub(crate) fn session_name() -> Result<String, Refusal> {
     let mut bytes = [0_u8; 3];
-    getrandom::fill(&mut bytes).map_err(|_| "Couldn't make a session name".to_owned())?;
+    getrandom::fill(&mut bytes)
+        .map_err(|_| (Code::Unavailable, "Couldn't make a session name".to_owned()))?;
     Ok(format!(
         "octet-{:02x}{:02x}{:02x}",
         bytes[0], bytes[1], bytes[2]
@@ -199,7 +238,7 @@ pub(crate) fn session_name() -> Result<String, String> {
 ///
 /// Why it did not start a session: tmux is missing, it ran out of time, or what it said on
 /// stderr (clipped).
-pub(crate) async fn launch(args: Vec<OsString>, name: &str) -> Result<(), String> {
+pub(crate) async fn launch(args: Vec<OsString>, name: &str) -> Result<(), Refusal> {
     let child = Command::new("tmux")
         .args(args)
         .stdin(Stdio::null())
@@ -208,23 +247,24 @@ pub(crate) async fn launch(args: Vec<OsString>, name: &str) -> Result<(), String
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "tmux isn't installed".to_owned(),
-            _ => format!("Couldn't run tmux: {e}"),
+            std::io::ErrorKind::NotFound => (Code::Unavailable, "tmux isn't installed".to_owned()),
+            _ => (Code::Unavailable, format!("Couldn't run tmux: {e}")),
         })?;
     let Ok(output) = timeout(LAUNCH_WITHIN, child.wait_with_output()).await else {
-        return Err(abandon(name).await);
+        return Err((Code::Timeout, abandon(name).await));
     };
-    let output = output.map_err(|e| format!("Couldn't run tmux: {e}"))?;
+    let output = output.map_err(|e| (Code::Unavailable, format!("Couldn't run tmux: {e}")))?;
     if output.status.success() {
         return Ok(());
     }
     let said = String::from_utf8_lossy(&output.stderr);
     let said = said.trim();
-    Err(if said.is_empty() {
+    let reason = if said.is_empty() {
         "tmux couldn't start the session".to_owned()
     } else {
         clip(said, TMUX_ERROR)
-    })
+    };
+    Err((Code::Unavailable, reason))
 }
 
 /// How long an accepted launch counts toward the cap while its interface has not registered.
@@ -300,7 +340,8 @@ pub(crate) struct Started {
 /// Where the literal canonical workspace (the value of `--cwd`) sits in [`start_args`]'s result.
 const WORKSPACE_ARG: usize = 10;
 
-/// Checks `request` against the allowed workspaces and starts it in a new tmux session.
+/// Checks `request` against the allowed workspaces and starts it in a new tmux session, on
+/// behalf of the device `by`.
 ///
 /// # Errors
 ///
@@ -309,12 +350,13 @@ pub(crate) async fn start(
     directory: &Path,
     configured: &[PathBuf],
     request: &StartRequest,
-    running: usize,
-) -> Result<Started, String> {
+    (running, by): (usize, &str),
+) -> Result<Started, Refusal> {
     let allowed = allowed_workspaces(directory, configured).await;
-    let octet = std::env::current_exe().map_err(|e| format!("Couldn't find octet: {e}"))?;
+    let octet = std::env::current_exe()
+        .map_err(|e| (Code::Unavailable, format!("Couldn't find octet: {e}")))?;
     let name = session_name()?;
-    let args = start_args(&octet, directory, request, &allowed, running, &name)?;
+    let args = start_args(&octet, directory, request, &allowed, running, (&name, by))?;
     let workspace = args
         .get(WORKSPACE_ARG)
         .map(PathBuf::from)
@@ -350,7 +392,7 @@ pub(crate) async fn recent(
     directory: &Path,
     allowed: &[PathBuf],
     workspace: Option<&Path>,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, Refusal> {
     let workspaces = match workspace {
         Some(requested) => vec![check_workspace(requested, allowed)?],
         None => allowed.to_vec(),
@@ -424,13 +466,14 @@ mod tests {
             request,
             allowed,
             running,
-            "octet-abc123",
+            ("octet-abc123", "Gemini 10"),
         )
         .map(|args| {
             args.iter()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect()
         })
+        .map_err(|(_, reason)| reason)
     }
 
     #[test]
@@ -456,6 +499,9 @@ mod tests {
                 "--engine",
                 "demo",
                 "--remote-started",
+                "octet-abc123",
+                "--remote-by",
+                "Gemini 10",
             ]
         );
 
@@ -494,6 +540,36 @@ mod tests {
     }
 
     #[test]
+    fn the_device_name_reaches_the_interface_as_one_short_plain_argument() {
+        assert_eq!(device_argument("Gemini 10").as_deref(), Some("Gemini 10"));
+        assert_eq!(
+            device_argument("  My\n\tiPhone \u{1b}[2J  ").as_deref(),
+            Some("My iPhone [2J")
+        );
+        assert_eq!(
+            device_argument("--mode full-access").as_deref(),
+            Some("mode full-access")
+        );
+        assert_eq!(
+            device_argument(&"é".repeat(90)).map(|d| d.chars().count()),
+            Some(40)
+        );
+        assert_eq!(device_argument(" - \u{7}"), None);
+        // Nothing left to name: the flag is left out.
+        let (_temp, ws) = workspace("w");
+        let got = start_args(
+            Path::new("/bin/octet"),
+            Path::new("/data"),
+            &request(&ws),
+            std::slice::from_ref(&ws),
+            0,
+            ("octet-abc123", "--"),
+        )
+        .unwrap();
+        assert!(!got.iter().any(|a| a == "--remote-by"), "{got:?}");
+    }
+
+    #[test]
     fn tmux_formats_and_separators_in_workspaces_are_escaped_in_the_cwd_flag_only() {
         for (name, escaped) in [
             ("C#", "C##"),
@@ -523,9 +599,10 @@ mod tests {
             &request(&ws),
             std::slice::from_ref(&ws),
             0,
-            "octet-abc123",
+            ("octet-abc123", "phone;"),
         )
         .unwrap();
+        assert_eq!(got[16], "phone\\;");
         assert_eq!(got[6], "/bin/octet\\;");
         assert_eq!(got[8], "/data\\;");
     }
@@ -575,7 +652,7 @@ mod tests {
         r.mode = Some("accept-edits".into());
         let got = args(&r, &allowed, 0).unwrap();
         assert_eq!(
-            got[14..],
+            got[17..],
             [
                 "--resume",
                 "abc-123",
@@ -638,7 +715,7 @@ mod tests {
             &request(&work),
             std::slice::from_ref(&work),
             0,
-            &name,
+            (&name, "Test phone"),
         )
         .unwrap();
         launch(args, &name).await.unwrap();
