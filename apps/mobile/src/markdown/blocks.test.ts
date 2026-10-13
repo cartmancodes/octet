@@ -45,13 +45,19 @@ describe("a streaming reply's blocks", () => {
     expect(last.more).toBe(16_000 - MAX_BLOCKS);
   });
 
-  it("keep the same drawn blocks while only the hidden tail grows", () => {
+  it("draw the newest MAX_BLOCKS of a long reply, each kept the same object as it streams", () => {
     let text = Array.from({ length: 1_000 }, (_, i) => `p${i}`).join("\n\n");
     const before = streamBlocks(text);
+    expect(before.blocks).toEqual(parse(text).slice(-MAX_BLOCKS));
+    expect(before.more).toBe(1_000 - MAX_BLOCKS);
     text += "\n\nanother";
     const after = streamBlocks(text);
-    expect(after.blocks).toBe(before.blocks);
+    expect(after.blocks).toEqual(parse(text).slice(-MAX_BLOCKS));
     expect(after.more).toBe(before.more + 1);
+    // The window moved on by one: the blocks still in it are the very objects drawn before, so
+    // only the new one and the grown one draw again.
+    expect(after.blocks.slice(0, MAX_BLOCKS - 2)).toEqual(before.blocks.slice(1, MAX_BLOCKS - 1));
+    after.blocks.slice(0, MAX_BLOCKS - 2).forEach((b, i) => expect(b).toBe(before.blocks[i + 1]));
   });
 
   it("start over when the reply's start was dropped", () => {
@@ -67,6 +73,7 @@ describe("a finished reply's blocks", () => {
     const shown = doneBlocks(text);
     expect(shown.total).toBe(parse(text).length);
     expect(shown.blocks).toHaveLength(MAX_BLOCKS);
+    expect(shown.blocks).toEqual(parse(text).slice(-MAX_BLOCKS)); // the newest
     expect(shown.more).toBe(shown.total - MAX_BLOCKS);
     const small = doneBlocks("a\n\nb");
     expect(small).toMatchObject({ total: 2, more: 0 });

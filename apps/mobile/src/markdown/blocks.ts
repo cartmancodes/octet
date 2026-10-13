@@ -1,5 +1,5 @@
-// The blocks a reply draws, bounded whatever the reply: at most `MAX_BLOCKS` of them, and a
-// count of the rest. A finished reply is parsed once per text, in a cache bounded by bytes. A
+// The blocks a reply draws, bounded whatever the reply: its newest `MAX_BLOCKS`, and a count of
+// the earlier ones (a streaming reply's newest text is what the user is watching). A finished reply is parsed once per text, in a cache bounded by bytes. A
 // streaming reply is parsed as it grows: the blocks before its last whole one are kept, and
 // only what came since is parsed again. Plain TypeScript; `Markdown.tsx` draws the result.
 import { utf8Length } from "../client/frames";
@@ -13,17 +13,42 @@ export const PARSE_CACHE_BYTES = 2 * 1024 * 1024;
 /** Streaming replies whose parsed start is kept: the ones on screen, a few at a time. */
 const STREAMS_KEPT = 4;
 
-/** What a reply draws: its first blocks, how many it has, and how many are not drawn. */
+/** What a reply draws: its last blocks, how many it has, and how many earlier ones are not drawn
+ * (so the first drawn block is block number `more` of the reply). */
 export interface Shown {
   blocks: Block[];
   total: number;
   more: number;
+  /** For a streaming reply, `blocks` in two: those from its start, the same array chunk after
+   * chunk while the start does not move, and those still being parsed. */
+  parts?: [Block[], Block[]];
 }
 
 const shown = (all: Block[]): Shown =>
   all.length > MAX_BLOCKS
-    ? { blocks: all.slice(0, MAX_BLOCKS), total: all.length, more: all.length - MAX_BLOCKS }
+    ? { blocks: all.slice(-MAX_BLOCKS), total: all.length, more: all.length - MAX_BLOCKS }
     : { blocks: all, total: all.length, more: 0 };
+
+/** `shown` of `head` then `tail`, without joining them: a chunk costs `MAX_BLOCKS` at most,
+ * however many blocks the start of the reply holds. `kept` is the head part drawn last time,
+ * reused while it is still the same blocks. */
+function shownOf(head: Block[], tail: Block[], kept: Kept | undefined): { out: Shown; kept: Kept } {
+  const total = head.length + tail.length;
+  const fromTail = Math.min(tail.length, MAX_BLOCKS);
+  const fromHead = Math.min(head.length, MAX_BLOCKS - fromTail);
+  const part =
+    kept && kept.head === head && kept.count === fromHead ? kept.part : head.slice(head.length - fromHead);
+  const rest = fromTail === tail.length ? tail : tail.slice(tail.length - fromTail);
+  const out: Shown = { blocks: part.concat(rest), total, more: total - fromHead - fromTail, parts: [part, rest] };
+  return { out, kept: { head, count: fromHead, part } };
+}
+
+/** The head part a streaming reply drew last: from which head blocks, how many, and the array. */
+interface Kept {
+  head: Block[];
+  count: number;
+  part: Block[];
+}
 
 // Finished replies
 
@@ -59,7 +84,7 @@ interface Stream {
   /** The text up to `head`: whole blocks, ending at the start of a line after a blank one. */
   headText: string;
   headBlocks: Block[];
-  shown: Shown;
+  kept: Kept;
 }
 const STREAMS: Stream[] = [];
 
@@ -115,15 +140,10 @@ export function streamBlocks(text: string): Shown {
     headBlocks = headBlocks.concat(parse(text.slice(head, cut)));
     head = cut;
   }
-  let out: Shown;
-  if (prev && prev.headBlocks.length >= MAX_BLOCKS) {
-    // The drawn blocks were all in the start, which only grew: they are the very same.
-    const total = headBlocks.length + parse(text.slice(head)).length;
-    out = { blocks: prev.shown.blocks, total, more: total - MAX_BLOCKS };
-  } else {
-    out = shown(headBlocks.concat(parse(text.slice(head))));
-  }
-  STREAMS.push({ headText: text.slice(0, head), headBlocks, shown: out });
+  // The start's blocks are the same objects chunk after chunk: drawn by their place in the
+  // reply, only the new and the growing one draw again.
+  const { out, kept } = shownOf(headBlocks, parse(text.slice(head)), prev?.kept);
+  STREAMS.push({ headText: text.slice(0, head), headBlocks, kept });
   if (STREAMS.length > STREAMS_KEPT) STREAMS.shift();
   return out;
 }

@@ -39,8 +39,8 @@ type Styles = ReturnType<typeof makeStyles>;
 const DARK = makeStyles(dark);
 const LIGHT = makeStyles(light);
 
-/** What a reply says in place of the blocks it does not draw. */
-export const restOfReply = (n: number): string => `Rest of the reply is on the Mac (${n} more blocks)`;
+/** What a reply says, at its top, in place of the earlier blocks it does not draw. */
+export const earlierBlocks = (n: number): string => `${n} earlier blocks of this reply are on the Mac`;
 
 /** The spans of a block as nested <Text>; a link's URL follows its text, muted. */
 function spans(list: readonly Span[], s: Styles): ReactNode[] {
@@ -97,15 +97,16 @@ const BlockView = memo(function BlockView({ block, s }: { block: Block; s: Style
   }
 });
 
-/** The drawn blocks: the same array draws nothing again, so a chunk that only grows a reply's
- * hidden tail redraws only the count. */
-const Blocks = memo(function Blocks({ blocks, s }: { blocks: Block[]; s: Styles }) {
-  return blocks.map((block, i) => <BlockView key={i} block={block} s={s} />);
+/** The drawn blocks, keyed by their place in the whole reply (`first` is the first one's): as
+ * the newest blocks move the window on, those still in it keep their key and their object, and
+ * do not draw again. */
+const Blocks = memo(function Blocks({ blocks, first, s }: { blocks: Block[]; first: number; s: Styles }) {
+  return blocks.map((block, i) => <BlockView key={first + i} block={block} s={s} />);
 });
 
 /**
- * A reply, drawn as the Markdown subset: at most `MAX_BLOCKS` blocks, then a line saying how
- * many more are on the Mac. A finished reply is parsed once per text; one `streaming` parses only
+ * A reply, drawn as the Markdown subset: its newest `MAX_BLOCKS` blocks, under a line saying how
+ * many earlier ones are on the Mac. A finished reply is parsed once per text; one `streaming` parses only
  * what came since its last whole block, so a chunk costs the same however long the reply is.
  */
 export const Markdown = memo(function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
@@ -114,8 +115,16 @@ export const Markdown = memo(function Markdown({ text, streaming = false }: { te
   const shown = useMemo(() => (streaming ? streamBlocks(text) : doneBlocks(text)), [text, streaming]);
   return (
     <View style={s.root}>
-      <Blocks blocks={shown.blocks} s={s} />
-      {shown.more > 0 ? <Text style={s.rest}>{restOfReply(shown.more)}</Text> : null}
+      {shown.more > 0 ? <Text style={s.rest}>{earlierBlocks(shown.more)}</Text> : null}
+      {shown.parts ? (
+        <>
+          {/* The start's part is the same array while the start does not move: it does not draw again. */}
+          <Blocks blocks={shown.parts[0]} first={shown.more} s={s} />
+          <Blocks blocks={shown.parts[1]} first={shown.more + shown.parts[0].length} s={s} />
+        </>
+      ) : (
+        <Blocks blocks={shown.blocks} first={shown.more} s={s} />
+      )}
     </View>
   );
 });

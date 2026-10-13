@@ -206,7 +206,7 @@ workspace. Tick each one on each phone.
   its last whole one and parses only what came since, so a chunk costs the same however long the
   reply is. A finished reply is parsed once per text, in a cache of at most 2 MB that unpairing
   clears.
-- A reply draws at most 400 blocks, then "Rest of the reply is on the Mac (N more blocks)".
+- A reply draws its newest 400 blocks, under "N earlier blocks of this reply are on the Mac".
 - A tool call costs a fixed 256 bytes toward the memory limits, even when its strings are empty.
   A tools entry holds 500 calls, then "N more calls on the Mac". An end finds its call by id.
 - The client delivers frames in one batch at most every 50 ms; the store applies a batch in one

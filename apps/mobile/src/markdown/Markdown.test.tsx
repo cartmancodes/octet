@@ -64,16 +64,21 @@ describe("markdown_is_inert (drawn)", () => {
     expect(screen.queryByText(/\*\*/)).toBeNull();
   });
 
-  it("draws at most 400 blocks of a reply, and says the rest is on the Mac", async () => {
+  it("draws the last 400 blocks of a reply, under a line saying the earlier ones are on the Mac", async () => {
     const text = Array.from({ length: 1_000 }, (_, i) => `para ${i}`).join("\n\n");
     for (const streaming of [false, true]) {
       await render(<Markdown text={text} streaming={streaming} />);
-      expect(screen.getByText("para 399")).toBeTruthy();
-      expect(screen.queryByText("para 400")).toBeNull();
-      expect(screen.getByText("Rest of the reply is on the Mac (600 more blocks)")).toBeTruthy();
+      expect(screen.getByText("para 999")).toBeTruthy();
+      expect(screen.getByText("para 600")).toBeTruthy();
+      expect(screen.queryByText("para 599")).toBeNull();
+      const line = screen.getByText("600 earlier blocks of this reply are on the Mac");
+      expect([dark.muted, light.muted]).toContain(style(line).color);
+      // At the top: before the first block drawn.
+      const texts = screen.container.queryAll((n) => n.type === "Text").map((n) => n.props.children as unknown);
+      expect(texts.indexOf("600 earlier blocks of this reply are on the Mac")).toBe(0);
     }
     await render(<Markdown text="short" />);
-    expect(screen.queryByText(/Rest of the reply/)).toBeNull();
+    expect(screen.queryByText(/earlier blocks/)).toBeNull();
   });
 
   it("draws a reply still streaming as Markdown too", async () => {
