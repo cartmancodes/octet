@@ -119,12 +119,8 @@ pub(crate) async fn watch(directory: &Path) -> Result<i32, CliError> {
 }
 
 /// Keeps the hub running as a per-user service, or with `print` only shows the unit.
-pub(crate) async fn install(
-    directory: PathBuf,
-    journal_dir: Option<PathBuf>,
-    print: bool,
-) -> Result<i32, CliError> {
-    blocking(move || crate::service::install_here(&directory, journal_dir.as_deref(), print)).await
+pub(crate) async fn install(directory: PathBuf, print: bool) -> Result<i32, CliError> {
+    blocking(move || crate::service::install_here(&directory, print)).await
 }
 
 /// Stops and removes that service.

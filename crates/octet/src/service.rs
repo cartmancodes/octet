@@ -64,13 +64,13 @@ pub(crate) struct ServicePlan {
     manager: Manager,
     home: PathBuf,
     program: PathBuf,
-    journal_dir: Option<PathBuf>,
+    data_dir: PathBuf,
     log: PathBuf,
     path: String,
 }
 
 impl ServicePlan {
-    /// A plan to run `program hub [--journal-dir DIR]`, logging to `<data_dir>/hub.log` where the
+    /// A plan to run `program hub --journal-dir DATA_DIR`, logging to `<data_dir>/hub.log` where the
     /// manager has a log file, with `tmux_dir` (where `tmux` was found) first on its `PATH`.
     ///
     /// # Errors
@@ -80,7 +80,6 @@ impl ServicePlan {
         manager: Manager,
         home: &Path,
         program: &Path,
-        journal_dir: Option<&Path>,
         data_dir: &Path,
         tmux_dir: Option<&Path>,
     ) -> Result<Self, CliError> {
@@ -98,7 +97,7 @@ impl ServicePlan {
             manager,
             home: home.to_owned(),
             program: program.to_owned(),
-            journal_dir: journal_dir.map(Path::to_owned),
+            data_dir: data_dir.to_owned(),
             log: data_dir.join("hub.log"),
             path: dirs.join(":"),
         };
@@ -122,10 +121,10 @@ impl ServicePlan {
             self.program.to_string_lossy().into_owned(),
             "hub".to_owned(),
         ];
-        if let Some(dir) = &self.journal_dir {
-            argv.push("--journal-dir".to_owned());
-            argv.push(dir.to_string_lossy().into_owned());
-        }
+        // Always the directory this install resolved: the service has another environment, so
+        // left to itself it could choose another directory than the one its log is in.
+        argv.push("--journal-dir".to_owned());
+        argv.push(self.data_dir.to_string_lossy().into_owned());
         argv
     }
 
@@ -193,7 +192,7 @@ impl ServicePlan {
             .map(|argument| systemd_quote(argument))
             .collect::<Vec<_>>()
             .join(" ");
-        let environment = systemd_quote(&format!("PATH={}", self.path));
+        let environment = systemd_assignment(&format!("PATH={}", self.path));
         format!(
             r"# {UNIT}: written by `octet hub install`; `octet hub uninstall` removes it.
 [Unit]
@@ -227,9 +226,19 @@ fn xml(text: &str) -> String {
     out
 }
 
-/// One systemd word: quoted if it holds anything systemd would split on or expand. Inside
-/// quotes `\` and `"` are escaped; `%` (a specifier) and `$` (a variable) are doubled.
+/// One systemd command-line word: quoted if it holds anything systemd would split on or expand.
+/// Inside quotes `\` and `"` are escaped; `%` (a specifier) and `$` (a variable) are doubled.
 fn systemd_quote(word: &str) -> String {
+    quote(word, true)
+}
+
+/// An `Environment=` assignment: as `systemd_quote`, except `$` stays, for systemd doesn't expand
+/// variables there.
+fn systemd_assignment(assignment: &str) -> String {
+    quote(assignment, false)
+}
+
+fn quote(word: &str, expands_dollar: bool) -> String {
     let plain = !word.is_empty()
         && word
             .chars()
@@ -243,7 +252,7 @@ fn systemd_quote(word: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '%' => out.push_str("%%"),
-            '$' => out.push_str("$$"),
+            '$' if expands_dollar => out.push_str("$$"),
             c => out.push(c),
         }
     }
@@ -268,6 +277,10 @@ pub(crate) struct Control {
     program: PathBuf,
     /// The user id for `launchctl gui/<uid>`; asked of `id -u` when first needed if `None`.
     uid: Option<String>,
+    /// What runs `id -u`.
+    id_program: PathBuf,
+    /// How long to wait between `launchctl bootstrap` tries.
+    retry_wait: Duration,
 }
 
 impl Control {
@@ -277,7 +290,17 @@ impl Control {
         Self {
             program,
             uid: Some(uid.into()),
+            id_program: PathBuf::from("id"),
+            retry_wait: Duration::ZERO,
         }
+    }
+
+    /// The same controller, finding its user id with `id_program` instead of `id`.
+    #[cfg(test)]
+    pub(crate) fn finding_the_uid_with(mut self, id_program: PathBuf) -> Self {
+        self.uid = None;
+        self.id_program = id_program;
+        self
     }
 
     /// The real tool for `manager`, or `$OCTET_SERVICE_CTL` when set.
@@ -293,14 +316,19 @@ impl Control {
                 },
                 PathBuf::from,
             );
-        Self { program, uid: None }
+        Self {
+            program,
+            uid: None,
+            id_program: PathBuf::from("id"),
+            retry_wait: BOOTSTRAP_WAIT,
+        }
     }
 
     fn user_id(&self) -> Result<String, CliError> {
         if let Some(uid) = &self.uid {
             return Ok(uid.clone());
         }
-        let output = Command::new("id")
+        let output = Command::new(&self.id_program)
             .arg("-u")
             .stdin(Stdio::null())
             .output()
@@ -427,44 +455,51 @@ pub(crate) fn install(
         return Err(foreign(plan));
     }
     let path = plan.unit_path();
+    // Everything that can fail before a file exists comes first, so a failure leaves nothing.
+    let domain = match plan.manager {
+        Manager::Launchd => Some(OsString::from(format!("gui/{}", control.user_id()?))),
+        Manager::Systemd => None,
+    };
     if let Some(parent) = plan.log.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| failed(format!("Couldn't create {}: {e}", parent.display())))?;
     }
     write_unit(&path, &plan.text())
         .map_err(|e| failed(format!("Couldn't write {}: {e}", path.display())))?;
-    match plan.manager {
-        Manager::Launchd => {
-            let domain = format!("gui/{}", control.user_id()?);
-            let (domain, plist) = (OsString::from(domain), path.clone().into_os_string());
-            // A copy that is already loaded has to go first; it may not be.
-            let _ = control.run(&args([OsStr::new("bootout"), &domain, &plist]));
-            let mut tries = 1;
-            while let Err(error) = control.run(&args([OsStr::new("bootstrap"), &domain, &plist])) {
-                if tries >= BOOTSTRAP_TRIES {
-                    return Err(error);
-                }
-                tries += 1;
-                std::thread::sleep(BOOTSTRAP_WAIT);
+    if let Some(domain) = domain {
+        let plist = path.clone().into_os_string();
+        // A copy that is already loaded has to go first; it may not be.
+        let _ = control.run(&args([OsStr::new("bootout"), &domain, &plist]));
+        let mut tries = 1;
+        while let Err(error) = control.run(&args([OsStr::new("bootstrap"), &domain, &plist])) {
+            if tries >= BOOTSTRAP_TRIES {
+                return Err(error);
             }
+            tries += 1;
+            std::thread::sleep(control.retry_wait);
         }
-        Manager::Systemd => {
-            control.run(&args([OsStr::new("--user"), OsStr::new("daemon-reload")]))?;
-            control.run(&args([
-                OsStr::new("--user"),
-                OsStr::new("enable"),
-                OsStr::new("--now"),
-                OsStr::new(UNIT),
-            ]))?;
-        }
+    } else {
+        control.run(&args([OsStr::new("--user"), OsStr::new("daemon-reload")]))?;
+        control.run(&args([
+            OsStr::new("--user"),
+            OsStr::new("enable"),
+            OsStr::new("--now"),
+            OsStr::new(UNIT),
+        ]))?;
+        // `enable --now` leaves a running unit alone; a changed program needs a restart.
+        control.run(&args([
+            OsStr::new("--user"),
+            OsStr::new("restart"),
+            OsStr::new(UNIT),
+        ]))?;
     }
-    let log = match plan.manager {
-        Manager::Launchd => plan.log.display().to_string(),
-        Manager::Systemd => format!("journalctl --user -u {UNIT}"),
+    let (log, restarts) = match plan.manager {
+        Manager::Launchd => (plan.log.display().to_string(), "stops"),
+        Manager::Systemd => (format!("journalctl --user -u {UNIT}"), "fails"),
     };
     writeln!(
         out,
-        "Installed {}\nThe hub starts at login and restarts if it stops.\nLog: {log}\nRemove it with: octet hub uninstall",
+        "Installed {}\nThe hub starts at login and restarts if it {restarts}.\nLog: {log}\nRemove it with: octet hub uninstall",
         path.display()
     )
     .map_err(say)
@@ -504,24 +539,25 @@ pub(crate) fn uninstall(
     }
     std::fs::remove_file(&path)
         .map_err(|e| failed(format!("Couldn't remove {}: {e}", path.display())))?;
+    writeln!(out, "Removed {}", path.display()).map_err(say)?;
     if plan.manager == Manager::Systemd {
-        control.run(&args([OsStr::new("--user"), OsStr::new("daemon-reload")]))?;
+        // The file is already gone, so a failure here is the user's to know about, not a failure.
+        if let Err(error) = control.run(&args([OsStr::new("--user"), OsStr::new("daemon-reload")]))
+        {
+            writeln!(out, "Warning: {error}").map_err(say)?;
+        }
     }
-    writeln!(out, "Removed {}", path.display()).map_err(say)
+    Ok(())
 }
 
-/// `octet hub install` for this user: the running `octet`, the hub's data directory for the log.
+/// `octet hub install` for this user: the running `octet`, serving from `data_dir`.
 ///
 /// # Errors
 ///
 /// No home directory, or what [`install`] reports.
-pub(crate) fn install_here(
-    data_dir: &Path,
-    journal_dir: Option<&Path>,
-    print: bool,
-) -> Result<(), CliError> {
+pub(crate) fn install_here(data_dir: &Path, print: bool) -> Result<(), CliError> {
     let manager = Manager::native();
-    let plan = here(manager, data_dir, journal_dir)?;
+    let plan = here(manager, data_dir)?;
     install(
         &plan,
         &Control::from_env(manager),
@@ -537,15 +573,11 @@ pub(crate) fn install_here(
 /// No home directory, or what [`uninstall`] reports.
 pub(crate) fn uninstall_here(data_dir: &Path) -> Result<(), CliError> {
     let manager = Manager::native();
-    let plan = here(manager, data_dir, None)?;
+    let plan = here(manager, data_dir)?;
     uninstall(&plan, &Control::from_env(manager), &mut std::io::stdout())
 }
 
-fn here(
-    manager: Manager,
-    data_dir: &Path,
-    journal_dir: Option<&Path>,
-) -> Result<ServicePlan, CliError> {
+fn here(manager: Manager, data_dir: &Path) -> Result<ServicePlan, CliError> {
     let home =
         octet_core::home_dir().ok_or_else(|| failed("Set HOME to find your home directory"))?;
     let program = std::env::current_exe()
@@ -556,17 +588,9 @@ fn here(
         std::path::absolute(path)
             .map_err(|e| failed(format!("Couldn't resolve {}: {e}", path.display())))
     };
-    let journal_dir = journal_dir.map(absolute).transpose()?;
     let data_dir = absolute(data_dir)?;
     let tmux = std::env::var_os("PATH").and_then(|search| find_tmux(&search));
-    ServicePlan::new(
-        manager,
-        &home,
-        &program,
-        journal_dir.as_deref(),
-        &data_dir,
-        tmux.as_deref(),
-    )
+    ServicePlan::new(manager, &home, &program, &data_dir, tmux.as_deref())
 }
 
 #[cfg(test)]
@@ -605,13 +629,13 @@ mod tests {
                 calls,
             }
         }
-        fn plan(&self, manager: Manager, journal_dir: Option<&Path>) -> ServicePlan {
+        /// A plan for `data_dir`, or the rig's own.
+        fn plan(&self, manager: Manager, data_dir: Option<&Path>) -> ServicePlan {
             ServicePlan::new(
                 manager,
                 &self.home,
                 Path::new("/opt/octet/bin/octet"),
-                journal_dir,
-                &self.data,
+                data_dir.unwrap_or(&self.data),
                 None,
             )
             .unwrap()
@@ -650,7 +674,6 @@ mod tests {
             Manager::Launchd,
             &rig.home,
             Path::new("/opt/octet/bin/octet"),
-            None,
             &rig.data,
             found.as_deref(),
         )
@@ -689,36 +712,45 @@ mod tests {
     #[test]
     fn the_launchd_plist_runs_the_hub_and_logs_to_hub_log() {
         let rig = Rig::new("");
-        let plan = rig.plan(Manager::Launchd, Some(Path::new("/srv/a & <b>")));
+        let data = Path::new("/srv/a & <b>");
+        let plan = rig.plan(Manager::Launchd, Some(data));
         assert_eq!(
             plan.unit_path(),
             rig.home.join("Library/LaunchAgents/dev.octet.hub.plist")
         );
         let text = plan.text();
-        let log = rig.data.join("hub.log");
+        let log = xml(&data.join("hub.log").to_string_lossy());
         for needle in [
             "<key>Label</key>\n  <string>dev.octet.hub</string>",
             "<key>ProgramArguments</key>",
             "<string>/opt/octet/bin/octet</string>\n    <string>hub</string>",
+            // The data directory the installing shell resolved, so the hub and its log agree.
             "<string>--journal-dir</string>\n    <string>/srv/a &amp; &lt;b&gt;</string>",
             "<key>RunAtLoad</key>\n  <true/>",
             "<key>KeepAlive</key>\n  <true/>",
-            &format!(
-                "<key>StandardOutPath</key>\n  <string>{}</string>",
-                log.display()
-            ),
-            &format!(
-                "<key>StandardErrorPath</key>\n  <string>{}</string>",
-                log.display()
-            ),
+            &format!("<key>StandardOutPath</key>\n  <string>{log}</string>"),
+            &format!("<key>StandardErrorPath</key>\n  <string>{log}</string>"),
             &format!("<string>{DEFAULTS}</string>"),
         ] {
             assert!(text.contains(needle), "missing {needle:?} in\n{text}");
         }
+    }
+
+    #[test]
+    fn the_data_directory_is_always_carried_into_the_service() {
+        let rig = Rig::new("");
+        let data = rig.data.display();
+        let launchd = rig.plan(Manager::Launchd, None).text();
         assert!(
-            !rig.plan(Manager::Launchd, None)
-                .text()
-                .contains("--journal-dir")
+            launchd.contains(&format!(
+                "<string>--journal-dir</string>\n    <string>{data}</string>"
+            )),
+            "{launchd}"
+        );
+        let systemd = rig.plan(Manager::Systemd, None).text();
+        assert!(
+            systemd.contains(&format!("octet hub --journal-dir {data}\n")),
+            "{systemd}"
         );
     }
 
@@ -732,7 +764,7 @@ mod tests {
         );
         let text = plain.text();
         for needle in [
-            "ExecStart=/opt/octet/bin/octet hub\n",
+            "ExecStart=/opt/octet/bin/octet hub --journal-dir ",
             "Restart=on-failure\n",
             &format!("Environment=PATH={DEFAULTS}\n"),
             "WantedBy=default.target\n",
@@ -751,14 +783,13 @@ mod tests {
             Manager::Systemd,
             &rig.home,
             Path::new("/Users/a b/octet"),
-            None,
-            &rig.data,
+            Path::new("/d"),
             Some(Path::new("/tmux dir")),
         )
         .unwrap();
         let text = odd.text();
         assert!(
-            text.contains("ExecStart=\"/Users/a b/octet\" hub\n"),
+            text.contains("ExecStart=\"/Users/a b/octet\" hub --journal-dir /d\n"),
             "{text}"
         );
         assert!(
@@ -774,7 +805,6 @@ mod tests {
             Manager::Systemd,
             &rig.home,
             Path::new("/opt/octet/bin/octet"),
-            None,
             &rig.data,
             Some(Path::new("/usr/local/bin")),
         )
@@ -794,7 +824,6 @@ mod tests {
             Manager::Launchd,
             &rig.home,
             Path::new("/opt/octet\n/octet"),
-            None,
             &rig.data,
             None,
         );
@@ -845,14 +874,15 @@ mod tests {
             rig.calls(),
             [
                 "--user daemon-reload",
-                "--user enable --now octet-hub.service"
+                "--user enable --now octet-hub.service",
+                "--user restart octet-hub.service"
             ]
         );
         let (result, _) = run_uninstall(&rig, &plan);
         result.unwrap();
         assert!(!unit.exists());
         assert_eq!(
-            rig.calls()[2..],
+            rig.calls()[3..],
             [
                 "--user disable --now octet-hub.service",
                 "--user daemon-reload"
@@ -920,10 +950,14 @@ mod tests {
         run_install(&rig, &rig.plan(Manager::Systemd, None), false)
             .0
             .unwrap();
-        let again = rig.plan(Manager::Systemd, Some(Path::new("/j")));
+        let elsewhere = rig.home.join("elsewhere");
+        let again = rig.plan(Manager::Systemd, Some(&elsewhere));
         run_install(&rig, &again, false).0.unwrap();
         let text = std::fs::read_to_string(again.unit_path()).unwrap();
-        assert!(text.contains("--journal-dir /j"), "{text}");
+        assert!(
+            text.contains(&format!("--journal-dir {}", elsewhere.display())),
+            "{text}"
+        );
     }
 
     #[test]
@@ -946,5 +980,118 @@ mod tests {
         let plan = rig.plan(Manager::Systemd, None);
         let result = install(&plan, &control, false, &mut Vec::new());
         assert!(matches!(&result, Err(CliError::Run(m)) if m.contains("nonexistent")));
+    }
+
+    /// A stand-in that fails the way `fail` (a shell `case` pattern on its first argument) says.
+    fn failing(rig: &Rig, fail: &str, code: i32) -> Control {
+        let script = write_script(
+            &rig.home.join("bin2"),
+            "ctl",
+            &format!(
+                "printf '%s\\n' \"$*\" >> '{calls}'\ncase \"$*\" in {fail}) echo 'refused' >&2; exit {code};; esac",
+                calls = rig.calls.display(),
+            ),
+        );
+        Control::new(script, "501")
+    }
+
+    #[test]
+    fn a_failing_bootout_is_ignored() {
+        let rig = Rig::new("");
+        let plan = rig.plan(Manager::Launchd, None);
+        let control = failing(&rig, "bootout*", 3);
+        install(&plan, &control, false, &mut Vec::new()).unwrap();
+        assert_eq!(rig.calls().len(), 2, "{:?}", rig.calls());
+        uninstall(&plan, &control, &mut Vec::new()).unwrap();
+        assert!(!plan.unit_path().exists());
+    }
+
+    #[test]
+    fn bootstrap_is_tried_again_and_can_succeed() {
+        let count = "n=$(cat \"$0.count\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$0.count\"\n\
+            if [ \"$1\" = bootstrap ] && [ \"$n\" -lt 3 ]; then echo 'Input/output error' >&2; exit 5; fi";
+        let rig = Rig::new(count);
+        let plan = rig.plan(Manager::Launchd, None);
+        run_install(&rig, &plan, false).0.unwrap();
+        let verbs: Vec<_> = rig
+            .calls()
+            .iter()
+            .map(|call| call.split(' ').next().unwrap().to_owned())
+            .collect();
+        assert_eq!(verbs, ["bootout", "bootstrap", "bootstrap"]);
+    }
+
+    #[test]
+    fn bootstrap_gives_up_after_three_tries() {
+        let rig = Rig::new("[ \"$1\" = bootstrap ] && { echo 'Input/output error' >&2; exit 5; }");
+        let plan = rig.plan(Manager::Launchd, None);
+        let (result, _) = run_install(&rig, &plan, false);
+        let Err(CliError::Run(message)) = result else {
+            panic!("expected a failure");
+        };
+        assert!(message.contains("Input/output error"), "{message}");
+        assert_eq!(rig.calls().len(), 4, "a bootout and three bootstraps");
+    }
+
+    #[test]
+    fn no_uid_means_nothing_is_written() {
+        let rig = Rig::new("");
+        let control = Control::new(rig.home.join("ctl"), "501")
+            .finding_the_uid_with(rig.home.join("no-such-id"));
+        let plan = rig.plan(Manager::Launchd, None);
+        let result = install(&plan, &control, false, &mut Vec::new());
+        assert!(
+            matches!(&result, Err(CliError::Run(m)) if m.contains("id -u")),
+            "{result:?}"
+        );
+        assert!(!rig.home.join("Library").exists());
+        assert!(!rig.data.exists());
+        assert!(rig.calls().is_empty());
+    }
+
+    #[test]
+    fn a_failing_daemon_reload_after_removal_is_a_warning() {
+        let rig = Rig::new("");
+        let plan = rig.plan(Manager::Systemd, None);
+        run_install(&rig, &plan, false).0.unwrap();
+        let control = failing(&rig, "--user daemon-reload", 1);
+        let mut out = Vec::new();
+        uninstall(&plan, &control, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!plan.unit_path().exists());
+        assert!(out.contains("Removed"), "{out}");
+        assert!(
+            out.contains("Warning") && out.contains("daemon-reload"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_install_message_says_what_restarts_it() {
+        let rig = Rig::new("");
+        let (_, launchd) = run_install(&rig, &rig.plan(Manager::Launchd, None), false);
+        assert!(launchd.contains("restarts if it stops"), "{launchd}");
+        let (_, systemd) = run_install(&rig, &rig.plan(Manager::Systemd, None), false);
+        assert!(systemd.contains("restarts if it fails"), "{systemd}");
+    }
+
+    #[test]
+    fn environment_is_quoted_without_doubling_dollars() {
+        let rig = Rig::new("");
+        let plan = ServicePlan::new(
+            Manager::Systemd,
+            &rig.home,
+            Path::new("/opt/octet/bin/octet"),
+            &rig.data,
+            Some(Path::new("/t$x/50%/a\"b")),
+        )
+        .unwrap();
+        let text = plan.text();
+        assert!(
+            text.contains(&format!(
+                "Environment=\"PATH=/t$x/50%%/a\\\"b:{DEFAULTS}\"\n"
+            )),
+            "{text}"
+        );
     }
 }

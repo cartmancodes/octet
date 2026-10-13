@@ -140,14 +140,13 @@ async fn run() -> Result<i32, CliError> {
             return Ok(0);
         }
         Parsed::Hub(args) => {
-            let journal_dir = args.journal_dir.clone();
             let directory = data_dir(args.journal_dir)?;
             return match args.action {
                 HubAction::Serve => hub::serve(directory, args.port, args.owner).await,
                 HubAction::Devices => hub::devices(&directory).await,
                 HubAction::Revoke(name) => hub::revoke(&directory, &name).await,
                 HubAction::Watch => hub::watch(&directory).await,
-                HubAction::Install { print } => hub::install(directory, journal_dir, print).await,
+                HubAction::Install { print } => hub::install(directory, print).await,
                 HubAction::Uninstall => hub::uninstall(directory).await,
             };
         }

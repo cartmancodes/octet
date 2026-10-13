@@ -393,7 +393,9 @@ octet hub install
 On macOS that writes a launchd agent, `~/Library/LaunchAgents/dev.octet.hub.plist`.
 On Linux it writes a systemd user unit, `~/.config/systemd/user/octet-hub.service`,
 and enables it. Either way the service runs the `octet` you ran this from, as
-`octet hub` (with your `--journal-dir`, if you gave one), and its `PATH` includes
+`octet hub --journal-dir DIR`, where DIR is the data directory this command resolved
+(from `--journal-dir`, `$XDG_DATA_HOME`, or `~/.local/share`), so the service and its log
+agree even though it doesn't see your shell's environment. Its `PATH` includes
 the directory where `tmux` was found, so the hub can start sessions from a
 launchd agent's bare environment. The service doesn't use `--port` or
 `--owner`; set the port in `hub.json`.
@@ -404,7 +406,8 @@ launchd agent's bare environment. The service doesn't use `--port` or
 - **See the file first.** `octet hub install --print` writes the file to the
   terminal and changes nothing.
 - **Move or upgrade `octet`.** The service holds the program's path, so run
-  `octet hub install` again after moving or reinstalling it. A file already at
+  `octet hub install` again after moving or reinstalling it; on Linux that also
+  restarts the running service. A file already at
   that path that isn't Octet's is never replaced.
 - **Remove it.** `octet hub uninstall` stops the service and deletes the file.
   It says "Not installed" if there is nothing to remove.
