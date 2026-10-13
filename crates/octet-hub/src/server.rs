@@ -8,7 +8,7 @@
 //! device token) and `pair` (a pairing secret); anything else, or a failed `hello` or `pair`,
 //! is refused and the socket closed, as is one silent for 30 seconds; at most 8 may wait at
 //! once. After `hello` it is authenticated as that device: every frame, text or not, first
-//! checks that the device is still paired (a revoked one is dropped at once) and takes a token
+//! checks that the device is still paired (a revoked one is told `revoked`, then closed) and takes a token
 //! from the device's bucket (60 a minute; an empty bucket refuses, it does not close). Every
 //! connection is pinged every 20 seconds, and one that misses two pongs is let go.
 //! Bridge commands go to the session under a hub-wide req and the reply comes back under the
@@ -111,6 +111,8 @@ const HANDSHAKE_WITHIN: Duration = Duration::from_secs(10);
 const PUBLISH_EVERY: Duration = Duration::from_secs(10);
 /// How long the closing handshake may take.
 const CLOSE_WITHIN: Duration = Duration::from_secs(2);
+/// How long a revoked phone has to take its refusal before its connection is cut.
+const REVOKED_GRACE: Duration = Duration::from_secs(1);
 /// Connections open at once; more are turned away at accept.
 const MAX_CONNECTIONS: usize = 64;
 /// Connections that have not said hello yet; more are turned away at accept.
@@ -129,6 +131,8 @@ const CONTROL_LIMIT: u64 = 4096;
 const CONTROL_WITHIN: Duration = Duration::from_secs(5);
 /// The refusal for a device past its bucket.
 const RATE_REFUSED: &str = "Too many commands; wait a minute";
+/// The refusal sent to a phone whose device was unpaired, just before it is closed.
+const REVOKED_REFUSED: &str = "This phone was unpaired on the Mac";
 /// The refusal for a frame that is not text.
 const NOT_TEXT: &str = "Send each message as a text frame";
 /// The refusal for a command whose session ended before it answered.
@@ -751,8 +755,7 @@ impl Hub {
     async fn authenticated(&mut self, conn: u64, device: &Device, text: Option<&str>) {
         self.store.reload_if_changed().await;
         if !self.paired(device) {
-            // Revoked: nothing more is written to it.
-            self.drop_conn(conn);
+            self.revoke(conn);
             return;
         }
         let req = text.map_or(0, req_of);
@@ -1215,7 +1218,7 @@ impl Hub {
             .map(|(&conn, _)| conn)
             .collect();
         for conn in revoked {
-            self.drop_conn(conn);
+            self.revoke(conn);
         }
     }
 
@@ -1291,6 +1294,29 @@ impl Hub {
         if state.out.try_send(Out::Close).is_err() {
             state.task.abort();
         }
+    }
+
+    /// Tells `conn` its device was unpaired, then ends it once that is sent, or after
+    /// [`REVOKED_GRACE`] if the phone does not take it.
+    fn revoke(&mut self, conn: u64) {
+        let Some(state) = self.forget(conn) else {
+            return;
+        };
+        let told = state
+            .out
+            .try_send(Out::Text(
+                refused(0, Code::Revoked, REVOKED_REFUSED).to_string(),
+            ))
+            .is_ok();
+        if !told || state.out.try_send(Out::Close).is_err() {
+            state.task.abort();
+            return;
+        }
+        let task = state.task;
+        tokio::spawn(async move {
+            tokio::time::sleep(REVOKED_GRACE).await;
+            task.abort();
+        });
     }
 
     /// Ends `conn` now.

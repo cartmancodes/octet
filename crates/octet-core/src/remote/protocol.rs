@@ -192,7 +192,7 @@ pub static CHOICES: &[Choices] = &[
 ];
 
 /// Every kind of journal record (the session's `record()`, and the journal's `session` header),
-/// with its data. The TypeScript adds a catch-all for kinds a later version adds.
+/// with its data. The TypeScript adds `UnknownJournalEvent` for kinds a later version adds.
 pub static EVENTS: &[EventKind] = &[
     EventKind {
         kind: "text",
@@ -1308,19 +1308,42 @@ fn ts_fields(out: &mut String, fields: &[Field]) {
     }
 }
 
-/// The `JournalEvent` union: one member per record kind, then any other kind.
+/// The journal event types: [`KnownJournalEvent`] (one member per record kind), the shape of any
+/// other kind, their union, the list of known kinds and the guard that narrows to the known ones.
+///
+/// The catch-all is a type of its own: inside one union it would absorb every discriminant, and
+/// `e.type === "text"` would not narrow `e.data`.
 fn ts_events(out: &mut String) {
-    out.push_str("\n/** A journal record's kind and data; the frame carries its `seq`. */\n");
-    out.push_str("export type JournalEvent =\n");
-    for event in EVENTS {
-        let _ = writeln!(
-            out,
-            "  | {{ type: \"{}\"; data: {} }}",
-            event.kind,
-            ts_type(event.data)
-        );
-    }
-    out.push_str("  | { type: string; data: unknown };\n");
+    out.push_str(
+        "\n/** A journal record of a kind this version knows; the frame carries its `seq`. */\n",
+    );
+    out.push_str("export type KnownJournalEvent =\n");
+    let members: Vec<String> = EVENTS
+        .iter()
+        .map(|event| {
+            format!(
+                "  | {{ type: \"{}\"; data: {} }}",
+                event.kind,
+                ts_type(event.data)
+            )
+        })
+        .collect();
+    out.push_str(&members.join("\n"));
+    out.push_str(";\n");
+    out.push_str("\n/** A journal record of a kind a later version added. */\n");
+    out.push_str("export interface UnknownJournalEvent {\n  type: string;\n  data: unknown;\n}\n");
+    out.push_str("\n/** Any journal record; narrow it with `isKnownEvent`. */\n");
+    out.push_str("export type JournalEvent = KnownJournalEvent | UnknownJournalEvent;\n");
+    let kinds: Vec<String> = EVENTS.iter().map(|e| format!("\"{}\"", e.kind)).collect();
+    out.push_str("\n/** Every record kind `KnownJournalEvent` types. */\n");
+    let _ = writeln!(
+        out,
+        "export const KNOWN_JOURNAL_KINDS: readonly string[] = [{}];",
+        kinds.join(", ")
+    );
+    out.push_str("\n/** Whether `e` is a record of a kind this version knows. */\n");
+    out.push_str("export function isKnownEvent(e: JournalEvent): e is KnownJournalEvent {\n");
+    out.push_str("  return KNOWN_JOURNAL_KINDS.includes(e.type);\n}\n");
 }
 
 /// The checked-in TypeScript for the app, generated from [`MESSAGES`] and [`OBJECTS`].
@@ -1734,7 +1757,7 @@ mod tests {
             "export type Mode = \"ask\" | \"accept-edits\" | \"auto\" | \"full-access\";",
             "export type Phase = \"connecting\" | \"idle\" | \"running\" | \"stopped\";",
             "export type ToolPhase = \"running\" | \"done\" | \"failed\";",
-            "export type JournalEvent =",
+            "export type KnownJournalEvent =",
             "  | { type: \"text\"; data: string }",
             "  | { type: \"tool\"; data: ToolData }",
             "  | { type: \"approval\"; data: ApprovalData }",
@@ -1743,7 +1766,9 @@ mod tests {
             "  | { type: \"hook\"; data: HookData }",
             "  | { type: \"session\"; data: Record<string, unknown> }",
             "  | { type: \"models\"; data: unknown[] }",
-            "  | { type: string; data: unknown };",
+            "export interface UnknownJournalEvent {",
+            "export type JournalEvent = KnownJournalEvent | UnknownJournalEvent;",
+            "export function isKnownEvent(e: JournalEvent): e is KnownJournalEvent {",
             "export interface ApprovalSummary {",
             "  summary: ApprovalSummary;",
             "  phase: ToolPhase;",
@@ -1908,6 +1933,78 @@ mod tests {
             panic!("a pair")
         };
         assert_eq!(kept.expose(), secret);
+    }
+
+    #[test]
+    fn the_known_journal_kinds_are_listed_for_the_guard() {
+        let ts = typescript();
+        let list = ts
+            .split("export const KNOWN_JOURNAL_KINDS: readonly string[] = [")
+            .nth(1)
+            .expect("the kinds array")
+            .split("];")
+            .next()
+            .unwrap();
+        let listed: Vec<&str> = list
+            .split(',')
+            .map(|k| k.trim().trim_matches('"'))
+            .filter(|k| !k.is_empty())
+            .collect();
+        let kinds: Vec<&str> = EVENTS.iter().map(|e| e.kind).collect();
+        assert_eq!(listed, kinds);
+        assert!(ts.contains("return KNOWN_JOURNAL_KINDS.includes(e.type);"));
+        // The catch-all is its own type, so it cannot absorb the known discriminants.
+        assert!(!ts.contains("  | { type: string; data: unknown }"));
+        let unknown = ts
+            .split("export interface UnknownJournalEvent {")
+            .nth(1)
+            .unwrap();
+        let unknown = unknown.split('}').next().unwrap();
+        assert!(unknown.contains("type: string;") && unknown.contains("data: unknown;"));
+    }
+
+    /// Whether `isKnownEvent` narrows `e.data` by the discriminant under `tsc --strict`.
+    #[test]
+    fn a_known_journal_event_narrows_in_typescript() {
+        let npx = std::process::Command::new("npx").arg("--version").output();
+        if !npx.is_ok_and(|out| out.status.success()) {
+            eprintln!("skipped: `npx` is not available, so tsc 5.6.3 cannot run");
+            return;
+        }
+        let dir = octet_testkit::TempDir::new("octet-protocol-ts");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("protocol.ts"), typescript()).unwrap();
+        let check = concat!(
+            "import { isKnownEvent, type JournalEvent } from \"./protocol\";\n",
+            "export function text(e: JournalEvent): string {\n",
+            "  if (isKnownEvent(e) && e.type === \"text\") {\n",
+            "    const s: string = e.data;\n",
+            "    return s;\n",
+            "  }\n",
+            "  return \"\";\n",
+            "}\n",
+        );
+        std::fs::write(dir.path().join("check.ts"), check).unwrap();
+        let out = std::process::Command::new("npx")
+            .args([
+                "--yes",
+                "-p",
+                "typescript@5.6.3",
+                "tsc",
+                "--noEmit",
+                "--strict",
+            ])
+            .args(["--target", "es2022", "--module", "es2022"])
+            .args(["--moduleResolution", "bundler", "check.ts"])
+            .current_dir(dir.path())
+            .output()
+            .expect("npx runs");
+        assert!(
+            out.status.success(),
+            "tsc rejected the narrowing check:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

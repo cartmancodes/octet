@@ -563,6 +563,39 @@ async fn unauthenticated_and_flooding_clients_are_refused() {
     assert!(bridge_quiet(&mut read).await, "nothing reaches the bridge");
 }
 
+/// The refusal a revoked connection gets as its next text frame, and whether it then closes.
+async fn revoked_then_closed(phone: &mut Phone) -> bool {
+    let frame = recv(phone).await;
+    assert_eq!(frame["v"], 1, "{frame}");
+    assert_eq!(frame["type"], "refused", "{frame}");
+    assert_eq!(frame["req"], 0, "{frame}");
+    assert_eq!(frame["code"], "revoked", "{frame}");
+    assert_eq!(
+        frame["reason"], "This phone was unpaired on the Mac",
+        "{frame}"
+    );
+    closes(phone).await
+}
+
+#[tokio::test]
+async fn a_revoked_phone_is_told_so_before_it_is_closed() {
+    let mut env = Env::new();
+    env.start().await;
+    let token = env.pair("Lost phone").await;
+    // One phone is found by the hub's reload; the other by its next frame.
+    let (mut idle, _) = hello(env.port, &token).await;
+    let (mut chatty, _) = hello(env.port, &token).await;
+    let mut cli = Store::open(&env.root).await.expect("the store");
+    assert!(cli.revoke("Lost phone").await);
+    send(
+        &mut chatty,
+        json!({"v": 1, "req": 9, "type": "subscribe", "session": "nobody"}),
+    )
+    .await;
+    assert!(revoked_then_closed(&mut chatty).await);
+    assert!(revoked_then_closed(&mut idle).await);
+}
+
 #[tokio::test]
 async fn subscribe_replays_then_streams() {
     let mut env = Env::new();

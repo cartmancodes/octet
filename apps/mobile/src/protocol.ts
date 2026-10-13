@@ -19,8 +19,8 @@ export type ToolPhase = "running" | "done" | "failed";
 /** Why a command was refused, for a client to act on; `reason` is the words to show. */
 export type RefusalCode = "unpaired" | "revoked" | "rate_limited" | "not_allowed" | "turn_open" | "not_connected" | "invalid" | "unavailable" | "busy" | "too_large" | "timeout";
 
-/** A journal record's kind and data; the frame carries its `seq`. */
-export type JournalEvent =
+/** A journal record of a kind this version knows; the frame carries its `seq`. */
+export type KnownJournalEvent =
   | { type: "text"; data: string }
   | { type: "user"; data: string }
   | { type: "finished"; data: string }
@@ -38,8 +38,24 @@ export type JournalEvent =
   | { type: "ready"; data: string }
   | { type: "session"; data: Record<string, unknown> }
   | { type: "models"; data: unknown[] }
-  | { type: "skills"; data: unknown[] }
-  | { type: string; data: unknown };
+  | { type: "skills"; data: unknown[] };
+
+/** A journal record of a kind a later version added. */
+export interface UnknownJournalEvent {
+  type: string;
+  data: unknown;
+}
+
+/** Any journal record; narrow it with `isKnownEvent`. */
+export type JournalEvent = KnownJournalEvent | UnknownJournalEvent;
+
+/** Every record kind `KnownJournalEvent` types. */
+export const KNOWN_JOURNAL_KINDS: readonly string[] = ["text", "user", "finished", "mode", "model_selected", "usage", "notice", "error", "tool", "approval", "approval_closed", "started", "stopped", "hook", "ready", "session", "models", "skills"];
+
+/** Whether `e` is a record of a kind this version knows. */
+export function isKnownEvent(e: JournalEvent): e is KnownJournalEvent {
+  return KNOWN_JOURNAL_KINDS.includes(e.type);
+}
 
 /** A place in a session's history: a journal file name and the record's sequence number. */
 export interface Cursor {
