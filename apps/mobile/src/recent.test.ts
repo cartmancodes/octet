@@ -80,5 +80,6 @@ describe("tmuxOfAck", () => {
     expect(tmuxOfAck({})).toBeNull();
     expect(tmuxOfAck(null)).toBeNull();
     expect(tmuxOfAck({ message: 5 })).toBeNull();
+    expect(tmuxOfAck({ message: "Starting other-name in /w" })).toBeNull(); // not one of the hub's names
   });
 });

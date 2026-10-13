@@ -50,7 +50,7 @@ export function modelsFor(catalogs: readonly CatalogInfo[], engine: Engine): Mod
   return models;
 }
 
-const STARTING = /^Starting (\S+) in /;
+const STARTING = /^Starting (octet-[\w-]+) in /;
 
 /** The tmux session's name from a start ack ("Starting octet-a1b2c3 in /path"), else null. */
 export function tmuxOfAck(ack: unknown): string | null {

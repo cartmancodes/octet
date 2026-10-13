@@ -15,6 +15,7 @@ export const TOKEN_KEY = "octet.token";
 
 export const NOT_A_LINK = "That isn't an Octet pairing link";
 export const UNPAIRED_NOTICE = "This phone was unpaired on the Mac";
+export const UNPAIR_FAILED_NOTICE = "This phone couldn't delete its pairing. Pair again to replace it.";
 /** The Mac took the pairing (its secret is spent and the name is registered) but the phone could
  * not keep the token: only revoking on the Mac frees the name. */
 const unsaved = (name: string): string =>
@@ -146,6 +147,7 @@ export class HubController {
    * in settings, and the connection is up. Failures come back as the words to show. */
   async pair(link: string, name: string): Promise<PairResult> {
     if (this.pairing) return { ok: false, message: "Already pairing", clear: false };
+    if (this.unpairing) return { ok: false, message: "Finishing unpairing. Try again in a moment.", clear: false };
     const parsed = parsePairLink(link);
     if (!parsed) return { ok: false, message: NOT_A_LINK, clear: false };
     const deviceName = name.trim() === "" ? this.defaultName() : name.trim();
@@ -185,11 +187,12 @@ export class HubController {
     return saveSettings({ hubUrl: url, deviceName });
   }
 
-  /** The user unpairs this phone: the connection and what the Mac sent are dropped, then the
-   * hub address and the token are deleted, and Pair shows with no notice. The device name stays
-   * to prefill the next pairing. The Mac keeps listing the phone until `octet hub revoke` there.
-   * A keychain that will not clear still ends at Pair: with no hub address the next start drops
-   * the token. */
+  /** The user unpairs this phone: the connection and what the Mac sent are dropped and Pair shows
+   * at once, with no notice; then the hub address and the token are deleted (the keychain twice).
+   * If either will not go, Pair shows `UNPAIR_FAILED_NOTICE`; the next start drops the token
+   * anyway, because with no hub address it can reach nowhere. The device name stays to prefill
+   * the next pairing. The Mac keeps listing the phone until `octet hub revoke` there. Pairing
+   * waits for the writes, so they cannot delete a new token. */
   async unpair(): Promise<void> {
     const client = this.current.client;
     if (this.unpairing || client === null) return;
@@ -197,9 +200,12 @@ export class HubController {
     try {
       this.release();
       client.stop();
-      await saveSettings({ hubUrl: null });
-      await this.tokens.clear().catch(() => undefined);
+      // Before any await: a foreground event now finds no client to start.
       this.set({ status: "unpaired", notice: null, client: null });
+      const address = await saveSettings({ hubUrl: null });
+      let token = await this.tokens.clear().then(() => true, () => false);
+      if (!token) token = await this.tokens.clear().then(() => true, () => false);
+      if (!address || !token) this.set({ notice: UNPAIR_FAILED_NOTICE });
     } finally {
       this.unpairing = false;
     }

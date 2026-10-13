@@ -180,6 +180,14 @@ describe("Settings", () => {
     });
   });
 
+  it("gives the Face ID switch a 44-point hit area", async () => {
+    await open();
+    const slop = toggle().props.hitSlop as { top: number; bottom: number; left: number; right: number };
+    // The native switch is 51 by 31 points.
+    expect(31 + slop.top + slop.bottom).toBeGreaterThanOrEqual(44);
+    expect(51 + slop.left + slop.right).toBeGreaterThanOrEqual(44);
+  });
+
   it("sizes its controls for a thumb", async () => {
     await open();
     const style = (el: { props: { style?: unknown } }) => (Array.isArray(el.props.style) ? el.props.style : [el.props.style]).flat();

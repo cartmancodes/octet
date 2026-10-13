@@ -1,18 +1,15 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
-import { memo, useCallback, useMemo, useRef, useState } from "react";
-import { KeyboardAvoidingView, Modal, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { memo, useCallback, useMemo, useState } from "react";
+import { KeyboardAvoidingView, Modal, Pressable, StyleSheet, Text, View } from "react-native";
 
-import { confirmBiometric } from "../auth";
 import type { RequestBody } from "../client/HubClient";
 import type { CatalogInfo, Engine, Mode, ModelInfo } from "../protocol";
 import { clipLabel, engineName } from "../sessions";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
-import { useAction, useAlive, type Send } from "./send";
+import { FullAccessConfirm } from "./FullAccessConfirm";
+import { FULL_ACCESS_WARNING, FULL_ACCESS_WORDS, useFullAccessArm } from "./fullAccess";
+import { useAction, type Send } from "./send";
 
-/** What the user types, exactly, to turn full access on. */
-export const FULL_ACCESS_WORDS = "full access";
-export const NO_FACE_ID = "Full access needs Face ID set up on this phone.";
-export const FULL_ACCESS_WARNING = "The agent can run any command without asking.";
 const BIOMETRIC_REASON = "Turn on full access for this session";
 
 export const MODE_NAMES: Record<Mode, string> = {
@@ -144,27 +141,7 @@ function makeStyles(theme: Theme) {
       gap: spacing.sm,
     },
     askText: { ...type.caption, color: theme.fg },
-    confirm: {
-      marginHorizontal: spacing.lg,
-      marginBottom: spacing.sm,
-      padding: spacing.md,
-      gap: spacing.sm,
-      borderRadius: radius.md,
-      borderColor: theme.amber,
-      borderWidth: 1,
-    },
     buttons: { flexDirection: "row", gap: spacing.md },
-    input: {
-      ...type.body,
-      minHeight: 44,
-      paddingHorizontal: spacing.md,
-      paddingVertical: spacing.sm,
-      color: theme.fg,
-      backgroundColor: theme.bg,
-      borderColor: theme.edge,
-      borderWidth: 1,
-      borderRadius: radius.md,
-    },
   });
 }
 const DARK = makeStyles(dark);
@@ -240,66 +217,6 @@ const Row = memo(function Row({ item, current, asking, pending, busy, onChoose, 
   );
 });
 
-interface FullAccessConfirmProps {
-  busy: boolean;
-  /** Called only once the words are exact. */
-  onTurnOn: () => void;
-  onCancel: () => void;
-}
-
-/**
- * The words that turn full access on, after Face ID. Its text lives here, so closing the panel
- * (or the sheet) forgets what was typed.
- */
-export const FullAccessConfirm = memo(function FullAccessConfirm({ busy, onTurnOn, onCancel }: FullAccessConfirmProps) {
-  const theme = useTheme();
-  const s = theme === light ? LIGHT : DARK;
-  const [words, setWords] = useState("");
-  const exact = words === FULL_ACCESS_WORDS;
-  const turnOn = useCallback(() => {
-    if (exact) onTurnOn();
-  }, [exact, onTurnOn]);
-  const off = busy || !exact;
-  return (
-    <View style={s.confirm}>
-      <Text style={s.warning}>{FULL_ACCESS_WARNING}</Text>
-      <Text style={s.askText}>{`Type ${FULL_ACCESS_WORDS} to turn it on.`}</Text>
-      <TextInput
-        accessibilityLabel="Type full access to confirm"
-        autoFocus
-        autoCapitalize="none"
-        autoCorrect={false}
-        spellCheck={false}
-        placeholder={FULL_ACCESS_WORDS}
-        placeholderTextColor={theme.muted}
-        value={words}
-        onChangeText={setWords}
-        style={s.input}
-      />
-      <View style={s.buttons}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Cancel full access"
-          onPress={onCancel}
-          style={s.button}
-        >
-          <Text style={s.label}>Cancel</Text>
-        </Pressable>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Turn on full access"
-          accessibilityState={{ disabled: off, busy }}
-          disabled={off}
-          onPress={turnOn}
-          style={[s.button, s.primary, off && s.off]}
-        >
-          <Text style={s.primaryLabel}>Turn on full access</Text>
-        </Pressable>
-      </View>
-    </View>
-  );
-});
-
 interface ModeModelSheetProps {
   session: string;
   /** The session's modes and models; null until the Mac has sent them. */
@@ -318,58 +235,45 @@ interface ModeModelSheetProps {
 export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, send }: ModeModelSheetProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
-  const alive = useAlive();
   const { busy, failed, run, fail } = useAction(send);
   const [visible, setVisible] = useState(false);
-  // Moves on at each open and close: a Face ID result that comes after the sheet it was asked
-  // for went away belongs to nobody.
-  const generation = useRef(0);
-  const checking = useRef(false);
   const [asking, setAsking] = useState<string | null>(null);
-  const [typing, setTyping] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
 
   const items = useMemo(() => (catalog ? itemsOf(catalog) : []), [catalog]);
   const currentMode = catalog?.current_mode;
   const currentModel = catalog?.current;
 
-  // A refusal disarms the full-access panel: the next try asks for Face ID again.
-  const [seenFailure, setSeenFailure] = useState(failed);
-  if (seenFailure !== failed) {
-    setSeenFailure(failed);
-    if (failed && typing) setTyping(false);
-  }
-
-  // The desk changed the mode: whatever Face ID armed the panel for is out of date, so it is
-  // disarmed and the next Turn on starts again from Face ID.
-  const [seenMode, setSeenMode] = useState(currentMode);
-  if (seenMode !== currentMode) {
-    setSeenMode(currentMode);
-    if (typing) setTyping(false);
-  }
+  // Face ID approves full access for this session at this mode: when the desk changes the mode,
+  // a refusal comes, the sheet closes or the words are sent, the approval is gone and the next
+  // Turn on starts again from Face ID.
+  const full = useFullAccessArm({
+    reason: BIOMETRIC_REASON,
+    key: `${session}|${currentMode ?? ""}`,
+    failed,
+    fail,
+  });
+  const { armed, arm, disarm, checking } = full;
 
   const reset = useCallback(() => {
     setAsking(null);
-    setTyping(false);
+    disarm();
     setPending(null);
-  }, []);
+  }, [disarm]);
   const openSheet = useCallback(() => {
-    generation.current += 1;
+    disarm();
     fail(null);
     setVisible(true);
-  }, [fail]);
+  }, [disarm, fail]);
   // While a change is out the sheet stays: its refusal (or its ack) has to land somewhere.
   const close = useCallback(() => {
     if (busy) return;
-    generation.current += 1;
-    checking.current = false;
     setVisible(false);
     reset();
     fail(null);
   }, [busy, reset, fail]);
   // The Mac took the change: the sheet's work is done.
   const done = useCallback(() => {
-    generation.current += 1;
     setVisible(false);
     reset();
   }, [reset]);
@@ -383,34 +287,16 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
     [run, done],
   );
 
-  const startFullAccess = useCallback(async () => {
-    const mine = generation.current;
-    checking.current = true;
-    try {
-      // Always, whatever the Face ID setting says.
-      const checked = await confirmBiometric(BIOMETRIC_REASON);
-      if (!alive() || generation.current !== mine) return;
-      if (checked === "ok") {
-        setAsking(null);
-        setTyping(true);
-      } else if (checked === "unavailable") {
-        fail({ text: NO_FACE_ID, retry: false });
-      }
-    } finally {
-      if (generation.current === mine) checking.current = false;
-    }
-  }, [alive, fail]);
-
   const onChoose = useCallback(
     (item: Item) => {
-      if (busy || checking.current || item.kind === "head") return;
+      if (busy || checking() || item.kind === "head") return;
       fail(null);
       if (item.kind === "mode") {
         if (item.mode === currentMode) return;
-        setTyping(false);
+        disarm();
         if (item.mode === "full-access") {
           setAsking(null);
-          void startFullAccess();
+          void arm();
           return;
         }
         sendChoice(item.key, { type: "set_mode", session, mode: item.mode });
@@ -418,7 +304,7 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
       }
       const { model } = item;
       if (currentModel && currentModel.engine === model.engine && currentModel.selection === model.selection) return;
-      setTyping(false);
+      disarm();
       if (currentModel && currentModel.engine !== model.engine) {
         setAsking(item.key); // the second tap is Switch
         return;
@@ -429,7 +315,7 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
         selection: model.selection,
       });
     },
-    [busy, fail, currentMode, currentModel, sendChoice, session, startFullAccess],
+    [busy, checking, fail, currentMode, currentModel, sendChoice, session, arm, disarm],
   );
   const onConfirm = useCallback(
     (item: Item) => {
@@ -444,7 +330,8 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
   );
 
   const turnOn = useCallback(() => {
-    if (busy) return;
+    if (busy || !armed) return;
+    disarm(); // sent: the approval is spent
     setPending("mode:full-access");
     run(
       {
@@ -455,11 +342,11 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
       },
       done,
     );
-  }, [busy, run, session, done]);
+  }, [busy, armed, disarm, run, session, done]);
   const cancelFull = useCallback(() => {
-    setTyping(false);
+    disarm();
     fail(null);
-  }, [fail]);
+  }, [disarm, fail]);
 
   const waiting = busy ? pending : null;
   const renderItem = useCallback<ListRenderItem<Item>>(
@@ -491,7 +378,6 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
   );
 
   if (!catalog) return null;
-  const typingFull = typing && currentMode !== "full-access";
   return (
     <View style={s.entry}>
       <Pressable accessibilityRole="button" accessibilityLabel="Mode and model" onPress={openSheet} style={s.button}>
@@ -528,7 +414,7 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
                 <Text style={s.failure}>{failed.text}</Text>
               </View>
             ) : null}
-            {typingFull ? <FullAccessConfirm busy={busy} onTurnOn={turnOn} onCancel={cancelFull} /> : null}
+            {armed ? <FullAccessConfirm busy={busy} onTurnOn={turnOn} onCancel={cancelFull} /> : null}
             <FlashList
               data={items}
               extraData={extra}

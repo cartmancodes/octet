@@ -404,6 +404,30 @@ describe("the mode and model sheet", () => {
       expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
     });
 
+    it("arms nothing when the desk changes the mode while Face ID is up", async () => {
+      let finish: (r: LocalAuthentication.LocalAuthenticationResult) => void = () => {};
+      auth.authenticateAsync.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+      const r = rig();
+      const view = await open(CATALOG, r);
+      await fireEvent.press(screen.getByRole("button", { name: FULL }));
+      await flush();
+      await view.rerender(sheet({ ...CATALOG, current_mode: "auto" }, r.send));
+      await act(async () => finish({ success: true }));
+      expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      expect(r.send).not.toHaveBeenCalled();
+    });
+
+    it("a sent full access is spent: a second Turn on cannot go without a fresh Face ID", async () => {
+      const r = rig();
+      await open(CATALOG, r);
+      await press(FULL);
+      await fireEvent.changeText(screen.getByLabelText("Type full access to confirm"), "full access");
+      await press("Turn on full access");
+      expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      await act(async () => r.waiting[0]?.reject(new Refusal("busy", "Finish the turn first")));
+      expect(screen.queryByRole("button", { name: "Turn on full access" })).toBeNull();
+    });
+
     it("can be cancelled before it is turned on", async () => {
       const r = rig();
       await open(CATALOG, r);

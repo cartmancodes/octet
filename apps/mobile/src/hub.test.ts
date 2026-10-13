@@ -2,7 +2,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as SecureStore from "expo-secure-store";
 
 import { FakeClock, Sockets } from "./client/fakes";
-import { HubController, TOKEN_KEY, UNPAIRED_NOTICE } from "./hub";
+import { HubController, TOKEN_KEY, UNPAIRED_NOTICE, UNPAIR_FAILED_NOTICE } from "./hub";
 import { loadSettings, saveSettings } from "./persist";
 import { createOctetStore } from "./store";
 
@@ -417,18 +417,65 @@ describe("unpair", () => {
     expect(again.hub.snapshot().status).toBe("unpaired");
   });
 
-  it("goes to Pair even when the keychain cannot be cleared, and the next start drops the token", async () => {
+  it("tries the keychain twice; a second try that works leaves no notice", async () => {
     const r = rig();
     r.hub.setForeground(true);
     await paired(r);
     (SecureStore.deleteItemAsync as jest.Mock).mockRejectedValueOnce(new Error("locked"));
     await r.hub.unpair();
     expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null });
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+  });
+
+  it("says so when the keychain will not clear: Pair shows a notice, and the next start drops the token", async () => {
+    const r = rig();
+    r.hub.setForeground(true);
+    await paired(r);
+    (SecureStore.deleteItemAsync as jest.Mock)
+      .mockRejectedValueOnce(new Error("locked"))
+      .mockRejectedValueOnce(new Error("locked"));
+    await r.hub.unpair();
+    expect(UNPAIR_FAILED_NOTICE).toBe("This phone couldn't delete its pairing. Pair again to replace it.");
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, client: null });
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN); // still there...
     const again = rig();
     await again.hub.init(); // ...but with no hub address it is dropped
     expect(again.hub.snapshot().status).toBe("unpaired");
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+  });
+
+  it("says so when the hub address cannot be cleared either", async () => {
+    const r = rig();
+    r.hub.setForeground(true);
+    await paired(r);
+    jest.spyOn(AsyncStorage, "setItem").mockRejectedValueOnce(new Error("disk full"));
+    await r.hub.unpair();
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, client: null });
+  });
+
+  it("a foreground event while unpairing does not start the old client again", async () => {
+    const r = rig();
+    r.hub.setForeground(true);
+    await paired(r);
+    const sockets = r.sockets.all.length;
+    const old = r.sockets.last;
+    const pending = r.hub.unpair();
+    r.hub.setForeground(false);
+    r.hub.setForeground(true);
+    await pending;
+    r.clock.advance(120_000);
+    expect(r.sockets.all).toHaveLength(sockets);
+    expect(old.closed).toBe(true);
+  });
+
+  it("shows Pair at once, and refuses a pairing until the storage writes are done", async () => {
+    const r = rig();
+    r.hub.setForeground(true);
+    await paired(r);
+    const pending = r.hub.unpair();
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null });
+    expect(await r.hub.pair(LINK, "iPhone")).toMatchObject({ ok: false, clear: false });
+    await pending;
+    expect(r.sockets.all.filter((s) => !s.closed)).toHaveLength(0);
   });
 
   it("does nothing when not paired, and a second call while one runs is ignored", async () => {

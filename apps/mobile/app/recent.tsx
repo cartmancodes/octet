@@ -99,8 +99,9 @@ export default function RecentAndNew() {
   }, [ask]);
   // On open, and again whenever the connection comes back: the list may have changed on the Mac.
   useEffect(() => {
-    if (hub === "ready") ask();
-  }, [hub, ask]);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- one extra render on a reconnect, to clear a stale failure now
+    if (hub === "ready") load();
+  }, [hub, load]);
 
   const locked = busy || (launch !== null && launch.tmux !== null && !launch.late);
 
@@ -108,6 +109,7 @@ export default function RecentAndNew() {
   const onResume = useCallback(
     (r: RecentInfo) => {
       opened.current = false;
+      setLaunch(null); // the first start's session is no longer the one to open
       run({ type: "start", engine: r.engine, workspace: r.workspace, resume: r.session }, started);
     },
     [run, started],
@@ -115,6 +117,7 @@ export default function RecentAndNew() {
   const onStart = useCallback(
     (body: StartBody) => {
       opened.current = false;
+      setLaunch(null);
       run(body, started);
     },
     [run, started],

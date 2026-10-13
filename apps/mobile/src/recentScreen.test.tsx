@@ -162,6 +162,24 @@ describe("Recent", () => {
     expect(button("Try again")).toBeNull();
   });
 
+  it("a reload after a reconnect clears the old failure at once", async () => {
+    const rig = await open();
+    await refuse(rig, "recent", "Too many requests, wait a moment", "rate_limited");
+    expect(screen.getByText("Too many requests, wait a moment")).toBeTruthy();
+    await act(async () => {
+      rig.sockets.last.drop();
+    });
+    await act(async () => {
+      rig.clock.advance(60_000);
+      rig.sockets.last.open();
+      rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+      rig.clock.advance(50);
+    });
+    expect(requests(rig, "recent")).toHaveLength(1); // the new socket's own
+    expect(screen.queryByText("Too many requests, wait a moment")).toBeNull();
+    expect(button("Try again")).toBeNull();
+  });
+
   it("offers Try again after a lost request too: recent only reads", async () => {
     const rig = await open();
     await act(async () => rig.clock.advance(31_000)); // the client gives up on a request after 30 s
@@ -294,6 +312,23 @@ describe("Recent", () => {
       // After 30 seconds the wait is over: the user may start another.
       await act(async () => void jest.advanceTimersByTime(31_000));
       for (const b of screen.getAllByRole("button", { name: /^Resume/ })) expect(b.props.accessibilityState.disabled).toBe(false);
+    });
+
+    it("a second start does not navigate to the first one's session", async () => {
+      const rig = await open();
+      await answer(rig, [item("one"), item("two")]);
+      await press(/^Resume Title of one/);
+      await ack(rig, "start", "Starting octet-aaaaaa in /w");
+      await act(async () => void jest.advanceTimersByTime(31_000)); // late; buttons are free again
+      await press(/^Resume Title of two/);
+      expect(screen.queryByText(/octet-aaaaaa/)).toBeNull(); // the old notice is gone
+      await hear(rig, [info("first", { tmux: "octet-aaaaaa" })]); // the first one turns up now
+      await flush();
+      expect(rig.view.getPathname()).toBe("/recent");
+      await ack(rig, "start", "Starting octet-bbbbbb in /w");
+      await hear(rig, [info("first", { tmux: "octet-aaaaaa" }), info("second", { tmux: "octet-bbbbbb" })]);
+      await flush();
+      expect(rig.view.getPathname()).toBe("/session/second");
     });
 
     it("tells the user it started even if the hub's words do not name the session", async () => {
@@ -499,6 +534,79 @@ describe("New", () => {
       await press("Start session");
       expect(auth.authenticateAsync).toHaveBeenCalledTimes(2);
       expect((typed() as never as { props: { value: string } }).props.value).toBe("");
+    });
+
+    it("a successful start disarms the panel: after the ack and the late notice the next Start asks for Face ID again", async () => {
+      const rig = await armed(await openNew());
+      await fireEvent.changeText(typed() as never, "full access");
+      await press("Turn on full access");
+      expect(typed()).toBeNull(); // sent: the words are spent
+      await ack(rig, "start", "Starting octet-a1b2c3 in /Users/me/Projects/live");
+      await act(async () => void jest.advanceTimersByTime(31_000));
+      expect(screen.getByText("octet-a1b2c3 hasn't appeared yet. Check tmux on the Mac.")).toBeTruthy();
+      expect(typed()).toBeNull();
+      expect(button("Turn on full access")).toBeNull();
+      await press("Start session");
+      expect(auth.authenticateAsync).toHaveBeenCalledTimes(2);
+      expect(startsSent(rig)).toHaveLength(1); // nothing went without a fresh Face ID
+    });
+
+    it("a start whose ack names no session also disarms it", async () => {
+      const rig = await armed(await openNew());
+      await fireEvent.changeText(typed() as never, "full access");
+      await press("Turn on full access");
+      await ack(rig, "start", "ok");
+      expect(button("Turn on full access")).toBeNull();
+      expect(typed()).toBeNull();
+    });
+
+    it("disarms when the armed workspace leaves the list: it never falls back to another one", async () => {
+      const rig = await openNew([], [info("live"), info("beta")]);
+      await choose("live");
+      await choose(FULL);
+      await press("Start session");
+      expect(typed()).toBeTruthy();
+      await hear(rig, [info("beta")]); // "live" is gone; the form would now fall back to beta
+      await flush();
+      expect(typed()).toBeNull();
+      expect(button("Turn on full access")).toBeNull();
+      expect(startsSent(rig)).toHaveLength(0);
+    });
+
+    it("disarms when the model leaves the catalog, and when another is chosen", async () => {
+      const rig = await openNew();
+      await hearCatalog(rig);
+      await flush();
+      await choose("Opus");
+      await choose(FULL);
+      await press("Start session");
+      expect(typed()).toBeTruthy();
+      await hearCatalog(rig, MODELS.filter((m) => m.selection !== "opus"));
+      await flush();
+      expect(typed()).toBeNull();
+      await press("Start session");
+      expect(typed()).toBeTruthy();
+      await choose("Sonnet");
+      expect(typed()).toBeNull();
+      expect(startsSent(rig)).toHaveLength(0);
+    });
+
+    it("arms nothing when Face ID answers after the form changed", async () => {
+      let finish: (r: LocalAuthentication.LocalAuthenticationResult) => void = () => {};
+      auth.authenticateAsync.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+      const rig = await openNew([], [info("live"), info("beta")]);
+      await choose("live");
+      await choose(FULL);
+      await fireEvent.press(screen.getByRole("button", { name: "Start session" }));
+      await flush();
+      await hear(rig, [info("beta")]); // the approved workspace goes while the prompt is up
+      await flush();
+      await act(async () => finish({ success: true }));
+      expect(typed()).toBeNull();
+      expect(startsSent(rig)).toHaveLength(0);
+      // and the next Start asks again
+      await press("Start session");
+      expect(auth.authenticateAsync).toHaveBeenCalledTimes(2);
     });
 
     it("a Resume never carries full access", async () => {

@@ -1,15 +1,16 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
-import { memo, useCallback, useMemo, useRef, useState } from "react";
-import { KeyboardAvoidingView, Pressable, StyleSheet, Text, View } from "react-native";
+import { memo, useCallback, useMemo, useState } from "react";
+import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 
-import { confirmBiometric } from "../auth";
 import type { RequestBody } from "../client/HubClient";
 import type { CatalogInfo, Engine, Mode } from "../protocol";
 import { modelsFor } from "../recent";
 import { clipLabel, engineName, sessionName } from "../sessions";
 import { radius, spacing, type, useTheme } from "../theme";
-import { FULL_ACCESS_WARNING, FULL_ACCESS_WORDS, FullAccessConfirm, MODE_NAMES, NO_FACE_ID } from "./ModeModelSheet";
-import { useAlive, type Failure } from "./send";
+import { FullAccessConfirm } from "./FullAccessConfirm";
+import { FULL_ACCESS_WARNING, FULL_ACCESS_WORDS, useFullAccessArm } from "./fullAccess";
+import { MODE_NAMES } from "./ModeModelSheet";
+import type { Failure } from "./send";
 
 export type StartBody = Extract<RequestBody, { type: "start" }>;
 
@@ -138,46 +139,14 @@ interface NewFormProps {
  */
 export const NewForm = memo(function NewForm({ workspaces, catalogs, locked, failed, onStart, onFail }: NewFormProps) {
   const theme = useTheme();
-  const alive = useAlive();
   const [choice, setChoice] = useState<Choice>({ engine: "claude", workspace: null, model: null, mode: null });
-  const [typing, setTyping] = useState(false);
-  // Moves with every change the user makes: a Face ID result for an older form belongs to nobody.
-  const generation = useRef(0);
-  const checking = useRef(false);
 
   const lines = useMemo(() => linesOf(workspaces, catalogs, choice.engine), [workspaces, catalogs, choice.engine]);
+  // What will be sent: a workspace or model that has left the lists is replaced (the first
+  // workspace; no model), and the full-access approval below goes with it.
   const workspace = choice.workspace !== null && workspaces.includes(choice.workspace) ? choice.workspace : (workspaces[0] ?? null);
   const model =
     choice.model !== null && modelsFor(catalogs, choice.engine).some((m) => m.selection === choice.model) ? choice.model : null;
-
-  // A refusal disarms the panel.
-  const [seenFailure, setSeenFailure] = useState(failed);
-  if (seenFailure !== failed) {
-    setSeenFailure(failed);
-    if (failed && typing) setTyping(false);
-  }
-
-  const onChoose = useCallback(
-    (line: Line) => {
-      if (line.kind !== "option") return;
-      generation.current += 1;
-      setTyping(false);
-      onFail(null);
-      setChoice((c) => {
-        switch (line.group) {
-          case "engine":
-            return c.engine === line.value ? c : { ...c, engine: line.value as Engine, model: null };
-          case "workspace":
-            return { ...c, workspace: line.value };
-          case "model":
-            return { ...c, model: line.value };
-          case "mode":
-            return { ...c, mode: line.value as Mode | null };
-        }
-      });
-    },
-    [onFail],
-  );
 
   const bodyOf = useCallback(
     (mode: Mode | null): StartBody | null => {
@@ -194,37 +163,59 @@ export const NewForm = memo(function NewForm({ workspaces, catalogs, locked, fai
     [choice.engine, workspace, model],
   );
 
-  const start = useCallback(async () => {
-    if (locked || checking.current) return;
+  // Face ID approves exactly this start: the engine, workspace, model and (no) resume it will
+  // send, and the mode. If any of them changes, the approval is gone.
+  const full = useFullAccessArm({
+    reason: BIOMETRIC_REASON,
+    key: JSON.stringify([choice.engine, workspace, model, null, choice.mode]),
+    failed,
+    fail: onFail,
+  });
+  const { armed, arm, disarm, checking } = full;
+
+  const onChoose = useCallback(
+    (line: Line) => {
+      if (line.kind !== "option") return;
+      disarm();
+      onFail(null);
+      setChoice((c) => {
+        switch (line.group) {
+          case "engine":
+            return c.engine === line.value ? c : { ...c, engine: line.value as Engine, model: null };
+          case "workspace":
+            return { ...c, workspace: line.value };
+          case "model":
+            return { ...c, model: line.value };
+          case "mode":
+            return { ...c, mode: line.value as Mode | null };
+        }
+      });
+    },
+    [onFail, disarm],
+  );
+
+  const start = useCallback(() => {
+    if (locked || checking()) return;
     onFail(null);
     if (choice.mode !== "full-access") {
       const body = bodyOf(choice.mode);
       if (body) onStart(body);
       return;
     }
-    const mine = generation.current;
-    checking.current = true;
-    try {
-      // Always, whatever the Face ID setting says.
-      const checked = await confirmBiometric(BIOMETRIC_REASON);
-      if (!alive() || generation.current !== mine) return;
-      if (checked === "ok") setTyping(true);
-      else if (checked === "unavailable") onFail({ text: NO_FACE_ID, retry: false });
-    } finally {
-      checking.current = false;
-    }
-  }, [locked, choice.mode, bodyOf, onStart, onFail, alive]);
+    disarm();
+    void arm(); // Face ID, always, whatever the setting says
+  }, [locked, checking, choice.mode, bodyOf, onStart, onFail, arm, disarm]);
 
   const turnOn = useCallback(() => {
-    if (locked) return;
+    if (locked || !armed) return;
     const body = bodyOf("full-access");
+    disarm(); // sent: the approval is spent
     if (body) onStart(body);
-  }, [locked, bodyOf, onStart]);
+  }, [locked, armed, bodyOf, onStart, disarm]);
   const cancelFull = useCallback(() => {
-    generation.current += 1;
-    setTyping(false);
+    disarm();
     onFail(null);
-  }, [onFail]);
+  }, [disarm, onFail]);
 
   // What each group has chosen now: the workspace and model as they will be sent.
   const chosen = useCallback(
@@ -252,7 +243,7 @@ export const NewForm = memo(function NewForm({ workspaces, catalogs, locked, fai
 
   const off = locked || workspace === null;
   return (
-    <KeyboardAvoidingView behavior="padding" style={styles.form}>
+    <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.form}>
       <FlashList
         testID="new-list"
         data={lines}
@@ -262,7 +253,7 @@ export const NewForm = memo(function NewForm({ workspaces, catalogs, locked, fai
         getItemType={typeOf}
         keyboardShouldPersistTaps="handled"
       />
-      {typing ? <FullAccessConfirm busy={locked} onTurnOn={turnOn} onCancel={cancelFull} /> : null}
+      {armed ? <FullAccessConfirm busy={locked} onTurnOn={turnOn} onCancel={cancelFull} /> : null}
       <View style={[styles.bar, { backgroundColor: theme.panel, borderColor: theme.edge }]}>
         <Pressable
           accessibilityRole="button"
