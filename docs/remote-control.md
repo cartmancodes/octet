@@ -424,6 +424,10 @@ environment, even after a login with no tmux running. The service doesn't use
 - **Restarts.** launchd restarts the hub whenever it stops; systemd restarts it
   five seconds after it fails, so a failure at boot doesn't use up systemd's
   start limit.
+- **Sessions outlive the service.** Stopping, restarting or reinstalling the
+  service stops the hub alone. The tmux server a phone's `start` forked keeps
+  running, with every session in it, yours too. The systemd unit sets
+  `KillMode=process` and the launchd agent sets `AbandonProcessGroup`.
 - **Linux without a login session.** A systemd user service stops when you log
   out unless lingering is on: `loginctl enable-linger "$USER"`.
 

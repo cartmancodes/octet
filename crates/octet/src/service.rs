@@ -149,6 +149,8 @@ impl ServicePlan {
         }
     }
 
+    /// The launchd agent. `AbandonProcessGroup` keeps launchd from killing what the hub started
+    /// (a tmux server a phone's `start` forked, and its sessions) when the agent stops.
     fn plist(&self) -> String {
         let mut arguments = String::new();
         for argument in self.arguments() {
@@ -171,6 +173,8 @@ impl ServicePlan {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>AbandonProcessGroup</key>
+  <true/>
   <key>StandardOutPath</key>
   <string>{log}</string>
   <key>StandardErrorPath</key>
@@ -187,6 +191,9 @@ impl ServicePlan {
         )
     }
 
+    /// The systemd user unit. `KillMode=process` stops the hub alone: the tmux server a phone's
+    /// `start` forked lives in the unit's cgroup, and a stop or restart would otherwise kill it
+    /// with every session in it.
     fn unit(&self) -> String {
         let exec = self
             .arguments()
@@ -204,6 +211,7 @@ Description=Octet hub, your terminal sessions on your phone
 ExecStart={exec}
 Restart=on-failure
 RestartSec=5
+KillMode=process
 Environment={environment}
 
 [Install]
@@ -790,6 +798,8 @@ mod tests {
             "<string>--journal-dir</string>\n    <string>/srv/a &amp; &lt;b&gt;</string>",
             "<key>RunAtLoad</key>\n  <true/>",
             "<key>KeepAlive</key>\n  <true/>",
+            // Stopping the agent leaves the tmux server a phone's `start` forked, and its sessions.
+            "<key>AbandonProcessGroup</key>\n  <true/>",
             &format!("<key>StandardOutPath</key>\n  <string>{log}</string>"),
             &format!("<key>StandardErrorPath</key>\n  <string>{log}</string>"),
             &format!("<string>{DEFAULTS}</string>"),
@@ -829,6 +839,9 @@ mod tests {
             "ExecStart=/opt/octet/bin/octet hub --journal-dir ",
             // Without a wait, a hub failing at boot exhausts systemd's start limit and stays down.
             "Restart=on-failure\nRestartSec=5\n",
+            // A stop or restart ends the hub only, never the tmux server a phone's `start` forked
+            // into the unit's cgroup, with every session in it.
+            "KillMode=process\n",
             &format!("Environment=PATH={DEFAULTS}\n"),
             "WantedBy=default.target\n",
         ] {
