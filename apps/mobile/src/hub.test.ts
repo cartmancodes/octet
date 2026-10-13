@@ -130,13 +130,28 @@ describe("starting", () => {
     expect(second.hub.snapshot().status).toBe("paired");
   });
 
-  it("keeps a good token when the saved settings are garbled", async () => {
+  it("takes garbled settings for the defaults: no hub address, so the token goes and Pair shows", async () => {
     await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
     await AsyncStorage.setItem("octet.settings.v1", "{not json");
     const r = rig();
     await r.hub.init();
     expect(r.hub.snapshot().status).toBe("unpaired");
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+  });
+
+  it("pairs over garbled settings: the save replaces them, and the pairing is kept", async () => {
+    for (const junk of ["not json", "[]", "null"]) {
+      await AsyncStorage.setItem("octet.settings.v1", junk);
+      await SecureStore.deleteItemAsync(TOKEN_KEY);
+      const r = rig();
+      await r.hub.init();
+      const pending = r.hub.pair(LINK, "iPhone");
+      accept(r);
+      expect([junk, await pending]).toEqual([junk, { ok: true }]);
+      expect((await loadSettings()).hubUrl).toBe("wss://mac.tail1234.ts.net/");
+      expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+      r.hub.setForeground(false);
+    }
   });
 
   it("is unpaired when the keychain cannot be read", async () => {

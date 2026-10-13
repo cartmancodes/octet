@@ -7,6 +7,11 @@ describe("cleaning hub text", () => {
     expect(field("rm -rf‏ /tmp‎/x؜", 100)).toBe("rm -rf /tmp/x");
   });
 
+  it("drops zero-width characters, which can pad a command with lines that look empty", () => {
+    expect(sanitize("a\u200bb\u200cc\u200dd\u2060e\ufefff", TEXT).out).toBe("abcdef");
+    expect(field("rm\u200b -rf", 100)).toBe("rm -rf");
+  });
+
   it("still drops the overrides and isolates", () => {
     expect(sanitize("a‮b⁦c⁩", TEXT).out).toBe("abc");
   });

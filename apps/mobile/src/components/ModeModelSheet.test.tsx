@@ -305,6 +305,33 @@ describe("the mode and model sheet", () => {
         expect(r.send).not.toHaveBeenCalled();
       });
 
+      it("a prompt still up when the app goes to the background arms nothing when it passes", async () => {
+        let pass: () => void = () => {};
+        auth.authenticateAsync.mockImplementationOnce(() => new Promise((resolve) => (pass = () => resolve({ success: true }))));
+        const r = rig();
+        await open(CATALOG, r);
+        await fireEvent.press(screen.getByRole("button", { name: FULL }));
+        await change("inactive");
+        await change("background");
+        await act(async () => pass());
+        await change("active");
+        expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      });
+
+      it("asks for no Face ID while the app is not in front", async () => {
+        const r = rig();
+        await open(CATALOG, r);
+        const state = jest.replaceProperty(AppState, "currentState", "background");
+        try {
+          await fireEvent.press(screen.getByRole("button", { name: FULL }));
+          await flush();
+          expect(auth.authenticateAsync).not.toHaveBeenCalled();
+          expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+        } finally {
+          state.restore();
+        }
+      });
+
       it("forgets it on the app switcher too, but not while its own Face ID prompt is up", async () => {
         let pass: () => void = () => {};
         auth.authenticateAsync.mockImplementationOnce(() => new Promise((resolve) => (pass = () => resolve({ success: true }))));

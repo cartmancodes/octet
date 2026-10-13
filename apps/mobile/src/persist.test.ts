@@ -29,6 +29,14 @@ describe("settings", () => {
     expect(await loadSettings()).toMatchObject({ hubUrl: "wss://mac.tail1234.ts.net/", faceId: true });
   });
 
+  it("a save replaces junk: it was read, as the defaults", async () => {
+    for (const junk of ["not json", "[]", "null"]) {
+      await AsyncStorage.setItem(SETTINGS_KEY, junk);
+      expect(await saveSettings({ hubUrl: "wss://mac.tail1.ts.net/", deviceName: "p" })).toBe(true);
+      expect(await loadSettings()).toMatchObject({ hubUrl: "wss://mac.tail1.ts.net/", deviceName: "p" });
+    }
+  });
+
   it("fall back to the defaults for junk", async () => {
     for (const junk of ["not json", "[]", "null", JSON.stringify({ deviceName: 5, faceId: "yes", hubUrl: { a: 1 } })]) {
       await AsyncStorage.setItem(SETTINGS_KEY, junk);

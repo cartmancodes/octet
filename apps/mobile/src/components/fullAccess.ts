@@ -71,7 +71,7 @@ export function useFullAccessArm(opts: {
   }, [invalidate]);
 
   const arm = useCallback(async () => {
-    if (prompting.current) return;
+    if (prompting.current || AppState.currentState !== "active") return;
     const mine = generation.current;
     const asked = current.current;
     prompting.current = true;
@@ -90,7 +90,9 @@ export function useFullAccessArm(opts: {
   // inactive, so a pass still being asked for is left alone.
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) => {
-      if (state !== "active" && !prompting.current) disarm();
+      // The background ends it all, a prompt still up included; inactive (the app switcher, or
+      // the prompt itself) spares only a prompt still up.
+      if (state === "background" || (state !== "active" && !prompting.current)) disarm();
     });
     return () => subscription.remove();
   }, [disarm]);

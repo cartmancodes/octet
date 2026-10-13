@@ -72,6 +72,9 @@ jest.mock("expo-splash-screen", () => ({
 }));
 
 beforeEach(() => {
+  // The app is in front, as it is for anyone tapping it. React Native's mock leaves it unset.
+  const { AppState } = jest.requireActual<typeof import("react-native")>("react-native");
+  (AppState as { currentState: string }).currentState = "active";
   const granted = { granted: true, canAskAgain: true, status: "granted" };
   const n = jest.requireMock("expo-notifications") as Record<string, jest.Mock>;
   for (const mock of Object.values(n)) if (jest.isMockFunction(mock)) mock.mockReset();

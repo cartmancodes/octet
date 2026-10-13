@@ -7,6 +7,10 @@ export const FOLD_BLANKS = 3;
 /** The line standing for `n` blank (or whitespace-only) lines. */
 export const blankLines = (n: number): string => `⋯ ${n} blank lines ⋯`;
 
+/** A line that shows nothing: whitespace, and the characters that draw as a blank (the braille
+ * blank, the Hangul fillers, the soft hyphen). */
+const BLANK = /^[\s⠀ㅤᅟﾠ­]*$/;
+
 /** `command` with each run of `FOLD_BLANKS` or more blank lines folded into one line saying
  * how many, and how many lines the command has. */
 export function foldCommand(command: string): { text: string; lines: number } {
@@ -19,7 +23,7 @@ export function foldCommand(command: string): { text: string; lines: number } {
     blanks = 0;
   };
   for (const line of all) {
-    if (line.trim() === "") {
+    if (BLANK.test(line)) {
       blanks += 1;
       continue;
     }

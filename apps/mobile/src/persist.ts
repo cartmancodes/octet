@@ -26,14 +26,19 @@ const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object
 const text = (x: unknown): string | null => (typeof x === "string" && x.length <= MAX_CHARS ? x : null);
 
 /** The saved settings; each field that is missing or not the right type is its default. None
- * saved is the defaults. `ok: false` when they could not be read, or were garbled: what they hold
- * is unknown, which is not the same as nothing saved. */
+ * saved, or garbage saved, is the defaults: a save then writes over it. `ok: false` only when
+ * storage could not be read at all: what it holds is unknown, which is not the same as nothing. */
 export async function readSettings(): Promise<{ ok: true; settings: Settings } | { ok: false }> {
+  let raw: string | null;
   try {
-    const raw = await AsyncStorage.getItem(SETTINGS_KEY);
-    if (raw === null) return { ok: true, settings: DEFAULT_SETTINGS };
+    raw = await AsyncStorage.getItem(SETTINGS_KEY);
+  } catch {
+    return { ok: false };
+  }
+  if (raw === null) return { ok: true, settings: DEFAULT_SETTINGS };
+  try {
     const value: unknown = JSON.parse(raw);
-    if (!isObj(value)) return { ok: false };
+    if (!isObj(value)) return { ok: true, settings: DEFAULT_SETTINGS };
     return {
       ok: true,
       settings: {
@@ -44,7 +49,7 @@ export async function readSettings(): Promise<{ ok: true; settings: Settings } |
       },
     };
   } catch {
-    return { ok: false };
+    return { ok: true, settings: DEFAULT_SETTINGS };
   }
 }
 
