@@ -45,6 +45,9 @@ export interface OctetState {
   reset(): void;
   /** The hub refused to stream `session` for good. */
   subscribeFailed(session: string, reason: string): void;
+  /** Lets go of a live session's transcript and approvals, keeping what other screens read of it
+   * (its catalog and last state). False for a session with no view, or one that ended. */
+  evict(session: string): boolean;
 }
 
 export type OctetStore = StoreApi<OctetState>;
@@ -201,6 +204,14 @@ export function createOctetStore(): OctetStore {
       if (get().hub !== hub) set({ hub });
     },
 
+    evict(session) {
+      const v = get().bySession.get(session);
+      if (!v || v.ended) return false;
+      const kept: SessionView = { ...EMPTY_VIEW, state: v.state, catalog: v.catalog, mode: v.mode, model: v.model, usage: v.usage, epoch: v.epoch + 1 };
+      set((st) => ({ bySession: new Map(st.bySession).set(session, kept) }));
+      return true;
+    },
+
     subscribeFailed(session, reason) {
       const old = get().bySession.get(session) ?? EMPTY_VIEW;
       const next = reduceView(old, [{ op: "failed", reason: field(reason, FIELD) }]);
@@ -317,13 +328,63 @@ const shown = (client: HubClient): Set<string> => {
   return set;
 };
 
+/** Live sessions whose transcripts the phone keeps, the ones seen last: each holds up to 1,000
+ * entries and 4 MiB, and nothing else bounds the total. */
+export const MAX_VIEWS = 4;
+
+/** The sessions each client streamed for a screen, the one seen last at the end. */
+const visited = new WeakMap<HubClient, string[]>();
+const visitsOf = (client: HubClient): string[] => {
+  let list = visited.get(client);
+  if (!list) visited.set(client, (list = []));
+  return list;
+};
+
+/** Lets go of the transcripts of live sessions past the `MAX_VIEWS` seen last, but never one on
+ * a screen. Each is forgotten by the client too, so the next `watch` replays it from the start. */
+function keepRecent(store: OctetStore, client: HubClient): void {
+  const visits = visitsOf(client);
+  const views = store.getState().bySession;
+  const holding = (id: string) => {
+    const v = views.get(id);
+    return v !== undefined && !v.ended && (v.transcript.entries.length > 0 || v.held !== null || v.approvals.length > 0);
+  };
+  // Newest first: a session not seen yet (a view a refusal made) counts as the oldest.
+  const order = [...visits].reverse();
+  for (const id of views.keys()) if (!visits.includes(id)) order.push(id);
+  let kept = 0;
+  for (const id of order) {
+    // One on a screen is kept, and counts, whether or not its replay has brought anything yet.
+    if (shown(client).has(id)) {
+      kept += 1;
+      continue;
+    }
+    if (!holding(id)) continue;
+    if (kept < MAX_VIEWS) {
+      kept += 1;
+      continue;
+    }
+    if (store.getState().evict(id)) {
+      requested(client).delete(id);
+      client.forget(id);
+    }
+  }
+  // Forget visits to sessions with no view and no screen, so the list stays as small as the store.
+  visited.set(client, visits.filter((id) => views.has(id) || shown(client).has(id)));
+}
+
 /** Streams `session`. One the store holds nothing of, and that was not asked for yet, subscribes
  * fresh, from the start of its journal: cursors are only in memory, so a cold start has no
- * transcript to resume. Asking again changes nothing. */
+ * transcript to resume. Asking again changes nothing. Seeing it makes it the newest of the
+ * `MAX_VIEWS` whose transcripts are kept. */
 export function watch(store: OctetStore, client: HubClient, session: string): void {
   const fresh = !store.getState().bySession.has(session) && !requested(client).has(session);
   requested(client).add(session);
   shown(client).add(session);
+  const visits = visitsOf(client).filter((id) => id !== session);
+  visits.push(session);
+  visited.set(client, visits);
+  keepRecent(store, client);
   client.subscribe(session, fresh);
 }
 

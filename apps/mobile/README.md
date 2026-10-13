@@ -212,6 +212,8 @@ workspace. Tick each one on each phone.
 - The client delivers frames in one batch at most every 50 ms; the store applies a batch in one
   `set`, and every part a batch did not change keeps its identity, so a screen that selects
   narrowly does not draw for another session's output.
+- The phone keeps the transcripts of the 4 sessions you looked at last. Opening another one
+  replays it from the Mac.
 - Budgets that tests hold, with room for a busy machine:
   - `src/perf.test.ts`:
     - 20,000 text and 2,000 tool events through the reducer and store in under 1 s, with

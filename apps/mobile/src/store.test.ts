@@ -4,7 +4,7 @@ import { FakeClock, Sockets } from "./client/fakes";
 import { HubClient } from "./client/HubClient";
 import type { CatalogInfo, JournalEvent, SessionInfo, StateInfo, ToPhone } from "./protocol";
 import { entrySize } from "./model/transcript";
-import { bindHooks, connectStore, createOctetStore, releaseSession, unwatch, watch, type OctetStore } from "./store";
+import { MAX_VIEWS, bindHooks, connectStore, createOctetStore, releaseSession, unwatch, watch, type OctetStore } from "./store";
 
 const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
   id,
@@ -503,6 +503,38 @@ describe("with a client", () => {
     clock.advance(50);
     expect(calls).toHaveLength(1);
     expect(view("a").transcript.entries).toMatchObject([{ text: "hello" }, { text: "hi there" }]);
+    off();
+  });
+
+  it("keeps the transcripts of the 4 sessions seen last; one seen before them is let go and replays from the start", () => {
+    expect(MAX_VIEWS).toBe(4);
+    const { sockets, clock, client, off } = rig();
+    const ids = ["a", "b", "c", "d", "e"];
+    sockets.last.receive({ type: "sessions", sessions: ids.map((id) => info(id)) });
+    const visit = (id: string) => {
+      watch(store, client, id);
+      sockets.last.receive({ type: "subscribed", session: id, from: "start", journals: ["j1"] });
+      sockets.last.receive({ type: "event", session: id, journal: "j1", seq: 1, event: { type: "user", data: `hi ${id}` } });
+      sockets.last.receive(catalogFrame(id));
+      clock.advance(50);
+      unwatch(client, id);
+      const req = sockets.last.commandsOf("unsubscribe").at(-1)?.req;
+      sockets.last.receive({ type: "ack", req, message: "" });
+      clock.advance(50);
+    };
+    ids.forEach(visit);
+    const holding = () => ids.filter((id) => (store.getState().bySession.get(id)?.transcript.entries.length ?? 0) > 0);
+    expect(holding()).toEqual(["b", "c", "d", "e"]);
+    // What the other screens read of it stays: its catalog (for New), its last state.
+    expect(view("a").catalog).not.toBeNull();
+    const asked = (id: string) => sockets.last.commandsOf("subscribe").filter((c) => c.session === id).at(-1);
+    // One still held resumes after its cursor; the one let go starts over.
+    watch(store, client, "e");
+    expect(asked("e")).toHaveProperty("after");
+    watch(store, client, "a");
+    expect(asked("a")).not.toHaveProperty("after");
+    // Seeing it made "b" the oldest of five: let go.
+    expect(holding()).toEqual(["c", "d", "e"]);
     off();
   });
 
