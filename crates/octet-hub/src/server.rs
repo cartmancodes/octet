@@ -33,7 +33,7 @@
 use crate::{
     launch::{self, Launches, StartRequest, clip as clip_to},
     owner::published_url,
-    push::{self, Pusher},
+    push::{self, Pusher, Sender},
     sessions::{SessionUpdate, Sessions},
     store::{Device, SECRET_REFUSED, Store},
     tail::{self, file_name},
@@ -468,10 +468,8 @@ pub struct Hub {
     events: mpsc::Sender<ConnEvent>,
     /// What to push, and when.
     pusher: Pusher,
-    /// Where pushes are posted.
-    push_endpoint: String,
-    /// Given to each send: the push tokens Expo said are dead.
-    dead_tokens: mpsc::Sender<Vec<String>>,
+    /// Posts pushes in the background.
+    sender: Sender,
     /// The last id given to a connection, hub req or replay.
     ids: u64,
 }
@@ -580,8 +578,7 @@ impl Hub {
             watched: Vec::new(),
             events,
             pusher: Pusher::default(),
-            push_endpoint: push::endpoint(),
-            dead_tokens,
+            sender: Sender::new(push::endpoint(), dead_tokens),
             ids: 0,
         };
         hub.sessions.refresh().await;
@@ -1388,7 +1385,6 @@ impl Hub {
         });
     }
 
-    /// Ends `conn` now.
     /// Hands the pusher what the sessions look like; what it finds new waits in a window for
     /// each device with a push token (whether it is connected is judged when the window closes).
     fn observe_push(&mut self) {
@@ -1405,6 +1401,7 @@ impl Hub {
     /// connected right now is looked at, so it gets none.
     fn flush_push(&mut self) {
         let now = Instant::now();
+        self.pusher.prune(now);
         let mut batch = Vec::new();
         for key in self.pusher.waiting() {
             let token = self
@@ -1426,25 +1423,7 @@ impl Hub {
         if batch.is_empty() {
             return;
         }
-        let endpoint = self.push_endpoint.clone();
-        let dead = self.dead_tokens.clone();
-        tokio::spawn(async move {
-            let messages: Vec<Value> = batch
-                .iter()
-                .map(|(token, due)| due.message(token))
-                .collect();
-            let outcomes = push::send(&endpoint, &messages).await;
-            push::report(&outcomes);
-            let gone: Vec<String> = batch
-                .into_iter()
-                .zip(outcomes)
-                .filter(|(_, outcome)| *outcome == push::Outcome::Dead)
-                .map(|((token, _), _)| token)
-                .collect();
-            if !gone.is_empty() {
-                let _ = dead.send(gone).await;
-            }
-        });
+        self.sender.dispatch(batch);
     }
 
     /// Clears push tokens Expo says no device has, from `devices.json` and the connections'
@@ -1454,10 +1433,8 @@ impl Hub {
             match self.store.drop_push_token(token).await {
                 Ok(Some(name)) => self.store.audit(&name, "", "push dropped").await,
                 Ok(None) => {}
-                Err(error) => {
-                    // The error names a path and a kind, never a token.
-                    eprintln!("Couldn't clear a dead push token: {}", error.kind());
-                }
+                // The only push log lines are the ruled ones: no kind, path or token.
+                Err(_) => push::report(&[push::Outcome::Failed]),
             }
             for state in self.conns.values_mut() {
                 if let Some(held) = state
@@ -1471,6 +1448,7 @@ impl Hub {
         }
     }
 
+    /// Ends `conn` now.
     fn drop_conn(&mut self, conn: u64) {
         if let Some(state) = self.forget(conn) {
             state.task.abort();

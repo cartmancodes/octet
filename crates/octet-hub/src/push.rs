@@ -8,16 +8,27 @@
 //! [`WINDOW`] and go out as one (an approval beats a finished turn, and the push names the most
 //! recent session), at most [`CAP`] in any minute.
 //!
+//! Two edges are accepted. When a session's journal list changes (a new vendor process) the
+//! approval ids it has seen are forgotten, so a reused id can stay hidden until the registration
+//! refresh shows the new list, and an approval still open in the old state can be pushed once more.
+//! A session that disappears mid-turn pushes nothing: it is forgotten with its phase.
+//!
 //! [`send`] posts a batch with `curl`: literal argv, the JSON body on stdin, so no token is in
 //! `ps`. The only log lines are `Push failed` and `Push refused: <code>`.
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     process::Stdio,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, process::Command, time::Instant, time::timeout};
+use tokio::{
+    io::AsyncWriteExt,
+    process::Command,
+    sync::{Semaphore, mpsc},
+    time::{Instant, timeout},
+};
 
 /// Where pushes go.
 pub(crate) const EXPO_URL: &str = "https://exp.host/--/api/v2/push/send";
@@ -33,6 +44,8 @@ const CAP: usize = 6;
 const MINUTE: Duration = Duration::from_secs(60);
 /// How long one send may take in all; `curl` itself is told 10 seconds.
 const SEND_WITHIN: Duration = Duration::from_secs(15);
+/// Sends that may run at once; one that finds them all busy is dropped.
+const SENDS_AT_ONCE: usize = 4;
 /// Notices kept per window; older ones are let go.
 const WINDOW_NOTICES: usize = 64;
 /// The longest error code that is logged.
@@ -229,6 +242,25 @@ impl Pusher {
         window.turns.drain(..extra);
     }
 
+    /// Forgets the devices whose last push is over a minute old.
+    pub(crate) fn prune(&mut self, now: Instant) {
+        self.sent.retain(|_, sent| {
+            while sent
+                .front()
+                .is_some_and(|at| now.saturating_duration_since(*at) >= MINUTE)
+            {
+                sent.pop_front();
+            }
+            !sent.is_empty()
+        });
+    }
+
+    /// How many devices have a push on record.
+    #[cfg(test)]
+    fn remembered(&self) -> usize {
+        self.sent.len()
+    }
+
     /// The devices with a window open.
     pub(crate) fn waiting(&self) -> Vec<String> {
         self.windows.keys().cloned().collect()
@@ -289,12 +321,7 @@ pub(crate) enum Outcome {
     Failed,
 }
 
-/// Posts `messages` to `endpoint` and says how each fared, in order.
-pub(crate) async fn send(endpoint: &str, messages: &[Value]) -> Vec<Outcome> {
-    send_with("curl", endpoint, messages).await
-}
-
-/// [`send`] with `program` as the `curl` to run.
+/// Posts `messages` to `endpoint` with `program` (`curl`), and says how each fared, in order.
 async fn send_with(program: &str, endpoint: &str, messages: &[Value]) -> Vec<Outcome> {
     let failed = || vec![Outcome::Failed; messages.len()];
     let Ok(body) = serde_json::to_vec(messages) else {
@@ -374,15 +401,89 @@ fn printable(code: &str) -> String {
     if word { code } else { "unknown" }.to_owned()
 }
 
-/// Logs what went wrong in `outcomes`: no token, session or body.
-pub(crate) fn report(outcomes: &[Outcome]) {
+/// The log lines for `outcomes`: no token, session or body. A batch logs `Push failed` once, and
+/// `Push refused: <code>` once for each distinct code.
+fn log_lines(outcomes: &[Outcome]) -> Vec<String> {
+    let mut lines = Vec::new();
     if outcomes.contains(&Outcome::Failed) {
-        eprintln!("Push failed");
+        lines.push("Push failed".to_owned());
     }
+    let mut seen = HashSet::new();
     for outcome in outcomes {
-        if let Outcome::Refused(code) = outcome {
-            eprintln!("Push refused: {code}");
+        if let Outcome::Refused(code) = outcome
+            && seen.insert(code)
+        {
+            lines.push(format!("Push refused: {code}"));
         }
+    }
+    lines
+}
+
+/// Logs what went wrong in `outcomes`.
+pub(crate) fn report(outcomes: &[Outcome]) {
+    for line in log_lines(outcomes) {
+        eprintln!("{line}");
+    }
+}
+
+/// Runs sends in the background, [`SENDS_AT_ONCE`] at a time.
+#[derive(Debug)]
+pub(crate) struct Sender {
+    program: String,
+    endpoint: String,
+    slots: Arc<Semaphore>,
+    /// Told the tokens Expo says are dead.
+    dead: mpsc::Sender<Vec<String>>,
+}
+
+impl Sender {
+    /// A sender that posts to `endpoint` with `curl`.
+    pub(crate) fn new(endpoint: String, dead: mpsc::Sender<Vec<String>>) -> Self {
+        Self::with_program("curl", endpoint, dead)
+    }
+
+    /// Like [`new`](Self::new), running `program` as `curl`.
+    fn with_program(program: &str, endpoint: String, dead: mpsc::Sender<Vec<String>>) -> Self {
+        Self {
+            program: program.to_owned(),
+            endpoint,
+            slots: Arc::new(Semaphore::new(SENDS_AT_ONCE)),
+            dead,
+        }
+    }
+
+    /// Posts the pushes `batch` (a token and what it is for) in a task of their own, and reports
+    /// the dead tokens. If every slot is busy the batch is dropped, logged as `Push failed`, and
+    /// this is false. Never waits.
+    pub(crate) fn dispatch(&self, batch: Vec<(String, Due)>) -> bool {
+        let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() else {
+            report(&[Outcome::Failed]);
+            return false;
+        };
+        let (program, endpoint, dead) = (
+            self.program.clone(),
+            self.endpoint.clone(),
+            self.dead.clone(),
+        );
+        tokio::spawn(async move {
+            let messages: Vec<Value> = batch
+                .iter()
+                .map(|(token, due)| due.message(token))
+                .collect();
+            let outcomes = send_with(&program, &endpoint, &messages).await;
+            drop(slot);
+            report(&outcomes);
+            let gone: Vec<String> = batch
+                .into_iter()
+                .zip(outcomes)
+                .filter(|(_, outcome)| *outcome == Outcome::Dead)
+                .map(|((token, _), _)| token)
+                .collect();
+            if !gone.is_empty() {
+                let _ = dead.send(gone).await;
+            }
+        });
+        true
     }
 }
 
@@ -742,5 +843,76 @@ mod tests {
             send_with("curl", "http://127.0.0.1:1", &messages).await,
             [Outcome::Failed, Outcome::Failed]
         );
+    }
+
+    #[test]
+    fn idle_devices_leave_nothing_behind() {
+        let mut pusher = seeded(&["s1"]);
+        let base = Instant::now();
+        let notices = open(&mut pusher, "s1", 1);
+        pusher.offer("dev", &notices, base);
+        assert_eq!(pusher.waiting(), ["dev"]);
+        assert!(pusher.due_for("dev", false, later(base, 2.0)).is_some());
+        // The window closed with its push; the minute's record is all that is left.
+        assert_eq!(pusher.waiting(), Vec::<String>::new());
+        assert_eq!(pusher.remembered(), 1);
+        pusher.prune(later(base, 59.0));
+        assert_eq!(pusher.remembered(), 1);
+        pusher.prune(later(base, 62.0));
+        assert_eq!(pusher.remembered(), 0);
+        // A window that closes without a push (connected) leaves no record either.
+        let notices = pusher.observe(&[snap("s1", Some("idle"), &[1, 2], &["a"])]);
+        pusher.offer("dev", &notices, later(base, 70.0));
+        assert_eq!(pusher.due_for("dev", true, later(base, 72.0)), None);
+        assert_eq!((pusher.waiting().len(), pusher.remembered()), (0, 0));
+    }
+
+    #[test]
+    fn a_request_wide_refusal_is_logged_once_a_code() {
+        let refused = |code: &str| Outcome::Refused(code.into());
+        assert_eq!(
+            log_lines(&[refused("A"), refused("A"), refused("B"), Outcome::Sent]),
+            ["Push refused: A", "Push refused: B"]
+        );
+        assert_eq!(
+            log_lines(&[Outcome::Failed, Outcome::Failed, refused("A")]),
+            ["Push failed", "Push refused: A"]
+        );
+        assert_eq!(
+            log_lines(&[Outcome::Sent, Outcome::Dead]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_four_sends_run_and_the_rest_are_dropped() {
+        // A "curl" that never answers in time.
+        let dir = std::env::temp_dir().join(format!("ohpush{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let program = dir.join("slow");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 5\n").expect("script");
+        std::fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod");
+        let (dead, _kept) = tokio::sync::mpsc::channel(1);
+        let sender = Sender::with_program(
+            program.to_str().expect("UTF-8"),
+            "http://127.0.0.1:1".into(),
+            dead,
+        );
+        let batch = || {
+            vec![(
+                "ExpoPushToken[x]".to_owned(),
+                Due {
+                    kind: Kind::Turn,
+                    session: "s".into(),
+                },
+            )]
+        };
+        let accepted: Vec<bool> = (0..6).map(|_| sender.dispatch(batch())).collect();
+        assert_eq!(accepted, [true, true, true, true, false, false]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

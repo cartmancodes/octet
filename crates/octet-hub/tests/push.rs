@@ -381,6 +381,17 @@ fn assert_content_free(fake: &Fake) {
     }
 }
 
+/// The first `curl` on the original `PATH`, before the stand-in is put in front of it.
+fn real_curl() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("curl"))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+        .expect("a curl on PATH")
+}
+
 /// The stand-in `curl`'s records: `(argv lines, stdin)` for each call.
 fn curl_calls(log: &Path) -> Vec<(Vec<String>, String)> {
     let mut calls = Vec::new();
@@ -408,8 +419,9 @@ fn push_goes_out_content_free_to_a_phone_in_the_background() {
     let script = bin.join("curl");
     let body = format!(
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{log}'/argv.$$\ncat > '{log}'/stdin.$$\n\
-         exec /usr/bin/curl \"$@\" < '{log}'/stdin.$$\n",
-        log = log.display()
+         exec '{curl}' \"$@\" < '{log}'/stdin.$$\n",
+        log = log.display(),
+        curl = real_curl().display()
     );
     std::fs::write(&script, body).expect("fake curl");
     std::fs::set_permissions(&script, PermissionsExt::from_mode(0o755)).expect("chmod");
