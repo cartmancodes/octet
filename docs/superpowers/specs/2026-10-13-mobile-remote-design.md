@@ -163,7 +163,7 @@ approval as `approval`; and the run directory is `<data dir>/run/`.
 | `prompt {session, text}` | Sends, or queues while a turn runs. |
 | `answer {session, approval, allow}` | Allows once, or denies. |
 | `cancel {session}` | Cancels the running turn. |
-| `steer {session, text}` | Codex only; refused on Claude with the terminal UI's message. |
+| `steer {session, text}` | Steers Codex's running turn. On Claude it does what the desk's `/steer` does: queues the text as a follow-up, with the terminal UI's message. |
 | `set_mode {session, mode}` | Runs `/mode`. `full-access` needs `confirm: "full access"`, plus a biometric check on the phone. |
 | `set_model {session, selection}` | Runs `/model NAME`; a provider switch reconnects and carries the conversation. |
 | `recent {workspace?}` | Lists recent sessions. |
