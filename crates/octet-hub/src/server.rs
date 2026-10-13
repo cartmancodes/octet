@@ -24,7 +24,10 @@
 //! that overflows it is dropped, and resumes from its cursor). When the connection's writer has
 //! sent the last replayed frame it reports, for each journal, the last `seq` replayed (and the
 //! cursor's, which the phone has), and the hub sends the buffered events past those, acks the
-//! subscription and streams live. The replay reads files to their end while the tail polls, so
+//! subscription and streams live. Buffered events the outbox has no room for, with the ack, go
+//! the replay's way instead, waiting for room as a page does, and the hub looks again once they
+//! are written. Frames a replay left queued for a subscription since dropped or replaced are not
+//! sent, so none follows its acknowledgement. The replay reads files to their end while the tail polls, so
 //! live events the replay already sent can still follow: a live event goes out only if its
 //! `seq` is past the last one sent of its journal. A late record of an older journal (the old
 //! session's last words after a reconnect) is past its journal's mark, so it is sent once. Each
@@ -306,8 +309,12 @@ impl Liveness {
 /// What a replay task has a connection's writer send.
 #[derive(Debug)]
 enum ReplayItem {
-    /// A replayed event frame.
-    Frame(String),
+    /// A replayed event frame, and whether its subscription is still the current one: the
+    /// writer passes over a frame queued for one since dropped or replaced.
+    Frame {
+        frame: String,
+        current: Arc<AtomicBool>,
+    },
     /// The replay is over: the writer reports it once everything before it is sent.
     Done {
         session: String,
@@ -319,14 +326,17 @@ enum ReplayItem {
 /// Where one subscription is.
 #[derive(Debug)]
 enum Subscription {
-    /// Replaying: live events wait in `buffer` as `(journal, seq, frame)`. `after` is the
-    /// phone's cursor, when the replay starts there.
+    /// Replaying, or handing over: live events wait in `buffer` as `(journal, seq, frame)`.
+    /// `seen` is the last `seq` of each journal the phone has or has queued (its cursor, then
+    /// what the replay sent). `current` is up while this subscription stands; its frames still
+    /// queued when it goes are not sent.
     Replaying {
         generation: u64,
         req: u64,
-        after: Option<Cursor>,
+        seen: HashMap<String, u64>,
         buffer: Vec<(String, u64, String)>,
         task: AbortHandle,
+        current: Arc<AtomicBool>,
     },
     /// Streaming live. `seen` is the last `seq` the phone has of each journal; a live event at
     /// or below it is a repeat of the replay (the tail had not read it yet) and is dropped.
@@ -355,7 +365,8 @@ fn admit(seen: &mut HashMap<String, u64>, journal: &str, seq: u64) -> bool {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        if let Self::Replaying { task, .. } = self {
+        if let Self::Replaying { task, current, .. } = self {
+            current.store(false, Ordering::Release);
             task.abort();
         }
     }
@@ -1035,23 +1046,32 @@ impl Hub {
         let names: Vec<String> = journals.iter().map(|j| file_name(j)).collect();
         // A cursor in a journal the session does not list is stale: the replay starts over.
         let after = after.filter(|cursor| names.contains(&cursor.journal));
+        let current = Arc::new(AtomicBool::new(true));
+        // The phone has what its cursor names.
+        let seen = after
+            .as_ref()
+            .map(|c| (c.journal.clone(), c.seq))
+            .into_iter()
+            .collect();
         let job = ReplayJob {
             conn,
             journals,
             first: subscribed_frame(&session, after.is_some(), &names).to_string(),
-            after: after.clone(),
+            after,
             session: session.clone(),
             generation,
             out: state.replay.clone(),
+            current: Arc::clone(&current),
             events: self.events.clone(),
         };
         let task = tokio::spawn(replay(job)).abort_handle();
         let subscription = Subscription::Replaying {
             generation,
             req,
-            after,
+            seen,
             buffer: Vec::new(),
             task,
+            current,
         };
         // A subscription it replaces stops its replay as it drops.
         state.subscriptions.insert(session, subscription);
@@ -1061,7 +1081,9 @@ impl Hub {
     }
 
     /// A replay's frames are all sent: the buffered events it did not send follow, then the ack,
-    /// and the subscription is live.
+    /// and the subscription is live. When the outbox has no room for them all and the ack, they
+    /// go the replay's way instead, waiting for room as a page does, and the hub looks again once
+    /// they are written: the subscription stays replaying, and buffers, until then.
     fn on_replayed(&mut self, conn: u64, session: &str, generation: u64, sent: Vec<(String, u64)>) {
         let Some(state) = self.conns.get_mut(&conn) else {
             return;
@@ -1070,29 +1092,38 @@ impl Hub {
             return;
         };
         let Subscription::Replaying {
-            generation: current,
+            generation: standing,
             req,
-            after,
+            seen,
             buffer,
-            ..
+            task,
+            current,
         } = subscription
         else {
             return;
         };
-        if *current != generation {
+        if *standing != generation {
             return;
         }
-        // The phone has what its cursor names, and what the replay sent.
-        let mut seen: HashMap<String, u64> = after
-            .take()
-            .map(|c| (c.journal, c.seq))
-            .into_iter()
-            .collect();
         for (journal, seq) in sent {
-            admit(&mut seen, &journal, seq);
+            admit(seen, &journal, seq);
         }
-        let fresh = fresh(std::mem::take(buffer), &mut seen);
+        let fresh = fresh(std::mem::take(buffer), seen);
+        if fresh.len() >= state.out.capacity() {
+            let job = HandOff {
+                conn,
+                frames: fresh,
+                session: session.to_owned(),
+                generation,
+                out: state.replay.clone(),
+                current: Arc::clone(current),
+                events: self.events.clone(),
+            };
+            *task = tokio::spawn(hand_off(job)).abort_handle();
+            return;
+        }
         let req = *req;
+        let seen = std::mem::take(seen);
         *subscription = Subscription::Live { seen };
         for frame in fresh {
             self.push(conn, frame);
@@ -1773,7 +1804,17 @@ struct ReplayJob {
     session: String,
     generation: u64,
     out: mpsc::Sender<ReplayItem>,
+    /// Whether the subscription still stands; given to every frame.
+    current: Arc<AtomicBool>,
     events: mpsc::Sender<ConnEvent>,
+}
+
+/// Queues `item` for the writer, waiting for room for at most [`WRITE_STALL`]; false if there
+/// was none in time or the connection is gone.
+async fn queue(out: &mpsc::Sender<ReplayItem>, item: ReplayItem) -> bool {
+    timeout(WRITE_STALL, out.send(item))
+        .await
+        .is_ok_and(|queued| queued.is_ok())
 }
 
 /// Replays a session's journals after the cursor, a page at a time, into the connection's
@@ -1787,6 +1828,7 @@ async fn replay(job: ReplayJob) {
         session,
         generation,
         out,
+        current,
         events,
     } = job;
     let mut sent: Vec<(String, u64)> = Vec::new();
@@ -1794,10 +1836,11 @@ async fn replay(job: ReplayJob) {
     let stalled = || async {
         let _ = events.send(ConnEvent::Stalled { conn }).await;
     };
-    if !timeout(WRITE_STALL, out.send(ReplayItem::Frame(first)))
-        .await
-        .is_ok_and(|queued| queued.is_ok())
-    {
+    let frame = |frame: String| ReplayItem::Frame {
+        frame,
+        current: Arc::clone(&current),
+    };
+    if !queue(&out, frame(first)).await {
         stalled().await;
         return;
     }
@@ -1813,11 +1856,7 @@ async fn replay(job: ReplayJob) {
             seq: *seq,
         };
         for (journal, seq, record) in &page {
-            let frame = ReplayItem::Frame(event_text(&session, journal, *seq, record));
-            if !timeout(WRITE_STALL, out.send(frame))
-                .await
-                .is_ok_and(|queued| queued.is_ok())
-            {
+            if !queue(&out, frame(event_text(&session, journal, *seq, record))).await {
                 stalled().await;
                 return;
             }
@@ -1836,11 +1875,51 @@ async fn replay(job: ReplayJob) {
         generation,
         sent,
     };
-    if !timeout(WRITE_STALL, out.send(done))
-        .await
-        .is_ok_and(|queued| queued.is_ok())
-    {
+    if !queue(&out, done).await {
         stalled().await;
+    }
+}
+
+/// What one hand-off task needs: the live events a replay's end found buffered.
+#[derive(Debug)]
+struct HandOff {
+    conn: u64,
+    frames: Vec<String>,
+    session: String,
+    generation: u64,
+    out: mpsc::Sender<ReplayItem>,
+    current: Arc<AtomicBool>,
+    events: mpsc::Sender<ConnEvent>,
+}
+
+/// Queues buffered live events the way a replay page goes, waiting for room, then marks the
+/// end again so the hub hands over what buffered meanwhile. A phone with no room for too long
+/// is reported stalled.
+async fn hand_off(job: HandOff) {
+    let HandOff {
+        conn,
+        frames,
+        session,
+        generation,
+        out,
+        current,
+        events,
+    } = job;
+    for frame in frames {
+        let current = Arc::clone(&current);
+        if !queue(&out, ReplayItem::Frame { frame, current }).await {
+            let _ = events.send(ConnEvent::Stalled { conn }).await;
+            return;
+        }
+    }
+    // The hub counted these as the phone's when it handed them over.
+    let done = ReplayItem::Done {
+        session,
+        generation,
+        sent: Vec::new(),
+    };
+    if !queue(&out, done).await {
+        let _ = events.send(ConnEvent::Stalled { conn }).await;
     }
 }
 
@@ -1931,8 +2010,10 @@ async fn pump(
                 }
             }
             item = replays.recv(), if replaying => match item {
-                Some(ReplayItem::Frame(frame)) => {
-                    if !write(&mut ws, frame).await {
+                Some(ReplayItem::Frame { frame, current }) => {
+                    // A subscription since dropped or replaced has its acknowledgement out
+                    // already: what it left queued would follow it.
+                    if current.load(Ordering::Acquire) && !write(&mut ws, frame).await {
                         return;
                     }
                 }

@@ -1522,3 +1522,104 @@ async fn at_most_eight_phone_started_sessions_run() {
         )
     );
 }
+
+/// Appends records `seqs` to the journal `name` of `env`, each padded with `pad` bytes.
+fn padded_journal(env: &Env, name: &str, seqs: std::ops::Range<u64>, pad: usize) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(env.root.join(name))
+        .expect("journal");
+    let filler = "x".repeat(pad);
+    for seq in seqs {
+        let record = json!({"format": "octet-preview-1", "seq": seq, "type": "text",
+            "data": {"n": seq, "pad": filler}});
+        writeln!(file, "{record}").expect("journal write");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_live_events_than_the_outbox_holds_wait_for_a_slow_phone_at_the_handover() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5101, 0..0).await;
+    // 300 records of 60 KB: the replay reads them and then waits on a phone that does not read.
+    padded_journal(&env, JOURNAL, 0..300, 60_000);
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(&mut phone, subscribe(3, &bridge.id, None)).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    // 700 small records land while the replay waits: more than the 512 live frames the outbox
+    // holds, so the handover cannot put them all there at once.
+    env.journal(JOURNAL, 300..1000);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut seqs = Vec::new();
+    let read = timeout(Duration::from_secs(30), async {
+        loop {
+            match phone.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(text.as_str()).expect("JSON");
+                    match frame["type"].as_str() {
+                        Some("event") => seqs.push(frame["seq"].as_u64().expect("a seq")),
+                        Some("ack") => return Some(frame),
+                        _ => {}
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .expect("the phone reads in time");
+    assert_eq!(
+        read,
+        Some(ack(3, "Subscribed")),
+        "the connection was cut after {} events (last {:?})",
+        seqs.len(),
+        seqs.last()
+    );
+    assert!(seqs.iter().copied().eq(0..1000), "a gap or a repeat");
+    // Still connected, and live.
+    send(&mut phone, json!({"v": 1, "req": 4, "type": "ping"})).await;
+    assert_eq!(recv_kind(&mut phone, "ack").await, ack(4, "pong"));
+    env.journal(JOURNAL, 1000..1001);
+    assert_eq!(recv_kind(&mut phone, "event").await["seq"], 1000);
+}
+
+#[tokio::test]
+async fn no_replayed_event_follows_the_unsubscribe_ack() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5102, 0..0).await;
+    padded_journal(&env, JOURNAL, 0..5000, 200);
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(&mut phone, subscribe(3, &bridge.id, None)).await;
+    // The phone does not read for a while, so the replay fills its queue to the writer.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 4, "type": "unsubscribe", "session": bridge.id}),
+    )
+    .await;
+    loop {
+        let frame = recv(&mut phone).await;
+        if frame["type"] == "ack" {
+            assert_eq!(frame, ack(4, "Unsubscribed"));
+            break;
+        }
+    }
+    let mut late = 0;
+    while let Ok(frame) = timeout(Duration::from_millis(400), recv(&mut phone)).await {
+        if frame["type"] == "event" {
+            late += 1;
+        }
+    }
+    assert_eq!(late, 0, "replayed events arrived after the unsubscribe ack");
+    // A new subscription's frames come after its own `subscribed`, and none of the old one's.
+    send(&mut phone, subscribe(5, &bridge.id, Some(4990))).await;
+    assert_eq!(recv(&mut phone).await["type"], "subscribed");
+    for seq in 4991..5000 {
+        assert_eq!(recv(&mut phone).await["seq"], seq);
+    }
+    assert_eq!(recv(&mut phone).await, ack(5, "Subscribed"));
+}
