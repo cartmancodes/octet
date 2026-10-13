@@ -510,4 +510,49 @@ describe("the mode and model sheet", () => {
     expect(style.minHeight).toBeGreaterThanOrEqual(44);
     expect([dark.fg, light.fg]).toContain(StyleSheet.flatten(screen.getByText("Auto").props.style).color);
   });
+
+  describe("offline", () => {
+    const offline = (send: ReturnType<typeof rig>["send"], off = true) => (
+      <ModeModelSheet session="s" catalog={CATALOG} send={send} offline={off} />
+    );
+
+    it("the Mode and model button is disabled", async () => {
+      const r = rig();
+      await render(offline(r.send));
+      expect(button("Mode and model")?.props.accessibilityState?.disabled).toBe(true);
+      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
+      expect(button("Auto")).toBeNull();
+    });
+
+    it("an open sheet's choices send nothing once the link drops", async () => {
+      const r = rig();
+      const view = await render(offline(r.send, false));
+      await press("Mode and model");
+      await settle();
+      await view.rerender(offline(r.send));
+      expect(button("Auto")?.props.accessibilityState?.disabled).toBe(true);
+      await fireEvent.press(screen.getByRole("button", { name: "Auto" }));
+      await fireEvent.press(screen.getByRole("button", { name: /^Full access$/ }));
+      await flush();
+      expect(auth.authenticateAsync).not.toHaveBeenCalled();
+      expect(r.send).not.toHaveBeenCalled();
+      // Close still works.
+      await press("Close");
+      expect(button("Auto")).toBeNull();
+    });
+
+    it("full access, armed before the drop, cannot be turned on while offline", async () => {
+      const r = rig();
+      const view = await render(offline(r.send, false));
+      await press("Mode and model");
+      await settle();
+      await press(/^Full access$/);
+      await fireEvent.changeText(screen.getByLabelText("Type full access to confirm"), "full access");
+      await view.rerender(offline(r.send));
+      const turnOn = screen.getByRole("button", { name: "Turn on full access" });
+      expect(turnOn.props.accessibilityState.disabled).toBe(true);
+      await fireEvent.press(turnOn);
+      expect(r.send).not.toHaveBeenCalled();
+    });
+  });
 });

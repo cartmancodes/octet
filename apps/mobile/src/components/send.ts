@@ -127,12 +127,19 @@ export interface TextSender {
   submit: () => void;
 }
 
-/** A text box that sends its text as a `prompt` or a `steer` for `session`. */
-export function useTextSender(send: Send, session: string, kind: "prompt" | "steer", onSent?: () => void): TextSender {
+/** A text box that sends its text as a `prompt` or a `steer` for `session`. `offline`: the Mac
+ * can't be reached, so nothing is sent; the text stays for when it is back. */
+export function useTextSender(
+  send: Send,
+  session: string,
+  kind: "prompt" | "steer",
+  onSent?: () => void,
+  offline = false,
+): TextSender {
   const [text, setTextState] = useState("");
   const { busy, failed, run, fail } = useAction(send);
   const slash = isSlash(text);
-  const canSend = !busy && text.trim() !== "" && !slash;
+  const canSend = !busy && !offline && text.trim() !== "" && !slash;
   const setText = useCallback(
     (next: string) => {
       setTextState(next);

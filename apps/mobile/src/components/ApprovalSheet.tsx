@@ -10,16 +10,14 @@ import { loadSettings } from "../persist";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
 import { failure, useAlive, type Send } from "./send";
 
-/** Allow stays dead this long after a request comes to the front: a tap meant for the one before
- * (or a thumb already on its way) must not approve the next. */
+/** Allow and Deny stay dead this long after a request comes to the front: a tap meant for the one
+ * before (or a thumb already on its way) must not answer the next. */
 export const ARM_MS = 400;
 /** Files listed before "+N more". */
 export const FILES_SHOWN = 5;
 export const NO_FACE_ID = "Face ID isn't set up on this phone. Turn it off in Settings to allow from here.";
 /** The system prompt's sentence is short; the action can be long. */
 const REASON_CHARS = 80;
-/** Answered approvals remembered, so one the Mac has not closed yet does not come back. */
-const ANSWERED_KEPT = 32;
 
 interface ApprovalSheetProps {
   session: string;
@@ -27,6 +25,8 @@ interface ApprovalSheetProps {
   approvals: PendingApproval[];
   /** Must be stable. */
   send: Send;
+  /** The Mac can't be reached: the request stays on screen and nothing can be answered. */
+  offline?: boolean;
 }
 
 function makeStyles(theme: Theme) {
@@ -82,12 +82,14 @@ const POSE = poseFor({ kind: "approval" });
  * another device closed disappears (the store drops it); one answered here goes at once. The sheet
  * is the only amber thing on the screen. The screen does not mount it for a session that ended.
  */
-export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, send }: ApprovalSheetProps) {
+export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, send, offline = false }: ApprovalSheetProps) {
+  // Answered here and not closed by the Mac yet: hidden. Only ids still listed are kept, so an id
+  // that left and came back is a new request (a vendor numbers its approvals from 1 again after a
+  // provider switch or a reconnect), shown and answerable.
   const [answered, setAnswered] = useState<readonly number[]>([]);
-  const onAnswered = useCallback(
-    (id: number) => setAnswered((prev) => (prev.includes(id) ? prev : [...prev, id].slice(-ANSWERED_KEPT))),
-    [],
-  );
+  const listed = answered.filter((id) => approvals.some((a) => a.id === id));
+  if (listed.length !== answered.length) setAnswered(listed);
+  const onAnswered = useCallback((id: number) => setAnswered((prev) => (prev.includes(id) ? prev : [...prev, id])), []);
   // The ids still open, for a request to ask after Face ID: the store may have closed it meanwhile.
   // A layout effect, not a passive one: it runs in the commit itself, so a close is visible at
   // once to an Allow that is awaiting Face ID, with no frame in between.
@@ -96,7 +98,7 @@ export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, s
     open.current = approvals.map((a) => a.id);
   });
   const isOpen = useCallback((id: number) => open.current.includes(id), []);
-  const waiting = approvals.filter((a) => !answered.includes(a.id));
+  const waiting = approvals.filter((a) => !listed.includes(a.id));
   const front = waiting[0];
   if (!front) return null;
   // Keyed by the id and what it asks: each request, and the same one once its content is filled
@@ -109,6 +111,7 @@ export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, s
       approval={front}
       more={waiting.length - 1}
       send={send}
+      offline={offline}
       onAnswered={onAnswered}
     />
   );
@@ -119,12 +122,13 @@ interface RequestProps {
   approval: PendingApproval;
   more: number;
   send: Send;
+  offline: boolean;
   /** Whether the approval is still open: it may have been closed elsewhere while Face ID was up. */
   isOpen: (id: number) => boolean;
   onAnswered: (id: number) => void;
 }
 
-function Request({ session, approval, more, send, isOpen, onAnswered }: RequestProps) {
+function Request({ session, approval, more, send, offline, isOpen, onAnswered }: RequestProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const alive = useAlive();
@@ -134,6 +138,12 @@ function Request({ session, approval, more, send, isOpen, onAnswered }: RequestP
   const [stage, setStage] = useState<"checking" | "sending" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const out = useRef(false);
+  // For an answer that awaited Face ID: the link may have gone down meanwhile. A layout effect,
+  // like `open` above, so the commit that takes the link away is seen at once.
+  const down = useRef(offline);
+  useLayoutEffect(() => {
+    down.current = offline;
+  });
 
   useEffect(() => {
     const timer = setTimeout(() => setArmed(true), ARM_MS);
@@ -143,7 +153,7 @@ function Request({ session, approval, more, send, isOpen, onAnswered }: RequestP
   const { summary, detail, id } = approval;
   const answer = useCallback(
     async (allow: boolean) => {
-      if (out.current || (allow && !armed)) return;
+      if (out.current || !armed || down.current) return;
       out.current = true;
       setError(null);
       setStage("checking");
@@ -162,8 +172,9 @@ function Request({ session, approval, more, send, isOpen, onAnswered }: RequestP
           }
         }
         // Face ID takes a while: send only if this request is still on screen, still open, and so
-        // still the one the user looked at (the screen takes the sheet away once the session ends).
-        if (!alive() || !isOpen(id)) return;
+        // still the one the user looked at (the screen takes the sheet away once the session ends),
+        // and the Mac can still be reached.
+        if (!alive() || !isOpen(id) || down.current) return;
         setStage("sending");
         await send({ type: "answer", session, approval: id, allow });
         if (allow) successTap();
@@ -182,7 +193,7 @@ function Request({ session, approval, more, send, isOpen, onAnswered }: RequestP
   const toggle = useCallback(() => setFull((open) => !open), []);
 
   const busy = stage !== null;
-  const canAllow = armed && !busy;
+  const canAnswer = armed && !busy && !offline;
   const files = summary.files.slice(0, FILES_SHOWN);
   const rest = summary.files.length - files.length;
   return (
@@ -224,20 +235,20 @@ function Request({ session, approval, more, send, isOpen, onAnswered }: RequestP
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Deny"
-          accessibilityState={{ disabled: busy, busy }}
-          disabled={busy}
+          accessibilityState={{ disabled: !canAnswer, busy }}
+          disabled={!canAnswer}
           onPress={deny}
-          style={[s.button, busy && s.off]}
+          style={[s.button, !canAnswer && s.off]}
         >
           <Text style={s.denyLabel}>Deny</Text>
         </Pressable>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Allow"
-          accessibilityState={{ disabled: !canAllow, busy }}
-          disabled={!canAllow}
+          accessibilityState={{ disabled: !canAnswer, busy }}
+          disabled={!canAnswer}
           onPress={allow}
-          style={[s.button, s.allow, !canAllow && s.off]}
+          style={[s.button, s.allow, !canAnswer && s.off]}
         >
           <Text style={s.allowLabel}>Allow</Text>
         </Pressable>

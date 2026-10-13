@@ -13,6 +13,8 @@ interface ComposerProps {
   queued: number;
   /** Must be stable. */
   send: Send;
+  /** The Mac can't be reached: the words stay, and nothing is sent. */
+  offline?: boolean;
 }
 
 function makeStyles(theme: Theme) {
@@ -68,10 +70,16 @@ export const hintFor = (phase: Phase, queued: number): string =>
  * connection never costs the user their words. `/…` is not sent: slash commands are the
  * terminal UI's.
  */
-export const Composer = memo(function Composer({ session, phase, queued, send }: ComposerProps) {
+export const Composer = memo(function Composer({ session, phase, queued, send, offline = false }: ComposerProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
-  const { text, setText, busy, failed, slash, canSend, submit } = useTextSender(send, session, "prompt");
+  const { text, setText, busy, failed, slash, canSend, submit } = useTextSender(
+    send,
+    session,
+    "prompt",
+    undefined,
+    offline,
+  );
   const verb = phase === "running" ? "Queue" : "Send";
   return (
     <View style={s.box}>
@@ -81,7 +89,14 @@ export const Composer = memo(function Composer({ session, phase, queued, send }:
         <View style={s.failure} accessibilityLiveRegion="polite">
           <Text style={s.failureText}>{failed.text}</Text>
           {failed.retry ? (
-            <Pressable accessibilityRole="button" accessibilityLabel="Try again" onPress={submit} style={s.retry}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Try again"
+              accessibilityState={{ disabled: offline }}
+              disabled={offline}
+              onPress={submit}
+              style={[s.retry, offline && s.off]}
+            >
               <Text style={s.retryText}>Try again</Text>
             </Pressable>
           ) : null}

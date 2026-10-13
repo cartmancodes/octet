@@ -138,25 +138,124 @@ describe("approvals_queue_and_close_elsewhere", () => {
     expect(r.sent).toEqual([]);
   });
 
-  it("keeps Allow disabled for 400 ms after each approval comes to the front, Deny not", async () => {
+  it("keeps Allow and Deny disabled for 400 ms after each approval comes to the front", async () => {
     const r = rig();
     await render(<ApprovalSheet session="s" approvals={[approval(1), approval(2)]} send={r.send} />);
     expect(disabled(allow())).toBe(true);
-    expect(disabled(deny())).toBe(false);
+    expect(disabled(deny())).toBe(true);
     await fireEvent.press(allow());
+    await fireEvent.press(deny());
     expect(r.send).not.toHaveBeenCalled();
     await settle(399);
     expect(disabled(allow())).toBe(true);
+    expect(disabled(deny())).toBe(true);
     await settle(1);
     expect(disabled(allow())).toBe(false);
+    expect(disabled(deny())).toBe(false);
     // the next one re-arms
     await fireEvent.press(allow());
     r.waiting[0]?.resolve();
     await flush();
     expect(screen.getByText("Run command 2")).toBeTruthy();
     expect(disabled(allow())).toBe(true);
+    expect(disabled(deny())).toBe(true);
+    await fireEvent.press(deny());
+    expect(r.send).toHaveBeenCalledTimes(1);
     await settle(400);
     expect(disabled(allow())).toBe(false);
+    expect(disabled(deny())).toBe(false);
+  });
+
+  it("shows an approval whose id comes back after it was answered and closed: it is a new one", async () => {
+    const r = rig();
+    const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+    await settle(400);
+    await fireEvent.press(allow());
+    r.waiting[0]?.resolve();
+    await flush();
+    // Answered: hidden while the Mac has not closed it yet.
+    expect(screen.queryByText("Run command 1")).toBeNull();
+    await view.rerender(<ApprovalSheet session="s" approvals={[]} send={r.send} />);
+    // The vendor started over (a provider switch, a reconnect): its ids restart at 1.
+    await view.rerender(
+      <ApprovalSheet session="s" approvals={[approval(1, { action: "Edit main.rs" })]} send={r.send} />,
+    );
+    expect(screen.getByText("Edit main.rs")).toBeTruthy();
+    await settle(400);
+    await fireEvent.press(deny());
+    expect(r.sent).toEqual([
+      { type: "answer", session: "s", approval: 1, allow: true },
+      { type: "answer", session: "s", approval: 1, allow: false },
+    ]);
+  });
+
+  it("keeps an answered approval hidden while the Mac still lists it", async () => {
+    const r = rig();
+    const view = await render(<ApprovalSheet session="s" approvals={[approval(1), approval(2)]} send={r.send} />);
+    await settle(400);
+    await fireEvent.press(deny());
+    r.waiting[0]?.resolve();
+    await flush();
+    await view.rerender(<ApprovalSheet session="s" approvals={[approval(1), approval(2)]} send={r.send} />);
+    expect(screen.queryByText("Run command 1")).toBeNull();
+    expect(screen.getByText("Run command 2")).toBeTruthy();
+  });
+
+  it("re-arms Deny too when the same approval's request is filled in", async () => {
+    const r = rig();
+    const view = await render(<ApprovalSheet session="s" approvals={[approval(1, { command: null })]} send={r.send} />);
+    await settle(400);
+    expect(disabled(deny())).toBe(false);
+    await view.rerender(
+      <ApprovalSheet session="s" approvals={[approval(1, { command: "rm -rf build" })]} send={r.send} />,
+    );
+    expect(disabled(deny())).toBe(true);
+    await fireEvent.press(deny());
+    expect(r.send).not.toHaveBeenCalled();
+    await settle(400);
+    expect(disabled(deny())).toBe(false);
+  });
+
+  describe("while the Mac can't be reached", () => {
+    it("disables Allow and Deny, keeps the request on screen, and sends nothing", async () => {
+      const r = rig();
+      await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} offline />);
+      await settle(400);
+      expect(screen.getByText("Run command 1")).toBeTruthy();
+      expect(disabled(allow())).toBe(true);
+      expect(disabled(deny())).toBe(true);
+      await fireEvent.press(allow());
+      await fireEvent.press(deny());
+      await flush();
+      expect(r.send).not.toHaveBeenCalled();
+    });
+
+    it("lets the user answer again once the Mac is back", async () => {
+      const r = rig();
+      const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} offline />);
+      await settle(400);
+      await view.rerender(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} offline={false} />);
+      expect(disabled(allow())).toBe(false);
+      await fireEvent.press(deny());
+      expect(r.sent).toEqual([{ type: "answer", session: "s", approval: 1, allow: false }]);
+    });
+
+    it("sends nothing when Face ID passes after the link went down", async () => {
+      await saveSettings({ faceId: true });
+      let pass: () => void = () => {};
+      auth.authenticateAsync.mockImplementationOnce(
+        () => new Promise((resolve) => (pass = () => resolve({ success: true }))),
+      );
+      const r = rig();
+      const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+      await settle(400);
+      await fireEvent.press(allow());
+      await flush();
+      expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
+      await view.rerender(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} offline />);
+      await act(async () => pass());
+      expect(r.send).not.toHaveBeenCalled();
+    });
   });
 
   it("asks for Face ID before Allow when the setting is on, and sends after it", async () => {
@@ -207,6 +306,7 @@ describe("approvals_queue_and_close_elsewhere", () => {
     await saveSettings({ faceId: true });
     const r = rig();
     await render(<ApprovalSheet session="s" approvals={[approval(4)]} send={r.send} />);
+    await settle(400);
     await fireEvent.press(deny());
     expect(auth.authenticateAsync).not.toHaveBeenCalled();
     expect(r.sent).toEqual([{ type: "answer", session: "s", approval: 4, allow: false }]);
@@ -244,6 +344,7 @@ describe("approvals_queue_and_close_elsewhere", () => {
   it("does not tap success for a deny", async () => {
     const r = rig();
     await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+    await settle(400);
     await fireEvent.press(deny());
     r.waiting[0]?.resolve();
     await flush();
@@ -253,6 +354,7 @@ describe("approvals_queue_and_close_elsewhere", () => {
   it("shows the hub's words on a refusal and lets the user answer again", async () => {
     const r = rig();
     await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+    await settle(400);
     await fireEvent.press(deny());
     r.waiting[0]?.reject(new Refusal("invalid", "That approval is already closed"));
     await flush();
@@ -265,6 +367,7 @@ describe("approvals_queue_and_close_elsewhere", () => {
   it("says a lost answer may not have reached the Mac, and offers no resend", async () => {
     const r = rig();
     await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+    await settle(400);
     await fireEvent.press(deny());
     r.waiting[0]?.reject(new Refusal("lost", "The Mac did not answer in time"));
     await flush();
@@ -276,6 +379,7 @@ describe("approvals_queue_and_close_elsewhere", () => {
   it("clears an old refusal when the next approval comes", async () => {
     const r = rig();
     const view = await render(<ApprovalSheet session="s" approvals={[approval(1), approval(2)]} send={r.send} />);
+    await settle(400);
     await fireEvent.press(deny());
     r.waiting[0]?.reject(new Refusal("busy", "The Mac is busy"));
     await flush();

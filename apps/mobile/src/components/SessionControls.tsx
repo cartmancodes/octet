@@ -11,6 +11,8 @@ interface SessionControlsProps {
   engine: Engine;
   /** Must be stable. */
   send: Send;
+  /** The Mac can't be reached: nothing is sent, and typed words stay. */
+  offline?: boolean;
 }
 
 function makeStyles(theme: Theme) {
@@ -57,7 +59,13 @@ const LIGHT = makeStyles(light);
  * or End the session when it is idle (after a question). Each shows only when the Mac would
  * accept it; a refusal is shown in the hub's words.
  */
-export const SessionControls = memo(function SessionControls({ session, phase, engine, send }: SessionControlsProps) {
+export const SessionControls = memo(function SessionControls({
+  session,
+  phase,
+  engine,
+  send,
+  offline = false,
+}: SessionControlsProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const control = useAction(send);
@@ -67,7 +75,7 @@ export const SessionControls = memo(function SessionControls({ session, phase, e
   // The Mac took End: wait for the session to leave rather than offer it again.
   const [ended, setEnded] = useState(false);
   const closeSteer = useCallback(() => setSteering(false), []);
-  const steer = useTextSender(send, session, "steer", closeSteer);
+  const steer = useTextSender(send, session, "steer", closeSteer, offline);
 
   // A new phase is a new situation: a half-made End or an open Steer field means nothing now.
   const [seen, setSeen] = useState(phase);
@@ -83,17 +91,24 @@ export const SessionControls = memo(function SessionControls({ session, phase, e
   const canSteer = running && engine === "codex";
   const canEnd = phase === "idle";
 
-  const cancel = useCallback(() => run({ type: "cancel", session }), [run, session]);
-  const ask = useCallback(() => setEnding(true), []);
+  const cancel = useCallback(() => {
+    if (!offline) run({ type: "cancel", session });
+  }, [run, session, offline]);
+  const ask = useCallback(() => {
+    if (!offline) setEnding(true);
+  }, [offline]);
   const keep = useCallback(() => setEnding(false), []);
   const end = useCallback(() => {
+    if (offline) return;
     setEnding(false);
     run({ type: "end", session }, () => setEnded(true));
-  }, [run, session]);
+  }, [run, session, offline]);
   const toggleSteer = useCallback(() => setSteering((open) => !open), []);
 
   if (!running && !canEnd) return null;
   const steerOpen = canSteer && steering;
+  const cancelOff = control.busy || offline;
+  const endOff = control.busy || ended || offline;
   return (
     <View style={s.box}>
       {canEnd && ending ? (
@@ -102,8 +117,10 @@ export const SessionControls = memo(function SessionControls({ session, phase, e
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="Yes, end it"
+            accessibilityState={{ disabled: offline }}
+            disabled={offline}
             onPress={end}
-            style={[s.button, s.primary]}
+            style={[s.button, s.primary, offline && s.off]}
           >
             <Text style={s.primaryLabel}>Yes, end it</Text>
           </Pressable>
@@ -117,10 +134,10 @@ export const SessionControls = memo(function SessionControls({ session, phase, e
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Cancel"
-              accessibilityState={{ disabled: control.busy, busy: control.busy }}
-              disabled={control.busy}
+              accessibilityState={{ disabled: cancelOff, busy: control.busy }}
+              disabled={cancelOff}
               onPress={cancel}
-              style={[s.button, control.busy && s.off]}
+              style={[s.button, cancelOff && s.off]}
             >
               <Text style={s.label}>Cancel</Text>
             </Pressable>
@@ -140,10 +157,10 @@ export const SessionControls = memo(function SessionControls({ session, phase, e
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={ended ? "Ending…" : "End session"}
-              accessibilityState={{ disabled: control.busy || ended, busy: control.busy || ended }}
-              disabled={control.busy || ended}
+              accessibilityState={{ disabled: endOff, busy: control.busy || ended }}
+              disabled={endOff}
               onPress={ask}
-              style={[s.button, (control.busy || ended) && s.off]}
+              style={[s.button, endOff && s.off]}
             >
               <Text style={s.label}>{ended ? "Ending…" : "End session"}</Text>
             </Pressable>
@@ -175,8 +192,10 @@ export const SessionControls = memo(function SessionControls({ session, phase, e
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="Try again"
+                  accessibilityState={{ disabled: offline }}
+                  disabled={offline}
                   onPress={steer.submit}
-                  style={s.button}
+                  style={[s.button, offline && s.off]}
                 >
                   <Text style={s.label}>Try again</Text>
                 </Pressable>

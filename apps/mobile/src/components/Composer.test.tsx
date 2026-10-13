@@ -151,4 +151,34 @@ describe("the composer", () => {
     const colour = (StyleSheet.flatten(screen.getByText("The Mac is busy").props.style) as { color?: string }).color;
     expect([dark.fg, light.fg]).toContain(colour);
   });
+
+  it("offline, keeps the words but cannot send them, until the Mac is back", async () => {
+    const r = rig();
+    const view = await render(<Composer session="s" phase="idle" queued={0} send={r.send} />);
+    await fireEvent.changeText(input(), "fix the hub");
+    await view.rerender(<Composer session="s" phase="idle" queued={0} send={r.send} offline />);
+    expect(input().props.value).toBe("fix the hub");
+    expect(disabled(sendButton())).toBe(true);
+    await fireEvent.press(sendButton());
+    expect(r.send).not.toHaveBeenCalled();
+    await view.rerender(<Composer session="s" phase="idle" queued={0} send={r.send} offline={false} />);
+    expect(input().props.value).toBe("fix the hub");
+    expect(disabled(sendButton())).toBe(false);
+    await fireEvent.press(sendButton());
+    expect(r.sent).toEqual([{ type: "prompt", session: "s", text: "fix the hub" }]);
+  });
+
+  it("offline, Try again sends nothing", async () => {
+    const r = rig();
+    const view = await render(<Composer session="s" phase="idle" queued={0} send={r.send} />);
+    await fireEvent.changeText(input(), "hi");
+    await fireEvent.press(sendButton());
+    r.waiting[0]?.reject(new Refusal("unsent", "Can't reach your Mac"));
+    await flush();
+    await view.rerender(<Composer session="s" phase="idle" queued={0} send={r.send} offline />);
+    const retry = screen.getByRole("button", { name: "Try again" });
+    expect(disabled(retry)).toBe(true);
+    await fireEvent.press(retry);
+    expect(r.send).toHaveBeenCalledTimes(1);
+  });
 });

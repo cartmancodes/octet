@@ -4,13 +4,12 @@ import { useCallback, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { Refusal } from "../../src/client/HubClient";
 import { ApprovalSheet } from "../../src/components/ApprovalSheet";
 import { Composer } from "../../src/components/Composer";
 import { useFollow } from "../../src/components/follow";
 import { HubBanner } from "../../src/components/HubBanner";
 import { ModeModelSheet } from "../../src/components/ModeModelSheet";
-import type { Send } from "../../src/components/send";
+import { useSend } from "../../src/components/send";
 import { SessionControls } from "../../src/components/SessionControls";
 import { TaskStrip } from "../../src/components/TaskStrip";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
@@ -41,6 +40,8 @@ const typeOf = (entry: Entry): string => entry.kind;
  * transcript opens at its end. Following the output is `useFollow`'s. */
 const KEEP_POSITION = { startRenderingFromBottom: true } as const;
 const NO_OPEN: ReadonlySet<string> = new Set();
+/** Over the controls while the Mac can't be reached. */
+export const WAITING = "Waiting for your Mac…";
 
 /**
  * One session: its Task strip and transcript. Shown, it streams the session (`watch`); left, it
@@ -117,12 +118,12 @@ export default function Session() {
   const now = nowLine(state, info);
 
   // Commands go to the Mac through the one client; with none (not paired yet) they are unsent.
-  const send = useCallback<Send>(
-    (body) => (client ? client.request(body) : Promise.reject(new Refusal("unsent", "Can't reach your Mac"))),
-    [client],
-  );
+  const send = useSend();
   // Only a live session takes commands: not an ended one, one the hub refused, or one that is gone.
   const live = !gone && !status.ended && status.failed === null;
+  // While the Mac can't be reached the screen shows its last state, greyed, and takes no command
+  // until the link is back. Nothing unmounts, so typed words outlive a brief `connecting`.
+  const offline = hub !== "ready";
   const phase = state?.phase ?? info?.phase ?? "idle";
   const queued = queueWords(state).count;
   // The home indicator's room is only needed under the composer; the keyboard covers it.
@@ -154,7 +155,7 @@ export default function Session() {
             {status.ended ? <Notice text="This session ended" /> : null}
             {status.failed !== null ? <Notice text={status.failed} /> : null}
             <TaskStrip state={state} now={now} goal={info?.goal ?? null} open={taskOpen} onOpen={setTaskOpen} />
-            <View style={styles.transcript}>
+            <View testID="transcript-area" style={[styles.transcript, offline && styles.greyed]}>
               <FlashList
                 ref={list}
                 testID="transcript"
@@ -186,11 +187,18 @@ export default function Session() {
             </View>
             {live ? (
               <>
-                <ApprovalSheet session={id} approvals={approvals} send={send} />
-                <SessionControls session={id} phase={phase} engine={info?.engine ?? "claude"} send={send} />
-                <ModeModelSheet session={id} catalog={catalog} send={send} />
+                {offline ? <Text style={[type.caption, styles.waiting, { color: theme.muted }]}>{WAITING}</Text> : null}
+                <ApprovalSheet session={id} approvals={approvals} send={send} offline={offline} />
+                <SessionControls
+                  session={id}
+                  phase={phase}
+                  engine={info?.engine ?? "claude"}
+                  send={send}
+                  offline={offline}
+                />
+                <ModeModelSheet session={id} catalog={catalog} send={send} offline={offline} />
                 <View style={{ paddingBottom: Math.max(insets.bottom, spacing.sm) }}>
-                  <Composer session={id} phase={phase} queued={queued} send={send} />
+                  <Composer session={id} phase={phase} queued={queued} send={send} offline={offline} />
                 </View>
               </>
             ) : null}
@@ -218,6 +226,9 @@ function Notice({ text }: { text: string }) {
 const styles = StyleSheet.create({
   screen: { flex: 1 },
   transcript: { flex: 1 },
+  /** The last state, while the Mac can't be reached: dimmed, whatever the theme. */
+  greyed: { opacity: 0.6 },
+  waiting: { paddingHorizontal: spacing.lg, paddingTop: spacing.sm },
   list: { paddingVertical: spacing.sm },
   gone: { flex: 1, alignItems: "center", justifyContent: "center", gap: spacing.lg, padding: spacing.xl },
   center: { textAlign: "center" },

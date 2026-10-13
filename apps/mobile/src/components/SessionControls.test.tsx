@@ -182,4 +182,50 @@ describe("the session controls", () => {
     await view.rerender(controls("idle", "claude", r.send));
     expect(button("End session")).toBeTruthy();
   });
+
+  describe("offline", () => {
+    const disabled = (name: string) => {
+      const node = screen.getByRole("button", { name }) as { props: { accessibilityState?: { disabled?: boolean } } };
+      return node.props.accessibilityState?.disabled === true;
+    };
+    const offline = (phase: Phase, engine: Engine, send: ReturnType<typeof rig>["send"], off = true) => (
+      <SessionControls session="s" phase={phase} engine={engine} send={send} offline={off} />
+    );
+
+    it("Cancel and End send nothing while the Mac can't be reached", async () => {
+      const r = rig();
+      const view = await render(offline("running", "claude", r.send));
+      expect(disabled("Cancel")).toBe(true);
+      await fireEvent.press(button("Cancel") as never);
+      await view.rerender(offline("idle", "claude", r.send));
+      expect(disabled("End session")).toBe(true);
+      await fireEvent.press(button("End session") as never);
+      expect(button("Yes, end it")).toBeNull();
+      expect(r.send).not.toHaveBeenCalled();
+      await view.rerender(offline("idle", "claude", r.send, false));
+      expect(disabled("End session")).toBe(false);
+    });
+
+    it("a half-made End cannot be confirmed once the link drops", async () => {
+      const r = rig();
+      const view = await render(offline("idle", "claude", r.send, false));
+      await fireEvent.press(button("End session") as never);
+      await view.rerender(offline("idle", "claude", r.send));
+      expect(disabled("Yes, end it")).toBe(true);
+      await fireEvent.press(button("Yes, end it") as never);
+      expect(r.send).not.toHaveBeenCalled();
+    });
+
+    it("the Steer field keeps its words but cannot send them", async () => {
+      const r = rig();
+      const view = await render(offline("running", "codex", r.send, false));
+      await fireEvent.press(button("Steer") as never);
+      await fireEvent.changeText(screen.getByLabelText("Steer message"), "use the other file");
+      await view.rerender(offline("running", "codex", r.send));
+      expect(screen.getByLabelText("Steer message").props.value).toBe("use the other file");
+      expect(disabled("Send steer")).toBe(true);
+      await fireEvent.press(button("Send steer") as never);
+      expect(r.send).not.toHaveBeenCalled();
+    });
+  });
 });

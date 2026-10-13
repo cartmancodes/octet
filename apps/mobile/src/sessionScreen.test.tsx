@@ -567,6 +567,75 @@ describe("the Session screen", () => {
       expect(screen.queryByLabelText("Message")).toBeNull();
     });
 
+    describe("while the Mac can't be reached", () => {
+      const isOff = (name: string) =>
+        screen.getByRole("button", { name }).props.accessibilityState?.disabled === true;
+
+      it("greys the transcript, says it is waiting, and takes no command, then comes back", async () => {
+        const rig = await launch([info("a", { phase: "idle" })]);
+        await open(rig, "a");
+        await feed(
+          rig,
+          subscribed(),
+          stateFrame({ phase: "idle" }),
+          ev({ type: "user", data: "Fix the hub" }),
+          approvalEvent(1, "Run tests"),
+          { type: "catalog", session: "a", catalog: { modes: ["ask", "auto"], current_mode: "ask", models: [], current: null } },
+        );
+        await wait(450);
+        await fireEvent.changeText(screen.getByLabelText("Message"), "half a thought");
+        expect(screen.queryByText("Waiting for your Mac…")).toBeNull();
+        expect(StyleSheet.flatten(screen.getByTestId("transcript-area").props.style).opacity ?? 1).toBe(1);
+        await act(async () => {
+          rig.sockets.last.drop();
+        });
+        // The last state, greyed, under a one-line note; nothing unmounted.
+        expect(screen.getByText("Waiting for your Mac…")).toBeTruthy();
+        expect(StyleSheet.flatten(screen.getByTestId("transcript-area").props.style).opacity).toBe(0.6);
+        expect(screen.getByText("Fix the hub")).toBeTruthy();
+        expect(screen.getByText("Run tests")).toBeTruthy();
+        for (const name of ["Allow", "Deny", "Send", "End session", "Mode and model"]) expect(isOff(name)).toBe(true);
+        await fireEvent.press(screen.getByRole("button", { name: "Send" }));
+        await fireEvent.press(screen.getByRole("button", { name: "Deny" }));
+        // A brief `connecting` keeps the typed words.
+        await act(async () => {
+          rig.clock.advance(500);
+        });
+        expect(screen.getByText("Connecting to your Mac…")).toBeTruthy();
+        expect(screen.getByLabelText("Message").props.value).toBe("half a thought");
+        await act(async () => {
+          rig.sockets.last.open();
+          rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+          rig.clock.advance(50);
+        });
+        expect(screen.queryByText("Waiting for your Mac…")).toBeNull();
+        expect(screen.getByLabelText("Message").props.value).toBe("half a thought");
+        for (const name of ["Allow", "Deny", "Send", "End session", "Mode and model"]) expect(isOff(name)).toBe(false);
+        expect(rig.sockets.all.flatMap((s) => s.commandsOf("prompt").concat(s.commandsOf("answer")))).toEqual([]);
+      });
+
+      it("sends no Allow when the link went down while Face ID was up", async () => {
+        await saveSettings({ faceId: true });
+        let pass: () => void = () => {};
+        jest.mocked(LocalAuthentication.authenticateAsync).mockImplementationOnce(
+          () => new Promise((resolve) => void (pass = () => resolve({ success: true }))),
+        );
+        const rig = await launch([info("a")]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), approvalEvent(1, "Run tests"));
+        await wait(450);
+        await fireEvent.press(screen.getByRole("button", { name: "Allow" }));
+        await act(async () => {});
+        await act(async () => {
+          rig.sockets.last.drop();
+          rig.clock.advance(500);
+          rig.sockets.last.open();
+        });
+        await act(async () => pass());
+        expect(rig.sockets.all.flatMap((s) => s.commandsOf("answer"))).toEqual([]);
+      });
+    });
+
     it("sends no Allow when the session ended while Face ID was up", async () => {
       await saveSettings({ faceId: true });
       let pass: () => void = () => {};

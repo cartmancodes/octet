@@ -154,7 +154,7 @@ interface RowProps {
   asking: boolean;
   /** This choice is out, waiting for the Mac. */
   pending: boolean;
-  /** Some choice is out: the others wait. */
+  /** Some choice is out, or the Mac can't be reached: the rows wait. */
   busy: boolean;
   onChoose: (item: Item) => void;
   onConfirm: (item: Item) => void;
@@ -223,6 +223,8 @@ interface ModeModelSheetProps {
   catalog: CatalogInfo | null;
   /** Must be stable. */
   send: Send;
+  /** The Mac can't be reached: the button and the sheet's choices are disabled. */
+  offline?: boolean;
 }
 
 /**
@@ -232,7 +234,12 @@ interface ModeModelSheetProps {
  * model of another engine asks once more. The "current" marks come from the catalog, never from
  * here: the Mac's `catalog` frame after the ack moves them.
  */
-export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, send }: ModeModelSheetProps) {
+export const ModeModelSheet = memo(function ModeModelSheet({
+  session,
+  catalog,
+  send,
+  offline = false,
+}: ModeModelSheetProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const { busy, failed, run, fail } = useAction(send);
@@ -261,10 +268,11 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
     setPending(null);
   }, [disarm]);
   const openSheet = useCallback(() => {
+    if (offline) return;
     disarm();
     fail(null);
     setVisible(true);
-  }, [disarm, fail]);
+  }, [disarm, fail, offline]);
   // While a change is out the sheet stays: its refusal (or its ack) has to land somewhere.
   const close = useCallback(() => {
     if (busy) return;
@@ -289,7 +297,7 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
 
   const onChoose = useCallback(
     (item: Item) => {
-      if (busy || checking() || item.kind === "head") return;
+      if (busy || offline || checking() || item.kind === "head") return;
       fail(null);
       if (item.kind === "mode") {
         if (item.mode === currentMode) return;
@@ -315,22 +323,22 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
         selection: model.selection,
       });
     },
-    [busy, checking, fail, currentMode, currentModel, sendChoice, session, arm, disarm],
+    [busy, offline, checking, fail, currentMode, currentModel, sendChoice, session, arm, disarm],
   );
   const onConfirm = useCallback(
     (item: Item) => {
-      if (busy || item.kind !== "model") return;
+      if (busy || offline || item.kind !== "model") return;
       sendChoice(item.key, {
         type: "set_model",
         session,
         selection: item.model.selection,
       });
     },
-    [busy, sendChoice, session],
+    [busy, offline, sendChoice, session],
   );
 
   const turnOn = useCallback(() => {
-    if (busy || !armed) return;
+    if (busy || offline || !armed) return;
     disarm(); // sent: the approval is spent
     setPending("mode:full-access");
     run(
@@ -342,13 +350,15 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
       },
       done,
     );
-  }, [busy, armed, disarm, run, session, done]);
+  }, [busy, offline, armed, disarm, run, session, done]);
   const cancelFull = useCallback(() => {
     disarm();
     fail(null);
   }, [disarm, fail]);
 
   const waiting = busy ? pending : null;
+  // Rows wait while a choice is out, and while the Mac can't be reached.
+  const held = busy || offline;
   const renderItem = useCallback<ListRenderItem<Item>>(
     ({ item }) => {
       const current =
@@ -364,23 +374,30 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
           current={current}
           asking={asking === item.key}
           pending={waiting === item.key}
-          busy={busy}
+          busy={held}
           onChoose={onChoose}
           onConfirm={onConfirm}
         />
       );
     },
-    [currentMode, currentModel, asking, waiting, busy, onChoose, onConfirm],
+    [currentMode, currentModel, asking, waiting, held, onChoose, onConfirm],
   );
   const extra = useMemo(
-    () => ({ asking, waiting, busy, currentMode, currentModel }),
-    [asking, waiting, busy, currentMode, currentModel],
+    () => ({ asking, waiting, held, currentMode, currentModel }),
+    [asking, waiting, held, currentMode, currentModel],
   );
 
   if (!catalog) return null;
   return (
     <View style={s.entry}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Mode and model" onPress={openSheet} style={s.button}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Mode and model"
+        accessibilityState={{ disabled: offline }}
+        disabled={offline}
+        onPress={openSheet}
+        style={[s.button, offline && s.off]}
+      >
         <Text style={s.label}>Mode and model</Text>
       </Pressable>
       <Modal testID="sheet" visible={visible} transparent animationType="slide" onRequestClose={close}>
@@ -414,7 +431,7 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
                 <Text style={s.failure}>{failed.text}</Text>
               </View>
             ) : null}
-            {armed ? <FullAccessConfirm busy={busy} onTurnOn={turnOn} onCancel={cancelFull} /> : null}
+            {armed ? <FullAccessConfirm busy={held} onTurnOn={turnOn} onCancel={cancelFull} /> : null}
             <FlashList
               data={items}
               extraData={extra}
