@@ -3,7 +3,7 @@
 // event yields a new `Transcript` whose unchanged entries are the very same objects.
 import type { HookData, KnownJournalEvent, ToolData, ToolPhase } from "../protocol";
 import { utf8Length } from "../client/frames";
-import { EARLIER, EARLIER_BYTES, TEXT, clip, sanitize, tailStart, type Esc } from "./text";
+import { EARLIER, EARLIER_BYTES, TEXT, clip, fit, sanitize, tailStart, type Clipped, type Esc } from "./text";
 import type { ToolCall } from "./summary";
 
 export type { ToolCall };
@@ -38,6 +38,10 @@ export const BLOCK_SLACK = 16 * 1024;
 export const MAX_ENTRIES = 1_000;
 /** Bytes kept per session; the TUI keeps 512 KiB of 160 entries, the phone more of both. */
 export const MAX_BYTES = 4 * 1024 * 1024;
+/** The most one entry holds, however its calls come: a paired end is cut to what is left. */
+export const ENTRY_BYTES = 200_000;
+/** Entries dropped that wait before they are cut off. */
+const COMPACT_AT = 256;
 /** The longest tool name, and target, kept. */
 const NAME_BYTES = 256;
 const TARGET_BYTES = 4 * 1024;
@@ -57,16 +61,25 @@ export function entrySize(e: Entry): number {
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null;
 const PHASES: readonly string[] = ["running", "done", "failed"];
 
-/** A tool record's data as a clean, clipped call, or null for data that is not one. */
-function toCall(data: unknown): { call: ToolCall; bytes: number } | null {
+/** A tool record's data with its strings clean and clipped, or null for data that is not one. */
+interface Made {
+  id: string;
+  phase: ToolPhase;
+  name: Clipped;
+  target: Clipped;
+  detail: Clipped;
+}
+function toCall(data: unknown): Made | null {
   if (!isObj(data)) return null;
   const { id, name, target, phase, detail } = data as Partial<Record<keyof ToolData, unknown>>;
   if (typeof id !== "string" || typeof name !== "string" || typeof phase !== "string" || !PHASES.includes(phase)) return null;
-  const n = clip(name, NAME_BYTES);
-  const t = clip(target, TARGET_BYTES);
-  const d = clip(detail, BLOCK_BYTES);
-  const call: ToolCall = { id: clip(id, NAME_BYTES).text, name: n.text, target: t.text, phase: phase as ToolPhase, detail: d.text };
-  return { call, bytes: n.bytes + t.bytes + d.bytes };
+  return {
+    id: clip(id, NAME_BYTES).text,
+    phase: phase as ToolPhase,
+    name: clip(name, NAME_BYTES),
+    target: clip(target, TARGET_BYTES),
+    detail: clip(detail, BLOCK_BYTES),
+  };
 }
 
 /** The words for a hook the TUI shows, or null for one it does not (it ran). */
@@ -104,6 +117,8 @@ export class TranscriptDraft {
   private tail: number;
   private owned = false;
   private changed = false;
+  /** Entries before this index were dropped, and are cut off in bulk. */
+  private head = 0;
 
   constructor(private readonly base: Transcript) {
     this.entries = base.entries;
@@ -115,6 +130,7 @@ export class TranscriptDraft {
 
   finish(): Transcript {
     if (!this.changed) return this.base;
+    this.compact();
     return { entries: this.entries, bytes: this.bytes, next: this.next, esc: this.esc, tail: this.tail };
   }
 
@@ -161,6 +177,12 @@ export class TranscriptDraft {
     }
     this.changed = true;
     return this.entries;
+  }
+
+  private compact(): void {
+    if (this.head === 0) return;
+    this.own().splice(0, this.head);
+    this.head = 0;
   }
 
   private setEsc(esc: Esc): void {
@@ -248,14 +270,14 @@ export class TranscriptDraft {
   private tool(data: unknown): void {
     const made = toCall(data);
     if (!made) return;
-    const { call, bytes } = made;
+    const { id, phase } = made;
     let index = -1;
-    if (call.phase !== "running" && call.id !== "") {
-      for (let i = this.entries.length - 1; i >= 0; i--) {
+    if (phase !== "running" && id !== "") {
+      for (let i = this.entries.length - 1; i >= this.head; i--) {
         const e = this.entries[i];
         if (e?.kind !== "tools") continue;
         if (e.over) break; // the entries before it are over too
-        if (e.calls.some((c) => c.id === call.id)) {
+        if (e.calls.some((c) => c.id === id)) {
           index = i;
           break;
         }
@@ -271,31 +293,29 @@ export class TranscriptDraft {
     const entry = this.entries[index];
     if (entry?.kind !== "tools") return;
     // A call with an ID replaces the one with that ID, keeping the start's target when the end has none.
-    const at = call.id === "" ? -1 : entry.calls.findIndex((c) => c.id === call.id);
-    const calls = entry.calls.slice();
-    let delta = bytes;
-    let record = call;
-    let recordBytes = bytes;
+    const at = id === "" ? -1 : entry.calls.findIndex((c) => c.id === id);
     const old = at >= 0 ? entry.calls[at] : undefined;
-    if (old) {
-      if (record.target === "") {
-        record = { ...call, target: old.target };
-        recordBytes += utf8Length(old.target);
-      }
-      delta = recordBytes - callBytes(old);
-      calls[at] = record;
-    } else {
-      calls.push(record);
-    }
+    const target: Clipped =
+      old && made.target.text === "" ? { text: old.target, bytes: utf8Length(old.target) } : made.target;
+    // An entry holds ENTRY_BYTES at most, however its calls arrive: the detail gets what is left.
+    const size = index === this.entries.length - 1 ? this.tail : entrySize(entry);
+    const oldBytes = old ? callBytes(old) : 0;
+    const room = ENTRY_BYTES - (size - oldBytes) - made.name.bytes - target.bytes;
+    const detail = fit(made.detail, Math.min(BLOCK_BYTES, room));
+    const call: ToolCall = { id, name: made.name.text, target: target.text, phase, detail: detail.text };
+    const bytes = made.name.bytes + target.bytes + detail.bytes;
+    const calls = entry.calls.slice();
+    if (old) calls[at] = call;
+    else calls.push(call);
     this.own()[index] = { ...entry, calls };
-    this.bytes += delta;
-    if (index === this.entries.length - 1) this.tail += delta;
+    this.bytes += bytes - oldBytes;
+    if (index === this.entries.length - 1) this.tail += bytes - oldBytes;
     this.trim();
   }
 
   /** The turn ended, finished or not: calls still running were stopped, and the reply is whole. */
   private turnOver(): void {
-    for (let i = this.entries.length - 1; i >= 0; i--) {
+    for (let i = this.entries.length - 1; i >= this.head; i--) {
       const e = this.entries[i];
       if (e?.kind !== "tools") continue;
       if (e.over) break; // the entries before it are over too
@@ -304,19 +324,16 @@ export class TranscriptDraft {
     this.closeReply();
   }
 
-  /** Old entries go, whole, past the limits; the newest never does. */
+  /** Old entries go, whole, past the limits; the newest never does. They are cut off in bulk,
+   * when the batch ends or a few hundred are waiting, not one by one. */
   private trim(): void {
-    let drop = 0;
-    let bytes = this.bytes;
-    while (this.entries.length - drop > 1 && (bytes > MAX_BYTES || this.entries.length - drop > MAX_ENTRIES)) {
-      const old = this.entries[drop];
-      if (old) bytes -= entrySize(old);
-      drop += 1;
+    while (this.entries.length - this.head > 1 && (this.bytes > MAX_BYTES || this.entries.length - this.head > MAX_ENTRIES)) {
+      const old = this.entries[this.head];
+      if (old) this.bytes -= entrySize(old);
+      this.head += 1;
+      this.changed = true;
     }
-    if (drop > 0) {
-      this.own().splice(0, drop);
-      this.bytes = bytes;
-    }
+    if (this.head >= COMPACT_AT) this.compact();
   }
 }
 

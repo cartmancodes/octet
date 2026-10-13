@@ -38,8 +38,16 @@ export async function loadSettings(): Promise<Settings> {
   }
 }
 
+/** Saves wait their turn: a patch reads what the one before wrote. */
+let saving: Promise<void> = Promise.resolve();
+
 /** Saves `patch` over what is saved. A failed write is dropped: settings are a convenience. */
-export async function saveSettings(patch: Partial<Settings>): Promise<void> {
+export function saveSettings(patch: Partial<Settings>): Promise<void> {
+  saving = saving.then(() => write(patch));
+  return saving;
+}
+
+async function write(patch: Partial<Settings>): Promise<void> {
   try {
     const next: Settings = { ...(await loadSettings()), ...patch };
     await AsyncStorage.setItem(

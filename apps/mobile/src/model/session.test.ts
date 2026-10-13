@@ -36,6 +36,32 @@ describe("approvals", () => {
     expect(ids(view([approval(1), approval(1)]))).toEqual([1]);
   });
 
+  it("get the journal's detail and summary when a state frame announced them first", () => {
+    const s = state({ approvals: [{ id: 1, summary: summary("from state") }] });
+    const v = view([{ op: "state", state: s }, approval(1, "from journal")]);
+    expect(ids(v)).toEqual([1]);
+    expect(v.approvals[0]).toMatchObject({ detail: '{"id":1}', summary: { action: "from journal" } });
+  });
+
+  it("stay closed when a stale state frame lists them again", () => {
+    const stale = state({ approvals: [{ id: 1, summary: summary("x") }, { id: 2, summary: summary("y") }] });
+    let v = view([approval(1), approval(2), closed(1)]);
+    v = view([{ op: "state", state: stale }], v);
+    expect(ids(v)).toEqual([2]);
+    // A stopped session's approvals are closed too.
+    v = view([ev({ type: "stopped", data: null }), { op: "state", state: stale }], v);
+    expect(ids(v)).toEqual([]);
+  });
+
+  it("remember only the last 256 closed", () => {
+    const ops: Op[] = [];
+    for (let i = 0; i < 300; i++) ops.push(approval(i), closed(i));
+    const v = view(ops);
+    expect(v.closed).toHaveLength(256);
+    const old = state({ approvals: [{ id: 0, summary: summary("x") }, { id: 299, summary: summary("y") }] });
+    expect(ids(view([{ op: "state", state: old }], v))).toEqual([0]);
+  });
+
   it("are replaced by the state frame's list", () => {
     const v = view([approval(1), { op: "state", state: state({ approvals: [{ id: 5, summary: summary("Edit 2 files") }] }) }]);
     expect(ids(v)).toEqual([5]);
@@ -108,6 +134,11 @@ describe("a_reset_replaces_the_transcript", () => {
     expect(view([{ op: "reset" }], old).state).toEqual(rest);
   });
 
+  it("forgets what was closed", () => {
+    const v = view([approval(1), closed(1), { op: "reset" }]);
+    expect(v.closed).toEqual([]);
+  });
+
   it("clears a failure", () => {
     expect(view([{ op: "reset" }], view([{ op: "failed", reason: "gone" }])).failed).toBeNull();
   });
@@ -151,6 +182,44 @@ describe("state and catalog", () => {
   it("survive a state that is not an object of the right shape", () => {
     const junk = { op: "state", state: { approvals: "no", queue: 5, mode: 3 } } as unknown as Op;
     expect(() => view([junk])).not.toThrow();
+  });
+});
+
+describe("enums and numbers from the hub", () => {
+  it("replace values outside the protocol's unions in a state frame", () => {
+    const v = view([{ op: "state", state: { phase: "flying", queue: [], queued: -4, mode: "yolo", approvals: [] } as unknown as StateInfo }]);
+    expect(v.state).toMatchObject({ phase: "idle", mode: "ask", queued: 0 });
+  });
+
+  it("keep the valid ones", () => {
+    const v = view([{ op: "state", state: state({ phase: "running", mode: "full-access", queued: 2 }) }]);
+    expect(v.state).toMatchObject({ phase: "running", mode: "full-access", queued: 2 });
+  });
+
+  it("skip catalog models of an unknown engine and fix the mode", () => {
+    const raw = {
+      modes: ["ask", "bogus", "auto"],
+      current_mode: "nope",
+      models: [
+        { engine: "claude", selection: "a", name: "A", id: "a" },
+        { engine: "gpt9", selection: "b", name: "B", id: "b" },
+      ],
+      current: { engine: "gpt9", selection: "b" },
+    } as unknown as CatalogInfo;
+    const v = view([{ op: "catalog", catalog: raw }]);
+    expect(v.catalog?.modes).toEqual(["ask", "auto"]);
+    expect(v.catalog?.current_mode).toBe("ask");
+    expect(v.catalog?.models.map((m) => m.selection)).toEqual(["a"]);
+    expect(v.catalog?.current).toBeNull();
+  });
+});
+
+describe("ended", () => {
+  it("is set and cleared by an op", () => {
+    const v = view([{ op: "ended", ended: true }]);
+    expect(v.ended).toBe(true);
+    expect(view([{ op: "ended", ended: false }], v).ended).toBe(false);
+    expect(view([{ op: "ended", ended: true }], v)).toBe(v);
   });
 });
 

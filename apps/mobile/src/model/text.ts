@@ -130,6 +130,15 @@ export function clip(raw: unknown, limit: number): Clipped {
   return { text: EARLIER + out.slice(tail.start), bytes: EARLIER_BYTES + tail.bytes };
 }
 
+/** `clipped` cut, if need be, to at most `limit` bytes in all: its end behind `EARLIER`, or
+ * nothing when `limit` leaves no room for any of it. */
+export function fit(clipped: Clipped, limit: number): Clipped {
+  if (clipped.bytes <= limit) return clipped;
+  if (limit <= EARLIER_BYTES) return { text: "", bytes: 0 };
+  const tail = tailStart(clipped.text, limit - EARLIER_BYTES);
+  return { text: EARLIER + clipped.text.slice(tail.start), bytes: EARLIER_BYTES + tail.bytes };
+}
+
 /** A short field cleaned and clipped to `limit` characters, for strings that are not output. */
 export function field(raw: unknown, limit: number): string {
   const s = typeof raw === "string" ? raw : "";

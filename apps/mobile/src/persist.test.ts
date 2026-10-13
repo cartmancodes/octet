@@ -44,6 +44,11 @@ describe("settings", () => {
     await expect(saveSettings({ faceId: false })).resolves.toBeUndefined();
   });
 
+  it("two saves at once both land", async () => {
+    await Promise.all([saveSettings({ hubUrl: "wss://a/" }), saveSettings({ faceId: false }), saveSettings({ deviceName: "P" })]);
+    expect(await loadSettings()).toEqual({ deviceName: "P", faceId: false, hubUrl: "wss://a/" });
+  });
+
   it("never hold a token", async () => {
     await saveSettings({ hubUrl: "wss://x/" });
     const raw = (await AsyncStorage.getItem(SETTINGS_KEY)) ?? "";

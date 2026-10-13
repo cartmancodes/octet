@@ -4,7 +4,7 @@ import { FakeClock, Sockets } from "./client/fakes";
 import { HubClient } from "./client/HubClient";
 import type { CatalogInfo, JournalEvent, SessionInfo, StateInfo, ToPhone } from "./protocol";
 import { entrySize } from "./model/transcript";
-import { bindHooks, connectStore, createOctetStore, unwatch, watch, type OctetStore } from "./store";
+import { bindHooks, connectStore, createOctetStore, releaseSession, unwatch, watch, type OctetStore } from "./store";
 
 const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
   id,
@@ -43,7 +43,7 @@ beforeEach(() => {
   store = createOctetStore();
 });
 const view = (id: string) => {
-  const v = store.getState().bySession[id];
+  const v = store.getState().bySession.get(id);
   if (!v) throw new Error(`no view for ${id}`);
   return v;
 };
@@ -199,18 +199,81 @@ describe("state and catalog", () => {
 });
 
 describe("sessions that end", () => {
-  it("lose their view and are forgotten by the client", () => {
+  it("keep their view, marked ended, and are returned once", () => {
     store.getState().applyBatch([sessions(info("a"), info("b")), user("a", "x"), user("b", "y")]);
+    const b = view("b");
     const ended = store.getState().applyBatch([sessions(info("b"))]);
     expect(ended).toEqual(["a"]);
-    expect(store.getState().bySession.a).toBeUndefined();
-    expect(store.getState().bySession.b).toBeDefined();
+    expect(view("a").ended).toBe(true);
+    expect(view("a").transcript.entries).toHaveLength(1);
+    expect(view("b")).toBe(b);
+    expect(store.getState().applyBatch([sessions(info("b"))])).toEqual([]);
+  });
+
+  it("can still bring its last events", () => {
+    store.getState().applyBatch([sessions(info("a")), user("a", "x")]);
+    store.getState().applyBatch([sessions()]);
+    store.getState().applyBatch([text("a", "final words")]);
+    expect(view("a").ended).toBe(true);
+    expect(view("a").transcript.entries[1]).toMatchObject({ text: "final words" });
+  });
+
+  it("are live again when listed again", () => {
+    store.getState().applyBatch([sessions(info("a")), user("a", "x")]);
+    store.getState().applyBatch([sessions()]);
+    store.getState().applyBatch([sessions(info("a"))]);
+    expect(view("a").ended).toBe(false);
+  });
+
+  it("are released by release(), which only takes an ended view", () => {
+    store.getState().applyBatch([sessions(info("a"), info("b")), user("a", "x"), user("b", "y")]);
+    store.getState().applyBatch([sessions(info("b"))]);
+    expect(store.getState().release("b")).toBe(false);
+    expect(store.getState().release("a")).toBe(true);
+    expect(store.getState().bySession.has("a")).toBe(false);
+    expect(store.getState().bySession.has("b")).toBe(true);
   });
 
   it("keep the view of a session never listed (events before the list)", () => {
     store.getState().applyBatch([user("early", "x")]);
     expect(store.getState().applyBatch([sessions(info("b"))])).toEqual([]);
-    expect(view("early")).toBeDefined();
+    expect(view("early").ended).toBe(false);
+  });
+});
+
+describe("ids the hub chooses", () => {
+  it("cannot reach Object.prototype", () => {
+    const ids = ["constructor", "__proto__", "toString", "hasOwnProperty"];
+    for (const id of ids) store.getState().applyBatch([sessions(info(id)), user(id, `hi ${id}`)]);
+    for (const id of ids) {
+      expect(view(id).transcript.entries).toMatchObject([{ text: `hi ${id}` }]);
+    }
+    expect(store.getState().bySession.has("valueOf")).toBe(false);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype, "entries")).toBe(false);
+  });
+
+  it("a hook for a session never seen is the empty view, even for constructor", async () => {
+    const hooks = bindHooks(store);
+    const h = await renderHook(() => hooks.useSession("constructor"));
+    expect(h.result.current.transcript.entries).toEqual([]);
+  });
+});
+
+describe("enums and numbers in the sessions list", () => {
+  it("replaces a bad mode or phase, drops a bad engine, clamps approvals", () => {
+    const bad = [
+      info("a", { mode: "yolo" as never, phase: "flying" as never, approvals: -3 }),
+      info("b", { engine: "gpt9" as never }),
+      info("c", { approvals: 1e12 }),
+      info("d", { approvals: 2.7 }),
+    ];
+    store.getState().applyBatch([sessions(...bad)]);
+    const list = store.getState().sessions;
+    expect(list.map((x) => x.id)).toEqual(["a", "c", "d"]);
+    expect(list[0]).toMatchObject({ mode: "ask", phase: "idle", approvals: 0 });
+    expect(list[1]?.approvals).toBeLessThanOrEqual(1_000_000);
+    expect(list[2]?.approvals).toBe(2);
   });
 });
 
@@ -234,7 +297,7 @@ describe("with a client", () => {
     const sockets = new Sockets();
     const clock = new FakeClock();
     const client = new HubClient({ url: "wss://mac/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
-    const off = connectStore(store, client);
+    const off = connectStore(store, client, { schedule: clock.schedule });
     client.start();
     sockets.last.open();
     sockets.last.receive({ type: "welcome", device: "iPhone" });
@@ -275,15 +338,74 @@ describe("with a client", () => {
     off();
   });
 
-  it("forgets a session that ended", () => {
+  it("holds an ended session for ten minutes, then forgets it", () => {
     const { sockets, clock, client, off } = rig();
     const forget = jest.spyOn(client, "forget");
     sockets.last.receive({ type: "sessions", sessions: [info("a"), info("b")] });
+    watch(store, client, "a");
+    sockets.last.receive({ type: "subscribed", session: "a", from: "start", journals: ["j1"] });
+    sockets.last.receive({ type: "event", session: "a", journal: "j1", seq: 1, event: { type: "user", data: "x" } });
     clock.advance(50);
     sockets.last.receive({ type: "sessions", sessions: [info("b")] });
     clock.advance(50);
+    expect(view("a").ended).toBe(true);
+    expect(forget).not.toHaveBeenCalled();
+    clock.advance(10 * 60_000 - 100);
+    expect(forget).not.toHaveBeenCalled();
+    clock.advance(200);
     expect(forget).toHaveBeenCalledWith("a");
     expect(forget).not.toHaveBeenCalledWith("b");
+    expect(store.getState().bySession.has("a")).toBe(false);
+    off();
+  });
+
+  it("releaseSession forgets at once and cancels the timer", () => {
+    const { sockets, clock, client, off } = rig();
+    const forget = jest.spyOn(client, "forget");
+    sockets.last.receive({ type: "sessions", sessions: [info("a")] });
+    watch(store, client, "a");
+    sockets.last.receive({ type: "subscribed", session: "a", from: "start", journals: ["j1"] });
+    sockets.last.receive({ type: "event", session: "a", journal: "j1", seq: 1, event: { type: "user", data: "x" } });
+    clock.advance(50);
+    sockets.last.receive({ type: "sessions", sessions: [] });
+    clock.advance(50);
+    const timers = clock.pending;
+    releaseSession(store, client, "a");
+    expect(forget).toHaveBeenCalledWith("a");
+    expect(store.getState().bySession.has("a")).toBe(false);
+    expect(clock.pending).toBe(timers - 1);
+    off();
+  });
+
+  it("releaseSession leaves a live session alone", () => {
+    const { sockets, clock, client, off } = rig();
+    const forget = jest.spyOn(client, "forget");
+    sockets.last.receive({ type: "sessions", sessions: [info("a")] });
+    watch(store, client, "a");
+    sockets.last.receive({ type: "subscribed", session: "a", from: "start", journals: ["j1"] });
+    sockets.last.receive({ type: "event", session: "a", journal: "j1", seq: 1, event: { type: "user", data: "x" } });
+    clock.advance(50);
+    releaseSession(store, client, "a");
+    expect(forget).not.toHaveBeenCalled();
+    expect(view("a")).toBeDefined();
+    off();
+  });
+
+  it("a session listed again keeps its view and loses its timer", () => {
+    const { sockets, clock, client, off } = rig();
+    const forget = jest.spyOn(client, "forget");
+    sockets.last.receive({ type: "sessions", sessions: [info("a")] });
+    watch(store, client, "a");
+    sockets.last.receive({ type: "subscribed", session: "a", from: "start", journals: ["j1"] });
+    sockets.last.receive({ type: "event", session: "a", journal: "j1", seq: 1, event: { type: "user", data: "x" } });
+    clock.advance(50);
+    sockets.last.receive({ type: "sessions", sessions: [] });
+    clock.advance(50);
+    sockets.last.receive({ type: "sessions", sessions: [info("a")] });
+    clock.advance(50);
+    clock.advance(11 * 60_000);
+    expect(forget).not.toHaveBeenCalled();
+    expect(view("a").ended).toBe(false);
     off();
   });
 

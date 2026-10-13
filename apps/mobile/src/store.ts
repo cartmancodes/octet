@@ -6,6 +6,7 @@ import { useShallow } from "zustand/react/shallow";
 import { createStore, useStore, type StoreApi } from "zustand";
 
 import type { HubClient, HubState } from "./client/HubClient";
+import { ENGINES, MODES, PHASES, count, member } from "./model/enums";
 import { EMPTY_VIEW, reduceView, type Op, type PendingApproval, type SessionView } from "./model/session";
 import { field } from "./model/text";
 import { isKnownEvent, type SessionInfo, type ToPhone } from "./protocol";
@@ -13,12 +14,15 @@ import { isKnownEvent, type SessionInfo, type ToPhone } from "./protocol";
 export interface OctetState {
   /** The live sessions, as the hub listed them last. */
   sessions: SessionInfo[];
-  /** What the phone knows of each session it has heard of. */
-  bySession: Record<string, SessionView>;
+  /** What the phone knows of each session it has heard of. A Map: the keys are the hub's. */
+  bySession: ReadonlyMap<string, SessionView>;
   hub: HubState;
-  /** Applies the client's frames, in order, in one commit. Returns the sessions that ended (they
-   * were listed before and are not now): their views are gone, and the caller forgets them. */
+  /** Applies the client's frames, in order, in one commit. Returns the sessions that just
+   * ended (they were listed before and are not now): their views stay, marked `ended`, until
+   * the caller releases them. */
   applyBatch(frames: readonly ToPhone[]): string[];
+  /** Drops the view of an ended session. False for one that is not ended. */
+  release(session: string): boolean;
   setHub(state: HubState): void;
   /** The hub refused to stream `session` for good. */
   subscribeFailed(session: string, reason: string): void;
@@ -36,13 +40,15 @@ function cleanSession(raw: unknown): SessionInfo | null {
   if (!isObj(raw) || typeof raw.id !== "string" || raw.id === "") return null;
   const optional = (x: unknown): string | null | undefined =>
     x === undefined ? undefined : typeof x === "string" ? field(x, FIELD) : null;
+  const engine = member(ENGINES, raw.engine);
+  if (engine === null) return null; // a session this app cannot drive
   const info: SessionInfo = {
     id: field(raw.id, FIELD),
-    engine: raw.engine as SessionInfo["engine"],
+    engine,
     workspace: field(raw.workspace, FIELD),
-    mode: raw.mode as SessionInfo["mode"],
-    phase: raw.phase as SessionInfo["phase"],
-    approvals: typeof raw.approvals === "number" ? raw.approvals : 0,
+    mode: member(MODES, raw.mode) ?? "ask",
+    phase: member(PHASES, raw.phase) ?? "idle",
+    approvals: count(raw.approvals),
     from_phone: raw.from_phone === true,
   };
   for (const key of ["model", "goal", "now", "tmux"] as const) {
@@ -78,7 +84,7 @@ function reconcile(prev: SessionInfo[], raw: unknown[]): SessionInfo[] {
 export function createOctetStore(): OctetStore {
   return createStore<OctetState>()((set, get) => ({
     sessions: [],
-    bySession: {},
+    bySession: new Map(),
     hub: "offline",
 
     applyBatch(frames) {
@@ -112,27 +118,36 @@ export function createOctetStore(): OctetStore {
         }
       }
 
+      // A listed session is live; one that was listed and is not now has ended, and keeps its view.
       const ended: string[] = [];
       if (sessions !== before) {
         const now = new Set(sessions.map((s) => s.id));
-        for (const s of before) if (!now.has(s.id)) ended.push(s.id);
-      }
-      let views: Record<string, SessionView> | null = null;
-      for (const [session, list] of ops) {
-        if (ended.includes(session)) continue;
-        const old = bySession[session];
-        const next = reduceView(old ?? EMPTY_VIEW, list);
-        if (next !== old && !(old === undefined && next === EMPTY_VIEW)) (views ??= { ...bySession })[session] = next;
-      }
-      for (const session of ended) {
-        if (session in bySession) {
-          views ??= { ...bySession };
-          delete views[session];
+        for (const s of before) {
+          if (now.has(s.id)) continue;
+          ended.push(s.id);
+          if (bySession.has(s.id) || ops.has(s.id)) push(s.id, { op: "ended", ended: true });
         }
+        for (const id of now) if (bySession.get(id)?.ended) push(id, { op: "ended", ended: false });
+      }
+      let views: Map<string, SessionView> | null = null;
+      for (const [session, list] of ops) {
+        const old = bySession.get(session);
+        const next = reduceView(old ?? EMPTY_VIEW, list);
+        if (next === old || (old === undefined && next === EMPTY_VIEW)) continue;
+        (views ??= new Map(bySession)).set(session, next);
       }
       if (views === null && sessions === before) return ended;
       set({ sessions, ...(views ? { bySession: views } : {}) });
       return ended;
+    },
+
+    release(session) {
+      const { bySession } = get();
+      if (!bySession.get(session)?.ended) return false;
+      const views = new Map(bySession);
+      views.delete(session);
+      set({ bySession: views });
+      return true;
     },
 
     setHub(hub) {
@@ -140,22 +155,64 @@ export function createOctetStore(): OctetStore {
     },
 
     subscribeFailed(session, reason) {
-      const old = get().bySession[session] ?? EMPTY_VIEW;
+      const old = get().bySession.get(session) ?? EMPTY_VIEW;
       const next = reduceView(old, [{ op: "failed", reason: field(reason, FIELD) }]);
-      if (next !== old) set((s) => ({ bySession: { ...s.bySession, [session]: next } }));
+      if (next !== old) set((s) => ({ bySession: new Map(s.bySession).set(session, next) }));
     },
   }));
 }
 
+/** How long a session that left the hub's list is kept for its screen. */
+export const ENDED_KEPT_MS = 10 * 60_000;
+
+export interface ConnectOptions {
+  /** Runs `fn` after `ms`; returns the function that cancels it. */
+  schedule?: (fn: () => void, ms: number) => () => void;
+}
+
+const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
+  const id = setTimeout(fn, ms);
+  return () => clearTimeout(id);
+};
+
+/** The timers that will release ended sessions, per client. */
+const releases = new WeakMap<HubClient, Map<string, () => void>>();
+const timersOf = (client: HubClient): Map<string, () => void> => {
+  let map = releases.get(client);
+  if (!map) releases.set(client, (map = new Map()));
+  return map;
+};
+
 /** Feeds the store from `client`: its batches, its connection state, and the sessions the hub
- * refused for good (forgotten, and their views marked failed). Returns the function that stops. */
-export function connectStore(store: OctetStore, client: HubClient): () => void {
+ * refused for good (forgotten, and their views marked failed). A session that leaves the hub's
+ * list keeps its view for `ENDED_KEPT_MS`, then is released and forgotten. Returns the function
+ * that stops all of it. */
+export function connectStore(store: OctetStore, client: HubClient, options: ConnectOptions = {}): () => void {
+  const schedule = options.schedule ?? defaultSchedule;
+  const timers = timersOf(client);
+  const cancel = (session: string) => {
+    timers.get(session)?.();
+    timers.delete(session);
+  };
   const forget = (session: string) => {
+    cancel(session);
     requested(client).delete(session);
     client.forget(session);
   };
   const offBatch = client.onBatch((frames) => {
-    for (const ended of store.getState().applyBatch(frames)) forget(ended);
+    const state = store.getState();
+    for (const ended of state.applyBatch(frames)) {
+      cancel(ended);
+      timers.set(
+        ended,
+        schedule(() => {
+          timers.delete(ended);
+          if (store.getState().release(ended)) forget(ended);
+        }, ENDED_KEPT_MS),
+      );
+    }
+    // A session listed again is live: its timer goes.
+    for (const [session] of timers) if (store.getState().bySession.get(session)?.ended === false) cancel(session);
   });
   const offState = client.onState((state) => store.getState().setHub(state));
   const offFailed = client.onSubscribeFailed((session, refusal) => {
@@ -167,7 +224,17 @@ export function connectStore(store: OctetStore, client: HubClient): () => void {
     offBatch();
     offState();
     offFailed();
+    for (const session of [...timers.keys()]) cancel(session);
   };
+}
+
+/** The user left the screen of an ended session: its view is dropped and the client forgets it. */
+export function releaseSession(store: OctetStore, client: HubClient, session: string): void {
+  if (!store.getState().release(session)) return;
+  timersOf(client).get(session)?.();
+  timersOf(client).delete(session);
+  requested(client).delete(session);
+  client.forget(session);
 }
 
 /** The sessions each client was asked to stream and not since released. */
@@ -182,7 +249,7 @@ const requested = (client: HubClient): Set<string> => {
  * fresh, from the start of its journal: cursors are only in memory, so a cold start has no
  * transcript to resume. Asking again changes nothing. */
 export function watch(store: OctetStore, client: HubClient, session: string): void {
-  const fresh = !(session in store.getState().bySession) && !requested(client).has(session);
+  const fresh = !store.getState().bySession.has(session) && !requested(client).has(session);
   requested(client).add(session);
   client.subscribe(session, fresh);
 }
@@ -199,14 +266,14 @@ const NO_APPROVALS: PendingApproval[] = [];
 export function bindHooks(store: OctetStore) {
   return {
     /** Everything the phone knows of a session; the same object until it changes. */
-    useSession: (id: string): SessionView => useStore(store, (s) => s.bySession[id] ?? EMPTY_VIEW),
+    useSession: (id: string): SessionView => useStore(store, (s) => s.bySession.get(id) ?? EMPTY_VIEW),
     /** The listed sessions; the same array until the list changes. */
     useSessions: (): SessionInfo[] => useStore(store, useShallow((s) => s.sessions)),
     useSessionInfo: (id: string): SessionInfo | undefined => useStore(store, (s) => s.sessions.find((x) => x.id === id)),
     /** A session's transcript entries: new only when an entry was added or changed. */
-    useEntries: (id: string) => useStore(store, (s) => (s.bySession[id] ?? EMPTY_VIEW).transcript.entries),
+    useEntries: (id: string) => useStore(store, (s) => (s.bySession.get(id) ?? EMPTY_VIEW).transcript.entries),
     useApprovals: (id: string): PendingApproval[] =>
-      useStore(store, (s) => s.bySession[id]?.approvals ?? NO_APPROVALS),
+      useStore(store, (s) => s.bySession.get(id)?.approvals ?? NO_APPROVALS),
     useHub: (): HubState => useStore(store, (s) => s.hub),
   };
 }

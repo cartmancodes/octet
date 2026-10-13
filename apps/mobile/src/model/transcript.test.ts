@@ -333,6 +333,37 @@ describe("huge_records_are_clipped_and_batched", () => {
     expect(t.bytes).toBe(measured(t));
   });
 
+  it("keeps an entry within 200,000 bytes when parallel calls end with big details", () => {
+    const events: KnownJournalEvent[] = [user("before"), started];
+    for (let i = 0; i < 10; i++) events.push(tool(String(i), "Read", `f${i}`, "running"));
+    for (let i = 0; i < 10; i++) events.push(tool(String(i), "Read", "", "done", `${i}`.repeat(32 * 1024)));
+    const t = applyAll(EMPTY_TRANSCRIPT, events);
+    expect(kinds(t)).toEqual(["user", "tools"]);
+    expect(entrySize(last(t))).toBeLessThanOrEqual(200_000);
+    expect(t.bytes).toBe(measured(t));
+    // The early ends fit whole; the late ones are cut to their end behind the note.
+    const calls = tools(last(t)).calls;
+    expect(calls[0]?.detail).toBe("0".repeat(32 * 1024));
+    const late = calls[9]?.detail ?? "";
+    expect(late.length).toBeLessThan(32 * 1024);
+    if (late !== "") {
+      expect(late.startsWith(EARLIER)).toBe(true);
+      expect(late.endsWith("9")).toBe(true);
+    }
+    expect(calls.every((c) => c.phase === "done")).toBe(true);
+    expect(t.entries[0]).toMatchObject({ kind: "user", text: "before" });
+  });
+
+  it("keeps the accounting exact when many parallel ends overflow the entry", () => {
+    const events: KnownJournalEvent[] = [];
+    for (let i = 0; i < 300; i++) events.push(tool(String(i), "Read", `f${i}`, "running"));
+    for (let i = 0; i < 300; i++) events.push(tool(String(i), "Read", "", "done", "x".repeat(60 * 1024)));
+    const t = applyAll(EMPTY_TRANSCRIPT, events);
+    for (const e of t.entries) expect(entrySize(e)).toBeLessThanOrEqual(200_000);
+    expect(t.bytes).toBe(measured(t));
+    expect(tools(t.entries[0] as Entry).calls).toHaveLength(300);
+  });
+
   it("clips a huge target and name too", () => {
     const t = run([tool("1", "N".repeat(1_000_000), "T".repeat(1_000_000), "running")]);
     expect(entrySize(last(t))).toBeLessThanOrEqual(CAP);

@@ -10,6 +10,7 @@ import type {
   StateInfo,
 } from "../protocol";
 import { EMPTY_TRANSCRIPT, TranscriptDraft, type Transcript } from "./transcript";
+import { ENGINES, MODES, PHASES, count, member } from "./enums";
 import { field } from "./text";
 
 /** An approval waiting, with the request as the journal recorded it (empty when only the
@@ -32,6 +33,10 @@ export interface SessionView {
   usage: string | null;
   /** Why the hub refused to stream this session, when it did for good. */
   failed: string | null;
+  /** The session left the hub's list; this is what it left behind, held until released. */
+  ended: boolean;
+  /** The last `MAX_CLOSED` approvals closed, so that a stale state frame cannot bring one back. */
+  closed: number[];
 }
 
 export const EMPTY_VIEW: SessionView = {
@@ -43,6 +48,8 @@ export const EMPTY_VIEW: SessionView = {
   model: null,
   usage: null,
   failed: null,
+  ended: false,
+  closed: [],
 };
 
 /** One change to a session's view, in the order the hub sent it. */
@@ -52,10 +59,13 @@ export type Op =
   | { op: "reset" }
   | { op: "state"; state: StateInfo }
   | { op: "catalog"; catalog: CatalogInfo }
-  | { op: "failed"; reason: string | null };
+  | { op: "failed"; reason: string | null }
+  | { op: "ended"; ended: boolean };
 
 /** Approvals waiting, at most. */
 export const MAX_APPROVALS = 32;
+/** Closed approval IDs remembered. */
+export const MAX_CLOSED = 256;
 /** Bounds on what a hub can make the phone hold. */
 const TEXT_CHARS = 8_000;
 const SHORT_CHARS = 512;
@@ -81,13 +91,13 @@ function cleanSummary(raw: unknown): ApprovalSummary {
   return out;
 }
 
-function cleanApprovals(raw: unknown, known: readonly PendingApproval[]): PendingApproval[] {
+function cleanApprovals(raw: unknown, known: readonly PendingApproval[], closed: readonly number[]): PendingApproval[] {
   if (!Array.isArray(raw)) return [];
   const out: PendingApproval[] = [];
   for (const a of raw.slice(0, MAX_APPROVALS)) {
     if (!isObj(a) || typeof a.id !== "number" || !Number.isSafeInteger(a.id)) continue;
     const id = a.id;
-    if (out.some((x) => x.id === id)) continue;
+    if (out.some((x) => x.id === id) || closed.includes(id)) continue;
     out.push({ id, summary: cleanSummary(a.summary), detail: known.find((k) => k.id === id)?.detail ?? "" });
   }
   return out;
@@ -95,26 +105,29 @@ function cleanApprovals(raw: unknown, known: readonly PendingApproval[]): Pendin
 
 function cleanGoal(raw: unknown): GoalInfo | null {
   if (!isObj(raw)) return null;
-  const n = (x: unknown): number => (typeof x === "number" && Number.isFinite(x) ? x : 0);
-  return { objective: str(raw.objective, TEXT_CHARS), status: str(raw.status, SHORT_CHARS), turns: n(raw.turns), max: n(raw.max) };
+  return { objective: str(raw.objective, TEXT_CHARS), status: str(raw.status, SHORT_CHARS), turns: count(raw.turns), max: count(raw.max) };
 }
 
 /** A state frame's payload, cleaned and bounded: it is the hub's, so untrusted. */
-export function cleanState(raw: StateInfo, known: readonly PendingApproval[] = []): StateInfo & { approvals: PendingApproval[] } {
+export function cleanState(
+  raw: StateInfo,
+  known: readonly PendingApproval[] = [],
+  closed: readonly number[] = [],
+): StateInfo & { approvals: PendingApproval[] } {
   const s: Record<string, unknown> = isObj(raw) ? raw : {};
   const queue = Array.isArray(s.queue) ? s.queue.slice(0, MAX_QUEUE).map((q) => str(q, TEXT_CHARS)) : [];
   const state: StateInfo = {
-    phase: s.phase as StateInfo["phase"],
+    phase: member(PHASES, s.phase) ?? "idle",
     queue,
-    queued: typeof s.queued === "number" && Number.isFinite(s.queued) ? s.queued : queue.length,
-    mode: s.mode as StateInfo["mode"],
+    queued: count(s.queued),
+    mode: member(MODES, s.mode) ?? "ask",
     approvals: [],
   };
   const goal = cleanGoal(s.goal);
   if (s.goal !== undefined) state.goal = goal;
   const now = optStr(s.now, TEXT_CHARS);
   if (now !== undefined) state.now = now;
-  return { ...state, approvals: cleanApprovals(s.approvals, known) };
+  return { ...state, approvals: cleanApprovals(s.approvals, known, closed) };
 }
 
 function cleanCatalog(raw: CatalogInfo): CatalogInfo {
@@ -122,9 +135,10 @@ function cleanCatalog(raw: CatalogInfo): CatalogInfo {
   const models: ModelInfo[] = [];
   if (Array.isArray(c.models)) {
     for (const m of c.models.slice(0, MAX_MODELS)) {
-      if (!isObj(m)) continue;
+      const engine = isObj(m) ? member(ENGINES, m.engine) : null;
+      if (!isObj(m) || engine === null) continue;
       models.push({
-        engine: m.engine as ModelInfo["engine"],
+        engine,
         selection: str(m.selection, SHORT_CHARS),
         name: str(m.name, SHORT_CHARS),
         id: str(m.id, SHORT_CHARS),
@@ -132,25 +146,38 @@ function cleanCatalog(raw: CatalogInfo): CatalogInfo {
     }
   }
   const out: CatalogInfo = {
-    modes: Array.isArray(c.modes) ? (c.modes.slice(0, MAX_MODES).filter((m) => typeof m === "string") as CatalogInfo["modes"]) : [],
-    current_mode: c.current_mode as CatalogInfo["current_mode"],
+    modes: Array.isArray(c.modes) ? c.modes.slice(0, MAX_MODES).flatMap((m) => member(MODES, m) ?? []) : [],
+    current_mode: member(MODES, c.current_mode) ?? "ask",
     models,
   };
-  if (isObj(c.current)) {
-    out.current = { engine: c.current.engine as ModelInfo["engine"], selection: str(c.current.selection, SHORT_CHARS) };
-  } else if (c.current === null) out.current = null;
+  const current = isObj(c.current) ? member(ENGINES, c.current.engine) : null;
+  if (isObj(c.current) && current !== null) out.current = { engine: current, selection: str(c.current.selection, SHORT_CHARS) };
+  else if (c.current !== undefined) out.current = null;
   return out;
 }
 
 /** The same value when `a` and `b` are alike (state and catalog are small and plain data). */
 const alike = (a: unknown, b: unknown): boolean => a === b || JSON.stringify(a) === JSON.stringify(b);
 
+/** `closed` with `ids` added, the oldest forgotten past `MAX_CLOSED`. */
+function remember(closed: number[], ids: number[]): number[] {
+  const next = closed.filter((id) => !ids.includes(id)).concat(ids);
+  return next.length > MAX_CLOSED ? next.slice(next.length - MAX_CLOSED) : next;
+}
+
 function approve(approvals: PendingApproval[], data: unknown): PendingApproval[] {
   if (!isObj(data) || typeof data.id !== "number" || !Number.isSafeInteger(data.id)) return approvals;
   const id = data.id;
-  if (approvals.some((a) => a.id === id) || approvals.length >= MAX_APPROVALS) return approvals;
   const detail = typeof data.detail === "string" ? str(data.detail, DETAIL_CHARS) : "";
-  return [...approvals, { id, summary: cleanSummary(data.summary), detail }];
+  const made: PendingApproval = { id, summary: cleanSummary(data.summary), detail };
+  const at = approvals.findIndex((a) => a.id === id);
+  if (at >= 0) {
+    // Listed already, from a state frame that told only the summary: the journal's record fills it in.
+    const next = approvals.slice();
+    next[at] = made;
+    return alike(approvals[at], made) ? approvals : next;
+  }
+  return approvals.length >= MAX_APPROVALS ? approvals : [...approvals, made];
 }
 
 /**
@@ -167,13 +194,17 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
       case "reset":
         draft = new TranscriptDraft(EMPTY_TRANSCRIPT);
         if (v.approvals.length > 0) v.approvals = [];
+        if (v.closed.length > 0) v.closed = [];
         v.failed = null;
+        break;
+      case "ended":
+        v.ended = op.ended;
         break;
       case "failed":
         v.failed = op.reason;
         break;
       case "state": {
-        const state = cleanState(op.state, v.approvals);
+        const state = cleanState(op.state, v.approvals, v.closed);
         const { approvals, ...rest } = state;
         if (!alike(v.state, rest)) v.state = rest;
         if (!alike(v.approvals, approvals)) v.approvals = approvals;
@@ -189,12 +220,18 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         switch (ev.type) {
           case "approval":
             v.approvals = approve(v.approvals, ev.data);
+            if (isObj(ev.data) && v.closed.includes(ev.data.id as number)) v.closed = v.closed.filter((id) => id !== ev.data.id);
             break;
           case "approval_closed":
+            if (typeof ev.data !== "number" || !Number.isSafeInteger(ev.data)) break;
+            v.closed = remember(v.closed, [ev.data]);
             if (v.approvals.some((a) => a.id === ev.data)) v.approvals = v.approvals.filter((a) => a.id !== ev.data);
             break;
           case "stopped":
-            if (v.approvals.length > 0) v.approvals = []; // nothing would answer them
+            if (v.approvals.length > 0) {
+              v.closed = remember(v.closed, v.approvals.map((a) => a.id)); // nothing would answer them
+              v.approvals = [];
+            }
             own().apply(ev);
             break;
           case "mode":
@@ -223,6 +260,8 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.mode === view.mode &&
     v.model === view.model &&
     v.usage === view.usage &&
-    v.failed === view.failed;
+    v.failed === view.failed &&
+    v.ended === view.ended &&
+    v.closed === view.closed;
   return same ? view : v;
 }
