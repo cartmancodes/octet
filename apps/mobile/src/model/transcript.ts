@@ -27,20 +27,46 @@ export interface Transcript {
   /** The bytes of the newest entry when it is an open reply or an open tools entry, so a stream
    * of records never counts it again. */
   tail: number;
-  /** Where each call of the open turn is, by its id: an end finds its call at once, however many
-   * calls the turn has. Forgotten when the turn is over. */
-  calls: ReadonlyMap<string, CallAt>;
 }
+
+export const EMPTY_TRANSCRIPT: Transcript = { entries: [], bytes: 0, next: 1, esc: TEXT, tail: 0 };
 
 /** A call's place: its entry's key (as a number) and its index in that entry's calls. */
 interface CallAt {
   key: number;
   at: number;
 }
+type CallIndex = Map<string, CallAt>;
 
-const NO_CALLS: ReadonlyMap<string, CallAt> = new Map();
+/**
+ * Where each call of the open turn is, by its id, so an end finds its call at once however many
+ * calls the turn has. It holds only the calls the transcript holds: a trimmed entry's ids go,
+ * and all go when the turn is over. It is the reducer's own, never copied: a draft takes it from
+ * the transcript it starts from and hands it to the one it makes, writing it in between. A
+ * transcript whose index moved on (an older one, applied to again) rebuilds one from its
+ * entries, so `apply` stays pure for whoever calls it.
+ */
+const INDEX = new WeakMap<Transcript, CallIndex>();
 
-export const EMPTY_TRANSCRIPT: Transcript = { entries: [], bytes: 0, next: 1, esc: TEXT, tail: 0, calls: NO_CALLS };
+/** The open turn's calls of `entries` (from `head`), newest first where an id is in two. */
+function rebuild(entries: readonly Entry[], head: number): CallIndex {
+  const index: CallIndex = new Map();
+  for (let i = entries.length - 1; i >= head; i--) {
+    const e = entries[i];
+    if (e?.kind !== "tools") continue;
+    if (e.over) break; // the entries before it are over too
+    for (let at = e.calls.length - 1; at >= 0; at--) {
+      const id = e.calls[at]?.id;
+      if (id !== undefined && id !== "" && !index.has(id)) index.set(id, { key: Number(e.key), at });
+    }
+  }
+  return index;
+}
+
+/** How many call ids the transcript's index holds (for tests: it is bounded by the calls held). */
+export function callIndexSize(t: Transcript): number {
+  return (INDEX.get(t) ?? rebuild(t.entries, 0)).size;
+}
 
 /** A tools entry closes, and a reply is trimmed back to, this many bytes. */
 export const BLOCK_BYTES = 64 * 1024;
@@ -131,10 +157,9 @@ export class TranscriptDraft {
   private next: number;
   private esc: Esc;
   private tail: number;
-  private calls: ReadonlyMap<string, CallAt>;
+  /** The call index, once this draft has taken it (from `base`, or rebuilt). */
+  private index: CallIndex | null = null;
   private owned = false;
-  /** `calls` is this draft's own copy. */
-  private ownedCalls = false;
   /** Calls arrays this draft made, written in place by later events of the batch. */
   private readonly ownArrays = new Set<ToolCall[]>();
   private changed = false;
@@ -147,13 +172,22 @@ export class TranscriptDraft {
     this.next = base.next;
     this.esc = base.esc;
     this.tail = base.tail;
-    this.calls = base.calls;
   }
 
   finish(): Transcript {
-    if (!this.changed) return this.base;
+    if (!this.changed) {
+      if (this.index) INDEX.set(this.base, this.index);
+      return this.base;
+    }
     this.compact();
-    return { entries: this.entries, bytes: this.bytes, next: this.next, esc: this.esc, tail: this.tail, calls: this.calls };
+    const made: Transcript = { entries: this.entries, bytes: this.bytes, next: this.next, esc: this.esc, tail: this.tail };
+    // An index this draft never took (no call came, none was trimmed) is still right: it moves on.
+    const index = this.index ?? INDEX.get(this.base);
+    if (index) {
+      INDEX.delete(this.base);
+      INDEX.set(made, index);
+    }
+    return made;
   }
 
   apply(ev: KnownJournalEvent): void {
@@ -286,14 +320,19 @@ export class TranscriptDraft {
     this.trim();
   }
 
-  /** The open turn's calls, this draft's own to write. */
-  private callMap(): Map<string, CallAt> {
-    if (!this.ownedCalls) {
-      this.calls = new Map(this.calls);
-      this.ownedCalls = true;
+  /** The call index, this draft's to write: taken from `base` (which then has none), or rebuilt. */
+  private callIndex(): CallIndex {
+    if (this.index === null) {
+      const taken = INDEX.get(this.base);
+      if (taken) INDEX.delete(this.base);
+      this.index = taken ?? rebuild(this.entries, this.head);
     }
-    this.changed = true;
-    return this.calls as Map<string, CallAt>;
+    return this.index;
+  }
+
+  /** A new call joins `back`: an open tools entry with under `BLOCK_BYTES` of text. */
+  private joins(back: Entry | undefined): back is Entry & { kind: "tools" } {
+    return back?.kind === "tools" && !back.over && this.tail - back.calls.length * CALL_BYTES <= BLOCK_BYTES;
   }
 
   /** The index of the live entry with key `key`: keys go up by one from entry to entry. */
@@ -313,14 +352,19 @@ export class TranscriptDraft {
     const { id, phase } = made;
     let index = -1;
     let at = -1;
-    const found = id === "" ? undefined : this.calls.get(id);
-    if (found && phase !== "running") {
-      index = this.indexOf(found.key);
-      at = index >= 0 ? found.at : -1;
+    const found = id === "" ? undefined : this.callIndex().get(id);
+    if (found) {
+      // An end goes to its call wherever it is; a start of a call already in the entry it would
+      // join replaces it there (the desk's `Entry::record`).
+      const i = this.indexOf(found.key);
+      if (i >= 0 && (phase !== "running" || (i === this.entries.length - 1 && this.joins(this.entries[i])))) {
+        index = i;
+        at = found.at;
+      }
     }
     if (index < 0) {
       const back = this.entries[this.entries.length - 1];
-      if (back?.kind !== "tools" || back.over || this.tail - back.calls.length * CALL_BYTES > BLOCK_BYTES) {
+      if (!this.joins(back)) {
         this.push({ kind: "tools", key: this.key(), calls: [], over: false }, 0);
       }
       index = this.entries.length - 1;
@@ -354,7 +398,7 @@ export class TranscriptDraft {
     if (old) calls[at] = call;
     else {
       calls.push(call);
-      if (id !== "") this.callMap().set(id, { key: Number(entry.key), at: calls.length - 1 });
+      if (id !== "") this.callIndex().set(id, { key: Number(entry.key), at: calls.length - 1 });
     }
     this.own()[index] = { ...entry, calls };
     this.bytes += bytes - oldBytes;
@@ -370,11 +414,7 @@ export class TranscriptDraft {
       if (e.over) break; // the entries before it are over too
       this.own()[i] = { ...e, over: true };
     }
-    if (this.calls.size > 0) {
-      this.calls = NO_CALLS;
-      this.ownedCalls = false;
-      this.changed = true;
-    }
+    this.index = new Map(); // nothing of this turn is open any more
     this.closeReply();
   }
 
@@ -384,10 +424,18 @@ export class TranscriptDraft {
     while (this.entries.length - this.head > 1 && (this.bytes > MAX_BYTES || this.entries.length - this.head > MAX_ENTRIES)) {
       const old = this.entries[this.head];
       if (old) this.bytes -= entrySize(old);
+      if (old?.kind === "tools" && !old.over) this.forget(old);
       this.head += 1;
       this.changed = true;
     }
     if (this.head >= COMPACT_AT) this.compact();
+  }
+
+  /** A trimmed entry's calls leave the index: the ids it holds are only for calls still here. */
+  private forget(entry: Entry & { kind: "tools" }): void {
+    const index = this.callIndex();
+    const key = Number(entry.key);
+    for (const call of entry.calls) if (call.id !== "" && index.get(call.id)?.key === key) index.delete(call.id);
   }
 }
 

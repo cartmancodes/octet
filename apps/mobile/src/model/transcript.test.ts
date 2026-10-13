@@ -10,6 +10,7 @@ import {
   MAX_ENTRIES,
   apply,
   applyAll,
+  callIndexSize,
   entrySize,
   type Entry,
   type Transcript,
@@ -160,6 +161,40 @@ describe("grouping tools", () => {
     expect(stored).toBeLessThanOrEqual(MAX_CALLS);
     expect(t.bytes).toBe(stored * CALL_BYTES);
     expect(took).toBeLessThan(1_000);
+  });
+
+  it("a second start of the same call, in the same entry, replaces it, as the desk records it", () => {
+    const t = run([started, tool("1", "Bash", "ls", "running"), tool("1", "Bash", "ls -la", "running")]);
+    expect(tools(last(t)).calls).toEqual([{ id: "1", name: "Bash", target: "ls -la", phase: "running", detail: "" }]);
+    expect(t.bytes).toBe(measured(t));
+    // Its end still pairs with it.
+    const done = applyAll(t, [tool("1", "Bash", "", "done", "ok")]);
+    expect(tools(last(done)).calls).toEqual([{ id: "1", name: "Bash", target: "ls -la", phase: "done", detail: "ok" }]);
+  });
+
+  it("keeps ids only for the calls it holds: those of trimmed entries go", () => {
+    let t = applyAll(EMPTY_TRANSCRIPT, [started]);
+    for (let i = 0; i < 5_000; i += 100) {
+      const batch: KnownJournalEvent[] = [];
+      for (let k = i; k < i + 100; k++) batch.push(text("x"), tool(`call-${k}`, "R", "", "running"));
+      t = applyAll(t, batch);
+    }
+    expect(t.entries.length).toBeLessThanOrEqual(MAX_ENTRIES);
+    const held = t.entries.reduce((n, e) => n + (e.kind === "tools" ? e.calls.length : 0), 0);
+    expect(callIndexSize(t)).toBe(held);
+    // An end of a call still held pairs; one of a trimmed call is a call of its own.
+    const done = applyAll(t, [tool("call-4999", "R", "", "done", "ok")]);
+    expect(tools(last(done)).calls.find((c) => c.id === "call-4999")?.phase).toBe("done");
+  });
+
+  it("is pure: applying to an older transcript again gives what it gave the first time", () => {
+    const base = run([started, tool("1", "Bash", "a", "running"), text("between"), tool("2", "Bash", "b", "running")]);
+    const first = applyAll(base, [tool("1", "Bash", "", "done", "one")]);
+    applyAll(first, [tool("2", "Bash", "", "done", "two"), finished]);
+    const again = applyAll(base, [tool("1", "Bash", "", "done", "one")]);
+    expect(again.entries).toEqual(first.entries);
+    const later = applyAll(base, [tool("2", "Bash", "", "done", "two")]);
+    expect(tools(last(later)).calls[0]).toMatchObject({ id: "2", phase: "done", detail: "two" });
   });
 
   it("finds an end's call by its id however many calls the turn has", () => {

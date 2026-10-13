@@ -2,7 +2,7 @@
 // budget is generous for a phone's CPU but tight for the work, so a change that makes a batch cost
 // more per event (or more per session) fails here rather than on a train.
 import type { BatchItem } from "./client/HubClient";
-import { MAX_BYTES, MAX_CALLS, MAX_ENTRIES } from "./model/transcript";
+import { MAX_BYTES, MAX_CALLS, MAX_ENTRIES, callIndexSize } from "./model/transcript";
 import { createOctetStore } from "./store";
 
 const SESSION = "a";
@@ -26,6 +26,11 @@ const HOSTILE_BUDGET_MS = 600;
  * 12-33 ms beside the other suites (it was 178-180 ms alone). */
 const READ_CALLS = 5_000;
 const READ_BUDGET_MS = 100;
+/** Text, then a call, again and again in one turn: each pair makes two entries, so old ones are
+ * trimmed all along. Before round 1 it took 136 ms; with a call map copied per batch, 6.3 s. */
+const PAIRS = 60_000;
+const PAIRS_BUDGET_MS = 400;
+const PAIRS_BATCH_MS = 20;
 
 let seq = 0;
 const event = (session: string, ev: object): BatchItem =>
@@ -127,6 +132,25 @@ describe("performance budgets", () => {
     console.log(`perf: ${READ_CALLS} Read calls took ${took.toFixed(0)} ms, worst batch ${worst.toFixed(1)} ms`);
     for (const e of toolsOf(store)) expect(e.calls.length).toBeLessThanOrEqual(MAX_CALLS);
     expect(took).toBeLessThan(READ_BUDGET_MS);
+  });
+
+  it(`takes a turn of ${PAIRS} text and call pairs in under ${PAIRS_BUDGET_MS} ms, no batch over ${PAIRS_BATCH_MS} ms`, () => {
+    const store = createOctetStore();
+    const frames: BatchItem[] = [
+      { v: 1, type: "subscribed", session: SESSION, from: "start", journals: ["j1"] } as BatchItem,
+      event(SESSION, { type: "user", data: "go" }),
+    ];
+    for (let k = 0; k < PAIRS; k++) {
+      frames.push(event(SESSION, { type: "text", data: "x" }));
+      frames.push(event(SESSION, { type: "tool", data: { id: `call-${k}`, name: "R", target: "", phase: "running", detail: "" } }));
+    }
+    const { took, worst } = timed(store, frames, 200);
+    const transcript = store.getState().bySession.get(SESSION)?.transcript;
+    const size = transcript ? callIndexSize(transcript) : -1;
+    console.log(`perf: ${PAIRS} text and call pairs took ${took.toFixed(0)} ms, worst batch ${worst.toFixed(1)} ms, ${size} ids kept`);
+    expect(took).toBeLessThan(PAIRS_BUDGET_MS);
+    expect(worst).toBeLessThan(PAIRS_BATCH_MS);
+    expect(size).toBeLessThanOrEqual(MAX_ENTRIES);
   });
 
   it("keeps a session's transcript inside its limits however much streams", () => {
