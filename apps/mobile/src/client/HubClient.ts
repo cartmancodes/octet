@@ -27,11 +27,20 @@ export type SocketFactory = (url: string) => Socket;
 /** What answers a request: `ack`, or `recent` for the `recent` command. */
 export type Ack = AckFrame | RecentFrame;
 
-/** A command that could not be done: the hub refused it, or it timed out, or there was no link. */
+/**
+ * A command that was not done. `code` is the hub's, or one of two the phone makes up:
+ * - `unsent`: the command never left the phone (no link yet, or the socket was already closed).
+ *   It is safe to offer the user a resend.
+ * - `lost`: it was sent and the outcome is unknown (the link dropped, or no answer in 30 s). Never
+ *   resend automatically, and offer a resend only after the user has looked at the session.
+ * The hub's own `timeout` (a session that did not answer) is a `lost` too. Any other hub code is
+ * a definite no: `busy`, `rate_limited` and `unavailable` may be offered again later, the rest
+ * (`not_allowed`, `invalid`, `turn_open`, ...) only after something changed.
+ */
 export class Refusal extends Error {
-  readonly code: RefusalCode | "timeout" | "offline";
+  readonly code: RefusalCode | "unsent" | "lost";
 
-  constructor(code: RefusalCode | "timeout" | "offline", reason: string) {
+  constructor(code: RefusalCode | "unsent" | "lost", reason: string) {
     super(reason);
     Object.setPrototypeOf(this, new.target.prototype);
     this.name = "Refusal";
@@ -65,6 +74,12 @@ export interface HubClientOptions {
    * frames up to that cursor were handed to the batch listeners, at most once per session per batch. */
   onCursor?: (session: string, cursor: Cursor | null) => void;
 }
+
+/** Recent requests that timed out, remembered so that their late answers are dropped. */
+const EXPIRED_KEPT = 64;
+/** A `rate_limited` or `timeout` refusal of a subscribe is retried this many times, this far apart. */
+export const SUBSCRIBE_RETRIES = 3;
+export const SUBSCRIBE_RETRY_MS = 5_000;
 
 export const REQUEST_TIMEOUT_MS = 30_000;
 export const HANDSHAKE_TIMEOUT_MS = 15_000;
@@ -116,8 +131,18 @@ export class HubClient {
 
   private readonly wanted = new Set<string>();
   private readonly pending = new Map<number, Pending>();
-  /** Requests whose answer is not awaited by a caller: subscribe and unsubscribe. */
-  private readonly quiet = new Set<number>();
+  /** Subscribe requests in flight: req -> session. */
+  private readonly subscribeReqs = new Map<number, string>();
+  /** Sessions with a subscribe sent on this connection and not since unsubscribed or refused. */
+  private readonly live = new Set<string>();
+  /** Unsubscribes awaiting their ack: req -> session. The ack shares the hub's FIFO outbox with
+   * live events, so no event of the old subscription can follow it; until then the session's
+   * frames are dropped and a new subscribe waits. */
+  private readonly settling = new Map<number, string>();
+  private readonly retries = new Map<string, number>();
+  private readonly retryTimers = new Map<string, () => void>();
+  private readonly expired = new Set<number>();
+  private readonly subscribeFailedListeners = new Set<(session: string, refusal: Refusal) => void>();
   private readonly pairings = new Set<() => void>();
 
   private buffer: ToPhone[] = [];
@@ -170,7 +195,7 @@ export class HubClient {
       const req = this.nextReq++;
       let done = false;
       const cancelTimer = this.schedule(
-        () => finish(() => reject(new Refusal("timeout", "The Mac did not answer in time"))),
+        () => finish(() => reject(new Refusal("lost", "The Mac did not answer in time"))),
         REQUEST_TIMEOUT_MS,
       );
       const finish = (settle: () => void): void => {
@@ -179,15 +204,23 @@ export class HubClient {
         cancelTimer();
         this.pairings.delete(abort);
         socket.onopen = socket.onmessage = socket.onclose = undefined;
-        socket.close();
+        try {
+          socket.close();
+        } catch {
+          // Already closed.
+        }
         settle();
       };
-      const abort = (): void => finish(() => reject(new Refusal("offline", "Can't reach your Mac")));
+      const abort = (): void => finish(() => reject(new Refusal("lost", "Can't reach your Mac")));
       this.pairings.add(abort);
 
       socket.onopen = () => {
         const command = { v: PROTOCOL_VERSION, type: "pair", req, secret, name, platform };
-        socket.send(JSON.stringify(command));
+        try {
+          socket.send(JSON.stringify(command));
+        } catch {
+          finish(() => reject(new Refusal("unsent", "Can't reach your Mac")));
+        }
       };
       socket.onmessage = (text) => {
         const frame = parseFrame(text);
@@ -230,13 +263,18 @@ export class HubClient {
   request(cmd: RequestBody): Promise<Ack> {
     const socket = this.socket;
     if (this.stateValue !== "ready" || !socket) {
-      return Promise.reject(new Refusal("offline", "Can't reach your Mac"));
+      return Promise.reject(new Refusal("unsent", "Can't reach your Mac"));
     }
     const req = this.nextReq++;
     return new Promise<Ack>((resolve, reject) => {
       const cancel = this.schedule(() => {
         this.pending.delete(req);
-        reject(new Refusal("timeout", "The Mac did not answer in time"));
+        this.expired.add(req);
+        if (this.expired.size > EXPIRED_KEPT) {
+          const oldest = this.expired.values().next().value;
+          if (oldest !== undefined) this.expired.delete(oldest);
+        }
+        reject(new Refusal("lost", "The Mac did not answer in time"));
       }, REQUEST_TIMEOUT_MS);
       this.pending.set(req, { resolve, reject, cancel });
       try {
@@ -244,27 +282,37 @@ export class HubClient {
       } catch {
         this.pending.delete(req);
         cancel();
-        reject(new Refusal("offline", "Can't reach your Mac"));
+        reject(new Refusal("unsent", "Can't reach your Mac"));
       }
     });
   }
 
   /** Streams a session: replays after its cursor, then live, and again after every reconnect.
-   * `fresh` forgets the cursor first, for a store that holds no transcript to resume. */
+   * `fresh` forgets the cursor first, for a store that holds no transcript to resume. A session
+   * already subscribed on this connection is unsubscribed first, and the new subscribe waits
+   * for that ack so that no stale live event lands among the replay. */
   subscribe(session: string, fresh = false): void {
     if (fresh) {
       this.cursors.forget(session);
       this.dirty.add(session);
     }
-    const already = this.wanted.has(session);
     this.wanted.add(session);
-    if (this.stateValue === "ready" && (fresh || !already)) this.sendSubscribe(session);
+    if (this.stateValue !== "ready") return;
+    if (this.isSettling(session)) return; // the ack of the unsubscribe sends it
+    this.cancelRetry(session);
+    if (this.live.has(session)) {
+      if (fresh) this.sendUnsubscribe(session);
+      return;
+    }
+    this.sendSubscribe(session);
   }
 
   /** Stops streaming a session. Its cursor is kept for a later subscribe. */
   unsubscribe(session: string): void {
     if (!this.wanted.delete(session)) return;
-    if (this.stateValue === "ready") this.sendQuiet({ type: "unsubscribe", session });
+    this.retries.delete(session);
+    this.cancelRetry(session);
+    if (this.stateValue === "ready" && this.live.has(session)) this.sendUnsubscribe(session);
   }
 
   /** Unsubscribes and drops the session's cursor, for a session that ended. */
@@ -272,6 +320,14 @@ export class HubClient {
     this.unsubscribe(session);
     this.cursors.forget(session);
     this.dirty.add(session);
+  }
+
+  /** Called when a subscribe is refused for good: at once for most codes, and for
+   * `rate_limited` or `timeout` after three retries 5 s apart. The session stays wanted; the
+   * consumer decides whether to `forget` it. */
+  onSubscribeFailed(fn: (session: string, refusal: Refusal) => void): () => void {
+    this.subscribeFailedListeners.add(fn);
+    return () => this.subscribeFailedListeners.delete(fn);
   }
 
   /** Called with each batch of frames, at most once per 50 ms. Returns the unsubscribe function. */
@@ -341,10 +397,16 @@ export class HubClient {
     }
     for (const [, entry] of this.pending) {
       entry.cancel();
-      entry.reject(new Refusal("offline", "Can't reach your Mac"));
+      entry.reject(new Refusal("lost", "Can't reach your Mac"));
     }
     this.pending.clear();
-    this.quiet.clear();
+    // A new connection has no stale frames and no subscriptions.
+    this.subscribeReqs.clear();
+    this.settling.clear();
+    this.live.clear();
+    this.retries.clear();
+    for (const cancel of this.retryTimers.values()) cancel();
+    this.retryTimers.clear();
   }
 
   private unpair(): void {
@@ -390,12 +452,16 @@ export class HubClient {
       case "ack":
       case "recent": {
         const entry = this.pending.get(frame.req);
+        const subscribed = this.subscribeReqs.get(frame.req);
         if (entry) {
           this.pending.delete(frame.req);
           entry.cancel();
           entry.resolve(frame);
+        } else if (subscribed !== undefined) {
+          this.subscribeReqs.delete(frame.req);
+          this.retries.delete(subscribed);
         } else {
-          this.quiet.delete(frame.req);
+          this.settled(frame.req); // else a late answer to a request that timed out: dropped
         }
         return;
       }
@@ -403,7 +469,7 @@ export class HubClient {
         this.refused(frame);
         return;
       case "event":
-        if (!this.wanted.has(frame.session)) return;
+        if (!this.wanted.has(frame.session) || this.isSettling(frame.session)) return;
         if (this.cursors.accept(frame.session, frame.journal, frame.seq)) {
           this.dirty.add(frame.session);
           this.queue(frame);
@@ -412,7 +478,8 @@ export class HubClient {
         }
         return;
       case "subscribed":
-        if (!this.wanted.has(frame.session)) return;
+        if (!this.wanted.has(frame.session) || this.isSettling(frame.session)) return;
+        this.retries.delete(frame.session);
         this.cursors.apply(frame.session, frame.from, frame.journals);
         this.dirty.add(frame.session);
         this.queue(frame);
@@ -424,32 +491,94 @@ export class HubClient {
 
   private refused(frame: RefusedFrame): void {
     const entry = this.pending.get(frame.req);
+    const session = this.subscribeReqs.get(frame.req);
     if (entry) {
       this.pending.delete(frame.req);
       entry.cancel();
       entry.reject(new Refusal(frame.code ?? "invalid", frame.reason));
-    } else {
-      this.quiet.delete(frame.req);
-      this.queue(frame); // unsolicited, unparsable-request or a subscribe's: the consumer shows it
+    } else if (session !== undefined) {
+      this.subscribeReqs.delete(frame.req);
+      this.live.delete(session);
+      if (!isUnpaired(frame.code)) this.subscribeRefused(session, frame);
+    } else if (!this.settled(frame.req) && frame.req === 0) {
+      this.queue(frame); // unsolicited (a revoked phone) or to a frame the hub could not parse
     }
     if (isUnpaired(frame.code)) this.unpair();
   }
 
-  private sendSubscribe(session: string): void {
-    const after = this.cursors.cursor(session);
-    this.sendQuiet(after ? { type: "subscribe", session, after } : { type: "subscribe", session });
+  private subscribeRefused(session: string, frame: RefusedFrame): void {
+    const tries = this.retries.get(session) ?? 0;
+    const transient = frame.code === "rate_limited" || frame.code === "timeout";
+    if (transient && tries < SUBSCRIBE_RETRIES && this.wanted.has(session)) {
+      this.retries.set(session, tries + 1);
+      this.cancelRetry(session);
+      this.retryTimers.set(
+        session,
+        this.schedule(() => {
+          this.retryTimers.delete(session);
+          const idle = !this.live.has(session) && !this.isSettling(session);
+          if (this.stateValue === "ready" && this.wanted.has(session) && idle) this.sendSubscribe(session);
+        }, SUBSCRIBE_RETRY_MS),
+      );
+      return;
+    }
+    this.retries.delete(session);
+    const refusal = new Refusal(frame.code ?? "invalid", frame.reason);
+    for (const fn of [...this.subscribeFailedListeners]) {
+      try {
+        fn(session, refusal);
+      } catch {
+        // One listener's failure is not the connection's.
+      }
+    }
   }
 
-  /** Sends a command whose answer is not awaited; a refusal still reaches the batch. */
-  private sendQuiet(cmd: { type: string } & Record<string, unknown>): void {
+  private isSettling(session: string): boolean {
+    for (const waiting of this.settling.values()) if (waiting === session) return true;
+    return false;
+  }
+
+  private cancelRetry(session: string): void {
+    this.retryTimers.get(session)?.();
+    this.retryTimers.delete(session);
+  }
+
+  /** An unsubscribe was answered (ack or refusal): subscribe again if the session is wanted. */
+  private settled(req: number): boolean {
+    const session = this.settling.get(req);
+    if (session === undefined) return false;
+    this.settling.delete(req);
+    if (this.stateValue === "ready" && this.wanted.has(session) && !this.isSettling(session)) {
+      this.sendSubscribe(session);
+    }
+    return true;
+  }
+
+  private sendSubscribe(session: string): void {
+    const after = this.cursors.cursor(session);
+    const req = this.send(after ? { type: "subscribe", session, after } : { type: "subscribe", session });
+    if (req === null) return;
+    this.subscribeReqs.set(req, session);
+    this.live.add(session);
+  }
+
+  private sendUnsubscribe(session: string): void {
+    const req = this.send({ type: "unsubscribe", session });
+    this.live.delete(session);
+    if (req !== null) this.settling.set(req, session);
+    else if (this.wanted.has(session)) this.sendSubscribe(session);
+  }
+
+  /** Sends a command whose answer the caller does not await; returns its req, or null when unsent. */
+  private send(cmd: { type: string } & Record<string, unknown>): number | null {
     const socket = this.socket;
-    if (!socket) return;
+    if (!socket) return null;
     const req = this.nextReq++;
-    this.quiet.add(req);
     try {
       socket.send(JSON.stringify({ ...cmd, v: PROTOCOL_VERSION, req }));
+      return req;
     } catch {
-      this.quiet.delete(req);
+      return null;
     }
   }
 
@@ -484,6 +613,12 @@ export class HubClient {
         }
       }
     }
-    for (const session of sessions) this.onCursor?.(session, this.cursors.cursor(session));
+    for (const session of sessions) {
+      try {
+        this.onCursor?.(session, this.cursors.cursor(session));
+      } catch {
+        // The store's failure to save is not the connection's.
+      }
+    }
   }
 }

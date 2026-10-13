@@ -137,11 +137,11 @@ describe("pairing", () => {
     const cut = r.client.pair("s", "p", "ios");
     r.sockets.last.open();
     r.sockets.last.drop();
-    await expect(cut).rejects.toMatchObject({ code: "offline" });
+    await expect(cut).rejects.toMatchObject({ code: "lost" });
 
     const silent = r.client.pair("s", "p", "ios");
     r.clock.advance(30_000);
-    await expect(silent).rejects.toMatchObject({ code: "timeout" });
+    await expect(silent).rejects.toMatchObject({ code: "lost" });
     expect(r.sockets.last.closed).toBe(true);
   });
 });
@@ -199,19 +199,37 @@ describe("requests", () => {
     r.clock.advance(1);
     await Promise.resolve();
     expect(outcome).toBeInstanceOf(Refusal);
-    expect(outcome).toMatchObject({ code: "timeout" });
+    expect(outcome).toMatchObject({ code: "lost" }); // sent, outcome unknown
     expect(r.clock.pending).toBe(0);
-    // A late ack is harmless.
-    r.sockets.last.receive({ type: "ack", req: r.sockets.last.commandsOf("prompt")[0]?.req, message: "late" });
+    // A late answer, ack or refusal, is dropped, not shown as traffic.
+    const req = r.sockets.last.commandsOf("prompt")[0]?.req;
+    r.sockets.last.receive({ type: "ack", req, message: "late" });
+    r.sockets.last.receive({ type: "refused", req, code: "busy", reason: "late" });
+    flush(r);
+    expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
+  });
+
+  it("remembers only the last 64 timed-out requests", async () => {
+    const r = rig();
+    ready(r);
+    for (let i = 0; i < 70; i++) r.client.request({ type: "cancel", session: "s" }).catch(() => undefined);
+    r.clock.advance(30_000);
+    await Promise.resolve();
+    const reqs = r.sockets.last.commandsOf("cancel").map((c) => c.req);
+    // The oldest was forgotten, so its late refusal is only dropped for not being req 0.
+    for (const req of reqs) r.sockets.last.receive({ type: "refused", req, code: "busy", reason: "late" });
+    flush(r);
+    expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
+    expect(r.states.at(-1)).toBe("ready");
   });
 
   it("rejects at once when offline, and when the link drops with a request waiting", async () => {
     const r = rig();
-    await expect(r.client.request({ type: "cancel", session: "s" })).rejects.toMatchObject({ code: "offline" });
+    await expect(r.client.request({ type: "cancel", session: "s" })).rejects.toMatchObject({ code: "unsent" });
     ready(r);
     const waiting = r.client.request({ type: "cancel", session: "s" });
     r.sockets.last.drop();
-    await expect(waiting).rejects.toMatchObject({ code: "offline" });
+    await expect(waiting).rejects.toMatchObject({ code: "lost" });
     expect(r.sockets.last.commandsOf("cancel")).toHaveLength(1);
   });
 
@@ -219,8 +237,33 @@ describe("requests", () => {
     const r = rig();
     r.client.start();
     r.sockets.last.open();
-    await expect(r.client.request({ type: "cancel", session: "s" })).rejects.toMatchObject({ code: "offline" });
+    await expect(r.client.request({ type: "cancel", session: "s" })).rejects.toMatchObject({ code: "unsent" });
     expect(r.sockets.last.commandsOf("cancel")).toHaveLength(0);
+  });
+
+  it("a socket that throws on send leaves the request unsent", async () => {
+    const r = rig();
+    ready(r);
+    r.sockets.last.send = () => {
+      throw new Error("closed");
+    };
+    await expect(r.client.request({ type: "cancel", session: "s" })).rejects.toMatchObject({ code: "unsent" });
+    expect(r.clock.pending).toBe(0);
+  });
+
+  it("a pairing whose socket throws on send or close rejects unsent", async () => {
+    const r = rig({ token: null });
+    const pending = r.client.pair("s", "p", "ios");
+    const socket = r.sockets.last;
+    socket.send = () => {
+      throw new Error("closed");
+    };
+    socket.close = () => {
+      throw new Error("closed");
+    };
+    socket.open();
+    await expect(pending).rejects.toMatchObject({ code: "unsent" });
+    expect(r.clock.pending).toBe(0);
   });
 });
 
@@ -521,19 +564,253 @@ describe("unpairing", () => {
     expect(delivered(r).some((f) => f.type === "refused" && f.code === "rate_limited")).toBe(true);
   });
 
-  it("a refused subscribe reaches the consumer", () => {
+  it("an unmatched refusal with a req is dropped; only req 0 is shown", () => {
     const r = rig();
     ready(r);
-    r.client.subscribe("gone");
-    const req = r.sockets.last.commandsOf("subscribe")[0]?.req;
-    r.sockets.last.receive({ type: "refused", req, code: "unavailable", reason: "The session ended" });
+    r.sockets.last.receive({ type: "refused", req: 4242, code: "busy", reason: "stray" });
     flush(r);
-    expect(delivered(r).some((f) => f.type === "refused" && f.reason === "The session ended")).toBe(true);
-    // And a subscribe's ack is not traffic.
+    expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
+  });
+
+  it("a subscribe's ack is not traffic", () => {
+    const r = rig();
+    ready(r);
     r.client.subscribe("live");
-    r.sockets.last.receive({ type: "ack", req: r.sockets.last.commandsOf("subscribe")[1]?.req, message: "ok" });
+    r.sockets.last.receive({ type: "ack", req: r.sockets.last.commandsOf("subscribe")[0]?.req, message: "ok" });
     flush(r);
-    expect(delivered(r).some((f) => f.type === "ack")).toBe(false);
+    expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
+  });
+
+  it("a throwing onCursor callback does not break stop or unpair", () => {
+    const sockets = new Sockets();
+    const clock = new FakeClock();
+    const client = new HubClient({
+      url: URL,
+      token: TOKEN,
+      factory: sockets.factory,
+      now: clock.now,
+      schedule: clock.schedule,
+      onCursor: () => {
+        throw new Error("disk full");
+      },
+    });
+    client.start();
+    sockets.last.open();
+    sockets.last.receive({ type: "welcome", device: "p" });
+    client.subscribe("s");
+    sockets.last.receive({ type: "subscribed", session: "s", from: "start", journals: ["a"] });
+    sockets.last.receive(event("s", "a", 1));
+    expect(() => client.stop()).not.toThrow();
+    expect(client.state).toBe("offline");
+  });
+});
+
+describe("subscribing again on a live connection", () => {
+  /** Ready, subscribed to s1 with a:1..3 taken. */
+  function live(): Rig {
+    const r = rig();
+    ready(r);
+    r.client.subscribe("s1");
+    r.sockets.last.receive({ type: "subscribed", session: "s1", from: "start", journals: ["a"] });
+    for (const seq of [1, 2, 3]) r.sockets.last.receive(event("s1", "a", seq));
+    flush(r);
+    r.batches.length = 0;
+    return r;
+  }
+  const lastReq = (r: Rig, type: string) => r.sockets.last.commandsOf(type).at(-1)?.req;
+
+  it("a fresh subscribe unsubscribes first, drops stale events, and loses no replayed row", () => {
+    const r = live();
+    const socket = r.sockets.last;
+    r.client.subscribe("s1", true);
+    expect(socket.commands().at(-1)).toMatchObject({ type: "unsubscribe", session: "s1" });
+    expect(socket.commandsOf("subscribe")).toHaveLength(1); // not yet
+
+    // The old subscription's last live events, before its unsubscribe is answered.
+    socket.receive(event("s1", "a", 500));
+    socket.receive({ type: "subscribed", session: "s1", from: "cursor", journals: ["a"] });
+    expect(socket.commandsOf("subscribe")).toHaveLength(1);
+
+    socket.receive({ type: "ack", req: lastReq(r, "unsubscribe"), message: "ok" });
+    expect(socket.commandsOf("subscribe")).toHaveLength(2);
+    expect(socket.commandsOf("subscribe")[1]?.after).toBeUndefined();
+
+    socket.receive({ type: "subscribed", session: "s1", from: "start", journals: ["a"] });
+    for (const seq of [1, 2, 3, 4]) socket.receive(event("s1", "a", seq));
+    flush(r);
+    expect(delivered(r).map((f) => (f.type === "event" ? `${f.journal}:${f.seq}` : f.type))).toEqual([
+      "subscribed",
+      "a:1",
+      "a:2",
+      "a:3",
+      "a:4",
+    ]);
+  });
+
+  it("forget then subscribe waits for the ack and starts from the start", () => {
+    const r = live();
+    const socket = r.sockets.last;
+    r.client.forget("s1");
+    r.client.subscribe("s1");
+    expect(socket.commandsOf("unsubscribe")).toHaveLength(1);
+    expect(socket.commandsOf("subscribe")).toHaveLength(1);
+    socket.receive(event("s1", "a", 500));
+    socket.receive({ type: "ack", req: lastReq(r, "unsubscribe"), message: "ok" });
+    expect(socket.commandsOf("subscribe")).toHaveLength(2);
+    expect(socket.commandsOf("subscribe")[1]?.after).toBeUndefined();
+    socket.receive({ type: "subscribed", session: "s1", from: "start", journals: ["a"] });
+    socket.receive(event("s1", "a", 1));
+    flush(r);
+    expect(eventSeqs(delivered(r))).toEqual(["a:1"]);
+  });
+
+  it("unsubscribe then subscribe resumes after the cursor once the ack is in", () => {
+    const r = live();
+    const socket = r.sockets.last;
+    r.client.unsubscribe("s1");
+    r.client.subscribe("s1");
+    socket.receive(event("s1", "a", 4)); // stale: dropped, and not remembered
+    expect(socket.commandsOf("subscribe")).toHaveLength(1);
+    socket.receive({ type: "ack", req: lastReq(r, "unsubscribe"), message: "ok" });
+    expect(socket.commandsOf("subscribe")[1]?.after).toEqual({ journal: "a", seq: 3 });
+    socket.receive({ type: "subscribed", session: "s1", from: "cursor", journals: ["a"] });
+    socket.receive(event("s1", "a", 4));
+    flush(r);
+    expect(eventSeqs(delivered(r))).toEqual(["a:4"]);
+  });
+
+  it("an unsubscribe nobody wants subscribed again sends no subscribe", () => {
+    const r = live();
+    r.client.unsubscribe("s1");
+    r.sockets.last.receive({ type: "ack", req: lastReq(r, "unsubscribe"), message: "ok" });
+    expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(1);
+  });
+
+  it("a refused unsubscribe still lets the subscribe go", () => {
+    const r = live();
+    r.client.subscribe("s1", true);
+    r.sockets.last.receive({ type: "refused", req: lastReq(r, "unsubscribe"), code: "invalid", reason: "x" });
+    expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(2);
+    flush(r);
+    expect(delivered(r)).toEqual([]);
+  });
+
+  it("a reconnect during the wait subscribes once on the new connection", () => {
+    const r = live();
+    r.client.subscribe("s1", true);
+    r.sockets.last.drop();
+    r.clock.advance(500);
+    r.sockets.last.open();
+    r.sockets.last.receive({ type: "welcome", device: "p" });
+    expect(r.sockets.last.commandsOf("unsubscribe")).toHaveLength(0);
+    expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(1);
+    expect(r.sockets.last.commandsOf("subscribe")[0]?.after).toBeUndefined();
+  });
+
+  it("subscribing to a session already live is a no-op", () => {
+    const r = live();
+    r.client.subscribe("s1");
+    expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(1);
+    expect(r.sockets.last.commandsOf("unsubscribe")).toHaveLength(0);
+  });
+});
+
+describe("a refused subscribe", () => {
+  function failing(r: Rig): [string, Refusal][] {
+    const failed: [string, Refusal][] = [];
+    r.client.onSubscribeFailed((session, refusal) => failed.push([session, refusal]));
+    return failed;
+  }
+  const refuse = (r: Rig, code: string, nth: number) =>
+    r.sockets.last.receive({
+      type: "refused",
+      req: r.sockets.last.commandsOf("subscribe")[nth]?.req,
+      code,
+      reason: `no: ${code}`,
+    });
+
+  it("is surfaced at once with its session for most codes, and not as traffic", () => {
+    const r = rig();
+    const failed = failing(r);
+    ready(r);
+    r.client.subscribe("gone");
+    refuse(r, "unavailable", 0);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.[0]).toBe("gone");
+    expect(failed[0]?.[1]).toBeInstanceOf(Refusal);
+    expect(failed[0]?.[1]).toMatchObject({ code: "unavailable", message: "no: unavailable" });
+    r.clock.advance(60_000);
+    expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(1); // no retry
+    flush(r);
+    expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
+    // The consumer can ask again.
+    r.client.subscribe("gone");
+    expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(2);
+  });
+
+  it.each(["rate_limited", "timeout"])("%s is retried three times 5 s apart, then surfaced", (code) => {
+    const r = rig();
+    const failed = failing(r);
+    ready(r);
+    r.client.subscribe("s1");
+    for (let n = 0; n < 3; n++) {
+      refuse(r, code, n);
+      expect(failed).toHaveLength(0);
+      expect(r.clock.delays).toEqual([5000]);
+      r.clock.advance(4999);
+      expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(n + 1);
+      r.clock.advance(1);
+      expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(n + 2);
+    }
+    refuse(r, code, 3);
+    expect(failed.map(([session, refusal]) => [session, refusal.code])).toEqual([["s1", code]]);
+    expect(r.clock.pending).toBe(0);
+  });
+
+  it("a retry that is accepted starts the count over", () => {
+    const r = rig();
+    const failed = failing(r);
+    ready(r);
+    r.client.subscribe("s1");
+    refuse(r, "rate_limited", 0);
+    r.clock.advance(5000);
+    r.sockets.last.receive({ type: "subscribed", session: "s1", from: "start", journals: ["a"] });
+    r.sockets.last.receive({ type: "ack", req: r.sockets.last.commandsOf("subscribe")[1]?.req, message: "ok" });
+    r.client.subscribe("s1", true);
+    r.sockets.last.receive({ type: "ack", req: r.sockets.last.commandsOf("unsubscribe")[0]?.req, message: "ok" });
+    for (let n = 2; n < 5; n++) {
+      refuse(r, "rate_limited", n);
+      r.clock.advance(5000);
+    }
+    expect(failed).toHaveLength(0);
+  });
+
+  it("the retry timer is cancelled by stop, unsubscribe and a dropped link", () => {
+    for (const cancel of [
+      (r: Rig) => r.client.stop(),
+      (r: Rig) => r.client.unsubscribe("s1"),
+      (r: Rig) => r.client.forget("s1"),
+      (r: Rig) => r.sockets.last.drop(),
+    ]) {
+      const r = rig();
+      ready(r);
+      r.client.subscribe("s1");
+      refuse(r, "rate_limited", 0);
+      expect(r.clock.delays).toContain(5000);
+      cancel(r);
+      r.clock.advance(5000);
+      expect(r.sockets.all.at(-1)?.commandsOf("subscribe").length).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("revoked on a subscribe unpairs and is not a subscribe failure", () => {
+    const r = rig();
+    const failed = failing(r);
+    ready(r);
+    r.client.subscribe("s1");
+    refuse(r, "revoked", 0);
+    expect(r.client.state).toBe("unpaired");
+    expect(failed).toHaveLength(0);
   });
 });
 
