@@ -4,7 +4,7 @@ import type { HubState } from "./client/HubClient";
 import type { Activity } from "./mascot/state";
 import { poseFor } from "./mascot/state";
 import type { PoseName } from "./mascot/poses";
-import type { Phase, SessionInfo } from "./protocol";
+import type { Engine, Phase, SessionInfo } from "./protocol";
 
 /** The last component of a workspace path ("/Users/me/Octet/" -> "Octet"). */
 export function folderName(path: string): string {
@@ -26,6 +26,9 @@ export function clipLabel(text: string, max = 120): string {
 }
 
 const ENGINE_NAMES = { claude: "Claude", codex: "Codex", demo: "Demo" } as const;
+
+/** An engine as the app names it. */
+export const engineName = (engine: Engine): string => ENGINE_NAMES[engine];
 
 /** "Claude · sonnet-5": the engine, and the model when the Mac says which. */
 export function engineLine(s: SessionInfo): string {

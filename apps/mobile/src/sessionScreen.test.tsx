@@ -536,6 +536,31 @@ describe("the Session screen", () => {
       expect(screen.queryByRole("button", { name: "Allow" })).toBeNull();
     });
 
+    it("changes the mode over the wire, and the catalog moves the current mark", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      const catalog = (current_mode: string) => ({
+        type: "catalog",
+        session: "a",
+        catalog: { modes: ["ask", "auto"], current_mode, models: [], current: null },
+      });
+      expect(screen.queryByRole("button", { name: "Mode and model" })).toBeNull();
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), catalog("ask"));
+      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Auto" }));
+      await act(async () => {});
+      const sent = lastCommand(rig, "set_mode");
+      expect(sent).toMatchObject({ session: "a", mode: "auto" });
+      await feed(rig, { type: "ack", req: sent?.req, message: "ok" });
+      expect(screen.queryByRole("button", { name: "Auto" })).toBeNull(); // the sheet closed
+      await feed(rig, catalog("auto"));
+      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
+      expect(screen.getByRole("button", { name: "Auto, current" })).toBeTruthy();
+      // An ended session takes no commands: the button goes with the controls.
+      await feed(rig, { type: "sessions", sessions: [] });
+      expect(screen.queryByRole("button", { name: "Mode and model" })).toBeNull();
+    });
+
     it("has none of them for a session that is gone", async () => {
       await launch([info("a")], "/session/zzz");
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();

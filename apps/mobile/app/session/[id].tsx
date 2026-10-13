@@ -9,6 +9,7 @@ import { ApprovalSheet } from "../../src/components/ApprovalSheet";
 import { Composer } from "../../src/components/Composer";
 import { useFollow } from "../../src/components/follow";
 import { HubBanner } from "../../src/components/HubBanner";
+import { ModeModelSheet } from "../../src/components/ModeModelSheet";
 import type { Send } from "../../src/components/send";
 import { SessionControls } from "../../src/components/SessionControls";
 import { TaskStrip } from "../../src/components/TaskStrip";
@@ -22,6 +23,7 @@ import {
   releaseSession,
   unwatch,
   useApprovals,
+  useCatalog,
   useEntries,
   useHub,
   useListed,
@@ -60,6 +62,7 @@ export default function Session() {
   const hub = useHub();
   const taskOpen = useTaskOpen();
   const approvals = useApprovals(id);
+  const catalog = useCatalog(id);
   const insets = useSafeAreaInsets();
   const setTaskOpen = octetStore.getState().setTaskOpen;
 
@@ -185,6 +188,7 @@ export default function Session() {
               <>
                 <ApprovalSheet session={id} approvals={approvals} send={send} />
                 <SessionControls session={id} phase={phase} engine={info?.engine ?? "claude"} send={send} />
+                <ModeModelSheet session={id} catalog={catalog} send={send} />
                 <View style={{ paddingBottom: Math.max(insets.bottom, spacing.sm) }}>
                   <Composer session={id} phase={phase} queued={queued} send={send} />
                 </View>

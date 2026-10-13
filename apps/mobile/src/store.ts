@@ -10,7 +10,7 @@ import { ENGINES, MODES, PHASES, count, member } from "./model/enums";
 import { EMPTY_VIEW, reduceView, type Op, type PendingApproval, type SessionState, type SessionView } from "./model/session";
 import type { Entry } from "./model/transcript";
 import { field } from "./model/text";
-import { isKnownEvent, type SessionInfo } from "./protocol";
+import { isKnownEvent, type CatalogInfo, type SessionInfo } from "./protocol";
 
 export interface OctetState {
   /** The live sessions, as the hub listed them last. */
@@ -339,6 +339,9 @@ export function bindHooks(store: OctetStore) {
     useTaskOpen: (): boolean => useStore(store, (s) => s.taskOpen),
     useApprovals: (id: string): PendingApproval[] =>
       useStore(store, (s) => s.bySession.get(id)?.approvals ?? NO_APPROVALS),
+    /** The modes and models a session offers, with the current ones marked; null until the Mac
+     * sends them. The same object until it changes. */
+    useCatalog: (id: string): CatalogInfo | null => useStore(store, (s) => s.bySession.get(id)?.catalog ?? null),
     useHub: (): HubState => useStore(store, (s) => s.hub),
   };
 }
@@ -355,5 +358,6 @@ export const {
   useListed,
   useTaskOpen,
   useApprovals,
+  useCatalog,
   useHub,
 } = bindHooks(octetStore);

@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 import { confirmBiometric } from "../auth";
@@ -89,8 +89,10 @@ export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, s
     [],
   );
   // The ids still open, for a request to ask after Face ID: the store may have closed it meanwhile.
+  // A layout effect, not a passive one: it runs in the commit itself, so a close is visible at
+  // once to an Allow that is awaiting Face ID, with no frame in between.
   const open = useRef<readonly number[]>([]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     open.current = approvals.map((a) => a.id);
   });
   const isOpen = useCallback((id: number) => open.current.includes(id), []);
