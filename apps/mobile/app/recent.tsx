@@ -8,32 +8,14 @@ import { NewForm, NO_WORKSPACE, type StartBody } from "../src/components/NewForm
 import { RecentRow } from "../src/components/RecentRow";
 import { failure, useAction, useAlive, useSend, type Failure } from "../src/components/send";
 import type { RecentInfo } from "../src/protocol";
-import { tmuxOfAck, workspaceChoices } from "../src/recent";
+import { recentItems, tmuxOfAck, workspaceChoices } from "../src/recent";
 import { useCatalogs, useHub, useListed, useSessions } from "../src/store";
 import { radius, spacing, type, useTheme } from "../src/theme";
 
 /** A launched session that has not shown in Sessions by now is probably not coming. */
 export const APPEAR_MS = 30_000;
-const ENGINES: readonly string[] = ["claude", "codex", "demo"];
 
 const keyOf = (r: RecentInfo): string => `${r.engine}:${r.workspace}:${r.session}`;
-
-/** What the hub sent, kept only if it has the shape of a `recent` answer. */
-function itemsOf(frame: unknown): RecentInfo[] | null {
-  if (typeof frame !== "object" || frame === null) return null;
-  const { type: kind, items } = frame as { type?: unknown; items?: unknown };
-  if (kind !== "recent" || !Array.isArray(items)) return null;
-  return items.filter(
-    (r): r is RecentInfo =>
-      typeof r === "object" &&
-      r !== null &&
-      ENGINES.includes((r as RecentInfo).engine) &&
-      typeof (r as RecentInfo).workspace === "string" &&
-      typeof (r as RecentInfo).session === "string" &&
-      typeof (r as RecentInfo).title === "string" &&
-      typeof (r as RecentInfo).started === "number",
-  );
-}
 
 interface Loaded {
   /** `loading` until the first answer. */
@@ -79,7 +61,7 @@ export default function RecentAndNew() {
     send({ type: "recent" }).then(
       (frame) => {
         if (!alive() || loadId.current !== mine) return;
-        const items = itemsOf(frame);
+        const items = recentItems(frame);
         setLoaded((l) =>
           items
             ? { state: "ready", items, pulling: false, failed: null, at: Date.now() }

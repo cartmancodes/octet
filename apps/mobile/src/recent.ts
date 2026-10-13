@@ -1,7 +1,31 @@
 // What the Recent and New screen derives: how long ago a session started, which workspaces and
 // models can be offered, and the tmux name in the hub's start ack. Pure; the screen draws it.
+import { FIELD_CHARS, field } from "./model/text";
 import type { CatalogInfo, Engine, ModelInfo, RecentInfo, SessionInfo } from "./protocol";
 import { folderName } from "./sessions";
+
+const ENGINES: readonly string[] = ["claude", "codex", "demo"];
+
+const isItem = (r: unknown): r is RecentInfo =>
+  typeof r === "object" &&
+  r !== null &&
+  ENGINES.includes((r as RecentInfo).engine) &&
+  typeof (r as RecentInfo).workspace === "string" &&
+  typeof (r as RecentInfo).session === "string" &&
+  typeof (r as RecentInfo).title === "string" &&
+  typeof (r as RecentInfo).started === "number";
+
+/** The items of a `recent` answer, or null for anything without its shape. The title and
+ * workspace are cleaned and clipped like a listed session's; the session id is kept exactly, for
+ * the Mac to resume by. */
+export function recentItems(frame: unknown): RecentInfo[] | null {
+  if (typeof frame !== "object" || frame === null) return null;
+  const { type: kind, items } = frame as { type?: unknown; items?: unknown };
+  if (kind !== "recent" || !Array.isArray(items)) return null;
+  return items
+    .filter(isItem)
+    .map((r) => ({ ...r, title: field(r.title, FIELD_CHARS), workspace: field(r.workspace, FIELD_CHARS) }));
+}
 
 const MINUTE = 60;
 const HOUR = 3_600;

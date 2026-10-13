@@ -16,6 +16,8 @@ import { radius, spacing, type, useTheme } from "../src/theme";
 const MASCOT = 59;
 /** The pull-to-refresh spinner stops by itself if the Mac does not answer. */
 const REFRESH_MAX_MS = 8_000;
+/** On a live link the list is pushed as it changes: a pull only waits this long for a sessions frame. */
+export const LIVE_PULL_MS = 1_000;
 
 const keyOf = (s: SessionInfo): string => s.id;
 
@@ -40,7 +42,8 @@ export default function Sessions() {
   const hub = useHub();
   const listed = useListed();
   const focused = useIsFocused();
-  const [pulled, setPulled] = useState(false);
+  // "live": pulled on a live link; "connect": pulled while the Mac could not be reached.
+  const [pull, setPull] = useState<"live" | "connect" | null>(null);
 
   const sorted = useMemo(() => sortSessions(sessions), [sessions]);
   const pose = headerPose(sessions, hub);
@@ -57,22 +60,35 @@ export default function Sessions() {
   );
   const openRecent = useCallback(() => router.push("/recent"), [router]);
 
-  // A pull is a fresh connection: stopping and starting says `hello` again and asks for the list.
+  // On a live link the sessions are pushed as they change, so a pull keeps the link (no offline
+  // flash) and only waits briefly for the next list. Otherwise it tries the Mac now, skipping
+  // what is left of the backoff.
   const refresh = useCallback(() => {
     if (!client) return;
-    client.stop();
-    client.start();
-    setPulled(true);
+    if (client.state === "ready") {
+      setPull("live");
+      return;
+    }
+    client.retry();
+    setPull("connect");
   }, [client]);
   useEffect(() => {
-    if (!pulled) return;
-    const timer = setTimeout(() => setPulled(false), REFRESH_MAX_MS);
-    return () => clearTimeout(timer);
-  }, [pulled]);
-  // The Mac answered: the pull is over, so a later drop does not bring the spinner back. (A
-  // pull stops the client first, so the render it causes sees the Mac unreachable.)
-  if (pulled && reachable) setPulled(false);
-  const refreshing = pulled && !reachable;
+    if (pull === null) return;
+    const timer = setTimeout(() => setPull(null), pull === "live" ? LIVE_PULL_MS : REFRESH_MAX_MS);
+    const off =
+      pull === "live" && client
+        ? client.onBatch((frames) => {
+            if (frames.some((f) => f.type === "sessions")) setPull(null);
+          })
+        : null;
+    return () => {
+      clearTimeout(timer);
+      off?.();
+    };
+  }, [pull, client]);
+  // The Mac answered: the pull is over, so a later drop does not bring the spinner back.
+  if (pull === "connect" && reachable) setPull(null);
+  const refreshing = pull === "live" || (pull === "connect" && !reachable);
 
   const empty = useMemo(
     () =>

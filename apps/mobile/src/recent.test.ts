@@ -1,5 +1,5 @@
 import type { CatalogInfo, RecentInfo, SessionInfo } from "./protocol";
-import { modelsFor, startedAgo, tmuxOfAck, workspaceChoices } from "./recent";
+import { modelsFor, recentItems, startedAgo, tmuxOfAck, workspaceChoices } from "./recent";
 
 const NOW = 1_800_000_000_000; // ms
 
@@ -81,5 +81,40 @@ describe("tmuxOfAck", () => {
     expect(tmuxOfAck(null)).toBeNull();
     expect(tmuxOfAck({ message: 5 })).toBeNull();
     expect(tmuxOfAck({ message: "Starting other-name in /w" })).toBeNull(); // not one of the hub's names
+  });
+});
+
+describe("recentItems", () => {
+  const item = (extra: Record<string, unknown> = {}) => ({
+    engine: "claude",
+    workspace: "/Users/me/octet",
+    session: "abc",
+    title: "Fix the hub",
+    started: 1_700_000_000,
+    ...extra,
+  });
+
+  it("keeps only items with the shape of a recent answer", () => {
+    expect(recentItems({ type: "ack" })).toBeNull();
+    expect(recentItems(null)).toBeNull();
+    expect(recentItems({ type: "recent", items: "no" })).toBeNull();
+    const items = recentItems({
+      type: "recent",
+      items: [item(), item({ engine: "vim" }), item({ title: 3 }), item({ started: "x" }), null],
+    });
+    expect(items).toEqual([item()]);
+  });
+
+  it("cleans the title and workspace the way sessions are, and clips them", () => {
+    const [cleaned] =
+      recentItems({
+        type: "recent",
+        items: [item({ title: "\u001b[31mred\u001b[0m \u202eevil\u0007", workspace: "/w\u001b]0;title\u0007/x" + "y".repeat(10_000) })],
+      }) ?? [];
+    expect(cleaned?.title).toBe("red evil");
+    expect(cleaned?.workspace.startsWith("/w/xyyy")).toBe(true);
+    expect(cleaned?.workspace.length).toBe(4_096);
+    // The id the Mac resumes by is sent back exactly as it came.
+    expect(cleaned?.session).toBe("abc");
   });
 });

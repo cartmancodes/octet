@@ -8,6 +8,7 @@ import type {
   ToPhone,
 } from "../protocol";
 import { PROTOCOL_VERSION } from "../protocol";
+import { SHORT_CHARS, field } from "../model/text";
 import { Backoff } from "./backoff";
 import { Cursors } from "./cursors";
 import { parseFrame } from "./frames";
@@ -85,8 +86,6 @@ export interface HubClientOptions {
   onCursor?: (session: string, cursor: Cursor | null) => void;
 }
 
-/** Recent requests that timed out, remembered so that their late answers are dropped. */
-const EXPIRED_KEPT = 64;
 /** A `rate_limited` or `timeout` refusal of a subscribe is retried this many times, this far apart. */
 export const SUBSCRIBE_RETRIES = 3;
 export const SUBSCRIBE_RETRY_MS = 5_000;
@@ -94,6 +93,8 @@ export const SUBSCRIBE_RETRY_MS = 5_000;
 export const REQUEST_TIMEOUT_MS = 30_000;
 export const HANDSHAKE_TIMEOUT_MS = 15_000;
 export const BATCH_INTERVAL_MS = 50;
+/** A link ready this long counts as good: its drop starts the backoff over. */
+export const STABLE_MS = 10_000;
 
 interface Pending {
   resolve: (ack: Ack) => void;
@@ -106,6 +107,9 @@ const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
   return () => clearTimeout(id);
 };
 
+/** A refusal's words, as the user will read them: the hub's, cleaned and clipped. */
+const refusalOf = (frame: RefusedFrame): Refusal => new Refusal(frame.code ?? "invalid", field(frame.reason, SHORT_CHARS));
+
 const isUnpaired = (code: RefusalCode | null | undefined): boolean =>
   code === "unpaired" || code === "revoked";
 
@@ -114,7 +118,7 @@ const isUnpaired = (code: RefusalCode | null | undefined): boolean =>
  *
  * `start()` connects, says `hello` with the device token, and on `welcome` is `ready` and
  * re-subscribes every wanted session after its cursor. A lost connection reconnects with a
- * jittered backoff until `stop()` (the app went to the background), which closes the socket
+ * jittered backoff (started over once a link has been ready for 10 s) until `stop()` (the app went to the background), which closes the socket
  * and leaves no timer behind. Only a `refused` with code `unpaired` or `revoked` forgets the
  * token and ends in the `unpaired` state; a closed socket never does.
  *
@@ -138,6 +142,8 @@ export class HubClient {
   private nextReq = 1;
   private cancelReconnect: (() => void) | null = null;
   private cancelHandshake: (() => void) | null = null;
+  /** When this connection said welcome; null before. */
+  private readyAt: number | null = null;
 
   private readonly wanted = new Set<string>();
   private readonly pending = new Map<number, Pending>();
@@ -151,7 +157,6 @@ export class HubClient {
   private readonly settling = new Map<number, string>();
   private readonly retries = new Map<string, number>();
   private readonly retryTimers = new Map<string, () => void>();
-  private readonly expired = new Set<number>();
   private readonly subscribeFailedListeners = new Set<(session: string, refusal: Refusal) => void>();
   private readonly pairings = new Set<() => void>();
 
@@ -240,7 +245,7 @@ export class HubClient {
           this.tokenValue = frame.token;
           finish(() => resolve({ token: frame.token, device: frame.device }));
         } else if (frame.type === "refused") {
-          finish(() => reject(new Refusal(frame.code ?? "invalid", frame.reason)));
+          finish(() => reject(refusalOf(frame)));
         }
       };
       socket.onclose = abort;
@@ -268,8 +273,23 @@ export class HubClient {
     if (this.stateValue !== "unpaired") this.setState("offline");
   }
 
+  /** Connects now instead of waiting out the backoff (the user pulled to refresh). A link that is
+   * up or opening is left alone; a stopped client starts. */
+  retry(): void {
+    if (!this.running) {
+      this.start();
+      return;
+    }
+    if (this.cancelReconnect === null) return;
+    this.cancelReconnect();
+    this.cancelReconnect = null;
+    this.connect();
+  }
+
   /** Sends a command and resolves with its `ack` (or `recent`) frame. Rejects with a
-   * `Refusal`: the hub's code and words, `timeout` after 30 s, or `offline` when not ready. */
+   * `Refusal`: the hub's code and words, `lost` after 30 s, or `unsent` when not ready. A request
+   * with no answer in 30 s takes the link for dead: the socket is closed and the client reconnects
+   * with its backoff, resuming every session from its cursor. */
   request(cmd: RequestBody): Promise<Ack> {
     const socket = this.socket;
     if (this.stateValue !== "ready" || !socket) {
@@ -279,12 +299,10 @@ export class HubClient {
     return new Promise<Ack>((resolve, reject) => {
       const cancel = this.schedule(() => {
         this.pending.delete(req);
-        this.expired.add(req);
-        if (this.expired.size > EXPIRED_KEPT) {
-          const oldest = this.expired.values().next().value;
-          if (oldest !== undefined) this.expired.delete(oldest);
-        }
         reject(new Refusal("lost", "The Mac did not answer in time"));
+        // A hub that is up answers in time; a half-open link (Wi-Fi gone, the Mac asleep) only
+        // looks open. Its late answers die with it.
+        if (this.socket === socket) this.lost();
       }, REQUEST_TIMEOUT_MS);
       this.pending.set(req, { resolve, reject, cancel });
       try {
@@ -382,6 +400,9 @@ export class HubClient {
 
   /** The socket is gone (or given up on): fail what waits, and come back if still wanted. */
   private lost(): void {
+    // A link that was good for a while starts the climb over; one that drops just after its
+    // welcome (a flapping network, a hub in a crash loop) keeps climbing.
+    if (this.readyAt !== null && this.now() - this.readyAt >= STABLE_MS) this.backoff.reset();
     this.teardown();
     if (!this.running || this.stateValue === "unpaired") return;
     this.setState("offline");
@@ -395,6 +416,7 @@ export class HubClient {
   private teardown(): void {
     this.cancelHandshake?.();
     this.cancelHandshake = null;
+    this.readyAt = null;
     const socket = this.socket;
     this.socket = null;
     if (socket) {
@@ -453,7 +475,7 @@ export class HubClient {
       case "welcome":
         this.cancelHandshake?.();
         this.cancelHandshake = null;
-        this.backoff.reset();
+        this.readyAt = this.now();
         this.setState("ready");
         for (const session of this.wanted) this.sendSubscribe(session);
         return;
@@ -506,7 +528,7 @@ export class HubClient {
     if (entry) {
       this.pending.delete(frame.req);
       entry.cancel();
-      entry.reject(new Refusal(frame.code ?? "invalid", frame.reason));
+      entry.reject(refusalOf(frame));
     } else if (session !== undefined) {
       this.subscribeReqs.delete(frame.req);
       this.live.delete(session);
@@ -534,7 +556,7 @@ export class HubClient {
       return;
     }
     this.retries.delete(session);
-    const refusal = new Refusal(frame.code ?? "invalid", frame.reason);
+    const refusal = refusalOf(frame);
     for (const fn of [...this.subscribeFailedListeners]) {
       try {
         fn(session, refusal);

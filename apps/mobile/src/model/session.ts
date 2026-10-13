@@ -11,7 +11,7 @@ import type {
 } from "../protocol";
 import { EMPTY_TRANSCRIPT, TranscriptDraft, type Entry, type Transcript } from "./transcript";
 import { ENGINES, MODES, PHASES, count, member } from "./enums";
-import { field } from "./text";
+import { SHORT_CHARS, field } from "./text";
 
 /** An approval waiting, with the request as the journal recorded it (empty when only the
  * terminal UI's state frame told of it). */
@@ -81,7 +81,6 @@ export const MAX_APPROVALS = 32;
 export const MAX_CLOSED = 256;
 /** Bounds on what a hub can make the phone hold. */
 const TEXT_CHARS = 8_000;
-const SHORT_CHARS = 512;
 const DETAIL_CHARS = 16_000;
 const MAX_FILES = 200;
 const MAX_QUEUE = 8;

@@ -139,6 +139,11 @@ export function fit(clipped: Clipped, limit: number): Clipped {
   return { text: EARLIER + clipped.text.slice(tail.start), bytes: EARLIER_BYTES + tail.bytes };
 }
 
+/** The most characters kept of a short hub string: a name, a reason, a label. */
+export const SHORT_CHARS = 512;
+/** The most characters kept of a path or an id, and of a session's listed fields. */
+export const FIELD_CHARS = 4_096;
+
 /** A short field cleaned and clipped to `limit` characters, for strings that are not output. */
 export function field(raw: unknown, limit: number): string {
   const s = typeof raw === "string" ? raw : "";

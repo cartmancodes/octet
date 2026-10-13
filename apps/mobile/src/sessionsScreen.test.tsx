@@ -206,20 +206,63 @@ describe("Sessions", () => {
     expect(screen.getByRole("button", { name: /^a, / }).props.accessibilityState).toMatchObject({ disabled: false });
   });
 
-  it("pull to refresh says hello again on a fresh connection", async () => {
+  it("pull to refresh on a live link keeps it: no new hello, no offline flash", async () => {
     const rig = await launch([info("a")]);
-    const before = rig.sockets.all.length;
     const first = rig.sockets.last;
-    const list = screen.getByTestId("sessions-list");
+    const list = () => screen.getByTestId("sessions-list");
+    const states: string[] = [];
+    const off = octetStore.subscribe((s) => states.push(s.hub));
     await act(async () => {
-      list.props.refreshControl.props.onRefresh();
+      list().props.refreshControl.props.onRefresh();
     });
-    expect(first.closed).toBe(true);
+    off();
+    expect(first.closed).toBe(false);
+    expect(rig.sockets.all).toHaveLength(1);
+    expect(states.filter((s) => s !== "ready")).toEqual([]);
+    expect(screen.queryByText("Can't reach your Mac")).toBeNull();
+    expect(list().props.refreshControl.props.refreshing).toBe(true);
+  });
+
+  it("pull to refresh on a live link ends with the next sessions frame, or after 1 s", async () => {
+    const rig = await launch([info("a")]);
+    const list = () => screen.getByTestId("sessions-list");
+    await act(async () => {
+      list().props.refreshControl.props.onRefresh();
+    });
+    await act(async () => void jest.advanceTimersByTime(999));
+    expect(list().props.refreshControl.props.refreshing).toBe(true);
+    await act(async () => void jest.advanceTimersByTime(1));
+    expect(list().props.refreshControl.props.refreshing).toBe(false);
+    // and a sessions frame ends it sooner
+    await act(async () => {
+      list().props.refreshControl.props.onRefresh();
+    });
+    expect(list().props.refreshControl.props.refreshing).toBe(true);
+    await hear(rig, [info("a"), info("b")]);
+    expect(list().props.refreshControl.props.refreshing).toBe(false);
+  });
+
+  it("pull to refresh while the Mac can't be reached tries again now, not after the backoff", async () => {
+    const rig = await launch([info("a")]);
+    await act(async () => {
+      rig.sockets.last.drop();
+    });
+    const before = rig.sockets.all.length;
+    expect(rig.clock.delays[0]).toBeGreaterThan(0);
+    await act(async () => {
+      screen.getByTestId("sessions-list").props.refreshControl.props.onRefresh();
+    });
     expect(rig.sockets.all).toHaveLength(before + 1);
+    expect(screen.getByTestId("sessions-list").props.refreshControl.props.refreshing).toBe(true);
     await act(async () => {
       rig.sockets.last.open();
     });
     expect(rig.sockets.last.commandsOf("hello")).toEqual([expect.objectContaining({ token: TOKEN })]);
+    await act(async () => {
+      rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+      rig.clock.advance(50);
+    });
+    expect(screen.getByTestId("sessions-list").props.refreshControl.props.refreshing).toBe(false);
   });
 
   it("shows a spinner while pulling, until the Mac answers", async () => {

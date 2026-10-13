@@ -171,6 +171,33 @@ describe("requests", () => {
     expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
   });
 
+  it("a refusal's reason is cleaned of escapes and clipped, for requests, subscribes and pairing", async () => {
+    const hostile = "\u001b[2J\u001b]0;pwned\u0007Not \u202eallowed" + "!".repeat(10_000);
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "end", session: "s" });
+    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("end")[0]?.req, code: "not_allowed", reason: hostile });
+    const refusal = (await pending.catch((e: unknown) => e)) as Refusal;
+    expect(refusal.message.startsWith("Not allowed!")).toBe(true);
+    expect(refusal.message.length).toBe(512);
+
+    const failed: string[] = [];
+    r.client.onSubscribeFailed((_s, f) => failed.push(f.message));
+    r.client.subscribe("s1");
+    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("subscribe")[0]?.req, code: "invalid", reason: hostile });
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.startsWith("Not allowed!")).toBe(true);
+    expect(failed[0]?.length).toBe(512);
+
+    const p = rig({ token: null });
+    const pairing = p.client.pair("bad", "p", "ios");
+    p.sockets.last.open();
+    p.sockets.last.receive({ type: "refused", req: p.sockets.last.commands()[0]?.req, code: "invalid", reason: hostile });
+    const pairRefusal = (await pairing.catch((e: unknown) => e)) as Refusal;
+    expect(pairRefusal.message.startsWith("Not allowed!")).toBe(true);
+    expect(pairRefusal.message.length).toBe(512);
+  });
+
   it("a recent frame answers its request", async () => {
     const r = rig();
     ready(r);
@@ -200,26 +227,44 @@ describe("requests", () => {
     await Promise.resolve();
     expect(outcome).toBeInstanceOf(Refusal);
     expect(outcome).toMatchObject({ code: "lost" }); // sent, outcome unknown
-    expect(r.clock.pending).toBe(0);
     // A late answer, ack or refusal, is dropped, not shown as traffic.
-    const req = r.sockets.last.commandsOf("prompt")[0]?.req;
-    r.sockets.last.receive({ type: "ack", req, message: "late" });
-    r.sockets.last.receive({ type: "refused", req, code: "busy", reason: "late" });
+    const req = r.sockets.all[0]?.commandsOf("prompt")[0]?.req;
+    r.sockets.all[0]?.receive({ type: "ack", req, message: "late" });
+    r.sockets.all[0]?.receive({ type: "refused", req, code: "busy", reason: "late" });
     flush(r);
     expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
   });
 
-  it("remembers only the last 64 timed-out requests", async () => {
+  it("a request that times out takes the link for dead: it reconnects and resumes from the cursors", async () => {
     const r = rig();
     ready(r);
-    for (let i = 0; i < 70; i++) r.client.request({ type: "cancel", session: "s" }).catch(() => undefined);
-    r.clock.advance(30_000);
-    await Promise.resolve();
-    const reqs = r.sockets.last.commandsOf("cancel").map((c) => c.req);
-    // The oldest was forgotten, so its late refusal is only dropped for not being req 0.
-    for (const req of reqs) r.sockets.last.receive({ type: "refused", req, code: "busy", reason: "late" });
+    r.client.subscribe("s1");
+    const first = r.sockets.last;
+    first.receive({ type: "subscribed", session: "s1", from: "start", journals: ["a"] });
+    first.receive(event("s1", "a", 1));
+    first.receive(event("s1", "a", 2));
     flush(r);
-    expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
+    const other = r.client.request({ type: "cancel", session: "s1" });
+    r.clock.advance(10_000);
+    const timedOut = r.client.request({ type: "prompt", session: "s1", text: "x" });
+    const errors = [other.catch((e: unknown) => e), timedOut.catch((e: unknown) => e)];
+    r.clock.advance(20_000); // the first request's 30 s are up
+    await expect(errors[0]).resolves.toMatchObject({ code: "lost" });
+    // The old socket is closed at once, and whatever else waited on it is lost too.
+    expect(first.closed).toBe(true);
+    await expect(errors[1]).resolves.toMatchObject({ code: "lost" });
+    expect(r.states.at(-1)).toBe("offline");
+    // The normal backoff, then a new socket that says hello and resumes after the cursor.
+    expect(r.sockets.all).toHaveLength(1);
+    r.clock.advance(500);
+    expect(r.sockets.all).toHaveLength(2);
+    const second = r.sockets.last;
+    second.open();
+    second.receive({ type: "welcome", device: "iPhone" });
+    expect(second.commandsOf("subscribe").map((c) => [c.session, c.after])).toEqual([["s1", { journal: "a", seq: 2 }]]);
+    // The old socket's late words change nothing.
+    first.receive(event("s1", "a", 3));
+    first.drop();
     expect(r.states.at(-1)).toBe("ready");
   });
 
@@ -286,10 +331,11 @@ describe("reconnecting", () => {
     }
     expect(waits).toEqual([500, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
 
-    // A welcome starts the climb over.
+    // A link that was ready for 10 s starts the climb over.
     r.clock.advance(r.clock.delays[0] ?? 0);
     r.sockets.last.open();
     r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    r.clock.advance(10_000);
     r.sockets.last.drop();
     expect(r.clock.delays).toEqual([500]);
 
@@ -304,6 +350,56 @@ describe("reconnecting", () => {
     const before = r.sockets.all.length;
     r.client.start();
     expect(r.sockets.all).toHaveLength(before + 1);
+  });
+
+  it("a welcome that drops within 10 s does not start the climb over", () => {
+    const r = rig({ random: () => 1 });
+    ready(r);
+    r.clock.advance(10_000);
+    const waits: number[] = [];
+    // A hub that welcomes and then drops the link at once (a flapping network, a crash loop).
+    for (let i = 0; i < 4; i++) {
+      r.sockets.last.drop();
+      const [wait] = r.clock.delays;
+      waits.push(wait ?? -1);
+      r.clock.advance(wait ?? 0);
+      r.sockets.last.open();
+      r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+      r.clock.advance(9_999);
+    }
+    expect(waits).toEqual([500, 1000, 2000, 4000]);
+    r.sockets.last.drop();
+    expect(r.clock.delays).toEqual([8000]);
+    // Ready for a full 10 s: the next drop waits the least again.
+    r.clock.advance(8000);
+    r.sockets.last.open();
+    r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    r.clock.advance(10_000);
+    r.sockets.last.drop();
+    expect(r.clock.delays).toEqual([500]);
+  });
+
+  it("retry connects at once when waiting out the backoff, and leaves a live or opening link alone", () => {
+    const r = rig({ random: () => 1 });
+    ready(r);
+    r.client.retry(); // ready: nothing to do
+    expect(r.sockets.all).toHaveLength(1);
+    for (let i = 0; i < 4; i++) {
+      r.sockets.last.drop();
+      r.clock.advance(r.clock.delays[0] ?? 0);
+    }
+    r.sockets.last.drop();
+    expect(r.clock.delays).toEqual([8000]);
+    r.client.retry();
+    expect(r.sockets.all).toHaveLength(6);
+    expect(r.states.at(-1)).toBe("connecting");
+    expect(r.clock.delays).toEqual([15_000]); // only the new socket's handshake timer
+    r.client.retry(); // opening: left to finish
+    expect(r.sockets.all).toHaveLength(6);
+    // Stopped (backgrounded), a retry is a start.
+    r.client.stop();
+    r.client.retry();
+    expect(r.sockets.all).toHaveLength(7);
   });
 
   it("jitter spreads the waits", () => {
@@ -403,7 +499,7 @@ describe("reconnecting", () => {
 
     // After the journal rolled over, the cursor is the newest journal's.
     second.drop();
-    r.clock.advance(500);
+    r.clock.advance(r.clock.delays[0] ?? 0); // the reconnect wait
     r.sockets.last.open();
     r.sockets.last.receive({ type: "welcome", device: "iPhone" });
     expect(r.sockets.last.commandsOf("subscribe").map((c) => [c.session, c.after])).toEqual([
@@ -487,7 +583,7 @@ describe("reconnecting", () => {
     flush(r);
     expect(r.cursors.at(-1)).toEqual(["s1", null]);
     next.drop();
-    r.clock.advance(500);
+    r.clock.advance(r.clock.delays[0] ?? 0); // the reconnect wait
     r.sockets.last.open();
     r.sockets.last.receive({ type: "welcome", device: "iPhone" });
     expect(r.sockets.last.commandsOf("subscribe")[0]?.after).toBeUndefined();
@@ -546,7 +642,7 @@ describe("unpairing", () => {
     for (const code of [1000, 1001, 1006, 1008, 1011, 4401]) {
       r.sockets.last.drop(code);
       expect(r.states.at(-1)).toBe("offline");
-      r.clock.advance(30_000);
+      r.clock.advance(r.clock.delays[0] ?? 0); // the reconnect wait
       r.sockets.last.open();
       expect(r.sockets.last.commands()[0]).toMatchObject({ type: "hello", token: TOKEN });
       r.sockets.last.receive({ type: "welcome", device: "iPhone" });

@@ -9,7 +9,7 @@ import type { BatchItem, HubClient, HubState } from "./client/HubClient";
 import { ENGINES, MODES, PHASES, count, member } from "./model/enums";
 import { EMPTY_VIEW, reduceView, type Op, type PendingApproval, type SessionState, type SessionView } from "./model/session";
 import type { Entry } from "./model/transcript";
-import { field } from "./model/text";
+import { FIELD_CHARS, field } from "./model/text";
 import { isKnownEvent, type CatalogInfo, type SessionInfo } from "./protocol";
 
 export interface OctetState {
@@ -42,7 +42,7 @@ export type OctetStore = StoreApi<OctetState>;
 
 /** Sessions listed, at most. */
 const MAX_SESSIONS = 200;
-const FIELD = 4_096;
+const FIELD = FIELD_CHARS;
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 

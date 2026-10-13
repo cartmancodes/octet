@@ -182,10 +182,19 @@ describe("Recent", () => {
 
   it("offers Try again after a lost request too: recent only reads", async () => {
     const rig = await open();
-    await act(async () => rig.clock.advance(31_000)); // the client gives up on a request after 30 s
+    // The client gives up on a request after 30 s, and on the link with it: it reconnects.
+    await act(async () => rig.clock.advance(31_000));
     expect(screen.getByText(/Not sure this reached the Mac/)).toBeTruthy();
-    await press("Try again");
-    expect(requests(rig, "recent")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+    await act(async () => {
+      rig.sockets.last.open();
+      rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+      rig.clock.advance(50);
+    });
+    expect(requests(rig, "recent")).toHaveLength(1); // asked again on the new link
+    // The reload cleared the failure.
+    expect(screen.queryByText(/Not sure this reached the Mac/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
 
   it("ignores a reply that comes after the screen left", async () => {

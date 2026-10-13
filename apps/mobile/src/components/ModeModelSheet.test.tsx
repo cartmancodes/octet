@@ -380,6 +380,7 @@ describe("the mode and model sheet", () => {
       await flush();
       await act(async () => screen.getByTestId("sheet").props.onRequestClose()); // Android back
       await press("Mode and model");
+      await settle();
       await act(async () => finish({ success: true }));
       expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
       expect(r.send).not.toHaveBeenCalled();
@@ -530,6 +531,7 @@ describe("the mode and model sheet", () => {
       await press("Mode and model");
       await settle();
       await view.rerender(offline(r.send));
+      await settle();
       expect(button("Auto")?.props.accessibilityState?.disabled).toBe(true);
       await fireEvent.press(screen.getByRole("button", { name: "Auto" }));
       await fireEvent.press(screen.getByRole("button", { name: /^Full access$/ }));
@@ -539,6 +541,7 @@ describe("the mode and model sheet", () => {
       // Close still works.
       await press("Close");
       expect(button("Auto")).toBeNull();
+      await settle();
     });
 
     it("full access, armed before the drop, cannot be turned on while offline", async () => {
@@ -549,10 +552,12 @@ describe("the mode and model sheet", () => {
       await press(/^Full access$/);
       await fireEvent.changeText(screen.getByLabelText("Type full access to confirm"), "full access");
       await view.rerender(offline(r.send));
+      await settle();
       const turnOn = screen.getByRole("button", { name: "Turn on full access" });
       expect(turnOn.props.accessibilityState.disabled).toBe(true);
       await fireEvent.press(turnOn);
       expect(r.send).not.toHaveBeenCalled();
+      await settle();
     });
   });
 });
