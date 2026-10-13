@@ -21,12 +21,16 @@ const STRING_LIMIT = 4096;
 /** Only printable ASCII and newlines: nothing to clean. */
 const PLAIN = /^[\x20-\x7e\n]*$/;
 
-const isBidi = (cp: number): boolean => (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069);
+/** Overrides and isolates (U+202A–202E, U+2066–2069), and the marks LRM, RLM and ALM (U+200E,
+ * U+200F, U+061C): the phone applies the bidi algorithm, so a mark alone reorders what it draws
+ * ("1<RLM> 22" shows as "22 1"). */
+const isBidi = (cp: number): boolean =>
+  (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069) || cp === 0x200e || cp === 0x200f || cp === 0x061c;
 const isControl = (cp: number): boolean => cp < 0x20 || (cp >= 0x7f && cp <= 0x9f);
 const isSurrogate = (cp: number): boolean => cp >= 0xd800 && cp <= 0xdfff;
 
 /**
- * `text` without terminal escapes, control characters (but newlines), bidi overrides and lone
+ * `text` without terminal escapes, control characters (but newlines), bidi controls and lone
  * surrogates, tabs as four spaces; and where the escape state ends. Lone surrogates cannot be
  * in a Rust string, and dropping them keeps byte counts exact.
  */
@@ -146,9 +150,15 @@ export const FIELD_CHARS = 4_096;
 
 /** A short field cleaned and clipped to `limit` characters, for strings that are not output. */
 export function field(raw: unknown, limit: number): string {
+  return fieldCut(raw, limit).text;
+}
+
+/** `field`, and whether its end was dropped to fit `limit`. */
+export function fieldCut(raw: unknown, limit: number): { text: string; cut: boolean } {
   const s = typeof raw === "string" ? raw : "";
-  const { out } = sanitize(s.length > limit * 2 ? wholeStart(s.slice(0, limit * 2)) : s, TEXT);
-  if (out.length <= limit) return out;
+  const long = s.length > limit * 2;
+  const { out } = sanitize(long ? wholeStart(s.slice(0, limit * 2)) : s, TEXT);
+  if (out.length <= limit) return { text: out, cut: long };
   const end = out.charCodeAt(limit - 1);
-  return out.slice(0, end >= 0xd800 && end <= 0xdbff ? limit - 1 : limit);
+  return { text: out.slice(0, end >= 0xd800 && end <= 0xdbff ? limit - 1 : limit), cut: true };
 }

@@ -5,6 +5,7 @@ import { confirmBiometric } from "../auth";
 import { successTap } from "../haptics";
 import { Mascot } from "../mascot/Mascot";
 import { poseFor } from "../mascot/state";
+import { foldCommand } from "../model/command";
 import type { PendingApproval } from "../model/session";
 import { loadSettings } from "../persist";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
@@ -18,6 +19,10 @@ export const FILES_SHOWN = 5;
 export const NO_FACE_ID = "Face ID isn't set up on this phone. Turn it off in Settings to allow from here.";
 /** The system prompt's sentence is short; the action can be long. */
 const REASON_CHARS = 80;
+/** Said when the command or the request is not whole on the phone: Allow runs the Mac's. */
+export const SHORTENED = "Shortened — the full command is on the Mac. Check the desk before allowing.";
+/** A command longer than this many lines says how many it has. */
+const COUNT_PAST = 3;
 
 interface ApprovalSheetProps {
   session: string;
@@ -47,6 +52,7 @@ function makeStyles(theme: Theme) {
     body: { maxHeight: 220 },
     bodyContent: { gap: spacing.xs },
     command: { ...type.mono, color: theme.fg },
+    shortened: { ...type.caption, color: theme.amber, fontWeight: "600" },
     file: { ...type.mono, color: theme.fg },
     more: { ...type.caption, color: theme.muted },
     where: { ...type.caption, color: theme.muted },
@@ -196,6 +202,7 @@ function Request({ session, approval, more, send, offline, isOpen, onAnswered }:
   const canAnswer = armed && !busy && !offline;
   const files = summary.files.slice(0, FILES_SHOWN);
   const rest = summary.files.length - files.length;
+  const command = summary.command ? foldCommand(summary.command) : null;
   return (
     <View style={s.sheet} accessibilityLiveRegion="polite">
       <View style={s.head}>
@@ -206,8 +213,10 @@ function Request({ session, approval, more, send, offline, isOpen, onAnswered }:
           {more > 0 ? <Text style={s.waiting}>{`${more} more waiting`}</Text> : null}
         </View>
       </View>
+      {approval.cut ? <Text style={s.shortened}>{SHORTENED}</Text> : null}
+      {command && command.lines > COUNT_PAST ? <Text style={s.more}>{`${command.lines} lines`}</Text> : null}
       <ScrollView style={s.body} contentContainerStyle={s.bodyContent}>
-        {summary.command ? <Text style={s.command}>{`$ ${summary.command}`}</Text> : null}
+        {command ? <Text style={s.command}>{`$ ${command.text}`}</Text> : null}
         {files.map((file, i) => (
           <Text key={`${i}:${file}`} style={s.file}>
             {file}

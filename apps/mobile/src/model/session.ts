@@ -11,12 +11,17 @@ import type {
 } from "../protocol";
 import { EMPTY_TRANSCRIPT, TranscriptDraft, type Entry, type Transcript } from "./transcript";
 import { ENGINES, MODES, PHASES, count, member } from "./enums";
-import { SHORT_CHARS, field } from "./text";
+import { SHORT_CHARS, field, fieldCut } from "./text";
 
 /** An approval waiting, with the request as the journal recorded it (empty when only the
  * terminal UI's state frame told of it). */
 export interface PendingApproval extends ApprovalInfo {
   detail: string;
+  /** The command or the detail is not whole: the phone cut it to fit, or the Mac sent it
+   * shortened. The sheet says so, since Allow runs what the Mac has. */
+  cut?: boolean;
+  /** The journal's record of it, whole, came: a state frame's shorter summary does not replace it. */
+  journaled?: boolean;
 }
 
 /** The terminal UI's state without its approvals, which the view keeps (and updates from the
@@ -108,15 +113,24 @@ const str = (x: unknown, limit: number): string => field(x, limit);
 const optStr = (x: unknown, limit: number): string | null | undefined =>
   x === undefined ? undefined : x === null ? null : typeof x === "string" ? str(x, limit) : null;
 
-function cleanSummary(raw: unknown): ApprovalSummary {
+/** How the Mac marks a string it shortened: the terminal UI's state frame cuts an approval's
+ * command to 4 KiB and ends it with this (`clip`, crates/octet-tui/src/bridge.rs). */
+const HUB_CLIP_MARK = "…";
+
+/** A summary cleaned and bounded, and whether its command is not whole. */
+function cleanSummary(raw: unknown): { summary: ApprovalSummary; cut: boolean } {
   const s = isObj(raw) ? raw : {};
   const files = Array.isArray(s.files) ? s.files.slice(0, MAX_FILES).map((f) => str(f, SHORT_CHARS * 4)) : [];
   const out: ApprovalSummary = { action: str(s.action, TEXT_CHARS), files, scope: str(s.scope, SHORT_CHARS) };
-  const command = optStr(s.command, DETAIL_CHARS);
-  if (command !== undefined) out.command = command;
+  let cut = false;
+  if (typeof s.command === "string") {
+    const command = fieldCut(s.command, DETAIL_CHARS);
+    out.command = command.text;
+    cut = command.cut || command.text.endsWith(HUB_CLIP_MARK);
+  } else if (s.command !== undefined) out.command = null;
   const cwd = optStr(s.cwd, SHORT_CHARS * 4);
   if (cwd !== undefined) out.cwd = cwd;
-  return out;
+  return { summary: out, cut };
 }
 
 function cleanApprovals(raw: unknown, known: readonly PendingApproval[], closed: readonly number[]): PendingApproval[] {
@@ -126,7 +140,13 @@ function cleanApprovals(raw: unknown, known: readonly PendingApproval[], closed:
     if (!isObj(a) || typeof a.id !== "number" || !Number.isSafeInteger(a.id)) continue;
     const id = a.id;
     if (out.some((x) => x.id === id) || closed.includes(id)) continue;
-    out.push({ id, summary: cleanSummary(a.summary), detail: known.find((k) => k.id === id)?.detail ?? "" });
+    const had = known.find((k) => k.id === id);
+    if (had?.journaled) {
+      out.push(had); // the journal's whole request, not the state frame's shortened summary
+      continue;
+    }
+    const { summary, cut } = cleanSummary(a.summary);
+    out.push({ id, summary, detail: had?.detail ?? "", cut });
   }
   return out;
 }
@@ -204,8 +224,9 @@ function setJournals(v: SessionView, journals: string[]): void {
 function approve(approvals: PendingApproval[], data: unknown): PendingApproval[] {
   if (!isObj(data) || typeof data.id !== "number" || !Number.isSafeInteger(data.id)) return approvals;
   const id = data.id;
-  const detail = typeof data.detail === "string" ? str(data.detail, DETAIL_CHARS) : "";
-  const made: PendingApproval = { id, summary: cleanSummary(data.summary), detail };
+  const detail = fieldCut(typeof data.detail === "string" ? data.detail : "", DETAIL_CHARS);
+  const { summary, cut } = cleanSummary(data.summary);
+  const made: PendingApproval = { id, summary, detail: detail.text, cut: cut || detail.cut, journaled: true };
   const at = approvals.findIndex((a) => a.id === id);
   if (at >= 0) {
     // Listed already, from a state frame that told only the summary: the journal's record fills it in.
