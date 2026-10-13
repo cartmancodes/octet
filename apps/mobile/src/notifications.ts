@@ -109,7 +109,8 @@ export function onTokenChange(fn: () => void): () => void {
 /**
  * Taps on notifications: a tap while the app runs (the listener) and the tap that launched it
  * (the last response). `fn` gets the session the tap names, or null when the data names none that
- * is valid. A tap is handed over once, however many ways it is reported. Returns the stop.
+ * is valid. A tap is handed over once, however many ways it is reported, and the native side is
+ * told it was taken, so that no later mount of the shell opens it again. Returns the stop.
  */
 export function watchTaps(fn: (session: string | null) => void): () => void {
   let live = true;
@@ -120,9 +121,18 @@ export function watchTaps(fn: (session: string | null) => void): () => void {
     if (id === last) return;
     last = id;
     fn(sessionFromData(response.notification.request.content.data));
+    try {
+      Notifications.clearLastNotificationResponse();
+    } catch {
+      // Without the native module there is no last response to repeat either.
+    }
   };
   const subscription = Notifications.addNotificationResponseReceivedListener(take);
-  Notifications.getLastNotificationResponseAsync().then(take, () => undefined);
+  try {
+    take(Notifications.getLastNotificationResponse());
+  } catch {
+    // The module cannot say (an UnavailabilityError): the launch was not a tap.
+  }
   return () => {
     live = false;
     subscription.remove();

@@ -169,12 +169,10 @@ describe("what a tap names", () => {
 describe("watching taps", () => {
   const response = (data: unknown, id = "n1") => ({ notification: { request: { identifier: id, content: { data } } } });
 
-  it("hands over a cold start's tap once, and a warm one from the listener", async () => {
-    n.getLastNotificationResponseAsync.mockResolvedValueOnce(response({ session: "1-2" }) as never);
+  it("hands over a cold start's tap once, and a warm one from the listener", () => {
+    n.getLastNotificationResponse.mockReturnValueOnce(response({ session: "1-2" }) as never);
     const heard: (string | null)[] = [];
     const stop = watchTaps((s) => heard.push(s));
-    await Promise.resolve();
-    await Promise.resolve();
     expect(heard).toEqual(["1-2"]);
     const listener = n.addNotificationResponseReceivedListener.mock.calls[0]?.[0];
     listener?.(response({ session: "3-4" }, "n2") as never);
@@ -184,27 +182,42 @@ describe("watching taps", () => {
     stop();
   });
 
-  it("does not repeat the cold start's tap when the listener reports it too", async () => {
-    n.getLastNotificationResponseAsync.mockResolvedValueOnce(response({ session: "1-2" }) as never);
+  it("clears the last response once it is taken, so that no later start sees it again", () => {
+    let last: unknown = response({ session: "1-2" });
+    n.getLastNotificationResponse.mockImplementation(() => last as never);
+    n.clearLastNotificationResponse.mockImplementation(() => {
+      last = null;
+    });
+    const heard: (string | null)[] = [];
+    watchTaps((s) => heard.push(s))();
+    watchTaps((s) => heard.push(s))();
+    expect(heard).toEqual(["1-2"]);
+    expect(n.clearLastNotificationResponse).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not repeat the cold start's tap when the listener reports it too", () => {
+    n.getLastNotificationResponse.mockReturnValueOnce(response({ session: "1-2" }) as never);
     const heard: (string | null)[] = [];
     watchTaps((s) => heard.push(s));
     const listener = n.addNotificationResponseReceivedListener.mock.calls[0]?.[0];
     listener?.(response({ session: "1-2" }) as never);
-    await Promise.resolve();
-    await Promise.resolve();
     expect(heard).toEqual(["1-2"]);
   });
 
-  it("stops listening when asked, and drops a cold start that arrives after", async () => {
-    let answer: (r: object | null) => void = () => {};
-    n.getLastNotificationResponseAsync.mockReturnValueOnce(new Promise((resolve) => (answer = resolve)) as never);
+  it("a module without the last response is no tap, and not an error", () => {
+    n.getLastNotificationResponse.mockImplementation(() => {
+      throw new Error("unavailable");
+    });
+    const heard: (string | null)[] = [];
+    expect(() => watchTaps((s) => heard.push(s))).not.toThrow();
+    expect(heard).toEqual([]);
+  });
+
+  it("stops listening when asked", () => {
     const remove = jest.fn();
     n.addNotificationResponseReceivedListener.mockReturnValueOnce({ remove } as never);
     const heard: (string | null)[] = [];
     watchTaps((s) => heard.push(s))();
     expect(remove).toHaveBeenCalled();
-    answer(response({ session: "1-2" }));
-    await Promise.resolve();
-    expect(heard).toEqual([]);
   });
 });

@@ -26,6 +26,8 @@ export default function Settings() {
   const { pushNotice } = useHubSnapshot();
   const [pushError, setPushError] = useState<string | null>(null);
   const pushing = useRef(false);
+  /** The switch is being worked on: "on" or "off"; null when idle. */
+  const [working, setWorking] = useState<"on" | "off" | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -71,12 +73,14 @@ export default function Settings() {
       pushing.current = true;
       try {
         setPushError(null);
+        setWorking(on ? "on" : "off");
         const result = await (on ? hub.turnOnNotifications() : hub.turnOffNotifications());
         if (!alive()) return;
         if (result.ok) setSaved((s) => (s ? { ...s, notifications: on } : s));
         else setPushError(result.message);
       } finally {
         pushing.current = false;
+        if (alive()) setWorking(null);
       }
     },
     [alive, hub],
@@ -99,7 +103,8 @@ export default function Settings() {
   if (saved === null) return <View style={[styles.screen, { backgroundColor: theme.bg }]} />;
   const version = Constants.expoConfig?.version;
   const hasProject = projectId() !== null;
-  const pushWords = pushError ?? (hasProject ? pushNotice : NO_PROJECT_ID);
+  const pushWords =
+    working === "on" ? "Turning on…" : working === "off" ? "Turning off…" : (pushError ?? (hasProject ? pushNotice : NO_PROJECT_ID));
   return (
     <View style={[styles.screen, { backgroundColor: theme.bg }]}>
       <View style={[styles.card, { backgroundColor: theme.panel, borderColor: theme.edge }]}>
@@ -134,7 +139,7 @@ export default function Settings() {
             accessibilityRole="switch"
             accessibilityLabel="Notifications"
             value={hasProject && saved.notifications}
-            disabled={!hasProject}
+            disabled={!hasProject || working !== null}
             onValueChange={flipPush}
             hitSlop={HIT}
             trackColor={{ false: theme.edge, true: theme.accent }}

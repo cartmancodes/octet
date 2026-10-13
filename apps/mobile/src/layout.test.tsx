@@ -247,23 +247,52 @@ describe("notifications", () => {
   });
 
   it("a cold start from a tap opens the session once the app knows it is paired", async () => {
-    n.getLastNotificationResponseAsync.mockResolvedValue(tap({ session: SESSION }));
+    n.getLastNotificationResponse.mockReturnValue(tap({ session: SESSION }));
     const { view } = await launch({ paired: true });
     await waitFor(() => expect(view.getPathname()).toBe(`/session/${SESSION}`));
   });
 
   it("a cold start from a tap while unpaired lands on Pair", async () => {
-    n.getLastNotificationResponseAsync.mockResolvedValue(tap({ session: SESSION }));
+    n.getLastNotificationResponse.mockReturnValue(tap({ session: SESSION }));
     const { view } = await launch();
     await screen.findByText("Pair with your Mac");
     expect(view.getPathname()).toBe("/pair");
   });
 
   it("a cold start tap with bad data lands on Sessions", async () => {
-    n.getLastNotificationResponseAsync.mockResolvedValue(tap({}));
+    n.getLastNotificationResponse.mockReturnValue(tap({}));
     const { view } = await launch({ paired: true });
     await screen.findByText("Sessions list");
     expect(view.getPathname()).toBe("/");
+  });
+
+  it("a cold start's tap is opened once, however often the shell mounts", async () => {
+    let last: unknown = tap({ session: SESSION });
+    n.getLastNotificationResponse.mockImplementation(() => last as never);
+    n.clearLastNotificationResponse.mockImplementation(() => {
+      last = null;
+    });
+    const first = await launch({ paired: true });
+    await waitFor(() => expect(first.view.getPathname()).toBe(`/session/${SESSION}`));
+    await act(async () => screen.unmount());
+    const second = await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    expect(second.view.getPathname()).toBe("/");
+  });
+
+  it("a tap during the notifications step waits, and opens after Not now", async () => {
+    mockProject = "11111111-2222-3333-4444-555555555555";
+    const { sockets, view } = await launch();
+    await fireEvent.changeText(await screen.findByLabelText("Pairing link"), LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    sockets.last.open();
+    const [command] = sockets.last.commandsOf("pair");
+    sockets.last.receive({ type: "paired", req: command?.req, token: TOKEN, device: "iPhone" });
+    const skip = await screen.findByRole("button", { name: "Not now" });
+    await act(async () => listener()?.(tap({ session: SESSION })));
+    expect(view.getPathname()).toBe("/pair");
+    await fireEvent.press(skip);
+    await waitFor(() => expect(view.getPathname()).toBe(`/session/${SESSION}`));
   });
 
   it("stops listening when the shell goes", async () => {

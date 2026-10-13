@@ -45,12 +45,12 @@ export default function RootLayout() {
     else router.push({ pathname: "/session/[id]", params: { id: session } });
   };
   // The latest of these, for the listener below, which is set up once.
-  const route = useRef({ status, open });
+  const route = useRef({ status, offer, open });
   const waiting = useRef<{ session: string | null } | null>(null);
   useEffect(() => {
-    route.current = { status, open };
-    if (status === "loading" || waiting.current === null) return;
-    // The tap that launched the app arrived before the saved pairing was read.
+    route.current = { status, offer, open };
+    if (status === "loading" || offer || waiting.current === null) return;
+    // A tap that arrived before the saved pairing was read, or during the notifications step.
     const { session } = waiting.current;
     waiting.current = null;
     open(session);
@@ -61,7 +61,7 @@ export default function RootLayout() {
   useEffect(() => {
     void configureNotifications();
     return watchTaps((session) => {
-      if (route.current.status === "loading") waiting.current = { session };
+      if (route.current.status === "loading" || route.current.offer) waiting.current = { session };
       else route.current.open(session);
     });
   }, []);

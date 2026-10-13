@@ -175,7 +175,7 @@ describe("Settings", () => {
       await flush();
       expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
       expect((await loadSettings()).hubUrl).toBeNull();
-      expect(rig.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null, client: null });
+      expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
       expect(await screen.findByText("Pair with your Mac")).toBeTruthy();
       expect(rig.view.getPathname()).toBe("/pair");
       expect(screen.queryByText("This phone was unpaired on the Mac")).toBeNull();
@@ -293,6 +293,37 @@ describe("Settings", () => {
       await reply(rig, { type: "refused", code: "invalid", reason: "Expo says no" });
       expect(screen.getByText("Expo says no")).toBeTruthy();
       expect(alert).not.toHaveBeenCalled();
+    });
+
+    it("while it works the switch is off-limits and says what it is doing", async () => {
+      mockConfig = { extra: { eas: { projectId: PROJECT } } };
+      const rig = await open();
+      await flip(true);
+      expect(screen.getByText("Turning on…")).toBeTruthy();
+      expect(switchOf().props.disabled).toBe(true);
+      await reply(rig, { type: "ack", message: "Notifications on" });
+      expect(screen.queryByText("Turning on…")).toBeNull();
+      expect(switchOf().props.disabled).toBeFalsy();
+      await flip(false);
+      expect(screen.getByText("Turning off…")).toBeTruthy();
+      await reply(rig, { type: "ack", message: "Notifications off" });
+      expect(screen.queryByText("Turning off…")).toBeNull();
+    });
+
+    it("off with the Mac out of reach: the switch does not move, and says so", async () => {
+      mockConfig = { extra: { eas: { projectId: PROJECT } } };
+      await saveSettings({ notifications: true });
+      const rig = await open();
+      await reply(rig, { type: "ack", message: "Notifications on" });
+      await act(async () => rig.sockets.last.drop());
+      await flip(false);
+      await act(async () => {
+        rig.clock.advance(8_000);
+      });
+      await flush();
+      expect(screen.getByText("Can't reach your Mac")).toBeTruthy();
+      expect(switchOf().props.value).toBe(true);
+      expect((await loadSettings()).notifications).toBe(true);
     });
 
     it("has a label, the switch role and a 44-point hit area", async () => {

@@ -446,7 +446,7 @@ describe("unpair", () => {
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
     expect((await loadSettings()).hubUrl).toBeNull();
     expect((await loadSettings()).deviceName).toBe("iPhone"); // kept to prefill the next pairing
-    expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null, client: null });
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
     expect(r.store.getState().sessions).toHaveLength(0);
     // The connection stays open just long enough for the Mac to hear "notifications off".
     expect(socket.commandsOf("register_push")).toEqual([expect.objectContaining({ token: null })]);
@@ -474,7 +474,7 @@ describe("unpair", () => {
     await paired(r);
     (SecureStore.deleteItemAsync as jest.Mock).mockRejectedValueOnce(new Error("locked"));
     await r.hub.unpair();
-    expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null, client: null });
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
   });
 
@@ -487,7 +487,7 @@ describe("unpair", () => {
       .mockRejectedValueOnce(new Error("locked"));
     await r.hub.unpair();
     expect(UNPAIR_FAILED_NOTICE).toBe("This phone couldn't delete its pairing. Pair again to replace it.");
-    expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, client: null });
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, client: null, offer: false, pushNotice: null });
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN); // still there...
     const again = rig();
     await again.hub.init(); // ...but with no hub address it is dropped
@@ -500,7 +500,7 @@ describe("unpair", () => {
     await paired(r);
     jest.spyOn(AsyncStorage, "setItem").mockRejectedValueOnce(new Error("disk full"));
     await r.hub.unpair();
-    expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, client: null });
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, client: null, offer: false, pushNotice: null });
   });
 
   it("a foreground event while unpairing does not start the old client again", async () => {
@@ -523,7 +523,7 @@ describe("unpair", () => {
     r.hub.setForeground(true);
     await paired(r);
     const pending = r.hub.unpair();
-    expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null, client: null });
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
     expect(await r.hub.pair(LINK, "iPhone")).toMatchObject({ ok: false, clear: false });
     await pending;
     r.clock.advance(2_000); // the Mac never answered the goodbye
@@ -875,3 +875,74 @@ describe("unpair and push", () => {
     await expect(pending).resolves.toEqual({ ok: true });
   });
 });
+
+describe("push operations run one at a time", () => {
+  it("a turn-off during the registration made at ready is sent after it, so the Mac ends off", async () => {
+    let giveToken: (t: { type: string; data: string }) => void = () => {};
+    n.getExpoPushTokenAsync.mockReturnValueOnce(new Promise((resolve) => (giveToken = resolve)) as never);
+    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
+    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/", notifications: true });
+    const r = rig();
+    r.hub.setForeground(true);
+    await r.hub.init();
+    r.sockets.last.open();
+    r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    await settle(); // the registration waits for its token
+    const off = r.hub.turnOffNotifications();
+    await settle();
+    expect(registrations(r)).toHaveLength(0); // nothing went out of turn
+    giveToken({ type: "expo", data: PUSH });
+    await settle();
+    answer(r);
+    await settle();
+    answer(r, "Notifications off");
+    await expect(off).resolves.toEqual({ ok: true });
+    expect(registrations(r).map((c) => c.token)).toEqual([PUSH, null]);
+    expect((await loadSettings()).notifications).toBe(false);
+  });
+
+  it("a registration that finds notifications turned off while it waited for the token sends nothing", async () => {
+    let giveToken: (t: { type: string; data: string }) => void = () => {};
+    n.getExpoPushTokenAsync.mockReturnValueOnce(new Promise((resolve) => (giveToken = resolve)) as never);
+    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
+    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/", notifications: true });
+    const r = rig();
+    r.hub.setForeground(true);
+    await r.hub.init();
+    r.sockets.last.open();
+    r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    await settle();
+    await saveSettings({ notifications: false });
+    giveToken({ type: "expo", data: PUSH });
+    await settle();
+    expect(registrations(r)).toHaveLength(0);
+  });
+});
+
+describe("a stale answer", () => {
+  it("an ack for a turn-on that the unpair overtook saves nothing", async () => {
+    const r = await readyWithPush(false);
+    const socket = r.sockets.last;
+    const done = r.hub.turnOnNotifications();
+    await settle();
+    const turnOn = registrations(r)[0];
+    await r.hub.unpair();
+    socket.receive({ type: "ack", req: turnOn?.req, message: "Notifications on" });
+    await expect(done).resolves.toMatchObject({ ok: false });
+    await settle();
+    expect((await loadSettings()).notifications).toBe(false);
+  });
+});
+
+describe("a revoke", () => {
+  it("also turns notifications off, so that the next pairing starts off", async () => {
+    const r = await readyWithPush();
+    answer(r);
+    expect((await loadSettings()).notifications).toBe(true);
+    r.sockets.last.receive({ type: "refused", req: 0, reason: "This device was revoked", code: "revoked" });
+    await settle();
+    expect(r.hub.snapshot().status).toBe("unpaired");
+    expect((await loadSettings()).notifications).toBe(false);
+  });
+});
+

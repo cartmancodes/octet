@@ -96,6 +96,8 @@ export class HubController {
   private detach: (() => void) | null = null;
   private starting: Promise<void> | null = null;
   private unpairing = false;
+  /** Push registrations wait their turn, so that the Mac ends with the last one asked for. */
+  private pushQueue: Promise<unknown> = Promise.resolve();
 
   constructor(opts: HubControllerOptions = {}) {
     this.factory = opts.factory ?? webSocketFactory;
@@ -272,16 +274,28 @@ export class HubController {
     return this.register(client, null, false);
   }
 
-  private async register(client: HubClient, token: string | null, on: boolean): Promise<PushResult> {
-    if (!(await this.whenReady(client)) || client !== this.current.client) return { ok: false, message: UNREACHABLE };
-    try {
-      await client.request({ type: "register_push", token });
-    } catch (error) {
-      return { ok: false, message: wordsOf(error) };
-    }
-    if (!(await saveSettings({ notifications: on }))) return { ok: false, message: NOT_SAVED };
-    this.notify(null);
-    return { ok: true };
+  /** Runs `job` after every push job before it, whether those worked or not. */
+  private inTurn<T>(job: () => Promise<T>): Promise<T> {
+    const run = this.pushQueue.then(job, job);
+    this.pushQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private register(client: HubClient, token: string | null, on: boolean): Promise<PushResult> {
+    return this.inTurn(async (): Promise<PushResult> => {
+      if (!(await this.whenReady(client)) || client !== this.current.client) return { ok: false, message: UNREACHABLE };
+      try {
+        await client.request({ type: "register_push", token });
+      } catch (error) {
+        return { ok: false, message: wordsOf(error) };
+      }
+      // An ack that comes after the unpair is for a pairing that is gone: it saves nothing.
+      if (client !== this.current.client) return { ok: false, message: UNREACHABLE };
+      // The Mac has the change; if the save fails the setting lags it, and the user is told so.
+      if (!(await saveSettings({ notifications: on }))) return { ok: false, message: NOT_SAVED };
+      this.notify(null);
+      return { ok: true };
+    });
   }
 
   /** Resolves true when `client` is ready, now or within `READY_WAIT_MS`; false when it is not. */
@@ -311,21 +325,25 @@ export class HubController {
   /** Registers the current push token with the Mac, if the user turned notifications on. Runs
    * after each ready and on a token rotation. A hub refusal shows on Settings; a link that
    * dropped is no news, the next ready tries again. */
-  private async syncPush(client: HubClient): Promise<void> {
-    if (!(await loadSettings()).notifications) return;
-    const got = await currentToken();
-    if (client !== this.current.client || client.state !== "ready") return;
-    if (!got.ok) {
-      this.notify(got.message);
-      return;
-    }
-    try {
-      await client.request({ type: "register_push", token: got.token });
-      if (client === this.current.client) this.notify(null);
-    } catch (error) {
-      if (client !== this.current.client) return;
-      if (error instanceof Refusal && error.code !== "unsent" && error.code !== "lost") this.notify(error.message);
-    }
+  private syncPush(client: HubClient): Promise<void> {
+    return this.inTurn(async () => {
+      if (!(await loadSettings()).notifications) return;
+      const got = await currentToken();
+      // The user may have turned it off while the token was coming.
+      if (!(await loadSettings()).notifications) return;
+      if (client !== this.current.client || client.state !== "ready") return;
+      if (!got.ok) {
+        this.notify(got.message);
+        return;
+      }
+      try {
+        await client.request({ type: "register_push", token: got.token });
+        if (client === this.current.client) this.notify(null);
+      } catch (error) {
+        if (client !== this.current.client) return;
+        if (error instanceof Refusal && error.code !== "unsent" && error.code !== "lost") this.notify(error.message);
+      }
+    });
   }
 
   private notify(pushNotice: string | null): void {
@@ -360,7 +378,6 @@ export class HubController {
     };
     this.set({ status: "paired", notice: null, client, offer, pushNotice: null });
     if (this.foreground) client.start();
-    if (client.state === "ready") void this.syncPush(client);
   }
 
   /** Drops the connection and what the old Mac sent. */
@@ -380,6 +397,9 @@ export class HubController {
     } catch {
       // The keychain keeps it; the next start is refused again and comes back here.
     }
+    // The Mac forgot this phone's token with the phone: a new pairing starts with notifications
+    // off, and its notifications step asks again.
+    await saveSettings({ notifications: false });
     if (client !== this.current.client) return;
     this.set({ status: "unpaired", notice: UNPAIRED_NOTICE, client: null, offer: false, pushNotice: null });
   }
