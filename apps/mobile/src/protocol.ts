@@ -275,7 +275,7 @@ export interface RegisterPushCommand {
   v: 1;
   type: "register_push";
   req: number;
-  token?: string | null;
+  token: string | null;
 }
 
 /** Ask the hub to answer, to tell a live connection from a dead one. */

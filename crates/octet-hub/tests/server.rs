@@ -1205,16 +1205,21 @@ async fn push_commands_before_hello_are_refused_as_unpaired() {
     }
 }
 
+/// How many commands a device may send at once before the hub rate limits it: the hub's
+/// `COMMANDS_PER_MINUTE` in `server.rs` (the flood test above spells it 60 too).
+const BURST: usize = 60;
+
 #[tokio::test]
 async fn ping_answers_pong_and_spends_the_rate_limit_like_any_command() {
+    const SENT: usize = 100;
     let mut env = Env::new();
     env.start().await;
     let (mut phone, _) = env.phone("Test phone").await;
-    for req in 100..200 {
+    for req in 1..=SENT as u64 {
         send(&mut phone, json!({"v": 1, "req": req, "type": "ping"})).await;
     }
     let mut answers = Vec::new();
-    for _ in 100..200 {
+    for _ in 0..SENT {
         let frame = loop {
             let frame = recv(&mut phone).await;
             if matches!(frame["type"].as_str(), Some("ack" | "refused")) {
@@ -1228,7 +1233,7 @@ async fn ping_answers_pong_and_spends_the_rate_limit_like_any_command() {
         ));
     }
     assert!(
-        answers[..60]
+        answers[..BURST]
             .iter()
             .all(|(kind, message, _)| kind == "ack" && message == "pong"),
         "{answers:?}"
@@ -1237,17 +1242,17 @@ async fn ping_answers_pong_and_spends_the_rate_limit_like_any_command() {
         .iter()
         .filter(|(kind, _, code)| kind == "refused" && code == "rate_limited")
         .count();
-    assert!(limited >= 39, "{answers:?}");
+    assert!(limited + 1 >= SENT - BURST, "{answers:?}");
 
     // A registration is charged like any other command too.
     let (mut spender, _) = env.phone("Spender").await;
-    for req in 1..=60 {
+    for req in 1..=BURST as u64 {
         send(&mut spender, json!({"v": 1, "req": req, "type": "ping"})).await;
     }
-    send(&mut spender, register(61, Some(PUSH))).await;
+    send(&mut spender, register(1_000, Some(PUSH))).await;
     let frame = loop {
         let frame = recv(&mut spender).await;
-        if frame["req"] == 61 {
+        if frame["req"] == 1_000 {
             break frame;
         }
     };

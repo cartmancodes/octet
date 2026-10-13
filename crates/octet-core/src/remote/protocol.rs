@@ -68,6 +68,8 @@ pub struct Field {
     pub ty: Ty,
     /// Whether the key can be absent (or null).
     pub optional: bool,
+    /// Whether the key must be present but may be null (`optional` is then false).
+    pub nullable: bool,
 }
 
 /// One message type.
@@ -119,6 +121,7 @@ const fn req(name: &'static str, ty: Ty) -> Field {
         name,
         ty,
         optional: false,
+        nullable: false,
     }
 }
 const fn opt(name: &'static str, ty: Ty) -> Field {
@@ -126,6 +129,16 @@ const fn opt(name: &'static str, ty: Ty) -> Field {
         name,
         ty,
         optional: true,
+        nullable: false,
+    }
+}
+/// A field that must be present but may be null.
+const fn req_null(name: &'static str, ty: Ty) -> Field {
+    Field {
+        name,
+        ty,
+        optional: false,
+        nullable: true,
     }
 }
 const fn message(
@@ -495,7 +508,7 @@ pub static MESSAGES: &[Message] = &[
     message(
         "register_push",
         FromPhone,
-        &[opt("token", Str)],
+        &[req_null("token", Str)],
         "Set the Expo push token notifications go to (`ExponentPushToken[..]` or \
          `ExpoPushToken[..]`), or turn them off with `null`; leaving `token` out is refused.",
     ),
@@ -978,6 +991,7 @@ fn check_fields(
     for field in fields {
         match map.get(field.name) {
             None | Some(Value::Null) if field.optional => {}
+            Some(Value::Null) if field.nullable => {}
             None | Some(Value::Null) => return Err(format!("Missing {}", at(field.name))),
             Some(value) => check_value(value, field.ty, &at(field.name))?,
         }
@@ -1349,13 +1363,13 @@ fn ts_type(ty: Ty) -> String {
     }
 }
 
-/// The fields of an interface; an optional one may also be null, as the parser takes it.
+/// The fields of an interface; an optional or nullable one may also be null, as the parser takes it.
 fn ts_fields(out: &mut String, fields: &[Field]) {
     for field in fields {
-        let (mark, null) = if field.optional {
-            ("?", " | null")
-        } else {
-            ("", "")
+        let (mark, null) = match (field.optional, field.nullable) {
+            (true, _) => ("?", " | null"),
+            (false, true) => ("", " | null"),
+            (false, false) => ("", ""),
         };
         let _ = writeln!(out, "  {}{mark}: {}{null};", field.name, ts_type(field.ty));
     }
@@ -2030,6 +2044,22 @@ mod tests {
                 "the reason repeats the token: {reason}"
             );
         }
+    }
+
+    #[test]
+    fn register_push_token_is_required_but_nullable_in_the_typescript() {
+        let ts = typescript();
+        let interface = ts
+            .split("export interface RegisterPushCommand {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the interface");
+        assert!(interface.contains("  token: string | null;"), "{interface}");
+        // Optional fields stay optional, so only this one changed.
+        assert!(ts.contains("  after?: Cursor | null;"));
+        // The parser takes what the TypeScript allows and refuses what it forbids.
+        assert!(parse_phone(r#"{"v":1,"req":1,"type":"register_push","token":null}"#).is_ok());
+        assert!(parse_phone(r#"{"v":1,"req":1,"type":"register_push"}"#).is_err());
     }
 
     #[test]

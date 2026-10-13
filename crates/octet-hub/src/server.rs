@@ -856,13 +856,25 @@ impl Hub {
     /// the device's hash reaches the audit line.
     async fn register_push(&mut self, conn: u64, device: &Device, req: u64, token: Option<String>) {
         let on = token.is_some();
-        if !self
+        match self
             .store
             .set_push_token(&device.token_sha256, token.clone())
             .await
         {
-            self.refuse(conn, req, Code::Unavailable, PUSH_NOT_SAVED);
-            return;
+            Ok(true) => {}
+            Ok(false) => {
+                self.refuse(conn, req, Code::Unavailable, PUSH_NOT_SAVED);
+                return;
+            }
+            Err(error) => {
+                // The error names a path and a kind, never the token or the device's hash.
+                eprintln!(
+                    "Couldn't save a phone's notification setting: {}",
+                    error.kind()
+                );
+                self.refuse(conn, req, Code::Unavailable, PUSH_NOT_SAVED);
+                return;
+            }
         }
         // The connections of this device carry a copy of it.
         for state in self.conns.values_mut() {

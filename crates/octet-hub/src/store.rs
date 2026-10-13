@@ -1,4 +1,5 @@
 //! Devices, pairing secrets, hub config and the audit log.
+use octet_core::remote::protocol::is_push_token;
 use octet_store::{create_private, create_private_dir, sync_directory};
 use sha2::{Digest, Sha256};
 use std::{
@@ -262,21 +263,39 @@ impl Store {
     }
 
     /// Sets, or with `None` clears, the push token of the device whose token hash is
-    /// `token_sha256`. False if there is no such device or the file cannot be written.
-    pub async fn set_push_token(&mut self, token_sha256: &str, token: Option<String>) -> bool {
+    /// `token_sha256`. False if there is no such device. A token is on one device only: any other
+    /// device holding it loses it, in the same write.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
+    pub async fn set_push_token(
+        &mut self,
+        token_sha256: &str,
+        token: Option<String>,
+    ) -> io::Result<bool> {
         self.update(|devices| {
-            let Some(device) = devices
-                .iter_mut()
-                .find(|device| device.token_sha256 == token_sha256)
-            else {
+            if !devices
+                .iter()
+                .any(|device| device.token_sha256 == token_sha256)
+            {
                 return (false, false);
-            };
-            let changed = device.push_token != token;
-            device.push_token = token;
+            }
+            let mut changed = false;
+            for device in devices.iter_mut() {
+                let wanted = if device.token_sha256 == token_sha256 {
+                    token.clone()
+                } else if token.is_some() && device.push_token == token {
+                    None
+                } else {
+                    continue;
+                };
+                changed |= device.push_token != wanted;
+                device.push_token = wanted;
+            }
             (true, changed)
         })
         .await
-        .unwrap_or(false)
     }
 
     /// The paired devices.
@@ -454,7 +473,7 @@ async fn read_devices(directory: &Path) -> io::Result<(Vec<Device>, Option<Stamp
                 created: entry["created"].as_u64()?,
                 last_seen: entry["last_seen"].as_u64()?,
                 token_sha256: text("token_sha256")?,
-                push_token: text("push_token"),
+                push_token: text("push_token").filter(|token| is_push_token(token)),
             })
             .filter(|device| {
                 !device.login.is_empty()
@@ -733,6 +752,7 @@ mod tests {
             store
                 .set_push_token(&device.token_sha256, Some(PUSH.to_owned()))
                 .await
+                .unwrap()
         );
         let file = dir.path().join("devices.json");
         let text = std::fs::read_to_string(&file).unwrap();
@@ -759,7 +779,12 @@ mod tests {
 
         // Clearing drops the key; another device is not touched.
         let other = paired(&mut store, "Other", epoch(4)).await;
-        assert!(store.set_push_token(&device.token_sha256, None).await);
+        assert!(
+            store
+                .set_push_token(&device.token_sha256, None)
+                .await
+                .unwrap()
+        );
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(
             !text.contains("push_token") && !text.contains(PUSH),
@@ -770,6 +795,7 @@ mod tests {
             store
                 .set_push_token(&device.token_sha256, Some(PUSH.to_owned()))
                 .await
+                .unwrap()
         );
 
         // An unknown device is reported, and a revoke drops the token with the device.
@@ -777,6 +803,7 @@ mod tests {
             !store
                 .set_push_token(&"0".repeat(64), Some(PUSH.to_owned()))
                 .await
+                .unwrap()
         );
         assert!(store.revoke("Gemini 10").await);
         let text = std::fs::read_to_string(&file).unwrap();
@@ -788,6 +815,188 @@ mod tests {
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[tokio::test]
+    async fn a_stored_push_token_that_is_not_an_expo_token_is_dropped_on_load() {
+        let dir = TempDir::new("hub-badpush");
+        let hash = |c: &str| c.repeat(64);
+        let entry = |name: &str, c: &str, push: &str| {
+            format!(
+                r#"{{"name":"{name}","platform":"ios","login":"{LOGIN}","created":1,"last_seen":2,"token_sha256":"{}","push_token":{push}}}"#,
+                hash(c)
+            )
+        };
+        let file = format!(
+            r#"{{"devices":[{},{},{},{}]}}"#,
+            entry("Good", "a", &format!("\"{PUSH}\"")),
+            entry("Url", "b", r#""https://evil.example/x""#),
+            entry("Number", "c", "7"),
+            entry("Null", "d", "null"),
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("devices.json"), file).unwrap();
+        let store = store(&dir).await;
+        let tokens: Vec<_> = store
+            .devices()
+            .iter()
+            .map(|d| (d.name.as_str(), d.push_token.as_deref()))
+            .collect();
+        assert_eq!(
+            tokens,
+            [
+                ("Good", Some(PUSH)),
+                ("Url", None),
+                ("Number", None),
+                ("Null", None)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn two_stores_keep_each_others_pairings_revokes_and_push_tokens() {
+        let dir = TempDir::new("hub-two");
+        let mut a = store(&dir).await;
+        let mut b = Store::open(dir.path()).await.unwrap();
+        let (_, one) = {
+            let secret = a.pairing_secret(epoch(1));
+            a.pair(&secret, "One", "ios", LOGIN, epoch(1))
+                .await
+                .unwrap()
+        };
+        let (_, two) = {
+            let secret = b.pairing_secret(epoch(2));
+            b.pair(&secret, "Two", "ios", LOGIN, epoch(2))
+                .await
+                .unwrap()
+        };
+        // b's own list was stale when it paired; the file has both.
+        assert_eq!(Store::open(dir.path()).await.unwrap().devices().len(), 2);
+
+        let (p1, p2) = ("ExpoPushToken[one-1]", "ExpoPushToken[two-2]");
+        assert!(
+            a.set_push_token(&one.token_sha256, Some(p1.into()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            b.set_push_token(&two.token_sha256, Some(p2.into()))
+                .await
+                .unwrap()
+        );
+        let on_disk = Store::open(dir.path()).await.unwrap();
+        let tokens: Vec<_> = on_disk
+            .devices()
+            .iter()
+            .map(|d| (d.name.as_str(), d.push_token.as_deref()))
+            .collect();
+        assert_eq!(tokens, [("One", Some(p1)), ("Two", Some(p2))]);
+
+        // b revokes One; a, which has not looked, cannot set a token on it, and keeps Two's.
+        assert!(b.revoke("One").await);
+        assert!(
+            !a.set_push_token(&one.token_sha256, Some(p1.into()))
+                .await
+                .unwrap()
+        );
+        assert_eq!(a.devices().len(), 1);
+        assert_eq!(a.devices()[0].push_token.as_deref(), Some(p2));
+
+        // A store that never wrote sees the token after a reload.
+        let mut c = Store::open(dir.path()).await.unwrap();
+        assert!(b.set_push_token(&two.token_sha256, None).await.unwrap());
+        assert!(c.reload_if_changed().await);
+        assert_eq!(c.devices()[0].push_token, None);
+        assert!(
+            a.set_push_token(&two.token_sha256, Some(p1.into()))
+                .await
+                .unwrap()
+        );
+        assert!(b.reload_if_changed().await);
+        assert_eq!(b.devices()[0].push_token.as_deref(), Some(p1));
+    }
+
+    #[tokio::test]
+    async fn a_push_token_is_never_held_by_two_devices() {
+        let dir = TempDir::new("hub-unique");
+        let mut store = store(&dir).await;
+        let mut hashes = Vec::new();
+        for name in ["One", "Two", "Three"] {
+            let secret = store.pairing_secret(epoch(1));
+            let (_, device) = store
+                .pair(&secret, name, "ios", LOGIN, epoch(1))
+                .await
+                .unwrap();
+            hashes.push(device.token_sha256);
+        }
+        assert!(
+            store
+                .set_push_token(&hashes[0], Some(PUSH.into()))
+                .await
+                .unwrap()
+        );
+        // The same token on another device (a phone handed on, or reinstalled) moves it.
+        assert!(
+            store
+                .set_push_token(&hashes[1], Some(PUSH.into()))
+                .await
+                .unwrap()
+        );
+        let held = |store: &Store| -> Vec<(String, Option<String>)> {
+            store
+                .devices()
+                .iter()
+                .map(|d| (d.name.clone(), d.push_token.clone()))
+                .collect()
+        };
+        let want = vec![
+            ("One".to_owned(), None),
+            ("Two".to_owned(), Some(PUSH.to_owned())),
+            ("Three".to_owned(), None),
+        ];
+        assert_eq!(held(&store), want);
+        assert_eq!(held(&Store::open(dir.path()).await.unwrap()), want);
+        let text = std::fs::read_to_string(dir.path().join("devices.json")).unwrap();
+        assert_eq!(text.matches(PUSH).count(), 1, "{text}");
+        // Another token on the holder leaves the others alone.
+        assert!(
+            store
+                .set_push_token(&hashes[1], Some("ExpoPushToken[other]".into()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_push_token(&hashes[2], Some(PUSH.into()))
+                .await
+                .unwrap()
+        );
+        assert_eq!(held(&store)[2].1.as_deref(), Some(PUSH));
+        assert_eq!(held(&store)[1].1.as_deref(), Some("ExpoPushToken[other]"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_write_is_an_error_that_names_no_token() {
+        let dir = TempDir::new("hub-pushfail");
+        let mut store = store(&dir).await;
+        let secret = store.pairing_secret(epoch(1));
+        let (_, device) = store
+            .pair(&secret, "One", "ios", LOGIN, epoch(1))
+            .await
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = store
+            .set_push_token(&device.token_sha256, Some(PUSH.into()))
+            .await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.expect_err("the directory is read-only");
+        let shown = format!("{error} {error:?}");
+        assert!(
+            !shown.contains("secretvalue") && !shown.contains(&device.token_sha256),
+            "{shown}"
+        );
+        // The list in memory still says what is on disk.
+        assert_eq!(store.devices()[0].push_token, None);
     }
 
     #[tokio::test]
