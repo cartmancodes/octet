@@ -414,11 +414,11 @@ environment, even after a login with no tmux running. The service doesn't use
   terminal and changes nothing.
 - **Move or upgrade `octet`.** The service holds the program's path, so run
   `octet hub install` again after moving or reinstalling it; on Linux that also
-  restarts the running service.
+  restarts the running service. A file already at the service file's path that
+  isn't Octet's is never replaced.
 - **Move or install tmux, Claude or Codex.** Install records where `tmux`,
   `claude` and `codex` were found; re-run `octet hub install` after moving or
-  installing them, or the hub won't find them. A file already at
-  that path that isn't Octet's is never replaced.
+  installing them, or the hub won't find them.
 - **Remove it.** `octet hub uninstall` stops the service and deletes the file.
   It says "Not installed" if there is nothing to remove.
 - **Restarts.** launchd restarts the hub whenever it stops; systemd restarts it
