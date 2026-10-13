@@ -110,6 +110,20 @@ impl Store {
     /// Fails if the directory cannot be created or tightened to 0700, or
     /// `devices.json` or `hub.json` cannot be read or are malformed.
     pub async fn open(directory: &Path) -> io::Result<Store> {
+        let mut store = Self::open_devices(directory).await?;
+        store.config = read_config(directory).await?;
+        Ok(store)
+    }
+
+    /// Opens the store in `directory` for its devices alone, as [`open`](Self::open) does but
+    /// without reading `hub.json`, whose settings it then leaves at their defaults: listing or
+    /// revoking a device must not wait on a typo there.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the directory cannot be created or tightened to 0700, or `devices.json` cannot
+    /// be read or is malformed.
+    pub async fn open_devices(directory: &Path) -> io::Result<Store> {
         create_private_dir(directory).await?;
         if fs::metadata(directory).await?.permissions().mode() & 0o077 != 0 {
             fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).await?;
@@ -118,7 +132,7 @@ impl Store {
         Ok(Store {
             directory: directory.to_owned(),
             devices,
-            config: read_config(directory).await?,
+            config: HubConfig::default(),
             secrets: Vec::new(),
             stamp,
         })
@@ -511,12 +525,19 @@ async fn read_devices(directory: &Path) -> io::Result<(Vec<Device>, Option<Stamp
     Ok((devices, stamp))
 }
 
+/// The settings when `hub.json` names none: port 47823 and no extra workspaces.
+impl Default for HubConfig {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_PORT,
+            workspaces: Vec::new(),
+        }
+    }
+}
+
 /// The settings in `hub.json`; defaults if it is missing.
 async fn read_config(directory: &Path) -> io::Result<HubConfig> {
-    let mut config = HubConfig {
-        port: DEFAULT_PORT,
-        workspaces: Vec::new(),
-    };
+    let mut config = HubConfig::default();
     let bytes = match fs::read(directory.join("hub.json")).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(config),

@@ -74,17 +74,29 @@ async fn announce(port: u16) {
 }
 
 async fn open(directory: &Path) -> Result<Store, CliError> {
-    Store::open(directory).await.map_err(|e| {
-        failed(format!(
-            "Couldn't open the hub's files in {}: {e}",
-            directory.display()
-        ))
-    })
+    Store::open(directory)
+        .await
+        .map_err(|e| opening(directory, &e))
+}
+
+/// The store for its devices alone: `devices` and `revoke` never need `hub.json`, so a typo
+/// there cannot stand between a stolen phone and its revoke.
+async fn open_devices(directory: &Path) -> Result<Store, CliError> {
+    Store::open_devices(directory)
+        .await
+        .map_err(|e| opening(directory, &e))
+}
+
+fn opening(directory: &Path, error: &std::io::Error) -> CliError {
+    failed(format!(
+        "Couldn't open the hub's files in {}: {error}",
+        directory.display()
+    ))
 }
 
 /// Prints the paired devices, one per line.
 pub(crate) async fn devices(directory: &Path) -> Result<i32, CliError> {
-    let store = open(directory).await?;
+    let store = open_devices(directory).await?;
     let now = SystemTime::now();
     if store.devices().is_empty() {
         println!("No paired devices");
@@ -95,13 +107,14 @@ pub(crate) async fn devices(directory: &Path) -> Result<i32, CliError> {
     Ok(0)
 }
 
-/// Unpairs the device called `name`; a running hub notices within 2 seconds.
+/// Unpairs the device called `name`, and audits it; a running hub notices within 2 seconds.
 pub(crate) async fn revoke(directory: &Path, name: &str) -> Result<i32, CliError> {
-    let mut store = open(directory).await?;
+    let mut store = open_devices(directory).await?;
     let shown = plain(name, NAME_CHARS);
     if !store.revoke(name).await {
         return Err(failed(format!("No device named {shown}")));
     }
+    store.audit(name, "", "revoked").await;
     println!("Revoked {shown}");
     Ok(0)
 }

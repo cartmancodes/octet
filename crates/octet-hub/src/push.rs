@@ -36,6 +36,9 @@ use tokio::{
 pub(crate) const EXPO_URL: &str = "https://exp.host/--/api/v2/push/send";
 /// The environment variable that points pushes at a local fake, in tests only.
 const SEAM: &str = "OCTET_HUB_PUSH_URL";
+/// Whether this build honours [`SEAM`]: debug builds only (the tests and the app's contract
+/// run them), so nothing that sets a release hub's environment can redirect its pushes.
+const SEAM_HONOURED: bool = cfg!(debug_assertions);
 /// The only prefix the seam is honoured for.
 const LOOPBACK: &str = "http://127.0.0.1:";
 /// How long pushes to one device collect before one goes out.
@@ -53,9 +56,20 @@ const WINDOW_NOTICES: usize = 64;
 /// The longest error code that is logged.
 const CODE_CHARS: usize = 64;
 
-/// Where to post: Expo, or, when `OCTET_HUB_PUSH_URL` names a loopback address, that.
+/// Where to post: Expo, or, in a debug build, when `OCTET_HUB_PUSH_URL` names a loopback
+/// address, that.
 pub(crate) fn endpoint() -> String {
-    endpoint_from(std::env::var(SEAM).ok().as_deref())
+    let seam = SEAM_HONOURED.then(|| std::env::var(SEAM).ok()).flatten();
+    endpoint_where(SEAM_HONOURED, seam.as_deref())
+}
+
+/// [`endpoint`] for a seam value, in a build that does or does not honour it.
+fn endpoint_where(honoured: bool, seam: Option<&str>) -> String {
+    if honoured {
+        endpoint_from(seam)
+    } else {
+        EXPO_URL.to_owned()
+    }
 }
 
 /// [`endpoint`] for a given seam value. Only `http://127.0.0.1:<port>[/<path>]` is taken, with a
@@ -878,6 +892,15 @@ mod tests {
             json!({"to": token, "title": "Octet", "body": "Turn finished",
                 "data": {"session": "123-456"}, "priority": "normal", "channelId": "turns"})
         );
+    }
+
+    #[test]
+    fn a_release_build_ignores_the_seam() {
+        let local = Some("http://127.0.0.1:8080/send");
+        assert_eq!(endpoint_where(false, local), EXPO_URL);
+        assert_eq!(endpoint_where(true, local), "http://127.0.0.1:8080/send");
+        // Tests and the app's contract run debug builds; a release build never honours it.
+        assert_eq!(SEAM_HONOURED, cfg!(debug_assertions));
     }
 
     #[test]

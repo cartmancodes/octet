@@ -173,6 +173,47 @@ async fn hub_devices_lists_and_revokes_a_paired_device() {
     );
 }
 
+#[tokio::test]
+async fn hub_devices_and_revoke_work_with_a_broken_hub_json_and_revoke_is_audited() {
+    let dir = octet_testkit::TempDir::new("octet-hub-cli");
+    let mut store = octet_hub::Store::open(dir.path()).await.unwrap();
+    let now = std::time::SystemTime::now();
+    let secret = store.pairing_secret(now);
+    let (token, _) = store
+        .pair(&secret, "Lost phone", "ios", "me@example.com", now)
+        .await
+        .unwrap();
+    // A typo in the hub's settings must not stand between a stolen phone and its revoke.
+    std::fs::write(dir.path().join("hub.json"), "{\"workspaces\": [").unwrap();
+    let path = dir.path().to_owned();
+    let (listed, revoked) = tokio::task::spawn_blocking(move || {
+        (
+            hub(&["devices"], &path),
+            hub(&["revoke", "Lost phone"], &path),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        listed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("Lost phone · ios"));
+    assert_eq!(
+        revoked.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    let audit = std::fs::read_to_string(dir.path().join("hub-audit.jsonl")).unwrap();
+    let last: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+    assert_eq!(last["device"], "Lost phone");
+    assert_eq!(last["what"], "revoked");
+    assert!(!audit.contains(&token), "{audit}");
+}
+
 /// A short data directory under `/tmp` (socket paths are limited), removed on drop.
 struct ShortDir(std::path::PathBuf);
 

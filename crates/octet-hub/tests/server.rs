@@ -874,12 +874,20 @@ async fn a_command_to_a_session_that_ends_is_refused_at_once() {
     let (mut phone, _) = env.phone("Test phone").await;
     let prompt = |req: u64| json!({"v": 1, "req": req, "type": "prompt", "session": bridge.id, "text": "hi"});
     let ended = |req: u64| refused(req, Code::Unavailable, "The session ended");
-    // The bridge's link closes with the command unanswered.
+    // The bridge's link closes with the command unanswered, the session still registered: it may
+    // have run the command, so the phone is told to look before sending it again.
     let (mut read, write) = bridge.accept().await;
     send(&mut phone, prompt(1)).await;
     assert_eq!(bridge_line(&mut read).await["type"], "prompt");
     drop((read, write));
-    assert_eq!(recv_kind(&mut phone, "refused").await, ended(1));
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(
+            1,
+            Code::Unavailable,
+            "Lost the link to that session; check it before sending again"
+        )
+    );
     // The hub links again; then the session goes away with a command unanswered.
     let (mut read, _write) = bridge.accept().await;
     send(&mut phone, prompt(2)).await;
@@ -1083,6 +1091,7 @@ async fn audit_records_remote_actions() {
     let lines: Vec<Value> = audit
         .lines()
         .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .filter(|line: &Value| line["what"] != "paired")
         .collect();
     assert_eq!(lines.len(), 2, "{audit}");
     for line in &lines {
@@ -1092,6 +1101,36 @@ async fn audit_records_remote_actions() {
     assert_eq!(lines[0]["what"], "prompt");
     assert_eq!(lines[1]["what"], "answer 4 allow");
     assert!(!audit.contains("secret plans"));
+}
+
+#[tokio::test]
+async fn a_pairing_is_audited_without_its_token_or_secret() {
+    let mut env = Env::new();
+    env.start().await;
+    let mut phone = connect(env.port, Some(OWNER)).await.expect("connects");
+    let secret = env.control(json!({"type": "pair_secret"})).await;
+    let secret = secret["secret"].as_str().expect("a secret").to_owned();
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 1, "type": "pair", "secret": secret, "name": "Test phone",
+            "platform": "ios"}),
+    )
+    .await;
+    let paired = recv(&mut phone).await;
+    let token = paired["token"].as_str().expect("a token");
+    let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
+    let lines: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{audit}");
+    assert_eq!(lines[0]["device"], "Test phone");
+    assert_eq!(lines[0]["session"], "");
+    assert_eq!(lines[0]["what"], "paired");
+    assert!(
+        !audit.contains(token) && !audit.contains(&secret),
+        "{audit}"
+    );
 }
 
 const PUSH: &str = "ExpoPushToken[Zk3_secretvalue-77]";
@@ -1284,7 +1323,7 @@ async fn the_audit_log_says_only_push_on_or_push_off() {
         .iter()
         .map(|l| l["what"].as_str().unwrap_or_default())
         .collect();
-    assert_eq!(what, ["push on", "push off"], "{audit}");
+    assert_eq!(what, ["paired", "push on", "push off"], "{audit}");
     assert!(
         lines
             .iter()
@@ -1713,7 +1752,9 @@ async fn more_live_events_than_the_outbox_holds_wait_for_a_slow_phone_at_the_han
 async fn no_replayed_event_follows_the_unsubscribe_ack() {
     let mut env = Env::new();
     let bridge = env.bridge(5102, 0..0).await;
-    padded_journal(&env, JOURNAL, 0..5000, 200);
+    // About 10 MB: more than the socket buffers hold, so the replay is still running when the
+    // unsubscribe arrives, on Linux too.
+    padded_journal(&env, JOURNAL, 0..5000, 2000);
     env.start().await;
     let (mut phone, _) = env.phone("Test phone").await;
     send(&mut phone, subscribe(3, &bridge.id, None)).await;

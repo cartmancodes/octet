@@ -151,6 +151,9 @@ const REVOKED_REFUSED: &str = "This phone was unpaired on the Mac";
 const NOT_TEXT: &str = "Send each message as a text frame";
 /// The refusal for a command whose session ended before it answered.
 const SESSION_ENDED: &str = "The session ended";
+/// The refusal for a command whose session is still there but whose link closed before it
+/// answered: the command may have run.
+const LINK_LOST: &str = "Lost the link to that session; check it before sending again";
 /// The refusal for a command the session did not answer in time.
 const NO_ANSWER: &str = "The session didn't answer";
 /// The refusal for a prompt or steer over [`PROMPT_LIMIT`].
@@ -826,7 +829,11 @@ impl Hub {
                 .pair(secret.expose(), &name, &platform, &self.owner, now)
                 .await
             {
-                Ok((token, device)) => self.send(conn, &paired(&token, &device.name)),
+                Ok((token, device)) => {
+                    // Who paired, and when; never the token or the secret.
+                    self.store.audit(&device.name, "", "paired").await;
+                    self.send(conn, &paired(&token, &device.name));
+                }
                 Err(reason) => {
                     let code = if reason == SECRET_REFUSED {
                         Code::Unpaired
@@ -1253,7 +1260,8 @@ impl Hub {
     }
 
     /// Refuses at once the commands waiting on a session whose link closed or that went away:
-    /// no answer can come.
+    /// no answer can come. A session still there may have run its command before the link
+    /// closed, so the phone is told to look before sending it again.
     fn refuse_ended(&mut self) {
         let ended: Vec<u64> = self
             .pending
@@ -1263,7 +1271,12 @@ impl Hub {
             .collect();
         for req in ended {
             if let Some(pending) = self.pending.remove(&req) {
-                self.refuse(pending.conn, pending.req, Code::Unavailable, SESSION_ENDED);
+                let reason = if self.sessions.journals(&pending.session).is_some() {
+                    LINK_LOST
+                } else {
+                    SESSION_ENDED
+                };
+                self.refuse(pending.conn, pending.req, Code::Unavailable, reason);
             }
         }
     }

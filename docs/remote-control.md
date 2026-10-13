@@ -513,7 +513,11 @@ octet hub revoke "My iPhone"
 
 A revoked phone is disconnected within two seconds and can't come back
 without pairing again. Run `octet hub devices` and `revoke` with the same
-`--journal-dir` as the hub if you gave it one.
+`--journal-dir` as the hub if you gave it one. Neither reads `hub.json`, so a
+mistake there never blocks a revoke. A relative `--journal-dir` is resolved
+to an absolute path when Octet starts. The hub, the sessions at your desk and
+the sessions a phone starts then use the same directory, whatever directory
+each one runs in.
 
 ### Keep a session off the phone
 
@@ -551,7 +555,13 @@ It then creates no socket and no file, and the hub and the phone never see it.
   remove the phone from the tailnet in the Tailscale admin console.
 - Every action from a phone (prompt, answer, mode, start and so on) is
   recorded with the phone's name in `hub-audit.jsonl`, without the prompt
-  text. The desk also shows a note naming the phone.
+  text. The desk also shows a note naming the phone. Pairing (`paired`) and
+  `octet hub revoke` (`revoked`) are recorded too, with the phone's name and
+  never a token or pairing code.
+- A command that was waiting when a session's link dropped is refused with
+  `Lost the link to that session; check it before sending again`. The command
+  may have run, so look before you send it again. `The session ended` means
+  the session is gone.
 - `full-access` from a phone needs the typed confirmation `full access`, which
   the hub checks itself, and the desk shows `⚠ Full access from NAME`. The
   phone app adds a Face ID or fingerprint check of its own.

@@ -109,9 +109,12 @@ async fn main() -> std::process::ExitCode {
     };
     std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
-/// Where journals and the hub's files go: `journal_dir`, else `$XDG_DATA_HOME`, else `~/.local/share`.
+/// Where journals and the hub's files go: `journal_dir`, else `$XDG_DATA_HOME`, else
+/// `~/.local/share`. It is made (owner-only) if missing and resolved to its canonical absolute
+/// path, so a terminal UI, the hub and the sessions a phone starts, each with its own working
+/// directory, all name the same place.
 fn data_dir(journal_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    journal_dir
+    let directory = journal_dir
         .or_else(|| {
             std::env::var_os("XDG_DATA_HOME")
                 .map(PathBuf::from)
@@ -121,7 +124,16 @@ fn data_dir(journal_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
         .or_else(|| octet_core::home_dir().map(|p| p.join(".local/share").join(JOURNAL_DIR)))
         .ok_or_else(|| {
             CliError::Usage("Set --journal-dir or HOME to choose transcript storage".into())
-        })
+        })?;
+    let resolve = || {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)?;
+        std::fs::canonicalize(&directory)
+    };
+    resolve().map_err(|e| CliError::Run(format!("Couldn't use {}: {e}", directory.display())))
 }
 
 /// Reads the options and runs; the process's exit code.
@@ -199,4 +211,27 @@ async fn run() -> Result<i32, CliError> {
         Run::Rpc => headless::rpc(config, directory).await,
     };
     result.map_err(CliError::Run)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_data_directory_becomes_absolute_and_exists() {
+        // Tests run in the crate's directory; `target` is scratch space there.
+        let relative = PathBuf::from(format!(
+            "target/../target/octet-data-dir-{}",
+            std::process::id()
+        ));
+        let resolved = data_dir(Some(relative.clone())).expect("a data directory");
+        let made = std::fs::canonicalize(&relative);
+        let _ = std::fs::remove_dir_all(&relative);
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert_eq!(
+            Some(resolved),
+            made.ok(),
+            "the same directory, made and resolved"
+        );
+    }
 }
