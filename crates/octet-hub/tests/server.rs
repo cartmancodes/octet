@@ -8,9 +8,14 @@ use octet_core::remote::{
 use octet_hub::{Hub, Store};
 use serde_json::{Value, json};
 use std::{
+    future::Future,
     io::Write as _,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    pin::Pin,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -35,6 +40,17 @@ const WAIT: Duration = Duration::from_secs(5);
 const JOURNAL: &str = "session-1-1.jsonl";
 
 type Phone = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// The address the fake `tailscale serve` shows every hub at.
+const SERVED_URL: &str = "https://mac.tail1234.ts.net";
+/// Ports whose hub the fake `tailscale serve` does not publish.
+static UNPUBLISHED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+/// A stand-in for asking Tailscale: every hub is published, except those in [`UNPUBLISHED`].
+fn fake_publisher(port: u16) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+    let hidden = UNPUBLISHED.lock().expect("lock").contains(&port);
+    Box::pin(async move { (!hidden).then(|| SERVED_URL.to_owned()) })
+}
 
 /// A data directory under `/tmp` (socket paths are limited to about 104 bytes), and the hub
 /// serving it once started.
@@ -69,7 +85,15 @@ impl Env {
             let shutdown = async {
                 let _ = stopped.await;
             };
-            Hub::serve(directory, 0, OWNER.to_owned(), shutdown).await
+            Hub::serve_with(
+                directory,
+                0,
+                OWNER.to_owned(),
+                shutdown,
+                oneshot::channel().0,
+                fake_publisher,
+            )
+            .await
         });
         self.stop = Some(stop);
         let status = timeout(WAIT, async {
@@ -334,14 +358,12 @@ async fn pair_then_hello_lists_sessions() {
     env.start().await;
     let status = env.control(json!({"type": "status"})).await;
     assert_eq!(status["devices"], 0, "{status}");
-    assert_eq!(status["published"], json!(status["url"].is_string()));
+    assert_eq!(status["published"], true, "{status}");
+    assert_eq!(status["url"], SERVED_URL, "{status}");
     let secret = env.control(json!({"type": "pair_secret"})).await;
     let text = secret["secret"].as_str().expect("a secret");
     assert_eq!(text.len(), 64);
-    assert!(
-        secret["url"].is_null() || secret["url"].is_string(),
-        "{secret}"
-    );
+    assert_eq!(secret["url"], SERVED_URL, "{secret}");
     assert!(env.control(json!({"type": "nope"})).await["error"].is_string());
 
     let token = env.pair("Test phone").await;
@@ -352,6 +374,33 @@ async fn pair_then_hello_lists_sessions() {
     assert_eq!(rows.len(), 1, "{sessions}");
     assert_eq!(rows[0]["id"], bridge.id);
     assert_eq!(rows[0]["engine"], "claude");
+}
+
+#[tokio::test]
+async fn an_unpublished_hub_mints_no_pairing_secret() {
+    let mut env = Env::new();
+    env.start().await;
+    UNPUBLISHED.lock().expect("lock").push(env.port);
+    let status = env.control(json!({"type": "status"})).await;
+    assert_eq!(status["published"], false, "{status}");
+    assert!(status["url"].is_null(), "{status}");
+    assert_eq!(status["port"], env.port);
+    let refusal = env.control(json!({"type": "pair_secret"})).await;
+    assert!(refusal["secret"].is_null(), "{refusal}");
+    assert!(refusal["url"].is_null(), "{refusal}");
+    assert_eq!(
+        refusal["reason"],
+        format!("Publish it first: tailscale serve --bg {}", env.port)
+    );
+    // Once published, the secret is minted and pairs a phone.
+    UNPUBLISHED
+        .lock()
+        .expect("lock")
+        .retain(|port| *port != env.port);
+    let status = env.control(json!({"type": "status"})).await;
+    assert_eq!(status["published"], true, "{status}");
+    let token = env.pair("Test phone").await;
+    assert_eq!(token.len(), 64);
 }
 
 #[tokio::test]

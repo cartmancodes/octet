@@ -426,6 +426,7 @@ pub(crate) fn show_pairing(app: &mut App, pairing: crate::remote::Pairing) {
         Pairing::NoTailnet => app.note(
             "Tailscale isn't connected, so a phone can't reach the hub. Run tailscale up, then /remote-control pair",
         ),
+        Pairing::NotPublished(reason) => app.note(reason),
         Pairing::Ready { url, secret } => {
             let room = crate::view::transcript_room(app.last_width, app.sidebar);
             app.note_apart(crate::remote::pair_report(&url, &secret, room.map(usize::from)));

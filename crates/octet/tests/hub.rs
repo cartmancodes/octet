@@ -7,7 +7,10 @@ use std::{
     fs::File,
     future::Future,
     io::Read,
-    os::{fd::FromRawFd, unix::process::CommandExt},
+    os::{
+        fd::FromRawFd,
+        unix::{fs::PermissionsExt, process::CommandExt},
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -39,6 +42,8 @@ struct World {
     dir: PathBuf,
     /// Where the hub process writes its output.
     hub_log: PathBuf,
+    /// The directory holding a fake `tailscale` that shows the hub as published.
+    bin: PathBuf,
     port: u16,
     hub: Child,
     tui: Child,
@@ -67,7 +72,25 @@ impl World {
             probe.local_addr().expect("an address").port()
         };
         let log = File::create(&hub_log).expect("hub log");
+        // The hub only pairs phones once `tailscale serve` publishes it, so a fake `tailscale`
+        // answers `serve status --json` with the hub's port proxied at a tailnet name.
+        let bin = PathBuf::from("/tmp").join(format!("{id}.bin"));
+        std::fs::create_dir_all(&bin).expect("fake tailscale directory");
+        let served = json!({
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"mac.tail1234.ts.net:443": {"Handlers": {"/": {
+                "Proxy": format!("http://127.0.0.1:{port}")}}}},
+        });
+        let script = bin.join("tailscale");
+        std::fs::write(&script, format!("#!/bin/sh\necho '{served}'\n")).expect("fake tailscale");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let hub = Command::new(env!("CARGO_BIN_EXE_octet"))
+            .env("PATH", path)
             .args(["hub", "--journal-dir"])
             .arg(&dir)
             .args(["--port", &port.to_string(), "--owner", OWNER])
@@ -77,9 +100,10 @@ impl World {
             .spawn()
             .expect("the hub starts");
         let (tui, screen, master, slave) = spawn_interface(&dir);
-        let world = Self {
+        let mut world = Self {
             dir,
             hub_log,
+            bin,
             port,
             hub,
             tui,
@@ -87,13 +111,7 @@ impl World {
             _master: master,
             _slave: slave,
         };
-        world
-            .within("the hub answers on hub.sock", async {
-                while world.control(&json!({"type": "status"})).await.is_none() {
-                    sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await;
+        world.hub_answers().await;
         world
             .within("the interface registers", async {
                 while !std::fs::read_dir(world.dir.join("run")).is_ok_and(|mut entries| {
@@ -105,6 +123,34 @@ impl World {
             })
             .await;
         world
+    }
+
+    /// Waits for the hub to answer on `hub.sock`, failing at once if its process has exited.
+    async fn hub_answers(&mut self) {
+        let limit = tokio::time::Instant::now() + WAIT;
+        while self.control(&json!({"type": "status"})).await.is_none() {
+            if let Some(status) = self.hub.try_wait().expect("wait") {
+                panic!("the hub exited early ({status})\n{}", self.evidence());
+            }
+            assert!(
+                tokio::time::Instant::now() < limit,
+                "timed out: the hub answers on hub.sock\n{}",
+                self.evidence()
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Waits until no frame arrives for a moment, for at most [`WAIT`].
+    async fn settle(&self, phone: &mut Phone) {
+        let limit = tokio::time::Instant::now() + WAIT;
+        while !self.quiet(phone).await {
+            assert!(
+                tokio::time::Instant::now() < limit,
+                "frames kept arriving\n{}",
+                self.evidence()
+            );
+        }
     }
 
     /// What the interface drew and what the hub said, for a failure message.
@@ -281,6 +327,7 @@ impl Drop for World {
         let _ = self.hub.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
         let _ = std::fs::remove_file(&self.hub_log);
+        let _ = std::fs::remove_dir_all(&self.bin);
     }
 }
 
@@ -471,6 +518,26 @@ impl<'a> Drive<'a> {
             .await
     }
 
+    /// Like [`event`](Self::event) for an event of `kind` whose data is `data`; one already
+    /// received (it may come before the ack) counts.
+    async fn event_with(&mut self, kind: &str, data: &str) {
+        let wanted = json!(data);
+        if self
+            .seen
+            .kinds
+            .iter()
+            .any(|(k, d)| k == kind && *d == wanted)
+        {
+            return;
+        }
+        let (world, seen) = (self.world, &mut self.seen);
+        world
+            .until(&mut self.phone, seen, |f| {
+                f["type"] == "event" && f["event"]["type"] == kind && f["event"]["data"] == wanted
+            })
+            .await;
+    }
+
     /// Drops the connection and says hello again with the same token.
     async fn reconnect(&mut self) {
         let (phone, _) = self.world.hello(&self.token).await;
@@ -519,8 +586,8 @@ async fn a_phone_drives_a_live_interface_through_the_hub() {
             .is_some_and(|m| m.contains("accept-edits")),
         "{ack}"
     );
-    assert_eq!(phone.event("mode").await["event"]["data"], "accept-edits");
-    while !world.quiet(&mut phone.phone).await {}
+    phone.event_with("mode", "accept-edits").await;
+    world.settle(&mut phone.phone).await;
 
     // A phone that drops and returns from its last cursor gets nothing twice.
     let after = phone.seen.last();

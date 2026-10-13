@@ -66,8 +66,8 @@ Rejected alternatives:
   directory created 0700. Beside it is `<pid>.json` (0600) holding the engine, workspace, model,
   vendor session id, journal path and start time. `--no-remote` turns the bridge off.
 - **Outbound.** Every event the terminal UI applies is forwarded as an `event` frame carrying its
-  journal `seq`. A `state` frame goes out when terminal UI–only state changes (queue, goal, NOW
-  line, mode, pending approvals). A `catalog` frame carries modes and models. Each subscriber
+  cursor (journal, `seq`). A `state` frame goes out when terminal UI–only state changes (queue, goal,
+  NOW line, mode, pending approvals). A `catalog` frame carries modes and models. Each subscriber
   has a bounded queue, and a subscriber that falls behind is disconnected. The terminal UI is
   never blocked.
 - **Inbound.** Commands arrive as an internal `Remote` event in the terminal UI's event loop.
@@ -262,8 +262,8 @@ approval as `approval`; and the run directory is `<data dir>/run/`.
 
 **Behaviour.**
 
-- **Reconnect.** Subscribes with the last `seq` per session, so returning from the background
-  replays exactly what was missed.
+- **Reconnect.** Subscribes with the last cursor (journal, `seq`) per session, so returning from the
+  background replays exactly what was missed.
 - **Offline.** "Can't reach your Mac": the last state is shown greyed out, with no actions until
   reconnected.
 - **Refusals.** Shown as the terminal UI words them.
@@ -272,7 +272,7 @@ approval as `approval`; and the run directory is `<data dir>/run/`.
 ### 5. Testing
 
 - **Bridge (unit).**
-  - Each event is forwarded once with its `seq`.
+  - Each event is forwarded once with its cursor (journal, `seq`).
   - A slow subscriber is dropped without stalling the terminal UI.
   - Each remote command takes the same path and gives the same refusals as its key or slash
     command (`TURN_OPEN`, queue full, arm delay, `can_reconnect`).

@@ -1,4 +1,4 @@
-//! The tailnet owner and the hub's tailnet URL, read from `tailscale status --json`.
+//! The tailnet owner, read from `tailscale status --json`, and the URL `tailscale serve` publishes the hub at.
 use std::{
     process::Stdio,
     time::{Duration, Instant},
@@ -26,11 +26,6 @@ pub async fn owner_login(override_login: Option<String>) -> Result<String, Strin
         .await
         .and_then(|json| parse_owner(&json))
         .ok_or_else(|| "Tailscale isn't running; start it or pass --owner".to_owned())
-}
-
-/// The hub's `https://<name>.ts.net` URL while Tailscale is running.
-pub async fn tailnet_url() -> Option<String> {
-    parse_tailnet_url(&status().await?)
 }
 
 /// The `https://<name>` URL `tailscale serve` already publishes for loopback `port`, if any.
@@ -86,17 +81,6 @@ fn parse_owner(status_json: &str) -> Option<String> {
     };
     let login = status["User"][id.as_str()]["LoginName"].as_str()?;
     (!login.is_empty()).then(|| login.to_owned())
-}
-
-/// `https://` and this node's DNS name, without its trailing dot, while the
-/// backend is running.
-fn parse_tailnet_url(status_json: &str) -> Option<String> {
-    let status: serde_json::Value = serde_json::from_str(status_json).ok()?;
-    if status["BackendState"] != "Running" {
-        return None;
-    }
-    let name = status["Self"]["DNSName"].as_str()?.trim_end_matches('.');
-    (!name.is_empty()).then(|| format!("https://{name}"))
 }
 
 /// The HTTPS URL of the first `serve status --json` handler that proxies to loopback `port`.
@@ -175,25 +159,6 @@ mod tests {
             None
         );
         assert_eq!(parse_owner("not json"), None);
-    }
-
-    #[test]
-    fn the_tailnet_url_needs_a_running_backend() {
-        assert_eq!(
-            parse_tailnet_url(RUNNING).as_deref(),
-            Some("https://mac.tail1234.ts.net")
-        );
-        let stopped = RUNNING.replace("Running", "Stopped");
-        assert_eq!(parse_tailnet_url(&stopped), None);
-        assert_eq!(
-            parse_tailnet_url(r#"{"BackendState":"Running","Self":{}}"#),
-            None
-        );
-        assert_eq!(
-            parse_tailnet_url(r#"{"BackendState":"Running","Self":{"DNSName":"."}}"#),
-            None
-        );
-        assert_eq!(parse_tailnet_url("not json"), None);
     }
 
     #[tokio::test]

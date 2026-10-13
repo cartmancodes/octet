@@ -159,7 +159,15 @@ fn a_started_session_counts_until_it_registers() {
             let shutdown = async {
                 let _ = stopped.await;
             };
-            Hub::serve(data, 0, OWNER.to_owned(), shutdown).await
+            Hub::serve_with(
+                data,
+                0,
+                OWNER.to_owned(),
+                shutdown,
+                oneshot::channel().0,
+                |_| Box::pin(async { Some("https://mac.tail1234.ts.net".to_owned()) }),
+            )
+            .await
         });
         let status = timeout(WAIT, async {
             loop {

@@ -396,7 +396,8 @@ In an Octet session on the Mac, type:
 
 It shows a QR code and a link. In the phone app choose **Pair** and scan it.
 The code works once and expires after 10 minutes. If the hub isn't running,
-Octet says `Start the hub first: octet hub`; if Tailscale is off, it says so.
+Octet says `Start the hub first: octet hub`; if it isn't published yet, Octet
+makes no code and says `Publish it first: tailscale serve --bg 47823`.
 Plain `/remote-control` also reports the hub: whether it is running, whether
 it is published, and how many phones are paired.
 
@@ -423,7 +424,7 @@ octet --no-remote
 
 It then creates no socket and no file, and the hub and the phone never see it.
 
-### Security notes
+### Hub security notes
 
 - The hub listens on `127.0.0.1` only. The only way in from outside is
   `tailscale serve`, which is reachable from your tailnet and nowhere else.
@@ -438,9 +439,9 @@ It then creates no socket and no file, and the hub and the phone never see it.
 - Every action from a phone (prompt, answer, mode, start and so on) is
   recorded with the phone's name in `hub-audit.jsonl`, without the prompt
   text. The desk also shows a note naming the phone.
-- `full-access` from a phone needs the typed confirmation `full access`, and
-  the app asks for Face ID or a fingerprint first. The desk shows an amber
-  note naming the phone.
+- `full-access` from a phone needs the typed confirmation `full access`, which
+  the hub checks itself, and the desk shows `⚠ Full access from NAME`. The
+  phone app adds a Face ID or fingerprint check of its own.
 - Allowing an approval from the phone allows that one request, once. The
   phone can't add permission rules, and a denied or expired approval stays
   denied.

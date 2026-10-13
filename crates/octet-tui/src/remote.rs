@@ -120,6 +120,8 @@ pub(crate) enum Pairing {
     Failed(String),
     /// The hub has no tailnet address, so a phone could not reach it.
     NoTailnet,
+    /// The hub is not published on the tailnet, so it gave no secret; the text says what to do.
+    NotPublished(String),
     /// A single-use secret and the hub's address.
     Ready { url: String, secret: String },
 }
@@ -137,6 +139,11 @@ pub(crate) async fn pairing(run: &Path, within: Duration) -> Pairing {
     };
     if let Some(error) = reply["error"].as_str() {
         return Pairing::Failed(format!("The hub refused: {error}"));
+    }
+    if reply["secret"].is_null()
+        && let Some(reason) = reply["reason"].as_str()
+    {
+        return Pairing::NotPublished(crate::text::clean(reason));
     }
     let Some(secret) = reply["secret"].as_str().filter(|secret| !secret.is_empty()) else {
         return Pairing::Failed("The hub gave no pairing code".into());
@@ -753,6 +760,20 @@ mod tests {
             panic!("an error reply is a failure")
         };
         assert!(why.contains("The hub is stopping"), "{why}");
+        served.await.unwrap();
+    }
+    #[tokio::test]
+    async fn an_unpublished_hub_gives_its_reason_and_no_secret() {
+        let dir = octet_testkit::TempDir::new("octet-rc-unpub");
+        let run = dir.path().join("run");
+        let served = crate::test_support::serve_hub(
+            &run,
+            r#"{"secret":null,"url":null,"reason":"Publish it first: tailscale serve --bg 47823"}"#,
+        );
+        let Pairing::NotPublished(reason) = pairing(&run, CHECK_TIMEOUT).await else {
+            panic!("a reason without a secret is not a pairing")
+        };
+        assert_eq!(reason, "Publish it first: tailscale serve --bg 47823");
         served.await.unwrap();
     }
     #[test]

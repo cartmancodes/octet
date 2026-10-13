@@ -28,7 +28,7 @@
 //! a queue of 512: a phone that lets it fill is dropped.
 use crate::{
     launch::{self, Launches, StartRequest, clip as clip_to},
-    owner::tailnet_url,
+    owner::published_url,
     sessions::{SessionUpdate, Sessions},
     store::{Device, Store},
     tail::{self, file_name},
@@ -48,6 +48,7 @@ use std::{
     future::Future,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    pin::Pin,
     time::{Duration, SystemTime},
 };
 use tokio::{
@@ -429,6 +430,15 @@ pub struct Hub {
     ids: u64,
 }
 
+/// What tells the control socket whether, and where, the hub is published on the tailnet: given
+/// the loopback port, the HTTPS URL `tailscale serve` shows it at, or `None`.
+pub type Publisher = fn(u16) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>;
+
+/// The real [`Publisher`]: asks `tailscale serve status`.
+fn tailscale_publisher(port: u16) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+    Box::pin(published_url(port))
+}
+
 impl Hub {
     /// Binds `127.0.0.1:<port>` and the local control socket; runs until `shutdown` resolves.
     ///
@@ -458,6 +468,23 @@ impl Hub {
         shutdown: impl Future<Output = ()>,
         ready: oneshot::Sender<u16>,
     ) -> Result<(), String> {
+        Self::serve_with(directory, port, owner, shutdown, ready, tailscale_publisher).await
+    }
+
+    /// Like [`serve_notify`](Self::serve_notify), asking `publisher` instead of Tailscale whether
+    /// the hub is published (for tests, which cannot depend on the machine's Tailscale).
+    ///
+    /// # Errors
+    ///
+    /// The same as [`serve`](Self::serve).
+    pub async fn serve_with(
+        directory: PathBuf,
+        port: u16,
+        owner: String,
+        shutdown: impl Future<Output = ()>,
+        ready: oneshot::Sender<u16>,
+        publisher: Publisher,
+    ) -> Result<(), String> {
         if owner.is_empty() {
             return Err("The tailnet owner's login is unknown".into());
         }
@@ -484,7 +511,7 @@ impl Hub {
         let (streams, mut accepted) = mpsc::channel(16);
         let accept_task = tokio::spawn(accept_tcp(listener, streams)).abort_handle();
         let (requests, mut controls) = mpsc::channel(16);
-        let control_task = tokio::spawn(serve_control(control, requests)).abort_handle();
+        let control_task = tokio::spawn(serve_control(control, requests, publisher)).abort_handle();
         let mut hub = Hub {
             store,
             sessions: Sessions::new(run),
@@ -1364,11 +1391,11 @@ async fn accept_tcp(listener: TcpListener, hub: mpsc::Sender<TcpStream>) {
 }
 
 /// Accepts control clients, each answered in its own task.
-async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>) {
+async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>, publisher: Publisher) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(control_client(stream, hub.clone()));
+                tokio::spawn(control_client(stream, hub.clone(), publisher));
             }
             // Out of descriptors, say: wait rather than spin.
             Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
@@ -1377,7 +1404,7 @@ async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>) {
 }
 
 /// Reads one request line from a control client and writes one answer line.
-async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>) {
+async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>, publisher: Publisher) {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     let mut reader = BufReader::new(read.take(CONTROL_LIMIT));
@@ -1391,7 +1418,7 @@ async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>) {
         watch_stream(&mut reader, &mut write, &hub).await;
         return;
     }
-    let answer = control_answer(&line, &hub).await;
+    let answer = control_answer(&line, &hub, publisher).await;
     let _ = timeout(
         CONTROL_WITHIN,
         write.write_all(format!("{answer}\n").as_bytes()),
@@ -1439,12 +1466,27 @@ async fn watch_stream(
     }
 }
 
+/// The hub's loopback port and how many phones are paired; `None` once the hub is stopping.
+async fn hub_status(hub: &mpsc::Sender<Control>) -> Option<(u16, usize)> {
+    let (reply, status) = oneshot::channel();
+    hub.send(Control::Status(reply)).await.ok()?;
+    status.await.ok()
+}
+
 /// The answer to one control request.
-async fn control_answer(line: &str, hub: &mpsc::Sender<Control>) -> Value {
+async fn control_answer(line: &str, hub: &mpsc::Sender<Control>, publisher: Publisher) -> Value {
     let kind = request_kind(line);
     let gone = || json!({"error": "The hub is stopping"});
     match kind.as_str() {
         "pair_secret" => {
+            // A secret is minted only for a hub a phone can reach: the port must be published.
+            let Some((port, _)) = hub_status(hub).await else {
+                return gone();
+            };
+            let Some(url) = publisher(port).await else {
+                return json!({"secret": null, "url": null,
+                    "reason": format!("Publish it first: tailscale serve --bg {port}")});
+            };
             let (reply, secret) = oneshot::channel();
             if hub.send(Control::PairSecret(reply)).await.is_err() {
                 return gone();
@@ -1452,17 +1494,13 @@ async fn control_answer(line: &str, hub: &mpsc::Sender<Control>) -> Value {
             let Ok(secret) = secret.await else {
                 return gone();
             };
-            json!({"secret": secret, "url": tailnet_url().await})
+            json!({"secret": secret, "url": url})
         }
         "status" => {
-            let (reply, status) = oneshot::channel();
-            if hub.send(Control::Status(reply)).await.is_err() {
-                return gone();
-            }
-            let Ok((port, devices)) = status.await else {
+            let Some((port, devices)) = hub_status(hub).await else {
                 return gone();
             };
-            let url = tailnet_url().await;
+            let url = publisher(port).await;
             json!({"port": port, "published": url.is_some(), "url": url, "devices": devices})
         }
         _ => json!({"error": "Unknown request"}),
