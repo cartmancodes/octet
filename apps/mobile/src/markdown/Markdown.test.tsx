@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react-native";
 import { StyleSheet } from "react-native";
 
-import { dark, light, type } from "../theme";
+import { dark, light } from "../theme";
 import { Markdown } from "./Markdown";
 import * as parser from "./parse";
 
@@ -47,8 +47,9 @@ describe("markdown_is_inert (drawn)", () => {
 
   it("draws code blocks and inline code in monospace", async () => {
     await render(<Markdown text={"Run `cargo test` now.\n\n```sh\nmake gate && echo **done**\n```"} />);
-    expect(style(screen.getByText("make gate && echo **done**")).fontFamily).toBe(type.mono.fontFamily);
-    expect(style(screen.getByText("cargo test")).fontFamily).toBe(type.mono.fontFamily);
+    // A family React Native can load (the test platform is iOS), not a CSS list.
+    expect(style(screen.getByText("make gate && echo **done**")).fontFamily).toBe("Menlo");
+    expect(style(screen.getByText("cargo test")).fontFamily).toBe("Menlo");
   });
 
   it("draws bold, italic, headings, lists and quotes", async () => {

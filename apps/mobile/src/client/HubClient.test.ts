@@ -1,6 +1,6 @@
-import type { Cursor, ToPhone } from "../protocol";
+import type { Cursor } from "../protocol";
 import { FakeClock, Sockets } from "./fakes";
-import { HubClient, Refusal, type HubState } from "./HubClient";
+import { HubClient, Refusal, type BatchItem, type HubState } from "./HubClient";
 
 const URL = "wss://mac.tail1234.ts.net/";
 const TOKEN = "device-token";
@@ -10,7 +10,7 @@ interface Rig {
   sockets: Sockets;
   clock: FakeClock;
   states: HubState[];
-  batches: ToPhone[][];
+  batches: BatchItem[][];
   cursors: [string, Cursor | null][];
 }
 
@@ -29,7 +29,7 @@ function rig(opts: { token?: string | null; cursors?: Record<string, Cursor>; ra
     onCursor: (session, cursor) => cursors.push([session, cursor]),
   });
   const states: HubState[] = [];
-  const batches: ToPhone[][] = [];
+  const batches: BatchItem[][] = [];
   client.onState((s) => states.push(s));
   client.onBatch((frames) => batches.push(frames));
   return { client, sockets, clock, states, batches, cursors };
@@ -53,8 +53,8 @@ const event = (session: string, journal: string, seq: number, data = "x") => ({
 });
 
 const flush = (r: Rig) => r.clock.advance(50);
-const delivered = (r: Rig): ToPhone[] => r.batches.flat();
-const eventSeqs = (frames: ToPhone[]) =>
+const delivered = (r: Rig): BatchItem[] => r.batches.flat();
+const eventSeqs = (frames: BatchItem[]) =>
   frames.flatMap((f) => (f.type === "event" ? [`${f.journal}:${f.seq}`] : []));
 
 describe("connecting", () => {
@@ -572,11 +572,26 @@ describe("unpairing", () => {
     expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
   });
 
-  it("a subscribe's ack is not traffic", () => {
+  it("a subscribe's ack is not traffic: the batch gets the client's replayed mark in its place", () => {
     const r = rig();
     ready(r);
     r.client.subscribe("live");
+    r.sockets.last.receive({ type: "subscribed", session: "live", from: "start", journals: ["j"] });
+    r.sockets.last.receive(event("live", "j", 1));
     r.sockets.last.receive({ type: "ack", req: r.sockets.last.commandsOf("subscribe")[0]?.req, message: "ok" });
+    flush(r);
+    // The hub acks a subscribe after the replay's last record: the mark follows it, in order.
+    expect(delivered(r).map((f) => f.type)).toEqual(["sessions", "subscribed", "event", "replayed"]);
+    expect(delivered(r)[3]).toEqual({ type: "replayed", session: "live" });
+  });
+
+  it("no replayed mark for a session no longer wanted", () => {
+    const r = rig();
+    ready(r);
+    r.client.subscribe("live");
+    const req = r.sockets.last.commandsOf("subscribe")[0]?.req;
+    r.client.unsubscribe("live");
+    r.sockets.last.receive({ type: "ack", req, message: "ok" });
     flush(r);
     expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
   });
@@ -891,7 +906,7 @@ describe("hostile input", () => {
     r.client.onBatch(() => {
       throw new Error("boom");
     });
-    const seen: ToPhone[][] = [];
+    const seen: BatchItem[][] = [];
     r.client.onBatch((frames) => seen.push(frames));
     ready(r);
     expect(() => flush(r)).not.toThrow();

@@ -5,12 +5,12 @@
 import { useShallow } from "zustand/react/shallow";
 import { createStore, useStore, type StoreApi } from "zustand";
 
-import type { HubClient, HubState } from "./client/HubClient";
+import type { BatchItem, HubClient, HubState } from "./client/HubClient";
 import { ENGINES, MODES, PHASES, count, member } from "./model/enums";
 import { EMPTY_VIEW, reduceView, type Op, type PendingApproval, type SessionState, type SessionView } from "./model/session";
 import type { Entry } from "./model/transcript";
 import { field } from "./model/text";
-import { isKnownEvent, type SessionInfo, type ToPhone } from "./protocol";
+import { isKnownEvent, type SessionInfo } from "./protocol";
 
 export interface OctetState {
   /** The live sessions, as the hub listed them last. */
@@ -24,9 +24,13 @@ export interface OctetState {
   /** Applies the client's frames, in order, in one commit. Returns the sessions that just
    * ended (they were listed before and are not now): their views stay, marked `ended`, until
    * the caller releases them. */
-  applyBatch(frames: readonly ToPhone[]): string[];
-  /** Drops the view of an ended session. False for one that is not ended. */
+  applyBatch(frames: readonly BatchItem[]): string[];
+  /** Drops the view of an ended session, or of a failed one the hub does not list. False for
+   * any other. */
   release(session: string): boolean;
+  /** The Task strip is open: one choice for every session's screen, for the app run. */
+  taskOpen: boolean;
+  setTaskOpen(open: boolean): void;
   setHub(state: HubState): void;
   /** Forgets everything the hub sent, for a phone unpaired from its Mac or paired with another. */
   reset(): void;
@@ -93,9 +97,14 @@ export function createOctetStore(): OctetStore {
     bySession: new Map(),
     hub: "offline",
     listed: false,
+    taskOpen: false,
 
     reset() {
-      set({ sessions: [], bySession: new Map(), hub: "offline", listed: false });
+      set({ sessions: [], bySession: new Map(), hub: "offline", listed: false, taskOpen: false });
+    },
+
+    setTaskOpen(taskOpen) {
+      if (get().taskOpen !== taskOpen) set({ taskOpen });
     },
 
     applyBatch(frames) {
@@ -128,6 +137,9 @@ export function createOctetStore(): OctetStore {
           case "catalog":
             push(frame.session, { op: "catalog", catalog: frame.catalog });
             break;
+          case "replayed":
+            push(frame.session, { op: "replayed" });
+            break;
           default:
             break; // replies to requests are the client's
         }
@@ -157,8 +169,10 @@ export function createOctetStore(): OctetStore {
     },
 
     release(session) {
-      const { bySession } = get();
-      if (!bySession.get(session)?.ended) return false;
+      const { bySession, sessions } = get();
+      const view = bySession.get(session);
+      const failedUnlisted = view?.failed != null && !sessions.some((s) => s.id === session);
+      if (!view?.ended && !failedUnlisted) return false;
       const views = new Map(bySession);
       views.delete(session);
       set({ bySession: views });
@@ -289,6 +303,8 @@ export interface SessionStatus {
   ended: boolean;
   /** Why the hub refused to stream it, when it did for good. */
   failed: string | null;
+  /** Moves on at each replay from the start. */
+  epoch: number;
 }
 
 /** Hooks over `store`: each selects the smallest part a screen needs. */
@@ -314,11 +330,13 @@ export function bindHooks(store: OctetStore) {
         store,
         useShallow((s) => {
           const v = s.bySession.get(id);
-          return { known: v !== undefined, ended: v?.ended ?? false, failed: v?.failed ?? null };
+          return { known: v !== undefined, ended: v?.ended ?? false, failed: v?.failed ?? null, epoch: v?.epoch ?? 0 };
         }),
       ),
     /** A sessions frame came since the store began or was reset. */
     useListed: (): boolean => useStore(store, (s) => s.listed),
+    /** The Task strip's open state, shared by every session's screen. */
+    useTaskOpen: (): boolean => useStore(store, (s) => s.taskOpen),
     useApprovals: (id: string): PendingApproval[] =>
       useStore(store, (s) => s.bySession.get(id)?.approvals ?? NO_APPROVALS),
     useHub: (): HubState => useStore(store, (s) => s.hub),
@@ -335,6 +353,7 @@ export const {
   useSessionState,
   useSessionStatus,
   useListed,
+  useTaskOpen,
   useApprovals,
   useHub,
 } = bindHooks(octetStore);

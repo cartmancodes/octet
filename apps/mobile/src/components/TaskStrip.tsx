@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useMemo } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { SessionState } from "../model/session";
@@ -12,6 +12,10 @@ interface TaskStripProps {
   now: string;
   /** The list's goal line, for a session whose state has not come yet. */
   goal: string | null;
+  /** Unfolded. Folded at first; the screen keeps the choice for every session, for the app run. */
+  open: boolean;
+  /** Called with the new open state. Must be stable. */
+  onOpen: (open: boolean) => void;
 }
 
 function makeStyles(theme: Theme) {
@@ -41,11 +45,10 @@ const COLLAPSED = { expanded: false } as const;
 
 /** The terminal UI's Task card: the goal and its turns, what is happening now, and the queue.
  * A tap on its head folds it to one line (NOW and the queue's count). Hub strings are text. */
-export const TaskStrip = memo(function TaskStrip({ state, now, goal: listedGoal }: TaskStripProps) {
+export const TaskStrip = memo(function TaskStrip({ state, now, goal: listedGoal, open, onOpen }: TaskStripProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
-  const [open, setOpen] = useState(true);
-  const toggle = useCallback(() => setOpen((o) => !o), []);
+  const toggle = useCallback(() => onOpen(!open), [onOpen, open]);
   const queue = useMemo(() => queueWords(state), [state]);
   const goal = state?.goal ?? null;
   const count = queuedCount(queue.count);

@@ -152,10 +152,21 @@ describe("the Session screen", () => {
       await fireEvent.press(row);
       expect(screen.getByText("✓ Read a.rs")).toBeTruthy();
       expect(screen.getByText("✓ Bash cargo build")).toBeTruthy();
-      expect(screen.getByText("Compiling\nFinished")).toBeTruthy();
+      expect(StyleSheet.flatten(screen.getByText("Compiling\nFinished").props.style).fontFamily).toBe("Menlo");
       expect(screen.getByRole("button", { name: /Read 3 files/ }).props.accessibilityState).toMatchObject({ expanded: true });
       await fireEvent.press(screen.getByRole("button", { name: /Read 3 files/ }));
       expect(screen.queryByText("✓ Read a.rs")).toBeNull();
+    });
+
+    it("a fresh replay closes the groups the user opened", async () => {
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), tool("1", "Read", "a.rs", "done"));
+      await fireEvent.press(screen.getByRole("button", { name: /Read 1 file/ }));
+      expect(screen.getByText("✓ Read a.rs")).toBeTruthy();
+      await feed(rig, subscribed(), tool("1", "Read", "a.rs", "done"));
+      expect(screen.queryByText("✓ Read a.rs")).toBeNull();
+      expect(screen.getByText("▸ Read 1 file")).toBeTruthy();
     });
 
     it("show a running call with its target", async () => {
@@ -268,6 +279,20 @@ describe("the Session screen", () => {
       expect(screen.queryByRole("button", { name: "New output below" })).toBeNull();
     });
 
+    it("scrolled up, content that only grew (a group opened, sizes measured) shows no pill", async () => {
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), ev({ type: "user", data: "go" }), tool("1", "Read", "a.rs", "done"));
+      await scrolled(400);
+      const spy = scrollToEnd();
+      await fireEvent.press(screen.getByRole("button", { name: /Read 1 file/ }));
+      await grew(3_600);
+      expect(screen.queryByRole("button", { name: "New output below" })).toBeNull();
+      expect(spy).not.toHaveBeenCalled();
+      await feed(rig, ev({ type: "text", data: "new" }));
+      expect(screen.getByRole("button", { name: "New output below" })).toBeTruthy();
+    });
+
     it("follows again once the user scrolls back to the bottom", async () => {
       const rig = await launch([info("a")]);
       await open(rig, "a");
@@ -299,6 +324,13 @@ describe("the Session screen", () => {
         }),
       );
       const strip = screen.getByTestId("task-strip");
+      // Folded at first: one line, NOW and the count.
+      expect(within(strip).getByText("Running Bash cargo test · 5 queued")).toBeTruthy();
+      expect(within(strip).queryByText("Make the hub survive restarts")).toBeNull();
+      const toggle = within(strip).getByRole("button", { name: /^Task/ });
+      expect(toggle.props.accessibilityLabel).toMatch(/5 queued/);
+      expect(toggle.props.accessibilityState).toMatchObject({ expanded: false });
+      await fireEvent.press(toggle);
       expect(within(strip).getByText("Make the hub survive restarts")).toBeTruthy();
       expect(within(strip).getByText("active · 3/20 turns")).toBeTruthy();
       expect(within(strip).getByText("Running Bash cargo test")).toBeTruthy();
@@ -308,15 +340,24 @@ describe("the Session screen", () => {
       expect(within(strip).getByText("Commit")).toBeTruthy();
       expect(within(strip).queryByText("Push")).toBeNull();
       expect(within(strip).getByText("+2 more")).toBeTruthy();
-      const toggle = within(strip).getByRole("button", { name: /^Task/ });
-      expect(toggle.props.accessibilityLabel).toMatch(/5 queued/);
-      expect(toggle.props.accessibilityState).toMatchObject({ expanded: true });
-      await fireEvent.press(toggle);
+      expect(within(strip).getByRole("button", { name: /^Task/ }).props.accessibilityState).toMatchObject({ expanded: true });
+      await fireEvent.press(within(strip).getByRole("button", { name: /^Task/ }));
       expect(within(strip).queryByText("Make the hub survive restarts")).toBeNull();
       expect(within(strip).queryByText("Run the gate")).toBeNull();
       expect(within(strip).getByText("Running Bash cargo test · 5 queued")).toBeTruthy();
-      await fireEvent.press(within(strip).getByRole("button", { name: /^Task/ }));
-      expect(within(strip).getByText("Make the hub survive restarts")).toBeTruthy();
+    });
+
+    it("remembers being opened for the next session's screen", async () => {
+      const rig = await launch([info("a"), info("b")]);
+      await open(rig, "a");
+      await fireEvent.press(within(screen.getByTestId("task-strip")).getByRole("button", { name: /^Task/ }));
+      await act(async () => router.back());
+      await open(rig, "b");
+      const strips = screen.getAllByTestId("task-strip");
+      const strip = strips[strips.length - 1];
+      if (!strip) throw new Error("no strip");
+      expect(within(strip).getByRole("button", { name: /^Task/ }).props.accessibilityState).toMatchObject({ expanded: true });
+      expect(within(strip).getByText("GOAL")).toBeTruthy();
     });
 
     it("says when there is no goal and nothing queued, and falls back to the phase", async () => {
@@ -324,6 +365,7 @@ describe("the Session screen", () => {
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
       const strip = screen.getByTestId("task-strip");
+      await fireEvent.press(within(strip).getByRole("button", { name: /^Task/ }));
       expect(within(strip).getByText("No goal")).toBeTruthy();
       expect(within(strip).getByText("Idle")).toBeTruthy();
       expect(within(strip).getByText("Nothing queued")).toBeTruthy();
@@ -356,6 +398,19 @@ describe("the Session screen", () => {
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();
       await fireEvent.press(screen.getByRole("button", { name: "Back to sessions" }));
       expect(rig.view.getPathname()).toBe("/");
+    });
+
+    it("a deep-linked session the hub refuses is gone too, with a way back, and its view is dropped on leaving", async () => {
+      const rig = await launch([info("a")], "/session/zzz");
+      const [command] = rig.sockets.last.commandsOf("subscribe");
+      expect(command).toMatchObject({ session: "zzz" });
+      await feed(rig, { type: "refused", req: command?.req, reason: "No such session", code: "invalid" });
+      expect(octetStore.getState().bySession.get("zzz")?.failed).toBe("No such session");
+      expect(screen.getByText("This session isn't running anymore")).toBeTruthy();
+      expect(screen.queryByTestId("transcript")).toBeNull();
+      await fireEvent.press(screen.getByRole("button", { name: "Back to sessions" }));
+      expect(rig.view.getPathname()).toBe("/");
+      expect(octetStore.getState().bySession.has("zzz")).toBe(false);
     });
 
     it("offline, the transcript stays under a banner", async () => {

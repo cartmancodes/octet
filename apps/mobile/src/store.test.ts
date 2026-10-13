@@ -221,11 +221,51 @@ describe("a fresh replay keeps the previous transcript on screen", () => {
     expect(view("a").transcript.entries).toMatchObject([{ text: "new" }]);
   });
 
+  it("an empty replay ends the hold when the client says the replay is over", async () => {
+    const hooks = bindHooks(store);
+    store.getState().applyBatch([user("a", "old")]);
+    const shown = await renderHook(() => hooks.useEntries("a"));
+    await act(() => {
+      store.getState().applyBatch([subscribed("a", "start")]);
+    });
+    expect(shown.result.current).toMatchObject([{ text: "old" }]);
+    await act(() => {
+      store.getState().applyBatch([{ type: "replayed", session: "a" }]);
+    });
+    expect(view("a").replaying).toBe(false);
+    expect(view("a").held).toBeNull();
+    expect(shown.result.current).toEqual([]);
+  });
+
+  it("a replayed mark for a session the store holds nothing of makes no view", () => {
+    store.getState().applyBatch([{ type: "replayed", session: "nobody" }]);
+    expect(store.getState().bySession.has("nobody")).toBe(false);
+  });
+
+  it("each reset moves the view's epoch on", () => {
+    store.getState().applyBatch([user("a", "old")]);
+    const before = view("a").epoch;
+    store.getState().applyBatch([subscribed("a", "start"), user("a", "new")]);
+    expect(view("a").epoch).toBe(before + 1);
+    store.getState().applyBatch([user("a", "more")]);
+    expect(view("a").epoch).toBe(before + 1);
+  });
+
   it("a second reset during a replay keeps the transcript first held", () => {
     store.getState().applyBatch([user("a", "old")]);
     store.getState().applyBatch([subscribed("a", "start")]);
     store.getState().applyBatch([subscribed("a", "start")]);
     expect(view("a").held).toMatchObject([{ text: "old" }]);
+  });
+});
+
+describe("the Task strip's open state", () => {
+  it("is closed at first, kept for the run, and closed again by reset", () => {
+    expect(store.getState().taskOpen).toBe(false);
+    store.getState().setTaskOpen(true);
+    expect(store.getState().taskOpen).toBe(true);
+    store.getState().reset();
+    expect(store.getState().taskOpen).toBe(false);
   });
 });
 
@@ -301,6 +341,16 @@ describe("sessions that end", () => {
     store.getState().applyBatch([sessions()]);
     store.getState().applyBatch([sessions(info("a"))]);
     expect(view("a").ended).toBe(false);
+  });
+
+  it("release() also takes a failed view of a session not listed, but not of a listed one", () => {
+    store.getState().applyBatch([sessions(info("a"))]);
+    store.getState().subscribeFailed("zzz", "No such session");
+    store.getState().subscribeFailed("a", "Busy");
+    expect(store.getState().release("zzz")).toBe(true);
+    expect(store.getState().bySession.has("zzz")).toBe(false);
+    expect(store.getState().release("a")).toBe(false);
+    expect(store.getState().bySession.has("a")).toBe(true);
   });
 
   it("are released by release(), which only takes an ended view", () => {

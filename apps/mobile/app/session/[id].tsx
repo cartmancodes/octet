@@ -21,6 +21,7 @@ import {
   useSessionInfo,
   useSessionState,
   useSessionStatus,
+  useTaskOpen,
   watch,
 } from "../../src/store";
 import { radius, spacing, type, useTheme } from "../../src/theme";
@@ -50,6 +51,8 @@ export default function Session() {
   const status = useSessionStatus(id);
   const listed = useListed();
   const hub = useHub();
+  const taskOpen = useTaskOpen();
+  const setTaskOpen = octetStore.getState().setTaskOpen;
 
   useFocusEffect(
     useCallback(() => {
@@ -70,6 +73,12 @@ export default function Session() {
 
   // Tools entries the user opened, by key: kept here, not in the row, which FlashList recycles.
   const [open, setOpen] = useState<ReadonlySet<string>>(NO_OPEN);
+  // A replay from the start numbers the entries again: the keys opened mean nothing now.
+  const [epoch, setEpoch] = useState(status.epoch);
+  if (epoch !== status.epoch) {
+    setEpoch(status.epoch);
+    setOpen(NO_OPEN);
+  }
   const toggle = useCallback((key: string) => {
     setOpen((prev) => {
       const next = new Set(prev);
@@ -83,14 +92,16 @@ export default function Session() {
   );
 
   const list = useRef<FlashListRef<Entry>>(null);
-  const follow = useFollow(list, entries);
+  const follow = useFollow(list, entries[entries.length - 1]);
 
   const back = useCallback(() => {
     if (router.canGoBack()) router.back();
     else router.replace("/");
   }, [router]);
 
-  const gone = listed && info === undefined && !status.known;
+  // Not listed, and nothing to show: never heard of (once the list came), or refused with no
+  // transcript (a deep link to an id the Mac does not have).
+  const gone = info === undefined && ((listed && !status.known) || (status.failed !== null && entries.length === 0));
   const now = nowLine(state, info);
 
   return (
@@ -113,7 +124,7 @@ export default function Session() {
         <>
           {status.ended ? <Notice text="This session ended" /> : null}
           {status.failed !== null ? <Notice text={status.failed} /> : null}
-          <TaskStrip state={state} now={now} goal={info?.goal ?? null} />
+          <TaskStrip state={state} now={now} goal={info?.goal ?? null} open={taskOpen} onOpen={setTaskOpen} />
           <View style={styles.transcript}>
             <FlashList
               ref={list}

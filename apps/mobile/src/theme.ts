@@ -1,4 +1,4 @@
-import { useColorScheme } from "react-native";
+import { Platform, useColorScheme } from "react-native";
 
 /** The colour roles, named after the terminal UI's (crates/octet-tui/src/view.rs). */
 export interface Theme {
@@ -51,7 +51,8 @@ export const type = {
   body: { fontSize: 16, lineHeight: 22 },
   title: { fontSize: 20, lineHeight: 26, fontWeight: "600" },
   display: { fontSize: 28, lineHeight: 34, fontWeight: "700" },
-  mono: { fontSize: 13, lineHeight: 18, fontFamily: "Menlo, monospace" },
+  // One family name: React Native takes no CSS fallback list.
+  mono: { fontSize: 13, lineHeight: 18, fontFamily: Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" }) },
 } as const;
 
 /** The theme for the system's colour scheme (dark when it is unset). */

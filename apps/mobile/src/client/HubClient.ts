@@ -24,6 +24,16 @@ export interface Socket {
 }
 export type SocketFactory = (url: string) => Socket;
 
+/** Not a wire frame: the client's note, in a batch, that a session's replay is over (the hub
+ * acks a subscribe after the replay's last record, and the ack itself stays in the client). */
+export interface ReplayedMark {
+  type: "replayed";
+  session: string;
+}
+
+/** What a batch carries: the hub's frames, in order, and the client's replayed marks among them. */
+export type BatchItem = ToPhone | ReplayedMark;
+
 /** What answers a request: `ack`, or `recent` for the `recent` command. */
 export type Ack = AckFrame | RecentFrame;
 
@@ -145,12 +155,12 @@ export class HubClient {
   private readonly subscribeFailedListeners = new Set<(session: string, refusal: Refusal) => void>();
   private readonly pairings = new Set<() => void>();
 
-  private buffer: ToPhone[] = [];
+  private buffer: BatchItem[] = [];
   private readonly dirty = new Set<string>();
   private cancelFlush: (() => void) | null = null;
   private lastFlush = Number.NEGATIVE_INFINITY;
 
-  private readonly batchListeners = new Set<(frames: ToPhone[]) => void>();
+  private readonly batchListeners = new Set<(frames: BatchItem[]) => void>();
   private readonly stateListeners = new Set<(state: HubState) => void>();
 
   private garbage = 0;
@@ -331,7 +341,7 @@ export class HubClient {
   }
 
   /** Called with each batch of frames, at most once per 50 ms. Returns the unsubscribe function. */
-  onBatch(fn: (frames: ToPhone[]) => void): () => void {
+  onBatch(fn: (frames: BatchItem[]) => void): () => void {
     this.batchListeners.add(fn);
     return () => this.batchListeners.delete(fn);
   }
@@ -460,6 +470,7 @@ export class HubClient {
         } else if (subscribed !== undefined) {
           this.subscribeReqs.delete(frame.req);
           this.retries.delete(subscribed);
+          if (this.wanted.has(subscribed) && !this.isSettling(subscribed)) this.queue({ type: "replayed", session: subscribed });
         } else {
           this.settled(frame.req); // else a late answer to a request that timed out: dropped
         }
@@ -584,7 +595,7 @@ export class HubClient {
 
   // Batching
 
-  private queue(frame: ToPhone): void {
+  private queue(frame: BatchItem): void {
     this.buffer.push(frame);
     if (this.cancelFlush) return;
     const wait = Math.max(0, this.lastFlush + BATCH_INTERVAL_MS - this.now());

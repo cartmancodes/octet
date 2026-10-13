@@ -42,6 +42,9 @@ export interface SessionView {
   /** While `replaying`, the entries shown before it began, so the screen does not flash empty
    * between the reset and the replay's first page; null otherwise. */
   held: Entry[] | null;
+  /** Moves on at each replay from the start: what the screen keeps by entry key (the groups
+   * opened) is forgotten, since keys start over. */
+  epoch: number;
 }
 
 export const EMPTY_VIEW: SessionView = {
@@ -57,6 +60,7 @@ export const EMPTY_VIEW: SessionView = {
   closed: [],
   replaying: false,
   held: null,
+  epoch: 0,
 };
 
 /** One change to a session's view, in the order the hub sent it. */
@@ -64,6 +68,8 @@ export type Op =
   | { op: "event"; ev: KnownJournalEvent }
   /** A replay from the start begins: the journal will bring everything again. */
   | { op: "reset" }
+  /** The replay is over (the hub acked the subscribe): a hold still up ends, empty or not. */
+  | { op: "replayed" }
   | { op: "state"; state: StateInfo }
   | { op: "catalog"; catalog: CatalogInfo }
   | { op: "failed"; reason: string | null }
@@ -206,9 +212,16 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
           v.replaying = true;
         }
         draft = new TranscriptDraft(EMPTY_TRANSCRIPT);
+        v.epoch += 1;
         if (v.approvals.length > 0) v.approvals = [];
         if (v.closed.length > 0) v.closed = [];
         v.failed = null;
+        break;
+      case "replayed":
+        if (v.replaying) {
+          v.replaying = false;
+          v.held = null;
+        }
         break;
       case "ended":
         v.ended = op.ended;
@@ -281,6 +294,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.ended === view.ended &&
     v.closed === view.closed &&
     v.replaying === view.replaying &&
-    v.held === view.held;
+    v.held === view.held &&
+    v.epoch === view.epoch;
   return same ? view : v;
 }

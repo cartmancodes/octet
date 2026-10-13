@@ -3,8 +3,10 @@
 // The list follows the output until the user drags it away from the bottom; while it follows,
 // every growth of the content (a new row, or a streaming row getting taller, reported by the
 // scroll view's onContentSizeChange after layout) scrolls to the end without animation. Scrolled
-// up, nothing moves; new output shows a "New output below" pill instead, and the pill (or the
-// user scrolling back down) follows again. Only a drag or a fling can stop following, so the
+// up, nothing moves. Only new output shows the "New output below" pill: the list's last entry
+// changed (a new one, or the streaming one grew). Content that merely got taller (a group
+// opened, FlashList replacing estimated sizes with measured ones) does not. The pill, or the
+// user scrolling back down, follows again. Only a drag or a fling can stop following, so the
 // list's own scrolling (to the end, or keeping the visible rows in place as old ones are dropped
 // above) never does.
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
@@ -30,8 +32,9 @@ export interface Follow {
   onContentSizeChange: (width: number, height: number) => void;
 }
 
-/** `content` is what the list draws: a new value while scrolled up shows the pill at once. */
-export function useFollow(list: RefObject<Scrollable | null>, content: unknown): Follow {
+/** `last` is the list's last entry: a different one while scrolled up is new output, and shows
+ * the pill. */
+export function useFollow(list: RefObject<Scrollable | null>, last: unknown): Follow {
   const following = useRef(true);
   const touching = useRef(false);
   /** The pill's animated scroll is on its way down: a fling Android reports for it is not the user's. */
@@ -73,14 +76,12 @@ export function useFollow(list: RefObject<Scrollable | null>, content: unknown):
     (_width: number, h: number) => {
       const grew = h > height.current;
       height.current = h;
-      if (!grew) return;
-      if (following.current) toEnd(false);
-      else setBelow(true);
+      if (grew && following.current) toEnd(false);
     },
     [toEnd],
   );
 
-  // A new row while scrolled up: the pill now, not after the next layout.
+  // New output while scrolled up: the pill. (The first render is not news.)
   const first = useRef(true);
   useEffect(() => {
     if (first.current) {
@@ -88,7 +89,7 @@ export function useFollow(list: RefObject<Scrollable | null>, content: unknown):
       return;
     }
     if (!following.current) setBelow(true);
-  }, [content]);
+  }, [last]);
 
   const jump = useCallback(() => {
     following.current = true;
