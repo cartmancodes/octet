@@ -793,7 +793,7 @@ impl Bridge {
         let Some(live) = self.live.as_ref() else {
             return;
         };
-        if let Err(error) = live.registration.write(&live.run).await {
+        if let Err(error) = write_registration(&live.registration, &live.run).await {
             if let Some(live) = self.live.take() {
                 live.shutdown().await;
             }
@@ -802,6 +802,31 @@ impl Bridge {
             self.off = Some(why);
         }
     }
+}
+
+/// Writes `<run>/<pid>.json` atomically: an owner-only temp file, synced once, then a rename, so a
+/// hub reads the old registration or the new one, never part of one. Unlike
+/// [`Registration::write`] the directory is not synced. The interface waits for this write on a
+/// mode, model or session change, and on macOS each sync is a full flush of the disk (about 5 ms,
+/// more on a busy disk). Syncing the directory as well would buy nothing: the file describes a
+/// live process, so after a power loss there is nothing left for it to describe.
+async fn write_registration(registration: &Registration, run: &Path) -> std::io::Result<()> {
+    let temp = run.join(format!("{}.json.tmp", registration.pid));
+    match tokio::fs::remove_file(&temp).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .await?;
+    file.write_all(registration.to_json().to_string().as_bytes())
+        .await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&temp, run.join(format!("{}.json", registration.pid))).await
 }
 
 /// Fills in what the registration says about the session.
@@ -1049,6 +1074,51 @@ mod tests {
         bridge.stop().await;
         assert!(registrations(&run).await.is_empty());
         assert!(!regs[0].socket.exists());
+    }
+
+    #[tokio::test]
+    async fn the_registration_is_replaced_whole_and_kept_private() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-write");
+        let run = run_dir(temp.path());
+        std::fs::create_dir_all(&run).unwrap();
+        let mut registration = Registration {
+            id: "4242-1790000000".into(),
+            pid: 4242,
+            started: 1_790_000_000,
+            socket: run.join("4242.sock"),
+            engine: "codex".into(),
+            workspace: "/work".into(),
+            model: "gpt".into(),
+            mode: "ask".into(),
+            vendor_session: String::new(),
+            journals: vec!["/j/a.jsonl".into()],
+            from_phone: false,
+            tmux: None,
+        };
+        write_registration(&registration, &run).await.unwrap();
+        // A stale temp file is no obstacle, and a rewrite replaces the whole file.
+        std::fs::write(run.join("4242.json.tmp"), "stale").unwrap();
+        registration.mode = "auto".into();
+        registration.vendor_session = "thread-1".into();
+        write_registration(&registration, &run).await.unwrap();
+        assert_eq!(
+            registrations(&run).await,
+            std::slice::from_ref(&registration)
+        );
+        let written = std::fs::read(run.join("4242.json")).unwrap();
+        assert_eq!(written, registration.to_json().to_string().into_bytes());
+        let mode = std::fs::metadata(run.join("4242.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!run.join("4242.json.tmp").exists());
+        // A run directory that is gone is an error, which turns the bridge off.
+        assert!(
+            write_registration(&registration, &run.join("gone"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
