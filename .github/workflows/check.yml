@@ -32,7 +32,7 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: make rust-check
-  # The mobile app: types, lint and tests (apps/mobile).
+  # The mobile app: types, lint and tests, then the iOS and Android bundles (apps/mobile).
   mobile:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -46,6 +46,9 @@ jobs:
           cache: npm
           cache-dependency-path: apps/mobile/package-lock.json
       - run: make mobile-check
+      # Proves both bundles compile (no native build): `make mobile-check` has installed the modules.
+      - run: npm run export:check
+        working-directory: apps/mobile
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 30

@@ -2,6 +2,8 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { renderRouter } from "expo-router/testing-library";
 import * as SecureStore from "expo-secure-store";
+import * as SystemUI from "expo-system-ui";
+import * as ReactNative from "react-native";
 import { AppState, Text } from "react-native";
 
 import RootLayout from "../app/_layout";
@@ -10,6 +12,7 @@ import { FakeClock, Sockets } from "./client/fakes";
 import { HubContext, HubController, TOKEN_KEY, UNPAIRED_NOTICE } from "./hub";
 import { saveSettings } from "./persist";
 import { createOctetStore } from "./store";
+import { dark, light } from "./theme";
 
 jest.mock("expo-camera", () => ({
   CameraView: () => null,
@@ -146,5 +149,23 @@ describe("the app shell", () => {
     expect(screen.getByText("Sessions list")).toBeTruthy();
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
     await waitFor(() => expect(screen.queryByText(UNPAIRED_NOTICE)).toBeNull());
+  });
+
+  describe("the root view behind the screens (Android's, and iOS's under a sheet)", () => {
+    it("takes the dark theme's background", async () => {
+      jest.mocked(SystemUI.setBackgroundColorAsync).mockClear();
+      jest.spyOn(ReactNative, "useColorScheme").mockReturnValue("dark");
+      await launch();
+      await screen.findByText("Pair with your Mac");
+      expect(SystemUI.setBackgroundColorAsync).toHaveBeenLastCalledWith(dark.bg);
+    });
+
+    it("takes the light theme's background", async () => {
+      jest.mocked(SystemUI.setBackgroundColorAsync).mockClear();
+      jest.spyOn(ReactNative, "useColorScheme").mockReturnValue("light");
+      await launch();
+      await screen.findByText("Pair with your Mac");
+      expect(SystemUI.setBackgroundColorAsync).toHaveBeenLastCalledWith(light.bg);
+    });
   });
 });

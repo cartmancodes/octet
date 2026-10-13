@@ -6,12 +6,14 @@
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
+    "backgroundColor": "#161113",
     "ios": {
       "bundleIdentifier": "dev.octet.mobile",
       "supportsTablet": false
     },
     "android": {
-      "package": "dev.octet.mobile"
+      "package": "dev.octet.mobile",
+      "backgroundColor": "#161113"
     },
     "plugins": [
       "expo-router",

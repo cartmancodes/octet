@@ -64,8 +64,11 @@ eas build --profile development --platform ios
 ```
 
 `eas build` asks to create the `development` profile (`eas.json`) on first use: choose a
-development client for devices. Install the build on your phone from the link EAS gives you
-(register the phone first when asked), then run `npx expo start` and open it from the app.
+development client for devices. A development profile also needs `expo-dev-client`, which the
+project does not include: `eas build --profile development` asks to install it, and whether to is
+your choice (it adds the dev menu and launcher to that build). Install the build on your phone
+from the link EAS gives you (register the phone first when asked), then run `npx expo start` and
+open it from the app.
 
 ### Android
 

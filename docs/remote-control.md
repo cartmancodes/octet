@@ -349,7 +349,9 @@ session: a session started from the phone runs in tmux (`tmux attach -t
 octet-NAME`), and one started at the desk shows up on the phone.
 
 You need the Mac side of Tailscale (step 3), and `tmux` if the phone should
-start sessions (step 1). The phone app itself is a separate download and
+start sessions (step 1). The phone app is not in any app store: you build it
+from source and install it on your phone yourself, as
+[its README](../apps/mobile/README.md#building-the-app-for-a-phone) describes. It
 needs no SSH setup.
 
 The app is an Expo (React Native) project in

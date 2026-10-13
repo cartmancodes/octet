@@ -18,7 +18,8 @@ jest.mock("expo-secure-store", () => {
 });
 
 // FlashList 2 measures its parent and rows through native layout, which a test renderer cannot do.
-// (Its own `jestSetup` still points at a component that FlashList 2 no longer exports.)
+// (Its own `jestSetup` still points at a component that FlashList 2 no longer exports.) The path
+// is private to FlashList: src/flashListMock.test.tsx fails by name if an upgrade moves it.
 jest.mock("@shopify/flash-list/dist/recyclerview/utils/measureLayout", () => ({
   ...jest.requireActual("@shopify/flash-list/dist/recyclerview/utils/measureLayout"),
   measureParentSize: jest.fn(() => ({ x: 0, y: 0, width: 400, height: 900 })),
@@ -38,4 +39,10 @@ jest.mock("expo-haptics", () => ({
   NotificationFeedbackType: { Success: "success", Warning: "warning", Error: "error" },
   impactAsync: jest.fn(async () => undefined),
   notificationAsync: jest.fn(async () => undefined),
+}));
+
+// The root view's colour is native; the layout sets it from the theme.
+jest.mock("expo-system-ui", () => ({
+  setBackgroundColorAsync: jest.fn(async (_color: string | null) => undefined),
+  getBackgroundColorAsync: jest.fn(async () => null),
 }));

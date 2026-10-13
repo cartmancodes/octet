@@ -1,5 +1,6 @@
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
+import * as SystemUI from "expo-system-ui";
 import { useEffect } from "react";
 import { AppState, View } from "react-native";
 
@@ -28,6 +29,12 @@ export default function RootLayout() {
     void hub.init();
     return () => subscription.remove();
   }, [hub]);
+
+  // The native root view, behind every screen (Android's window, iOS's under a sheet as it
+  // slides): app.json paints it dark before JavaScript runs; from here it follows the theme.
+  useEffect(() => {
+    SystemUI.setBackgroundColorAsync(theme.bg).catch(() => undefined);
+  }, [theme.bg]);
 
   if (status === "loading") return <View style={{ flex: 1, backgroundColor: theme.bg }} />;
 
