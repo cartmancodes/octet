@@ -261,6 +261,18 @@ describe("the Session screen", () => {
       expect(screen.queryByRole("button", { name: "New output below" })).toBeNull();
     });
 
+    it("keeps following at the entry limit, when a new entry is shorter than the old one dropped above", async () => {
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), ev({ type: "user", data: "go" }), ev({ type: "text", data: "one" }));
+      await grew(3_000);
+      const spy = scrollToEnd();
+      await feed(rig, ev({ type: "notice", data: "a short new row" }));
+      await grew(2_750); // the dropped row was taller: the content shrank
+      expect(spy).toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: "New output below" })).toBeNull();
+    });
+
     it("stays put when the user scrolled up, offers New output below, and the pill scrolls down", async () => {
       const rig = await launch([info("a")]);
       await open(rig, "a");

@@ -1,8 +1,9 @@
 // Sticking a transcript to its bottom while output streams, unless the user scrolled up.
 //
 // The list follows the output until the user drags it away from the bottom; while it follows,
-// every growth of the content (a new row, or a streaming row getting taller, reported by the
-// scroll view's onContentSizeChange after layout) scrolls to the end without animation. Scrolled
+// every change of the content's size (a new row, a streaming row getting taller, or an old row
+// dropped at the entry limit, reported by the scroll view's onContentSizeChange after layout)
+// scrolls to the end without animation. Scrolled
 // up, nothing moves. Only new output shows the "New output below" pill: the list's last entry
 // changed (a new one, or the streaming one grew). Content that merely got taller (a group
 // opened, FlashList replacing estimated sizes with measured ones) does not. The pill, or the
@@ -72,11 +73,14 @@ export function useFollow(list: RefObject<Scrollable | null>, last: unknown): Fo
     touching.current = false;
   }, []);
 
+  // Any change, not only growth: at the entry limit each new row drops one above, and when that
+  // one was taller the content shrinks with the new row below the view. Scrolling to the end of
+  // a shorter list is harmless.
   const onContentSizeChange = useCallback(
     (_width: number, h: number) => {
-      const grew = h > height.current;
+      const changed = h !== height.current;
       height.current = h;
-      if (grew && following.current) toEnd(false);
+      if (changed && following.current) toEnd(false);
     },
     [toEnd],
   );
