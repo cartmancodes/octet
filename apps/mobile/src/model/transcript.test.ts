@@ -3,7 +3,9 @@ import { utf8Length } from "../client/frames";
 import {
   BLOCK_BYTES,
   BLOCK_SLACK,
+  CALL_BYTES,
   EARLIER,
+  MAX_CALLS,
   EMPTY_TRANSCRIPT,
   MAX_ENTRIES,
   apply,
@@ -117,6 +119,61 @@ describe("grouping tools", () => {
       expect(tools(last(t)).over).toBe(true);
       expect(tools(last(t)).calls[0]?.phase).toBe("running");
     }
+  });
+
+  it("charges every call a fixed 256 bytes, so a call of empty strings is not free", () => {
+    expect(CALL_BYTES).toBe(256);
+    const t = run([tool("1", "", "", "running"), tool("2", "Read", "a.rs", "done", "ok")]);
+    expect(t.bytes).toBe(2 * CALL_BYTES + utf8Length("Reada.rsok"));
+    expect(t.bytes).toBe(measured(t));
+    // An end replaces its call: still charged once.
+    expect(run([tool("1", "", "", "running"), tool("1", "", "", "done")]).bytes).toBe(CALL_BYTES);
+  });
+
+  it("holds at most 500 calls in an entry, and counts the rest as on the Mac", () => {
+    expect(MAX_CALLS).toBe(500);
+    const events: KnownJournalEvent[] = [started];
+    for (let i = 0; i < 700; i++) events.push(tool(`c${i}`, "Read", `f${i}`, "running"), tool(`c${i}`, "Read", "", "done"));
+    events.push(tool("", "Bash", "ls", "done")); // an unpaired call over the cap counts too
+    const t = applyAll(EMPTY_TRANSCRIPT, events);
+    expect(kinds(t)).toEqual(["tools"]);
+    const entry = tools(last(t));
+    expect(entry.calls).toHaveLength(500);
+    expect(entry.calls.every((c) => c.phase === "done")).toBe(true);
+    expect(entry.more).toBe(201); // each hidden call once: its start, not its end
+    expect(t.bytes).toBe(measured(t));
+    // The next turn starts an entry of its own, with room again.
+    const next = applyAll(t, [finished, started, tool("n", "Bash", "ls", "running")]);
+    expect(kinds(next)).toEqual(["tools", "tools"]);
+    expect(tools(last(next)).calls).toHaveLength(1);
+    expect(tools(last(next)).more ?? 0).toBe(0);
+  });
+
+  it("takes a hostile 20,000 empty calls in bounded memory and time", () => {
+    const events: KnownJournalEvent[] = [started];
+    for (let i = 0; i < 20_000; i++) events.push(tool(`c${i}`, "", "", "running"), tool(`c${i}`, "", "", "done"));
+    const began = performance.now();
+    let t = EMPTY_TRANSCRIPT;
+    for (let i = 0; i < events.length; i += 200) t = applyAll(t, events.slice(i, i + 200));
+    const took = performance.now() - began;
+    const stored = t.entries.reduce((n, e) => n + (e.kind === "tools" ? e.calls.length : 0), 0);
+    expect(stored).toBeLessThanOrEqual(MAX_CALLS);
+    expect(t.bytes).toBe(stored * CALL_BYTES);
+    expect(took).toBeLessThan(1_000);
+  });
+
+  it("finds an end's call by its id however many calls the turn has", () => {
+    const events: KnownJournalEvent[] = [started];
+    for (let i = 0; i < 400; i++) events.push(tool(`c${i}`, "Read", `f${i}`, "running"));
+    events.push(text("between"));
+    for (let i = 400; i < 800; i++) events.push(tool(`c${i}`, "Read", `f${i}`, "running"));
+    for (let i = 0; i < 800; i++) events.push(tool(`c${i}`, "Read", "", "done", `${i}`));
+    const t = applyAll(EMPTY_TRANSCRIPT, events);
+    expect(kinds(t)).toEqual(["tools", "reply", "tools"]);
+    const all = t.entries.flatMap((e) => (e.kind === "tools" ? e.calls : []));
+    expect(all).toHaveLength(800);
+    expect(all.every((c, i) => c.phase === "done" && c.detail === `${i}` && c.target === `f${i}`)).toBe(true);
+    expect(t.bytes).toBe(measured(t));
   });
 
   it("keeps the earlier turn's entries over and marks only this turn's", () => {

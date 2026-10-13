@@ -94,6 +94,9 @@ function detail(text: string, keep?: number): { lines: string[]; more: number } 
   return { lines: all.slice(skip), more: skip };
 }
 
+/** The text of a count of calls a tools entry does not hold (past `MAX_CALLS`). */
+export const moreCalls = (n: number): string => `${n} more calls on the Mac`;
+
 /** The text of a count of hidden lines. */
 export const moreLines = (n: number): string => `+${n} more lines`;
 

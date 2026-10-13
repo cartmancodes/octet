@@ -2,7 +2,7 @@ import { memo, useCallback, useMemo } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { Entry } from "../model/transcript";
-import { callRows, moreLines, summary, toolRows, type ToolRow } from "../model/summary";
+import { callRows, moreCalls, moreLines, summary, toolRows, type ToolRow } from "../model/summary";
 import { dark, light, spacing, type, useTheme, type Theme } from "../theme";
 
 export type ToolsEntry = Extract<Entry, { kind: "tools" }>;
@@ -48,6 +48,7 @@ function spoken(entry: ToolsEntry, open: boolean): string {
     `Tools: ${summary(entry.calls)}`,
     failed > 0 ? `${failed} failed` : "",
     running > 0 ? (entry.over ? `${running} stopped` : `${running} running`) : "",
+    (entry.more ?? 0) > 0 ? moreCalls(entry.more ?? 0) : "",
     open ? "hide details" : "show details",
   ]
     .filter((x) => x !== "")
@@ -78,6 +79,7 @@ export const ToolRun = memo(function ToolRun({ entry, open, onToggle }: ToolRunP
       style={s.run}
     >
       <Rows rows={rows} s={s} />
+      {(entry.more ?? 0) > 0 ? <Text style={s.head}>{moreCalls(entry.more ?? 0)}</Text> : null}
     </Pressable>
   );
 });

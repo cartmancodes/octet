@@ -12,7 +12,8 @@ export { EARLIER };
 export type Entry =
   | { kind: "user"; key: string; text: string }
   | { kind: "reply"; key: string; text: string; done: boolean }
-  | { kind: "tools"; key: string; calls: ToolCall[]; over: boolean }
+  /** `more`: calls past `MAX_CALLS` this entry does not hold; only the Mac has them. */
+  | { kind: "tools"; key: string; calls: ToolCall[]; over: boolean; more?: number }
   | { kind: "note" | "error"; key: string; text: string };
 
 export interface Transcript {
@@ -26,9 +27,20 @@ export interface Transcript {
   /** The bytes of the newest entry when it is an open reply or an open tools entry, so a stream
    * of records never counts it again. */
   tail: number;
+  /** Where each call of the open turn is, by its id: an end finds its call at once, however many
+   * calls the turn has. Forgotten when the turn is over. */
+  calls: ReadonlyMap<string, CallAt>;
 }
 
-export const EMPTY_TRANSCRIPT: Transcript = { entries: [], bytes: 0, next: 1, esc: TEXT, tail: 0 };
+/** A call's place: its entry's key (as a number) and its index in that entry's calls. */
+interface CallAt {
+  key: number;
+  at: number;
+}
+
+const NO_CALLS: ReadonlyMap<string, CallAt> = new Map();
+
+export const EMPTY_TRANSCRIPT: Transcript = { entries: [], bytes: 0, next: 1, esc: TEXT, tail: 0, calls: NO_CALLS };
 
 /** A tools entry closes, and a reply is trimmed back to, this many bytes. */
 export const BLOCK_BYTES = 64 * 1024;
@@ -40,6 +52,10 @@ export const MAX_ENTRIES = 1_000;
 export const MAX_BYTES = 4 * 1024 * 1024;
 /** The most one entry holds, however its calls come: a paired end is cut to what is left. */
 export const ENTRY_BYTES = 200_000;
+/** What a call costs on top of its strings, so that calls of empty strings are not free. */
+export const CALL_BYTES = 256;
+/** Calls one tools entry holds; past it a call is only counted, in `more`. */
+export const MAX_CALLS = 500;
 /** Entries dropped that wait before they are cut off. */
 const COMPACT_AT = 256;
 /** The longest tool name, and target, kept. */
@@ -48,7 +64,7 @@ const TARGET_BYTES = 4 * 1024;
 /** A text record is cut to its last 4 × `BLOCK_BYTES` characters before it is scanned. */
 const NOTE_BYTES = 8 * 1024;
 
-const callBytes = (c: ToolCall): number => utf8Length(c.name) + utf8Length(c.target) + utf8Length(c.detail);
+const callBytes = (c: ToolCall): number => CALL_BYTES + utf8Length(c.name) + utf8Length(c.target) + utf8Length(c.detail);
 
 /** Bytes an entry holds, for the transcript's limit. */
 export function entrySize(e: Entry): number {
@@ -115,7 +131,12 @@ export class TranscriptDraft {
   private next: number;
   private esc: Esc;
   private tail: number;
+  private calls: ReadonlyMap<string, CallAt>;
   private owned = false;
+  /** `calls` is this draft's own copy. */
+  private ownedCalls = false;
+  /** Calls arrays this draft made, written in place by later events of the batch. */
+  private readonly ownArrays = new Set<ToolCall[]>();
   private changed = false;
   /** Entries before this index were dropped, and are cut off in bulk. */
   private head = 0;
@@ -126,12 +147,13 @@ export class TranscriptDraft {
     this.next = base.next;
     this.esc = base.esc;
     this.tail = base.tail;
+    this.calls = base.calls;
   }
 
   finish(): Transcript {
     if (!this.changed) return this.base;
     this.compact();
-    return { entries: this.entries, bytes: this.bytes, next: this.next, esc: this.esc, tail: this.tail };
+    return { entries: this.entries, bytes: this.bytes, next: this.next, esc: this.esc, tail: this.tail, calls: this.calls };
   }
 
   apply(ev: KnownJournalEvent): void {
@@ -264,49 +286,76 @@ export class TranscriptDraft {
     this.trim();
   }
 
+  /** The open turn's calls, this draft's own to write. */
+  private callMap(): Map<string, CallAt> {
+    if (!this.ownedCalls) {
+      this.calls = new Map(this.calls);
+      this.ownedCalls = true;
+    }
+    this.changed = true;
+    return this.calls as Map<string, CallAt>;
+  }
+
+  /** The index of the live entry with key `key`: keys go up by one from entry to entry. */
+  private indexOf(key: number): number {
+    const first = this.entries[0];
+    if (first === undefined) return -1;
+    const i = key - Number(first.key);
+    return i >= this.head && i < this.entries.length && this.entries[i]?.key === String(key) ? i : -1;
+  }
+
   /** An end goes to the current turn's call with its ID, wherever other entries put it; any
-   * other call joins the newest entry when that is an open tools entry under `BLOCK_BYTES`,
-   * else starts one. */
+   * other call joins the newest entry when that is an open tools entry with under `BLOCK_BYTES`
+   * of text, else starts one. An entry holds `MAX_CALLS`: past it a call is counted, not kept. */
   private tool(data: unknown): void {
     const made = toCall(data);
     if (!made) return;
     const { id, phase } = made;
     let index = -1;
-    if (phase !== "running" && id !== "") {
-      for (let i = this.entries.length - 1; i >= this.head; i--) {
-        const e = this.entries[i];
-        if (e?.kind !== "tools") continue;
-        if (e.over) break; // the entries before it are over too
-        if (e.calls.some((c) => c.id === id)) {
-          index = i;
-          break;
-        }
-      }
+    let at = -1;
+    const found = id === "" ? undefined : this.calls.get(id);
+    if (found && phase !== "running") {
+      index = this.indexOf(found.key);
+      at = index >= 0 ? found.at : -1;
     }
     if (index < 0) {
       const back = this.entries[this.entries.length - 1];
-      if (back?.kind !== "tools" || back.over || this.tail > BLOCK_BYTES) {
+      if (back?.kind !== "tools" || back.over || this.tail - back.calls.length * CALL_BYTES > BLOCK_BYTES) {
         this.push({ kind: "tools", key: this.key(), calls: [], over: false }, 0);
       }
       index = this.entries.length - 1;
     }
     const entry = this.entries[index];
     if (entry?.kind !== "tools") return;
+    if (at < 0 && entry.calls.length >= MAX_CALLS) {
+      // Kept on the Mac only. A call is counted once, at its start: an end with no call here is
+      // most likely one of these, so it counts nothing (an unpaired call has no end to come).
+      if (phase === "running" || id === "") this.own()[index] = { ...entry, more: (entry.more ?? 0) + 1 };
+      return;
+    }
     // A call with an ID replaces the one with that ID, keeping the start's target when the end has none.
-    const at = id === "" ? -1 : entry.calls.findIndex((c) => c.id === id);
     const old = at >= 0 ? entry.calls[at] : undefined;
     const target: Clipped =
       old && made.target.text === "" ? { text: old.target, bytes: utf8Length(old.target) } : made.target;
     // An entry holds ENTRY_BYTES at most, however its calls arrive: the detail gets what is left.
     const size = index === this.entries.length - 1 ? this.tail : entrySize(entry);
     const oldBytes = old ? callBytes(old) : 0;
-    const room = ENTRY_BYTES - (size - oldBytes) - made.name.bytes - target.bytes;
+    const room = ENTRY_BYTES - (size - oldBytes) - CALL_BYTES - made.name.bytes - target.bytes;
     const detail = fit(made.detail, Math.min(BLOCK_BYTES, room));
     const call: ToolCall = { id, name: made.name.text, target: target.text, phase, detail: detail.text };
-    const bytes = made.name.bytes + target.bytes + detail.bytes;
-    const calls = entry.calls.slice();
+    const bytes = CALL_BYTES + made.name.bytes + target.bytes + detail.bytes;
+    // The calls array is copied once per batch, then written in place: an event costs the same
+    // however many calls the entry holds.
+    let calls = entry.calls;
+    if (!this.ownArrays.has(calls)) {
+      calls = calls.slice();
+      this.ownArrays.add(calls);
+    }
     if (old) calls[at] = call;
-    else calls.push(call);
+    else {
+      calls.push(call);
+      if (id !== "") this.callMap().set(id, { key: Number(entry.key), at: calls.length - 1 });
+    }
     this.own()[index] = { ...entry, calls };
     this.bytes += bytes - oldBytes;
     if (index === this.entries.length - 1) this.tail += bytes - oldBytes;
@@ -320,6 +369,11 @@ export class TranscriptDraft {
       if (e?.kind !== "tools") continue;
       if (e.over) break; // the entries before it are over too
       this.own()[i] = { ...e, over: true };
+    }
+    if (this.calls.size > 0) {
+      this.calls = NO_CALLS;
+      this.ownedCalls = false;
+      this.changed = true;
     }
     this.closeReply();
   }
