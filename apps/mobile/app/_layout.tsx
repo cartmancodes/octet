@@ -6,7 +6,7 @@ import { useEffect, useRef } from "react";
 import { AppState, View } from "react-native";
 
 import { useHubController, useHubSnapshot } from "../src/hub";
-import { configureNotifications, watchTaps } from "../src/notifications";
+import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
 import { useTheme } from "../src/theme";
 
 // The native splash stays up until the app knows whether it is paired; app.json paints it in the
@@ -27,11 +27,14 @@ export default function RootLayout() {
   useEffect(() => {
     // The socket and its timers live only while the app is in the foreground. `inactive` is a
     // pause (a Face ID prompt, the app switcher), not the background. A launch that reports no
-    // state yet counts as foreground.
+    // state yet counts as foreground. Back in the app, the notifications in the tray are old
+    // news: the screens show the live state.
     hub.setForeground(AppState.currentState !== "background");
     const subscription = AppState.addEventListener("change", (state) => {
-      if (state === "active") hub.setForeground(true);
-      else if (state === "background") hub.setForeground(false);
+      if (state === "active") {
+        hub.setForeground(true);
+        void clearDelivered();
+      } else if (state === "background") hub.setForeground(false);
     });
     void hub.init();
     return () => subscription.remove();

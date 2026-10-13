@@ -13,7 +13,7 @@ import { radius, spacing, type, useTheme } from "../src/theme";
 const TURN_OFF_REASON = "Turn off Face ID for allowing";
 export const UNPAIR_TITLE = "Unpair this phone?";
 export const UNPAIR_BODY =
-  "You'll need a new pairing code from the Mac. The Mac keeps listing this phone until you run `octet hub revoke <name>` there.";
+  "You'll need a new pairing code from the Mac. Notifications to this phone stop. The Mac keeps listing this phone until you run `octet hub revoke <name>` there.";
 
 /** This phone's settings: where it is paired, whether Allow asks for Face ID, and Unpair. */
 export default function Settings() {

@@ -146,7 +146,7 @@ describe("Settings", () => {
       expect(alert).toHaveBeenCalledTimes(1);
       expect(alert.mock.calls[0]?.[0]).toBe("Unpair this phone?");
       expect(alert.mock.calls[0]?.[1]).toBe(
-        "You'll need a new pairing code from the Mac. The Mac keeps listing this phone until you run `octet hub revoke <name>` there.",
+        "You'll need a new pairing code from the Mac. Notifications to this phone stop. The Mac keeps listing this phone until you run `octet hub revoke <name>` there.",
       );
       expect(buttons(alert).map((b) => [b.text, b.style])).toEqual([
         ["Cancel", "cancel"],

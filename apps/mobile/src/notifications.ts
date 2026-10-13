@@ -16,6 +16,9 @@ const PUSH_TOKEN = /^Expo(nent)?PushToken\[[A-Za-z0-9_-]{1,200}\]$/;
 const SESSION_ID = /^[0-9]+-[0-9]+$/;
 /** No id the hub makes is longer; a tap's data comes from outside the app. */
 const SESSION_ID_CHARS = 128;
+/** How long a push token fetch may take. It can hang (no network to Expo, or to Apple or
+ * Google), and push work runs one job at a time, so a hung fetch would hold every later one. */
+const TOKEN_WAIT_MS = 15_000;
 
 /** The app's EAS project id, from its config; null when it has none. Never made up: push tokens
  * belong to the project that built the app. */
@@ -65,11 +68,18 @@ export async function configureNotifications(): Promise<void> {
 export type PushToken = { ok: true; token: string } | { ok: false; message: string };
 
 async function tokenFor(id: string): Promise<PushToken> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), TOKEN_WAIT_MS);
+  });
   try {
-    const { data } = await Notifications.getExpoPushTokenAsync({ projectId: id });
-    return PUSH_TOKEN.test(data) ? { ok: true, token: data } : { ok: false, message: FAILED };
+    const got = await Promise.race([Notifications.getExpoPushTokenAsync({ projectId: id }), late]);
+    if (got === null) return { ok: false, message: FAILED };
+    return PUSH_TOKEN.test(got.data) ? { ok: true, token: got.data } : { ok: false, message: FAILED };
   } catch {
     return { ok: false, message: FAILED };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -98,6 +108,27 @@ export async function currentToken(): Promise<PushToken> {
     return { ok: false, message: FAILED };
   }
   return tokenFor(id);
+}
+
+/** Best effort: this phone stops receiving pushes for the app, so Expo reports its token as gone
+ * (`DeviceNotRegistered`) and the hub drops it. For an unpair the Mac did not hear. A later
+ * turn-on registers again. */
+export async function dropPushRegistration(): Promise<void> {
+  try {
+    await Notifications.unregisterForNotificationsAsync();
+  } catch {
+    // Nothing more can be done from here; revoking on the Mac drops the token there.
+  }
+}
+
+/** Best effort: removes the app's notifications from the tray. The app shows the live state once
+ * it is open, so what they said is old news. */
+export async function clearDelivered(): Promise<void> {
+  try {
+    await Notifications.dismissAllNotificationsAsync();
+  } catch {
+    // They stay in the tray; nothing depends on them.
+  }
 }
 
 /** Calls `fn` when the phone's push token rotates; returns the stop. */

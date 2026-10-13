@@ -408,9 +408,17 @@ run("the app's hub client against the real octet hub", () => {
     }
     await sleep(3500);
     expect(pushFake?.bodies).toHaveLength(1);
-    // The token is in neither the hub's output nor its audit file.
+    // The token is in neither the hub's output nor its audit file. The audit file is the one the
+    // hub writes: it holds this run's prompt and the push registration, so the check is not
+    // passed by an empty or other file.
     expect(hubLog).not.toContain(PUSH_TOKEN);
-    expect(readFileSync(path.join(root, "hub-audit.jsonl"), "utf8")).not.toContain(PUSH_TOKEN);
+    const audit = readFileSync(path.join(root, "hub-audit.jsonl"), "utf8");
+    const whats = audit
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => (JSON.parse(line) as { what?: unknown }).what);
+    expect(whats).toEqual(expect.arrayContaining(["prompt", "push on"]));
+    expect(audit).not.toContain(PUSH_TOKEN);
   });
 
   it("turns notifications off", async () => {

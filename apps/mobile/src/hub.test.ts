@@ -620,10 +620,33 @@ describe("registering for push", () => {
     expect(subscription.remove).toHaveBeenCalled();
   });
 
-  it("with the permission revoked in the phone's settings sends nothing and says so on Settings", async () => {
+  it("with the permission revoked in the phone's settings tells the Mac to stop, stays on, and says so on Settings", async () => {
     n.getPermissionsAsync.mockResolvedValueOnce({ granted: false, canAskAgain: false, status: "denied" } as never);
     const r = await readyWithPush();
-    expect(registrations(r)).toHaveLength(0);
+    // The Mac would go on pushing to a phone that shows nothing: it is told "no token".
+    expect(registrations(r)).toEqual([expect.objectContaining({ type: "register_push", token: null })]);
+    expect(n.getExpoPushTokenAsync).not.toHaveBeenCalled();
+    answer(r, "Notifications off");
+    await settle();
+    expect(r.hub.snapshot().pushNotice).toBe("Notifications are off for Octet in the phone's settings.");
+    // The setting stays on, so that a permission given back registers again on the next ready.
+    expect((await loadSettings()).notifications).toBe(true);
+    r.sockets.last.drop();
+    r.clock.advance(500);
+    r.sockets.last.open();
+    r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    await settle();
+    expect(registrations(r).map((c) => c.token)).toEqual([null, PUSH]);
+    answer(r);
+    await settle();
+    expect(r.hub.snapshot().pushNotice).toBeNull();
+  });
+
+  it("with the permission revoked and the Mac refusing the stop, still says why on Settings", async () => {
+    n.getPermissionsAsync.mockResolvedValueOnce({ granted: false, canAskAgain: false, status: "denied" } as never);
+    const r = await readyWithPush();
+    r.sockets.last.receive({ type: "refused", req: registrations(r)[0]?.req, code: "invalid", reason: "No" });
+    await settle();
     expect(r.hub.snapshot().pushNotice).toBe("Notifications are off for Octet in the phone's settings.");
   });
 
@@ -824,21 +847,27 @@ describe("unpair and push", () => {
     await settle();
     expect(socket.closed).toBe(true);
     expect((await loadSettings()).notifications).toBe(false);
+    // The Mac heard it, so the phone keeps its registration with the push service.
+    expect(n.unregisterForNotificationsAsync).not.toHaveBeenCalled();
   });
 
-  it("closes the connection after 2 s if the Mac never answers", async () => {
+  it("closes the connection after 2 s if the Mac never answers, and drops the push registration", async () => {
     const r = await readyWithPush();
     answer(r);
     const socket = r.sockets.last;
     await r.hub.unpair();
     r.clock.advance(1_999);
     expect(socket.closed).toBe(false);
+    expect(n.unregisterForNotificationsAsync).not.toHaveBeenCalled();
     r.clock.advance(1);
+    await settle();
     expect(socket.closed).toBe(true);
     expect(r.clock.pending).toBe(0);
+    // Expo then reports the token as gone, and the hub drops it.
+    expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
   });
 
-  it("a refused goodbye changes nothing: it still unpairs", async () => {
+  it("a refused goodbye changes nothing: it still unpairs, and drops the push registration", async () => {
     const r = await readyWithPush();
     answer(r);
     await r.hub.unpair();
@@ -848,16 +877,30 @@ describe("unpair and push", () => {
     expect(r.sockets.last.closed).toBe(true);
     expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null });
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
   });
 
-  it("with the link down there is nothing to send: it closes at once", async () => {
+  it("with the link down there is nothing to send: it closes at once and drops the push registration", async () => {
     const r = await readyWithPush();
     answer(r);
     r.sockets.last.drop();
     const socket = r.sockets.last;
     await r.hub.unpair();
+    await settle();
     expect(socket.commandsOf("register_push").filter((c) => c.token === null)).toHaveLength(0);
     expect(r.hub.snapshot().status).toBe("unpaired");
+    expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it("a push registration that will not drop is no failure: it still unpairs, quietly", async () => {
+    n.unregisterForNotificationsAsync.mockRejectedValueOnce(new Error("no native module"));
+    const r = await readyWithPush();
+    answer(r);
+    r.sockets.last.drop();
+    await r.hub.unpair();
+    await settle();
+    expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
+    expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null });
   });
 
   it("the Mac's goodbye does not feed the store, and a new pairing is not held up", async () => {
@@ -916,6 +959,40 @@ describe("push operations run one at a time", () => {
     giveToken({ type: "expo", data: PUSH });
     await settle();
     expect(registrations(r)).toHaveLength(0);
+  });
+});
+
+describe("a push token that never comes", () => {
+  afterEach(() => jest.useRealTimers());
+
+  it("turning on gives up after 15 s with the usual words, so the switch is free again", async () => {
+    const r = await readyWithPush(false);
+    jest.useFakeTimers();
+    n.getExpoPushTokenAsync.mockReturnValue(new Promise(() => {}) as never);
+    let result: unknown;
+    void r.hub.turnOnNotifications().then((value) => (result = value));
+    await jest.advanceTimersByTimeAsync(14_999);
+    expect(result).toBeUndefined();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(result).toEqual({ ok: false, message: "Couldn't turn on notifications. Try again." });
+    expect(registrations(r)).toHaveLength(0);
+    expect((await loadSettings()).notifications).toBe(false);
+  });
+
+  it("a fetch that hangs at ready does not hold up a later turn-off", async () => {
+    jest.useFakeTimers();
+    n.getExpoPushTokenAsync.mockReturnValueOnce(new Promise(() => {}) as never);
+    const r = await readyWithPush();
+    let result: unknown;
+    void r.hub.turnOffNotifications().then((value) => (result = value));
+    await settle();
+    expect(registrations(r)).toHaveLength(0); // waiting its turn behind the hung fetch
+    await jest.advanceTimersByTimeAsync(15_000);
+    expect(registrations(r).map((c) => c.token)).toEqual([null]);
+    answer(r, "Notifications off");
+    await jest.advanceTimersByTimeAsync(0);
+    expect(result).toEqual({ ok: true });
+    expect((await loadSettings()).notifications).toBe(false);
   });
 });
 

@@ -148,6 +148,24 @@ describe("the app shell", () => {
     expect(sockets.last.closed).toBe(false);
   });
 
+  it("clears the notifications it left in the tray each time the app comes to the foreground", async () => {
+    const { sockets } = await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    connected({ sockets });
+    n.dismissAllNotificationsAsync.mockClear();
+    await act(async () => changeAppState("inactive"));
+    await act(async () => changeAppState("background"));
+    expect(n.dismissAllNotificationsAsync).not.toHaveBeenCalled();
+    await act(async () => changeAppState("active"));
+    expect(n.dismissAllNotificationsAsync).toHaveBeenCalledTimes(1);
+    // One that cannot be cleared is no reason to stop: the app still connects.
+    n.dismissAllNotificationsAsync.mockRejectedValueOnce(new Error("no native module"));
+    await act(async () => changeAppState("background"));
+    await act(async () => changeAppState("active"));
+    expect(n.dismissAllNotificationsAsync).toHaveBeenCalledTimes(2);
+    expect(sockets.last.closed).toBe(false);
+  });
+
   it("revoked_unpairs: the Mac revoking the phone deletes the token and shows Pair with the reason", async () => {
     const { sockets } = await launch({ paired: true });
     await screen.findByText("Sessions list");

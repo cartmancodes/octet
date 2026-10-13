@@ -73,6 +73,23 @@ describe("turning on", () => {
     expect(n.getExpoPushTokenAsync).not.toHaveBeenCalled();
   });
 
+  it("gives up on a token fetch after 15 s, and one that answers leaves no timer behind", async () => {
+    jest.useFakeTimers();
+    try {
+      await expect(askForToken()).resolves.toMatchObject({ ok: true });
+      expect(jest.getTimerCount()).toBe(0);
+      n.getExpoPushTokenAsync.mockReturnValueOnce(new Promise(() => {}) as never);
+      let result: unknown;
+      void currentToken().then((value) => (result = value));
+      await jest.advanceTimersByTimeAsync(14_999);
+      expect(result).toBeUndefined();
+      await jest.advanceTimersByTimeAsync(1);
+      expect(result).toEqual({ ok: false, message: "Couldn't turn on notifications. Try again." });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it("says so when the token cannot be had", async () => {
     n.getExpoPushTokenAsync.mockRejectedValueOnce(new Error("offline"));
     await expect(askForToken()).resolves.toEqual({ ok: false, message: "Couldn't turn on notifications. Try again." });

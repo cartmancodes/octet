@@ -8,7 +8,7 @@ import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from ".
 import { isHubUrl, parsePairLink } from "./client/link";
 import { webSocketFactory } from "./client/socket";
 import { NOT_SAVED, loadSettings, saveSettings } from "./persist";
-import { askForToken, currentToken, onTokenChange, projectId } from "./notifications";
+import { DENIED, askForToken, currentToken, dropPushRegistration, onTokenChange, projectId } from "./notifications";
 import { connectStore, octetStore, type OctetStore } from "./store";
 
 /** The keychain item holding the device token: the only place it is kept. */
@@ -239,18 +239,29 @@ export class HubController {
   }
 
   /** Stops `client`, but first, on a ready link, tells the Mac "notifications off" and keeps the
-   * link until the Mac answers or refuses, or `GOODBYE_MS` pass. Nothing waits on it. */
+   * link until the Mac answers or refuses, or `GOODBYE_MS` pass. Nothing waits on it. If the Mac
+   * did not ack it, the phone drops its push registration instead, so that the Mac's pushes
+   * bounce and it forgets the token. */
   private stopAfterGoodbye(client: HubClient): void {
     if (client.state !== "ready") {
       client.stop();
+      void dropPushRegistration();
       return;
     }
-    const cancel = this.schedule(() => client.stop(), GOODBYE_MS);
-    const done = () => {
+    let finished = false;
+    let cancel = () => {};
+    const finish = (heard: boolean) => {
+      if (finished) return;
+      finished = true;
       cancel();
       client.stop();
+      if (!heard) void dropPushRegistration();
     };
-    client.request({ type: "register_push", token: null }).then(done, done);
+    cancel = this.schedule(() => finish(false), GOODBYE_MS);
+    client.request({ type: "register_push", token: null }).then(
+      () => finish(true),
+      () => finish(false),
+    );
   }
 
   // Notifications
@@ -324,7 +335,9 @@ export class HubController {
 
   /** Registers the current push token with the Mac, if the user turned notifications on. Runs
    * after each ready and on a token rotation. A hub refusal shows on Settings; a link that
-   * dropped is no news, the next ready tries again. */
+   * dropped is no news, the next ready tries again. With the permission taken away in the phone's
+   * settings, the Mac is told "no token" (it would push to a phone that shows nothing) and the
+   * setting stays on, so a permission given back registers again on the next ready. */
   private syncPush(client: HubClient): Promise<void> {
     return this.inTurn(async () => {
       if (!(await loadSettings()).notifications) return;
@@ -333,6 +346,10 @@ export class HubController {
       if (!(await loadSettings()).notifications) return;
       if (client !== this.current.client || client.state !== "ready") return;
       if (!got.ok) {
+        if (got.message === DENIED) {
+          await client.request({ type: "register_push", token: null }).catch(() => undefined);
+          if (client !== this.current.client) return;
+        }
         this.notify(got.message);
         return;
       }

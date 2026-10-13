@@ -131,8 +131,12 @@ Set it up with your own accounts (nothing here creates one):
 4. Build again (`eas build --profile development --platform ios` or `android`) and install it.
 
 Turn it on in the step after pairing or in **Settings**: the app asks the phone for permission,
-then registers its token with the Mac. Turning it off, or unpairing, tells the Mac to stop. Tapping
-a notification opens that session. A push says only `Octet` and `Approval waiting` or `Turn
+then registers its token with the Mac. Turning it off, or unpairing, tells the Mac to stop; an
+unpair the Mac doesn't hear (it is out of reach) drops the phone's push registration instead, so
+the Mac's next push bounces and it forgets the token. Taking the permission away in the phone's
+settings also tells the Mac to stop, on the next connection; give it back and the app registers
+again. Tapping a notification opens that session, and opening the app clears its notifications
+from the tray. A push says only `Octet` and `Approval waiting` or `Turn
 finished`; what the hub sends, where, and when is in [the guide](../../docs/remote-control.md#push-notifications).
 
 ## Device pass
@@ -148,6 +152,9 @@ workspace. Tick each one on each phone.
       closed app).
 - [ ] Allow behind biometrics: the approval needs Face ID or the fingerprint, and the turn goes on.
 - [ ] A finished turn on a locked phone pushes `Turn finished`; with the app open, nothing does.
+- [ ] An approval that arrives with the app open, still waiting when you leave the app: one push.
+- [ ] With `octet hub install`, after a fresh login and no tmux running, start a Claude session
+      from the phone.
 - [ ] Switch from Wi-Fi to cellular mid-turn: the transcript resumes with nothing missing or doubled.
 - [ ] Answer an approval on one phone: it closes on the other phone and on the desk.
 - [ ] Change the model and the mode; full access asks for the typed confirmation.

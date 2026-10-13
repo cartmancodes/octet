@@ -61,6 +61,8 @@ jest.mock("expo-notifications", () => ({
   addNotificationResponseReceivedListener: jest.fn(),
   getLastNotificationResponse: jest.fn(),
   clearLastNotificationResponse: jest.fn(),
+  unregisterForNotificationsAsync: jest.fn(),
+  dismissAllNotificationsAsync: jest.fn(),
 }));
 
 // The splash stays up until the app knows whether it is paired.
@@ -80,6 +82,8 @@ beforeEach(() => {
   n.addPushTokenListener!.mockImplementation(() => ({ remove: jest.fn() }));
   n.addNotificationResponseReceivedListener!.mockImplementation(() => ({ remove: jest.fn() }));
   n.getLastNotificationResponse!.mockReturnValue(null);
+  n.unregisterForNotificationsAsync!.mockResolvedValue(undefined);
+  n.dismissAllNotificationsAsync!.mockResolvedValue(undefined);
   const splash = jest.requireMock("expo-splash-screen") as Record<string, jest.Mock>;
   for (const mock of Object.values(splash)) mock.mockReset();
   splash.preventAutoHideAsync!.mockResolvedValue(true);
