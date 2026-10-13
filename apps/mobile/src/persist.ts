@@ -25,22 +25,33 @@ const MAX_CHARS = 2_048;
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 const text = (x: unknown): string | null => (typeof x === "string" && x.length <= MAX_CHARS ? x : null);
 
-/** The saved settings; each field that is missing or not the right type is its default. */
-export async function loadSettings(): Promise<Settings> {
+/** The saved settings; each field that is missing or not the right type is its default. None
+ * saved is the defaults. `ok: false` when they could not be read, or were garbled: what they hold
+ * is unknown, which is not the same as nothing saved. */
+export async function readSettings(): Promise<{ ok: true; settings: Settings } | { ok: false }> {
   try {
     const raw = await AsyncStorage.getItem(SETTINGS_KEY);
-    if (raw === null) return DEFAULT_SETTINGS;
+    if (raw === null) return { ok: true, settings: DEFAULT_SETTINGS };
     const value: unknown = JSON.parse(raw);
-    if (!isObj(value)) return DEFAULT_SETTINGS;
+    if (!isObj(value)) return { ok: false };
     return {
-      deviceName: text(value.deviceName),
-      faceId: typeof value.faceId === "boolean" ? value.faceId : DEFAULT_SETTINGS.faceId,
-      hubUrl: text(value.hubUrl),
-      notifications: typeof value.notifications === "boolean" ? value.notifications : DEFAULT_SETTINGS.notifications,
+      ok: true,
+      settings: {
+        deviceName: text(value.deviceName),
+        faceId: typeof value.faceId === "boolean" ? value.faceId : DEFAULT_SETTINGS.faceId,
+        hubUrl: text(value.hubUrl),
+        notifications: typeof value.notifications === "boolean" ? value.notifications : DEFAULT_SETTINGS.notifications,
+      },
     };
   } catch {
-    return DEFAULT_SETTINGS;
+    return { ok: false };
   }
+}
+
+/** The saved settings, or the defaults when they cannot be read. */
+export async function loadSettings(): Promise<Settings> {
+  const read = await readSettings();
+  return read.ok ? read.settings : DEFAULT_SETTINGS;
 }
 
 /** Saves wait their turn: a patch reads what the one before wrote. */
@@ -55,7 +66,10 @@ export function saveSettings(patch: Partial<Settings>): Promise<boolean> {
 
 async function write(patch: Partial<Settings>): Promise<boolean> {
   try {
-    const next: Settings = { ...(await loadSettings()), ...patch };
+    // A read that failed would write the defaults over what is saved (the hub address too).
+    const read = await readSettings();
+    if (!read.ok) return false;
+    const next: Settings = { ...read.settings, ...patch };
     await AsyncStorage.setItem(
       SETTINGS_KEY,
       JSON.stringify({

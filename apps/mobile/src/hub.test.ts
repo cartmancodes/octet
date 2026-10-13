@@ -116,6 +116,29 @@ describe("starting", () => {
     expect(r.sockets.all).toHaveLength(1);
   });
 
+  it("keeps a good token when the settings cannot be read once at launch", async () => {
+    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
+    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
+    jest.mocked(AsyncStorage.getItem).mockRejectedValueOnce(new Error("busy"));
+    const first = rig();
+    await first.hub.init();
+    expect(first.hub.snapshot().status).toBe("unpaired");
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+    // The next launch reads them and is paired again, with no new pairing.
+    const second = rig();
+    await second.hub.init();
+    expect(second.hub.snapshot().status).toBe("paired");
+  });
+
+  it("keeps a good token when the saved settings are garbled", async () => {
+    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
+    await AsyncStorage.setItem("octet.settings.v1", "{not json");
+    const r = rig();
+    await r.hub.init();
+    expect(r.hub.snapshot().status).toBe("unpaired");
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+  });
+
   it("is unpaired when the keychain cannot be read", async () => {
     jest.mocked(SecureStore.getItemAsync).mockRejectedValueOnce(new Error("locked"));
     const r = rig();
@@ -189,10 +212,24 @@ describe("pairing", () => {
     const socket = r.sockets.last;
     socket.open();
     const [command] = socket.commandsOf("pair");
-    socket.receive({ type: "refused", req: command?.req, reason: "That pairing code has expired", code: "invalid" });
-    expect(await pending).toEqual({ ok: false, message: "That pairing code has expired", clear: true });
+    socket.receive({ type: "refused", req: command?.req, reason: "A device with that name is already paired", code: "invalid" });
+    // The Mac kept its code: only a spent or expired one (`unpaired`) is no good any more.
+    expect(await pending).toEqual({ ok: false, message: "A device with that name is already paired", clear: false });
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
     expect(r.hub.snapshot().status).toBe("unpaired");
+  });
+
+  it("forgets the link only when the Mac says its code is spent or expired", async () => {
+    for (const [code, clear] of [["unpaired", true], ["invalid", false], ["rate_limited", false], ["busy", false]] as const) {
+      const r = rig();
+      await r.hub.init();
+      const pending = r.hub.pair(LINK, "iPhone");
+      const socket = r.sockets.last;
+      socket.open();
+      const [command] = socket.commandsOf("pair");
+      socket.receive({ type: "refused", req: command?.req, reason: "No", code });
+      expect([code, await pending]).toEqual([code, { ok: false, message: "No", clear }]);
+    }
   });
 
   it("says so when the Mac cannot be reached", async () => {

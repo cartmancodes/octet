@@ -8,7 +8,7 @@ import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from ".
 import { NOT_A_LINK, isHubUrl, pairLinkProblem, parsePairLink } from "./client/link";
 import { webSocketFactory } from "./client/socket";
 import { isDevBuild } from "./build";
-import { NOT_SAVED, loadSettings, saveSettings } from "./persist";
+import { NOT_SAVED, loadSettings, readSettings, saveSettings } from "./persist";
 import { DENIED, askForToken, currentToken, dropPushRegistration, onTokenChange, projectId } from "./notifications";
 import { connectStore, octetStore, type OctetStore } from "./store";
 
@@ -51,8 +51,9 @@ const READY_WAIT_MS = 8_000;
 /** How long unpair leaves the connection open for the Mac to hear "notifications off". */
 const GOODBYE_MS = 2_000;
 
-/** A failed pairing: `clear` says the link is no good any more (the Mac answered, or took the
- * secret), so the screen forgets it; a link that is invalid or never reached the Mac is kept for editing. */
+/** A failed pairing: `clear` says the link is no good any more (the Mac says its code is spent
+ * or expired, or took the secret), so the screen forgets it; any other link is kept, to edit or
+ * to try again. */
 export type PairResult = { ok: true } | { ok: false; message: string; clear: boolean };
 
 export interface TokenStore {
@@ -146,7 +147,14 @@ export class HubController {
   }
 
   private async load(): Promise<void> {
-    const [token, settings] = await Promise.all([this.tokens.load().catch(() => null), loadSettings()]);
+    const [token, read] = await Promise.all([this.tokens.load().catch(() => null), readSettings()]);
+    if (!read.ok) {
+      // Settings that could not be read say nothing of the hub address: the token stays for
+      // the next launch, and this one shows Pair.
+      this.set({ status: "unpaired" });
+      return;
+    }
+    const settings = read.settings;
     this.savedName = settings.deviceName;
     if (token === null || token === "") {
       this.set({ status: "unpaired" });
@@ -194,7 +202,9 @@ export class HubController {
       return { ok: true };
     } catch (error) {
       if (!(error instanceof Refusal)) return { ok: false, message: "Pairing failed", clear: false };
-      return { ok: false, message: error.message, clear: error.code !== "unsent" && error.code !== "lost" };
+      // Only a spent or expired code is refused as `unpaired`; on any other refusal the Mac keeps
+      // the code, and the link is good to try again (another device name, a moment later).
+      return { ok: false, message: error.message, clear: error.code === "unpaired" };
     } finally {
       this.pairing = null;
     }

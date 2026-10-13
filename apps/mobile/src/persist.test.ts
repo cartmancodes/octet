@@ -22,6 +22,13 @@ describe("settings", () => {
     });
   });
 
+  it("a save never writes the defaults over settings it could not read", async () => {
+    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
+    jest.mocked(AsyncStorage.getItem).mockRejectedValueOnce(new Error("busy"));
+    expect(await saveSettings({ faceId: false })).toBe(false);
+    expect(await loadSettings()).toMatchObject({ hubUrl: "wss://mac.tail1234.ts.net/", faceId: true });
+  });
+
   it("fall back to the defaults for junk", async () => {
     for (const junk of ["not json", "[]", "null", JSON.stringify({ deviceName: 5, faceId: "yes", hubUrl: { a: 1 } })]) {
       await AsyncStorage.setItem(SETTINGS_KEY, junk);

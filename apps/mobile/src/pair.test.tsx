@@ -176,13 +176,13 @@ describe("the Pair screen", () => {
     expect(sockets.all).toHaveLength(0);
   });
 
-  it("after a refusal the link and the scan are forgotten, and the same code asks again", async () => {
+  it("after a spent code's refusal the link and the scan are forgotten, and the same code asks again", async () => {
     const rig = await open();
     await scan(LINK);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     rig.sockets.last.open();
     const [command] = rig.sockets.last.commandsOf("pair");
-    rig.sockets.last.receive({ type: "refused", req: command?.req, reason: "That pairing code has expired", code: "invalid" });
+    rig.sockets.last.receive({ type: "refused", req: command?.req, reason: "That pairing code has expired", code: "unpaired" });
     expect(await screen.findByText("That pairing code has expired")).toBeTruthy();
     expect(screen.getByLabelText("Pairing link").props.value).toBe("");
     expect(screen.queryByText("Pair with mac.tail1234.ts.net?")).toBeNull();
@@ -226,6 +226,19 @@ describe("the Pair screen", () => {
     expect(await screen.findByText("A device with that name is already paired")).toBeTruthy();
     expect(mockRouter.replace).not.toHaveBeenCalled();
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    // The Mac kept the code: the link stays, to pair again under another name.
+    expect(screen.getByLabelText("Pairing link").props.value).toBe(LINK);
+  });
+
+  it("forgets the link when the Mac says its code is spent or expired", async () => {
+    const rig = await open();
+    await fireEvent.changeText(screen.getByLabelText("Pairing link"), LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    rig.sockets.last.open();
+    const [command] = rig.sockets.last.commandsOf("pair");
+    rig.sockets.last.receive({ type: "refused", req: command?.req, reason: "Pairing code already used or expired", code: "unpaired" });
+    expect(await screen.findByText("Pairing code already used or expired")).toBeTruthy();
+    expect(screen.getByLabelText("Pairing link").props.value).toBe("");
   });
 
   it("works with the camera off: the paste field stays usable", async () => {
