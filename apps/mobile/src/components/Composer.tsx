@@ -21,7 +21,7 @@ function makeStyles(theme: Theme) {
     hint: { ...type.caption, color: theme.muted },
     note: { ...type.caption, color: theme.muted },
     failure: { flexDirection: "row", alignItems: "center", gap: spacing.md },
-    failureText: { ...type.caption, color: theme.amber, flex: 1 },
+    failureText: { ...type.caption, color: theme.fg, flex: 1 },
     row: { flexDirection: "row", alignItems: "flex-end", gap: spacing.sm },
     input: {
       ...type.body,

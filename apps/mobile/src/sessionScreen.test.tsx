@@ -1,5 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { act, fireEvent, within } from "@testing-library/react-native";
+import * as LocalAuthentication from "expo-local-authentication";
 import { router } from "expo-router";
 import { renderRouter, screen } from "expo-router/testing-library";
 import * as SecureStore from "expo-secure-store";
@@ -539,6 +540,24 @@ describe("the Session screen", () => {
       await launch([info("a")], "/session/zzz");
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();
       expect(screen.queryByLabelText("Message")).toBeNull();
+    });
+
+    it("sends no Allow when the session ended while Face ID was up", async () => {
+      await saveSettings({ faceId: true });
+      let pass: () => void = () => {};
+      jest.mocked(LocalAuthentication.authenticateAsync).mockImplementationOnce(
+        () => new Promise((resolve) => void (pass = () => resolve({ success: true }))),
+      );
+      const rig = await launch([info("a"), info("b")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"));
+      await wait(450);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow" }));
+      await act(async () => {});
+      await feed(rig, { type: "sessions", sessions: [info("b")] });
+      expect(screen.getByText("This session ended")).toBeTruthy();
+      await act(async () => pass());
+      expect(rig.sockets.last.commandsOf("answer")).toEqual([]);
     });
   });
 });

@@ -33,6 +33,8 @@ export function failure(error: unknown): Failure {
   return { text: "Something went wrong. Try again.", retry: false };
 }
 
+const isLow = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
+
 /** The length of `text` once UTF-8 encoded. */
 export function utf8Bytes(text: string): number {
   let bytes = 0;
@@ -40,10 +42,10 @@ export function utf8Bytes(text: string): number {
     const c = text.charCodeAt(i);
     if (c < 0x80) bytes += 1;
     else if (c < 0x800) bytes += 2;
-    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length) {
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length && isLow(text.charCodeAt(i + 1))) {
       bytes += 4; // a surrogate pair is one character of four bytes
       i += 1;
-    } else bytes += 3;
+    } else bytes += 3; // the rest of the BMP, and a lone surrogate (U+FFFD when encoded)
   }
   return bytes;
 }

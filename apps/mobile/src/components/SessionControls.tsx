@@ -33,7 +33,7 @@ function makeStyles(theme: Theme) {
     off: { opacity: 0.4 },
     question: { ...type.body, color: theme.fg },
     failure: { flexDirection: "row", alignItems: "center", gap: spacing.md },
-    failureText: { ...type.caption, color: theme.amber, flex: 1 },
+    failureText: { ...type.caption, color: theme.fg, flex: 1 },
     input: {
       ...type.body,
       minHeight: 44,
@@ -64,8 +64,20 @@ export const SessionControls = memo(function SessionControls({ session, phase, e
   const { run } = control;
   const [steering, setSteering] = useState(false);
   const [ending, setEnding] = useState(false);
+  // The Mac took End: wait for the session to leave rather than offer it again.
+  const [ended, setEnded] = useState(false);
   const closeSteer = useCallback(() => setSteering(false), []);
   const steer = useTextSender(send, session, "steer", closeSteer);
+
+  // A new phase is a new situation: a half-made End or an open Steer field means nothing now.
+  const [seen, setSeen] = useState(phase);
+  if (seen !== phase) {
+    setSeen(phase);
+    setEnding(false);
+    setEnded(false);
+    setSteering(false);
+    steer.setText("");
+  }
 
   const running = phase === "running";
   const canSteer = running && engine === "codex";
@@ -76,7 +88,7 @@ export const SessionControls = memo(function SessionControls({ session, phase, e
   const keep = useCallback(() => setEnding(false), []);
   const end = useCallback(() => {
     setEnding(false);
-    run({ type: "end", session });
+    run({ type: "end", session }, () => setEnded(true));
   }, [run, session]);
   const toggleSteer = useCallback(() => setSteering((open) => !open), []);
 
@@ -127,13 +139,13 @@ export const SessionControls = memo(function SessionControls({ session, phase, e
           {canEnd ? (
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel="End session"
-              accessibilityState={{ disabled: control.busy, busy: control.busy }}
-              disabled={control.busy}
+              accessibilityLabel={ended ? "Ending…" : "End session"}
+              accessibilityState={{ disabled: control.busy || ended, busy: control.busy || ended }}
+              disabled={control.busy || ended}
               onPress={ask}
-              style={[s.button, control.busy && s.off]}
+              style={[s.button, (control.busy || ended) && s.off]}
             >
-              <Text style={s.label}>End session</Text>
+              <Text style={s.label}>{ended ? "Ending…" : "End session"}</Text>
             </Pressable>
           ) : null}
         </View>

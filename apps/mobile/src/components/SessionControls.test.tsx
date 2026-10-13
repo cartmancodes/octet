@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
+import { StyleSheet } from "react-native";
 
 import { Refusal, type RequestBody } from "../client/HubClient";
 import type { Engine, Phase } from "../protocol";
+import { dark, light } from "../theme";
 import { SessionControls } from "./SessionControls";
 
 function rig() {
@@ -129,5 +131,55 @@ describe("the session controls", () => {
   it("shows nothing when there is nothing to do", async () => {
     await render(controls("stopped", "claude", rig().send));
     expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("draws a refusal in the text colour, not amber", async () => {
+    const r = rig();
+    await render(controls("running", "claude", r.send));
+    await fireEvent.press(button("Cancel") as never);
+    r.waiting[0]?.reject(new Refusal("busy", "The Mac is busy"));
+    await flush();
+    const colour = (StyleSheet.flatten(screen.getByText("The Mac is busy").props.style) as { color?: string }).color;
+    expect([dark.fg, light.fg]).toContain(colour);
+  });
+
+  it("forgets a half-made End when the phase changes", async () => {
+    const r = rig();
+    const view = await render(controls("idle", "claude", r.send));
+    await fireEvent.press(button("End session") as never);
+    expect(screen.getByText("End this session?")).toBeTruthy();
+    await view.rerender(controls("running", "claude", r.send));
+    await view.rerender(controls("idle", "claude", r.send));
+    expect(screen.queryByText("End this session?")).toBeNull();
+    expect(button("End session")).toBeTruthy();
+  });
+
+  it("forgets an open Steer field and its text when the phase changes", async () => {
+    const r = rig();
+    const view = await render(controls("running", "codex", r.send));
+    await fireEvent.press(button("Steer") as never);
+    await fireEvent.changeText(screen.getByLabelText("Steer message"), "go left");
+    await view.rerender(controls("idle", "codex", r.send));
+    await view.rerender(controls("running", "codex", r.send));
+    expect(screen.queryByLabelText("Steer message")).toBeNull();
+    await fireEvent.press(button("Steer") as never);
+    expect(screen.getByLabelText("Steer message").props.value).toBe("");
+  });
+
+  it("says Ending… after End's ack, disabled, until the phase moves on", async () => {
+    const r = rig();
+    const view = await render(controls("idle", "claude", r.send));
+    await fireEvent.press(button("End session") as never);
+    await fireEvent.press(screen.getByRole("button", { name: "Yes, end it" }));
+    r.waiting[0]?.resolve();
+    await flush();
+    expect(button("End session")).toBeNull();
+    const ending = screen.getByRole("button", { name: "Ending…" });
+    expect(ending.props.accessibilityState?.disabled === true || ending.props["aria-disabled"] === true).toBe(true);
+    await fireEvent.press(ending);
+    expect(r.send).toHaveBeenCalledTimes(1);
+    await view.rerender(controls("running", "claude", r.send));
+    await view.rerender(controls("idle", "claude", r.send));
+    expect(button("End session")).toBeTruthy();
   });
 });

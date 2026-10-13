@@ -283,4 +283,96 @@ describe("approvals_queue_and_close_elsewhere", () => {
     await view.rerender(<ApprovalSheet session="s" approvals={[approval(2)]} send={r.send} />);
     expect(screen.queryByText("The Mac is busy")).toBeNull();
   });
+
+  describe("an answer waiting on Face ID", () => {
+    /** Makes the next Face ID prompt wait; returns what settles it. */
+    const deferAuth = () => {
+      let settle: (ok: boolean) => void = () => {};
+      auth.authenticateAsync.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            settle = (ok) => resolve(ok ? { success: true } : { success: false, error: "user_cancel" });
+          }),
+      );
+      return (ok = true) => act(async () => settle(ok));
+    };
+
+    it("sends nothing when the approval was closed elsewhere while the prompt was up", async () => {
+      await saveSettings({ faceId: true });
+      const r = rig();
+      const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+      await settle(400);
+      const pass = deferAuth();
+      await fireEvent.press(allow());
+      await flush();
+      await view.rerender(<ApprovalSheet session="s" approvals={[]} send={r.send} />);
+      await pass();
+      expect(r.send).not.toHaveBeenCalled();
+      expect(Haptics.notificationAsync).not.toHaveBeenCalled();
+    });
+
+    it("sends nothing for the one closed, nor for the next that took its place", async () => {
+      await saveSettings({ faceId: true });
+      const r = rig();
+      const view = await render(<ApprovalSheet session="s" approvals={[approval(1), approval(2)]} send={r.send} />);
+      await settle(400);
+      const pass = deferAuth();
+      await fireEvent.press(allow());
+      await flush();
+      await view.rerender(<ApprovalSheet session="s" approvals={[approval(2)]} send={r.send} />);
+      await pass();
+      expect(r.send).not.toHaveBeenCalled();
+      expect(screen.getByText("Run command 2")).toBeTruthy();
+    });
+
+    it("sends nothing when the sheet is gone (the session ended or the screen closed)", async () => {
+      await saveSettings({ faceId: true });
+      const r = rig();
+      const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+      await settle(400);
+      const pass = deferAuth();
+      await fireEvent.press(allow());
+      await flush();
+      await view.unmount();
+      await pass();
+      expect(r.send).not.toHaveBeenCalled();
+      expect(Haptics.notificationAsync).not.toHaveBeenCalled();
+    });
+
+    it("sends once for two quick taps on Allow: one prompt, one answer", async () => {
+      await saveSettings({ faceId: true });
+      const r = rig();
+      await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+      await settle(400);
+      const pass = deferAuth();
+      await fireEvent.press(allow());
+      await fireEvent.press(allow());
+      await flush();
+      await pass();
+      expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
+      expect(r.send).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("arms Allow again when the same approval's request is filled in", async () => {
+    const r = rig();
+    const view = await render(<ApprovalSheet session="s" approvals={[approval(1, { command: null })]} send={r.send} />);
+    await settle(400);
+    expect(disabled(allow())).toBe(false);
+    await view.rerender(
+      <ApprovalSheet session="s" approvals={[approval(1, { command: "rm -rf build" })]} send={r.send} />,
+    );
+    expect(screen.getByText("$ rm -rf build")).toBeTruthy();
+    expect(disabled(allow())).toBe(true);
+    await settle(400);
+    expect(disabled(allow())).toBe(false);
+  });
+
+  it("does not re-arm for a rerender with the same content", async () => {
+    const r = rig();
+    const view = await render(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+    await settle(400);
+    await view.rerender(<ApprovalSheet session="s" approvals={[approval(1)]} send={r.send} />);
+    expect(disabled(allow())).toBe(false);
+  });
 });

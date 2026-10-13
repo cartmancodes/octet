@@ -88,13 +88,21 @@ export const ApprovalSheet = memo(function ApprovalSheet({ session, approvals, s
     (id: number) => setAnswered((prev) => (prev.includes(id) ? prev : [...prev, id].slice(-ANSWERED_KEPT))),
     [],
   );
+  // The ids still open, for a request to ask after Face ID: the store may have closed it meanwhile.
+  const open = useRef<readonly number[]>([]);
+  useEffect(() => {
+    open.current = approvals.map((a) => a.id);
+  });
+  const isOpen = useCallback((id: number) => open.current.includes(id), []);
   const waiting = approvals.filter((a) => !answered.includes(a.id));
   const front = waiting[0];
   if (!front) return null;
-  // Keyed: each request starts unarmed, closed and with no old error.
+  // Keyed by the id and what it asks: each request, and the same one once its content is filled
+  // in (the journal record after the state frame), starts unarmed, closed and with no old error.
   return (
     <Request
-      key={front.id}
+      key={`${front.id}:${JSON.stringify(front.summary)}`}
+      isOpen={isOpen}
       session={session}
       approval={front}
       more={waiting.length - 1}
@@ -109,10 +117,12 @@ interface RequestProps {
   approval: PendingApproval;
   more: number;
   send: Send;
+  /** Whether the approval is still open: it may have been closed elsewhere while Face ID was up. */
+  isOpen: (id: number) => boolean;
   onAnswered: (id: number) => void;
 }
 
-function Request({ session, approval, more, send, onAnswered }: RequestProps) {
+function Request({ session, approval, more, send, isOpen, onAnswered }: RequestProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const alive = useAlive();
@@ -149,7 +159,10 @@ function Request({ session, approval, more, send, onAnswered }: RequestProps) {
             if (checked === "failed") return; // cancelled or no match: nothing is sent
           }
         }
-        if (alive()) setStage("sending");
+        // Face ID takes a while: send only if this request is still on screen, still open, and so
+        // still the one the user looked at (the screen takes the sheet away once the session ends).
+        if (!alive() || !isOpen(id)) return;
+        setStage("sending");
         await send({ type: "answer", session, approval: id, allow });
         if (allow) successTap();
         onAnswered(id);
@@ -160,7 +173,7 @@ function Request({ session, approval, more, send, onAnswered }: RequestProps) {
         if (alive()) setStage(null);
       }
     },
-    [armed, summary.action, session, id, send, onAnswered, alive],
+    [armed, summary.action, session, id, send, isOpen, onAnswered, alive],
   );
   const allow = useCallback(() => void answer(true), [answer]);
   const deny = useCallback(() => void answer(false), [answer]);

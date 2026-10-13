@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import * as Haptics from "expo-haptics";
+import { StyleSheet } from "react-native";
 
 import { Refusal, type RequestBody } from "../client/HubClient";
+import { dark, light } from "../theme";
 import { Composer } from "./Composer";
 
 function rig() {
@@ -137,5 +139,16 @@ describe("the composer", () => {
     r.waiting[0]?.resolve();
     await flush();
     expect(input().props.value).toBe("first, and more");
+  });
+
+  it("draws a refusal in the text colour, not amber, which is the approval sheet's", async () => {
+    const r = rig();
+    await render(<Composer session="s" phase="idle" queued={0} send={r.send} />);
+    await fireEvent.changeText(input(), "hi");
+    await fireEvent.press(sendButton());
+    r.waiting[0]?.reject(new Refusal("busy", "The Mac is busy"));
+    await flush();
+    const colour = (StyleSheet.flatten(screen.getByText("The Mac is busy").props.style) as { color?: string }).color;
+    expect([dark.fg, light.fg]).toContain(colour);
   });
 });
