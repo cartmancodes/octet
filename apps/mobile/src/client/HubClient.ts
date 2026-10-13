@@ -482,7 +482,9 @@ export class HubClient {
         this.cancelPing = null;
         this.pingReq = null;
         if (this.socket !== socket) return;
-        if (this.lastHeard > sentAt) this.armPing();
+        // It spoke since the ping: count the quiet from its last frame, not from now, so that a link
+        // that went silent just after speaking is still found dead within ~35 s of that frame.
+        if (this.lastHeard > sentAt) this.armPing(Math.max(0, PING_INTERVAL_MS - (this.now() - this.lastHeard)));
         else this.lost();
       }, PING_TIMEOUT_MS);
     }, delay);

@@ -46,3 +46,41 @@ jest.mock("expo-system-ui", () => ({
   setBackgroundColorAsync: jest.fn(async (_color: string | null) => undefined),
   getBackgroundColorAsync: jest.fn(async () => null),
 }));
+
+// Notifications: permission is granted and a token comes back unless a test says otherwise. Nothing
+// reaches a native module. The behaviours are set before each test, because `restoreAllMocks`
+// (which several files call) strips a `jest.fn`'s implementation.
+jest.mock("expo-notifications", () => ({
+  AndroidImportance: { DEFAULT: 5, HIGH: 6 },
+  setNotificationHandler: jest.fn(),
+  setNotificationChannelAsync: jest.fn(),
+  getPermissionsAsync: jest.fn(),
+  requestPermissionsAsync: jest.fn(),
+  getExpoPushTokenAsync: jest.fn(),
+  addPushTokenListener: jest.fn(),
+  addNotificationResponseReceivedListener: jest.fn(),
+  getLastNotificationResponseAsync: jest.fn(),
+}));
+
+// The splash stays up until the app knows whether it is paired.
+jest.mock("expo-splash-screen", () => ({
+  preventAutoHideAsync: jest.fn(async () => true),
+  hideAsync: jest.fn(async () => undefined),
+}));
+
+beforeEach(() => {
+  const granted = { granted: true, canAskAgain: true, status: "granted" };
+  const n = jest.requireMock("expo-notifications") as Record<string, jest.Mock>;
+  for (const mock of Object.values(n)) if (jest.isMockFunction(mock)) mock.mockReset();
+  n.setNotificationChannelAsync!.mockResolvedValue(null);
+  n.getPermissionsAsync!.mockResolvedValue(granted);
+  n.requestPermissionsAsync!.mockResolvedValue(granted);
+  n.getExpoPushTokenAsync!.mockResolvedValue({ type: "expo", data: "ExponentPushToken[abc-123_XYZ]" });
+  n.addPushTokenListener!.mockImplementation(() => ({ remove: jest.fn() }));
+  n.addNotificationResponseReceivedListener!.mockImplementation(() => ({ remove: jest.fn() }));
+  n.getLastNotificationResponseAsync!.mockResolvedValue(null);
+  const splash = jest.requireMock("expo-splash-screen") as Record<string, jest.Mock>;
+  for (const mock of Object.values(splash)) mock.mockReset();
+  splash.preventAutoHideAsync!.mockResolvedValue(true);
+  splash.hideAsync!.mockResolvedValue(undefined);
+});

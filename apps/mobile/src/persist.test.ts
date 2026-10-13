@@ -8,13 +8,18 @@ beforeEach(async () => {
 describe("settings", () => {
   it("default when nothing is saved", async () => {
     expect(await loadSettings()).toEqual(DEFAULT_SETTINGS);
-    expect(DEFAULT_SETTINGS).toEqual({ deviceName: null, faceId: true, hubUrl: null });
+    expect(DEFAULT_SETTINGS).toEqual({ deviceName: null, faceId: true, hubUrl: null, notifications: false });
   });
 
   it("round-trip, and a save merges into what is there", async () => {
     await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
     await saveSettings({ deviceName: "Shubho's iPhone", faceId: false });
-    expect(await loadSettings()).toEqual({ deviceName: "Shubho's iPhone", faceId: false, hubUrl: "wss://mac.tail1234.ts.net/" });
+    expect(await loadSettings()).toEqual({
+      deviceName: "Shubho's iPhone",
+      faceId: false,
+      hubUrl: "wss://mac.tail1234.ts.net/",
+      notifications: false,
+    });
   });
 
   it("fall back to the defaults for junk", async () => {
@@ -22,6 +27,24 @@ describe("settings", () => {
       await AsyncStorage.setItem(SETTINGS_KEY, junk);
       expect(await loadSettings()).toEqual(DEFAULT_SETTINGS);
     }
+  });
+
+  it("notifications are off by default, round-trip, and an old record without the field still loads", async () => {
+    await AsyncStorage.setItem(
+      SETTINGS_KEY,
+      JSON.stringify({ deviceName: "Old", faceId: false, hubUrl: "wss://mac.tail1234.ts.net/" }),
+    );
+    expect(await loadSettings()).toEqual({
+      deviceName: "Old",
+      faceId: false,
+      hubUrl: "wss://mac.tail1234.ts.net/",
+      notifications: false,
+    });
+    await saveSettings({ notifications: true });
+    expect((await loadSettings()).notifications).toBe(true);
+    expect((await loadSettings()).deviceName).toBe("Old");
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ notifications: "yes" }));
+    expect((await loadSettings()).notifications).toBe(false);
   });
 
   it("keep the good fields of a partly bad record, and bound strings", async () => {
@@ -43,12 +66,12 @@ describe("settings", () => {
 
   it("two saves at once both land", async () => {
     await Promise.all([saveSettings({ hubUrl: "wss://a/" }), saveSettings({ faceId: false }), saveSettings({ deviceName: "P" })]);
-    expect(await loadSettings()).toEqual({ deviceName: "P", faceId: false, hubUrl: "wss://a/" });
+    expect(await loadSettings()).toEqual({ deviceName: "P", faceId: false, hubUrl: "wss://a/", notifications: false });
   });
 
   it("never hold a token", async () => {
     await saveSettings({ hubUrl: "wss://x/" });
     const raw = (await AsyncStorage.getItem(SETTINGS_KEY)) ?? "";
-    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "hubUrl"]);
+    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "hubUrl", "notifications"]);
   });
 });

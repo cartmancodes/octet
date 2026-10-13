@@ -658,6 +658,25 @@ describe("keepalive", () => {
     expect(pings(second)).toHaveLength(1);
   });
 
+  it("a link that speaks just before the deadline and then goes quiet is found dead ~35 s after that frame", () => {
+    const r = rig();
+    welcomed(r);
+    const socket = r.sockets.last;
+    r.clock.advance(PING_INTERVAL_MS); // the ping goes out; its deadline is 10 s on
+    r.clock.advance(PING_TIMEOUT_MS - 1);
+    socket.receive({ type: "sessions", sessions: [] }); // any frame is proof of life, 1 ms before the deadline
+    r.clock.advance(1); // the deadline passes: the next ping counts from that frame, not from now
+    r.clock.advance(PING_INTERVAL_MS - 2);
+    expect(pings(socket)).toHaveLength(1);
+    r.clock.advance(1);
+    expect(pings(socket)).toHaveLength(2); // 25 s after the frame, not 25 s after the deadline
+    r.clock.advance(PING_TIMEOUT_MS - 1);
+    expect(socket.closed).toBe(false);
+    r.clock.advance(1);
+    expect(socket.closed).toBe(true); // 35 s after the last frame
+    expect(r.states.at(-1)).toBe("offline");
+  });
+
   it("a ping the hub refuses still proves the link is alive", () => {
     const r = rig();
     welcomed(r);

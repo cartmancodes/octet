@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as SecureStore from "expo-secure-store";
+import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
 
 import Pair from "../app/pair";
@@ -28,6 +29,16 @@ jest.mock("expo-camera", () => {
     useCameraPermissions: () => [mockCamera.permission, mockCamera.request],
   };
 });
+
+let mockProject: string | undefined;
+jest.mock("expo-constants", () => ({
+  __esModule: true,
+  default: {
+    get expoConfig() {
+      return { extra: { eas: { projectId: mockProject } } };
+    },
+  },
+}));
 
 const SECRET = "ab".repeat(32);
 const LINK = `https://mac.tail1234.ts.net/#pair=${SECRET}`;
@@ -71,6 +82,7 @@ beforeEach(async () => {
   await SecureStore.deleteItemAsync(TOKEN_KEY);
   jest.clearAllMocks();
   mockCamera.props = null;
+  mockProject = undefined;
 });
 
 describe("the Pair screen", () => {
@@ -243,5 +255,74 @@ describe("the Pair screen", () => {
     rig.sockets.last.receive({ type: "refused", req: command?.req, reason: "<a href=x>[go](https://evil.test)</a>", code: "invalid" });
     const shown = await screen.findByText("<a href=x>[go](https://evil.test)</a>");
     expect(shown.props.onPress).toBeUndefined();
+  });
+});
+
+describe("the notifications step after pairing", () => {
+  const PROJECT = "11111111-2222-3333-4444-555555555555";
+  const notifications = Notifications as jest.Mocked<typeof Notifications>;
+
+  /** Pairs on a Mac that then welcomes the phone, and lands on the step. */
+  async function pairedToStep() {
+    mockProject = PROJECT;
+    const rig = await open();
+    rig.hub.setForeground(true);
+    await fireEvent.changeText(screen.getByLabelText("Pairing link"), LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    accept(rig);
+    await screen.findByRole("button", { name: "Turn on notifications" });
+    rig.sockets.last.open();
+    rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    return rig;
+  }
+  const ack = async (rig: Awaited<ReturnType<typeof open>>, message: string) => {
+    await waitFor(() => expect(rig.sockets.last.commandsOf("register_push")).toHaveLength(1));
+    const [command] = rig.sockets.last.commandsOf("register_push");
+    await act(async () => rig.sockets.last.receive({ type: "ack", req: command?.req, message }));
+  };
+
+  it("follows a pairing when the app has a project id, instead of going straight on", async () => {
+    await pairedToStep();
+    expect(screen.getByRole("button", { name: "Not now" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Pair" })).toBeNull();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it("Not now goes on to Sessions without asking for anything", async () => {
+    const rig = await pairedToStep();
+    await fireEvent.press(screen.getByRole("button", { name: "Not now" }));
+    expect(mockRouter.replace).toHaveBeenCalledWith("/");
+    expect(notifications.requestPermissionsAsync).not.toHaveBeenCalled();
+    expect(rig.sockets.last.commandsOf("register_push")).toHaveLength(0);
+    expect((await loadSettings()).notifications).toBe(false);
+    expect(rig.hub.snapshot().offer).toBe(false);
+  });
+
+  it("Turn on notifications asks, registers, saves, and goes on to Sessions", async () => {
+    const rig = await pairedToStep();
+    await fireEvent.press(screen.getByRole("button", { name: "Turn on notifications" }));
+    await ack(rig, "Notifications on");
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
+    expect(notifications.requestPermissionsAsync).toHaveBeenCalledTimes(1);
+    expect((await loadSettings()).notifications).toBe(true);
+  });
+
+  it("a denial is said here and the step stays, so that Not now is still there", async () => {
+    notifications.requestPermissionsAsync.mockResolvedValueOnce({ granted: false, canAskAgain: false, status: "denied" } as never);
+    await pairedToStep();
+    await fireEvent.press(screen.getByRole("button", { name: "Turn on notifications" }));
+    expect(await screen.findByText("Notifications are off for Octet in the phone's settings.")).toBeTruthy();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    await fireEvent.press(screen.getByRole("button", { name: "Not now" }));
+    expect(mockRouter.replace).toHaveBeenCalledWith("/");
+  });
+
+  it("is skipped with no project id", async () => {
+    const rig = await open();
+    await fireEvent.changeText(screen.getByLabelText("Pairing link"), LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    accept(rig);
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
+    expect(screen.queryByRole("button", { name: "Turn on notifications" })).toBeNull();
   });
 });

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 
 import { hubHost, parsePairLink } from "../src/client/link";
+import { useAlive } from "../src/components/send";
 import { NOT_A_LINK, useHubController, useHubSnapshot } from "../src/hub";
 import { Mascot } from "../src/mascot/Mascot";
 import { radius, spacing, type, useTheme } from "../src/theme";
@@ -18,7 +19,7 @@ export default function Pair() {
   const theme = useTheme();
   const router = useRouter();
   const hub = useHubController();
-  const { notice } = useHubSnapshot();
+  const { notice, offer } = useHubSnapshot();
   const [permission, requestPermission] = useCameraPermissions();
   const [link, setLink] = useState("");
   const [name, setName] = useState(() => hub.initialName());
@@ -45,7 +46,8 @@ export default function Pair() {
     try {
       const result = await hub.pair(link, name);
       if (result.ok) {
-        router.replace("/");
+        // With a notifications step to show, Pair stays up until the user answers it.
+        if (!hub.snapshot().offer) router.replace("/");
         return;
       }
       setError(result.message);
@@ -86,6 +88,8 @@ export default function Pair() {
     setError(null);
     setLink("");
   }, []);
+
+  if (offer) return <NotificationsStep />;
 
   const cameraOn = permission?.granted === true;
   const cameraOff = permission !== null && !permission.granted && !permission.canAskAgain;
@@ -179,6 +183,77 @@ export default function Pair() {
         )}
       </ScrollView>
     </KeyboardAvoidingView>
+  );
+}
+
+/** After a pairing, once: get a notification when an agent needs approval or finishes a turn.
+ * Skippable; Settings has the same switch. */
+function NotificationsStep() {
+  const theme = useTheme();
+  const router = useRouter();
+  const hub = useHubController();
+  const alive = useAlive();
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const working = useRef(false);
+
+  const leave = useCallback(() => {
+    hub.finishOffer();
+    router.replace("/");
+  }, [hub, router]);
+
+  const turnOn = useCallback(async () => {
+    if (working.current) return;
+    working.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await hub.turnOnNotifications();
+      if (!alive()) return;
+      if (result.ok) leave();
+      else setError(result.message);
+    } finally {
+      working.current = false;
+      if (alive()) setBusy(false);
+    }
+  }, [alive, hub, leave]);
+  const onTurnOn = useCallback(() => void turnOn(), [turnOn]);
+
+  return (
+    <View style={[styles.content, { flex: 1, backgroundColor: theme.bg }]}>
+      <Mascot pose="idle" size={118} />
+      <Text accessibilityRole="header" style={[type.display, { color: theme.fg }]}>
+        Paired
+      </Text>
+      <Text style={[type.body, { color: theme.muted }]}>
+        Get a notification when an agent needs your approval or finishes a turn, while the app is closed.
+      </Text>
+      {error !== null && (
+        <Text accessibilityRole="alert" style={[type.body, { color: theme.accent }]}>
+          {error}
+        </Text>
+      )}
+      <Pressable
+        onPress={onTurnOn}
+        disabled={busy}
+        accessibilityRole="button"
+        accessibilityLabel="Turn on notifications"
+        accessibilityState={{ disabled: busy, busy }}
+        style={[styles.button, { backgroundColor: theme.accent, opacity: busy ? 0.5 : 1 }]}
+      >
+        <Text style={[type.body, { color: theme.bg, fontWeight: "600" }]}>
+          {busy ? "Turning on…" : "Turn on notifications"}
+        </Text>
+      </Pressable>
+      <Pressable
+        onPress={leave}
+        accessibilityRole="button"
+        accessibilityLabel="Not now"
+        style={[styles.button, { borderColor: theme.edge, borderWidth: 1 }]}
+      >
+        <Text style={[type.body, { color: theme.fg }]}>Not now</Text>
+      </Pressable>
+    </View>
   );
 }
 

@@ -5,15 +5,15 @@ import { Alert, Pressable, StyleSheet, Switch, Text, View } from "react-native";
 import { confirmBiometric } from "../src/auth";
 import { hubHost } from "../src/client/link";
 import { useAlive } from "../src/components/send";
-import { useHubController } from "../src/hub";
-import { loadSettings, saveSettings, type Settings as Saved } from "../src/persist";
+import { useHubController, useHubSnapshot } from "../src/hub";
+import { NO_PROJECT_ID, projectId } from "../src/notifications";
+import { NOT_SAVED, loadSettings, saveSettings, type Settings as Saved } from "../src/persist";
 import { radius, spacing, type, useTheme } from "../src/theme";
 
 const TURN_OFF_REASON = "Turn off Face ID for allowing";
 export const UNPAIR_TITLE = "Unpair this phone?";
 export const UNPAIR_BODY =
   "You'll need a new pairing code from the Mac. The Mac keeps listing this phone until you run `octet hub revoke <name>` there.";
-export const NOT_SAVED = "Couldn't save that setting";
 
 /** This phone's settings: where it is paired, whether Allow asks for Face ID, and Unpair. */
 export default function Settings() {
@@ -23,6 +23,9 @@ export default function Settings() {
   const [saved, setSaved] = useState<Saved | null>(null);
   const [error, setError] = useState(false);
   const checking = useRef(false);
+  const { pushNotice } = useHubSnapshot();
+  const [pushError, setPushError] = useState<string | null>(null);
+  const pushing = useRef(false);
 
   useEffect(() => {
     let live = true;
@@ -62,6 +65,30 @@ export default function Settings() {
     [change],
   );
 
+  const changePush = useCallback(
+    async (on: boolean) => {
+      if (pushing.current) return;
+      pushing.current = true;
+      try {
+        setPushError(null);
+        const result = await (on ? hub.turnOnNotifications() : hub.turnOffNotifications());
+        if (!alive()) return;
+        if (result.ok) setSaved((s) => (s ? { ...s, notifications: on } : s));
+        else setPushError(result.message);
+      } finally {
+        pushing.current = false;
+      }
+    },
+    [alive, hub],
+  );
+
+  const flipPush = useCallback(
+    (on: boolean) => {
+      void changePush(on);
+    },
+    [changePush],
+  );
+
   const unpair = useCallback(() => {
     Alert.alert(UNPAIR_TITLE, UNPAIR_BODY, [
       { text: "Cancel", style: "cancel" },
@@ -71,6 +98,8 @@ export default function Settings() {
 
   if (saved === null) return <View style={[styles.screen, { backgroundColor: theme.bg }]} />;
   const version = Constants.expoConfig?.version;
+  const hasProject = projectId() !== null;
+  const pushWords = pushError ?? (hasProject ? pushNotice : NO_PROJECT_ID);
   return (
     <View style={[styles.screen, { backgroundColor: theme.bg }]}>
       <View style={[styles.card, { backgroundColor: theme.panel, borderColor: theme.edge }]}>
@@ -95,6 +124,28 @@ export default function Settings() {
         {error ? (
           <View accessibilityLiveRegion="polite">
             <Text style={[type.caption, { color: theme.fg }]}>{NOT_SAVED}</Text>
+          </View>
+        ) : null}
+      </View>
+      <View style={[styles.card, { backgroundColor: theme.panel, borderColor: theme.edge }]}>
+        <View style={styles.switchRow}>
+          <Text style={[type.body, styles.grow, { color: theme.fg }]}>Notifications</Text>
+          <Switch
+            accessibilityRole="switch"
+            accessibilityLabel="Notifications"
+            value={hasProject && saved.notifications}
+            disabled={!hasProject}
+            onValueChange={flipPush}
+            hitSlop={HIT}
+            trackColor={{ false: theme.edge, true: theme.accent }}
+          />
+        </View>
+        <Text style={[type.caption, { color: theme.muted }]}>
+          Get a notification when an agent needs your approval or finishes a turn, while the app is closed.
+        </Text>
+        {pushWords !== null ? (
+          <View accessibilityLiveRegion="polite">
+            <Text style={[type.caption, { color: theme.fg }]}>{pushWords}</Text>
           </View>
         ) : null}
       </View>

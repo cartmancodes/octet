@@ -7,7 +7,8 @@ import { Platform } from "react-native";
 import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from "./client/HubClient";
 import { isHubUrl, parsePairLink } from "./client/link";
 import { webSocketFactory } from "./client/socket";
-import { loadSettings, saveSettings } from "./persist";
+import { NOT_SAVED, loadSettings, saveSettings } from "./persist";
+import { askForToken, currentToken, onTokenChange, projectId } from "./notifications";
 import { connectStore, octetStore, type OctetStore } from "./store";
 
 /** The keychain item holding the device token: the only place it is kept. */
@@ -30,7 +31,21 @@ export interface HubSnapshot {
   notice: string | null;
   /** The connection, while paired. */
   client: HubClient | null;
+  /** Just paired, and the notifications step is up: Pair stays until `finishOffer`. */
+  offer: boolean;
+  /** Why the Mac did not take this phone's push registration (or why the phone could not make
+   * one), for Settings to show; null when the last registration worked or none was tried. */
+  pushNotice: string | null;
 }
+
+/** The outcome of turning notifications on or off: done, or the words for why not. */
+export type PushResult = { ok: true } | { ok: false; message: string };
+
+const UNREACHABLE = "Can't reach your Mac";
+/** How long turning notifications on or off waits for a connection that is coming back. */
+const READY_WAIT_MS = 8_000;
+/** How long unpair leaves the connection open for the Mac to hear "notifications off". */
+const GOODBYE_MS = 2_000;
 
 /** A failed pairing: `clear` says the link is no good any more (the Mac answered, or took the
  * secret), so the screen forgets it; a link that is invalid or never reached the Mac is kept for editing. */
@@ -70,8 +85,9 @@ export class HubController {
   private readonly tokens: TokenStore;
   private readonly platform: string;
   private readonly clientOptions: NonNullable<HubControllerOptions["clientOptions"]>;
+  private readonly schedule: (fn: () => void, ms: number) => () => void;
 
-  private current: HubSnapshot = { status: "loading", notice: null, client: null };
+  private current: HubSnapshot = { status: "loading", notice: null, client: null, offer: false, pushNotice: null };
   private readonly listeners = new Set<() => void>();
   private foreground = false;
   private savedName: string | null = null;
@@ -87,6 +103,12 @@ export class HubController {
     this.tokens = opts.tokens ?? keychain;
     this.platform = opts.platform ?? Platform.OS;
     this.clientOptions = opts.clientOptions ?? {};
+    this.schedule =
+      this.clientOptions.schedule ??
+      ((fn, ms) => {
+        const id = setTimeout(fn, ms);
+        return () => clearTimeout(id);
+      });
   }
 
   // What screens read
@@ -162,7 +184,7 @@ export class HubController {
         return { ok: false, message: unsaved(deviceName), clear: true };
       }
       this.savedName = deviceName;
-      this.adopt(client);
+      this.adopt(client, projectId() !== null);
       return { ok: true };
     } catch (error) {
       if (!(error instanceof Refusal)) return { ok: false, message: "Pairing failed", clear: false };
@@ -199,17 +221,115 @@ export class HubController {
     if (this.unpairing || client === null) return;
     this.unpairing = true;
     try {
+      // Best effort, sent before the connection is released and never waited on: the Mac stops
+      // pushing to this phone. Revoking on the Mac ends it there anyway.
+      this.stopAfterGoodbye(client);
       this.release();
-      client.stop();
       // Before any await: a foreground event now finds no client to start.
-      this.set({ status: "unpaired", notice: null, client: null });
-      const address = await saveSettings({ hubUrl: null });
+      this.set({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
+      const address = await saveSettings({ hubUrl: null, notifications: false });
       let token = await this.tokens.clear().then(() => true, () => false);
       if (!token) token = await this.tokens.clear().then(() => true, () => false);
       if (!address || !token) this.set({ notice: UNPAIR_FAILED_NOTICE });
     } finally {
       this.unpairing = false;
     }
+  }
+
+  /** Stops `client`, but first, on a ready link, tells the Mac "notifications off" and keeps the
+   * link until the Mac answers or refuses, or `GOODBYE_MS` pass. Nothing waits on it. */
+  private stopAfterGoodbye(client: HubClient): void {
+    if (client.state !== "ready") {
+      client.stop();
+      return;
+    }
+    const cancel = this.schedule(() => client.stop(), GOODBYE_MS);
+    const done = () => {
+      cancel();
+      client.stop();
+    };
+    client.request({ type: "register_push", token: null }).then(done, done);
+  }
+
+  // Notifications
+
+  /** Turns notifications on: permission, the token, the Mac's ack, and only then the setting.
+   * The answer is the words to show; nothing is saved on a failure. A link that is coming back
+   * is waited for, briefly. */
+  async turnOnNotifications(): Promise<PushResult> {
+    const client = this.current.client;
+    if (client === null) return { ok: false, message: UNREACHABLE };
+    const got = await askForToken();
+    if (!got.ok) return got;
+    return this.register(client, got.token, true);
+  }
+
+  /** Turns notifications off: the Mac is told first (a null token), then the setting is saved.
+   * With the Mac out of reach it stays on, since the Mac would go on pushing. */
+  async turnOffNotifications(): Promise<PushResult> {
+    const client = this.current.client;
+    if (client === null) return { ok: false, message: UNREACHABLE };
+    return this.register(client, null, false);
+  }
+
+  private async register(client: HubClient, token: string | null, on: boolean): Promise<PushResult> {
+    if (!(await this.whenReady(client)) || client !== this.current.client) return { ok: false, message: UNREACHABLE };
+    try {
+      await client.request({ type: "register_push", token });
+    } catch (error) {
+      return { ok: false, message: wordsOf(error) };
+    }
+    if (!(await saveSettings({ notifications: on }))) return { ok: false, message: NOT_SAVED };
+    this.notify(null);
+    return { ok: true };
+  }
+
+  /** Resolves true when `client` is ready, now or within `READY_WAIT_MS`; false when it is not. */
+  private whenReady(client: HubClient): Promise<boolean> {
+    if (client.state === "ready") return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      let off = () => {};
+      let cancel = () => {};
+      const done = (ready: boolean) => {
+        off();
+        cancel();
+        resolve(ready);
+      };
+      off = client.onState((state) => {
+        if (state === "ready") done(true);
+        else if (state === "unpaired") done(false);
+      });
+      cancel = this.schedule(() => done(false), READY_WAIT_MS);
+    });
+  }
+
+  /** The user answered the notifications step (or skipped it): Pair gives way to Sessions. */
+  finishOffer(): void {
+    if (this.current.offer) this.set({ offer: false });
+  }
+
+  /** Registers the current push token with the Mac, if the user turned notifications on. Runs
+   * after each ready and on a token rotation. A hub refusal shows on Settings; a link that
+   * dropped is no news, the next ready tries again. */
+  private async syncPush(client: HubClient): Promise<void> {
+    if (!(await loadSettings()).notifications) return;
+    const got = await currentToken();
+    if (client !== this.current.client || client.state !== "ready") return;
+    if (!got.ok) {
+      this.notify(got.message);
+      return;
+    }
+    try {
+      await client.request({ type: "register_push", token: got.token });
+      if (client === this.current.client) this.notify(null);
+    } catch (error) {
+      if (client !== this.current.client) return;
+      if (error instanceof Refusal && error.code !== "unsent" && error.code !== "lost") this.notify(error.message);
+    }
+  }
+
+  private notify(pushNotice: string | null): void {
+    if (this.current.pushNotice !== pushNotice) this.set({ pushNotice });
   }
 
   // Internals
@@ -219,20 +339,28 @@ export class HubController {
     for (const fn of [...this.listeners]) fn();
   }
 
-  /** Makes `client` the app's connection, feeding the store, and connects it if in the foreground. */
-  private adopt(client: HubClient): void {
+  /** Makes `client` the app's connection, feeding the store, and connects it if in the foreground.
+   * `offer` holds Pair for the notifications step. */
+  private adopt(client: HubClient, offer = false): void {
     this.release();
     this.current.client?.stop();
     const offStore = connectStore(this.store, client);
     const offState = client.onState((state) => {
       if (state === "unpaired") void this.unpaired(client);
+      else if (state === "ready") void this.syncPush(client);
+    });
+    // A rotated token while the link is down is sent by the next ready.
+    const offToken = onTokenChange(() => {
+      if (client.state === "ready") void this.syncPush(client);
     });
     this.detach = () => {
       offStore();
       offState();
+      offToken();
     };
-    this.set({ status: "paired", notice: null, client });
+    this.set({ status: "paired", notice: null, client, offer, pushNotice: null });
     if (this.foreground) client.start();
+    if (client.state === "ready") void this.syncPush(client);
   }
 
   /** Drops the connection and what the old Mac sent. */
@@ -253,9 +381,12 @@ export class HubController {
       // The keychain keeps it; the next start is refused again and comes back here.
     }
     if (client !== this.current.client) return;
-    this.set({ status: "unpaired", notice: UNPAIRED_NOTICE, client: null });
+    this.set({ status: "unpaired", notice: UNPAIRED_NOTICE, client: null, offer: false, pushNotice: null });
   }
 }
+
+/** The words for a failed command: the hub's own, else a plain one. */
+const wordsOf = (error: unknown): string => (error instanceof Refusal ? error.message : "Something went wrong. Try again.");
 
 /** The app's connection. */
 export const hub = new HubController();

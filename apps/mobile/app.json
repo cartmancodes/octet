@@ -31,6 +31,16 @@
           "microphonePermission": false,
           "recordAudioAndroid": false
         }
+      ],
+      "expo-notifications",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#faf6f5",
+          "dark": {
+            "backgroundColor": "#161113"
+          }
+        }
       ]
     ]
   }

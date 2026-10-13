@@ -1,7 +1,10 @@
 import { act, fireEvent, screen, waitFor } from "@testing-library/react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { router } from "expo-router";
 import { renderRouter } from "expo-router/testing-library";
+import * as Notifications from "expo-notifications";
 import * as SecureStore from "expo-secure-store";
+import * as SplashScreen from "expo-splash-screen";
 import * as SystemUI from "expo-system-ui";
 import * as ReactNative from "react-native";
 import { AppState, Text } from "react-native";
@@ -19,12 +22,24 @@ jest.mock("expo-camera", () => ({
   useCameraPermissions: () => [{ granted: false, canAskAgain: false, status: "denied" }, jest.fn()],
 }));
 
+let mockProject: string | undefined;
+jest.mock("expo-constants", () => ({
+  __esModule: true,
+  default: {
+    get expoConfig() {
+      return { extra: { eas: { projectId: mockProject } } };
+    },
+  },
+}));
+
 const TOKEN = "cd".repeat(32);
+const n = Notifications as jest.Mocked<typeof Notifications>;
 const LINK = `https://mac.tail1234.ts.net/#pair=${"ab".repeat(32)}`;
 
 let changeAppState: (state: string) => void = () => {};
 
 beforeEach(async () => {
+  mockProject = undefined;
   await AsyncStorage.clear();
   await SecureStore.deleteItemAsync(TOKEN_KEY);
   jest.spyOn(AppState, "addEventListener").mockImplementation((_type, listener) => {
@@ -53,8 +68,16 @@ async function launch(opts: { paired?: boolean } = {}) {
       <RootLayout />
     </HubContext.Provider>
   );
-  await renderRouter({ _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => null, recent: () => null, settings: () => null });
-  return { hub, sockets, clock };
+  const view = renderRouter({
+    _layout: Layout,
+    index: () => <Text>Sessions list</Text>,
+    pair: Pair,
+    "session/[id]": () => null,
+    recent: () => null,
+    settings: () => null,
+  });
+  await view;
+  return { hub, sockets, clock, view };
 }
 
 /** Walks the connection to ready: hello, welcome. */
@@ -167,5 +190,104 @@ describe("the app shell", () => {
       await screen.findByText("Pair with your Mac");
       expect(SystemUI.setBackgroundColorAsync).toHaveBeenLastCalledWith(light.bg);
     });
+  });
+});
+
+describe("notifications", () => {
+  const tap = (data: unknown, id = "n1") =>
+    ({ notification: { request: { identifier: id, content: { data } } } }) as never;
+  const listener = () => n.addNotificationResponseReceivedListener.mock.calls[0]?.[0];
+  const SESSION = "4821-1790000000";
+
+  it("is configured at start-up: nothing shows in the foreground, and the splash lifts once the state is known", async () => {
+    await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    expect(n.setNotificationHandler).toHaveBeenCalledTimes(1);
+    expect(SplashScreen.hideAsync).toHaveBeenCalled();
+  });
+
+  it("keeps the splash up while the saved pairing is being read", async () => {
+    const hub = new HubController({
+      factory: new Sockets().factory,
+      store: createOctetStore(),
+      platform: "ios",
+      tokens: { load: () => new Promise(() => {}), save: async () => {}, clear: async () => {} },
+    });
+    const Layout = () => (
+      <HubContext.Provider value={hub}>
+        <RootLayout />
+      </HubContext.Provider>
+    );
+    await renderRouter({ _layout: Layout, index: () => null, pair: Pair });
+    expect(SplashScreen.hideAsync).not.toHaveBeenCalled();
+  });
+
+  it("a tap while paired opens that session", async () => {
+    const { sockets, view } = await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    connected({ sockets });
+    await act(async () => listener()?.(tap({ session: SESSION })));
+    expect(view.getPathname()).toBe(`/session/${SESSION}`);
+  });
+
+  it("a tap while unpaired goes to Pair", async () => {
+    const { view } = await launch();
+    await screen.findByText("Pair with your Mac");
+    await act(async () => listener()?.(tap({ session: SESSION })));
+    expect(view.getPathname()).toBe("/pair");
+  });
+
+  it("a tap with bad data goes to Sessions and opens no session", async () => {
+    const { view } = await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    await act(async () => router.push("/settings"));
+    expect(view.getPathname()).toBe("/settings");
+    await act(async () => listener()?.(tap({ session: "../../settings" })));
+    expect(view.getPathname()).toBe("/");
+  });
+
+  it("a cold start from a tap opens the session once the app knows it is paired", async () => {
+    n.getLastNotificationResponseAsync.mockResolvedValue(tap({ session: SESSION }));
+    const { view } = await launch({ paired: true });
+    await waitFor(() => expect(view.getPathname()).toBe(`/session/${SESSION}`));
+  });
+
+  it("a cold start from a tap while unpaired lands on Pair", async () => {
+    n.getLastNotificationResponseAsync.mockResolvedValue(tap({ session: SESSION }));
+    const { view } = await launch();
+    await screen.findByText("Pair with your Mac");
+    expect(view.getPathname()).toBe("/pair");
+  });
+
+  it("a cold start tap with bad data lands on Sessions", async () => {
+    n.getLastNotificationResponseAsync.mockResolvedValue(tap({}));
+    const { view } = await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    expect(view.getPathname()).toBe("/");
+  });
+
+  it("stops listening when the shell goes", async () => {
+    const remove = jest.fn();
+    n.addNotificationResponseReceivedListener.mockReturnValue({ remove } as never);
+    await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    await act(async () => screen.unmount());
+    expect(remove).toHaveBeenCalled();
+  });
+
+  it("pairing with a project id holds on the notifications step until it is answered, then goes to Sessions", async () => {
+    mockProject = "11111111-2222-3333-4444-555555555555";
+    const { sockets, view } = await launch();
+    await fireEvent.changeText(await screen.findByLabelText("Pairing link"), LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    sockets.last.open();
+    const [command] = sockets.last.commandsOf("pair");
+    sockets.last.receive({ type: "paired", req: command?.req, token: TOKEN, device: "iPhone" });
+    const skip = await screen.findByRole("button", { name: "Not now" });
+    expect(screen.queryByText("Sessions list")).toBeNull();
+    expect(view.getPathname()).toBe("/pair");
+    await fireEvent.press(skip);
+    expect(await screen.findByText("Sessions list")).toBeTruthy();
+    expect(view.getPathname()).toBe("/");
   });
 });

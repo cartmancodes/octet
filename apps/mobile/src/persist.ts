@@ -10,10 +10,14 @@ export interface Settings {
   faceId: boolean;
   /** The hub's address, wss://...; null until paired. */
   hubUrl: string | null;
+  /** Push notifications are on: the Mac has this phone's token. Off unless the user turned it on. */
+  notifications: boolean;
 }
 
-export const DEFAULT_SETTINGS: Settings = { deviceName: null, faceId: true, hubUrl: null };
+export const DEFAULT_SETTINGS: Settings = { deviceName: null, faceId: true, hubUrl: null, notifications: false };
 export const SETTINGS_KEY = "octet.settings.v1";
+/** What to tell the user when a settings write failed. */
+export const NOT_SAVED = "Couldn't save that setting";
 
 /** The longest string kept: a longer one is not a name or a URL. */
 const MAX_CHARS = 2_048;
@@ -32,6 +36,7 @@ export async function loadSettings(): Promise<Settings> {
       deviceName: text(value.deviceName),
       faceId: typeof value.faceId === "boolean" ? value.faceId : DEFAULT_SETTINGS.faceId,
       hubUrl: text(value.hubUrl),
+      notifications: typeof value.notifications === "boolean" ? value.notifications : DEFAULT_SETTINGS.notifications,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -53,7 +58,12 @@ async function write(patch: Partial<Settings>): Promise<boolean> {
     const next: Settings = { ...(await loadSettings()), ...patch };
     await AsyncStorage.setItem(
       SETTINGS_KEY,
-      JSON.stringify({ deviceName: next.deviceName, faceId: next.faceId, hubUrl: next.hubUrl }),
+      JSON.stringify({
+        deviceName: next.deviceName,
+        faceId: next.faceId,
+        hubUrl: next.hubUrl,
+        notifications: next.notifications,
+      }),
     );
     return true;
   } catch {

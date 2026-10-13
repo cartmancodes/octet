@@ -94,6 +94,22 @@ The app keeps the device token in the iOS Keychain / Android Keystore (`expo-sec
 in plain storage. **Settings** shows where you are paired, turns the Face ID check on allowing an
 approval on or off (full access always asks), and unpairs.
 
+## Notifications
+
+The app can notify you when an agent needs approval or finishes a turn, while the app is closed.
+The Mac's hub sends the pushes through Expo's push service, only to a phone that has no open
+connection to it, and shows nothing while the app is open. Push tokens belong to an EAS project, so
+notifications need the app's **EAS project id**: it is not in this repository (it is yours). `eas
+init` (see [Building the app for a phone](#building-the-app-for-a-phone)) writes it to `app.json`
+as `extra.eas.projectId`; build again after that. Without it the **Notifications** switch in
+Settings is off and says so, and pairing skips the notifications step. On iOS, EAS also sets up the
+Apple push credentials for the build; on Android, push needs a Firebase (FCM) credential added to
+the EAS project. Neither is in this repository.
+
+Turn it on in the step after pairing or in **Settings**: the app asks the phone for permission,
+then registers its token with the Mac. Turning it off, or unpairing, tells the Mac to stop. Tapping
+a notification opens that session.
+
 ## Performance notes
 
 - Every list over a few items is a FlashList (v2, which measures rows itself: no
