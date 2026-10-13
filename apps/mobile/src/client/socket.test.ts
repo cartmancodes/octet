@@ -1,0 +1,64 @@
+import { webSocketFactory } from "./socket";
+
+class FakeWebSocket {
+  static last: FakeWebSocket;
+  sent: string[] = [];
+  closed = false;
+  onopen?: () => void;
+  onmessage?: (event: { data?: unknown }) => void;
+  onclose?: (event: { code?: number }) => void;
+  onerror?: () => void;
+  constructor(readonly url: string) {
+    FakeWebSocket.last = this;
+  }
+  send(text: string) {
+    this.sent.push(text);
+  }
+  close() {
+    this.closed = true;
+  }
+}
+
+const realWebSocket = globalThis.WebSocket;
+beforeEach(() => {
+  globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+});
+afterEach(() => {
+  globalThis.WebSocket = realWebSocket;
+});
+
+describe("webSocketFactory", () => {
+  it("opens the url and passes on opens, text frames and closes", () => {
+    const socket = webSocketFactory("wss://mac.ts.net/");
+    const seen: unknown[] = [];
+    socket.onopen = () => seen.push("open");
+    socket.onmessage = (text) => seen.push(text);
+    socket.onclose = (code) => seen.push(code);
+    const ws = FakeWebSocket.last;
+    expect(ws.url).toBe("wss://mac.ts.net/");
+    ws.onopen?.();
+    ws.onmessage?.({ data: "{}" });
+    ws.onclose?.({ code: 1001 });
+    expect(seen).toEqual(["open", "{}", 1001]);
+  });
+
+  it("ignores binary frames", () => {
+    const socket = webSocketFactory("wss://mac.ts.net/");
+    const seen: unknown[] = [];
+    socket.onmessage = (text) => seen.push(text);
+    FakeWebSocket.last.onmessage?.({ data: new ArrayBuffer(4) });
+    expect(seen).toEqual([]);
+  });
+
+  it("treats an error as a close, and sends and closes through", () => {
+    const socket = webSocketFactory("wss://mac.ts.net/");
+    const codes: number[] = [];
+    socket.onclose = (code) => codes.push(code);
+    FakeWebSocket.last.onerror?.();
+    expect(codes).toEqual([1006]);
+    socket.send("hi");
+    socket.close();
+    expect(FakeWebSocket.last.sent).toEqual(["hi"]);
+    expect(FakeWebSocket.last.closed).toBe(true);
+  });
+});

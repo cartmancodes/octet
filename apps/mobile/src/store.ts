@@ -24,6 +24,8 @@ export interface OctetState {
   /** Drops the view of an ended session. False for one that is not ended. */
   release(session: string): boolean;
   setHub(state: HubState): void;
+  /** Forgets everything the hub sent, for a phone unpaired from its Mac or paired with another. */
+  reset(): void;
   /** The hub refused to stream `session` for good. */
   subscribeFailed(session: string, reason: string): void;
 }
@@ -86,6 +88,10 @@ export function createOctetStore(): OctetStore {
     sessions: [],
     bySession: new Map(),
     hub: "offline",
+
+    reset() {
+      set({ sessions: [], bySession: new Map(), hub: "offline" });
+    },
 
     applyBatch(frames) {
       const { sessions: before, bySession } = get();

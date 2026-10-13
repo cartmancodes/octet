@@ -48,6 +48,19 @@ const view = (id: string) => {
   return v;
 };
 
+describe("reset", () => {
+  it("forgets the sessions, their transcripts and the connection state, and keeps working", () => {
+    store.getState().applyBatch([sessions(info("a")), subscribed("a", "start"), text("a", "hello")]);
+    store.getState().setHub("ready");
+    store.getState().reset();
+    expect(store.getState().sessions).toEqual([]);
+    expect(store.getState().bySession.size).toBe(0);
+    expect(store.getState().hub).toBe("offline");
+    store.getState().applyBatch([sessions(info("b"))]);
+    expect(store.getState().sessions.map((s) => s.id)).toEqual(["b"]);
+  });
+});
+
 describe("the sessions list", () => {
   it("is updated by a sessions frame", () => {
     store.getState().applyBatch([sessions(info("a"), info("b", { goal: "ship it" }))]);

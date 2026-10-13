@@ -1,0 +1,17 @@
+// Test doubles every test file shares: async-storage and the keychain are in memory.
+jest.mock("@react-native-async-storage/async-storage", () =>
+  jest.requireActual("@react-native-async-storage/async-storage/jest/async-storage-mock"),
+);
+
+jest.mock("expo-secure-store", () => {
+  const kept = new Map<string, string>();
+  return {
+    getItemAsync: jest.fn(async (key: string) => kept.get(key) ?? null),
+    setItemAsync: jest.fn(async (key: string, value: string) => {
+      kept.set(key, value);
+    }),
+    deleteItemAsync: jest.fn(async (key: string) => {
+      kept.delete(key);
+    }),
+  };
+});
