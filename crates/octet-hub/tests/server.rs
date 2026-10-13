@@ -653,6 +653,61 @@ async fn a_subscription_without_a_known_cursor_replays_every_journal_from_the_st
 }
 
 #[tokio::test]
+async fn a_live_subscriber_gets_the_previous_journals_late_records_once() {
+    let mut env = Env::new();
+    let (old, new) = ("session-1-1.jsonl", "session-2-1.jsonl");
+    env.journal(old, 0..2);
+    let mut registration = Registration {
+        id: "5060-1790000000".into(),
+        pid: 5060,
+        started: 1_790_000_000,
+        socket: env.run.join("5060.sock"),
+        engine: "codex".into(),
+        workspace: "/work".into(),
+        model: String::new(),
+        mode: "ask".into(),
+        vendor_session: String::new(),
+        journals: vec![env.root.join(old)],
+        from_phone: false,
+        tmux: None,
+    };
+    let _listener = UnixListener::bind(&registration.socket).expect("bridge socket");
+    registration.write(&env.run).await.expect("registration");
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 2, "type": "subscribe", "session": registration.id,
+            "after": {"journal": old, "seq": 1}}),
+    )
+    .await;
+    assert_eq!(recv_kind(&mut phone, "ack").await, ack(2, "Subscribed"));
+    // The interface reconnects: a new journal begins, and the hub's next scan sees it.
+    env.journal(new, 0..1);
+    registration.journals.push(env.root.join(new));
+    registration.write(&env.run).await.expect("registration");
+    let first = recv_kind(&mut phone, "event").await;
+    assert_eq!(
+        (first["journal"].clone(), first["seq"].clone()),
+        (json!(new), json!(0))
+    );
+    // The old session's stop record lands after the switch.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(env.root.join(old))
+        .expect("journal");
+    let stopped = json!({"format": "octet-preview-1", "seq": 2, "type": "stopped", "data": null});
+    writeln!(file, "{stopped}").expect("journal write");
+    let late = recv_kind(&mut phone, "event").await;
+    assert_eq!(
+        (late["journal"].clone(), late["seq"].clone()),
+        (json!(old), json!(2))
+    );
+    assert_eq!(late["event"]["type"], "stopped");
+    assert!(quiet(&mut phone).await, "it arrives once");
+}
+
+#[tokio::test]
 async fn commands_reach_the_bridge_and_replies_come_back() {
     let mut env = Env::new();
     let bridge = env.bridge(5004, 0..1).await;

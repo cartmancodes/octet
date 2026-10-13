@@ -3,11 +3,14 @@
 //!
 //! # Replay and live events
 //!
-//! A session's one [`Tail`] is the source of truth for live events. It starts at the last whole
-//! line of the newest journal when the hub first sees the session (older history is for
-//! [`replay`](crate::tail::replay)), and moves to each later journal from its first byte, after
-//! the old journal's remaining whole lines are emitted. Within a journal, records are emitted in
-//! order, so a client's position is the last `seq` it has of each journal. A client that
+//! A session's [`Tail`] of its newest journal is the source of truth for live events. It starts
+//! at the last whole line of the newest journal when the hub first sees the session (older
+//! history is for [`replay`](crate::tail::replay)), and moves to each later journal from its
+//! first byte, after the old journal's remaining whole lines are emitted. The old session can
+//! still write its last records (usage, an error, `stopped`) after the new journal begins, so
+//! the old journal's tail is kept and read alongside until it has a `stopped` record or ten
+//! seconds have passed; its late records go out under its own name. Within a journal, records
+//! are emitted in order, so a client's position is the last `seq` it has of each journal. A client that
 //! subscribes registers first, then replays page by page (each page's last record is the next
 //! cursor), meanwhile buffering live [`SessionUpdate::Event`]s in a capped buffer (a client that
 //! overflows it is dropped, and resumes from its cursor), and then drops every buffered event at
@@ -34,7 +37,7 @@ use tokio::{
     },
     sync::mpsc,
     task::AbortHandle,
-    time::{Interval, MissedTickBehavior, interval, timeout},
+    time::{Instant, Interval, MissedTickBehavior, interval, timeout},
 };
 
 /// How often every session's journal is read for new records.
@@ -53,6 +56,8 @@ const LINE_LIMIT: u64 = MAX_BRIDGE_LINE as u64 + 1;
 const REGISTRATION_LIMIT: u64 = 1024 * 1024;
 /// The longest `goal` in a `sessions` row, in characters.
 const GOAL_CHARS: usize = 200;
+/// How long a journal the session has moved on from is still read for its last records.
+const FOLLOW_PREVIOUS: Duration = Duration::from_secs(10);
 
 /// What changed in the sessions since the last call to [`Sessions::next`].
 #[derive(Debug, PartialEq)]
@@ -120,12 +125,21 @@ impl Drop for Link {
     }
 }
 
-/// One session: its registration, bridge link, journal tail and what the bridge last said.
+/// A journal the session moved on from, read for its last records until `until`.
+#[derive(Debug)]
+struct Previous {
+    tail: Tail,
+    until: Instant,
+}
+
+/// One session: its registration, bridge link, journal tails and what the bridge last said.
 #[derive(Debug)]
 struct Live {
     registration: Registration,
     link: Option<Link>,
     tail: Option<Tail>,
+    /// Journals it moved on from that may still get records, oldest first.
+    previous: Vec<Previous>,
     state: Option<Value>,
     catalog: Option<Value>,
     last_activity: Option<u64>,
@@ -277,6 +291,7 @@ impl Sessions {
                         registration,
                         link,
                         tail,
+                        previous: Vec::new(),
                         state: None,
                         catalog: None,
                         last_activity,
@@ -446,18 +461,35 @@ impl Sessions {
         self.pending.push_back(update);
     }
 
-    /// Reads every session's journal for records written since the last pass.
+    /// Reads every session's journals for records written since the last pass: the journals
+    /// it moved on from first, each let go once it stops or its time is up, then the newest.
     async fn poll_tails(&mut self) {
+        let now = Instant::now();
         for at in 0..self.live.len() {
             let live = &mut self.live[at];
-            let Some(tail) = live.tail.as_mut() else {
-                continue;
-            };
-            let Ok(records) = tail.read().await else {
-                continue;
-            };
-            let journal = file_name(tail.path());
-            if emit(&mut self.pending, &live.registration.id, &journal, &records) {
+            let id = &live.registration.id;
+            let mut wrote = false;
+            live.previous.retain(|previous| previous.until > now);
+            let mut index = 0;
+            while index < live.previous.len() {
+                let tail = &mut live.previous[index].tail;
+                let found = match tail.read().await {
+                    Ok(records) => emit(&mut self.pending, id, &file_name(tail.path()), &records),
+                    Err(_) => Emitted::default(),
+                };
+                wrote |= found.any;
+                if found.stopped {
+                    live.previous.remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            if let Some(tail) = live.tail.as_mut()
+                && let Ok(records) = tail.read().await
+            {
+                wrote |= emit(&mut self.pending, id, &file_name(tail.path()), &records).any;
+            }
+            if wrote {
                 live.last_activity = activity(&live.registration.journals).await;
             }
         }
@@ -511,10 +543,26 @@ fn shows_differently(old: &Registration, new: &Registration) -> bool {
     )
 }
 
-/// Queues an event for each record `records` holds; true if there was any.
-fn emit(pending: &mut VecDeque<SessionUpdate>, id: &str, journal: &str, records: &[Value]) -> bool {
-    let before = pending.len();
+/// What [`emit`] queued.
+#[derive(Debug, Default, Clone, Copy)]
+struct Emitted {
+    /// Any event.
+    any: bool,
+    /// A `stopped` record: the journal's session has ended.
+    stopped: bool,
+}
+
+/// Queues an event for each record `records` holds.
+fn emit(
+    pending: &mut VecDeque<SessionUpdate>,
+    id: &str,
+    journal: &str,
+    records: &[Value],
+) -> Emitted {
+    let mut emitted = Emitted::default();
     for (seq, record) in records.iter().filter_map(event_of) {
+        emitted.any = true;
+        emitted.stopped |= record["type"] == "stopped";
         pending.push_back(SessionUpdate::Event {
             id: id.to_owned(),
             journal: journal.to_owned(),
@@ -522,12 +570,13 @@ fn emit(pending: &mut VecDeque<SessionUpdate>, id: &str, journal: &str, records:
             record,
         });
     }
-    pending.len() > before
+    emitted
 }
 
 /// Moves `live`'s tail to the newest of `journals`. What the old journal has left is emitted
 /// first, then every journal between whole (every earlier one when it had no tail or its journal
-/// left the list), and the tail starts the newest from its first byte.
+/// left the list), and the tail starts the newest from its first byte. Each journal it moves on
+/// from without a `stopped` record is kept in `previous`, to be read for a while longer.
 async fn follow(live: &mut Live, journals: &[PathBuf], pending: &mut VecDeque<SessionUpdate>) {
     let Some(newest) = journals.last() else {
         return;
@@ -537,32 +586,35 @@ async fn follow(live: &mut Live, journals: &[PathBuf], pending: &mut VecDeque<Se
         return;
     }
     let id = live.registration.id.clone();
-    if let Some(tail) = live.tail.as_mut() {
-        drain(tail, &id, pending).await;
-    }
+    let until = Instant::now() + FOLLOW_PREVIOUS;
+    let mut passed: Vec<Tail> = live.tail.take().into_iter().collect();
     // Journals before the newest that this tail has not passed come whole: all of the new
     // ones when it had none or its journal left the list, those after its journal otherwise.
     let start = current
         .and_then(|c| journals.iter().position(|j| *j == c))
         .map_or(0, |at| at + 1);
     let between = journals.get(start..journals.len() - 1).unwrap_or_default();
-    for path in between {
-        drain(&mut Tail::new(path.clone()), &id, pending).await;
+    passed.extend(between.iter().map(|path| Tail::new(path.clone())));
+    for mut tail in passed {
+        if !drain(&mut tail, &id, pending).await {
+            live.previous.push(Previous { tail, until });
+        }
     }
     live.tail = Some(Tail::new(newest.clone()));
 }
 
-/// Queues the events of everything `tail` has left to read.
-async fn drain(tail: &mut Tail, id: &str, pending: &mut VecDeque<SessionUpdate>) {
+/// Queues the events of everything `tail` has left to read; whether one was a `stopped` record.
+async fn drain(tail: &mut Tail, id: &str, pending: &mut VecDeque<SessionUpdate>) -> bool {
     let journal = file_name(tail.path());
+    let mut stopped = false;
     loop {
         let before = tail.offset();
         let Ok(records) = tail.read().await else {
-            return;
+            return stopped;
         };
-        emit(pending, id, &journal, &records);
+        stopped |= emit(pending, id, &journal, &records).stopped;
         if tail.offset() <= before {
-            return;
+            return stopped;
         }
     }
 }
@@ -842,6 +894,16 @@ mod tests {
                 writeln!(file, "{line}").unwrap();
             }
         }
+
+        /// Appends one record of `kind` to the journal `name`.
+        fn record(&self, name: &str, seq: u64, kind: &str) {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(self.root.join(name))
+                .unwrap();
+            let line = json!({"format": "octet-preview-1", "seq": seq, "type": kind, "data": null});
+            writeln!(file, "{line}").unwrap();
+        }
     }
 
     impl Drop for Env {
@@ -894,6 +956,64 @@ mod tests {
         assert_eq!(event(&got[2]), ("session-2-1.jsonl", 1));
         env.journal("session-2-1.jsonl", 2..3);
         assert_eq!(event(&next(&mut sessions).await), ("session-2-1.jsonl", 2));
+    }
+
+    #[tokio::test]
+    async fn the_previous_journal_is_followed_until_it_stops() {
+        let (old, new) = ("session-1-1.jsonl", "session-2-1.jsonl");
+        let env = Env::new();
+        env.journal(old, 0..2);
+        let one = env.registration(4080, &[old]);
+        let _bridge = Env::listen(&one);
+        one.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        env.journal(new, 0..1);
+        env.registration(4080, &[old, new])
+            .write(&env.run)
+            .await
+            .unwrap();
+        sessions.refresh().await;
+        assert_eq!(event(&next(&mut sessions).await), (new, 0));
+        // The old session's last words land after the switch: they still arrive, once.
+        env.record(old, 2, "usage");
+        assert_eq!(event(&next(&mut sessions).await), (old, 2));
+        env.record(old, 3, "stopped");
+        assert_eq!(event(&next(&mut sessions).await), (old, 3));
+        // After its stop record the old journal is let go.
+        env.record(old, 4, "error");
+        env.journal(new, 1..2);
+        assert_eq!(event(&next(&mut sessions).await), (new, 1));
+        let quiet = timeout(Duration::from_millis(400), sessions.next()).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+    }
+
+    #[tokio::test]
+    async fn the_previous_journal_is_let_go_after_ten_seconds() {
+        let (old, new) = ("session-1-1.jsonl", "session-2-1.jsonl");
+        let env = Env::new();
+        env.journal(old, 0..1);
+        let one = env.registration(4081, &[old]);
+        let _bridge = Env::listen(&one);
+        one.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        env.journal(new, 0..1);
+        env.registration(4081, &[old, new])
+            .write(&env.run)
+            .await
+            .unwrap();
+        sessions.refresh().await;
+        assert_eq!(event(&next(&mut sessions).await), (new, 0));
+        assert_eq!(sessions.live[0].previous.len(), 1);
+        // Its ten seconds are up: a record written after is not read.
+        sessions.live[0].previous[0].until = Instant::now();
+        env.record(old, 1, "usage");
+        let quiet = timeout(Duration::from_millis(400), sessions.next()).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+        assert!(sessions.live[0].previous.is_empty());
     }
 
     #[tokio::test]
