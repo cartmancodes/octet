@@ -7,7 +7,15 @@ import { createStore, useStore, type StoreApi } from "zustand";
 
 import type { BatchItem, HubClient, HubState } from "./client/HubClient";
 import { ENGINES, MODES, PHASES, count, member } from "./model/enums";
-import { EMPTY_VIEW, reduceView, type Op, type PendingApproval, type SessionState, type SessionView } from "./model/session";
+import {
+  EMPTY_VIEW,
+  reduceView,
+  type Op,
+  type PendingApproval,
+  type SessionState,
+  type SessionView,
+  type TurnEnd,
+} from "./model/session";
 import type { Entry } from "./model/transcript";
 import { FIELD_CHARS, field } from "./model/text";
 import { isKnownEvent, type CatalogInfo, type SessionInfo } from "./protocol";
@@ -146,15 +154,22 @@ export function createOctetStore(): OctetStore {
       }
 
       // A listed session is live; one that was listed and is not now has ended, and keeps its view.
+      // One refused for good that comes into the list is a session again (it started since a deep
+      // link asked for it, or started over under its id): its failure is over.
       const ended: string[] = [];
       if (sessions !== before) {
         const now = new Set(sessions.map((s) => s.id));
+        const was = new Set(before.map((s) => s.id));
         for (const s of before) {
           if (now.has(s.id)) continue;
           ended.push(s.id);
           if (bySession.has(s.id) || ops.has(s.id)) push(s.id, { op: "ended", ended: true });
         }
-        for (const id of now) if (bySession.get(id)?.ended) push(id, { op: "ended", ended: false });
+        for (const id of now) {
+          const old = bySession.get(id);
+          if (old?.ended) push(id, { op: "ended", ended: false });
+          if (old?.failed != null && !was.has(id)) push(id, { op: "failed", reason: null });
+        }
       }
       let views: Map<string, SessionView> | null = null;
       for (const [session, list] of ops) {
@@ -231,6 +246,10 @@ export function connectStore(store: OctetStore, client: HubClient, options: Conn
   };
   const offBatch = client.onBatch((frames) => {
     const state = store.getState();
+    // Only a list can end a failure: look for failed views only when one came.
+    const failed = frames.some((f) => f.type === "sessions")
+      ? [...state.bySession].flatMap(([id, v]) => (v.failed !== null ? [id] : []))
+      : [];
     for (const ended of state.applyBatch(frames)) {
       cancel(ended);
       // Nothing to hold for a screen: the client lets it go now rather than never.
@@ -248,6 +267,12 @@ export function connectStore(store: OctetStore, client: HubClient, options: Conn
     }
     // A session listed again is live: its timer goes.
     for (const [session] of timers) if (store.getState().bySession.get(session)?.ended === false) cancel(session);
+    // A failure the list ended: the screen showing the session streams it again.
+    for (const session of failed) {
+      if (shown(client).has(session) && store.getState().bySession.get(session)?.failed === null) {
+        watch(store, client, session);
+      }
+    }
   });
   const offState = client.onState((state) => store.getState().setHub(state));
   const offFailed = client.onSubscribeFailed((session, refusal) => {
@@ -280,18 +305,29 @@ const requested = (client: HubClient): Set<string> => {
   return set;
 };
 
+/** The sessions each client streams for a screen (watched and not since unwatched). Unlike
+ * `requested`, a refusal does not take a session out: its screen still shows it. */
+const screens = new WeakMap<HubClient, Set<string>>();
+const shown = (client: HubClient): Set<string> => {
+  let set = screens.get(client);
+  if (!set) screens.set(client, (set = new Set()));
+  return set;
+};
+
 /** Streams `session`. One the store holds nothing of, and that was not asked for yet, subscribes
  * fresh, from the start of its journal: cursors are only in memory, so a cold start has no
  * transcript to resume. Asking again changes nothing. */
 export function watch(store: OctetStore, client: HubClient, session: string): void {
   const fresh = !store.getState().bySession.has(session) && !requested(client).has(session);
   requested(client).add(session);
+  shown(client).add(session);
   client.subscribe(session, fresh);
 }
 
 /** Stops streaming `session`; the store keeps what it holds, and a later `watch` resumes. */
 export function unwatch(client: HubClient, session: string): void {
   requested(client).delete(session);
+  shown(client).delete(session);
   client.unsubscribe(session);
 }
 
@@ -356,6 +392,8 @@ export function bindHooks(store: OctetStore) {
         }),
       ),
     useHub: (): HubState => useStore(store, (s) => s.hub),
+    /** How the session's last turn ended, for its mascot; null before one ends and while one runs. */
+    useSessionTurn: (id: string): TurnEnd | null => useStore(store, (s) => s.bySession.get(id)?.turn ?? null),
   };
 }
 
@@ -374,4 +412,5 @@ export const {
   useCatalog,
   useCatalogs,
   useHub,
+  useSessionTurn,
 } = bindHooks(octetStore);

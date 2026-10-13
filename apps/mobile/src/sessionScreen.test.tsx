@@ -310,6 +310,34 @@ describe("the Session screen", () => {
     });
   });
 
+  describe("the mascot", () => {
+    const mascot = () => within(screen.getByTestId("session-mascot")).getByLabelText(/^Octet, /);
+    const approvalEvent = (id: number, action: string) =>
+      ev({ type: "approval", data: { id, detail: "", summary: { action, command: null, files: [], cwd: null, scope: "once" } } });
+    it("shows the session's state in the header: running, idle, and how the turn ended", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+      expect(mascot().props.accessibilityLabel).toBe("Octet, idle");
+      expect(mascot().props.width).toBe(59);
+      await feed(rig, ev({ type: "started", data: null }), stateFrame({ phase: "running", now: "Running Edit src/main.rs" }));
+      expect(mascot().props.accessibilityLabel).toBe("Octet, coding");
+      await feed(rig, stateFrame({ phase: "running", now: "Thinking" }));
+      expect(mascot().props.accessibilityLabel).toBe("Octet, thinking");
+      await feed(rig, ev({ type: "finished", data: "completed" }), stateFrame({ phase: "idle" }));
+      expect(mascot().props.accessibilityLabel).toBe("Octet, success");
+      await feed(rig, approvalEvent(1, "Run tests"));
+      expect(mascot().props.accessibilityLabel).toBe("Octet, approval");
+    });
+
+    it("shows error after a failed turn", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), ev({ type: "error", data: "The model is overloaded" }), stateFrame({ phase: "idle" }));
+      expect(mascot().props.accessibilityLabel).toBe("Octet, error");
+    });
+  });
+
   describe("the Task strip", () => {
     it("shows the goal and its turns, NOW, and the queue's first lines and count, and collapses", async () => {
       const rig = await launch([info("a")]);
@@ -559,6 +587,20 @@ describe("the Session screen", () => {
       // An ended session takes no commands: the button goes with the controls.
       await feed(rig, { type: "sessions", sessions: [] });
       expect(screen.queryByRole("button", { name: "Mode and model" })).toBeNull();
+    });
+
+    it("an approval that comes while the mode sheet is open is pointed out there", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), {
+        type: "catalog",
+        session: "a",
+        catalog: { modes: ["ask", "auto"], current_mode: "ask", models: [], current: null },
+      });
+      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
+      expect(screen.queryByText("An approval is waiting \u2014 close this to answer it.")).toBeNull();
+      await feed(rig, approvalEvent(1, "Run tests"));
+      expect(screen.getByText("An approval is waiting \u2014 close this to answer it.")).toBeTruthy();
     });
 
     it("has none of them for a session that is gone", async () => {

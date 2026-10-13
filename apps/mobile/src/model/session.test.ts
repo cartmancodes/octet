@@ -230,3 +230,28 @@ describe("failed", () => {
     expect(v.transcript.entries).toHaveLength(1);
   });
 });
+
+describe("how the last turn ended, for the mascot", () => {
+  const finished = (data: string): Op => ev({ type: "finished", data });
+  it("is unknown until a turn ends, and again once the next one starts", () => {
+    expect(view([]).turn).toBeNull();
+    expect(view([ev({ type: "started", data: null })]).turn).toBeNull();
+    expect(view([finished("completed"), ev({ type: "started", data: null })]).turn).toBeNull();
+  });
+  it("is finished after a completed turn, stopped after an interrupted one, failed otherwise (as the terminal UI)", () => {
+    expect(view([finished("completed")]).turn).toBe("finished");
+    expect(view([finished("interrupted")]).turn).toBe("stopped");
+    expect(view([finished("failed")]).turn).toBe("failed");
+    expect(view([finished("inProgress")]).turn).toBe("failed");
+  });
+  it("is failed after an error record, which a later stop does not hide", () => {
+    expect(view([ev({ type: "error", data: "boom" })]).turn).toBe("failed");
+    expect(view([ev({ type: "error", data: "boom" }), ev({ type: "stopped", data: null })]).turn).toBe("failed");
+    expect(view([finished("completed"), ev({ type: "stopped", data: null })]).turn).toBe("stopped");
+  });
+  it("is cleared by a ready record and by a replay from the start", () => {
+    expect(view([finished("completed"), ev({ type: "ready", data: "sess-1" })]).turn).toBeNull();
+    expect(view([finished("completed"), { op: "reset" }]).turn).toBeNull();
+  });
+});
+

@@ -4,6 +4,7 @@ import type { HubState } from "./client/HubClient";
 import type { Activity } from "./mascot/state";
 import { poseFor } from "./mascot/state";
 import type { PoseName } from "./mascot/poses";
+import type { TurnEnd } from "./model/session";
 import type { Engine, Phase, SessionInfo } from "./protocol";
 
 /** The last component of a workspace path ("/Users/me/Octet/" -> "Octet"). */
@@ -65,8 +66,10 @@ function runningActivity(now: string | null | undefined): Activity {
   return { kind: "replying" };
 }
 
-/** The mascot pose of one session, by the same mapping as the terminal UI's. */
-export function sessionPose(s: SessionInfo): PoseName {
+/** The mascot pose of one session, by the same mapping as the terminal UI's: an approval
+ * waiting, else the running turn's activity, a stopped connection asleep, and otherwise how the
+ * last turn ended (success, error) when known, else idle. */
+export function poseOf(s: { approvals: number; phase: Phase; now?: string | null; turn?: TurnEnd | null }): PoseName {
   if (s.approvals > 0) return poseFor({ kind: "approval" });
   switch (s.phase) {
     case "running":
@@ -74,9 +77,12 @@ export function sessionPose(s: SessionInfo): PoseName {
     case "stopped":
       return poseFor({ kind: "stopped" });
     default:
-      return poseFor({ kind: "idle" });
+      return poseFor(s.turn ? { kind: s.turn } : { kind: "idle" });
   }
 }
+
+/** The pose of a listed session: the list does not say how its last turn ended. */
+export const sessionPose = (s: SessionInfo): PoseName => poseOf(s);
 
 /** The header mascot: the worst state across the sessions. A Mac that cannot be reached is
  * asleep; otherwise an approval waiting, else the newest running session's pose, else idle. */

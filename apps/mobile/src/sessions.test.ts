@@ -1,5 +1,5 @@
 import type { SessionInfo } from "./protocol";
-import { clipLabel, engineLine, folderName, headerPose, nowText, sessionName, sessionPose, sortSessions } from "./sessions";
+import { clipLabel, engineLine, folderName, headerPose, nowText, poseOf, sessionName, sessionPose, sortSessions } from "./sessions";
 
 const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
   id,
@@ -113,6 +113,21 @@ describe("sessionPose", () => {
     expect(sessionPose(info("a", { phase: "stopped" }))).toBe("sleeping");
     // a stale NOW line does not make a stopped session busy
     expect(sessionPose(info("a", { phase: "idle", now: "Running Bash ls" }))).toBe("idle");
+  });
+});
+
+describe("poseOf: one session's pose, with how its last turn ended", () => {
+  it("shows success after a completed turn and error after a failed one, while idle", () => {
+    expect(poseOf({ approvals: 0, phase: "idle", turn: "finished" })).toBe("success");
+    expect(poseOf({ approvals: 0, phase: "idle", turn: "failed" })).toBe("error");
+    expect(poseOf({ approvals: 0, phase: "idle", turn: "stopped" })).toBe("sleeping");
+    expect(poseOf({ approvals: 0, phase: "idle", turn: null })).toBe("idle");
+  });
+  it("lets an approval, a running turn and a stopped connection come first", () => {
+    expect(poseOf({ approvals: 1, phase: "idle", turn: "failed" })).toBe("approval");
+    expect(poseOf({ approvals: 0, phase: "running", now: "Running Edit a.rs", turn: "finished" })).toBe("coding");
+    expect(poseOf({ approvals: 0, phase: "running", now: null, turn: "failed" })).toBe("thinking");
+    expect(poseOf({ approvals: 0, phase: "stopped", turn: "finished" })).toBe("sleeping");
   });
 });
 

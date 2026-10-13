@@ -23,6 +23,10 @@ export interface PendingApproval extends ApprovalInfo {
  * journal) in `approvals`. */
 export type SessionState = Omit<StateInfo, "approvals">;
 
+/** How the last turn ended, as the terminal UI's mascot tells it (crates/octet-tui/src/app.rs):
+ * a completed turn finished, an interrupted one stopped, anything else (or an error) failed. */
+export type TurnEnd = "finished" | "failed" | "stopped";
+
 export interface SessionView {
   transcript: Transcript;
   state: SessionState | null;
@@ -45,6 +49,8 @@ export interface SessionView {
   /** Moves on at each replay from the start: what the screen keeps by entry key (the groups
    * opened) is forgotten, since keys start over. */
   epoch: number;
+  /** How the last turn ended; null before one ends and while the next runs. */
+  turn: TurnEnd | null;
 }
 
 export const EMPTY_VIEW: SessionView = {
@@ -61,6 +67,7 @@ export const EMPTY_VIEW: SessionView = {
   replaying: false,
   held: null,
   epoch: 0,
+  turn: null,
 };
 
 /** One change to a session's view, in the order the hub sent it. */
@@ -212,6 +219,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         }
         draft = new TranscriptDraft(EMPTY_TRANSCRIPT);
         v.epoch += 1;
+        v.turn = null;
         if (v.approvals.length > 0) v.approvals = [];
         if (v.closed.length > 0) v.closed = [];
         v.failed = null;
@@ -257,6 +265,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
             if (v.approvals.some((a) => a.id === ev.data)) v.approvals = v.approvals.filter((a) => a.id !== ev.data);
             break;
           case "stopped":
+            if (v.turn !== "failed") v.turn = "stopped";
             if (v.approvals.length > 0) {
               v.closed = remember(v.closed, v.approvals.map((a) => a.id)); // nothing would answer them
               v.approvals = [];
@@ -271,6 +280,19 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
             break;
           case "usage":
             if (typeof ev.data === "string") v.usage = str(ev.data, SHORT_CHARS);
+            break;
+          case "started":
+          case "ready":
+            v.turn = null;
+            own().apply(ev);
+            break;
+          case "finished":
+            v.turn = ev.data === "completed" ? "finished" : ev.data === "interrupted" ? "stopped" : "failed";
+            own().apply(ev);
+            break;
+          case "error":
+            v.turn = "failed";
+            own().apply(ev);
             break;
           default:
             own().apply(ev);
@@ -294,6 +316,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.closed === view.closed &&
     v.replaying === view.replaying &&
     v.held === view.held &&
-    v.epoch === view.epoch;
+    v.epoch === view.epoch &&
+    v.turn === view.turn;
   return same ? view : v;
 }

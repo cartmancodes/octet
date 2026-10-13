@@ -1,6 +1,6 @@
 import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
 import { Stack, useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -14,9 +14,11 @@ import { SessionControls } from "../../src/components/SessionControls";
 import { TaskStrip } from "../../src/components/TaskStrip";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
 import { useHubClient } from "../../src/hub";
+import { Mascot } from "../../src/mascot/Mascot";
+import type { PoseName } from "../../src/mascot/poses";
 import type { Entry } from "../../src/model/transcript";
 import { nowLine, queueWords } from "../../src/session";
-import { sessionName } from "../../src/sessions";
+import { poseOf, sessionName } from "../../src/sessions";
 import {
   octetStore,
   releaseSession,
@@ -29,6 +31,7 @@ import {
   useSessionInfo,
   useSessionState,
   useSessionStatus,
+  useSessionTurn,
   useTaskOpen,
   watch,
 } from "../../src/store";
@@ -64,6 +67,7 @@ export default function Session() {
   const taskOpen = useTaskOpen();
   const approvals = useApprovals(id);
   const catalog = useCatalog(id);
+  const turn = useSessionTurn(id);
   const insets = useSafeAreaInsets();
   const setTaskOpen = octetStore.getState().setTaskOpen;
 
@@ -126,6 +130,9 @@ export default function Session() {
   const offline = hub !== "ready";
   const phase = state?.phase ?? info?.phase ?? "idle";
   const queued = queueWords(state).count;
+  // The mascot in the header: this session's state, by the same map as the Sessions list's.
+  const pose = poseOf({ approvals: approvals.length, phase, now: state?.now ?? info?.now, turn });
+  const header = useMemo(() => ({ title, headerRight: () => <HeaderMascot pose={pose} /> }), [title, pose]);
   // The home indicator's room is only needed under the composer; the keyboard covers it.
   const [offset, setOffset] = useState(0);
   const root = useRef<View>(null);
@@ -134,7 +141,7 @@ export default function Session() {
   return (
     <View ref={root} onLayout={measure} style={[styles.screen, { backgroundColor: theme.bg }]}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={offset} style={styles.screen}>
-        <Stack.Screen options={{ title }} />
+        <Stack.Screen options={header} />
         <HubBanner state={hub} announce={focused} />
         {gone ? (
           <View style={styles.gone}>
@@ -196,7 +203,13 @@ export default function Session() {
                   send={send}
                   offline={offline}
                 />
-                <ModeModelSheet session={id} catalog={catalog} send={send} offline={offline} />
+                <ModeModelSheet
+                  session={id}
+                  catalog={catalog}
+                  send={send}
+                  offline={offline}
+                  approval={approvals.length > 0}
+                />
                 <View style={{ paddingBottom: Math.max(insets.bottom, spacing.sm) }}>
                   <Composer session={id} phase={phase} queued={queued} send={send} offline={offline} />
                 </View>
@@ -205,6 +218,18 @@ export default function Session() {
           </>
         )}
       </KeyboardAvoidingView>
+    </View>
+  );
+}
+
+/** The mascot drawn at its smallest crisp size, 59 points (one whole multiple of its width). */
+const MASCOT = 59;
+
+/** The header's mascot. */
+function HeaderMascot({ pose }: { pose: PoseName }) {
+  return (
+    <View testID="session-mascot">
+      <Mascot pose={pose} size={MASCOT} />
     </View>
   );
 }

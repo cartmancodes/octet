@@ -426,6 +426,18 @@ describe("hub state and failures", () => {
     expect(store.getState().hub).toBe("ready");
   });
 
+  it("clears a failure when the session is listed again, and keeps one still unlisted or listed all along", () => {
+    store.getState().applyBatch([sessions(info("b"))]);
+    store.getState().subscribeFailed("a", "No such session");
+    store.getState().subscribeFailed("b", "Not allowed");
+    store.getState().applyBatch([sessions(info("b"), info("c"))]);
+    expect(view("a").failed).toBe("No such session");
+    expect(view("b").failed).toBe("Not allowed"); // listed all along: a list frame is not a new start
+    store.getState().applyBatch([sessions(info("a"), info("b"))]);
+    expect(view("a").failed).toBeNull();
+    expect(view("b").failed).toBe("Not allowed");
+  });
+
   it("marks a session failed", () => {
     store.getState().applyBatch([user("a", "x")]);
     store.getState().subscribeFailed("a", "Not allowed");
@@ -477,6 +489,41 @@ describe("with a client", () => {
     sockets.last.receive({ type: "refused", req, reason: "That session is not allowed", code: "not_allowed" });
     expect(forget).toHaveBeenCalledWith("a");
     expect(view("a").failed).toBe("That session is not allowed");
+    off();
+  });
+
+  it("a session refused for good and then listed again is streamed again while a screen holds it", () => {
+    const { sockets, clock, client, off } = rig();
+    // A deep link to a session the Mac has not started yet: refused, so the screen says why.
+    watch(store, client, "a");
+    const first = sockets.last.commandsOf("subscribe")[0]?.req;
+    sockets.last.receive({ type: "refused", req: first, reason: "No such session", code: "invalid" });
+    expect(view("a").failed).toBe("No such session");
+    sockets.last.receive({ type: "sessions", sessions: [info("b")] });
+    clock.advance(50);
+    expect(view("a").failed).toBe("No such session");
+    expect(sockets.last.commandsOf("subscribe")).toHaveLength(1);
+    // It starts: listed now, so the failure is over and the screen streams it.
+    sockets.last.receive({ type: "sessions", sessions: [info("a"), info("b")] });
+    clock.advance(50);
+    expect(view("a").failed).toBeNull();
+    expect(sockets.last.commandsOf("subscribe").map((c) => c.session)).toEqual(["a", "a"]);
+    // A list that changes again does not ask a second time.
+    sockets.last.receive({ type: "sessions", sessions: [info("a", { phase: "running" }), info("b")] });
+    clock.advance(50);
+    expect(sockets.last.commandsOf("subscribe")).toHaveLength(2);
+    off();
+  });
+
+  it("a session refused and listed again is not streamed when no screen holds it", () => {
+    const { sockets, clock, client, off } = rig();
+    watch(store, client, "a");
+    const req = sockets.last.commandsOf("subscribe")[0]?.req;
+    sockets.last.receive({ type: "refused", req, reason: "No such session", code: "invalid" });
+    unwatch(client, "a"); // the user left its screen (an unlisted failed view is released then)
+    sockets.last.receive({ type: "sessions", sessions: [info("a")] });
+    clock.advance(50);
+    expect(sockets.last.commandsOf("subscribe")).toHaveLength(1);
     off();
   });
 

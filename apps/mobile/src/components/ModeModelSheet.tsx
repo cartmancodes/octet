@@ -11,6 +11,8 @@ import { FULL_ACCESS_WARNING, FULL_ACCESS_WORDS, useFullAccessArm } from "./full
 import { useAction, type Send } from "./send";
 
 const BIOMETRIC_REASON = "Turn on full access for this session";
+/** Over the open sheet while the session has an approval waiting: the sheet covers the approval. */
+export const APPROVAL_WAITING = "An approval is waiting \u2014 close this to answer it.";
 
 export const MODE_NAMES: Record<Mode, string> = {
   ask: "Ask",
@@ -135,6 +137,13 @@ function makeStyles(theme: Theme) {
     mark: { ...type.caption, color: theme.accent, fontWeight: "700" },
     status: { ...type.caption, color: theme.muted },
     warning: { ...type.caption, color: theme.amber },
+    approval: {
+      ...type.body,
+      color: theme.amber,
+      fontWeight: "600",
+      paddingHorizontal: spacing.lg,
+      paddingBottom: spacing.sm,
+    },
     ask: {
       paddingHorizontal: spacing.lg,
       paddingBottom: spacing.sm,
@@ -225,6 +234,8 @@ interface ModeModelSheetProps {
   send: Send;
   /** The Mac can't be reached: the button and the sheet's choices are disabled. */
   offline?: boolean;
+  /** The session has an approval waiting, which the open sheet would hide. */
+  approval?: boolean;
 }
 
 /**
@@ -239,6 +250,7 @@ export const ModeModelSheet = memo(function ModeModelSheet({
   catalog,
   send,
   offline = false,
+  approval = false,
 }: ModeModelSheetProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
@@ -411,6 +423,11 @@ export const ModeModelSheet = memo(function ModeModelSheet({
             style={StyleSheet.absoluteFill}
           />
           <View style={s.sheet}>
+            {approval ? (
+              <View accessibilityLiveRegion="polite">
+                <Text style={s.approval}>{APPROVAL_WAITING}</Text>
+              </View>
+            ) : null}
             <View style={s.head}>
               <Text accessibilityRole="header" style={s.title}>
                 Mode and model

@@ -560,4 +560,32 @@ describe("the mode and model sheet", () => {
       await settle();
     });
   });
+
+  describe("an approval waiting", () => {
+    const NOTE = "An approval is waiting \u2014 close this to answer it.";
+    const withApproval = (send: ReturnType<typeof rig>["send"], waiting: boolean) => (
+      <ModeModelSheet session="s" catalog={CATALOG} send={send} approval={waiting} />
+    );
+
+    it("says so in amber at the top of the open sheet, as soon as one comes", async () => {
+      const r = rig();
+      const view = await render(withApproval(r.send, false));
+      await press("Mode and model");
+      await settle();
+      expect(screen.queryByText(NOTE)).toBeNull();
+      await view.rerender(withApproval(r.send, true));
+      await settle();
+      const note = screen.getByText(NOTE);
+      expect([dark.amber, light.amber]).toContain(StyleSheet.flatten(note.props.style).color);
+      // It goes when the approval is answered elsewhere.
+      await view.rerender(withApproval(r.send, false));
+      await settle();
+      expect(screen.queryByText(NOTE)).toBeNull();
+    });
+
+    it("is not shown while the sheet is closed", async () => {
+      await render(withApproval(rig().send, true));
+      expect(screen.queryByText(NOTE)).toBeNull();
+    });
+  });
 });
