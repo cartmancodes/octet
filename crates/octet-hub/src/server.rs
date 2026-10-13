@@ -36,7 +36,10 @@
 //! live events the replay already sent can still follow: a live event goes out only if its
 //! `seq` is past the last one sent of its journal. A late record of an older journal (the old
 //! session's last words after a reconnect) is past its journal's mark, so it is sent once. Each
-//! replay page resumes at the byte where the last stopped. Live frames go through a queue of
+//! replay page resumes at the byte where the last stopped, and the first page after a cursor
+//! starts at the last mark at or below it of the hub's journal index (`tail::Index`),
+//! which replays build as they read, so a phone back with its cursor does not have the whole
+//! journal read again. Live frames go through a queue of
 //! 512: a phone that lets it fill is dropped.
 use crate::{
     launch::{self, Launches, StartRequest, clip as clip_to},
@@ -541,6 +544,8 @@ pub struct Hub {
     launches: Launches,
     /// Whether a `recent` scan is running; only one runs at a time (see [`Scanning`]).
     scanning: Arc<AtomicBool>,
+    /// Where seqs are in the journals, for replays after a cursor.
+    index: tail::SharedIndex,
     /// Given to each connection and replay task.
     events: mpsc::Sender<ConnEvent>,
     /// What to push, and when.
@@ -647,6 +652,7 @@ impl Hub {
             directory,
             launches: Launches::default(),
             scanning: Arc::new(AtomicBool::new(false)),
+            index: tail::SharedIndex::default(),
             owner,
             port,
             conns: HashMap::new(),
@@ -1124,6 +1130,7 @@ impl Hub {
             out: state.replay.clone(),
             current: Arc::clone(&current),
             events: self.events.clone(),
+            index: Arc::clone(&self.index),
         };
         let task = tokio::spawn(replay(job)).abort_handle();
         let subscription = Subscription::Replaying {
@@ -1902,6 +1909,8 @@ struct ReplayJob {
     /// Whether the subscription still stands; given to every frame.
     current: Arc<AtomicBool>,
     events: mpsc::Sender<ConnEvent>,
+    /// The hub's index of the journals, which the replay starts from and adds to.
+    index: tail::SharedIndex,
 }
 
 /// Queues `item` for the writer, waiting for room for at most [`WRITE_STALL`]; false if there
@@ -1925,6 +1934,7 @@ async fn replay(job: ReplayJob) {
         out,
         current,
         events,
+        index,
     } = job;
     let mut sent: Vec<(String, u64)> = Vec::new();
     let mut offset = 0;
@@ -1940,8 +1950,12 @@ async fn replay(job: ReplayJob) {
         return;
     }
     loop {
-        let (page, more, end) =
-            tail::replay_from(&journals, after.as_ref(), offset, REPLAY_PAGE).await;
+        let tail::Page {
+            records: page,
+            more,
+            end,
+            ..
+        } = tail::replay_from(&journals, after.as_ref(), offset, REPLAY_PAGE, Some(&index)).await;
         offset = end;
         let Some((journal, seq, _)) = page.last() else {
             break;

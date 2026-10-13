@@ -2,10 +2,11 @@
 use octet_core::remote::protocol::Cursor;
 use serde_json::Value;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::SeekFrom,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 use tokio::{
     fs::File,
@@ -186,20 +187,132 @@ pub(crate) async fn replay(
     after: Option<&Cursor>,
     limit: usize,
 ) -> (Vec<(String, u64, Value)>, bool) {
-    let (records, more, _) = replay_from(journals, after, 0, limit).await;
-    (records, more)
+    let page = replay_from(journals, after, 0, limit, None).await;
+    (page.records, page.more)
+}
+
+/// One page of a replay.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Page {
+    /// `(journal file name, seq, event)`, oldest first.
+    pub records: Vec<(String, u64, Value)>,
+    /// Whether more records follow.
+    pub more: bool,
+    /// The offset just past the last record's line, within that record's journal.
+    pub end: u64,
+    /// The bytes of journal it read.
+    pub read: u64,
+}
+
+/// Records between two marks of a journal in an [`Index`].
+const MARK_EVERY: u64 = 1_000;
+/// Bytes between two marks, if fewer records fill them.
+const MARK_BYTES: u64 = 1024 * 1024;
+/// Marks kept for one journal; past it every other one goes.
+const MARKS_KEPT: usize = 1024;
+/// Journals indexed at once; past it the index starts over.
+const JOURNALS_INDEXED: usize = 256;
+
+/// Where seqs are in journals: for each journal a few marks, `(seq, offset just past that seq's
+/// line)`, about one every 1,000 records, so a replay after a cursor starts at the last mark at
+/// or below it instead of at byte 0. Seqs rise through a journal, so every record before a
+/// mark's offset has a seq at or below the mark's. Replays build it as they read. A journal
+/// replaced (another inode), shorter than a mark, or whose marks disagree starts over.
+#[derive(Debug, Default)]
+pub(crate) struct Index {
+    journals: HashMap<PathBuf, Marks>,
+}
+
+/// An [`Index`] the replay tasks share.
+pub(crate) type SharedIndex = Arc<Mutex<Index>>;
+
+/// The marks of one journal file.
+#[derive(Debug)]
+struct Marks {
+    /// `(device, inode)` of the file they were made in.
+    identity: (u64, u64),
+    /// `(seq, offset)`, both rising.
+    marks: Vec<(u64, u64)>,
+}
+
+impl Index {
+    /// The offset of the last mark at or below `seq` in `path`, which is the file `identity` and
+    /// `len` bytes long now; `None` if none is known or the marks are of another file.
+    fn start(&mut self, path: &Path, identity: (u64, u64), len: u64, seq: u64) -> Option<u64> {
+        let known = self.journals.get(path)?;
+        if known.identity == identity {
+            let at = known.marks.partition_point(|&(marked, _)| marked <= seq);
+            let &(_, offset) = at.checked_sub(1).and_then(|at| known.marks.get(at))?;
+            if offset <= len {
+                return Some(offset);
+            }
+        }
+        self.journals.remove(path);
+        None
+    }
+
+    /// Notes that the line of `seq` in `path` (the file `identity`) ends at `offset`.
+    fn mark(&mut self, path: &Path, identity: (u64, u64), seq: u64, offset: u64) {
+        if !self.journals.contains_key(path) && self.journals.len() >= JOURNALS_INDEXED {
+            self.journals.clear();
+        }
+        let known = self
+            .journals
+            .entry(path.to_owned())
+            .or_insert_with(|| Marks {
+                identity,
+                marks: Vec::new(),
+            });
+        if known.identity != identity {
+            *known = Marks {
+                identity,
+                marks: Vec::new(),
+            };
+        }
+        let at = known.marks.partition_point(|&(marked, _)| marked < seq);
+        let next = known.marks.get(at).copied();
+        if next.is_some_and(|(marked, _)| marked == seq) {
+            return;
+        }
+        let before = at
+            .checked_sub(1)
+            .and_then(|at| known.marks.get(at))
+            .copied();
+        let in_step = before.is_none_or(|(_, earlier)| earlier < offset)
+            && next.is_none_or(|(_, later)| later > offset);
+        if !in_step {
+            // The file is not what the marks say any more.
+            known.marks.clear();
+            known.marks.push((seq, offset));
+            return;
+        }
+        known.marks.insert(at, (seq, offset));
+        if known.marks.len() > MARKS_KEPT {
+            known.marks = known.marks.iter().copied().step_by(2).collect();
+        }
+    }
+}
+
+/// `index`, locked; one a panicking replay left poisoned is still sound (each change is whole).
+fn locked(index: &SharedIndex) -> std::sync::MutexGuard<'_, Index> {
+    index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// [`replay`], starting the cursor's journal at byte `offset` (the offset a previous page
 /// returned; 0 for the first page), and also returning the offset just past the last record's
 /// line, within that record's journal, so the next page reads on from there instead of from
 /// the start. An offset past the end of the file (a replaced journal) reads it from the start.
+/// With an `index`, a first page starts at the cursor journal's last mark at or below the
+/// cursor, and every journal read is marked as it goes.
 pub(crate) async fn replay_from(
     journals: &[PathBuf],
     after: Option<&Cursor>,
     offset: u64,
     limit: usize,
-) -> (Vec<(String, u64, Value)>, bool, u64) {
+    index: Option<&SharedIndex>,
+) -> Page {
     let whole = Start {
         after: None,
         offset: 0,
@@ -221,9 +334,10 @@ pub(crate) async fn replay_from(
         None => (0, whole),
     };
     let mut records = VecDeque::new();
+    let mut read = 0;
     for (n, path) in journals.get(at..).unwrap_or_default().iter().enumerate() {
         let from = if n == 0 { first } else { whole };
-        journal_records(path, from, limit, &mut records).await;
+        read += journal_records(path, from, limit, &mut records, index).await;
         if records.len() > limit {
             break;
         }
@@ -231,7 +345,12 @@ pub(crate) async fn replay_from(
     let more = records.len() > limit;
     records.truncate(limit);
     let end = records.back().map_or(first.offset, |r: &Found| r.3);
-    (strip(records), more, end)
+    Page {
+        records: strip(records),
+        more,
+        end,
+        read,
+    }
 }
 
 /// A record found by a replay, and the byte offset just past its line.
@@ -261,44 +380,88 @@ pub(crate) fn file_name(journal: &Path) -> String {
 }
 
 /// Appends to `out` the records of one journal from `from`, a line at a time, and stops once
-/// `out` holds more than `keep`.
-async fn journal_records(path: &Path, from: Start, keep: usize, out: &mut VecDeque<Found>) {
+/// `out` holds more than `keep`; the bytes it read. With an `index`, a start at byte 0 after a
+/// seq starts at the last mark at or below it instead, and the lines read are marked.
+async fn journal_records(
+    path: &Path,
+    from: Start,
+    keep: usize,
+    out: &mut VecDeque<Found>,
+    index: Option<&SharedIndex>,
+) -> u64 {
     let Ok(mut file) = File::open(path).await else {
-        return;
+        return 0;
     };
     let Ok(meta) = file.metadata().await else {
-        return;
+        return 0;
     };
     if !meta.is_file() {
-        return;
+        return 0;
     }
     let mut position = if from.offset <= meta.len() {
         from.offset
     } else {
         0
     };
+    let identity = (meta.dev(), meta.ino());
+    let marked = match (index, from.after) {
+        (Some(index), Some(after)) if position == 0 => {
+            locked(index).start(path, identity, meta.len(), after)
+        }
+        _ => None,
+    };
+    if let Some(marked) = marked
+        && ends_a_line(&mut file, marked).await
+    {
+        position = marked;
+    }
     if file.seek(SeekFrom::Start(position)).await.is_err() {
-        return;
+        return 0;
     }
     let name = file_name(path);
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
+    let mut taken = 0;
+    // Records and bytes since the last mark.
+    let (mut records, mut bytes) = (0, 0);
     while let Some((whole, read)) = next_line(&mut reader, &mut line).await {
         position += read;
+        taken += read;
+        bytes += read;
         let parsed = whole
             .then(|| serde_json::from_slice::<Value>(&line).ok())
             .flatten();
         let Some((seq, event)) = parsed.as_ref().and_then(event_of) else {
             continue;
         };
+        records += 1;
+        if let Some(index) = index
+            && (records >= MARK_EVERY || bytes >= MARK_BYTES)
+        {
+            locked(index).mark(path, identity, seq, position);
+            (records, bytes) = (0, 0);
+        }
         if from.after.is_some_and(|after| seq <= after) {
             continue;
         }
         out.push_back((name.clone(), seq, event, position));
         if out.len() > keep {
-            return;
+            return taken;
         }
     }
+    taken
+}
+
+/// Whether the byte before `offset` in `file` is a newline, as before a mark's line: a check
+/// that the file still has a line boundary where the mark says.
+async fn ends_a_line(file: &mut File, offset: u64) -> bool {
+    let Some(before) = offset.checked_sub(1) else {
+        return true;
+    };
+    let mut byte = [0; 1];
+    file.seek(SeekFrom::Start(before)).await.is_ok()
+        && file.read_exact(&mut byte).await.is_ok()
+        && byte == *b"\n"
 }
 
 /// Reads the next line of `reader` into `line` (newline removed), with the bytes it took.
@@ -570,7 +733,7 @@ mod tests {
             .len() as u64
         };
         let journals = [a.clone(), b];
-        let (page, more, offset) = replay_from(&journals, Some(&after("a.jsonl", 0)), 0, 4).await;
+        let (page, more, offset) = paged(&journals, Some(&after("a.jsonl", 0)), 0, 4).await;
         assert_eq!(
             marks(&page),
             ["a.jsonl1", "a.jsonl2", "a.jsonl3", "a.jsonl4"]
@@ -585,24 +748,102 @@ mod tests {
         assert_ne!(swapped, text);
         text = swapped;
         std::fs::write(&a, &text).unwrap();
-        let (page, more, offset) =
-            replay_from(&journals, Some(&after("a.jsonl", 4)), offset, 4).await;
+        let (page, more, offset) = paged(&journals, Some(&after("a.jsonl", 4)), offset, 4).await;
         assert_eq!(
             marks(&page),
             ["a.jsonl5", "a.jsonl6", "a.jsonl7", "a.jsonl8"]
         );
         assert!(more);
         // Across a journal boundary the offset is within the journal of the last record.
-        let (page, more, offset) =
-            replay_from(&journals, Some(&after("a.jsonl", 8)), offset, 2).await;
+        let (page, more, offset) = paged(&journals, Some(&after("a.jsonl", 8)), offset, 2).await;
         assert_eq!(marks(&page), ["a.jsonl9", "b.jsonl0"]);
         assert!(more);
         assert_eq!(offset, line(0));
-        let (page, more, _) = replay_from(&journals, Some(&after("b.jsonl", 0)), offset, 5).await;
+        let (page, more, _) = paged(&journals, Some(&after("b.jsonl", 0)), offset, 5).await;
         assert_eq!(marks(&page), ["b.jsonl1", "b.jsonl2"]);
         assert!(!more);
         // An offset past the end of a replaced, shorter file starts it over.
-        let (page, _, _) = replay_from(&journals, Some(&after("b.jsonl", 0)), 1 << 40, 5).await;
+        let (page, _, _) = paged(&journals, Some(&after("b.jsonl", 0)), 1 << 40, 5).await;
         assert_eq!(marks(&page), ["b.jsonl1", "b.jsonl2"]);
+    }
+
+    /// [`replay_from`] without an index: the records, whether more follow, and the end offset.
+    async fn paged(
+        journals: &[PathBuf],
+        after: Option<&Cursor>,
+        offset: u64,
+        limit: usize,
+    ) -> (Vec<(String, u64, Value)>, bool, u64) {
+        let page = replay_from(journals, after, offset, limit, None).await;
+        (page.records, page.more, page.end)
+    }
+
+    #[tokio::test]
+    async fn an_indexed_journal_replays_from_near_the_cursor() {
+        let dir = temp("octet-hub-index");
+        let path = journal(dir.path(), "a.jsonl", 0..50_000);
+        let journals = [path.clone()];
+        let index = SharedIndex::default();
+        let near_end = after("a.jsonl", 49_998);
+        // Nothing marked yet: the first replay reads the journal from byte 0, marking it.
+        let first = replay_from(&journals, Some(&near_end), 0, 500, Some(&index)).await;
+        assert_eq!(marks(&first.records), ["a.jsonl49999"]);
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(first.read, size);
+        // Marked: the same replay reads about one mark's stride, not the file.
+        let again = replay_from(&journals, Some(&near_end), 0, 500, Some(&index)).await;
+        assert_eq!(again.records, first.records);
+        assert!(again.read < 128 * 1024, "read {} of {size}", again.read);
+        // No gap or repeat at, around or between marks, or at either end.
+        for seq in [
+            0, 1, 998, 999, 1_000, 1_001, 1_999, 25_000, 48_999, 49_000, 49_999,
+        ] {
+            let cursor = after("a.jsonl", seq);
+            let with = replay_from(&journals, Some(&cursor), 0, 3, Some(&index)).await;
+            let without = paged(&journals, Some(&cursor), 0, 3).await;
+            assert_eq!((with.records, with.more, with.end), without, "after {seq}");
+        }
+        // Another file in its place (a new inode) is read from its start.
+        let other = dir.path().join("other.jsonl");
+        std::fs::rename(journal(dir.path(), "b.jsonl", 0..10), &other).unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        let replaced =
+            replay_from(&journals, Some(&after("a.jsonl", 6)), 0, 500, Some(&index)).await;
+        assert_eq!(
+            marks(&replaced.records),
+            ["a.jsonl7", "a.jsonl8", "a.jsonl9"]
+        );
+    }
+
+    #[test]
+    fn an_index_keeps_its_marks_in_step_and_bounded() {
+        let mut index = Index::default();
+        let path = Path::new("/j/a.jsonl");
+        let file = (1, 2);
+        index.mark(path, file, 1_000, 70_000);
+        index.mark(path, file, 2_000, 140_000);
+        assert_eq!(index.start(path, file, 200_000, 999), None);
+        assert_eq!(index.start(path, file, 200_000, 1_500), Some(70_000));
+        assert_eq!(index.start(path, file, 200_000, 9_999), Some(140_000));
+        // Of another file, or past the end of this one: forgotten.
+        assert_eq!(index.start(path, (1, 3), 200_000, 1_500), None);
+        index.mark(path, file, 1_000, 70_000);
+        assert_eq!(index.start(path, file, 100, 1_500), None);
+        assert!(index.journals.is_empty());
+        // A mark out of step with the others (a rewritten file) starts them over.
+        index.mark(path, file, 1_000, 70_000);
+        index.mark(path, file, 2_000, 10);
+        assert_eq!(index.journals[path].marks, [(2_000, 10)]);
+        // Thinned past the cap, never longer.
+        for n in 1..=5_000u64 {
+            index.mark(path, file, 2_000 + n * 1_000, 10 + n * 70_000);
+        }
+        assert!(index.journals[path].marks.len() <= MARKS_KEPT);
+        assert_eq!(index.start(path, file, u64::MAX, 2_000), Some(10));
+        // Bounded in journals too.
+        for n in 0..=JOURNALS_INDEXED {
+            index.mark(Path::new(&format!("/j/{n}.jsonl")), file, 1, 1);
+        }
+        assert!(index.journals.len() <= JOURNALS_INDEXED);
     }
 }
