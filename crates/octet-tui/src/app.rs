@@ -831,6 +831,19 @@ impl App {
         self.status(StatusKind::Plain, &text);
         self.add(Role::Notice, &text);
     }
+    /// The sequence number of the latest transcript entry, to tell later ones apart.
+    pub(crate) fn last_seq(&self) -> u64 {
+        self.chat.next_seq
+    }
+    /// Puts `prefix` before the text of every entry added after `seq`.
+    pub(crate) fn prefix_since(&mut self, seq: u64, prefix: &str) {
+        for entry in self.chat.entries.iter_mut().filter(|e| e.seq > seq) {
+            entry.text.insert_str(0, prefix);
+            entry.invalidate();
+            self.chat.bytes += prefix.len();
+        }
+        self.trim();
+    }
     /// Adds a notice to the transcript without touching the status line, for text like a pairing secret.
     pub(crate) fn note_apart(&mut self, text: impl Into<String>) {
         self.add(Role::Notice, &text.into());

@@ -38,7 +38,7 @@ async fn a_remote_prompt_sends_or_queues_like_enter() {
     idle(&mut app);
     let vendor = RecordingVendor::default();
     let (result, action) = run(&mut app, &vendor, prompt("hello")).await;
-    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(result, Ok("Sent".into()));
     assert!(matches!(action, Action::Continue));
     assert_eq!(vendor.sent.borrow().len(), 1);
     assert!(app.conn.is_running());
@@ -187,10 +187,18 @@ async fn remote_steer_mirrors_the_steer_command() {
     app.conn.start_turn();
     let vendor = RecordingVendor::default();
     let (result, _) = run(&mut app, &vendor, steer("look at docs")).await;
-    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(result, Ok("Steering".into()));
     assert!(matches!(
         &vendor.sent.borrow()[..],
         [Command::Steer(text)] if text == "look at docs"
+    ));
+    // Idle, a steer goes as a prompt, as `/steer` does at the desk.
+    idle(&mut app);
+    let (result, _) = run(&mut app, &vendor, steer("start here")).await;
+    assert_eq!(result, Ok("Sent as a prompt".into()));
+    assert!(matches!(
+        vendor.sent.borrow().last(),
+        Some(Command::Prompt(text)) if text == "start here"
     ));
     let config = Config::new(Engine::CLAUDE, "claude", "/tmp");
     let mut app = App::new(&config, "journal".into());
@@ -400,6 +408,68 @@ async fn slash_text_is_refused_for_prompts_and_steers() {
         }
     }
     assert!(vendor.sent.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_remote_command_names_its_device_on_the_desk() {
+    const FROM: &str = "Refused from iPhone 15: ";
+    let vendor = RecordingVendor::default();
+    // Whatever a refusal adds to the transcript or the status line names the device.
+    let added = |app: &App, before: usize| -> Vec<String> {
+        app.chat
+            .entries
+            .iter()
+            .skip(before)
+            .map(|entry| entry.text.clone())
+            .collect()
+    };
+    // A mode change while one is pending: the mode command notes why.
+    let mut app = app();
+    idle(&mut app);
+    app.conn.mode_pending = Some(Mode::Auto);
+    let before = app.chat.entries.len();
+    let (result, _) = run(&mut app, &vendor, mode("accept-edits", None)).await;
+    let reason = "Mode change pending; wait for the vendor to confirm";
+    assert_eq!(result, Err(reason.into()));
+    assert_eq!(added(&app, before), [format!("{FROM}{reason}")]);
+    assert_eq!(app.status_line, format!("{FROM}{reason}"));
+    // A model change during a turn: the model command hints why.
+    let mut app = super::app();
+    app.models.catalogs.set(
+        Engine::CLAUDE,
+        vec![octet_core::ModelInfo {
+            selection: "opus".into(),
+            id: Some("opus".into()),
+            name: "opus".into(),
+            description: String::new(),
+        }],
+        std::time::SystemTime::now(),
+    );
+    app.conn.start_turn();
+    let before = app.chat.entries.len();
+    let select = BridgeCommand::SetModel {
+        selection: "opus".into(),
+    };
+    let (result, _) = run(&mut app, &vendor, select).await;
+    assert_eq!(result, Err(TURN_OPEN.into()));
+    assert!(added(&app, before).is_empty());
+    assert_eq!(app.status_line, format!("{FROM}{TURN_OPEN}"));
+    // A prompt into a full queue.
+    for _ in 0..crate::app::QUEUE_LIMIT {
+        run(&mut app, &vendor, prompt("more")).await;
+    }
+    let (result, _) = run(&mut app, &vendor, prompt("one too many")).await;
+    let reason = result.expect_err("the queue is full");
+    assert_eq!(app.status_line, format!("{FROM}{reason}"));
+    // A refusal the desk was never told of stays off it.
+    let mut app = super::app();
+    idle(&mut app);
+    app.hint("desk status");
+    let before = app.chat.entries.len();
+    let (result, _) = run(&mut app, &vendor, BridgeCommand::Cancel).await;
+    assert_eq!(result, Err("No turn is running".into()));
+    assert!(added(&app, before).is_empty());
+    assert_eq!(app.status_line, "desk status");
 }
 
 #[tokio::test]

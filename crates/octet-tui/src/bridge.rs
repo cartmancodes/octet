@@ -158,6 +158,15 @@ fn bad_line_req(text: &str) -> u64 {
         .unwrap_or_default()
 }
 
+/// A parse refusal as the bridge says it. The protocol's parser words a version mismatch for the
+/// hub refusing a phone ("this hub speaks"); here the bridge refuses the hub.
+fn bridge_words(reason: String) -> String {
+    match reason.strip_prefix("Unsupported protocol version; this hub ") {
+        Some(rest) => format!("Unsupported protocol version; the hub {rest}"),
+        None => reason,
+    }
+}
+
 /// Reads a hub's command lines. A bad line is refused to that hub alone; a good one goes to the
 /// interface. Ends when the hub goes or sends a message over the limit; `reading` is dropped then.
 async fn read_peer(
@@ -214,7 +223,7 @@ async fn read_peer(
                     return;
                 }
             }
-            Err(reason) => refuse(bad_line_req(text), Code::Invalid, &reason),
+            Err(reason) => refuse(bad_line_req(text), Code::Invalid, &bridge_words(reason)),
         }
     }
 }
@@ -262,10 +271,11 @@ pub(crate) async fn handle_remote(
     } else {
         None
     };
+    let (seq, status) = (app.last_seq(), app.status_line.clone());
     let done = run_remote(app, vendor, remote.command, desk, &mut action).await;
+    let by = device_name(&remote.by);
     match done {
         Ok((what, reply)) => {
-            let by = device_name(&remote.by);
             app.note(format!("{what} from {by}"));
             // The note must not hide that a cancel is under way.
             if app.conn.is_cancelling() {
@@ -273,7 +283,17 @@ pub(crate) async fn handle_remote(
             }
             (Ok(reply), action)
         }
-        Err(reason) => (Err(reason), Action::Continue),
+        Err(reason) => {
+            // The desk's own refusal text, put there by the command run for the phone, says who
+            // asked: the desk user typed none of it.
+            let refused = format!("Refused from {by}: ");
+            app.prefix_since(seq, &refused);
+            if app.status_line != status {
+                let kind = app.status_kind;
+                app.status(kind, &format!("{refused}{}", app.status_line));
+            }
+            (Err(reason), Action::Continue)
+        }
     }
 }
 
@@ -359,11 +379,17 @@ async fn run_remote(
     match command {
         BridgeCommand::Prompt { text } => {
             plain_text(&text)?;
-            if send_remote_prompt(app, vendor, text) {
-                Ok(("Prompt".into(), app.status_line.clone()))
-            } else {
-                Err(app.status_line.clone())
+            let waiting = app.composer.queue.len();
+            if !send_remote_prompt(app, vendor, text) {
+                return Err(app.status_line.clone());
             }
+            // Queued, the status line says how many wait, as Enter's does.
+            let reply = if app.composer.queue.len() > waiting {
+                app.status_line.clone()
+            } else {
+                "Sent".into()
+            };
+            Ok(("Prompt".into(), reply))
         }
         BridgeCommand::Answer { approval, allow } => {
             // A double tap meant for the last approval must not answer this one.
@@ -388,14 +414,17 @@ async fn run_remote(
         }
         BridgeCommand::Steer { text } => {
             plain_text(&text)?;
-            let waiting = app.composer.queue.len();
+            let (waiting, running) = (app.composer.queue.len(), app.conn.is_running());
             if !steer_with(app, vendor, text, send_remote_prompt) {
                 return Err(app.status_line.clone());
             }
+            // Queued, the status line has the desk's words for why.
             let reply = if app.composer.queue.len() > waiting {
                 app.status_line.clone()
-            } else {
+            } else if running {
                 "Steering".into()
+            } else {
+                "Sent as a prompt".into()
             };
             Ok(("Steer".into(), reply))
         }
@@ -1391,6 +1420,30 @@ mod tests {
             (refused["type"].as_str(), refused["req"].as_u64()),
             (Some("refused"), Some(7)),
             "{refused}"
+        );
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_hub_on_another_protocol_version_is_told_which_the_hub_speaks() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-version");
+        let dir = temp.path().to_path_buf();
+        let mut bridge = Bridge::start(&dir, true, None).await;
+        let (app, config) = demo();
+        bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
+        let regs = registrations(&run_dir(&dir)).await;
+        let (mut lines, mut write) = connect(&regs[0].socket).await;
+        let _ = first_line(&mut bridge, &app, &mut lines).await;
+        let _ = next_line(&mut lines).await;
+        write
+            .write_all(b"{\"v\":2,\"req\":4,\"type\":\"cancel\",\"by\":\"p\"}\n")
+            .await
+            .unwrap();
+        let refused: Value = serde_json::from_str(&next_line(&mut lines).await).unwrap();
+        assert_eq!(refused["req"], 4, "{refused}");
+        assert_eq!(
+            refused["reason"],
+            "Unsupported protocol version; the hub speaks version 1"
         );
         bridge.stop().await;
     }
