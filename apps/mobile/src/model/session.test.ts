@@ -188,6 +188,18 @@ describe("a_reset_replaces_the_transcript", () => {
     expect(after.approvals).toEqual([]);
   });
 
+  it("keeps an approval the latest state frame listed, whichever comes first, the state or the reset", () => {
+    const s = state({ approvals: [{ id: 7, summary: summary("Run tests") }] });
+    const user = ev({ type: "user", data: "go" });
+    const stateFirst = view([{ op: "state", state: s }, { op: "reset" }, user]);
+    expect(ids(stateFirst)).toEqual([7]);
+    const resetFirst = view([{ op: "reset" }, { op: "state", state: s }, user]);
+    expect(ids(resetFirst)).toEqual([7]);
+    // The replay fills it in, and closes it if it was closed.
+    expect(view([approval(7, "from journal")], stateFirst).approvals[0]?.summary.action).toBe("from journal");
+    expect(ids(view([closed(7)], stateFirst))).toEqual([]);
+  });
+
   it("keeps the state and catalog, which are not journal records", () => {
     const s = state({ now: "Reading" });
     const old = view([{ op: "state", state: s }]);

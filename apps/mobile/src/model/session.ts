@@ -37,6 +37,10 @@ export interface SessionView {
   state: SessionState | null;
   catalog: CatalogInfo | null;
   approvals: PendingApproval[];
+  /** The approvals the latest state frame listed, less those closed since. A replay from the
+   * start keeps them on screen: the state frame and the replay's start reach the phone in
+   * either order, and the approval's own record can be far down a long journal. */
+  stated: PendingApproval[];
   mode: string | null;
   model: string | null;
   usage: string | null;
@@ -67,6 +71,7 @@ export const EMPTY_VIEW: SessionView = {
   state: null,
   catalog: null,
   approvals: [],
+  stated: [],
   mode: null,
   model: null,
   usage: null,
@@ -258,7 +263,8 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         draft = new TranscriptDraft(EMPTY_TRANSCRIPT);
         v.epoch += 1;
         v.turn = null;
-        if (v.approvals.length > 0) v.approvals = [];
+        // What the latest state frame listed is still waiting; the replay fills it in or closes it.
+        if (!alike(v.approvals, v.stated)) v.approvals = v.stated;
         if (v.closed.length > 0) v.closed = [];
         v.failed = null;
         break;
@@ -285,6 +291,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         const { approvals, ...rest } = state;
         if (!alike(v.state, rest)) v.state = rest;
         if (!alike(v.approvals, approvals)) v.approvals = approvals;
+        if (!alike(v.stated, approvals)) v.stated = approvals;
         break;
       }
       case "catalog": {
@@ -311,6 +318,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
             if (typeof ev.data !== "number" || !Number.isSafeInteger(ev.data)) break;
             v.closed = remember(v.closed, [ev.data]);
             if (v.approvals.some((a) => a.id === ev.data)) v.approvals = v.approvals.filter((a) => a.id !== ev.data);
+            if (v.stated.some((a) => a.id === ev.data)) v.stated = v.stated.filter((a) => a.id !== ev.data);
             break;
           case "stopped":
             if (v.turn !== "failed") v.turn = "stopped";
@@ -318,6 +326,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
               v.closed = remember(v.closed, v.approvals.map((a) => a.id)); // nothing would answer them
               v.approvals = [];
             }
+            if (v.stated.length > 0) v.stated = [];
             own().apply(ev);
             break;
           case "mode":
@@ -356,6 +365,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.state === view.state &&
     v.catalog === view.catalog &&
     v.approvals === view.approvals &&
+    v.stated === view.stated &&
     v.mode === view.mode &&
     v.model === view.model &&
     v.usage === view.usage &&
