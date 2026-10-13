@@ -1,6 +1,7 @@
 // What turning on full access shares between the mode sheet and a new session: the words, and the
 // guard that makes Face ID and the typed words approve exactly one thing, once.
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AppState } from "react-native";
 
 import { confirmBiometric } from "../auth";
 import { useAlive, type Failure } from "./send";
@@ -27,7 +28,7 @@ export interface FullAccessArm {
  * `key` names exactly what Face ID approves (the session and mode for the sheet; engine,
  * workspace, model and resume for a new session). The approval is for that key only: any change
  * of the key disarms it and voids a prompt still up, as do `disarm` (call it on a send, on a
- * close), a refusal (`failed`) and unmounting. So the words can never send anything but what
+ * close), a refusal (`failed`) and unmounting. Leaving the app disarms it too. So the words can never send anything but what
  * Face ID was asked about, and never twice.
  */
 export function useFullAccessArm(opts: {
@@ -83,6 +84,16 @@ export function useFullAccessArm(opts: {
       if (generation.current === mine) prompting.current = false;
     }
   }, [reason, alive, fail]);
+
+  // Leaving the app (the background, or the app switcher: anything but active) forgets a pass:
+  // whoever comes back finds the words are not enough. The Face ID prompt itself makes the app
+  // inactive, so a pass still being asked for is left alone.
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state !== "active" && !prompting.current) disarm();
+    });
+    return () => subscription.remove();
+  }, [disarm]);
 
   const checking = useCallback(() => prompting.current, []);
   return { armed: armedKey !== null && armedKey === key, checking, arm, disarm };

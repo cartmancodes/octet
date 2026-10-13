@@ -15,7 +15,9 @@ export async function confirmBiometric(reason: string): Promise<BiometricResult>
       LocalAuthentication.isEnrolledAsync(),
     ]);
     if (!hardware || !enrolled) return "unavailable";
-    const result = await LocalAuthentication.authenticateAsync({ promptMessage: reason });
+    // Android: Class 3 only. Its default, weak, takes a camera face unlock that a photo can fool;
+    // a phone with only that falls back to its PIN.
+    const result = await LocalAuthentication.authenticateAsync({ promptMessage: reason, biometricsSecurityLevel: "strong" });
     return result.success ? "ok" : "failed";
   } catch {
     return "failed";

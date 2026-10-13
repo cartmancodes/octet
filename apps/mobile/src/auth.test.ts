@@ -14,7 +14,12 @@ beforeEach(() => {
 describe("confirmBiometric", () => {
   it("is ok when the user passes, and shows the reason", async () => {
     expect(await confirmBiometric("Allow: Run tests")).toBe("ok");
-    expect(auth.authenticateAsync).toHaveBeenCalledWith({ promptMessage: "Allow: Run tests" });
+    expect(auth.authenticateAsync).toHaveBeenCalledWith(expect.objectContaining({ promptMessage: "Allow: Run tests" }));
+  });
+
+  it("takes only strong (Class 3) biometrics on Android, never a face unlock a photo can fool", async () => {
+    await confirmBiometric("x");
+    expect(auth.authenticateAsync).toHaveBeenCalledWith(expect.objectContaining({ biometricsSecurityLevel: "strong" }));
   });
 
   it("fails when the user cancels or does not match", async () => {

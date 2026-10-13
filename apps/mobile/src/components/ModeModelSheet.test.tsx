@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import * as LocalAuthentication from "expo-local-authentication";
 import { measureParentSize } from "@shopify/flash-list/dist/recyclerview/utils/measureLayout";
-import { StyleSheet } from "react-native";
+import { AppState, StyleSheet } from "react-native";
 
 import { Refusal, type RequestBody } from "../client/HubClient";
 import type { CatalogInfo } from "../protocol";
@@ -279,6 +279,45 @@ describe("the mode and model sheet", () => {
       ]);
       await act(async () => r.waiting[0]?.resolve());
       expect(screen.queryByText("Ask")).toBeNull();
+    });
+
+    describe("leaving the app", () => {
+      let listeners: ((state: string) => void)[] = [];
+      beforeEach(() => {
+        listeners = [];
+        jest.spyOn(AppState, "addEventListener").mockImplementation((_type, listener) => {
+          listeners.push(listener as (state: string) => void);
+          return { remove: () => void (listeners = listeners.filter((l) => l !== listener)) } as ReturnType<typeof AppState.addEventListener>;
+        });
+      });
+      afterEach(() => jest.restoreAllMocks());
+      const change = (state: string) => act(async () => listeners.forEach((l) => l(state)));
+
+      it("forgets a Face ID pass: back in the app, the words are not enough", async () => {
+        const r = rig();
+        await open(CATALOG, r);
+        await press(FULL);
+        expect(screen.getByLabelText("Type full access to confirm")).toBeTruthy();
+        await change("background");
+        await change("active");
+        expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+        expect(button("Turn on full access")).toBeNull();
+        expect(r.send).not.toHaveBeenCalled();
+      });
+
+      it("forgets it on the app switcher too, but not while its own Face ID prompt is up", async () => {
+        let pass: () => void = () => {};
+        auth.authenticateAsync.mockImplementationOnce(() => new Promise((resolve) => (pass = () => resolve({ success: true }))));
+        const r = rig();
+        await open(CATALOG, r);
+        await fireEvent.press(screen.getByRole("button", { name: FULL }));
+        await change("inactive"); // the system prompt itself
+        await act(async () => pass());
+        await change("active");
+        expect(screen.getByLabelText("Type full access to confirm")).toBeTruthy();
+        await change("inactive");
+        expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      });
     });
 
     it("asks for biometrics even when the Face ID setting is off", async () => {

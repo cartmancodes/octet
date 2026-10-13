@@ -82,7 +82,7 @@ describe("Settings", () => {
     it("asks for biometrics first and then saves it off", async () => {
       await open();
       await turn(false);
-      expect(auth.authenticateAsync).toHaveBeenCalledWith({ promptMessage: "Turn off Face ID for allowing" });
+      expect(auth.authenticateAsync).toHaveBeenCalledWith(expect.objectContaining({ promptMessage: "Turn off Face ID for allowing" }));
       expect(toggle().props.value).toBe(false);
       expect((await loadSettings()).faceId).toBe(false);
     });
