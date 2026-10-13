@@ -18,7 +18,7 @@ use octet_core::remote::{
 use octet_core::{Config, Mode};
 use serde_json::{Value, json};
 use std::{
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -552,18 +552,59 @@ struct Live {
     catalog_key: Option<u64>,
 }
 
+/// Makes sure `run` is a real directory of ours that only we can use, making it if it is not
+/// there. A symlink, or a directory of someone else's, is refused before anything is created in
+/// it: whatever a link points at would otherwise get the socket and the registration.
+async fn private_directory(run: &Path) -> std::io::Result<()> {
+    let refused = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a private directory", run.display()),
+        )
+    };
+    // `lstat`: a link is never followed, so a dangling one is refused too.
+    let found = match tokio::fs::symlink_metadata(run).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(run)
+                .await?;
+            tokio::fs::symlink_metadata(run).await?
+        }
+        other => other?,
+    };
+    // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if !found.is_dir() || found.uid() != me {
+        return Err(refused());
+    }
+    if found.permissions().mode() & 0o777 != 0o700 {
+        // Not through the path, which could be swapped for a link since: the directory just
+        // looked at, or nothing.
+        let opened = tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(run)
+            .await
+            .map_err(|_| refused())?;
+        let again = opened.metadata().await?;
+        if !again.is_dir() || again.uid() != me {
+            return Err(refused());
+        }
+        opened
+            .set_permissions(PermissionsExt::from_mode(0o700))
+            .await?;
+    }
+    Ok(())
+}
+
 impl Live {
     /// Makes the run directory and listens on `<run>/<pid>.sock`; `tmux`, the session a phone
     /// started this interface in, is registered.
     async fn open(directory: &Path, tmux: Option<String>) -> std::io::Result<Self> {
         let run = run_dir(directory);
-        tokio::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&run)
-            .await?;
-        // A directory that was there already may be looser.
-        tokio::fs::set_permissions(&run, PermissionsExt::from_mode(0o700)).await?;
+        private_directory(&run).await?;
         let pid = std::process::id();
         let socket = run.join(format!("{pid}.sock"));
         // Only a dead process of ours could have left it, since the pid is ours.
@@ -1533,6 +1574,58 @@ mod tests {
         assert!(app.entries_text().contains("Remote control is off: "));
         assert!(app.remote_off.is_some());
         broken.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_run_dir_that_is_a_symlink_turns_the_bridge_off_and_creates_nothing() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-link");
+        let dir = temp.path().join("data");
+        let target = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, PermissionsExt::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, run_dir(&dir)).unwrap();
+        let mut bridge = Bridge::start(&dir, true, None).await;
+        let (mut app, config) = demo();
+        crate::connect(&mut app, &mut bridge, &config, &dir.join("j.jsonl")).await;
+        let why = format!(
+            "Remote control is off: {} is not a private directory",
+            run_dir(&dir).display()
+        );
+        assert!(app.entries_text().contains(&why), "{}", app.entries_text());
+        assert_eq!(app.remote_off.as_deref(), Some(why.as_str()));
+        bridge.stop().await;
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        // The target's mode is left alone, too.
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_ne!(mode, 0o700, "the symlink's target was tightened");
+        // A link to nowhere is no better.
+        let dangling = temp.path().join("dangling");
+        std::fs::create_dir_all(&dangling).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("nowhere"), run_dir(&dangling)).unwrap();
+        let bridge = Bridge::start(&dangling, true, None).await;
+        assert!(bridge.live.is_none());
+        assert!(!temp.path().join("nowhere").exists());
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_loose_run_dir_of_ours_is_tightened_and_works() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-loose");
+        let dir = temp.path().to_path_buf();
+        let run = run_dir(&dir);
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&run, PermissionsExt::from_mode(0o755)).unwrap();
+        let mut bridge = Bridge::start(&dir, true, None).await;
+        assert!(bridge.take_note().is_none());
+        let (app, config) = demo();
+        bridge
+            .connected(&app, &config, &dir.join("session-1.jsonl"))
+            .await;
+        let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_eq!(registrations(&run).await.len(), 1);
+        bridge.stop().await;
     }
 
     #[test]
