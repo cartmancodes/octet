@@ -62,7 +62,7 @@ Rejected alternatives:
 
 **Bridge (`octet-tui`, new `bridge.rs`).**
 
-- **Socket.** At start, each terminal UI listens on `~/.local/share/octet/run/<pid>.sock` in a
+- **Socket.** At start, each terminal UI listens on `<data dir>/run/<pid>.sock` in a
   directory created 0700. Beside it is `<pid>.json` (0600) holding the engine, workspace, model,
   vendor session id, journal path and start time. `--no-remote` turns the bridge off.
 - **Outbound.** Every event the terminal UI applies is forwarded as an `event` frame carrying its
@@ -121,12 +121,17 @@ Both links use JSON messages `{ "v": 1, "type": …, … }`: bridge ↔ hub over
 newline-delimited, and hub ↔ phone over a WebSocket, one message per frame. A message with an
 unknown `v` is refused with a `refused` frame naming the supported version.
 
+*Amended 2026-10-13, as built:* a cursor is `{journal, seq}`, because a session can span several
+journals (a reconnect or provider switch starts a new one) and `seq` is only unique within one.
+`subscribe` takes `after: Cursor`, and `event` frames carry the cursor; `answer` names the
+approval as `approval`; and the run directory is `<data dir>/run/`.
+
 **Hub → phone frames:**
 
 | Frame | Contents |
 |---|---|
 | `sessions` | Live sessions: id, engine, model, workspace, phase, pending-approval count, last activity, goal one-liner, started-from-phone flag. Sent on connect and on any change. |
-| `event` | `{session, seq, event}`. `event` is exactly the journal record's data: text, `tool {id,name,target,phase,detail}`, `approval {id,detail,summary}`, `approval_closed`, `finished`, notices, errors, usage, mode, model. **The journal format is the wire format.** |
+| `event` | `{session, journal, seq, event: {type, data}}`. `event` is exactly the journal record's type and data: text, `tool {id,name,target,phase,detail}`, `approval {id,detail,summary}`, `approval_closed`, `finished`, notices, errors, usage, mode, model. **The journal format is the wire format.** |
 | `state` | Terminal UI–only state: queue (first lines, count), goal (objective, status, turns/max), NOW line, mode, pending approvals with summaries. |
 | `catalog` | Modes, and every provider's models (the terminal UI's `model_entries()`), current one marked. |
 | `recent` | Recent sessions for `recent {workspace?}`: vendor, workspace, id, title, last activity (the listing `/sessions` uses). |
@@ -136,10 +141,10 @@ unknown `v` is refused with a `refused` frame naming the supported version.
 
 | Command | Effect |
 |---|---|
-| `subscribe {session, after_seq}` | Replays from the journal after `after_seq`, then streams live. No gaps, no duplicates. |
+| `subscribe {session, after: Cursor{journal, seq}}` | Replays from the journals after `after` (cursors cross journals; `after` omitted or null replays from the start), then streams live. No gaps, no duplicates. |
 | `unsubscribe {session}` | Stops the stream. |
 | `prompt {session, text}` | Sends, or queues while a turn runs. |
-| `answer {session, approval_id, allow}` | Allows once, or denies. |
+| `answer {session, approval, allow}` | Allows once, or denies. |
 | `cancel {session}` | Cancels the running turn. |
 | `steer {session, text}` | Codex only; refused on Claude with the terminal UI's message. |
 | `set_mode {session, mode}` | Runs `/mode`. `full-access` needs `confirm: "full access"`, plus a biometric check on the phone. |
@@ -160,9 +165,9 @@ unknown `v` is refused with a `refused` frame naming the supported version.
 
 **Ordering, loss and limits.**
 
-- `seq` is the journal's sequence number, shared by live and replayed frames.
+- A cursor, `{journal, seq}`, is the journal file's name and the record's sequence number, shared by live and replayed frames.
 - The hub drops a phone that falls behind, and a bridge drops a hub that falls behind. Neither
-  blocks the terminal UI. The phone reconnects with its last `seq`.
+  blocks the terminal UI. The phone reconnects with its last cursor.
 - An approval answered anywhere (desk, the other phone) arrives as `approval_closed`, and every
   screen dismisses it.
 - Frames are bounded as the engine bounds events (32 KiB tool detail, 64 KiB prompts). The hub
@@ -276,7 +281,7 @@ unknown `v` is refused with a `refused` frame naming the supported version.
 - **Hub (unit and integration, against a fake bridge and a fake push endpoint).**
   - Pairing secrets expire and are single use.
   - A token is accepted only from its pairing's tailnet login; revoking closes its connections.
-  - Replay after `after_seq` from a real journal has no gaps or duplicates.
+  - Replay after a cursor from a real journal has no gaps or duplicates.
   - Rate limits hold; malformed commands are refused.
   - Push payloads carry no content.
   - `start` builds the tmux arguments without a shell, refuses workspaces that are not allowed,

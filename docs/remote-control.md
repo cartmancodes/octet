@@ -20,6 +20,10 @@ and what it can't, is in [The `/remote-control` check](#the-remote-control-check
 if the phone won't connect, see [Troubleshooting](#troubleshooting). Why this
 design, and its limits: [the evaluation](rust/remote-control-ssh.md).
 
+Octet also has a hub that lets a phone app list, watch and answer your running
+sessions without a terminal: see [Phone app (hub)](#phone-app-hub). It is
+optional, and the terminal route in steps 1 to 7 works without it.
+
 ## 1. Install tmux and mosh on the Mac
 
 ```sh
@@ -335,11 +339,129 @@ phone can be attached to the same session at once. By default (tmux 3.1 and
 later) the screen takes the size of whichever of them was used last; add
 `set -g window-size smallest` to `~/.tmux.conf` to fit both instead.
 
+## Phone app (hub)
+
+The hub is a small server on the Mac that shares your running Octet sessions
+with a phone app, over your tailnet. The phone sees each session's transcript,
+sends prompts, answers approvals, changes mode and model, and can start a
+session or resume a recent one. You can still sit at the Mac and join any
+session: a session started from the phone runs in tmux (`tmux attach -t
+octet-NAME`), and one started at the desk shows up on the phone.
+
+You need the Mac side of Tailscale (step 3), and `tmux` if the phone should
+start sessions (step 1). The phone app itself is a separate download and
+needs no SSH setup.
+
+### Start the hub
+
+```sh
+octet hub
+```
+
+It listens on `127.0.0.1` port 47823 (`--port N` or `hub.json` changes it)
+and says where it is. Only the Mac itself can reach that port. The tailnet
+login that may connect is yours, read from Tailscale (`--owner LOGIN` sets
+another). Leave the hub running in its own terminal or tmux window; running
+Octet sessions carry on if it stops, and the phone just can't reach them.
+
+To see what every session is doing, in another terminal:
+
+```sh
+octet hub watch
+```
+
+It prints one line per session event (tool calls, approvals, finished turns)
+until you press Ctrl+C. It shows the same thing the phone would see.
+
+### Put it on your tailnet
+
+The hub never listens on the network. Publish it with Tailscale, which adds
+HTTPS on the Mac's `*.ts.net` name and tells the hub which tailnet user is
+connecting:
+
+```sh
+tailscale serve --bg 47823
+```
+
+Only devices on your tailnet can open that address. Use `tailscale serve
+status` to see it, and `tailscale serve --https=443 off` to take it down.
+
+### Pair a phone
+
+In an Octet session on the Mac, type:
+
+```
+/remote-control pair
+```
+
+It shows a QR code and a link. In the phone app choose **Pair** and scan it.
+The code works once and expires after 10 minutes. If the hub isn't running,
+Octet says `Start the hub first: octet hub`; if Tailscale is off, it says so.
+Plain `/remote-control` also reports the hub: whether it is running, whether
+it is published, and how many phones are paired.
+
+To list the paired phones, or remove one:
+
+```sh
+octet hub devices
+octet hub revoke "My iPhone"
+```
+
+A revoked phone is disconnected within two seconds and can't come back
+without pairing again. Run `octet hub devices` and `revoke` with the same
+`--journal-dir` as the hub if you gave it one.
+
+### Keep a session off the phone
+
+Each Octet session shares itself with the hub through a private socket in
+`run/` beside its journals, and a file saying which engine, workspace and mode
+it uses. To keep one session private, start it with:
+
+```sh
+octet --no-remote
+```
+
+It then creates no socket and no file, and the hub and the phone never see it.
+
+### Security notes
+
+- The hub listens on `127.0.0.1` only. The only way in from outside is
+  `tailscale serve`, which is reachable from your tailnet and nowhere else.
+  Never expose the port any other way.
+- A connection needs your tailnet login **and** a device token. The token is
+  made when you pair; the hub keeps only its hash in `devices.json`, which is
+  readable by you alone, and the phone keeps the token in its secure storage.
+  Another tailnet device, or another program on the Mac, can't connect
+  without pairing.
+- A lost or stolen phone: run `octet hub revoke NAME` on the Mac. Then
+  remove the phone from the tailnet in the Tailscale admin console.
+- Every action from a phone (prompt, answer, mode, start and so on) is
+  recorded with the phone's name in `hub-audit.jsonl`, without the prompt
+  text. The desk also shows a note naming the phone.
+- `full-access` from a phone needs the typed confirmation `full access`, and
+  the app asks for Face ID or a fingerprint first. The desk shows an amber
+  note naming the phone.
+- Allowing an approval from the phone allows that one request, once. The
+  phone can't add permission rules, and a denied or expired approval stays
+  denied.
+- The phone can start sessions only in workspaces that appear in your recent
+  sessions or in the `workspaces` list of `hub.json` in the data directory,
+  and at most eight phone-started sessions run at once.
+- The phone can't run slash commands, `!` shell commands or `/goal`, edit
+  files outside a session, or see sessions started with `--no-remote`.
+- Pairing codes, device tokens and push tokens are never written to logs or
+  journals.
+
+The hub's files (`devices.json`, `hub.json`, `hub-audit.jsonl`) and the
+`run/` directory live beside the journals: `$XDG_DATA_HOME/octet/rust-preview`,
+or `~/.local/share/octet/rust-preview`. `--journal-dir PATH` chooses another.
+
 ## Turn it off
 
 - Quit Octet with Ctrl+C twice, or `tmux kill-session -t octet`.
 - Turn off **Remote Login** in System Settings, or run `sudo tailscale set --ssh=false`.
 - Disconnect the Mac in the Tailscale app.
+- Stop the hub with Ctrl+C, and take it off the tailnet with `tailscale serve --https=443 off`.
 
 ## Security notes
 

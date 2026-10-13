@@ -11,6 +11,18 @@ Claude Code and Codex CLIs.
 
 ### Added
 
+- A phone hub and a bridge in every terminal interface: `octet hub` serves
+  your running sessions to a phone app over your tailnet (loopback only,
+  published with `tailscale serve`), with transcripts, prompts, approvals,
+  mode and model changes, recent sessions and starting or ending a session.
+  Each interface shares its session through a private socket in `run/`; a
+  device token and your tailnet login are both required, every remote action
+  is audited, and full access needs a typed confirmation.
+- `/remote-control pair` shows a QR code and link that pair a phone with the
+  hub (single use, 10 minutes); `/remote-control` also reports the hub.
+- `octet hub devices`, `octet hub revoke NAME` and `octet hub watch` list
+  paired phones, unpair one, and print what every session is doing.
+- `--no-remote` keeps a session off the hub.
 - Plugins pass through: Claude sessions load the plugins your Claude
   settings enable (user, project and local `enabledPlugins`), with hook
   activity journaled and the hooks that fail, block or answer an approval

@@ -531,6 +531,7 @@ dependencies = [
 name = "octet"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "libc",
  "octet-core",
  "octet-hub",
@@ -539,6 +540,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

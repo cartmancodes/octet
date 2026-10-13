@@ -18,6 +18,8 @@ thiserror.workspace = true
 octet-core = { workspace = true, features = ["testing"] }
 octet-testkit.workspace = true
 libc.workspace = true
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 
 [lints]
 workspace = true

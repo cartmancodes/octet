@@ -38,7 +38,8 @@ published as a pre-release, and re-running replaces the archives.
 
 `--effort LEVEL` sets the reasoning effort (see below). `--no-plugins` and
 `--no-plugin-hooks` turn the vendors' plugins, or only their hooks, off (see
-[Plugins and skills](#plugins-and-skills)).
+[Plugins and skills](#plugins-and-skills)). `--no-remote` keeps this session
+off the phone hub (see [Phone app (hub)](remote-control.md#phone-app-hub)).
 
 ### Without the interface: print, JSON and RPC
 
@@ -200,6 +201,10 @@ edits the filter.
 `/remote-control` checks, without changing anything, whether this session can be
 reached from a phone over tmux, Tailscale SSH and mosh, and prints the phone
 command. Setup steps: [Use Octet from your phone](remote-control.md).
+`/remote-control pair` asks a running `octet hub` for a pairing code and shows
+it as a QR code and a link for the phone app (it works once and expires after
+10 minutes); plain `/remote-control` also reports the hub. See
+[Phone app (hub)](remote-control.md#phone-app-hub).
 The preview also supports persistent multi-turn goals through `/goal`.
 Changing sessions or exporting requires an idle turn, and `/compact` a
 connected one; a refused command explains why on the status line.
