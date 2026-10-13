@@ -132,11 +132,12 @@ export class HubController {
     }
   }
 
-  /** The app came to the foreground (connect) or went to the background (close the socket and
-   * leave no timer). `inactive` is not the background: a Face ID prompt passes through it. */
+  /** The app came to the foreground (connect, or skip a backoff wait: the network may well be
+   * back) or went to the background (close the socket and leave no timer, pings included).
+   * `inactive` is not the background: a Face ID prompt passes through it. */
   setForeground(active: boolean): void {
     this.foreground = active;
-    if (active) this.current.client?.start();
+    if (active) this.current.client?.retry(); // a start when stopped; leaves a live or opening link alone
     else {
       this.pairing?.stop();
       this.current.client?.stop();

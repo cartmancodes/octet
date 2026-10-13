@@ -43,7 +43,11 @@ function rig() {
   });
   return { sent, send, waiting };
 }
-const flush = () => act(async () => {});
+/** Drains a macrotask inside act, so FlashList's rAF -> setTimeout(0) load timer cannot fire outside it. */
+const flush = () =>
+  act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 /** Lets FlashList's load timer fire inside act. */
 const settle = () => act(async () => void (await new Promise((resolve) => setTimeout(resolve, 5))));
 const sheet = (catalog: CatalogInfo | null, send: ReturnType<typeof rig>["send"]) => (

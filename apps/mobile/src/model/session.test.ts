@@ -53,6 +53,29 @@ describe("approvals", () => {
     expect(ids(v)).toEqual([]);
   });
 
+  it("a new journal forgets the closed, so a state frame may bring back an id the new process reuses", () => {
+    const reused = state({ approvals: [{ id: 1, summary: summary("again") }] });
+    const base = view([{ op: "journals", journals: ["j1"] }, approval(1), closed(1)]);
+    // The same journals (a reconnect that resumes): still closed.
+    let v = view([{ op: "journals", journals: ["j1"] }, { op: "state", state: reused }], base);
+    expect(ids(v)).toEqual([]);
+    // The hub lists a new journal (a new vendor process).
+    v = view([{ op: "journals", journals: ["j1", "j2"] }, { op: "state", state: reused }], base);
+    expect(ids(v)).toEqual([1]);
+    expect(v.closed).toEqual([]);
+    expect(v.journals).toEqual(["j1", "j2"]);
+  });
+
+  it("an event from a journal not seen before forgets the closed too", () => {
+    const reused = state({ approvals: [{ id: 1, summary: summary("again") }] });
+    let v = view([{ op: "journals", journals: ["j1"] }, { op: "event", ev: { type: "started", data: null }, journal: "j1" }, approval(1), closed(1)]);
+    v = view([{ op: "event", ev: { type: "text", data: "x" }, journal: "j1" }, { op: "state", state: reused }], v);
+    expect(ids(v)).toEqual([]);
+    v = view([{ op: "event", ev: { type: "text", data: "y" }, journal: "j2" }, { op: "state", state: reused }], v);
+    expect(ids(v)).toEqual([1]);
+    expect(v.journals).toEqual(["j1", "j2"]);
+  });
+
   it("remember only the last 256 closed", () => {
     const ops: Op[] = [];
     for (let i = 0; i < 300; i++) ops.push(approval(i), closed(i));

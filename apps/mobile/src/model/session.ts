@@ -41,6 +41,10 @@ export interface SessionView {
   ended: boolean;
   /** The last `MAX_CLOSED` approvals closed, so that a stale state frame cannot bring one back. */
   closed: number[];
+  /** The journals the hub listed for this session (newest last), plus any a record came from.
+   * A new vendor process starts a new journal, and reuses approval ids: when this list changes,
+   * `closed` is forgotten. */
+  journals: string[];
   /** A replay from the start began and has brought no record yet. */
   replaying: boolean;
   /** While `replaying`, the entries shown before it began, so the screen does not flash empty
@@ -64,6 +68,7 @@ export const EMPTY_VIEW: SessionView = {
   failed: null,
   ended: false,
   closed: [],
+  journals: [],
   replaying: false,
   held: null,
   epoch: 0,
@@ -72,7 +77,9 @@ export const EMPTY_VIEW: SessionView = {
 
 /** One change to a session's view, in the order the hub sent it. */
 export type Op =
-  | { op: "event"; ev: KnownJournalEvent }
+  | { op: "event"; ev: KnownJournalEvent; journal?: string }
+  /** The hub's `subscribed` frame listed these journals (oldest first). */
+  | { op: "journals"; journals: readonly string[] }
   /** A replay from the start begins: the journal will bring everything again. */
   | { op: "reset" }
   /** The replay is over (the hub acked the subscribe): a hold still up ends, empty or not. */
@@ -86,6 +93,8 @@ export type Op =
 export const MAX_APPROVALS = 32;
 /** Closed approval IDs remembered. */
 export const MAX_CLOSED = 256;
+/** Journal ids remembered per session. */
+export const MAX_JOURNALS = 64;
 /** Bounds on what a hub can make the phone hold. */
 const TEXT_CHARS = 8_000;
 const DETAIL_CHARS = 16_000;
@@ -184,6 +193,14 @@ function remember(closed: number[], ids: number[]): number[] {
   return next.length > MAX_CLOSED ? next.slice(next.length - MAX_CLOSED) : next;
 }
 
+/** A journal list change means a new vendor process, which may reuse approval ids the old one
+ * closed: forget `closed`, and take `journals`. */
+function setJournals(v: SessionView, journals: string[]): void {
+  if (journals.length === v.journals.length && journals.every((j, i) => j === v.journals[i])) return;
+  v.journals = journals.slice(-MAX_JOURNALS);
+  if (v.closed.length > 0) v.closed = [];
+}
+
 function approve(approvals: PendingApproval[], data: unknown): PendingApproval[] {
   if (!isObj(data) || typeof data.id !== "number" || !Number.isSafeInteger(data.id)) return approvals;
   const id = data.id;
@@ -224,6 +241,12 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         if (v.closed.length > 0) v.closed = [];
         v.failed = null;
         break;
+      case "journals":
+        setJournals(
+          v,
+          op.journals.filter((j): j is string => typeof j === "string").map((j) => str(j, SHORT_CHARS)),
+        );
+        break;
       case "replayed":
         if (v.replaying) {
           v.replaying = false;
@@ -250,6 +273,10 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
       }
       case "event": {
         const ev = op.ev;
+        if (op.journal !== undefined) {
+          const journal = str(op.journal, SHORT_CHARS);
+          if (!v.journals.includes(journal)) setJournals(v, [...v.journals, journal]); // one the hub did not list yet
+        }
         if (v.replaying) {
           v.replaying = false;
           v.held = null;
@@ -314,6 +341,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.failed === view.failed &&
     v.ended === view.ended &&
     v.closed === view.closed &&
+    v.journals === view.journals &&
     v.replaying === view.replaying &&
     v.held === view.held &&
     v.epoch === view.epoch &&

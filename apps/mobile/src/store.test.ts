@@ -259,6 +259,31 @@ describe("a fresh replay keeps the previous transcript on screen", () => {
   });
 });
 
+describe("approval ids reused by a new vendor process", () => {
+  const withJournals = (journals: string[]): ToPhone => ({ v: 1, type: "subscribed", session: "a", from: "cursor", journals });
+  const reused = stateFrame("a", { approvals: [{ id: 1, summary: { action: "again", files: [], scope: "once" } }] });
+  const idsOf = () => store.getState().bySession.get("a")?.approvals.map((x) => x.id);
+
+  beforeEach(() => {
+    store.getState().applyBatch([
+      sessions(info("a")),
+      subscribed("a", "start"),
+      ev("a", { type: "approval", data: { id: 1, detail: "{}", summary: { action: "first", files: [], scope: "once" } } }),
+      ev("a", { type: "approval_closed", data: 1 }),
+    ]);
+  });
+
+  it("stays closed across a resume that lists the same journals", () => {
+    store.getState().applyBatch([withJournals(["j1"]), reused]);
+    expect(idsOf()).toEqual([]);
+  });
+
+  it("shows again once the session's journal list changed", () => {
+    store.getState().applyBatch([withJournals(["j1", "j2"]), reused]);
+    expect(idsOf()).toEqual([1]);
+  });
+});
+
 describe("the Task strip's open state", () => {
   it("is closed at first, kept for the run, and closed again by reset", () => {
     expect(store.getState().taskOpen).toBe(false);

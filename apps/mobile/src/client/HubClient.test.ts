@@ -1,6 +1,6 @@
 import type { Cursor } from "../protocol";
 import { FakeClock, Sockets } from "./fakes";
-import { HubClient, Refusal, type BatchItem, type HubState } from "./HubClient";
+import { HubClient, PING_INTERVAL_MS, PING_TIMEOUT_MS, Refusal, type BatchItem, type HubState } from "./HubClient";
 
 const URL = "wss://mac.tail1234.ts.net/";
 const TOKEN = "device-token";
@@ -293,7 +293,7 @@ describe("requests", () => {
       throw new Error("closed");
     };
     await expect(r.client.request({ type: "cancel", session: "s" })).rejects.toMatchObject({ code: "unsent" });
-    expect(r.clock.pending).toBe(0);
+    expect(r.clock.pending).toBe(1); // the keepalive; the request left no timer
   });
 
   it("a pairing whose socket throws on send or close rejects unsent", async () => {
@@ -602,6 +602,119 @@ describe("reconnecting", () => {
   });
 });
 
+/** Walks the client to ready with no time passing, so the keepalive counts from the welcome. */
+function welcomed(r: Rig): void {
+  r.client.start();
+  r.sockets.last.open();
+  r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+}
+
+/** The ping commands a socket has been sent. */
+const pings = (socket: { commandsOf(type: string): Record<string, unknown>[] }) => socket.commandsOf("ping");
+
+describe("keepalive", () => {
+  it("pings every 25 s while ready, and an ack keeps the link", () => {
+    const r = rig();
+    welcomed(r);
+    const socket = r.sockets.last;
+    r.clock.advance(PING_INTERVAL_MS - 1);
+    expect(pings(socket)).toHaveLength(0);
+    r.clock.advance(1);
+    expect(pings(socket)).toHaveLength(1);
+    socket.receive({ type: "ack", req: pings(socket)[0]?.req, message: "pong" });
+    r.clock.advance(PING_TIMEOUT_MS + 1);
+    expect(r.states.at(-1)).toBe("ready"); // answered in time
+    r.clock.advance(PING_INTERVAL_MS - PING_TIMEOUT_MS - 1);
+    expect(pings(socket)).toHaveLength(2);
+    expect(r.sockets.all).toHaveLength(1);
+  });
+
+  it("a_missed_ping_reconnects: no ack in 10 s is a dead link, with the request timeout's path", async () => {
+    const r = rig();
+    welcomed(r);
+    r.client.subscribe("s1");
+    const first = r.sockets.last;
+    first.receive({ type: "subscribed", session: "s1", from: "start", journals: ["a"] });
+    first.receive(event("s1", "a", 1));
+    flush(r);
+    r.clock.advance(PING_INTERVAL_MS - 50); // the flush above took 50 ms of the interval
+    expect(pings(first)).toHaveLength(1);
+    const waiting = r.client.request({ type: "cancel", session: "s1" }).catch((e: unknown) => e);
+    r.clock.advance(PING_TIMEOUT_MS - 1);
+    expect(first.closed).toBe(false);
+    r.clock.advance(1);
+    expect(first.closed).toBe(true);
+    expect(r.states.at(-1)).toBe("offline");
+    await expect(waiting).resolves.toMatchObject({ code: "lost" });
+    // The normal backoff, then a new socket that resumes after the cursor.
+    r.clock.advance(500);
+    expect(r.sockets.all).toHaveLength(2);
+    const second = r.sockets.last;
+    second.open();
+    second.receive({ type: "welcome", device: "iPhone" });
+    expect(second.commandsOf("subscribe").map((c) => [c.session, c.after])).toEqual([["s1", { journal: "a", seq: 1 }]]);
+    // The new link pings on its own schedule.
+    r.clock.advance(PING_INTERVAL_MS);
+    expect(pings(second)).toHaveLength(1);
+  });
+
+  it("a ping the hub refuses still proves the link is alive", () => {
+    const r = rig();
+    welcomed(r);
+    r.clock.advance(PING_INTERVAL_MS);
+    r.sockets.last.receive({ type: "refused", req: pings(r.sockets.last)[0]?.req, code: "rate_limited", reason: "slow" });
+    r.clock.advance(PING_TIMEOUT_MS + 1);
+    expect(r.states.at(-1)).toBe("ready");
+  });
+
+  it("is internal: no batch carries a ping's ack, and a late ack after teardown is dropped", () => {
+    const r = rig();
+    welcomed(r);
+    const first = r.sockets.last;
+    r.clock.advance(PING_INTERVAL_MS);
+    const req = pings(first)[0]?.req;
+    first.receive({ type: "ack", req, message: "pong" });
+    flush(r);
+    expect(delivered(r)).toEqual([]);
+    r.clock.advance(PING_INTERVAL_MS);
+    r.clock.advance(PING_TIMEOUT_MS); // missed: reconnects
+    first.receive({ type: "ack", req: pings(first)[1]?.req, message: "pong" });
+    flush(r);
+    expect(delivered(r)).toEqual([]);
+  });
+
+  it("after a missed ping a request is unsent, not lost", async () => {
+    const r = rig();
+    welcomed(r);
+    r.clock.advance(PING_INTERVAL_MS + PING_TIMEOUT_MS);
+    // The link is gone; a request now is unsent, not lost, and nothing rejected on its own.
+    await expect(r.client.request({ type: "cancel", session: "s1" })).rejects.toMatchObject({ code: "unsent" });
+  });
+
+  it("no ping in the background: stop leaves no keepalive timer, and none runs until ready again", () => {
+    const r = rig();
+    welcomed(r);
+    const socket = r.sockets.last;
+    r.clock.advance(PING_INTERVAL_MS); // a ping and its deadline are waiting
+    r.client.stop();
+    expect(r.clock.pending).toBe(0);
+    r.clock.advance(PING_INTERVAL_MS * 4);
+    expect(pings(socket)).toHaveLength(1);
+    expect(r.sockets.all).toHaveLength(1);
+    // Connecting again: no ping before the welcome.
+    r.client.start();
+    r.clock.advance(PING_INTERVAL_MS - 1);
+    expect(pings(r.sockets.last)).toHaveLength(0);
+  });
+
+  it("a link that drops leaves no keepalive timer behind", () => {
+    const r = rig();
+    welcomed(r);
+    r.sockets.last.drop();
+    expect(r.clock.delays).toEqual([500]); // only the reconnect
+  });
+});
+
 describe("unpairing", () => {
   it.each(["unpaired", "revoked"] as const)(
     "unpaired_and_revoked_move_to_unpaired_and_forget_the_token (%s)",
@@ -850,7 +963,7 @@ describe("a refused subscribe", () => {
     expect(failed[0]?.[0]).toBe("gone");
     expect(failed[0]?.[1]).toBeInstanceOf(Refusal);
     expect(failed[0]?.[1]).toMatchObject({ code: "unavailable", message: "no: unavailable" });
-    r.clock.advance(60_000);
+    r.clock.advance(20_000); // short of the first ping
     expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(1); // no retry
     flush(r);
     expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
@@ -867,7 +980,7 @@ describe("a refused subscribe", () => {
     for (let n = 0; n < 3; n++) {
       refuse(r, code, n);
       expect(failed).toHaveLength(0);
-      expect(r.clock.delays).toEqual([5000]);
+      expect(r.clock.delays[0]).toBe(5000);
       r.clock.advance(4999);
       expect(r.sockets.last.commandsOf("subscribe")).toHaveLength(n + 1);
       r.clock.advance(1);
@@ -875,7 +988,7 @@ describe("a refused subscribe", () => {
     }
     refuse(r, code, 3);
     expect(failed.map(([session, refusal]) => [session, refusal.code])).toEqual([["s1", code]]);
-    expect(r.clock.pending).toBe(0);
+    expect(r.clock.pending).toBe(1); // the keepalive; no retry timer is left
   });
 
   it("a retry that is accepted starts the count over", () => {
@@ -1050,7 +1163,7 @@ describe("batching", () => {
     const r = rig();
     ready(r);
     flush(r);
-    expect(r.clock.pending).toBe(0);
+    expect(r.clock.pending).toBe(1); // only the keepalive
   });
 
   it("unsubscribing from the batch stream stops the calls", () => {

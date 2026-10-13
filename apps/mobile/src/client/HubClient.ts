@@ -95,6 +95,9 @@ export const HANDSHAKE_TIMEOUT_MS = 15_000;
 export const BATCH_INTERVAL_MS = 50;
 /** A link ready this long counts as good: its drop starts the backoff over. */
 export const STABLE_MS = 10_000;
+/** While ready, a `ping` goes out this often; with no answer within `PING_TIMEOUT_MS` the link is dead. */
+export const PING_INTERVAL_MS = 25_000;
+export const PING_TIMEOUT_MS = 10_000;
 
 interface Pending {
   resolve: (ack: Ack) => void;
@@ -125,6 +128,10 @@ const isUnpaired = (code: RefusalCode | null | undefined): boolean =>
  * Frames reach `onBatch` listeners in order, at most once per 50 ms. A session's events are
  * deduplicated by `(journal, seq)`. `subscribed` frames are passed on as they come, so a
  * consumer sees `from: "start"` (a reset) in its place in the stream.
+ *
+ * While ready, a keepalive `ping` goes out every 25 s; no answer within 10 s takes the link for
+ * dead, as a request timeout does. Pings are the client's own: they are never in a batch, and no
+ * caller's request rides on them.
  */
 export class HubClient {
   private readonly url: string;
@@ -144,6 +151,10 @@ export class HubClient {
   private cancelHandshake: (() => void) | null = null;
   /** When this connection said welcome; null before. */
   private readyAt: number | null = null;
+  /** The next ping, or the deadline of the one sent; at most one is ever armed. */
+  private cancelPing: (() => void) | null = null;
+  /** The req of the ping awaiting its answer; null between pings. */
+  private pingReq: number | null = null;
 
   private readonly wanted = new Set<string>();
   private readonly pending = new Map<number, Pending>();
@@ -416,6 +427,9 @@ export class HubClient {
   private teardown(): void {
     this.cancelHandshake?.();
     this.cancelHandshake = null;
+    this.cancelPing?.();
+    this.cancelPing = null;
+    this.pingReq = null;
     this.readyAt = null;
     const socket = this.socket;
     this.socket = null;
@@ -439,6 +453,34 @@ export class HubClient {
     this.retries.clear();
     for (const cancel of this.retryTimers.values()) cancel();
     this.retryTimers.clear();
+  }
+
+  /** Arms the next ping, `PING_INTERVAL_MS` from now. */
+  private armPing(): void {
+    this.cancelPing?.();
+    const socket = this.socket;
+    this.cancelPing = this.schedule(() => {
+      this.cancelPing = null;
+      if (this.socket !== socket) return;
+      this.pingReq = this.send({ type: "ping" });
+      if (this.pingReq === null) {
+        this.lost(); // a socket that cannot send is as good as dead
+        return;
+      }
+      this.cancelPing = this.schedule(() => {
+        this.cancelPing = null;
+        this.pingReq = null;
+        if (this.socket === socket) this.lost();
+      }, PING_TIMEOUT_MS);
+    }, PING_INTERVAL_MS);
+  }
+
+  /** True when `req` answers the ping in flight (and then the next one is armed). */
+  private pinged(req: number): boolean {
+    if (this.pingReq === null || req !== this.pingReq) return false;
+    this.pingReq = null;
+    this.armPing();
+    return true;
   }
 
   private unpair(): void {
@@ -477,12 +519,14 @@ export class HubClient {
         this.cancelHandshake = null;
         this.readyAt = this.now();
         this.setState("ready");
+        this.armPing();
         for (const session of this.wanted) this.sendSubscribe(session);
         return;
       case "paired":
         return; // only answers a pairing, which has its own connection
       case "ack":
       case "recent": {
+        if (this.pinged(frame.req)) return;
         const entry = this.pending.get(frame.req);
         const subscribed = this.subscribeReqs.get(frame.req);
         if (entry) {
@@ -523,6 +567,7 @@ export class HubClient {
   }
 
   private refused(frame: RefusedFrame): void {
+    if (this.pinged(frame.req)) return; // any answer shows the link is alive
     const entry = this.pending.get(frame.req);
     const session = this.subscribeReqs.get(frame.req);
     if (entry) {

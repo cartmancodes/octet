@@ -363,6 +363,36 @@ describe("the app's lifecycle", () => {
     expect(r.sockets.last.commandsOf("hello")).toHaveLength(1);
   });
 
+  it("foreground_reconnects_now: returning while a reconnect waits skips the backoff", async () => {
+    const r = rig();
+    r.hub.setForeground(true);
+    await paired(r);
+    const dropped = r.sockets.last;
+    dropped.drop();
+    expect(r.clock.delays).toEqual([500]); // the client waits out its backoff
+    expect(r.sockets.all).toHaveLength(2);
+    r.hub.setForeground(true); // the app is active again
+    expect(r.sockets.all).toHaveLength(3);
+    expect(r.sockets.last).not.toBe(dropped);
+    r.sockets.last.open();
+    expect(r.sockets.last.commandsOf("hello")).toHaveLength(1);
+    // A link that is up is left alone.
+    r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    r.hub.setForeground(true);
+    expect(r.sockets.all).toHaveLength(3);
+  });
+
+  it("sends no ping in the background", async () => {
+    const r = rig();
+    r.hub.setForeground(true);
+    await paired(r);
+    const socket = r.sockets.last;
+    r.hub.setForeground(false);
+    r.clock.advance(120_000);
+    expect(socket.commandsOf("ping")).toHaveLength(0);
+    expect(r.clock.pending).toBe(0);
+  });
+
   it("does nothing without a client", () => {
     const r = rig();
     r.hub.setForeground(false);

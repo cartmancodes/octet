@@ -75,7 +75,8 @@ export function poseOf(s: { approvals: number; phase: Phase; now?: string | null
     case "running":
       return poseFor(runningActivity(s.now));
     case "stopped":
-      return poseFor({ kind: "stopped" });
+      // A session that stopped after an error keeps the error pose.
+      return poseFor(s.turn === "failed" ? { kind: "failed" } : { kind: "stopped" });
     default:
       return poseFor(s.turn ? { kind: s.turn } : { kind: "idle" });
   }

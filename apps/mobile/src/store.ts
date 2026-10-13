@@ -135,9 +135,10 @@ export function createOctetStore(): OctetStore {
             break;
           case "subscribed":
             if (frame.from === "start") push(frame.session, { op: "reset" });
+            push(frame.session, { op: "journals", journals: frame.journals });
             break;
           case "event":
-            if (isKnownEvent(frame.event)) push(frame.session, { op: "event", ev: frame.event });
+            if (isKnownEvent(frame.event)) push(frame.session, { op: "event", ev: frame.event, journal: frame.journal });
             break;
           case "state":
             push(frame.session, { op: "state", state: frame.state });

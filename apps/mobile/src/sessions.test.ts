@@ -129,6 +129,11 @@ describe("poseOf: one session's pose, with how its last turn ended", () => {
     expect(poseOf({ approvals: 0, phase: "running", now: null, turn: "failed" })).toBe("thinking");
     expect(poseOf({ approvals: 0, phase: "stopped", turn: "finished" })).toBe("sleeping");
   });
+  it("keeps the error pose when a session stops after an error", () => {
+    expect(poseOf({ approvals: 0, phase: "stopped", turn: "failed" })).toBe("error");
+    expect(poseOf({ approvals: 1, phase: "stopped", turn: "failed" })).toBe("approval");
+    expect(poseOf({ approvals: 0, phase: "running", now: "Thinking", turn: "failed" })).toBe("thinking");
+  });
 });
 
 describe("headerPose: the worst state across the sessions", () => {
