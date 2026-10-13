@@ -1,7 +1,9 @@
 //! Push end to end: a fake bridge opens approvals, the hub posts to a local HTTP fake with the
 //! real `curl`, and a stand-in `curl` first on `PATH` records its argv and stdin before running it.
 //! This is its own test binary with one test, so changing `PATH` and `OCTET_HUB_PUSH_URL` before
-//! anything else runs cannot race another test.
+//! anything else runs cannot race another test. A release build ignores `OCTET_HUB_PUSH_URL`, so
+//! the test runs in debug builds only.
+#![cfg(debug_assertions)]
 use futures_util::{SinkExt, StreamExt};
 use octet_core::remote::{
     protocol::{ack, bridge_state_frame},
