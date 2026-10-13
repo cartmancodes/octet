@@ -196,6 +196,7 @@ mod tests {
             created: 1_790_000_000,
             last_seen: 1_790_000_000 - 1,
             token_sha256: String::new(),
+            push_token: None,
         };
         let now = UNIX_EPOCH + Duration::from_secs(1_790_000_000 + 7_200);
         assert_eq!(

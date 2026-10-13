@@ -270,6 +270,21 @@ export interface PairCommand {
   platform: string;
 }
 
+/** Set the Expo push token notifications go to (`ExponentPushToken[..]` or `ExpoPushToken[..]`), or turn them off with `null`; leaving `token` out is refused. */
+export interface RegisterPushCommand {
+  v: 1;
+  type: "register_push";
+  req: number;
+  token?: string | null;
+}
+
+/** Ask the hub to answer, to tell a live connection from a dead one. */
+export interface PingCommand {
+  v: 1;
+  type: "ping";
+  req: number;
+}
+
 /** Replay a session after a cursor, then stream it live. */
 export interface SubscribeCommand {
   v: 1;
@@ -480,6 +495,8 @@ export type ToPhone =
 export type FromPhone =
   | HelloCommand
   | PairCommand
+  | RegisterPushCommand
+  | PingCommand
   | SubscribeCommand
   | UnsubscribeCommand
   | PromptCommand

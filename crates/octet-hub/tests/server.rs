@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use std::{
     future::Future,
     io::Write as _,
+    os::unix::fs::PermissionsExt as _,
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -1091,6 +1092,204 @@ async fn audit_records_remote_actions() {
     assert_eq!(lines[0]["what"], "prompt");
     assert_eq!(lines[1]["what"], "answer 4 allow");
     assert!(!audit.contains("secret plans"));
+}
+
+const PUSH: &str = "ExpoPushToken[Zk3_secretvalue-77]";
+
+fn register(req: u64, token: Option<&str>) -> Value {
+    json!({"v": 1, "req": req, "type": "register_push", "token": token})
+}
+
+#[tokio::test]
+async fn register_push_sets_and_clears_the_devices_token() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let (mut other, _) = env.phone("Other phone").await;
+    let stored = |env: &Env| std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+
+    send(&mut phone, register(7, Some(PUSH))).await;
+    let ack = recv_kind(&mut phone, "ack").await;
+    assert_eq!(
+        (ack["req"].as_u64(), ack["message"].as_str()),
+        (Some(7), Some("Notifications on"))
+    );
+    let text = stored(&env);
+    assert!(text.contains(PUSH), "{text}");
+    let reopened = Store::open(&env.root).await.expect("the store");
+    let tokens: Vec<_> = reopened
+        .devices()
+        .iter()
+        .map(|d| (d.name.as_str(), d.push_token.as_deref()))
+        .collect();
+    assert_eq!(tokens, [("Test phone", Some(PUSH)), ("Other phone", None)]);
+
+    // A later hello still sees a working device, and a second registration replaces the first.
+    let newer = "ExponentPushToken[rotated-1]";
+    send(&mut phone, register(8, Some(newer))).await;
+    assert_eq!(
+        recv_kind(&mut phone, "ack").await["message"],
+        "Notifications on"
+    );
+    let text = stored(&env);
+    assert!(text.contains(newer) && !text.contains(PUSH), "{text}");
+
+    // Turning it off removes it, and only for that device.
+    send(&mut other, register(1, Some("ExpoPushToken[other-device]"))).await;
+    assert_eq!(
+        recv_kind(&mut other, "ack").await["message"],
+        "Notifications on"
+    );
+    send(&mut phone, register(9, None)).await;
+    let ack = recv_kind(&mut phone, "ack").await;
+    assert_eq!(
+        (ack["req"].as_u64(), ack["message"].as_str()),
+        (Some(9), Some("Notifications off"))
+    );
+    let text = stored(&env);
+    assert!(
+        !text.contains(newer) && text.contains("other-device"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::metadata(env.root.join("devices.json"))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[tokio::test]
+async fn a_bad_push_token_is_refused_and_the_connection_goes_on() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    for (req, token) in [
+        (1, "https://exp.host/evil"),
+        (2, "ExpoPushToken[]"),
+        (3, ""),
+    ] {
+        send(&mut phone, register(req, Some(token))).await;
+        let refusal = recv_kind(&mut phone, "refused").await;
+        assert_eq!(
+            (refusal["req"].as_u64(), refusal["code"].as_str()),
+            (Some(req), Some("invalid")),
+            "{refusal}"
+        );
+    }
+    send(&mut phone, json!({"v": 1, "req": 4, "type": "ping"})).await;
+    assert_eq!(recv_kind(&mut phone, "ack").await["message"], "pong");
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(!text.contains("push_token"), "{text}");
+}
+
+#[tokio::test]
+async fn push_commands_before_hello_are_refused_as_unpaired() {
+    let mut env = Env::new();
+    env.start().await;
+    for command in [
+        register(41, Some(PUSH)),
+        register(42, None),
+        json!({"v": 1, "req": 43, "type": "ping"}),
+    ] {
+        let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
+        let req = command["req"].clone();
+        send(&mut stranger, command).await;
+        let refusal = recv(&mut stranger).await;
+        assert_eq!(refusal["type"], "refused", "{refusal}");
+        assert_eq!(refusal["req"], req);
+        assert_eq!(refusal["code"], "unpaired");
+        assert!(closes(&mut stranger).await);
+    }
+}
+
+#[tokio::test]
+async fn ping_answers_pong_and_spends_the_rate_limit_like_any_command() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    for req in 100..200 {
+        send(&mut phone, json!({"v": 1, "req": req, "type": "ping"})).await;
+    }
+    let mut answers = Vec::new();
+    for _ in 100..200 {
+        let frame = loop {
+            let frame = recv(&mut phone).await;
+            if matches!(frame["type"].as_str(), Some("ack" | "refused")) {
+                break frame;
+            }
+        };
+        answers.push((
+            frame["type"].as_str().unwrap_or_default().to_owned(),
+            frame["message"].clone(),
+            frame["code"].clone(),
+        ));
+    }
+    assert!(
+        answers[..60]
+            .iter()
+            .all(|(kind, message, _)| kind == "ack" && message == "pong"),
+        "{answers:?}"
+    );
+    let limited = answers
+        .iter()
+        .filter(|(kind, _, code)| kind == "refused" && code == "rate_limited")
+        .count();
+    assert!(limited >= 39, "{answers:?}");
+
+    // A registration is charged like any other command too.
+    let (mut spender, _) = env.phone("Spender").await;
+    for req in 1..=60 {
+        send(&mut spender, json!({"v": 1, "req": req, "type": "ping"})).await;
+    }
+    send(&mut spender, register(61, Some(PUSH))).await;
+    let frame = loop {
+        let frame = recv(&mut spender).await;
+        if frame["req"] == 61 {
+            break frame;
+        }
+    };
+    assert_eq!(
+        (frame["type"].as_str(), frame["code"].as_str()),
+        (Some("refused"), Some("rate_limited"))
+    );
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(!text.contains(PUSH), "{text}");
+}
+
+#[tokio::test]
+async fn the_audit_log_says_only_push_on_or_push_off() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(&mut phone, register(1, Some(PUSH))).await;
+    recv_kind(&mut phone, "ack").await;
+    send(&mut phone, register(2, None)).await;
+    recv_kind(&mut phone, "ack").await;
+    send(&mut phone, json!({"v": 1, "req": 3, "type": "ping"})).await;
+    recv_kind(&mut phone, "ack").await;
+    let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
+    let lines: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect();
+    let what: Vec<_> = lines
+        .iter()
+        .map(|l| l["what"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(what, ["push on", "push off"], "{audit}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l["device"] == "Test phone" && l["session"] == ""),
+        "{audit}"
+    );
+    assert!(
+        !audit.contains("secretvalue") && !audit.contains("ExpoPushToken"),
+        "{audit}"
+    );
 }
 
 #[tokio::test]

@@ -493,6 +493,19 @@ pub static MESSAGES: &[Message] = &[
         "Pair a new device with a pairing secret.",
     ),
     message(
+        "register_push",
+        FromPhone,
+        &[opt("token", Str)],
+        "Set the Expo push token notifications go to (`ExponentPushToken[..]` or \
+         `ExpoPushToken[..]`), or turn them off with `null`; leaving `token` out is refused.",
+    ),
+    message(
+        "ping",
+        FromPhone,
+        &[],
+        "Ask the hub to answer, to tell a live connection from a dead one.",
+    ),
+    message(
         "subscribe",
         FromPhone,
         &[req("session", Str), opt("after", Object("Cursor"))],
@@ -755,6 +768,13 @@ pub enum PhoneCommand {
         /// `ios` or `android`.
         platform: String,
     },
+    /// Set the Expo push token notifications go to, or turn them off.
+    RegisterPush {
+        /// The checked Expo push token; `None` turns notifications off.
+        token: Option<Secret>,
+    },
+    /// Answer with an ack, to show the connection is alive.
+    Ping,
     /// Replay a session after `after`, then stream it.
     Subscribe {
         /// The session id.
@@ -1052,6 +1072,35 @@ fn flag(map: &Map<String, Value>, key: &str) -> bool {
     map.get(key).and_then(Value::as_bool).unwrap_or_default()
 }
 
+/// Whether `token` is an Expo push token: `ExpoPushToken[..]` or `ExponentPushToken[..]` around
+/// 1 to 200 letters, digits, `_` or `-`.
+pub fn is_push_token(token: &str) -> bool {
+    let Some(inner) = token
+        .strip_prefix("ExpoPushToken[")
+        .or_else(|| token.strip_prefix("ExponentPushToken["))
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    (1..=200).contains(&inner.len())
+        && inner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The `token` of a `register_push`: a checked Expo push token, or `None` for `null`. A missing
+/// `token` is refused, so that turning notifications off is always said.
+fn push_token(map: &Map<String, Value>) -> Result<Option<Secret>, String> {
+    match map.get("token") {
+        None => Err("Missing token".into()),
+        Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_str() {
+            Some(token) if is_push_token(token) => Ok(Some(Secret(token.to_owned()))),
+            _ => Err("token must be an Expo push token or null".into()),
+        },
+    }
+}
+
 /// Parses one phone message: `(req, command)`, or the reason it was refused.
 ///
 /// # Errors
@@ -1070,6 +1119,10 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
             name: text(m, "name"),
             platform: text(m, "platform"),
         },
+        "register_push" => PhoneCommand::RegisterPush {
+            token: push_token(m)?,
+        },
+        "ping" => PhoneCommand::Ping,
         "subscribe" => PhoneCommand::Subscribe {
             session: text(m, "session"),
             after: m.get("after").and_then(Value::as_object).map(|c| Cursor {
@@ -1933,6 +1986,68 @@ mod tests {
             panic!("a pair")
         };
         assert_eq!(kept.expose(), secret);
+    }
+
+    #[test]
+    fn register_push_takes_an_expo_token_or_null_and_refuses_anything_else() {
+        let accepted = [
+            "ExpoPushToken[abc-DEF_123]",
+            "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]",
+            &format!("ExpoPushToken[{}]", "a".repeat(200)),
+        ];
+        for token in accepted {
+            let text = format!(r#"{{"v":1,"req":4,"type":"register_push","token":"{token}"}}"#);
+            let (req, command) = parse_phone(&text).unwrap_or_else(|e| panic!("{token}: {e}"));
+            assert_eq!(req, 4);
+            let PhoneCommand::RegisterPush { token: Some(kept) } = command else {
+                panic!("a registration of {token}")
+            };
+            assert_eq!(kept.expose(), token);
+        }
+        let (_, off) =
+            parse_phone(r#"{"v":1,"req":5,"type":"register_push","token":null}"#).unwrap();
+        assert_eq!(off, PhoneCommand::RegisterPush { token: None });
+        let too_long = format!("ExpoPushToken[{}]", "a".repeat(201));
+        let refused = [
+            r#"{"v":1,"req":6,"type":"register_push"}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":""}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":"ExpoPushToken[]"}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":"ExpoPushToken[a b]"}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":"expopushtoken[abc]"}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":"ExpoPushToken[abc]x"}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":"xExpoPushToken[abc]"}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":"ExpoPushToken[abc]\n"}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":"https://evil.example/x"}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":7}"#.to_owned(),
+            r#"{"v":1,"req":6,"type":"register_push","token":"ExpoPushToken[abc]","extra":1}"#
+                .to_owned(),
+            format!(r#"{{"v":1,"req":6,"type":"register_push","token":"{too_long}"}}"#),
+        ];
+        for text in &refused {
+            let reason = parse_phone(text).expect_err(text);
+            assert!(
+                !reason.contains("abc]"),
+                "the reason repeats the token: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn ping_parses_and_takes_no_fields() {
+        let (req, command) = parse_phone(r#"{"v":1,"req":9,"type":"ping"}"#).unwrap();
+        assert_eq!((req, command), (9, PhoneCommand::Ping));
+        assert!(parse_phone(r#"{"v":1,"req":9,"type":"ping","x":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_push_registration_never_shows_its_token_in_debug_output() {
+        let token = "ExpoPushToken[Zk3_secretvalue-77]";
+        let text = format!(r#"{{"v":1,"req":1,"type":"register_push","token":"{token}"}}"#);
+        let (_, command) = parse_phone(&text).unwrap();
+        let shown = format!("{command:?}");
+        assert!(!shown.contains("secretvalue"), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
+        assert!(!format!("{:?}", PhoneCommand::RegisterPush { token: None }).contains("redacted"));
     }
 
     #[test]

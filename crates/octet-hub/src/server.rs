@@ -147,6 +147,8 @@ const FULL_ACCESS: &str = "Full access needs confirm: \"full access\"";
 const SCAN_RUNNING: &str = "A recent-sessions scan is running; try again";
 /// The refusal for a background job that took too long.
 const JOB_TIMED_OUT: &str = "That took too long; try again";
+/// The refusal for a push registration that could not be written.
+const PUSH_NOT_SAVED: &str = "Could not save the notification setting; try again";
 /// How long a scan or a start may take in all.
 const JOB_WITHIN: Duration = Duration::from_secs(30);
 /// The longest workspace path kept in an audit line, in characters.
@@ -779,6 +781,11 @@ impl Hub {
                 self.refuse(conn, req, Code::Invalid, "Already connected");
                 return;
             }
+            PhoneCommand::Ping => return self.send(conn, &ack(req, "pong")),
+            PhoneCommand::RegisterPush { token } => {
+                let token = token.map(|token| token.expose().to_owned());
+                return self.register_push(conn, device, req, token).await;
+            }
             PhoneCommand::Subscribe { session, after } => {
                 self.subscribe(conn, req, session, after);
                 return;
@@ -843,6 +850,37 @@ impl Hub {
         };
         self.route(conn, device, req, &session, &command, &what)
             .await;
+    }
+
+    /// Sets, or with `None` clears, `device`'s push token, and answers `req`. Neither the token nor
+    /// the device's hash reaches the audit line.
+    async fn register_push(&mut self, conn: u64, device: &Device, req: u64, token: Option<String>) {
+        let on = token.is_some();
+        if !self
+            .store
+            .set_push_token(&device.token_sha256, token.clone())
+            .await
+        {
+            self.refuse(conn, req, Code::Unavailable, PUSH_NOT_SAVED);
+            return;
+        }
+        // The connections of this device carry a copy of it.
+        for state in self.conns.values_mut() {
+            if let Some(held) = state
+                .device
+                .as_mut()
+                .filter(|held| held.token_sha256 == device.token_sha256)
+            {
+                held.push_token.clone_from(&token);
+            }
+        }
+        let (message, what) = if on {
+            ("Notifications on", "push on")
+        } else {
+            ("Notifications off", "push off")
+        };
+        self.store.audit(&device.name, "", what).await;
+        self.send(conn, &ack(req, message));
     }
 
     /// Lists resumable sessions in the background; the scan reads up to 400 journals, and only

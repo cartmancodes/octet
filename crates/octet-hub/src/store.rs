@@ -27,7 +27,7 @@ const SEEN_WRITE_GAP: u64 = 60;
 pub(crate) const SECRET_REFUSED: &str = "Pairing code already used or expired";
 
 /// A paired phone.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Device {
     /// The name the phone gave at pairing.
     pub name: String,
@@ -41,6 +41,26 @@ pub struct Device {
     pub last_seen: u64,
     /// The hex SHA-256 of its token; the token itself is never stored.
     pub token_sha256: String,
+    /// The Expo push token notifications go to, if the phone turned them on.
+    pub push_token: Option<String>,
+}
+
+/// Shows the device without its token hash or push token.
+impl std::fmt::Debug for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Device")
+            .field("name", &self.name)
+            .field("platform", &self.platform)
+            .field("login", &self.login)
+            .field("created", &self.created)
+            .field("last_seen", &self.last_seen)
+            .field("token_sha256", &"<redacted>")
+            .field(
+                "push_token",
+                &self.push_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// The hub's settings from `hub.json`.
@@ -167,6 +187,7 @@ impl Store {
             created: seconds,
             last_seen: seconds,
             token_sha256: sha256_hex(&token),
+            push_token: None,
         };
         self.update(|devices| {
             if devices.iter().any(|kept| kept.name == device.name) {
@@ -235,6 +256,24 @@ impl Store {
             devices.retain(|device| device.name != name);
             let removed = devices.len() != before;
             (removed, removed)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Sets, or with `None` clears, the push token of the device whose token hash is
+    /// `token_sha256`. False if there is no such device or the file cannot be written.
+    pub async fn set_push_token(&mut self, token_sha256: &str, token: Option<String>) -> bool {
+        self.update(|devices| {
+            let Some(device) = devices
+                .iter_mut()
+                .find(|device| device.token_sha256 == token_sha256)
+            else {
+                return (false, false);
+            };
+            let changed = device.push_token != token;
+            device.push_token = token;
+            (true, changed)
         })
         .await
         .unwrap_or(false)
@@ -324,14 +363,18 @@ impl Store {
             let devices: Vec<_> = devices
                 .iter()
                 .map(|device| {
-                    serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "name": device.name,
                         "platform": device.platform,
                         "login": device.login,
                         "created": device.created,
                         "last_seen": device.last_seen,
                         "token_sha256": device.token_sha256,
-                    })
+                    });
+                    if let Some(push) = &device.push_token {
+                        entry["push_token"] = serde_json::json!(push);
+                    }
+                    entry
                 })
                 .collect::<Vec<_>>();
             let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({ "devices": devices }))?;
@@ -411,6 +454,7 @@ async fn read_devices(directory: &Path) -> io::Result<(Vec<Device>, Option<Stamp
                 created: entry["created"].as_u64()?,
                 last_seen: entry["last_seen"].as_u64()?,
                 token_sha256: text("token_sha256")?,
+                push_token: text("push_token"),
             })
             .filter(|device| {
                 !device.login.is_empty()
@@ -672,6 +716,92 @@ mod tests {
             0o600
         );
         assert!(!std::fs::read_to_string(&file).unwrap().contains(&token));
+    }
+
+    const PUSH: &str = "ExpoPushToken[Zk3_secretvalue-77]";
+
+    #[tokio::test]
+    async fn push_tokens_are_kept_private() {
+        let dir = TempDir::new("hub-push");
+        let mut store = store(&dir).await;
+        let token = paired(&mut store, "Gemini 10", epoch(1)).await;
+        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        assert_eq!(device.push_token, None);
+
+        // Setting stores it in the 0600 file as `push_token`, and it reads back.
+        assert!(
+            store
+                .set_push_token(&device.token_sha256, Some(PUSH.to_owned()))
+                .await
+        );
+        let file = dir.path().join("devices.json");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("\"push_token\""), "{text}");
+        assert!(text.contains(PUSH), "{text}");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(reopened.devices()[0].push_token.as_deref(), Some(PUSH));
+        let seen = store.authenticate(&token, LOGIN, epoch(3)).await.unwrap();
+        assert_eq!(seen.push_token.as_deref(), Some(PUSH));
+
+        // Debug shows neither the push token nor the token hash.
+        let shown = format!("{:?}", reopened.devices()[0]);
+        assert!(!shown.contains("secretvalue"), "{shown}");
+        assert!(!shown.contains(&device.token_sha256), "{shown}");
+        assert!(
+            shown.contains("Gemini 10"),
+            "the name is not a secret: {shown}"
+        );
+        assert!(shown.contains("redacted"), "{shown}");
+
+        // Clearing drops the key; another device is not touched.
+        let other = paired(&mut store, "Other", epoch(4)).await;
+        assert!(store.set_push_token(&device.token_sha256, None).await);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains("push_token") && !text.contains(PUSH),
+            "{text}"
+        );
+        assert!(store.authenticate(&other, LOGIN, epoch(5)).await.is_some());
+        assert!(
+            store
+                .set_push_token(&device.token_sha256, Some(PUSH.to_owned()))
+                .await
+        );
+
+        // An unknown device is reported, and a revoke drops the token with the device.
+        assert!(
+            !store
+                .set_push_token(&"0".repeat(64), Some(PUSH.to_owned()))
+                .await
+        );
+        assert!(store.revoke("Gemini 10").await);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains(PUSH) && !text.contains("push_token"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn a_devices_file_from_before_push_tokens_still_loads() {
+        let dir = TempDir::new("hub-legacy");
+        let hash = "ab".repeat(32);
+        let legacy = format!(
+            r#"{{"devices":[{{"name":"Old","platform":"ios","login":"{LOGIN}","created":1,"last_seen":2,"token_sha256":"{hash}"}}]}}"#
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("devices.json"), legacy).unwrap();
+        let store = store(&dir).await;
+        assert_eq!(store.devices().len(), 1);
+        assert_eq!(store.devices()[0].push_token, None);
     }
 
     #[tokio::test]
