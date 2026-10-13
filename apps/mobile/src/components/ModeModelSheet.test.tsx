@@ -15,10 +15,20 @@ const CATALOG: CatalogInfo = {
   modes: ["ask", "accept-edits", "auto", "full-access"],
   current_mode: "ask",
   models: [
-    { engine: "claude", selection: "sonnet", name: "Sonnet", id: "claude-sonnet-5" },
+    {
+      engine: "claude",
+      selection: "sonnet",
+      name: "Sonnet",
+      id: "claude-sonnet-5",
+    },
     { engine: "claude", selection: "opus", name: "Opus", id: "claude-opus-5" },
     { engine: "codex", selection: "gpt", name: "GPT", id: "gpt-6" },
-    { engine: "claude", selection: "haiku", name: "Haiku", id: "claude-haiku-5" },
+    {
+      engine: "claude",
+      selection: "haiku",
+      name: "Haiku",
+      id: "claude-haiku-5",
+    },
   ],
   current: { engine: "claude", selection: "sonnet" },
 };
@@ -55,7 +65,12 @@ const open = async (catalog: CatalogInfo | null, r: ReturnType<typeof rig>) => {
 
 beforeEach(async () => {
   // A tall list, so FlashList draws every row of the catalog (it draws only what is near the view).
-  (measureParentSize as jest.Mock).mockReturnValue({ x: 0, y: 0, width: 400, height: 5000 });
+  (measureParentSize as jest.Mock).mockReturnValue({
+    x: 0,
+    y: 0,
+    width: 400,
+    height: 5000,
+  });
   auth.hasHardwareAsync.mockResolvedValue(true);
   auth.isEnrolledAsync.mockResolvedValue(true);
   auth.authenticateAsync.mockResolvedValue({ success: true });
@@ -107,7 +122,10 @@ describe("the mode and model sheet", () => {
   });
 
   it("sends ask, accept-edits and auto at once, with no biometrics", async () => {
-    for (const [label, mode] of [["Accept edits", "accept-edits"], ["Auto", "auto"]] as const) {
+    for (const [label, mode] of [
+      ["Accept edits", "accept-edits"],
+      ["Auto", "auto"],
+    ] as const) {
       const r = rig();
       await open(CATALOG, r);
       await press(label);
@@ -133,7 +151,7 @@ describe("the mode and model sheet", () => {
     const r = rig();
     await open(CATALOG, r);
     await press("Auto");
-    expect(screen.getByText("Changing…")).toBeTruthy();
+    expect(screen.getAllByText("Changing…").length).toBeGreaterThan(0);
     await press("Accept edits"); // a second choice while one is out
     expect(r.send).toHaveBeenCalledTimes(1);
     await act(async () => r.waiting[0]?.resolve());
@@ -191,7 +209,7 @@ describe("the mode and model sheet", () => {
       expect(screen.getByText("Switches to Codex; the conversation carries over")).toBeTruthy();
       await press("Switch");
       expect(r.sent).toEqual([{ type: "set_model", session: "s", selection: "gpt" }]);
-      expect(screen.getByText("Changing…")).toBeTruthy();
+      expect(screen.getAllByText("Changing…").length).toBeGreaterThan(0);
       await act(async () => r.waiting[0]?.resolve());
       expect(screen.queryByText("Ask")).toBeNull();
     });
@@ -247,7 +265,14 @@ describe("the mode and model sheet", () => {
       await fireEvent.changeText(field, "full access");
       expect(turnOn().props.accessibilityState.disabled).toBe(false);
       await press("Turn on full access");
-      expect(r.sent).toEqual([{ type: "set_mode", session: "s", mode: "full-access", confirm: "full access" }]);
+      expect(r.sent).toEqual([
+        {
+          type: "set_mode",
+          session: "s",
+          mode: "full-access",
+          confirm: "full access",
+        },
+      ]);
       await act(async () => r.waiting[0]?.resolve());
       expect(screen.queryByText("Ask")).toBeNull();
     });
@@ -261,7 +286,10 @@ describe("the mode and model sheet", () => {
     });
 
     it("sends nothing and shows no field when biometrics fail", async () => {
-      auth.authenticateAsync.mockResolvedValueOnce({ success: false, error: "user_cancel" });
+      auth.authenticateAsync.mockResolvedValueOnce({
+        success: false,
+        error: "user_cancel",
+      });
       const r = rig();
       await open(CATALOG, r);
       await press(FULL);
@@ -308,7 +336,53 @@ describe("the mode and model sheet", () => {
       await press("Turn on full access");
       await act(async () => r.waiting[0]?.reject(new Refusal("not_allowed", "Full access is off on this Mac")));
       expect(screen.getByText("Full access is off on this Mac")).toBeTruthy();
-      expect(screen.getByLabelText("Type full access to confirm")).toBeTruthy();
+      expect(screen.getByText("Ask")).toBeTruthy(); // the sheet stays
+      // The panel is disarmed: the next try asks for Face ID again.
+      expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      await press(FULL);
+      expect(auth.authenticateAsync).toHaveBeenCalledTimes(2);
+      expect(screen.getByLabelText("Type full access to confirm").props.value).toBe("");
+    });
+
+    it("gives one prompt for a double tap on the row", async () => {
+      let finish: (r: LocalAuthentication.LocalAuthenticationResult) => void = () => {};
+      auth.authenticateAsync.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+      const r = rig();
+      await open(CATALOG, r);
+      const row = screen.getByRole("button", { name: FULL });
+      await fireEvent.press(row);
+      await fireEvent.press(row);
+      await act(async () => finish({ success: true }));
+      expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
+    });
+
+    it("says it needs Face ID when the phone has no biometric hardware", async () => {
+      auth.hasHardwareAsync.mockResolvedValueOnce(false);
+      const r = rig();
+      await open(CATALOG, r);
+      await press(FULL);
+      expect(screen.getByText("Full access needs Face ID set up on this phone.")).toBeTruthy();
+      expect(r.send).not.toHaveBeenCalled();
+    });
+
+    it("focuses the field", async () => {
+      await open(CATALOG, rig());
+      await press(FULL);
+      expect(screen.getByLabelText("Type full access to confirm").props.autoFocus).toBe(true);
+    });
+
+    it("opens nothing if the sheet was closed and reopened while Face ID was up", async () => {
+      let finish: (r: LocalAuthentication.LocalAuthenticationResult) => void = () => {};
+      auth.authenticateAsync.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+      const r = rig();
+      await open(CATALOG, r);
+      await fireEvent.press(screen.getByRole("button", { name: FULL }));
+      await flush();
+      await act(async () => screen.getByTestId("sheet").props.onRequestClose()); // Android back
+      await press("Mode and model");
+      await act(async () => finish({ success: true }));
+      expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      expect(r.send).not.toHaveBeenCalled();
     });
 
     it("can be cancelled before it is turned on", async () => {
@@ -319,6 +393,71 @@ describe("the mode and model sheet", () => {
       expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
       expect(r.send).not.toHaveBeenCalled();
     });
+  });
+
+  it("closes on Android back and on the scrim when idle", async () => {
+    await open(CATALOG, rig());
+    await act(async () => screen.getByTestId("sheet").props.onRequestClose());
+    expect(screen.queryByText("Ask")).toBeNull();
+    await press("Mode and model");
+    await fireEvent.press(screen.getByTestId("scrim"));
+    expect(screen.queryByText("Ask")).toBeNull();
+  });
+
+  describe("while a change is out", () => {
+    it("cannot be closed, shows the refusal when it comes, and the ack closes it", async () => {
+      const r = rig();
+      await open(CATALOG, r);
+      await press("Auto");
+      const closer = screen.getByRole("button", { name: "Changing…" });
+      expect(closer.props.accessibilityState.disabled).toBe(true);
+      await fireEvent.press(closer);
+      await fireEvent.press(screen.getByTestId("scrim"));
+      await act(async () => screen.getByTestId("sheet").props.onRequestClose());
+      expect(screen.getByText("Ask")).toBeTruthy();
+      await act(async () => r.waiting[0]?.reject(new Refusal("busy", "Finish or cancel the current turn first")));
+      expect(screen.getByText("Finish or cancel the current turn first")).toBeTruthy();
+      expect(button("Close")).toBeTruthy();
+      // Try again; this time the ack closes the sheet.
+      await press("Auto");
+      await act(async () => screen.getByTestId("sheet").props.onRequestClose());
+      expect(screen.getByText("Ask")).toBeTruthy();
+      await act(async () => r.waiting[1]?.resolve());
+      expect(screen.queryByText("Ask")).toBeNull();
+    });
+  });
+
+  it("lists a duplicated mode or model once", async () => {
+    const dup: CatalogInfo = {
+      ...CATALOG,
+      modes: ["ask", "auto", "ask"],
+      models: [
+        ...CATALOG.models,
+        {
+          engine: "claude",
+          selection: "sonnet",
+          name: "Sonnet again",
+          id: "x",
+        },
+      ],
+    };
+    await open(dup, rig());
+    expect(screen.getAllByRole("button", { name: /^Ask/ })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: /^Sonnet/ })).toHaveLength(1);
+    expect(screen.queryByText("Sonnet again")).toBeNull();
+  });
+
+  it("clips a long model name in its label", async () => {
+    const name = "M".repeat(300);
+    await open(
+      {
+        ...CATALOG,
+        models: [{ engine: "claude", selection: "long", name, id: "long" }],
+      },
+      rig(),
+    );
+    const row = screen.getByRole("button", { name: /^MMM/ });
+    expect(row.props.accessibilityLabel.length).toBeLessThanOrEqual(130);
   });
 
   it("themes and sizes its controls", async () => {
