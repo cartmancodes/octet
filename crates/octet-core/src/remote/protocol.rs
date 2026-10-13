@@ -163,6 +163,11 @@ pub static CHOICES: &[Choices] = &[
         doc: "Where a session's connection is.",
     },
     Choices {
+        name: "ReplayFrom",
+        values: &["cursor", "start"],
+        doc: "Where a replay starts: after the phone's cursor, or at the start of the session.",
+    },
+    Choices {
         name: "ToolPhase",
         values: &["running", "done", "failed"],
         doc: "Where a tool call is.",
@@ -417,6 +422,18 @@ pub static MESSAGES: &[Message] = &[
         ToPhone,
         &[req("sessions", ObjectList("SessionInfo"))],
         "The live sessions.",
+    ),
+    message(
+        "subscribed",
+        ToPhone,
+        &[
+            req("session", Str),
+            req("from", Choice("ReplayFrom")),
+            req("journals", StrList),
+        ],
+        "A replay begins: after the cursor, or from the start of the session's first journal when \
+         there was no cursor or the hub does not know its journal; `journals` lists every \
+         journal, oldest first.",
     ),
     message(
         "event",
@@ -1170,6 +1187,15 @@ pub fn paired(token: &str, device: &str) -> Value {
 pub fn sessions_frame(sessions: &[Value]) -> Value {
     frame("sessions", json!({ "sessions": sessions }))
 }
+/// The `subscribed` frame: session `session` replays after the phone's cursor (`from_cursor`)
+/// or from its start, through `journals`.
+pub fn subscribed_frame(session: &str, from_cursor: bool, journals: &[String]) -> Value {
+    let from = if from_cursor { "cursor" } else { "start" };
+    frame(
+        "subscribed",
+        json!({ "session": session, "from": from, "journals": journals }),
+    )
+}
 /// The `event` frame for the journal record `seq` of `journal`: `kind` and `data` are the
 /// record's `type` and `data` (its `format` and `seq` stay out; `seq` rides on the frame).
 pub fn event_frame(session: &str, journal: &str, seq: u64, kind: &str, data: &Value) -> Value {
@@ -1545,6 +1571,10 @@ mod tests {
             (welcome("Gemini 10"), Direction::ToPhone),
             (paired("tok", "Gemini 10"), Direction::ToPhone),
             (sessions_frame(&[session]), Direction::ToPhone),
+            (
+                subscribed_frame("1-2", false, &["session-1.jsonl".into()]),
+                Direction::ToPhone,
+            ),
             (
                 event_frame("1-2", "session-1.jsonl", 3, "text", &data),
                 Direction::ToPhone,

@@ -6,14 +6,14 @@
 //! A session's one [`Tail`] is the source of truth for live events. It starts at the last whole
 //! line of the newest journal when the hub first sees the session (older history is for
 //! [`replay`](crate::tail::replay)), and moves to each later journal from its first byte, after
-//! the old journal's remaining whole lines are emitted. Journals and their records are emitted
-//! in order, so a client's position is a high-water mark: `(index of the journal in the
-//! registration's list, seq)`, see [`Sessions::journals`]. A client that subscribes registers
-//! first, then replays page by page (each page's last record is the next cursor), meanwhile
-//! buffering live [`SessionUpdate::Event`]s in a capped buffer (a client that overflows it is
-//! dropped, and resumes from its cursor), and then drops every buffered event at or below its
-//! high-water mark. Everything the tail emits after the subscription is either in the replay
-//! or delivered live, so nothing is lost and nothing repeats.
+//! the old journal's remaining whole lines are emitted. Within a journal, records are emitted in
+//! order, so a client's position is the last `seq` it has of each journal. A client that
+//! subscribes registers first, then replays page by page (each page's last record is the next
+//! cursor), meanwhile buffering live [`SessionUpdate::Event`]s in a capped buffer (a client that
+//! overflows it is dropped, and resumes from its cursor), and then drops every buffered event at
+//! or below what it has of that event's journal. Everything the tail emits after the
+//! subscription is either in the replay or delivered live, so nothing is lost and nothing
+//! repeats.
 use crate::tail::{Tail, event_of, file_name};
 use octet_core::remote::{
     protocol::{BridgeCommand, Code, MAX_BRIDGE_LINE, VERSION, bridge_command_json},

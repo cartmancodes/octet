@@ -17,15 +17,19 @@
 //! # Subscriptions
 //!
 //! A subscription registers first and then replays the journals page by page in its own task,
-//! which writes through the connection's replay queue and waits for room there. Live events
-//! for the session meanwhile wait in a capped buffer (a phone that overflows it is dropped, and
-//! resumes from its cursor). When the connection's writer has sent the last replayed frame it
-//! reports the high-water mark, `(index of the journal, seq)` of the last record replayed (or
-//! the cursor, when nothing was), and the hub sends the buffered events past that mark, acks
-//! the subscription and streams live. The replay reads files to their end while the tail polls,
-//! so live events at or below the mark can still follow: they are dropped until the first one
-//! past it. Each replay page resumes at the byte where the last stopped. Live frames go through
-//! a queue of 512: a phone that lets it fill is dropped.
+//! which writes through the connection's replay queue and waits for room there. The replay
+//! starts after the phone's cursor, or, with no cursor or one naming a journal the session does
+//! not list, at the start of its first journal; its first frame, `subscribed`, says which, and
+//! lists the journals. Live events for the session meanwhile wait in a capped buffer (a phone
+//! that overflows it is dropped, and resumes from its cursor). When the connection's writer has
+//! sent the last replayed frame it reports, for each journal, the last `seq` replayed (and the
+//! cursor's, which the phone has), and the hub sends the buffered events past those, acks the
+//! subscription and streams live. The replay reads files to their end while the tail polls, so
+//! live events the replay already sent can still follow: a live event goes out only if its
+//! `seq` is past the last one sent of its journal. A late record of an older journal (the old
+//! session's last words after a reconnect) is past its journal's mark, so it is sent once. Each
+//! replay page resumes at the byte where the last stopped. Live frames go through a queue of
+//! 512: a phone that lets it fill is dropped.
 use crate::{
     launch::{self, Launches, StartRequest, clip as clip_to},
     owner::published_url,
@@ -38,7 +42,7 @@ use octet_core::remote::{
     protocol::{
         BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, ack, catalog_frame, event_frame,
         full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of, sessions_frame,
-        state_frame, welcome,
+        state_frame, subscribed_frame, welcome,
     },
     run::run_dir,
 };
@@ -139,12 +143,12 @@ const AUDIT_TEXT: usize = 64;
 enum ConnEvent {
     /// A frame arrived: its text, or `None` for one that is not text.
     Message { conn: u64, text: Option<String> },
-    /// The writer sent a replay's last frame; `last` is the last record it held.
+    /// The writer sent a replay's last frame; `sent` is the last `seq` it held of each journal.
     Replayed {
         conn: u64,
         session: String,
         generation: u64,
-        last: Option<(String, u64)>,
+        sent: Vec<(String, u64)>,
     },
     /// A background job (a scan or a launch) finished: `frame` is the answer for `conn`.
     Answer {
@@ -192,13 +196,13 @@ impl std::fmt::Debug for ConnEvent {
                 conn,
                 session,
                 generation,
-                last,
+                sent,
             } => f
                 .debug_struct("Replayed")
                 .field("conn", conn)
                 .field("session", session)
                 .field("generation", generation)
-                .field("last", last)
+                .field("sent", sent)
                 .finish(),
             Self::Answer {
                 conn,
@@ -268,49 +272,45 @@ enum ReplayItem {
     Done {
         session: String,
         generation: u64,
-        last: Option<(String, u64)>,
+        sent: Vec<(String, u64)>,
     },
 }
 
 /// Where one subscription is.
 #[derive(Debug)]
 enum Subscription {
-    /// Replaying: live events wait in `buffer` as `(journal, seq, frame)`.
+    /// Replaying: live events wait in `buffer` as `(journal, seq, frame)`. `after` is the
+    /// phone's cursor, when the replay starts there.
     Replaying {
         generation: u64,
         req: u64,
-        journals: Vec<String>,
         after: Option<Cursor>,
         buffer: Vec<(String, u64, String)>,
         task: AbortHandle,
     },
-    /// Streaming live. Until a live event past `mark`, the high-water mark of the replay as
-    /// `(index in journals, seq)`, arrives, events at or below it are repeats of the replay
-    /// (the tail had not read them yet) and are dropped.
-    Live {
-        mark: Option<(usize, u64)>,
-        journals: Vec<String>,
-    },
+    /// Streaming live. `seen` is the last `seq` the phone has of each journal; a live event at
+    /// or below it is a repeat of the replay (the tail had not read it yet) and is dropped.
+    Live { seen: HashMap<String, u64> },
 }
 
 impl Subscription {
-    /// Whether a live event of `journal` and `seq` goes to the phone; the first past the mark
-    /// clears it.
+    /// Whether a live event of `journal` and `seq` goes to the phone, which then has it.
     fn admit(&mut self, journal: &str, seq: u64) -> bool {
         match self {
-            Self::Live { mark, journals } => {
-                let Some(at) = *mark else {
-                    return true;
-                };
-                if !is_past(journals, at, journal, seq) {
-                    return false;
-                }
-                *mark = None;
-                true
-            }
+            Self::Live { seen } => admit(seen, journal, seq),
             Self::Replaying { .. } => false,
         }
     }
+}
+
+/// Whether the phone, which has the records up to `seen` of each journal, lacks `seq` of
+/// `journal`; if so it is counted as had.
+fn admit(seen: &mut HashMap<String, u64>, journal: &str, seq: u64) -> bool {
+    if seen.get(journal).is_some_and(|last| seq <= *last) {
+        return false;
+    }
+    seen.insert(journal.to_owned(), seq);
+    true
 }
 
 impl Drop for Subscription {
@@ -605,8 +605,8 @@ impl Hub {
                 conn,
                 session,
                 generation,
-                last,
-            } => self.on_replayed(conn, &session, generation, last),
+                sent,
+            } => self.on_replayed(conn, &session, generation, sent),
             ConnEvent::Answer {
                 conn,
                 frame,
@@ -916,10 +916,13 @@ impl Hub {
         let Some(state) = self.conns.get_mut(&conn) else {
             return;
         };
-        let names = journals.iter().map(|j| file_name(j)).collect();
+        let names: Vec<String> = journals.iter().map(|j| file_name(j)).collect();
+        // A cursor in a journal the session does not list is stale: the replay starts over.
+        let after = after.filter(|cursor| names.contains(&cursor.journal));
         let job = ReplayJob {
             conn,
             journals,
+            first: subscribed_frame(&session, after.is_some(), &names).to_string(),
             after: after.clone(),
             session: session.clone(),
             generation,
@@ -930,7 +933,6 @@ impl Hub {
         let subscription = Subscription::Replaying {
             generation,
             req,
-            journals: names,
             after,
             buffer: Vec::new(),
             task,
@@ -942,15 +944,9 @@ impl Hub {
         }
     }
 
-    /// A replay's frames are all sent: the buffered events past its high-water mark follow,
-    /// then the ack, and the subscription is live.
-    fn on_replayed(
-        &mut self,
-        conn: u64,
-        session: &str,
-        generation: u64,
-        last: Option<(String, u64)>,
-    ) {
+    /// A replay's frames are all sent: the buffered events it did not send follow, then the ack,
+    /// and the subscription is live.
+    fn on_replayed(&mut self, conn: u64, session: &str, generation: u64, sent: Vec<(String, u64)>) {
         let Some(state) = self.conns.get_mut(&conn) else {
             return;
         };
@@ -960,7 +956,6 @@ impl Hub {
         let Subscription::Replaying {
             generation: current,
             req,
-            journals,
             after,
             buffer,
             ..
@@ -971,14 +966,18 @@ impl Hub {
         if *current != generation {
             return;
         }
-        let mark = last.or_else(|| after.take().map(|c| (c.journal, c.seq)));
-        let mark = mark_index(journals, mark);
-        let fresh = past_mark(std::mem::take(buffer), journals, mark);
+        // The phone has what its cursor names, and what the replay sent.
+        let mut seen: HashMap<String, u64> = after
+            .take()
+            .map(|c| (c.journal, c.seq))
+            .into_iter()
+            .collect();
+        for (journal, seq) in sent {
+            admit(&mut seen, &journal, seq);
+        }
+        let fresh = fresh(std::mem::take(buffer), &mut seen);
         let req = *req;
-        *subscription = Subscription::Live {
-            mark,
-            journals: std::mem::take(journals),
-        };
+        *subscription = Subscription::Live { seen };
         for frame in fresh {
             self.push(conn, frame);
         }
@@ -1277,33 +1276,12 @@ fn bridge_command(command: PhoneCommand) -> Option<(String, BridgeCommand, Strin
     }
 }
 
-/// A high-water mark `(journal, seq)` as `(index in journals, seq)`; none for a journal the
-/// replay did not read (or no mark), so that everything counts as past it.
-fn mark_index(journals: &[String], mark: Option<(String, u64)>) -> Option<(usize, u64)> {
-    let (journal, seq) = mark?;
-    Some((journals.iter().position(|j| *j == journal)?, seq))
-}
-
-/// Whether the record `seq` of `journal` comes after `mark` in a replay of `journals`: later
-/// in the same journal, or in a later one. A journal the replay did not know is newer than all
-/// it read.
-fn is_past(journals: &[String], mark: (usize, u64), journal: &str, seq: u64) -> bool {
-    journals
-        .iter()
-        .position(|j| j == journal)
-        .is_none_or(|index| (index, seq) > mark)
-}
-
-/// The frames of `buffer`, `(journal, seq, frame)`, past `mark` (see [`is_past`]); with no
-/// mark, all of them.
-fn past_mark(
-    buffer: Vec<(String, u64, String)>,
-    journals: &[String],
-    mark: Option<(usize, u64)>,
-) -> Vec<String> {
+/// The frames of `buffer`, `(journal, seq, frame)`, that the phone lacks given `seen` (see
+/// [`admit`]), which then counts them as had.
+fn fresh(buffer: Vec<(String, u64, String)>, seen: &mut HashMap<String, u64>) -> Vec<String> {
     buffer
         .into_iter()
-        .filter(|(journal, seq, _)| mark.is_none_or(|mark| is_past(journals, mark, journal, *seq)))
+        .filter(|(journal, seq, _)| admit(seen, journal, *seq))
         .map(|(_, _, frame)| frame)
         .collect()
 }
@@ -1500,6 +1478,8 @@ async fn control_answer(line: &str, hub: &mpsc::Sender<Control>, publisher: Publ
 struct ReplayJob {
     conn: u64,
     journals: Vec<PathBuf>,
+    /// The `subscribed` frame, sent before the replay.
+    first: String,
     after: Option<Cursor>,
     session: String,
     generation: u64,
@@ -1513,14 +1493,25 @@ async fn replay(job: ReplayJob) {
     let ReplayJob {
         conn,
         journals,
+        first,
         mut after,
         session,
         generation,
         out,
         events,
     } = job;
-    let mut last = None;
+    let mut sent: Vec<(String, u64)> = Vec::new();
     let mut offset = 0;
+    let stalled = || async {
+        let _ = events.send(ConnEvent::Stalled { conn }).await;
+    };
+    if !timeout(WRITE_STALL, out.send(ReplayItem::Frame(first)))
+        .await
+        .is_ok_and(|queued| queued.is_ok())
+    {
+        stalled().await;
+        return;
+    }
     loop {
         let (page, more, end) =
             tail::replay_from(&journals, after.as_ref(), offset, REPLAY_PAGE).await;
@@ -1536,13 +1527,16 @@ async fn replay(job: ReplayJob) {
             let frame = ReplayItem::Frame(event_text(&session, journal, *seq, record));
             if !timeout(WRITE_STALL, out.send(frame))
                 .await
-                .is_ok_and(|sent| sent.is_ok())
+                .is_ok_and(|queued| queued.is_ok())
             {
-                let _ = events.send(ConnEvent::Stalled { conn }).await;
+                stalled().await;
                 return;
             }
+            match sent.last_mut() {
+                Some((last, at)) if last == journal => *at = *seq,
+                _ => sent.push((journal.clone(), *seq)),
+            }
         }
-        last = Some((next.journal.clone(), next.seq));
         after = Some(next);
         if !more {
             break;
@@ -1551,13 +1545,13 @@ async fn replay(job: ReplayJob) {
     let done = ReplayItem::Done {
         session,
         generation,
-        last,
+        sent,
     };
     if !timeout(WRITE_STALL, out.send(done))
         .await
-        .is_ok_and(|sent| sent.is_ok())
+        .is_ok_and(|queued| queued.is_ok())
     {
-        let _ = events.send(ConnEvent::Stalled { conn }).await;
+        stalled().await;
     }
 }
 
@@ -1653,8 +1647,8 @@ async fn pump(
                         return;
                     }
                 }
-                Some(ReplayItem::Done { session, generation, last }) => {
-                    let done = ConnEvent::Replayed { conn, session, generation, last };
+                Some(ReplayItem::Done { session, generation, sent }) => {
+                    let done = ConnEvent::Replayed { conn, session, generation, sent };
                     if events.send(done).await.is_err() {
                         return;
                     }
@@ -1697,26 +1691,33 @@ mod tests {
     }
 
     #[test]
-    fn live_events_past_the_high_water_mark_are_kept() {
-        let journals = ["a".to_owned(), "b".to_owned()];
-        let buffer = || buffered(&[("a", 4), ("a", 5), ("b", 0), ("b", 1), ("c", 0)]);
-        // Replayed up to a/5: the rest of a is a repeat; b and the unknown c are new.
-        let kept = past_mark(buffer(), &journals, Some((0, 5)));
-        assert_eq!(kept, ["b0", "b1", "c0"]);
-        // Replayed into b: everything of a is older.
-        let kept = past_mark(buffer(), &journals, Some((1, 0)));
-        assert_eq!(kept, ["b1", "c0"]);
-        // Nothing replayed and no cursor, or a mark in no journal of the replay: all are new.
-        assert_eq!(past_mark(buffer(), &journals, None).len(), 5);
-        assert_eq!(
-            past_mark(
-                buffer(),
-                &journals,
-                mark_index(&journals, Some(("gone".into(), 9)))
-            )
-            .len(),
-            5
-        );
+    fn buffered_events_the_replay_did_not_send_are_kept() {
+        let buffer = buffered(&[("a", 4), ("a", 5), ("a", 6), ("b", 0), ("b", 1), ("c", 0)]);
+        // Replayed up to a/5 and b/0: the rest of a, b/1 and the unknown c are new.
+        let mut seen = HashMap::from([("a".to_owned(), 5), ("b".to_owned(), 0)]);
+        assert_eq!(fresh(buffer, &mut seen), ["a6", "b1", "c0"]);
+        assert_eq!(seen["a"], 6);
+        // Nothing replayed: all are new.
+        let buffer = buffered(&[("a", 4), ("b", 0)]);
+        assert_eq!(fresh(buffer, &mut HashMap::new()), ["a4", "b0"]);
+    }
+
+    #[test]
+    fn a_live_subscription_drops_repeats_but_takes_late_records_of_an_older_journal() {
+        // The replay ended at b/3, having read a to its end (a/9); the tail had not yet emitted
+        // a/9, b/2 or b/3.
+        let mut live = Subscription::Live {
+            seen: HashMap::from([("a".to_owned(), 9), ("b".to_owned(), 3)]),
+        };
+        assert!(!live.admit("a", 9));
+        assert!(!live.admit("b", 2));
+        assert!(!live.admit("b", 3));
+        assert!(live.admit("b", 4));
+        // The old session writes its last records after the new one began: they are new.
+        assert!(live.admit("a", 10));
+        assert!(!live.admit("a", 10), "once");
+        // A journal the replay did not know is new.
+        assert!(live.admit("c", 0));
     }
 
     #[test]
@@ -1753,34 +1754,6 @@ mod tests {
         assert!(!bucket.take(second));
         let later = second + Duration::from_secs(600);
         assert_eq!((0..100).filter(|_| bucket.take(later)).count(), 60);
-    }
-
-    #[test]
-    fn a_live_subscription_drops_repeats_until_past_its_mark() {
-        // The replay ended at a/5, and the tail had not yet emitted a/4 and a/5.
-        let journals = vec!["a".to_owned(), "b".to_owned()];
-        let mut live = Subscription::Live {
-            mark: Some((0, 5)),
-            journals,
-        };
-        assert!(!live.admit("a", 4));
-        assert!(!live.admit("a", 5));
-        assert!(live.admit("a", 6));
-        // Past the mark once, everything after is new.
-        assert!(live.admit("b", 0));
-        assert!(live.admit("a", 1));
-        // A journal the replay did not know is past the mark.
-        let mut live = Subscription::Live {
-            mark: Some((1, 9)),
-            journals: vec!["a".to_owned(), "b".to_owned()],
-        };
-        assert!(!live.admit("a", 99));
-        assert!(live.admit("c", 0));
-        let mut unmarked = Subscription::Live {
-            mark: None,
-            journals: Vec::new(),
-        };
-        assert!(unmarked.admit("a", 0));
     }
 
     #[test]

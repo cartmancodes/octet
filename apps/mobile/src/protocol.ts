@@ -10,6 +10,9 @@ export type Mode = "ask" | "accept-edits" | "auto" | "full-access";
 /** Where a session's connection is. */
 export type Phase = "connecting" | "idle" | "running" | "stopped";
 
+/** Where a replay starts: after the phone's cursor, or at the start of the session. */
+export type ReplayFrom = "cursor" | "start";
+
 /** Where a tool call is. */
 export type ToolPhase = "running" | "done" | "failed";
 
@@ -171,6 +174,15 @@ export interface SessionsFrame {
   v: 1;
   type: "sessions";
   sessions: SessionInfo[];
+}
+
+/** A replay begins: after the cursor, or from the start of the session's first journal when there was no cursor or the hub does not know its journal; `journals` lists every journal, oldest first. */
+export interface SubscribedFrame {
+  v: 1;
+  type: "subscribed";
+  session: string;
+  from: ReplayFrom;
+  journals: string[];
 }
 
 /** One journal record of a session, live or replayed. */
@@ -441,6 +453,7 @@ export type ToPhone =
   | WelcomeFrame
   | PairedFrame
   | SessionsFrame
+  | SubscribedFrame
   | EventFrame
   | StateFrame
   | CatalogFrame

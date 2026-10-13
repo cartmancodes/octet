@@ -175,8 +175,8 @@ async fn whole_lines_end(path: &Path) -> std::io::Result<u64> {
 /// seq, event)`, and whether more follow. A cursor names a journal and a `seq`: the rest of
 /// that journal, then every later journal; the caller pages by passing the last record it got
 /// as the next cursor. No cursor, or a cursor naming no journal here (the phone's list is
-/// stale), gives the newest journal's last `limit` records and `more` false. Journals are read
-/// a line at a time, never whole; unreadable journals and half-written lines are passed over.
+/// stale), starts at the first record of the first journal. Journals are read a line at a time,
+/// never whole; unreadable journals and half-written lines are passed over.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the server pages with replay_from")
@@ -200,45 +200,37 @@ pub(crate) async fn replay_from(
     offset: u64,
     limit: usize,
 ) -> (Vec<(String, u64, Value)>, bool, u64) {
+    let whole = Start {
+        after: None,
+        offset: 0,
+    };
     let found = after.and_then(|cursor| {
         let at = journals
             .iter()
             .position(|j| file_name(j) == cursor.journal)?;
         Some((at, cursor.seq))
     });
-    let mut records = VecDeque::new();
-    let Some((at, seq)) = found else {
-        if let Some(newest) = journals.last() {
-            // The deque keeps only the newest `limit`, whatever the journal's length.
-            let from = Start {
-                after: None,
-                offset: 0,
-            };
-            journal_records(newest, from, limit, true, &mut records).await;
-        }
-        let end = records.back().map_or(0, |r: &Found| r.3);
-        return (strip(records), false, end);
-    };
-    for (n, path) in journals[at..].iter().enumerate() {
-        let from = if n == 0 {
+    let (at, first) = match found {
+        Some((at, seq)) => (
+            at,
             Start {
                 after: Some(seq),
                 offset,
-            }
-        } else {
-            Start {
-                after: None,
-                offset: 0,
-            }
-        };
-        journal_records(path, from, limit, false, &mut records).await;
+            },
+        ),
+        None => (0, whole),
+    };
+    let mut records = VecDeque::new();
+    for (n, path) in journals.get(at..).unwrap_or_default().iter().enumerate() {
+        let from = if n == 0 { first } else { whole };
+        journal_records(path, from, limit, &mut records).await;
         if records.len() > limit {
             break;
         }
     }
     let more = records.len() > limit;
     records.truncate(limit);
-    let end = records.back().map_or(offset, |r| r.3);
+    let end = records.back().map_or(first.offset, |r: &Found| r.3);
     (strip(records), more, end)
 }
 
@@ -268,16 +260,9 @@ pub(crate) fn file_name(journal: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Appends to `out` the records of one journal from `from`, a line at a time. With `newest`
-/// the last `keep` records of the whole journal are kept; otherwise it stops once `out` holds
-/// more than `keep`.
-async fn journal_records(
-    path: &Path,
-    from: Start,
-    keep: usize,
-    newest: bool,
-    out: &mut VecDeque<Found>,
-) {
+/// Appends to `out` the records of one journal from `from`, a line at a time, and stops once
+/// `out` holds more than `keep`.
+async fn journal_records(path: &Path, from: Start, keep: usize, out: &mut VecDeque<Found>) {
     let Ok(mut file) = File::open(path).await else {
         return;
     };
@@ -311,10 +296,7 @@ async fn journal_records(
         }
         out.push_back((name.clone(), seq, event, position));
         if out.len() > keep {
-            if !newest {
-                return;
-            }
-            out.pop_front();
+            return;
         }
     }
 }
@@ -444,11 +426,16 @@ mod tests {
         );
         assert!(!more);
         assert_eq!(got[0].2, serde_json::json!({"type": "t", "data": null}));
-        // No cursor: the newest journal only. A stale cursor: the same.
-        let newest = ["b.jsonl0", "b.jsonl1", "b.jsonl2"];
-        assert_eq!(marks(&replay(&journals, None, 500).await.0), newest);
+        // No cursor: everything, from the start of the first journal. A stale cursor: the same.
+        let everything = [
+            "a.jsonl0", "a.jsonl1", "a.jsonl2", "a.jsonl3", "b.jsonl0", "b.jsonl1", "b.jsonl2",
+        ];
+        assert_eq!(marks(&replay(&journals, None, 500).await.0), everything);
         let stale = after("gone.jsonl", 9);
-        assert_eq!(marks(&replay(&journals, Some(&stale), 500).await.0), newest);
+        assert_eq!(
+            marks(&replay(&journals, Some(&stale), 500).await.0),
+            everything
+        );
         let end = after("b.jsonl", 2);
         assert_eq!(
             replay(&journals, Some(&end), 500).await,
@@ -464,14 +451,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_without_a_cursor_keeps_the_last_500_records() {
+    async fn replay_without_a_cursor_pages_from_the_start() {
         let dir = temp("octet-hub-replay-long");
         let long = journal(dir.path(), "a.jsonl", 0..1200);
-        let (got, more) = replay(&[long], None, 500).await;
+        let (got, more) = replay(std::slice::from_ref(&long), None, 500).await;
         assert_eq!(got.len(), 500);
-        assert!(!more);
-        assert_eq!(got.first().map(|r| r.1), Some(700));
-        assert_eq!(got.last().map(|r| r.1), Some(1199));
+        assert!(more, "the rest is a page away");
+        assert_eq!(got.first().map(|r| r.1), Some(0));
+        assert_eq!(got.last().map(|r| r.1), Some(499));
     }
 
     #[tokio::test]
@@ -520,10 +507,10 @@ mod tests {
         assert_eq!(page.last().map(|r| r.1), Some(40_500));
         let (page, more) = replay(&journals, Some(&after("a.jsonl", 49_700)), 500).await;
         assert_eq!((page.len(), more), (299, false));
-        // No cursor: the last 500, however long the journal.
+        // No cursor: the first 500, however long the journal.
         let (page, more) = replay(&journals, None, 500).await;
-        assert_eq!((page.len(), more), (500, false));
-        assert_eq!(page.first().map(|r| r.1), Some(49_500));
+        assert_eq!((page.len(), more), (500, true));
+        assert_eq!(page.first().map(|r| r.1), Some(0));
     }
 
     #[tokio::test]

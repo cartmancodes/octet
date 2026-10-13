@@ -521,6 +521,12 @@ async fn subscribe_replays_then_streams() {
     let token = env.pair("Test phone").await;
     let (mut phone, _) = hello(env.port, &token).await;
     send(&mut phone, subscribe(3, &bridge.id, Some(2))).await;
+    // The replay says where it starts, then replays.
+    assert_eq!(
+        recv(&mut phone).await,
+        json!({"v": 1, "type": "subscribed", "session": bridge.id, "from": "cursor",
+            "journals": [JOURNAL]})
+    );
     for seq in [3, 4] {
         let event = recv(&mut phone).await;
         assert_eq!(event["type"], "event", "{event}");
@@ -544,6 +550,7 @@ async fn subscribe_replays_then_streams() {
     drop(phone);
     let (mut again, _) = hello(env.port, &token).await;
     send(&mut again, subscribe(4, &bridge.id, Some(5))).await;
+    assert_eq!(recv(&mut again).await["from"], "cursor");
     assert_eq!(recv(&mut again).await, ack(4, "Subscribed"));
     assert!(quiet(&mut again).await);
     env.journal(JOURNAL, 6..7);
@@ -553,9 +560,10 @@ async fn subscribe_replays_then_streams() {
         (json!("event"), json!(6))
     );
 
-    // Without a cursor: the newest journal's records, then live.
+    // Without a cursor: every record from the start, then live.
     let (mut fresh, _) = hello(env.port, &token).await;
     send(&mut fresh, subscribe(5, &bridge.id, None)).await;
+    assert_eq!(recv(&mut fresh).await["from"], "start");
     for seq in 0..7 {
         assert_eq!(recv(&mut fresh).await["seq"], seq);
     }
@@ -570,11 +578,78 @@ async fn subscribe_replays_then_streams() {
     let (mut racer, _) = hello(env.port, &token).await;
     env.journal(JOURNAL, 7..8);
     send(&mut racer, subscribe(7, &bridge.id, Some(6))).await;
+    assert_eq!(recv(&mut racer).await["type"], "subscribed");
     assert_eq!(recv(&mut racer).await["seq"], 7);
     assert_eq!(recv(&mut racer).await, ack(7, "Subscribed"));
     assert!(quiet(&mut racer).await, "the tail's copy of 7 is a repeat");
     env.journal(JOURNAL, 8..9);
     assert_eq!(recv(&mut racer).await["seq"], 8);
+}
+
+#[tokio::test]
+async fn a_subscription_without_a_known_cursor_replays_every_journal_from_the_start() {
+    let mut env = Env::new();
+    let older = "session-1-1.jsonl";
+    let newer = "session-2-1.jsonl";
+    env.journal(older, 0..3);
+    env.journal(newer, 0..2);
+    let registration = Registration {
+        id: "5050-1790000000".into(),
+        pid: 5050,
+        started: 1_790_000_000,
+        socket: env.run.join("5050.sock"),
+        engine: "codex".into(),
+        workspace: "/work".into(),
+        model: String::new(),
+        mode: "ask".into(),
+        vendor_session: String::new(),
+        journals: vec![env.root.join(older), env.root.join(newer)],
+        from_phone: false,
+        tmux: None,
+    };
+    let _listener = UnixListener::bind(&registration.socket).expect("bridge socket");
+    registration.write(&env.run).await.expect("registration");
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let everything = [(older, 0), (older, 1), (older, 2), (newer, 0), (newer, 1)];
+    let cursor = |journal: &str, seq: u64| json!({"journal": journal, "seq": seq});
+    for (req, after, from) in [
+        (2, Value::Null, "start"),
+        (3, cursor("session-0-1.jsonl", 9), "start"),
+        (4, cursor(older, 1), "cursor"),
+    ] {
+        send(
+            &mut phone,
+            json!({"v": 1, "req": req, "type": "subscribe", "session": registration.id,
+                "after": after}),
+        )
+        .await;
+        let subscribed = recv_kind(&mut phone, "subscribed").await;
+        assert_eq!(subscribed["from"], from, "{subscribed}");
+        assert_eq!(
+            subscribed["journals"],
+            json!([older, newer]),
+            "{subscribed}"
+        );
+        let mut got = Vec::new();
+        loop {
+            let frame = recv(&mut phone).await;
+            if frame == ack(req, "Subscribed") {
+                break;
+            }
+            assert_eq!(frame["type"], "event", "{frame}");
+            got.push((
+                frame["journal"].as_str().expect("a journal").to_owned(),
+                frame["seq"].as_u64().expect("a seq"),
+            ));
+        }
+        let skip = if from == "cursor" { 2 } else { 0 };
+        let wanted: Vec<(String, u64)> = everything[skip..]
+            .iter()
+            .map(|&(j, s)| (j.to_owned(), s))
+            .collect();
+        assert_eq!(got, wanted, "{after}");
+    }
 }
 
 #[tokio::test]
@@ -694,7 +769,7 @@ async fn state_and_catalog_follow_subscriptions() {
     }
     send(&mut phone, subscribe(2, &bridge.id, Some(0))).await;
     let mut got = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         got.push(recv(&mut phone).await);
     }
     assert!(
