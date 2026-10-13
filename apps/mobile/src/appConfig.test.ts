@@ -82,3 +82,29 @@ describe("eas.json", () => {
     expect(text).not.toMatch(/projectId|owner|appleId|ascAppId|appleTeamId|serviceAccountKeyPath/);
   });
 });
+
+describe("the app's reach", () => {
+  const config = expo as typeof expo & {
+    ios: { infoPlist?: { NSAppTransportSecurity?: { NSAllowsArbitraryLoads?: boolean } } };
+    android: { blockedPermissions?: string[]; permissions?: string[] };
+  };
+
+  it("keeps App Transport Security on: the app opens only wss:// to its Mac", () => {
+    expect(config.ios.infoPlist?.NSAppTransportSecurity?.NSAllowsArbitraryLoads).toBe(false);
+  });
+
+  it("blocks the Android permissions it does not use, and keeps the ones it does", () => {
+    const blocked = config.android.blockedPermissions ?? [];
+    for (const p of [
+      "android.permission.SYSTEM_ALERT_WINDOW",
+      "android.permission.READ_EXTERNAL_STORAGE",
+      "android.permission.WRITE_EXTERNAL_STORAGE",
+      "android.permission.RECORD_AUDIO",
+    ]) {
+      expect(blocked).toContain(p);
+    }
+    for (const kept of ["CAMERA", "INTERNET", "USE_BIOMETRIC", "USE_FINGERPRINT", "POST_NOTIFICATIONS", "VIBRATE"]) {
+      expect(blocked).not.toContain(`android.permission.${kept}`);
+    }
+  });
+});

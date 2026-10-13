@@ -9,11 +9,22 @@
     "backgroundColor": "#161113",
     "ios": {
       "bundleIdentifier": "dev.octet.mobile",
-      "supportsTablet": false
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false
+        }
+      }
     },
     "android": {
       "package": "dev.octet.mobile",
-      "backgroundColor": "#161113"
+      "backgroundColor": "#161113",
+      "blockedPermissions": [
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "plugins": [
       "expo-router",
