@@ -397,22 +397,33 @@ On Linux it writes a systemd user unit, `~/.config/systemd/user/octet-hub.servic
 and enables it. Either way the service runs the `octet` you ran this from, as
 `octet hub --journal-dir DIR`, where DIR is the data directory this command resolved
 (from `--journal-dir`, `$XDG_DATA_HOME`, or `~/.local/share`), so the service and its log
-agree even though it doesn't see your shell's environment. Its `PATH` includes
-the directory where `tmux` was found, so the hub can start sessions from a
-launchd agent's bare environment. The service doesn't use `--port` or
-`--owner`; set the port in `hub.json`.
+agree even though it doesn't see your shell's environment. Its `PATH` starts
+with the directories where `tmux`, `claude` and `codex` were found on your
+shell's `PATH` when you ran the command, then the usual system directories, so
+the hub can start sessions (and the agents in them) from a service's bare
+environment, even after a login with no tmux running. The service doesn't use
+`--port` or `--owner`; set the port in `hub.json`.
 
 - **Logs.** On macOS the hub's output goes to `hub.log` in the data directory
   (`~/.local/share/octet/rust-preview/hub.log` unless you chose another); read it with
   `tail -f`. On Linux use `journalctl --user -u octet-hub.service -f`.
+- **hub.log grows.** Nothing rotates it. To empty it, run
+  `: > ~/.local/share/octet/rust-preview/hub.log` (your data directory, if you
+  chose another); the running hub carries on writing to it.
 - **See the file first.** `octet hub install --print` writes the file to the
   terminal and changes nothing.
 - **Move or upgrade `octet`.** The service holds the program's path, so run
   `octet hub install` again after moving or reinstalling it; on Linux that also
-  restarts the running service. A file already at
+  restarts the running service.
+- **Move or install tmux, Claude or Codex.** Install records where `tmux`,
+  `claude` and `codex` were found; re-run `octet hub install` after moving or
+  installing them, or the hub won't find them. A file already at
   that path that isn't Octet's is never replaced.
 - **Remove it.** `octet hub uninstall` stops the service and deletes the file.
   It says "Not installed" if there is nothing to remove.
+- **Restarts.** launchd restarts the hub whenever it stops; systemd restarts it
+  five seconds after it fails, so a failure at boot doesn't use up systemd's
+  start limit.
 - **Linux without a login session.** A systemd user service stops when you log
   out unless lingering is on: `loginctl enable-linger "$USER"`.
 
@@ -440,12 +451,15 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
 - **Which phones.** A phone gets a push only if it turned notifications on and
   has no open connection to the hub. The app closes its connection when it goes
   to the background, so a phone you are holding with the app open gets
-  nothing.
+  nothing. An approval that arrived while you were looking and is still
+  waiting when the app goes to the background is pushed then, once (within the
+  same limits).
 - **How often.** One push per approval, however often it is shown again; one per
   finished turn. Pushes to a phone collect for about two seconds and go out as
   one (an approval wins over a finished turn), and a phone gets at most six
   in any minute. A phone Expo reports as gone has its token cleared.
-- **curl.** The hub sends each push by running `curl` from its `PATH`. Without
+- **curl.** The hub sends each push by running `curl` from its `PATH`, with
+  `-q` so it ignores any `~/.curlrc`. Without
   `curl` every push fails (the hub logs `Push failed` and carries on). macOS
   and most Linux systems have it in `/usr/bin`; the service `octet hub install`
   writes carries a `PATH` that includes `/usr/bin`, so it finds it.

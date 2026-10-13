@@ -517,6 +517,8 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
         assert_eq!(
             argv,
             &[
+                // First, so curl reads no ~/.curlrc that could add options or log the body.
+                "-q",
                 "-sS",
                 "--max-time",
                 "10",
@@ -532,8 +534,8 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     }
 }
 
-/// A phone with the app open gets nothing; the same phone in the background gets the next one,
-/// and only that one.
+/// A phone with the app open gets nothing. When it goes to the background, the approval it was
+/// spared and that is still open reaches it, once; then the next one does.
 async fn connected_phones_are_left_alone(fake: &Fake, root: PathBuf) {
     const TOKEN: &str = "ExpoPushToken[story-b-token]";
     let env = Env::start(root, 6102).await;
@@ -543,9 +545,14 @@ async fn connected_phones_are_left_alone(fake: &Fake, root: PathBuf) {
     link.state("idle", &[1]).await;
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(4)).await, 0);
     background(phone).await;
-    link.state("idle", &[1, 2]).await;
-    fake.wait_for(TOKEN, 0).await;
+    assert_eq!(
+        fake.wait_for(TOKEN, 0).await,
+        approval_message(TOKEN, &env.id)
+    );
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 1);
+    link.state("idle", &[1, 2]).await;
+    fake.wait_for(TOKEN, 1).await;
+    assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 2);
 }
 
 /// Expo says the token is dead: it is cleared from `devices.json` and never tried again.

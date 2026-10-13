@@ -6,7 +6,9 @@
 //! stopped running. A session's first state seeds what it has seen and pushes nothing, so a hub
 //! restart does not repeat what the phone was already told. Pushes to one device collect for
 //! [`WINDOW`] and go out as one (an approval beats a finished turn, and the push names the most
-//! recent session), at most [`CAP`] in any minute.
+//! recent session), at most [`CAP`] in any minute. A device that is connected when its window
+//! closes gets nothing, but the approvals it was spared are held: when its last connection drops,
+//! those still open are offered to it again.
 //!
 //! Two edges are accepted. When a session's journal list changes (a new vendor process) the
 //! approval ids it has seen are forgotten, so a reused id can stay hidden until the registration
@@ -155,6 +157,9 @@ pub(crate) struct Pusher {
     windows: HashMap<String, Window>,
     /// When each device was last pushed to, by device key.
     sent: HashMap<String, VecDeque<Instant>>,
+    /// Approvals held back from a device because it was connected, by device key: offered again
+    /// when its last connection drops, if they are still open.
+    held: HashMap<String, Vec<(String, u64)>>,
 }
 
 // Device keys identify devices in `devices.json`: Debug shows counts only.
@@ -164,6 +169,7 @@ impl std::fmt::Debug for Pusher {
             .field("sessions", &self.seen.len())
             .field("waiting", &self.windows.len())
             .field("recipients", &self.sent.len())
+            .field("held", &self.held.len())
             .finish()
     }
 }
@@ -242,8 +248,14 @@ impl Pusher {
         window.turns.drain(..extra);
     }
 
-    /// Forgets the devices whose last push is over a minute old.
+    /// Forgets the devices whose last push is over a minute old, and held-back approvals that are
+    /// no longer open.
     pub(crate) fn prune(&mut self, now: Instant) {
+        let seen = &self.seen;
+        self.held.retain(|_, held| {
+            held.retain(|(session, id)| seen.get(session).is_some_and(|s| s.open.contains(id)));
+            !held.is_empty()
+        });
         self.sent.retain(|_, sent| {
             while sent
                 .front()
@@ -253,6 +265,28 @@ impl Pusher {
             }
             !sent.is_empty()
         });
+    }
+
+    /// `device` has no connection left: the approvals held back from it while it was connected
+    /// that are still open are offered to it again, in a window opening at `now` (or the one
+    /// already open), and so subject to [`CAP`] like any other.
+    pub(crate) fn disconnected(&mut self, device: &str, now: Instant) {
+        let Some(held) = self.held.remove(device) else {
+            return;
+        };
+        let notices: Vec<Notice> = held
+            .into_iter()
+            .filter(|(session, id)| self.is_open(session, *id))
+            .map(|(session, id)| Notice::Approval { session, id })
+            .collect();
+        self.offer(device, &notices, now);
+    }
+
+    /// Whether approval `id` is open in `session` now.
+    fn is_open(&self, session: &str, id: u64) -> bool {
+        self.seen
+            .get(session)
+            .is_some_and(|seen| seen.open.contains(&id))
     }
 
     /// How many devices have a push on record.
@@ -268,20 +302,32 @@ impl Pusher {
 
     /// The push due to `device` at `now`, if its window has been open for [`WINDOW`]; the window
     /// then closes either way. Nothing is due to a device that `connected` (its user is looking
-    /// at it), for an approval already answered, or past [`CAP`] in the last minute.
+    /// at it: its open approvals are held for [`disconnected`](Self::disconnected)), for an
+    /// approval already answered, or past [`CAP`] in the last minute.
     pub(crate) fn due_for(&mut self, device: &str, connected: bool, now: Instant) -> Option<Due> {
         if now.saturating_duration_since(self.windows.get(device)?.opened) < WINDOW {
             return None;
         }
         let window = self.windows.remove(device)?;
         if connected {
+            let open: Vec<(String, u64)> = window
+                .approvals
+                .into_iter()
+                .filter(|(session, id)| self.is_open(session, *id))
+                .collect();
+            if !open.is_empty() {
+                let held = self.held.entry(device.to_owned()).or_default();
+                for approval in open {
+                    if !held.contains(&approval) {
+                        held.push(approval);
+                    }
+                }
+                let extra = held.len().saturating_sub(WINDOW_NOTICES);
+                held.drain(..extra);
+            }
             return None;
         }
-        let still_open = |(session, id): &&(String, u64)| {
-            self.seen
-                .get(session)
-                .is_some_and(|seen| seen.open.contains(id))
-        };
+        let still_open = |(session, id): &&(String, u64)| self.is_open(session, *id);
         let due = if let Some((session, _)) = window.approvals.iter().rev().find(still_open) {
             Due {
                 kind: Kind::Approval,
@@ -328,8 +374,10 @@ async fn send_with(program: &str, endpoint: &str, messages: &[Value]) -> Vec<Out
         return failed();
     };
     let post = async {
+        // `-q` must come first: it stops curl reading `~/.curlrc`, which could add options (a
+        // trace, a proxy, an output file) the hub never chose.
         let mut child = Command::new(program)
-            .args(["-sS", "--max-time", "10"])
+            .args(["-q", "-sS", "--max-time", "10"])
             .args(["-H", "Content-Type: application/json"])
             .args(["-H", "Accept: application/json"])
             .args(["--data-binary", "@-"])
@@ -702,6 +750,74 @@ mod tests {
         pusher.offer("b", &third, later(base, 50.0));
         assert!(pusher.due_for("a", true, later(base, 52.0)).is_none());
         assert!(pusher.due_for("b", false, later(base, 52.0)).is_some());
+    }
+
+    #[test]
+    fn an_approval_held_back_while_connected_goes_out_when_the_phone_leaves() {
+        let mut pusher = seeded(&["s1"]);
+        let base = Instant::now();
+        let first = open(&mut pusher, "s1", 1);
+        pusher.offer("dev", &first, base);
+        assert_eq!(pusher.due_for("dev", true, later(base, 2.0)), None);
+        // The app goes to the background: the approval still open is offered again, in a window.
+        pusher.disconnected("dev", later(base, 10.0));
+        assert_eq!(pusher.waiting(), ["dev"]);
+        assert_eq!(pusher.due_for("dev", false, later(base, 11.0)), None);
+        assert_eq!(
+            pusher.due_for("dev", false, later(base, 12.0)),
+            Some(Due {
+                kind: Kind::Approval,
+                session: "s1".into()
+            })
+        );
+        // Pushed now, so a second goodbye offers nothing.
+        pusher.disconnected("dev", later(base, 20.0));
+        assert_eq!(pusher.waiting(), Vec::<String>::new());
+
+        // Back within the window: held back again, and offered again at the next goodbye.
+        let second = open(&mut pusher, "s1", 5);
+        assert_eq!(second, [approval("s1", 5)]);
+        pusher.offer("dev", &second, later(base, 30.0));
+        assert_eq!(pusher.due_for("dev", true, later(base, 32.0)), None);
+        pusher.disconnected("dev", later(base, 33.0));
+        assert_eq!(pusher.due_for("dev", true, later(base, 35.0)), None);
+        pusher.disconnected("dev", later(base, 36.0));
+        assert!(pusher.due_for("dev", false, later(base, 38.0)).is_some());
+
+        // An approval answered while the phone was open is not offered at all.
+        let third = open(&mut pusher, "s1", 6);
+        assert_eq!(third, [approval("s1", 6)]);
+        pusher.offer("dev", &third, later(base, 40.0));
+        assert_eq!(pusher.due_for("dev", true, later(base, 42.0)), None);
+        pusher.observe(&[snap("s1", Some("idle"), &[], &["a"])]);
+        pusher.disconnected("dev", later(base, 43.0));
+        assert_eq!(pusher.waiting(), Vec::<String>::new());
+        // Nor is anything offered to another device, or to one that was never held back.
+        pusher.disconnected("other", later(base, 44.0));
+        assert_eq!(pusher.waiting(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn what_is_offered_again_still_counts_against_the_cap() {
+        let mut pusher = seeded(&["s1"]);
+        let base = Instant::now();
+        // Six pushes in the minute already.
+        for n in 0..6_u64 {
+            let at = 3.0 * f64::from(u32::try_from(n).expect("small"));
+            let notices = open(&mut pusher, "s1", n);
+            pusher.offer("dev", &notices, later(base, at));
+            assert!(
+                pusher
+                    .due_for("dev", false, later(base, at + 2.0))
+                    .is_some()
+            );
+        }
+        let held = open(&mut pusher, "s1", 50);
+        pusher.offer("dev", &held, later(base, 20.0));
+        assert_eq!(pusher.due_for("dev", true, later(base, 22.0)), None);
+        pusher.disconnected("dev", later(base, 23.0));
+        assert_eq!(pusher.waiting(), ["dev"], "offered again");
+        assert_eq!(pusher.due_for("dev", false, later(base, 25.0)), None);
     }
 
     #[test]

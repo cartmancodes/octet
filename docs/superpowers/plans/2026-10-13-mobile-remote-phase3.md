@@ -21,9 +21,10 @@
 - **The app** registers its Expo push token with a new `register_push` command after each
   `ready`, and whenever the token rotates. A tap on a notification opens that session.
 - **Liveness** is a new `ping` command that the hub acks.
-- **The service.** The service files are written by `crates/octet/src/service.rs`. A hidden
-  environment seam replaces `launchctl`/`systemctl` in tests, so tests never touch the real user
-  session.
+- **The service.** The service files are written by `crates/octet/src/service.rs`. Tests hand
+  `Control::new` a stand-in for `launchctl`/`systemctl`, so tests never touch the real user
+  session. (The final review removed an earlier `OCTET_SERVICE_CTL` environment seam: production
+  runs `/bin/launchctl`, or `systemctl` from `PATH`.)
 
 **Tech stack:**
 
@@ -227,8 +228,9 @@
 - **Uninstall:** stop or boot out, remove the file, and on Linux run `daemon-reload` again. It is
   idempotent: "Not installed" when there is nothing to remove.
 - **`--print`:** writes the unit to stdout and changes nothing.
-- **Test seam:** the hidden `OCTET_SERVICE_CTL=<path>` replaces `launchctl`/`systemctl`, receiving
-  the same argv. `HOME` points at a temp dir. Tests never call the real tools.
+- **Test seam:** tests build `Control::new(<stand-in>, uid)`, which receives the same argv as
+  `launchctl`/`systemctl`; there is no environment override (the final review removed
+  `OCTET_SERVICE_CTL`). `HOME` points at a temp dir. Tests never call the real tools.
 - **Files:** 0644. The directory is created if missing. An existing file is replaced only if it
   is ours (it contains `dev.octet.hub` / `octet-hub`); otherwise refuse.
 

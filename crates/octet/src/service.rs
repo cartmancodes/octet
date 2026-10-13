@@ -1,8 +1,8 @@
 //! `octet hub install` and `uninstall`: the hub as a per-user launchd agent (macOS) or systemd
 //! user unit (Linux), so it starts at login and comes back if it stops.
 //!
-//! Every process runs with literal argv, never a shell. The hidden `OCTET_SERVICE_CTL` replaces
-//! `launchctl` / `systemctl` (receiving the same argv), so tests never touch the user's session.
+//! Every process runs with literal argv, never a shell. Tests hand `Control::new` a stand-in for
+//! `launchctl` / `systemctl` (receiving the same argv), so they never touch the user's session.
 use crate::args::CliError;
 use octet_hub::plain;
 use std::{
@@ -18,7 +18,9 @@ use std::{
 const LABEL: &str = "dev.octet.hub";
 /// The systemd unit's name.
 const UNIT: &str = "octet-hub.service";
-/// Directories a bare launchd or systemd `PATH` lacks, after the one `tmux` was found in.
+/// The tools the hub starts, in the order their directories lead the service's `PATH`.
+const TOOLS: [&str; 3] = ["tmux", "claude", "codex"];
+/// Directories a bare launchd or systemd `PATH` lacks, after the ones the [`TOOLS`] were found in.
 const DEFAULT_PATH: [&str; 4] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
 /// How many times `launchctl bootstrap` is tried: it can fail just after a `bootout`.
 const BOOTSTRAP_TRIES: u32 = 3;
@@ -71,7 +73,7 @@ pub(crate) struct ServicePlan {
 
 impl ServicePlan {
     /// A plan to run `program hub --journal-dir DATA_DIR`, logging to `<data_dir>/hub.log` where the
-    /// manager has a log file, with `tmux_dir` (where `tmux` was found) first on its `PATH`.
+    /// manager has a log file, with `lead` (where the [`TOOLS`] were found) first on its `PATH`.
     ///
     /// # Errors
     ///
@@ -81,12 +83,12 @@ impl ServicePlan {
         home: &Path,
         program: &Path,
         data_dir: &Path,
-        tmux_dir: Option<&Path>,
+        lead: &[PathBuf],
     ) -> Result<Self, CliError> {
         let mut dirs: Vec<String> = Vec::new();
-        for dir in tmux_dir
+        for dir in lead
+            .iter()
             .map(|dir| dir.to_string_lossy().into_owned())
-            .into_iter()
             .chain(DEFAULT_PATH.iter().map(|dir| (*dir).to_owned()))
         {
             if !dirs.contains(&dir) {
@@ -201,6 +203,7 @@ Description=Octet hub, your terminal sessions on your phone
 [Service]
 ExecStart={exec}
 Restart=on-failure
+RestartSec=5
 Environment={environment}
 
 [Install]
@@ -260,18 +263,31 @@ fn quote(word: &str, expands_dollar: bool) -> String {
     out
 }
 
-/// The directory holding an executable `tmux` on `search` (a `PATH` value), if any. Relative
+/// The directory holding an executable `name` on `search` (a `PATH` value), if any. Relative
 /// entries are skipped: the service would resolve them against its own directory.
-pub(crate) fn find_tmux(search: &OsStr) -> Option<PathBuf> {
+pub(crate) fn find_on_path(search: &OsStr, name: &str) -> Option<PathBuf> {
     std::env::split_paths(search)
         .filter(|dir| dir.is_absolute())
         .find(|dir| {
-            std::fs::metadata(dir.join("tmux"))
+            std::fs::metadata(dir.join(name))
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
 }
 
-/// The program that loads and unloads the unit: `launchctl` or `systemctl`, or the test seam.
+/// The directories on `search` where `tmux`, `claude` and `codex` were found, in that order, each
+/// once; a tool that isn't there adds nothing. The service's own `PATH` lacks the directories a
+/// shell adds (`claude` is often in `~/.local/bin`), so a session started from the phone needs these.
+pub(crate) fn tool_dirs(search: &OsStr) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in TOOLS.iter().filter_map(|tool| find_on_path(search, tool)) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// The program that loads and unloads the unit: `launchctl` or `systemctl`, or a test's stand-in.
 #[derive(Debug)]
 pub(crate) struct Control {
     program: PathBuf,
@@ -303,21 +319,15 @@ impl Control {
         self
     }
 
-    /// The real tool for `manager`, or `$OCTET_SERVICE_CTL` when set.
-    pub(crate) fn from_env(manager: Manager) -> Self {
-        let program = std::env::var_os("OCTET_SERVICE_CTL")
-            .filter(|path| !path.is_empty())
-            .map_or_else(
-                || {
-                    PathBuf::from(match manager {
-                        Manager::Launchd => "launchctl",
-                        Manager::Systemd => "systemctl",
-                    })
-                },
-                PathBuf::from,
-            );
+    /// The real tool for `manager`. `launchctl` is always `/bin/launchctl`; where `systemctl` is
+    /// varies by distribution, so it is looked up on `PATH`. Tests build a [`Control`] with
+    /// `Control::new` instead: nothing in the environment can swap the tool.
+    pub(crate) fn native(manager: Manager) -> Self {
         Self {
-            program,
+            program: PathBuf::from(match manager {
+                Manager::Launchd => "/bin/launchctl",
+                Manager::Systemd => "systemctl",
+            }),
             uid: None,
             id_program: PathBuf::from("id"),
             retry_wait: BOOTSTRAP_WAIT,
@@ -560,7 +570,7 @@ pub(crate) fn install_here(data_dir: &Path, print: bool) -> Result<(), CliError>
     let plan = here(manager, data_dir)?;
     install(
         &plan,
-        &Control::from_env(manager),
+        &Control::native(manager),
         print,
         &mut std::io::stdout(),
     )
@@ -574,7 +584,7 @@ pub(crate) fn install_here(data_dir: &Path, print: bool) -> Result<(), CliError>
 pub(crate) fn uninstall_here(data_dir: &Path) -> Result<(), CliError> {
     let manager = Manager::native();
     let plan = here(manager, data_dir)?;
-    uninstall(&plan, &Control::from_env(manager), &mut std::io::stdout())
+    uninstall(&plan, &Control::native(manager), &mut std::io::stdout())
 }
 
 fn here(manager: Manager, data_dir: &Path) -> Result<ServicePlan, CliError> {
@@ -589,8 +599,8 @@ fn here(manager: Manager, data_dir: &Path) -> Result<ServicePlan, CliError> {
             .map_err(|e| failed(format!("Couldn't resolve {}: {e}", path.display())))
     };
     let data_dir = absolute(data_dir)?;
-    let tmux = std::env::var_os("PATH").and_then(|search| find_tmux(&search));
-    ServicePlan::new(manager, &home, &program, &data_dir, tmux.as_deref())
+    let lead = std::env::var_os("PATH").map_or_else(Vec::new, |search| tool_dirs(&search));
+    ServicePlan::new(manager, &home, &program, &data_dir, &lead)
 }
 
 #[cfg(test)]
@@ -636,7 +646,7 @@ mod tests {
                 &self.home,
                 Path::new("/opt/octet/bin/octet"),
                 data_dir.unwrap_or(&self.data),
-                None,
+                &[],
             )
             .unwrap()
         }
@@ -667,7 +677,7 @@ mod tests {
         let bin = dir.path().join("bin");
         write_script(&bin, "tmux", "exit 0");
         let search = std::env::join_paths([bin.as_path(), Path::new("/usr/bin")]).unwrap();
-        let found = find_tmux(&search);
+        let found = find_on_path(&search, "tmux");
         assert_eq!(found.as_deref(), Some(bin.as_path()));
         let rig = Rig::new("");
         let plan = ServicePlan::new(
@@ -675,7 +685,7 @@ mod tests {
             &rig.home,
             Path::new("/opt/octet/bin/octet"),
             &rig.data,
-            found.as_deref(),
+            &found.into_iter().collect::<Vec<_>>(),
         )
         .unwrap();
         let expected = format!("{}:{DEFAULTS}", bin.display());
@@ -683,6 +693,55 @@ mod tests {
         assert!(
             text.contains(&format!("<key>PATH</key>\n    <string>{expected}</string>")),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_service_finds_the_vendor_clis() {
+        let dir = TempDir::new("octet-service-clis");
+        let brew = dir.path().join("brew");
+        let local = dir.path().join("local");
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        write_script(&brew, "tmux", "exit 0");
+        write_script(&local, "claude", "exit 0");
+        write_script(&brew, "codex", "exit 0");
+        let search =
+            std::env::join_paths([empty.as_path(), local.as_path(), brew.as_path()]).unwrap();
+        // tmux, claude, codex in that order, each directory once.
+        let found = tool_dirs(&search);
+        assert_eq!(found, [brew.clone(), local.clone()]);
+        let rig = Rig::new("");
+        let plan = ServicePlan::new(
+            Manager::Launchd,
+            &rig.home,
+            Path::new("/opt/octet/bin/octet"),
+            &rig.data,
+            &found,
+        )
+        .unwrap();
+        let expected = format!("{}:{}:{DEFAULTS}", brew.display(), local.display());
+        let text = plan.text();
+        assert!(
+            text.contains(&format!("<key>PATH</key>\n    <string>{expected}</string>")),
+            "{text}"
+        );
+        // A tool that isn't installed adds nothing.
+        let only_claude = std::env::join_paths([local.as_path()]).unwrap();
+        assert_eq!(tool_dirs(&only_claude), [local]);
+        assert!(tool_dirs(OsStr::new("")).is_empty());
+    }
+
+    #[test]
+    fn the_real_tools_are_fixed_and_not_taken_from_the_environment() {
+        assert_eq!(
+            Control::native(Manager::Launchd).program,
+            Path::new("/bin/launchctl")
+        );
+        // Where systemctl lives varies by distribution, so it is looked up on PATH.
+        assert_eq!(
+            Control::native(Manager::Systemd).program,
+            Path::new("systemctl")
         );
     }
 
@@ -705,8 +764,11 @@ mod tests {
             real.as_path(),
         ])
         .unwrap();
-        assert_eq!(find_tmux(&search).as_deref(), Some(real.as_path()));
-        assert_eq!(find_tmux(OsStr::new("")), None);
+        assert_eq!(
+            find_on_path(&search, "tmux").as_deref(),
+            Some(real.as_path())
+        );
+        assert_eq!(find_on_path(OsStr::new(""), "tmux"), None);
     }
 
     #[test]
@@ -765,7 +827,8 @@ mod tests {
         let text = plain.text();
         for needle in [
             "ExecStart=/opt/octet/bin/octet hub --journal-dir ",
-            "Restart=on-failure\n",
+            // Without a wait, a hub failing at boot exhausts systemd's start limit and stays down.
+            "Restart=on-failure\nRestartSec=5\n",
             &format!("Environment=PATH={DEFAULTS}\n"),
             "WantedBy=default.target\n",
         ] {
@@ -784,7 +847,7 @@ mod tests {
             &rig.home,
             Path::new("/Users/a b/octet"),
             Path::new("/d"),
-            Some(Path::new("/tmux dir")),
+            &[PathBuf::from("/tmux dir")],
         )
         .unwrap();
         let text = odd.text();
@@ -806,7 +869,7 @@ mod tests {
             &rig.home,
             Path::new("/opt/octet/bin/octet"),
             &rig.data,
-            Some(Path::new("/usr/local/bin")),
+            &[PathBuf::from("/usr/local/bin")],
         )
         .unwrap();
         assert!(
@@ -825,7 +888,7 @@ mod tests {
             &rig.home,
             Path::new("/opt/octet\n/octet"),
             &rig.data,
-            None,
+            &[],
         );
         assert!(matches!(bad, Err(CliError::Run(_))));
     }
@@ -1083,7 +1146,7 @@ mod tests {
             &rig.home,
             Path::new("/opt/octet/bin/octet"),
             &rig.data,
-            Some(Path::new("/t$x/50%/a\"b")),
+            &[PathBuf::from("/t$x/50%/a\"b")],
         )
         .unwrap();
         let text = plan.text();

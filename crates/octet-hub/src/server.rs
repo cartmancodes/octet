@@ -1455,10 +1455,30 @@ impl Hub {
         }
     }
 
-    /// Removes `conn` and its unanswered commands; its replays stop as it drops.
+    /// Removes `conn` and its unanswered commands; its replays stop as it drops. When it was its
+    /// device's last connection, the approvals that device was spared while looking are offered
+    /// to it again.
     fn forget(&mut self, conn: u64) -> Option<Conn> {
         let state = self.conns.remove(&conn)?;
         self.pending.retain(|_, pending| pending.conn != conn);
+        if let Some(device) = &state.device {
+            let key = &device.token_sha256;
+            let still_here = self.conns.values().any(|other| {
+                other
+                    .device
+                    .as_ref()
+                    .is_some_and(|held| &held.token_sha256 == key)
+            });
+            // A device unpaired, or without a push token, has nowhere to be told.
+            let reachable = self
+                .store
+                .devices()
+                .iter()
+                .any(|known| &known.token_sha256 == key && known.push_token.is_some());
+            if !still_here && reachable {
+                self.pusher.disconnected(key, Instant::now());
+            }
+        }
         Some(state)
     }
 }
