@@ -7,7 +7,8 @@ import { createStore, useStore, type StoreApi } from "zustand";
 
 import type { HubClient, HubState } from "./client/HubClient";
 import { ENGINES, MODES, PHASES, count, member } from "./model/enums";
-import { EMPTY_VIEW, reduceView, type Op, type PendingApproval, type SessionView } from "./model/session";
+import { EMPTY_VIEW, reduceView, type Op, type PendingApproval, type SessionState, type SessionView } from "./model/session";
+import type { Entry } from "./model/transcript";
 import { field } from "./model/text";
 import { isKnownEvent, type SessionInfo, type ToPhone } from "./protocol";
 
@@ -17,6 +18,9 @@ export interface OctetState {
   /** What the phone knows of each session it has heard of. A Map: the keys are the hub's. */
   bySession: ReadonlyMap<string, SessionView>;
   hub: HubState;
+  /** A sessions frame came since the store began or was reset: until then an empty `sessions`
+   * means "not told yet", not "none". */
+  listed: boolean;
   /** Applies the client's frames, in order, in one commit. Returns the sessions that just
    * ended (they were listed before and are not now): their views stay, marked `ended`, until
    * the caller releases them. */
@@ -88,14 +92,16 @@ export function createOctetStore(): OctetStore {
     sessions: [],
     bySession: new Map(),
     hub: "offline",
+    listed: false,
 
     reset() {
-      set({ sessions: [], bySession: new Map(), hub: "offline" });
+      set({ sessions: [], bySession: new Map(), hub: "offline", listed: false });
     },
 
     applyBatch(frames) {
-      const { sessions: before, bySession } = get();
+      const { sessions: before, bySession, listed: wasListed } = get();
       let sessions = before;
+      let listed = wasListed;
       const ops = new Map<string, Op[]>();
       const push = (session: string, op: Op) => {
         const list = ops.get(session);
@@ -105,7 +111,10 @@ export function createOctetStore(): OctetStore {
       for (const frame of frames) {
         switch (frame.type) {
           case "sessions":
-            if (Array.isArray(frame.sessions)) sessions = reconcile(sessions, frame.sessions);
+            if (Array.isArray(frame.sessions)) {
+              sessions = reconcile(sessions, frame.sessions);
+              listed = true;
+            }
             break;
           case "subscribed":
             if (frame.from === "start") push(frame.session, { op: "reset" });
@@ -142,8 +151,8 @@ export function createOctetStore(): OctetStore {
         if (next === old || (old === undefined && next === EMPTY_VIEW)) continue;
         (views ??= new Map(bySession)).set(session, next);
       }
-      if (views === null && sessions === before) return ended;
-      set({ sessions, ...(views ? { bySession: views } : {}) });
+      if (views === null && sessions === before && listed === wasListed) return ended;
+      set({ sessions, ...(views ? { bySession: views } : {}), ...(listed !== wasListed ? { listed } : {}) });
       return ended;
     },
 
@@ -274,6 +283,14 @@ export function unwatch(client: HubClient, session: string): void {
 
 const NO_APPROVALS: PendingApproval[] = [];
 
+export interface SessionStatus {
+  /** The store holds a view of it. */
+  known: boolean;
+  ended: boolean;
+  /** Why the hub refused to stream it, when it did for good. */
+  failed: string | null;
+}
+
 /** Hooks over `store`: each selects the smallest part a screen needs. */
 export function bindHooks(store: OctetStore) {
   return {
@@ -282,8 +299,26 @@ export function bindHooks(store: OctetStore) {
     /** The listed sessions; the same array until the list changes. */
     useSessions: (): SessionInfo[] => useStore(store, useShallow((s) => s.sessions)),
     useSessionInfo: (id: string): SessionInfo | undefined => useStore(store, (s) => s.sessions.find((x) => x.id === id)),
-    /** A session's transcript entries: new only when an entry was added or changed. */
-    useEntries: (id: string) => useStore(store, (s) => (s.bySession.get(id) ?? EMPTY_VIEW).transcript.entries),
+    /** A session's transcript entries: new only when an entry was added or changed. During a
+     * replay from the start that has brought nothing yet, the entries shown before it. */
+    useEntries: (id: string): Entry[] =>
+      useStore(store, (s) => {
+        const v = s.bySession.get(id) ?? EMPTY_VIEW;
+        return v.replaying && v.held ? v.held : v.transcript.entries;
+      }),
+    /** The terminal UI's state of a session (goal, NOW, queue); the same object until it changes. */
+    useSessionState: (id: string): SessionState | null => useStore(store, (s) => s.bySession.get(id)?.state ?? null),
+    /** Whether the phone holds a view of the session, and whether it ended or failed. */
+    useSessionStatus: (id: string): SessionStatus =>
+      useStore(
+        store,
+        useShallow((s) => {
+          const v = s.bySession.get(id);
+          return { known: v !== undefined, ended: v?.ended ?? false, failed: v?.failed ?? null };
+        }),
+      ),
+    /** A sessions frame came since the store began or was reset. */
+    useListed: (): boolean => useStore(store, (s) => s.listed),
     useApprovals: (id: string): PendingApproval[] =>
       useStore(store, (s) => s.bySession.get(id)?.approvals ?? NO_APPROVALS),
     useHub: (): HubState => useStore(store, (s) => s.hub),
@@ -292,4 +327,14 @@ export function bindHooks(store: OctetStore) {
 
 /** The app's store, and its hooks. */
 export const octetStore = createOctetStore();
-export const { useSession, useSessions, useSessionInfo, useEntries, useApprovals, useHub } = bindHooks(octetStore);
+export const {
+  useSession,
+  useSessions,
+  useSessionInfo,
+  useEntries,
+  useSessionState,
+  useSessionStatus,
+  useListed,
+  useApprovals,
+  useHub,
+} = bindHooks(octetStore);

@@ -3,7 +3,7 @@ import { act, fireEvent, within } from "@testing-library/react-native";
 import { useLocalSearchParams } from "expo-router";
 import { renderRouter, screen } from "expo-router/testing-library";
 import * as SecureStore from "expo-secure-store";
-import { AppState, StyleSheet, Text } from "react-native";
+import { AccessibilityInfo, AppState, StyleSheet, Text } from "react-native";
 
 import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
@@ -233,6 +233,69 @@ describe("Sessions", () => {
     // the same list again changes nothing on screen
     await hear(rig, [info("a"), info("b", { phase: "running", now: "Thinking" }), info("c")]);
     expect(drawn).not.toHaveBeenCalled();
+  });
+
+  it("says it is loading until the Mac sends the list, not that there are none", async () => {
+    const rig = await launch(null);
+    await screen.findByTestId("sessions-list");
+    await act(async () => {
+      rig.sockets.last.open();
+      rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+      rig.clock.advance(50);
+    });
+    expect(screen.getByText("Loading sessions…")).toBeTruthy();
+    expect(screen.queryByText("No Octet sessions are running on your Mac")).toBeNull();
+    await hear(rig, []);
+    expect(screen.queryByText("Loading sessions…")).toBeNull();
+    expect(screen.getByText("No Octet sessions are running on your Mac")).toBeTruthy();
+  });
+
+  it("the offline banner is a polite live region and is announced when its words change", async () => {
+    const announce = jest.spyOn(AccessibilityInfo, "announceForAccessibility");
+    const rig = await launch([info("a")]);
+    announce.mockClear();
+    await act(async () => {
+      rig.sockets.last.drop();
+    });
+    expect(screen.getByLabelText("Can't reach your Mac").props.accessibilityLiveRegion).toBe("polite");
+    expect(announce).toHaveBeenCalledWith("Can't reach your Mac");
+    expect(announce).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      rig.clock.advance(60_000); // the reconnect timer opens a new socket
+    });
+    expect(announce).toHaveBeenLastCalledWith("Connecting to your Mac…");
+  });
+
+  it("the refresh spinner stops once the Mac answers and does not come back on a later drop", async () => {
+    const rig = await launch([info("a")]);
+    const list = () => screen.getByTestId("sessions-list");
+    await act(async () => {
+      list().props.refreshControl.props.onRefresh();
+    });
+    await hear(rig, [info("a")]);
+    expect(list().props.refreshControl.props.refreshing).toBe(false);
+    await act(async () => {
+      rig.sockets.last.drop();
+    });
+    expect(list().props.refreshControl.props.refreshing).toBe(false);
+  });
+
+  it("names a session with a blank workspace Session", async () => {
+    await launch([info("x", { workspace: "" }), info("y", { workspace: "/" })]);
+    expect(screen.getAllByRole("button", { name: /^Session, Claude/ })).toHaveLength(2);
+    expect(screen.getAllByText("Session")).toHaveLength(2);
+  });
+
+  it("clips the goal and NOW line in a card's label, and shows them whole", async () => {
+    const goal = "g".repeat(500);
+    const now = `Running Bash ${"n".repeat(500)}`;
+    await launch([info("a", { goal, now, phase: "running" })]);
+    const card = screen.getByRole("button", { name: /^a, / });
+    const parts = String(card.props.accessibilityLabel).split(", ");
+    expect(parts.every((p) => p.length <= 120)).toBe(true);
+    expect(parts.some((p) => p.startsWith("ggg") && p.endsWith("…"))).toBe(true);
+    expect(parts.some((p) => p.startsWith("Running Bash nnn") && p.endsWith("…"))).toBe(true);
+    expect(within(card).getByText(goal)).toBeTruthy();
   });
 
   describe("the header mascot", () => {

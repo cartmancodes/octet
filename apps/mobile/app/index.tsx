@@ -1,5 +1,5 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
-import { useRouter } from "expo-router";
+import { useIsFocused, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
@@ -9,7 +9,7 @@ import { useHubClient } from "../src/hub";
 import { Mascot } from "../src/mascot/Mascot";
 import type { SessionInfo } from "../src/protocol";
 import { headerPose, sortSessions } from "../src/sessions";
-import { useHub, useSessions } from "../src/store";
+import { useHub, useListed, useSessions } from "../src/store";
 import { radius, spacing, type, useTheme } from "../src/theme";
 
 /** The mascot is drawn at one whole multiple of its 59-unit width. */
@@ -26,6 +26,8 @@ export default function Sessions() {
   const client = useHubClient();
   const sessions = useSessions();
   const hub = useHub();
+  const listed = useListed();
+  const focused = useIsFocused();
   const [pulled, setPulled] = useState(false);
 
   const sorted = useMemo(() => sortSessions(sessions), [sessions]);
@@ -55,11 +57,18 @@ export default function Sessions() {
     const timer = setTimeout(() => setPulled(false), REFRESH_MAX_MS);
     return () => clearTimeout(timer);
   }, [pulled]);
+  // The Mac answered: the pull is over, so a later drop does not bring the spinner back. (A
+  // pull stops the client first, so the render it causes sees the Mac unreachable.)
+  if (pulled && reachable) setPulled(false);
   const refreshing = pulled && !reachable;
 
   const empty = useMemo(
     () =>
-      reachable ? (
+      reachable && !listed ? (
+        <View style={styles.empty}>
+          <Text style={[type.body, styles.emptyText, { color: theme.muted }]}>Loading sessions…</Text>
+        </View>
+      ) : reachable ? (
         <View style={styles.empty}>
           <Text style={[type.body, styles.emptyText, { color: theme.muted }]}>
             No Octet sessions are running on your Mac
@@ -74,7 +83,7 @@ export default function Sessions() {
           </Pressable>
         </View>
       ) : null,
-    [reachable, openRecent, theme],
+    [reachable, listed, openRecent, theme],
   );
 
   return (
@@ -83,7 +92,7 @@ export default function Sessions() {
         <Mascot pose={pose} size={MASCOT} />
         <Text style={[type.body, { color: theme.muted }]}>{summary(sessions.length, waiting)}</Text>
       </View>
-      <HubBanner state={hub} />
+      <HubBanner state={hub} announce={focused} />
       <FlashList
         testID="sessions-list"
         data={sorted}

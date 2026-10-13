@@ -186,6 +186,71 @@ describe("a_reset_replaces_the_transcript", () => {
   });
 });
 
+describe("a fresh replay keeps the previous transcript on screen", () => {
+  it("until the replay's first page commits, across batches", async () => {
+    const hooks = bindHooks(store);
+    store.getState().applyBatch([user("a", "old"), text("a", "reply")]);
+    const before = view("a").transcript.entries;
+    const shown = await renderHook(() => hooks.useEntries("a"));
+    expect(shown.result.current).toBe(before);
+    await act(() => {
+      store.getState().applyBatch([subscribed("a", "start")]);
+    });
+    expect(view("a").replaying).toBe(true);
+    expect(view("a").transcript.entries).toEqual([]);
+    expect(shown.result.current).toBe(before); // no empty flash
+    await act(() => {
+      store.getState().applyBatch([user("a", "new")]);
+    });
+    expect(view("a").replaying).toBe(false);
+    expect(view("a").held).toBeNull();
+    expect(shown.result.current).toMatchObject([{ kind: "user", text: "new" }]);
+  });
+
+  it("holds what the batch had before the reset, stale live records included", () => {
+    store.getState().applyBatch([user("a", "old")]);
+    store.getState().applyBatch([text("a", "late"), subscribed("a", "start")]);
+    expect(view("a").held).toMatchObject([{ text: "old" }, { text: "late" }]);
+  });
+
+  it("holds nothing when the reset and the first page come in one batch", () => {
+    store.getState().applyBatch([user("a", "old")]);
+    store.getState().applyBatch([subscribed("a", "start"), user("a", "new")]);
+    expect(view("a").replaying).toBe(false);
+    expect(view("a").held).toBeNull();
+    expect(view("a").transcript.entries).toMatchObject([{ text: "new" }]);
+  });
+
+  it("a second reset during a replay keeps the transcript first held", () => {
+    store.getState().applyBatch([user("a", "old")]);
+    store.getState().applyBatch([subscribed("a", "start")]);
+    store.getState().applyBatch([subscribed("a", "start")]);
+    expect(view("a").held).toMatchObject([{ text: "old" }]);
+  });
+});
+
+describe("listed", () => {
+  it("is false until a sessions frame is applied, even an empty one, and false again after reset", () => {
+    expect(store.getState().listed).toBe(false);
+    store.getState().applyBatch([user("a", "x")]);
+    expect(store.getState().listed).toBe(false);
+    store.getState().applyBatch([sessions()]);
+    expect(store.getState().listed).toBe(true);
+    store.getState().reset();
+    expect(store.getState().listed).toBe(false);
+  });
+
+  it("has its own hook", async () => {
+    const hooks = bindHooks(store);
+    const listed = await renderHook(() => hooks.useListed());
+    expect(listed.result.current).toBe(false);
+    await act(() => {
+      store.getState().applyBatch([sessions(info("a"))]);
+    });
+    expect(listed.result.current).toBe(true);
+  });
+});
+
 describe("state and catalog", () => {
   it("are stored per session", () => {
     store.getState().applyBatch([stateFrame("a", { now: "Reading", queue: ["next"], queued: 1 }), stateFrame("b", { now: "Idle" }), catalogFrame("a")]);

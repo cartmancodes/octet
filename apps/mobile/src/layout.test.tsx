@@ -50,7 +50,7 @@ async function launch(opts: { paired?: boolean } = {}) {
       <RootLayout />
     </HubContext.Provider>
   );
-  await renderRouter({ _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair });
+  await renderRouter({ _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => null });
   return { hub, sockets, clock };
 }
 
@@ -65,6 +65,25 @@ describe("the app shell", () => {
     const { sockets } = await launch();
     expect(await screen.findByText("Pair with your Mac")).toBeTruthy();
     expect(screen.queryByText("Sessions list")).toBeNull();
+    expect(sockets.all).toHaveLength(0);
+  });
+
+  it("a link to a session before pairing lands on Pair, not the session", async () => {
+    const sockets = new Sockets();
+    const hub = new HubController({ factory: sockets.factory, store: createOctetStore(), platform: "ios" });
+    const Layout = () => (
+      <HubContext.Provider value={hub}>
+        <RootLayout />
+      </HubContext.Provider>
+    );
+    const view = renderRouter(
+      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text> },
+      { initialUrl: "/session/x" },
+    );
+    await view;
+    expect(await screen.findByText("Pair with your Mac")).toBeTruthy();
+    expect(screen.queryByText("Session x")).toBeNull();
+    expect(view.getPathname()).toBe("/pair");
     expect(sockets.all).toHaveLength(0);
   });
 

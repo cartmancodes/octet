@@ -9,7 +9,7 @@ import type {
   ModelInfo,
   StateInfo,
 } from "../protocol";
-import { EMPTY_TRANSCRIPT, TranscriptDraft, type Transcript } from "./transcript";
+import { EMPTY_TRANSCRIPT, TranscriptDraft, type Entry, type Transcript } from "./transcript";
 import { ENGINES, MODES, PHASES, count, member } from "./enums";
 import { field } from "./text";
 
@@ -37,6 +37,11 @@ export interface SessionView {
   ended: boolean;
   /** The last `MAX_CLOSED` approvals closed, so that a stale state frame cannot bring one back. */
   closed: number[];
+  /** A replay from the start began and has brought no record yet. */
+  replaying: boolean;
+  /** While `replaying`, the entries shown before it began, so the screen does not flash empty
+   * between the reset and the replay's first page; null otherwise. */
+  held: Entry[] | null;
 }
 
 export const EMPTY_VIEW: SessionView = {
@@ -50,6 +55,8 @@ export const EMPTY_VIEW: SessionView = {
   failed: null,
   ended: false,
   closed: [],
+  replaying: false,
+  held: null,
 };
 
 /** One change to a session's view, in the order the hub sent it. */
@@ -192,6 +199,12 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
   for (const op of ops) {
     switch (op.op) {
       case "reset":
+        if (!v.replaying) {
+          // What the screen showed (this batch's earlier records included) stays up until the replay brings something.
+          const shown = draft ? (draft as TranscriptDraft).finish() : v.transcript;
+          v.held = shown.entries.length > 0 ? shown.entries : null;
+          v.replaying = true;
+        }
         draft = new TranscriptDraft(EMPTY_TRANSCRIPT);
         if (v.approvals.length > 0) v.approvals = [];
         if (v.closed.length > 0) v.closed = [];
@@ -217,6 +230,10 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
       }
       case "event": {
         const ev = op.ev;
+        if (v.replaying) {
+          v.replaying = false;
+          v.held = null;
+        }
         switch (ev.type) {
           case "approval":
             v.approvals = approve(v.approvals, ev.data);
@@ -262,6 +279,8 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.usage === view.usage &&
     v.failed === view.failed &&
     v.ended === view.ended &&
-    v.closed === view.closed;
+    v.closed === view.closed &&
+    v.replaying === view.replaying &&
+    v.held === view.held;
   return same ? view : v;
 }

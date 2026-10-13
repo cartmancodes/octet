@@ -1,0 +1,201 @@
+import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
+import { Stack, useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
+import { useCallback, useRef, useState } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+
+import { useFollow } from "../../src/components/follow";
+import { HubBanner } from "../../src/components/HubBanner";
+import { TaskStrip } from "../../src/components/TaskStrip";
+import { TranscriptRow } from "../../src/components/TranscriptRow";
+import { useHubClient } from "../../src/hub";
+import type { Entry } from "../../src/model/transcript";
+import { nowLine } from "../../src/session";
+import { sessionName } from "../../src/sessions";
+import {
+  octetStore,
+  releaseSession,
+  unwatch,
+  useEntries,
+  useHub,
+  useListed,
+  useSessionInfo,
+  useSessionState,
+  useSessionStatus,
+  watch,
+} from "../../src/store";
+import { radius, spacing, type, useTheme } from "../../src/theme";
+
+const keyOf = (entry: Entry): string => entry.key;
+const typeOf = (entry: Entry): string => entry.kind;
+/** FlashList 2 keeps the visible rows in place as rows above change (old ones dropped); the
+ * transcript opens at its end. Following the output is `useFollow`'s. */
+const KEEP_POSITION = { startRenderingFromBottom: true } as const;
+const NO_OPEN: ReadonlySet<string> = new Set();
+
+/**
+ * One session: its Task strip and transcript. Shown, it streams the session (`watch`); left, it
+ * stops (`unwatch`) and lets an ended session go (`releaseSession`). It reads only this
+ * session's part of the store, so other sessions' output never draws it again.
+ */
+export default function Session() {
+  const params = useLocalSearchParams<{ id: string }>();
+  const id = typeof params.id === "string" ? params.id : "";
+  const theme = useTheme();
+  const router = useRouter();
+  const client = useHubClient();
+  const focused = useIsFocused();
+  const info = useSessionInfo(id);
+  const entries = useEntries(id);
+  const state = useSessionState(id);
+  const status = useSessionStatus(id);
+  const listed = useListed();
+  const hub = useHub();
+
+  useFocusEffect(
+    useCallback(() => {
+      if (!client || id === "") return;
+      // An ended session's view is what it left behind: there is nothing more to stream.
+      if (!octetStore.getState().bySession.get(id)?.ended) watch(octetStore, client, id);
+      return () => {
+        unwatch(client, id);
+        releaseSession(octetStore, client, id);
+      };
+    }, [client, id]),
+  );
+
+  // The title outlives the session's place in the list.
+  const [workspace, setWorkspace] = useState(info?.workspace);
+  if (info && info.workspace !== workspace) setWorkspace(info.workspace);
+  const title = sessionName(workspace);
+
+  // Tools entries the user opened, by key: kept here, not in the row, which FlashList recycles.
+  const [open, setOpen] = useState<ReadonlySet<string>>(NO_OPEN);
+  const toggle = useCallback((key: string) => {
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  }, []);
+  const renderItem = useCallback<ListRenderItem<Entry>>(
+    ({ item }) => <TranscriptRow entry={item} open={open.has(item.key)} onToggle={toggle} />,
+    [open, toggle],
+  );
+
+  const list = useRef<FlashListRef<Entry>>(null);
+  const follow = useFollow(list, entries);
+
+  const back = useCallback(() => {
+    if (router.canGoBack()) router.back();
+    else router.replace("/");
+  }, [router]);
+
+  const gone = listed && info === undefined && !status.known;
+  const now = nowLine(state, info);
+
+  return (
+    <View style={[styles.screen, { backgroundColor: theme.bg }]}>
+      <Stack.Screen options={{ title }} />
+      <HubBanner state={hub} announce={focused} />
+      {gone ? (
+        <View style={styles.gone}>
+          <Text style={[type.body, styles.center, { color: theme.muted }]}>This session isn&apos;t running anymore</Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Back to sessions"
+            onPress={back}
+            style={[styles.button, { borderColor: theme.accent }]}
+          >
+            <Text style={[type.body, { color: theme.accent }]}>Back to sessions</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <>
+          {status.ended ? <Notice text="This session ended" /> : null}
+          {status.failed !== null ? <Notice text={status.failed} /> : null}
+          <TaskStrip state={state} now={now} goal={info?.goal ?? null} />
+          <View style={styles.transcript}>
+            <FlashList
+              ref={list}
+              testID="transcript"
+              data={entries}
+              extraData={open}
+              renderItem={renderItem}
+              keyExtractor={keyOf}
+              getItemType={typeOf}
+              maintainVisibleContentPosition={KEEP_POSITION}
+              onScroll={follow.onScroll}
+              onScrollBeginDrag={follow.onScrollBeginDrag}
+              onScrollEndDrag={follow.onScrollEndDrag}
+              onMomentumScrollBegin={follow.onMomentumScrollBegin}
+              onMomentumScrollEnd={follow.onMomentumScrollEnd}
+              onContentSizeChange={follow.onContentSizeChange}
+              scrollEventThrottle={32}
+              contentContainerStyle={styles.list}
+            />
+            {follow.below ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="New output below"
+                onPress={follow.jump}
+                style={[styles.pill, { backgroundColor: theme.selected, borderColor: theme.accent }]}
+              >
+                <Text style={[type.caption, { color: theme.fg }]}>New output below ↓</Text>
+              </Pressable>
+            ) : null}
+          </View>
+          {/* The composer (Task 8) goes here, shown only while the session is live. */}
+        </>
+      )}
+    </View>
+  );
+}
+
+/** A line over the transcript saying why it is not live. */
+function Notice({ text }: { text: string }) {
+  const theme = useTheme();
+  return (
+    <View
+      accessible
+      accessibilityLabel={text}
+      style={[styles.notice, { backgroundColor: theme.panel, borderColor: theme.edge }]}
+    >
+      <Text style={[type.body, { color: theme.muted }]}>{text}</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  screen: { flex: 1 },
+  transcript: { flex: 1 },
+  list: { paddingVertical: spacing.sm },
+  gone: { flex: 1, alignItems: "center", justifyContent: "center", gap: spacing.lg, padding: spacing.xl },
+  center: { textAlign: "center" },
+  button: {
+    minHeight: 44,
+    minWidth: 44,
+    paddingHorizontal: spacing.xl,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.md,
+    borderWidth: 1,
+  },
+  notice: {
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.lg,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    marginHorizontal: spacing.lg,
+    marginBottom: spacing.sm,
+  },
+  pill: {
+    position: "absolute",
+    bottom: spacing.lg,
+    alignSelf: "center",
+    minHeight: 44,
+    justifyContent: "center",
+    paddingHorizontal: spacing.lg,
+    borderRadius: radius.lg,
+    borderWidth: 1,
+  },
+});

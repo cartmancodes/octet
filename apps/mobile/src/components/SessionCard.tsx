@@ -2,7 +2,7 @@ import { memo, useCallback, useMemo } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { SessionInfo } from "../protocol";
-import { engineLine, folderName, nowText } from "../sessions";
+import { clipLabel, engineLine, nowText, sessionName } from "../sessions";
 import { radius, spacing, type, useTheme } from "../theme";
 
 interface SessionCardProps {
@@ -19,7 +19,7 @@ const approvalsWaiting = (n: number): string => `${n} ${n === 1 ? "approval" : "
  * and an amber badge counting approvals waiting. Every string is the Mac's and drawn as text. */
 export const SessionCard = memo(function SessionCard({ info, disabled, onOpen }: SessionCardProps) {
   const theme = useTheme();
-  const folder = folderName(info.workspace);
+  const folder = sessionName(info.workspace);
   const now = nowText(info);
   const engine = engineLine(info);
   const open = useCallback(() => onOpen(info.id), [onOpen, info.id]);
@@ -34,8 +34,8 @@ export const SessionCard = memo(function SessionCard({ info, disabled, onOpen }:
   const label = [
     folder,
     engine,
-    now,
-    info.goal ? info.goal : null,
+    clipLabel(now),
+    info.goal ? clipLabel(info.goal) : null,
     info.approvals > 0 ? approvalsWaiting(info.approvals) : null,
   ]
     .filter((x) => x !== null && x !== "")

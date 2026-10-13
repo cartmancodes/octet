@@ -1,5 +1,5 @@
 import type { SessionInfo } from "./protocol";
-import { engineLine, folderName, headerPose, nowText, sessionPose, sortSessions } from "./sessions";
+import { clipLabel, engineLine, folderName, headerPose, nowText, sessionName, sessionPose, sortSessions } from "./sessions";
 
 const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
   id,
@@ -23,6 +23,33 @@ describe("folderName", () => {
     ["", ""],
   ])("%s -> %s", (path, name) => {
     expect(folderName(path)).toBe(name);
+  });
+});
+
+describe("sessionName", () => {
+  it.each([
+    ["/Users/me/Octet", "Octet"],
+    ["", "Session"],
+    ["/", "Session"],
+    ["///", "Session"],
+    ["/Users/me/   /", "Session"],
+    [undefined, "Session"],
+  ])("%p is %p", (workspace, name) => {
+    expect(sessionName(workspace)).toBe(name);
+  });
+});
+
+describe("clipLabel", () => {
+  it("leaves a short text alone and cuts a long one to the limit with an ellipsis", () => {
+    expect(clipLabel("short")).toBe("short");
+    expect(clipLabel("x".repeat(120))).toBe("x".repeat(120));
+    const cut = clipLabel("x".repeat(121));
+    expect(cut).toHaveLength(120);
+    expect(cut.endsWith("…")).toBe(true);
+  });
+  it("never splits a surrogate pair", () => {
+    const cut = clipLabel("x".repeat(118) + "😀".repeat(10));
+    expect(cut).toBe("x".repeat(118) + "…");
   });
 });
 

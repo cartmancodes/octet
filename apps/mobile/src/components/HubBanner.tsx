@@ -1,5 +1,5 @@
-import { memo } from "react";
-import { StyleSheet, Text, View } from "react-native";
+import { memo, useEffect } from "react";
+import { AccessibilityInfo, StyleSheet, Text, View } from "react-native";
 
 import type { HubState } from "../client/HubClient";
 import { radius, spacing, type, useTheme } from "../theme";
@@ -18,15 +18,20 @@ export function bannerText(state: HubState): string | null {
 }
 
 /** The strip over the list while the Mac is not reachable: what the list shows is the last the
- * Mac said. */
-export const HubBanner = memo(function HubBanner({ state }: { state: HubState }) {
+ * Mac said. A change of its words is spoken: a live region on Android, an announcement on iOS.
+ * `announce` is false on a screen not in front, so a banner under it does not speak twice. */
+export const HubBanner = memo(function HubBanner({ state, announce = true }: { state: HubState; announce?: boolean }) {
   const theme = useTheme();
   const text = bannerText(state);
+  useEffect(() => {
+    if (text !== null && announce) AccessibilityInfo.announceForAccessibility(text);
+  }, [text, announce]);
   if (text === null) return null;
   return (
     <View
       accessible
       accessibilityRole="alert"
+      accessibilityLiveRegion="polite"
       accessibilityLabel={text}
       style={[styles.banner, { backgroundColor: theme.panel, borderColor: theme.edge }]}
     >
