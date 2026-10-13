@@ -8,8 +8,15 @@ describe("cleaning hub text", () => {
   });
 
   it("drops zero-width characters, which can pad a command with lines that look empty", () => {
-    expect(sanitize("a\u200bb\u200cc\u200dd\u2060e\ufefff", TEXT).out).toBe("abcdef");
+    expect(sanitize("a\u200bb\u2060c\ufeffd", TEXT).out).toBe("abcd");
     expect(field("rm\u200b -rf", 100)).toBe("rm -rf");
+  });
+
+  it("keeps the joiners that emoji and scripts need (ZWJ, ZWNJ)", () => {
+    const family = "\u{1F468}\u200d\u{1F469}\u200d\u{1F467}";
+    expect(sanitize(family, TEXT).out).toBe(family);
+    const persian = "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645";
+    expect(sanitize(persian, TEXT).out).toBe(persian);
   });
 
   it("still drops the overrides and isolates", () => {

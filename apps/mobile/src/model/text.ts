@@ -26,9 +26,10 @@ const PLAIN = /^[\x20-\x7e\n]*$/;
  * ("1<RLM> 22" shows as "22 1"). */
 const isBidi = (cp: number): boolean =>
   (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069) || cp === 0x200e || cp === 0x200f || cp === 0x061c;
-/** Zero-width characters (U+200B-200D, U+2060, U+FEFF): invisible, so a line of them looks
- * empty and can pad what Allow runs out of sight. */
-const isInvisible = (cp: number): boolean => (cp >= 0x200b && cp <= 0x200d) || cp === 0x2060 || cp === 0xfeff;
+/** Zero-width characters with no job in text (U+200B, U+2060, U+FEFF): invisible, so a line of
+ * them looks empty and can pad what Allow runs out of sight. The joiners (ZWNJ, ZWJ) stay:
+ * emoji sequences and scripts such as Persian need them; the command fold treats them as blank. */
+const isInvisible = (cp: number): boolean => cp === 0x200b || cp === 0x2060 || cp === 0xfeff;
 const isControl = (cp: number): boolean => cp < 0x20 || (cp >= 0x7f && cp <= 0x9f);
 const isSurrogate = (cp: number): boolean => cp >= 0xd800 && cp <= 0xdfff;
 
