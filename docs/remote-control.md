@@ -426,7 +426,9 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
 
 - **What is sent.** Exactly this and nothing else: the title `Octet`, the body
   `Approval waiting` or `Turn finished`, and `data` holding the hub's opaque
-  session id so a tap opens that session. No prompt, command, file name,
+  session id so a tap opens that session, plus the fixed delivery fields
+  Expo needs (`to`, which is the phone's push token, and `sound`, `priority`
+  and `channelId`, which are constants). No prompt, command, file name,
   workspace, model or reply text ever goes in a push, so the push services
   never see what you are working on.
 - **Where it goes.** The hub posts each push to Expo's push service, `https://exp.host/--/api/v2/push/send`,
@@ -443,6 +445,10 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
   finished turn. Pushes to a phone collect for about two seconds and go out as
   one (an approval wins over a finished turn), and a phone gets at most six
   in any minute. A phone Expo reports as gone has its token cleared.
+- **curl.** The hub sends each push by running `curl` from its `PATH`. Without
+  `curl` every push fails (the hub logs `Push failed` and carries on). macOS
+  and most Linux systems have it in `/usr/bin`; the service `octet hub install`
+  writes carries a `PATH` that includes `/usr/bin`, so it finds it.
 - **Turn it off.** Switch **Notifications** off in the app's Settings (the
   hub forgets the token at once). Unpairing the phone, or `octet hub revoke
   "NAME"` on the Mac, removes its token as well. Stopping the hub stops

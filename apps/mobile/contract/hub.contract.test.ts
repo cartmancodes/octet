@@ -90,8 +90,11 @@ class PushFake {
     });
   });
 
-  listen(port: number): Promise<void> {
-    return new Promise((resolve) => this.server.listen(port, "127.0.0.1", resolve));
+  /** Listens on a free port and returns it. */
+  listen(): Promise<number> {
+    return new Promise((resolve) =>
+      this.server.listen(0, "127.0.0.1", () => resolve((this.server.address() as net.AddressInfo).port)),
+    );
   }
 
   close(): void {
@@ -238,13 +241,15 @@ run("the app's hub client against the real octet hub", () => {
     );
 
     pushFake = new PushFake();
-    await pushFake.listen(await freePort());
-    const pushPort = (pushFake.server.address() as net.AddressInfo).port;
+    const pushPort = await pushFake.listen();
 
     hub = spawn(BINARY, ["hub", "--journal-dir", root, "--port", String(port), "--owner", OWNER], {
       env: {
         ...process.env,
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        // curl must reach the local fake directly, whatever proxy the machine's environment names.
+        NO_PROXY: "127.0.0.1",
+        no_proxy: "127.0.0.1",
         OCTET_HUB_PUSH_URL: `http://127.0.0.1:${pushPort}/--/api/v2/push/send`,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -403,6 +408,9 @@ run("the app's hub client against the real octet hub", () => {
     }
     await sleep(3500);
     expect(pushFake?.bodies).toHaveLength(1);
+    // The token is in neither the hub's output nor its audit file.
+    expect(hubLog).not.toContain(PUSH_TOKEN);
+    expect(readFileSync(path.join(root, "hub-audit.jsonl"), "utf8")).not.toContain(PUSH_TOKEN);
   });
 
   it("turns notifications off", async () => {

@@ -111,12 +111,23 @@ the EAS project. Neither is in this repository.
 Set it up with your own accounts (nothing here creates one):
 
 1. `eas init` in `apps/mobile`, if you have not (it adds the project id to `app.json`).
-2. iPhone: `eas credentials`, choose iOS, and let EAS create or upload an APNs key for push. This
-   needs the paid Apple developer account that the device build already needs.
-3. Android: create a Firebase project, add the Android app (package `app.json` names), then give
-   EAS its FCM V1 service-account key under `eas credentials`, Android, Google Service Account
-   Key for push notifications (FCM V1). Put the `google-services.json` where the Expo guide for
-   push notifications says.
+2. iPhone: register the iPhone with EAS before the first build (`eas device:create`), then run
+   `eas build --profile development --platform ios`. When the build asks "Setup Push Notifications
+   for your project" / "Generate a new Apple Push Notifications service key", answer yes. The manual
+   route is `eas credentials`. This needs the paid Apple developer account that the device build
+   already needs.
+3. Android, in three parts:
+   - In the Firebase console, create a project and add the Android app (the package name in
+     `app.json`), then download `google-services.json`. Put it at the root of `apps/mobile` and add
+     `"googleServicesFile": "./google-services.json"` under `expo.android` in `app.json` yourself
+     (this repository does not add it: a missing file would break prebuild and export). It holds
+     only public identifiers, so it may be committed.
+   - In the Firebase console go to Project settings, Service accounts, "Generate new private key".
+     This FCM V1 service-account key is a secret: **never commit it** (add it to `.gitignore`).
+   - Upload it: `eas credentials`, then Android, the build profile (for example `development`),
+     Google Service Account, "Manage your Google Service Account Key for Push Notifications (FCM
+     V1)", "Set up a Google Service Account Key for Push Notifications (FCM V1)", "Upload a new
+     service account key". The same page is on expo.dev under Credentials, Service credentials.
 4. Build again (`eas build --profile development --platform ios` or `android`) and install it.
 
 Turn it on in the step after pairing or in **Settings**: the app asks the phone for permission,
