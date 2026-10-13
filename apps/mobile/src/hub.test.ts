@@ -174,6 +174,14 @@ describe("pairing", () => {
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
   });
 
+  it("refuses a pair link to a host that is not a .ts.net name, without opening a socket", async () => {
+    const r = rig();
+    await r.hub.init();
+    const result = await r.hub.pair(`https://mac.example.com/#pair=${SECRET}`, "iPhone");
+    expect(result).toEqual({ ok: false, message: "Pair links come from tailscale serve (a .ts.net name)", clear: false });
+    expect(r.sockets.all).toHaveLength(0);
+  });
+
   it("shows the hub's words when it refuses", async () => {
     const r = rig();
     await r.hub.init();

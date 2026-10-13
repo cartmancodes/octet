@@ -3,7 +3,7 @@ import { useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 
-import { hubHost, parsePairLink } from "../src/client/link";
+import { hubHost, pairLinkProblem, parsePairLink } from "../src/client/link";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { NOT_A_LINK, useHubController, useHubSnapshot } from "../src/hub";
@@ -37,7 +37,7 @@ export default function Pair() {
 
   const parsed = useMemo(() => parsePairLink(link), [link]);
   const pasted = link.trim() !== "";
-  const shownError = error ?? (pasted && parsed === null ? NOT_A_LINK : null);
+  const shownError = error ?? (pasted && parsed === null ? (pairLinkProblem(link) ?? NOT_A_LINK) : null);
 
   const pair = useCallback(async () => {
     if (attempting.current || parsed === null) return;
@@ -70,8 +70,9 @@ export default function Pair() {
     // fills the field; the user confirms the Mac it names, and pairing waits for the tap.
     if (attempting.current || data === lastScan.current) return;
     lastScan.current = data;
-    if (parsePairLink(data) === null) {
-      setError(NOT_A_LINK);
+    const problem = pairLinkProblem(data);
+    if (problem !== null) {
+      setError(problem);
       return;
     }
     setError(null);

@@ -155,6 +155,18 @@ describe("the Pair screen", () => {
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
+  it("a link to a host that is not a .ts.net name says where pair links come from, and opens nothing", async () => {
+    const { sockets } = await open();
+    await scan(`https://mac.tail1234.ts.net.evil.example/#pair=${SECRET}`);
+    expect(screen.getByText("Pair links come from tailscale serve (a .ts.net name)")).toBeTruthy();
+    await fireEvent.changeText(screen.getByLabelText("Pairing link"), `https://100.64.0.7:8443/#pair=${SECRET}`);
+    expect(screen.getByText("Pair links come from tailscale serve (a .ts.net name)")).toBeTruthy();
+    expect(screen.queryByText(/^Pair with .*\?$/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Pair" }).props.accessibilityState.disabled).toBe(true);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    expect(sockets.all).toHaveLength(0);
+  });
+
   it("an invalid scan says so, once however often the camera sees it", async () => {
     const { sockets } = await open();
     await scan("WIFI:S:cafe;;");

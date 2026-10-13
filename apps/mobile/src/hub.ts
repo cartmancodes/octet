@@ -5,7 +5,7 @@ import { createContext, useContext, useSyncExternalStore } from "react";
 import { Platform } from "react-native";
 
 import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from "./client/HubClient";
-import { isHubUrl, parsePairLink } from "./client/link";
+import { NOT_A_LINK, isHubUrl, pairLinkProblem, parsePairLink } from "./client/link";
 import { webSocketFactory } from "./client/socket";
 import { isDevBuild } from "./build";
 import { NOT_SAVED, loadSettings, saveSettings } from "./persist";
@@ -18,7 +18,7 @@ export const tokenKey = (dev: boolean): string => (dev ? "octet.token.dev" : "oc
 /** The keychain item holding this build's device token: the only place it is kept. */
 export const TOKEN_KEY = tokenKey(isDevBuild());
 
-export const NOT_A_LINK = "That isn't an Octet pairing link";
+export { NOT_A_LINK };
 export const UNPAIRED_NOTICE = "This phone was unpaired on the Mac";
 export const UNPAIR_FAILED_NOTICE = "This phone couldn't delete its pairing. Pair again to replace it.";
 /** The Mac took the pairing (its secret is spent and the name is registered) but the phone could
@@ -178,7 +178,7 @@ export class HubController {
     if (this.pairing) return { ok: false, message: "Already pairing", clear: false };
     if (this.unpairing) return { ok: false, message: "Finishing unpairing. Try again in a moment.", clear: false };
     const parsed = parsePairLink(link);
-    if (!parsed) return { ok: false, message: NOT_A_LINK, clear: false };
+    if (!parsed) return { ok: false, message: pairLinkProblem(link) ?? NOT_A_LINK, clear: false };
     const deviceName = name.trim() === "" ? this.defaultName() : name.trim();
     const client = new HubClient({ ...this.clientOptions, url: parsed.url, token: null, factory: this.factory });
     this.pairing = client;
