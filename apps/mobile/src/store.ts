@@ -191,7 +191,8 @@ const timersOf = (client: HubClient): Map<string, () => void> => {
 
 /** Feeds the store from `client`: its batches, its connection state, and the sessions the hub
  * refused for good (forgotten, and their views marked failed). A session that leaves the hub's
- * list keeps its view for `ENDED_KEPT_MS`, then is released and forgotten. Returns the function
+ * list keeps its view for `ENDED_KEPT_MS`, then is released and forgotten (one with no view is
+ * forgotten at once). Returns the function
  * that stops all of it. */
 export function connectStore(store: OctetStore, client: HubClient, options: ConnectOptions = {}): () => void {
   const schedule = options.schedule ?? defaultSchedule;
@@ -209,6 +210,11 @@ export function connectStore(store: OctetStore, client: HubClient, options: Conn
     const state = store.getState();
     for (const ended of state.applyBatch(frames)) {
       cancel(ended);
+      // Nothing to hold for a screen: the client lets it go now rather than never.
+      if (!store.getState().bySession.has(ended)) {
+        forget(ended);
+        continue;
+      }
       timers.set(
         ended,
         schedule(() => {

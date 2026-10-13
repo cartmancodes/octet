@@ -372,6 +372,22 @@ describe("with a client", () => {
     off();
   });
 
+  it("a session that leaves the list with no view is forgotten at once, with no timer", () => {
+    const { sockets, clock, client, off } = rig();
+    const forget = jest.spyOn(client, "forget");
+    sockets.last.receive({ type: "sessions", sessions: [info("a"), info("b")] });
+    clock.advance(50);
+    watch(store, client, "a"); // asked for, but nothing has come of it yet
+    const timers = clock.pending;
+    sockets.last.receive({ type: "sessions", sessions: [info("b")] });
+    clock.advance(50);
+    expect(store.getState().bySession.has("a")).toBe(false);
+    expect(forget).toHaveBeenCalledWith("a");
+    expect(forget).not.toHaveBeenCalledWith("b");
+    expect(clock.pending).toBe(timers);
+    off();
+  });
+
   it("releaseSession forgets at once and cancels the timer", () => {
     const { sockets, clock, client, off } = rig();
     const forget = jest.spyOn(client, "forget");

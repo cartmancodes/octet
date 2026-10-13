@@ -16,3 +16,12 @@ jest.mock("expo-secure-store", () => {
     }),
   };
 });
+
+// FlashList 2 measures its parent and rows through native layout, which a test renderer cannot do.
+// (Its own `jestSetup` still points at a component that FlashList 2 no longer exports.)
+jest.mock("@shopify/flash-list/dist/recyclerview/utils/measureLayout", () => ({
+  ...jest.requireActual("@shopify/flash-list/dist/recyclerview/utils/measureLayout"),
+  measureParentSize: jest.fn(() => ({ x: 0, y: 0, width: 400, height: 900 })),
+  measureFirstChildLayout: jest.fn(() => ({ x: 0, y: 0, width: 400, height: 900 })),
+  measureItemLayout: jest.fn(() => ({ x: 0, y: 0, width: 400, height: 100 })),
+}));

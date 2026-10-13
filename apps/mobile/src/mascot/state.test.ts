@@ -35,4 +35,12 @@ describe("poseFor mirrors the TUI's mascot::State", () => {
   it.each([tool("Edit"), tool("Write"), tool("Bash", "cargo test")])("%j codes", (a) => {
     expect(poseFor(a)).toBe("coding");
   });
+
+  it("a Bash call stays coding, whatever it runs that is not a search", () => {
+    expect(poseFor(tool("Bash"))).toBe("coding");
+    expect(poseFor(tool("Bash", ""))).toBe("coding");
+    expect(poseFor(tool("Bash", "  npm run build"))).toBe("coding");
+    expect(poseFor(tool("Bash", "git commit -m x"))).toBe("coding");
+    expect(poseFor(tool("bash", "cargo test"))).toBe("coding");
+  });
 });
