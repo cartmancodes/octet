@@ -142,7 +142,8 @@ pub(crate) fn apply(app: &mut App, ended: Ended) {
         }
     };
     match done {
-        Done::Remote(checks) => {
+        Done::Remote(mut checks) => {
+            checks.bridge_off.clone_from(&app.remote_off);
             let report = remote::report(&checks);
             app.note(report.text.as_str());
             // The status line, one row high, gets the count of problems.

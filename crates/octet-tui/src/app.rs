@@ -366,6 +366,8 @@ pub(crate) struct App {
     /// Another provider's skill, picked in `/skills`: it runs once the
     /// switch to that provider is ready.
     pub(crate) pending_skill: Option<SkillRun>,
+    /// Why the bridge to a hub is off, when it could not start or broke; `/remote-control` says it.
+    pub(crate) remote_off: Option<String>,
     /// Whether the Task sidebar shows on wide terminals; F2 flips it.
     pub(crate) sidebar: bool,
     /// The terminal's width at the last frame, for F2 to say when the sidebar can show.
@@ -432,6 +434,7 @@ impl App {
             models: crate::models::Models::default(),
             pending_handoff: None,
             pending_skill: None,
+            remote_off: None,
             sidebar: true,
             last_width: 0,
         }

@@ -241,9 +241,7 @@ impl Loop<'_> {
     async fn share(&mut self, app: &mut App) {
         self.bridge.refresh(app).await;
         self.bridge.publish(app);
-        if let Some(note) = self.bridge.take_note() {
-            app.note(note);
-        }
+        self.bridge.tell(app);
     }
 
     /// A key, paste or resize.

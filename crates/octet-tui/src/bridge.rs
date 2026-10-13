@@ -497,6 +497,12 @@ fn frame_line(frame: &Value) -> String {
     format!("{frame}\n")
 }
 
+/// The data directory is too deep for a socket in it: a Unix socket's path has at most 104 bytes
+/// on macOS and 108 on Linux.
+#[derive(Debug, thiserror::Error)]
+#[error("the socket path {} is too long; a shorter data directory turns it on", .0.display())]
+struct SocketPathTooLong(PathBuf);
+
 /// A running bridge.
 struct Live {
     run: PathBuf,
@@ -536,7 +542,14 @@ impl Live {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
             _ => {}
         }
-        let listener = UnixListener::bind(&socket)?;
+        let listener = UnixListener::bind(&socket).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                // Only the path's length makes a bind of a path this short of NULs invalid.
+                std::io::Error::new(error.kind(), SocketPathTooLong(socket.clone()))
+            } else {
+                error
+            }
+        })?;
         if let Err(e) = tokio::fs::set_permissions(&socket, PermissionsExt::from_mode(0o600)).await
         {
             let _ = tokio::fs::remove_file(&socket).await;
@@ -634,34 +647,50 @@ pub(crate) struct Bridge {
     live: Option<Live>,
     /// Why the bridge is off, until the interface shows it.
     note: Option<String>,
+    /// Why the bridge is off, for `/remote-control`; `None` while it runs or was turned off.
+    off: Option<String>,
 }
 
 impl Bridge {
     /// Listens for hubs under `directory`, unless `enabled` is false. A failure leaves a bridge
-    /// that is off, with a note saying why. `tmux` names the tmux session a hub's `start`
-    /// launched this interface in.
+    /// that is off, with a note saying why; a data directory too deep for a socket is said only
+    /// by `/remote-control`, since the bridge is on by default and the user may never want it.
+    /// `tmux` names the tmux session a hub's `start` launched this interface in.
     pub(crate) async fn start(directory: &Path, enabled: bool, tmux: Option<String>) -> Bridge {
+        let mut bridge = Bridge {
+            live: None,
+            note: None,
+            off: None,
+        };
         if !enabled {
-            return Bridge {
-                live: None,
-                note: None,
-            };
+            return bridge;
         }
         match Live::open(directory, tmux).await {
-            Ok(live) => Bridge {
-                live: Some(live),
-                note: None,
-            },
-            Err(error) => Bridge {
-                live: None,
-                note: Some(format!("Remote control is off: {error}")),
-            },
+            Ok(live) => bridge.live = Some(live),
+            Err(error) => {
+                let too_long =
+                    matches!(error.get_ref(), Some(inner) if inner.is::<SocketPathTooLong>());
+                let why = format!("Remote control is off: {error}");
+                bridge.note = (!too_long).then(|| why.clone());
+                bridge.off = Some(why);
+            }
         }
+        bridge
     }
 
     /// The note for the interface to show, once.
     pub(crate) fn take_note(&mut self) -> Option<String> {
         self.note.take()
+    }
+
+    /// Shows the note, once, and keeps why the bridge is off where `/remote-control` finds it.
+    pub(crate) fn tell(&mut self, app: &mut App) {
+        if let Some(note) = self.note.take() {
+            app.note(note);
+        }
+        if app.remote_off != self.off {
+            app.remote_off.clone_from(&self.off);
+        }
     }
 
     /// The interface connected a session journaling to `journal`: registers it, and sends the
@@ -768,7 +797,9 @@ impl Bridge {
             if let Some(live) = self.live.take() {
                 live.shutdown().await;
             }
-            self.note = Some(format!("Remote control is off: {error}"));
+            let why = format!("Remote control is off: {error}");
+            self.note = Some(why.clone());
+            self.off = Some(why);
         }
     }
 }
@@ -1348,6 +1379,36 @@ mod tests {
         assert!(note.starts_with("Remote control is off: "), "{note}");
         assert!(broken.take_note().is_none());
         broken.connected(&app, &config, &dir.join("j.jsonl")).await;
+        broken.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_data_dir_too_long_for_a_socket_turns_the_bridge_off_quietly() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-long");
+        // Far past the 104 bytes (macOS) or 108 (Linux) a socket's path may have.
+        let deep = temp.path().join("d".repeat(200));
+        let mut bridge = Bridge::start(&deep, true, None).await;
+        assert!(bridge.take_note().is_none(), "nothing is said at start");
+        let (mut app, config) = demo();
+        crate::connect(&mut app, &mut bridge, &config, &deep.join("j.jsonl")).await;
+        assert!(
+            !app.entries_text().contains("Remote control"),
+            "{}",
+            app.entries_text()
+        );
+        let off = app.remote_off.clone().expect("/remote-control can say why");
+        assert!(off.starts_with("Remote control is off: "), "{off}");
+        assert!(off.contains("too long"), "{off}");
+        bridge.stop().await;
+        // Any other failure is still said at once, and kept for /remote-control too.
+        let blocked = temp.path().join("blocked");
+        std::fs::write(&blocked, "").unwrap();
+        let mut broken = Bridge::start(&blocked, true, None).await;
+        let mut app = demo().0;
+        crate::connect(&mut app, &mut broken, &config, &deep.join("j.jsonl")).await;
+        assert!(broken.take_note().is_none(), "shown once, by connect");
+        assert!(app.entries_text().contains("Remote control is off: "));
+        assert!(app.remote_off.is_some());
         broken.stop().await;
     }
 

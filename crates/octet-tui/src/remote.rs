@@ -53,6 +53,8 @@ pub(crate) struct Checks {
     pub mosh: Option<(u32, u32, u32)>,
     /// What the hub's control socket says.
     pub hub: HubState,
+    /// Why this interface's bridge is off, when it could not start or broke.
+    pub bridge_off: Option<String>,
 }
 
 /// Whether a hub runs, and what it says.
@@ -445,6 +447,7 @@ async fn probe_with(
         tailscale_ssh,
         mosh,
         hub,
+        bridge_off: None,
     }
 }
 
@@ -554,6 +557,9 @@ pub(crate) fn report(checks: &Checks) -> Report {
     });
     // The hub is optional (the phone can use SSH alone), so no state of it is a failed check.
     lines.push(hub_line(&checks.hub));
+    if let Some(off) = &checks.bridge_off {
+        lines.push(mark(false, off));
+    }
     if let (Some(tailnet), true) = (&checks.tailnet, checks.ssh || checks.tailscale_ssh) {
         // Run now, the command would open a new, empty session, not this one.
         if matches!(checks.tmux, Tmux::Outside) {
@@ -604,6 +610,7 @@ mod tests {
             tailscale_ssh: false,
             mosh: Some((1, 4, 0)),
             hub: HubState::NotRunning,
+            bridge_off: None,
         }
     }
     fn hub(published: bool, devices: usize) -> HubStatus {
@@ -1018,6 +1025,28 @@ mod tests {
         });
         assert!(text.contains("Remote Login"), "{text}");
         assert!(!text.contains("tailscale set --ssh"), "{text}");
+    }
+    #[test]
+    fn remote_control_says_why_this_sessions_bridge_is_off() {
+        const OFF: &str = "Remote control is off: the socket path /x/run/1.sock is too long";
+        let config = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp");
+        let mut app = crate::app::App::new(&config, "journal".into());
+        app.remote_off = Some(OFF.into());
+        crate::jobs::apply(
+            &mut app,
+            crate::jobs::Ended::Done(crate::jobs::Done::Remote(ready())),
+        );
+        let text = app.entries_text();
+        assert!(text.contains(&format!("[!!] {OFF}")), "{text}");
+        assert_eq!(app.status_line, "Remote control: 1 problem (report above)");
+        // A bridge that is on adds nothing.
+        let mut on = crate::app::App::new(&config, "journal".into());
+        crate::jobs::apply(
+            &mut on,
+            crate::jobs::Ended::Done(crate::jobs::Done::Remote(ready())),
+        );
+        assert!(!on.entries_text().contains("Remote control is off"));
+        assert_eq!(on.status_line, "Remote control: ready (report above)");
     }
     #[test]
     fn tmux_without_rgb_shows_the_config_lines() {

@@ -230,9 +230,7 @@ fn restore_terminal_on_panic() {
 async fn connect(app: &mut App, bridge: &mut Bridge, config: &Config, journal: &std::path::Path) {
     app.connection(config, journal.to_path_buf());
     bridge.connected(app, config, journal).await;
-    if let Some(note) = bridge.take_note() {
-        app.note(note);
-    }
+    bridge.tell(app);
 }
 /// A session could not open. An earlier CLI may still be exiting: it is
 /// waited for, and the running job ended, before the error is returned.
