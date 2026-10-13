@@ -542,8 +542,9 @@ It then creates no socket and no file, and the hub and the phone never see it.
   Another tailnet device, or another program on the Mac, can't connect
   without pairing.
 - A web page can't use your browser to connect. The hub refuses a
-  connection whose `Origin` names another site; the app sends none, or the
-  hub's own address.
+  connection whose `Origin` names another site. The app sends none, or the
+  hub's own address: the one the request names, or the `*.ts.net` name
+  `tailscale serve` publishes it at.
 - Connections that stall mid-request can't keep a phone out. Each one must
   finish connecting within 5 seconds, and once 32 are connecting at once, a new
   one pushes out the oldest. A stalled one never counts against the 8 that may

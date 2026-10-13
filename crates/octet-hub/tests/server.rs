@@ -1612,6 +1612,29 @@ async fn a_web_page_of_another_site_is_refused_at_the_handshake() {
     assert!(connect_with(env.port, &forwarded).await.is_ok());
 }
 
+#[tokio::test]
+async fn an_origin_naming_the_published_host_is_accepted_whatever_the_host_header() {
+    // `tailscale serve` may hand the request on as Host 127.0.0.1:<port>, with no
+    // X-Forwarded-Host: the phone's Origin then names only the published address.
+    let mut env = Env::new();
+    env.start().await;
+    let published = connect_with(env.port, &[("Origin", "https://mac.tail1234.ts.net")]).await;
+    assert!(published.is_ok(), "{published:?}");
+    let shouted = connect_with(env.port, &[("Origin", "https://MAC.tail1234.ts.net:443")]).await;
+    assert!(shouted.is_ok(), "{shouted:?}");
+    for origin in ["https://evil.example", "https://other.tail1234.ts.net"] {
+        let result = connect_with(env.port, &[("Origin", origin)]).await;
+        assert!(refused_with(&result, 403), "{origin}: {result:?}");
+    }
+    // Unpublished, only the request's own host names the hub.
+    let mut hidden = Env::new();
+    let port = free_port().await;
+    UNPUBLISHED.lock().expect("lock").push(port);
+    hidden.start_with(port, RECHECK).await;
+    let result = connect_with(hidden.port, &[("Origin", "https://mac.tail1234.ts.net")]).await;
+    assert!(refused_with(&result, 403), "{result:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handshakes_that_stall_do_not_keep_a_phone_out() {
     let mut env = Env::new();

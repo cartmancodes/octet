@@ -6,8 +6,9 @@
 //! A connection must finish its WebSocket upgrade within 5 seconds of being accepted, and at
 //! most 32 upgrade at once (a new one lets the oldest go), so sockets that stall mid-request
 //! cannot keep a phone out. The handshake turns away any request whose `Tailscale-User-Login`
-//! header is not exactly the owner's login, or whose `Origin` names a host the request does not
-//! (a web page of another site; the app sends none, or the hub's own), with 403, and one the hub
+//! header is not exactly the owner's login, or whose `Origin` names a host that is neither the
+//! request's (`Host`, `X-Forwarded-Host`) nor that of the hub's published URL as last asked (a
+//! web page of another site; the app sends none, or the hub's own), with 403, and one the hub
 //! has no room for (64 open, or 8 not past `hello`) with 503. A connection then starts
 //! unauthenticated and accepts only `hello` (a
 //! device token) and `pair` (a pairing secret); anything else, or a failed `hello` or `pair`,
@@ -642,10 +643,14 @@ impl Hub {
         let (dead_tokens, mut dead) = mpsc::channel(PUSH_QUEUE);
         let (streams, mut accepted) = mpsc::channel(16);
         let room = Arc::new(Room::default());
-        let accept_task =
-            tokio::spawn(accept_tcp(listener, owner.clone(), room, streams)).abort_handle();
         let (requests, mut controls) = mpsc::channel(16);
         let (published_in, published) = watch::channel(Publication::Unknown);
+        let gate = Admission {
+            owner: owner.clone(),
+            room,
+            published: published.clone(),
+        };
+        let accept_task = tokio::spawn(accept_tcp(listener, gate, streams)).abort_handle();
         let publish_task =
             tokio::spawn(watch_published(port, publisher, recheck, published_in)).abort_handle();
         let control_task = tokio::spawn(serve_control(control, requests, published)).abort_handle();
@@ -1712,12 +1717,7 @@ async fn bind_control(path: &Path) -> Result<UnixListener, String> {
 /// their seats, to the hub loop. At most [`MAX_HANDSHAKES`] upgrade at once: one accepted past
 /// that lets the oldest go, so sockets that stall mid-request cannot keep a phone out, and each
 /// has [`HANDSHAKE_WITHIN`] in all.
-async fn accept_tcp(
-    listener: TcpListener,
-    owner: String,
-    room: Arc<Room>,
-    hub: mpsc::Sender<Upgraded>,
-) {
+async fn accept_tcp(listener: TcpListener, gate: Admission, hub: mpsc::Sender<Upgraded>) {
     let mut upgrading: VecDeque<AbortHandle> = VecDeque::new();
     loop {
         match listener.accept().await {
@@ -1731,9 +1731,9 @@ async fn accept_tcp(
                 {
                     oldest.abort();
                 }
-                let (owner, room, hub) = (owner.clone(), Arc::clone(&room), hub.clone());
+                let (gate, hub) = (gate.clone(), hub.clone());
                 let task = tokio::spawn(async move {
-                    if let Some(upgraded) = handshake(stream, &owner, &room).await {
+                    if let Some(upgraded) = handshake(stream, &gate).await {
                         let _ = hub.send(upgraded).await;
                     }
                 });
@@ -2057,16 +2057,34 @@ async fn connection(
     let _ = events.send(ConnEvent::Closed { conn }).await;
 }
 
+/// What every handshake is checked against: the owner's login, the hub's room, and where the
+/// hub is published, as `tailscale serve status` last said (the cache `status` and
+/// `pair_secret` answer from; nothing is asked on a request's way in).
+#[derive(Debug, Clone)]
+struct Admission {
+    owner: String,
+    room: Arc<Room>,
+    published: Published,
+}
+
 /// The WebSocket upgrade, refused as [`Gate`] says, within [`HANDSHAKE_WITHIN`]: the connection
 /// and the seat it took.
-async fn handshake(stream: TcpStream, owner: &str, room: &Arc<Room>) -> Option<Upgraded> {
+async fn handshake(stream: TcpStream, admission: &Admission) -> Option<Upgraded> {
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))
         .max_frame_size(Some(MAX_MESSAGE));
+    let published = match &*admission.published.borrow() {
+        Publication::At(url) => url.split_once("://").map(|(_, rest)| {
+            let authority = rest.split('/').next().unwrap_or_default();
+            host_of(authority).to_owned()
+        }),
+        _ => None,
+    };
     let mut seat = None;
     let gate = Gate {
-        owner,
-        room,
+        owner: &admission.owner,
+        room: &admission.room,
+        published: published.as_deref(),
         seat: &mut seat,
     };
     let ws = timeout(
@@ -2086,6 +2104,8 @@ async fn handshake(stream: TcpStream, owner: &str, room: &Arc<Room>) -> Option<U
 struct Gate<'a> {
     owner: &'a str,
     room: &'a Arc<Room>,
+    /// The host of the hub's published URL, when it is published.
+    published: Option<&'a str>,
     seat: &'a mut Option<Seat>,
 }
 
@@ -2095,7 +2115,7 @@ impl Callback for Gate<'_> {
         let login = headers
             .get("Tailscale-User-Login")
             .and_then(|value| value.to_str().ok());
-        if login != Some(self.owner) || foreign_origin(headers) {
+        if login != Some(self.owner) || foreign_origin(headers, self.published) {
             return Err(refusal(StatusCode::FORBIDDEN, "Forbidden"));
         }
         let Some(seat) = self.room.seat() else {
@@ -2117,10 +2137,12 @@ fn refusal(status: StatusCode, text: &str) -> ErrorResponse {
 }
 
 /// Whether a web page of another site may have opened this socket: an `Origin` is there and its
-/// host is neither the `Host` the request names nor the `X-Forwarded-Host` that `tailscale
-/// serve` adds. A browser sends `Origin` with every WebSocket and cannot set the others; the
-/// app's socket sends none, or the hub's own address.
-fn foreign_origin(headers: &HeaderMap) -> bool {
+/// host (any case, any port) is none of the `Host` the request names, the `X-Forwarded-Host`
+/// that `tailscale serve` may add, and `published`, the host of the hub's published URL (the
+/// app's socket names it whatever `tailscale serve` forwards as `Host`). A browser sends
+/// `Origin` with every WebSocket and cannot set the others; the app's socket sends none, or
+/// the hub's own address.
+fn foreign_origin(headers: &HeaderMap, published: Option<&str>) -> bool {
     let Some(origin) = headers.get("Origin") else {
         return false;
     };
@@ -2136,7 +2158,7 @@ fn foreign_origin(headers: &HeaderMap) -> bool {
         let value = headers.get(name)?.to_str().ok()?;
         Some(host_of(value.split(',').next().unwrap_or_default()))
     };
-    ![named("Host"), named("X-Forwarded-Host")]
+    ![named("Host"), named("X-Forwarded-Host"), published]
         .into_iter()
         .flatten()
         .any(|host| !host.is_empty() && host.eq_ignore_ascii_case(origin))
@@ -2302,26 +2324,47 @@ mod tests {
             map
         };
         let host = ("Host", "mac.tail1234.ts.net");
-        assert!(!foreign_origin(&headers(&[host])), "no Origin");
+        assert!(!foreign_origin(&headers(&[host]), None), "no Origin");
         for same in [
             "https://mac.tail1234.ts.net",
             "https://MAC.tail1234.ts.net:443",
         ] {
             assert!(
-                !foreign_origin(&headers(&[host, ("Origin", same)])),
+                !foreign_origin(&headers(&[host, ("Origin", same)]), None),
                 "{same}"
             );
         }
         for other in ["https://evil.example", "null", "mac.tail1234.ts.net", ""] {
             assert!(
-                foreign_origin(&headers(&[host, ("Origin", other)])),
+                foreign_origin(&headers(&[host, ("Origin", other)]), None),
                 "{other}"
             );
         }
         let v6 = headers(&[("Host", "[::1]:47823"), ("Origin", "http://[::1]:47823")]);
-        assert!(!foreign_origin(&v6));
+        assert!(!foreign_origin(&v6, None));
         let no_host = headers(&[("Origin", "https://mac.tail1234.ts.net")]);
-        assert!(foreign_origin(&no_host));
+        assert!(foreign_origin(&no_host, None));
+    }
+
+    #[test]
+    fn an_origin_naming_the_published_host_is_never_foreign() {
+        // What `tailscale serve` may forward: the loopback Host, no X-Forwarded-Host.
+        let request = |origin: &'static str| {
+            let mut map = HeaderMap::new();
+            map.insert("Host", "127.0.0.1:47823".parse().unwrap());
+            map.insert("Origin", origin.parse().unwrap());
+            map
+        };
+        let published = Some("mac.qa.ts.net");
+        for ours in ["https://mac.qa.ts.net", "https://MAC.qa.ts.net:443"] {
+            assert!(!foreign_origin(&request(ours), published), "{ours}");
+        }
+        for other in ["https://evil.example", "https://other.qa.ts.net"] {
+            assert!(foreign_origin(&request(other), published), "{other}");
+        }
+        // Not published: the request's own host alone names the hub.
+        assert!(foreign_origin(&request("https://mac.qa.ts.net"), None));
+        assert!(!foreign_origin(&request("http://127.0.0.1:47823"), None));
     }
 
     #[test]
