@@ -57,6 +57,8 @@ function Cards() {
   );
 }
 
+afterEach(() => jest.restoreAllMocks());
+
 describe("render budgets", () => {
   it("streams 100 text events into session A: its transcript draws once per batch, B's not at all", async () => {
     store.getState().applyBatch([
@@ -96,10 +98,21 @@ describe("render budgets", () => {
     expect(screen.getByText(/start 0 1 2 .* 99$/)).toBeTruthy();
     expect(commits.a).toBeGreaterThan(0);
     expect(commits.a).toBeLessThanOrEqual(EVENTS / BATCHES + 2);
+    expect(rows.mock.calls.length).toBeGreaterThan(0);
     expect(rows.mock.calls.length).toBeLessThanOrEqual(EVENTS / BATCHES + 2);
     expect(commits.b).toBe(0);
     expect(commits.cards).toBe(0);
     expect(cards).not.toHaveBeenCalled();
-    jest.restoreAllMocks();
+
+    // The same probes do fire when B's own data changes, so the zeros above mean something.
+    await act(async () => {
+      store.getState().applyBatch([
+        event("b", " more"),
+        { v: 1, type: "sessions", sessions: [info("a"), { ...info("b"), phase: "idle" }] },
+      ] as BatchItem[]);
+    });
+    expect(commits.b).toBeGreaterThan(0);
+    expect(commits.cards).toBeGreaterThan(0);
+    expect(cards).toHaveBeenCalled();
   });
 });

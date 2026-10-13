@@ -81,8 +81,11 @@ npx expo run:android                                     # or locally: needs the
 
 1. On the Mac, start the hub and publish it (see [the guide](../../docs/remote-control.md#phone-app-hub)).
 2. In an Octet session on the Mac, type `/remote-control pair`. It shows a QR code and a link.
-3. In the app choose **Pair**, scan the code (or paste the link), give the phone a name and tap
-   **Pair**. The code works once and expires after 10 minutes.
+3. Open the app. Until it is paired it shows **Pair with your Mac**. Scan the code with the
+   camera, or paste the link into **Paste link**. Once the link is valid the app says `Pair with
+   <the hub's address>?` and the **Pair** button turns on (it is dimmed until then). Give the phone a
+   name under **Device name** (the Mac lists it in `octet hub devices`) and tap **Pair**. The code
+   works once and expires after 10 minutes.
 
 The app keeps the device token in the iOS Keychain / Android Keystore (`expo-secure-store`), never
 in plain storage. **Settings** shows where you are paired, turns the Face ID check on allowing an
@@ -109,7 +112,7 @@ approval on or off (full access always asks), and unpairs.
 
 ## Troubleshooting
 
-**The app can't reach your Mac ("Can't reach your Mac").** The phone must be on the tailnet:
+**The Sessions list shows "Can't reach your Mac".** The phone must be on the tailnet:
 open the Tailscale app, check it is connected and signed in to the same tailnet as the Mac, and
 that the Mac itself is online there. The hub is reachable only through your tailnet; there is no
 other route. Check that `octet hub` is still running on the Mac.
@@ -120,22 +123,24 @@ your Tailscale configuration), as described in
 [docs/remote-control.md](../../docs/remote-control.md#put-it-on-your-tailnet). The hub looks again
 every 10 seconds, so it can take that long to notice.
 
-**The app says it is unpaired.** The Mac removed this phone (`octet hub revoke NAME`), so the hub
-no longer knows its token. Pair again with `/remote-control pair`.
-`octet hub devices` lists the phones the Mac knows.
+**The app is back on "Pair with your Mac", saying "This phone was unpaired on the Mac".** The Mac
+removed this phone (`octet hub revoke NAME`), so the hub no longer knows its token. Pair again with
+`/remote-control pair`. `octet hub devices` lists the phones the Mac knows.
 
-**Allow says Face ID isn't available.** Allowing an approval asks the phone's biometrics first.
-If Face ID or a fingerprint isn't set up on the phone, or isn't enrolled, the app can't ask and
-sends nothing. Enrol one in the phone's own settings, or turn off **Face ID to allow** in the
-app's Settings. Deny never needs it.
+**Allow says "Face ID isn't set up on this phone. Turn it off in Settings to allow from here."**
+Allowing an approval asks the phone's biometrics first. If Face ID or a fingerprint isn't set up on
+the phone (or none is enrolled), the app can't ask and sends nothing. Enrol one in the phone's own
+settings, or turn off **Face ID to allow** in the app's Settings (the gear on the Sessions screen).
+Deny never needs it.
 
 **A session I started doesn't appear.** Phone-started sessions run in tmux on the Mac. Check
 `tmux ls` for an `octet-...` session (`tmux attach -t octet-NAME` shows what it says): tmux must
 be installed, the workspace must be one the hub allows (a folder from your recent sessions, or in
-`hub.json`'s `workspaces`), and at most eight phone-started sessions run at once. Pull to refresh
-the Sessions list.
+`hub.json`'s `workspaces`), and at most eight phone-started sessions run at once. Pull down on the
+Sessions list to refresh it; after a Start the app says "NAME hasn't appeared yet. Check tmux on the Mac." when the session is late.
 
 **Pairing says the code is invalid or expired.** Codes work once and last 10 minutes. Run
 `/remote-control pair` again for a new one.
 
-**The camera is off.** Paste the link instead: the pairing screen has a field for it.
+**The camera is off.** The pairing screen says "Camera access is off — paste the link instead": paste the
+link into **Paste link**.

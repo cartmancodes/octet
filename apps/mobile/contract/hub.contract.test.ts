@@ -3,11 +3,14 @@
 //
 // Test-only fakes, all in temp directories that afterAll removes:
 // - `tailscale` on the hub's PATH answers `serve status --json` with the hub's own port, so the
-//   hub sees itself as published. Nothing here touches the real Tailscale.
+//   hub sees itself as published. Nothing here touches the real Tailscale. The hub tries
+//   `/Applications/Tailscale.app/...` if `tailscale` on PATH fails (crates/octet-hub/src/owner.rs), so
+//   the stand-in logs every call it gets and the test asserts the lookup reached it and nothing else
+//   was asked of it; a stand-in that fails would fall through to the real app, and so fails the test.
 // - the WebSocket factory sets `Tailscale-User-Login`, which `tailscale serve` adds in real life.
 //   The app itself never sends that header.
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, appendFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, appendFileSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -109,6 +112,7 @@ class FakeBridge {
 run("the app's hub client against the real octet hub", () => {
   let root = "";
   let binDir = "";
+  let standInLog = "";
   let hub: ChildProcess | null = null;
   let hubLog = "";
   let port = 0;
@@ -136,14 +140,17 @@ run("the app's hub client against the real octet hub", () => {
     port = await freePort();
 
     // A stand-in `tailscale`: `serve status --json` shows the hub published; anything else fails.
+    // Each call's arguments are appended to `tailscale.log`, for the test to check.
     const serveStatus = JSON.stringify({
       TCP: { "443": { HTTPS: true } },
       Web: { "mac.test.ts.net:443": { Handlers: { "/": { Proxy: `http://127.0.0.1:${port}` } } } },
     });
     const script = path.join(binDir, "tailscale");
+    standInLog = path.join(binDir, "tailscale.log");
     writeFileSync(
       script,
-      `#!/bin/sh\nif [ "$1 $2 $3" = "serve status --json" ]; then printf '%s' '${serveStatus}'; else exit 1; fi\n`,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${standInLog}'\n` +
+        `if [ "$1 $2 $3" = "serve status --json" ]; then printf '%s' '${serveStatus}'; else exit 1; fi\n`,
     );
     chmodSync(script, 0o755);
 
@@ -216,6 +223,8 @@ run("the app's hub client against the real octet hub", () => {
     }
   }
 
+  // The tests below run in order, on purpose, and share state: the paired client, the session's
+  // journal and the events collected so far. Each builds on the one before; run the file whole.
   it("refuses a connection without the tailnet login header, as the app never sends it", async () => {
     const status = await new Promise<number>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${port}/`);
@@ -230,6 +239,10 @@ run("the app's hub client against the real octet hub", () => {
     const secret = await control(path.join(root, "run", "hub.sock"), { type: "pair_secret" });
     expect(typeof secret.secret).toBe("string");
     expect(secret.url).toBe("https://mac.test.ts.net");
+    // The hub's publish lookup went to the stand-in, and asked it only the one read-only question.
+    const asked = readFileSync(standInLog, "utf8").split("\n").filter((line) => line !== "");
+    expect(asked.length).toBeGreaterThan(0);
+    expect(asked.every((line) => line === "serve status --json")).toBe(true);
 
     const factory = nodeSocketFactory(OWNER, sockets);
     const url = `ws://127.0.0.1:${port}/`;
@@ -297,7 +310,11 @@ run("the app's hub client against the real octet hub", () => {
 
   it("is unpaired once the Mac revokes the phone", async () => {
     const revoke = spawn(BINARY, ["hub", "revoke", PHONE, "--journal-dir", root], { stdio: "ignore" });
-    await new Promise<void>((resolve) => revoke.once("exit", () => resolve()));
+    const code = await new Promise<number | null>((resolve, reject) => {
+      revoke.once("error", reject);
+      revoke.once("exit", (exitCode) => resolve(exitCode));
+    });
+    expect(code).toBe(0);
     await until("the client to be unpaired", () => client?.state === "unpaired", 10_000);
     expect(client?.token).toBeNull();
   });
