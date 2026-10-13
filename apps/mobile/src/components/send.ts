@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Refusal, type RequestBody } from "../client/HubClient";
+import { useHubClient } from "../hub";
 import { lightTap } from "../haptics";
 
 /** Sends a command to the Mac; resolves on its ack, rejects with a `Refusal`. */
@@ -31,6 +32,16 @@ export function failure(error: unknown): Failure {
     return { text: error.message, retry: error.code === "unsent" };
   }
   return { text: "Something went wrong. Try again.", retry: false };
+}
+
+/** A `Send` over the app's one connection; with none (not paired yet) every command is unsent.
+ * Stable while the connection is. */
+export function useSend(): Send {
+  const client = useHubClient();
+  return useCallback<Send>(
+    (body) => (client ? client.request(body) : Promise.reject(new Refusal("unsent", "Can't reach your Mac"))),
+    [client],
+  );
 }
 
 const isLow = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
@@ -68,8 +79,8 @@ export function useAlive(): () => boolean {
 export interface Action {
   busy: boolean;
   failed: Failure | null;
-  /** Sends `body` unless a send is out; `onAck` runs when the Mac acks it. */
-  run: (body: RequestBody, onAck?: () => void) => void;
+  /** Sends `body` unless a send is out; `onAck` runs, with the Mac's answer, when it acks. */
+  run: (body: RequestBody, onAck?: (ack: unknown) => void) => void;
   fail: (failed: Failure | null) => void;
 }
 
@@ -80,17 +91,17 @@ export function useAction(send: Send): Action {
   const out = useRef(false);
   const alive = useAlive();
   const run = useCallback(
-    (body: RequestBody, onAck?: () => void) => {
+    (body: RequestBody, onAck?: (ack: unknown) => void) => {
       if (out.current) return;
       out.current = true;
       setBusy(true);
       setFailed(null);
       send(body).then(
-        () => {
+        (ack) => {
           out.current = false;
           if (!alive()) return;
           setBusy(false);
-          onAck?.();
+          onAck?.(ack);
         },
         (error: unknown) => {
           out.current = false;

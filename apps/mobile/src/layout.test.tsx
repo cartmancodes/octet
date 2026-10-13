@@ -50,7 +50,7 @@ async function launch(opts: { paired?: boolean } = {}) {
       <RootLayout />
     </HubContext.Provider>
   );
-  await renderRouter({ _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => null });
+  await renderRouter({ _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => null, recent: () => null, settings: () => null });
   return { hub, sockets, clock };
 }
 
@@ -77,7 +77,7 @@ describe("the app shell", () => {
       </HubContext.Provider>
     );
     const view = renderRouter(
-      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text> },
+      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text>, recent: () => null, settings: () => null },
       { initialUrl: "/session/x" },
     );
     await view;

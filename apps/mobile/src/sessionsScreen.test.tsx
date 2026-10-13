@@ -67,6 +67,7 @@ async function launch(list: SessionInfo[] | null) {
       return <Text testID="opened">{useLocalSearchParams<{ id: string }>().id}</Text>;
     },
     recent: () => <Text>Recent screen</Text>,
+    settings: () => <Text>Settings screen</Text>,
   });
   await view;
   const rig = { hub, sockets, clock, view };
@@ -150,6 +151,16 @@ describe("Sessions", () => {
     expect(screen.getByText("No Octet sessions are running on your Mac")).toBeTruthy();
     await fireEvent.press(screen.getByRole("button", { name: "Recent and new" }));
     expect(view.getPathname()).toBe("/recent");
+  });
+
+  it("has a Settings gear in the header that opens Settings, with or without sessions", async () => {
+    const { view } = await launch([info("a")]);
+    const gear = screen.getByRole("button", { name: "Settings" });
+    expect(StyleSheet.flatten(gear.props.style).minHeight).toBeGreaterThanOrEqual(44);
+    expect(StyleSheet.flatten(gear.props.style).minWidth).toBeGreaterThanOrEqual(44);
+    await fireEvent.press(gear);
+    expect(view.getPathname()).toBe("/settings");
+    expect(screen.getByText("Settings screen")).toBeTruthy();
   });
 
   it("tapping a card opens that session", async () => {

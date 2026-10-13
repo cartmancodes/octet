@@ -46,6 +46,8 @@ export default function RootLayout() {
         <Stack.Protected guard={paired}>
           <Stack.Screen name="index" options={{ title: "Sessions" }} />
           <Stack.Screen name="session/[id]" options={{ title: "Session" }} />
+          <Stack.Screen name="recent" options={{ title: "Recent and new" }} />
+          <Stack.Screen name="settings" options={{ title: "Settings" }} />
         </Stack.Protected>
         <Stack.Protected guard={!paired}>
           <Stack.Screen name="pair" options={{ title: "Pair", headerShown: false }} />

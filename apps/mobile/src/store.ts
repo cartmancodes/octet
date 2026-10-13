@@ -342,6 +342,19 @@ export function bindHooks(store: OctetStore) {
     /** The modes and models a session offers, with the current ones marked; null until the Mac
      * sends them. The same object until it changes. */
     useCatalog: (id: string): CatalogInfo | null => useStore(store, (s) => s.bySession.get(id)?.catalog ?? null),
+    /** The catalogs of the live sessions that have sent one; each the same object until it changes. */
+    useCatalogs: (): CatalogInfo[] =>
+      useStore(
+        store,
+        useShallow((s) => {
+          const catalogs: CatalogInfo[] = [];
+          for (const { id } of s.sessions) {
+            const catalog = s.bySession.get(id)?.catalog;
+            if (catalog) catalogs.push(catalog);
+          }
+          return catalogs;
+        }),
+      ),
     useHub: (): HubState => useStore(store, (s) => s.hub),
   };
 }
@@ -359,5 +372,6 @@ export const {
   useTaskOpen,
   useApprovals,
   useCatalog,
+  useCatalogs,
   useHub,
 } = bindHooks(octetStore);

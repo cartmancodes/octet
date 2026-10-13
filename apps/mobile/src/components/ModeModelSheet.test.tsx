@@ -385,6 +385,25 @@ describe("the mode and model sheet", () => {
       expect(r.send).not.toHaveBeenCalled();
     });
 
+    it("disarms the panel when the desk changes the mode: the next Turn on needs a fresh Face ID", async () => {
+      const r = rig();
+      const view = await open(CATALOG, r);
+      await press(FULL);
+      expect(screen.getByLabelText("Type full access to confirm")).toBeTruthy();
+      // The desk flips to auto, then to full access, then back to ask.
+      await view.rerender(sheet({ ...CATALOG, current_mode: "auto" }, r.send));
+      expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      await view.rerender(sheet({ ...CATALOG, current_mode: "full-access" }, r.send));
+      await view.rerender(sheet({ ...CATALOG, current_mode: "ask" }, r.send));
+      expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Turn on full access" })).toBeNull();
+      expect(r.send).not.toHaveBeenCalled();
+      // Choosing it again asks for Face ID again.
+      auth.authenticateAsync.mockClear();
+      await press(FULL);
+      expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
+    });
+
     it("can be cancelled before it is turned on", async () => {
       const r = rig();
       await open(CATALOG, r);

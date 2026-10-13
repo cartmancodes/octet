@@ -15,7 +15,7 @@ export const NO_FACE_ID = "Full access needs Face ID set up on this phone.";
 export const FULL_ACCESS_WARNING = "The agent can run any command without asking.";
 const BIOMETRIC_REASON = "Turn on full access for this session";
 
-const MODE_NAMES: Record<Mode, string> = {
+export const MODE_NAMES: Record<Mode, string> = {
   ask: "Ask",
   "accept-edits": "Accept edits",
   auto: "Auto",
@@ -251,7 +251,7 @@ interface FullAccessConfirmProps {
  * The words that turn full access on, after Face ID. Its text lives here, so closing the panel
  * (or the sheet) forgets what was typed.
  */
-const FullAccessConfirm = memo(function FullAccessConfirm({ busy, onTurnOn, onCancel }: FullAccessConfirmProps) {
+export const FullAccessConfirm = memo(function FullAccessConfirm({ busy, onTurnOn, onCancel }: FullAccessConfirmProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const [words, setWords] = useState("");
@@ -338,6 +338,14 @@ export const ModeModelSheet = memo(function ModeModelSheet({ session, catalog, s
   if (seenFailure !== failed) {
     setSeenFailure(failed);
     if (failed && typing) setTyping(false);
+  }
+
+  // The desk changed the mode: whatever Face ID armed the panel for is out of date, so it is
+  // disarmed and the next Turn on starts again from Face ID.
+  const [seenMode, setSeenMode] = useState(currentMode);
+  if (seenMode !== currentMode) {
+    setSeenMode(currentMode);
+    if (typing) setTyping(false);
   }
 
   const reset = useCallback(() => {

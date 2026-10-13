@@ -379,3 +379,67 @@ describe("the app's lifecycle", () => {
     expect((await pending).ok).toBe(false);
   });
 });
+
+describe("unpair", () => {
+  it("clears the token and the hub address, forgets the Mac's sessions, and shows Pair with no notice", async () => {
+    const r = rig();
+    r.hub.setForeground(true);
+    await paired(r);
+    const client = r.hub.snapshot().client;
+    r.sockets.last.receive({
+      type: "sessions",
+      sessions: [
+        { id: "s1", engine: "claude", workspace: "/w", mode: "ask", phase: "idle", approvals: 0, from_phone: false },
+      ],
+    });
+    r.clock.advance(50);
+    expect(r.store.getState().sessions).toHaveLength(1);
+    const socket = r.sockets.last;
+    await r.hub.unpair();
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect((await loadSettings()).hubUrl).toBeNull();
+    expect((await loadSettings()).deviceName).toBe("iPhone"); // kept to prefill the next pairing
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null });
+    expect(r.store.getState().sessions).toHaveLength(0);
+    expect(client?.state).toBe("offline");
+    expect(socket.closed).toBe(true);
+  });
+
+  it("stays quiet when the connection drops afterwards, and a restart is unpaired", async () => {
+    const r = rig();
+    r.hub.setForeground(true);
+    await paired(r);
+    await r.hub.unpair();
+    r.clock.advance(120_000);
+    expect(r.sockets.all.filter((s) => !s.closed)).toHaveLength(0);
+    const again = rig();
+    await again.hub.init();
+    expect(again.hub.snapshot().status).toBe("unpaired");
+  });
+
+  it("goes to Pair even when the keychain cannot be cleared, and the next start drops the token", async () => {
+    const r = rig();
+    r.hub.setForeground(true);
+    await paired(r);
+    (SecureStore.deleteItemAsync as jest.Mock).mockRejectedValueOnce(new Error("locked"));
+    await r.hub.unpair();
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null });
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN); // still there...
+    const again = rig();
+    await again.hub.init(); // ...but with no hub address it is dropped
+    expect(again.hub.snapshot().status).toBe("unpaired");
+    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+  });
+
+  it("does nothing when not paired, and a second call while one runs is ignored", async () => {
+    const r = rig();
+    await r.hub.init();
+    await r.hub.unpair();
+    expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null });
+    const p = rig();
+    p.hub.setForeground(true);
+    await paired(p);
+    await Promise.all([p.hub.unpair(), p.hub.unpair()]);
+    expect(p.hub.snapshot().status).toBe("unpaired");
+  });
+});

@@ -78,6 +78,7 @@ export class HubController {
   private pairing: HubClient | null = null;
   private detach: (() => void) | null = null;
   private starting: Promise<void> | null = null;
+  private unpairing = false;
 
   constructor(opts: HubControllerOptions = {}) {
     this.factory = opts.factory ?? webSocketFactory;
@@ -182,6 +183,26 @@ export class HubController {
       }
     }
     return saveSettings({ hubUrl: url, deviceName });
+  }
+
+  /** The user unpairs this phone: the connection and what the Mac sent are dropped, then the
+   * hub address and the token are deleted, and Pair shows with no notice. The device name stays
+   * to prefill the next pairing. The Mac keeps listing the phone until `octet hub revoke` there.
+   * A keychain that will not clear still ends at Pair: with no hub address the next start drops
+   * the token. */
+  async unpair(): Promise<void> {
+    const client = this.current.client;
+    if (this.unpairing || client === null) return;
+    this.unpairing = true;
+    try {
+      this.release();
+      client.stop();
+      await saveSettings({ hubUrl: null });
+      await this.tokens.clear().catch(() => undefined);
+      this.set({ status: "unpaired", notice: null, client: null });
+    } finally {
+      this.unpairing = false;
+    }
   }
 
   // Internals

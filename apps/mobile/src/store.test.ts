@@ -301,6 +301,20 @@ describe("state and catalog", () => {
     expect(view("b").catalog).toBeNull();
   });
 
+  it("useCatalogs gives the live sessions' catalogs, the same array until one changes", async () => {
+    const hooks = bindHooks(store);
+    const h = await renderHook(() => hooks.useCatalogs());
+    expect(h.result.current).toEqual([]);
+    await act(async () => store.getState().applyBatch([sessions(info("a"), info("b")), catalogFrame("a")]));
+    const first = h.result.current;
+    expect(first.map((c) => c.modes)).toEqual([["ask"]]);
+    await act(async () => store.getState().applyBatch([stateFrame("b", { now: "Reading" })])); // not a catalog
+    expect(h.result.current).toBe(first);
+    // A session that left the list takes its catalog with it.
+    await act(async () => store.getState().applyBatch([sessions(info("b"))]));
+    expect(h.result.current).toEqual([]);
+  });
+
   it("take the state's approvals as the pending ones", () => {
     store.getState().applyBatch([stateFrame("a", { approvals: [{ id: 3, summary: { action: "Edit", files: ["a.rs"], scope: "once" } }] })]);
     expect(view("a").approvals.map((a) => a.id)).toEqual([3]);

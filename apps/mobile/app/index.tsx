@@ -1,5 +1,5 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
-import { useIsFocused, useRouter } from "expo-router";
+import { Stack, useIsFocused, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
@@ -18,6 +18,18 @@ const MASCOT = 59;
 const REFRESH_MAX_MS = 8_000;
 
 const keyOf = (s: SessionInfo): string => s.id;
+
+/** The gear in the header: opens Settings. */
+function SettingsButton() {
+  const theme = useTheme();
+  const router = useRouter();
+  const open = useCallback(() => router.push("/settings"), [router]);
+  return (
+    <Pressable accessibilityRole="button" accessibilityLabel="Settings" onPress={open} style={styles.gear}>
+      <Text style={[type.title, { color: theme.fg }]}>{"\u2699"}</Text>
+    </Pressable>
+  );
+}
 
 /** The live sessions, approvals waiting first. The mascot at the top is the worst state across them. */
 export default function Sessions() {
@@ -88,6 +100,7 @@ export default function Sessions() {
 
   return (
     <View style={[styles.screen, { backgroundColor: theme.bg }]}>
+      <Stack.Screen options={HEADER} />
       <View style={styles.header}>
         <Mascot pose={pose} size={MASCOT} />
         <Text style={[type.body, { color: theme.muted }]}>{summary(sessions.length, waiting)}</Text>
@@ -114,8 +127,13 @@ function summary(total: number, waiting: number): string {
   return waiting > 0 ? `${sessions} · ${waiting} waiting for approval` : sessions;
 }
 
+// The header calls this as a function, not as a component: the hooks live in SettingsButton.
+const renderGear = () => <SettingsButton />;
+const HEADER = { headerRight: renderGear };
+
 const styles = StyleSheet.create({
   screen: { flex: 1 },
+  gear: { minHeight: 44, minWidth: 44, alignItems: "center", justifyContent: "center" },
   header: {
     flexDirection: "row",
     alignItems: "center",
