@@ -292,6 +292,9 @@ pub(crate) struct Asked {
     pub(crate) id: u64,
     pub(crate) detail: String,
     pub(crate) summary: octet_core::ApprovalSummary,
+    /// When it arrived. A remote answer waits `APPROVAL_ARM` from here, as the desk waits from
+    /// when the dialog is drawn.
+    pub(crate) arrived: tokio::time::Instant,
 }
 /// Dialogs over the screen: help, the palette and approvals.
 pub(crate) struct Overlays {
@@ -986,6 +989,7 @@ impl App {
                     id,
                     detail: clean(&detail),
                     summary,
+                    arrived: tokio::time::Instant::now(),
                 });
                 if first {
                     self.overlay.front_changed();

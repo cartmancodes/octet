@@ -5,7 +5,7 @@
 //! breaks turns itself off with one note; the interface goes on.
 use crate::{
     Action, Exit,
-    app::{App, CANCELLING, ConnPhase, StatusKind},
+    app::{APPROVAL_ARM, App, CANCELLING, ConnPhase, StatusKind},
     commands::{mode_command, model_command, steer_with},
     input::{answer_approval, cancel_turn, send_remote_prompt},
     registry::TURN_OPEN,
@@ -58,6 +58,10 @@ const QUEUE_LINE: usize = 200;
 const DESK_EDITING: &str = "The desk is editing a prompt";
 /// The refusal of an end or reconnect while a `!` command runs at the desk.
 const DESK_SHELL: &str = "A ! command is running at the desk";
+/// The refusal of an end while the desk holds a draft, `!` output or images not yet sent.
+const DESK_DRAFT: &str = "The desk has an unsent draft";
+/// The refusal of an answer to an approval younger than the arm delay, as the desk refuses a key.
+const APPROVAL_OPENING: &str = "The approval just opened";
 
 /// A command from a hub, for the interface to run.
 #[derive(Debug)]
@@ -231,6 +235,14 @@ pub(crate) async fn handle_remote(
     }
 }
 
+/// The desk holds work an end would throw away: a draft, or `!` output or images waiting for it.
+fn desk_has_draft(app: &App) -> bool {
+    let composer = &app.composer;
+    !composer.editor.text().is_empty()
+        || !composer.attachments.is_empty()
+        || !composer.images.is_empty()
+}
+
 /// `text` is something to send as a prompt, not blank and not a slash command.
 fn plain_text(text: &str) -> Result<(), String> {
     if text.trim().is_empty() {
@@ -250,6 +262,8 @@ fn refusal_code(reason: &str) -> Code {
         Code::NotConnected
     } else if reason == DESK_EDITING
         || reason == DESK_SHELL
+        || reason == DESK_DRAFT
+        || reason == APPROVAL_OPENING
         || reason.starts_with("The queue is full")
         || reason.starts_with("Mode change pending")
     {
@@ -309,6 +323,15 @@ async fn run_remote(
             }
         }
         BridgeCommand::Answer { approval, allow } => {
+            // A double tap meant for the last approval must not answer this one.
+            if app
+                .overlay
+                .approvals
+                .iter()
+                .any(|asked| asked.id == approval && asked.arrived.elapsed() < APPROVAL_ARM)
+            {
+                return Err(APPROVAL_OPENING.into());
+            }
             answer_approval(app, vendor, approval, allow)?;
             let what = if allow { "Allowed" } else { "Denied" };
             Ok((what.into(), what.into()))
@@ -343,6 +366,9 @@ async fn run_remote(
             }
             if app.turn_open() {
                 return Err(TURN_OPEN.into());
+            }
+            if desk_has_draft(app) {
+                return Err(DESK_DRAFT.into());
             }
             *action = Action::Exit(Exit::Quit);
             Ok(("Ended".into(), "Ending".into()))
@@ -991,6 +1017,8 @@ mod tests {
             (crate::registry::NOT_CONNECTED, Code::NotConnected),
             (DESK_EDITING, Code::Busy),
             (DESK_SHELL, Code::Busy),
+            (DESK_DRAFT, Code::Busy),
+            (APPROVAL_OPENING, Code::Busy),
             (
                 "The queue is full (8 prompts); wait for the turn or press Esc",
                 Code::Busy,

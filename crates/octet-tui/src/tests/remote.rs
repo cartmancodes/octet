@@ -73,7 +73,9 @@ async fn a_remote_answer_needs_an_open_approval() {
     let mut app = app();
     app.event(approval(1, "first"));
     app.event(approval(2, "second"));
+    // The desk's dialog was never drawn; the phone's arm delay has passed.
     assert!(!app.overlay.approval_armed());
+    crate::test_support::arm_remote_answers(&mut app);
     let vendor = RecordingVendor::default();
     let answer = |approval, allow| BridgeCommand::Answer { approval, allow };
     let (result, _) = run(&mut app, &vendor, answer(2, true)).await;
@@ -87,6 +89,79 @@ async fn a_remote_answer_needs_an_open_approval() {
     let (result, _) = run(&mut app, &vendor, answer(9, true)).await;
     assert_eq!(result, Err("No approval 9 is waiting".into()));
     assert_eq!(vendor.sent.borrow().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_remote_answer_waits_for_the_approval_to_arm() {
+    const OPENING: &str = "The approval just opened";
+    let mut app = app();
+    app.event(approval(1, "first"));
+    let vendor = RecordingVendor::default();
+    let answer = |approval| BridgeCommand::Answer {
+        approval,
+        allow: true,
+    };
+    tokio::time::advance(std::time::Duration::from_millis(60)).await;
+    let (result, action) = run(&mut app, &vendor, answer(1)).await;
+    assert_eq!(result, Err(OPENING.into()));
+    assert!(matches!(action, Action::Continue));
+    assert!(vendor.sent.borrow().is_empty());
+    assert_eq!(app.overlay.approvals.len(), 1);
+    assert!(
+        !app.entries_text().contains("Allowed from"),
+        "{}",
+        app.entries_text()
+    );
+    // Each approval arms on its own: one that arrives later waits its own delay.
+    tokio::time::advance(std::time::Duration::from_millis(300)).await;
+    app.event(approval(2, "second"));
+    tokio::time::advance(std::time::Duration::from_millis(40)).await;
+    let (result, _) = run(&mut app, &vendor, answer(1)).await;
+    assert!(result.is_ok(), "{result:?}");
+    let (result, _) = run(&mut app, &vendor, answer(2)).await;
+    assert_eq!(result, Err(OPENING.into()));
+    tokio::time::advance(crate::app::APPROVAL_ARM).await;
+    let (result, _) = run(&mut app, &vendor, answer(2)).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(matches!(
+        &vendor.sent.borrow()[..],
+        [
+            Command::Answer { id: 1, allow: true },
+            Command::Answer { id: 2, allow: true }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn remote_end_keeps_an_unsent_desk_draft() {
+    const DRAFT: &str = "The desk has an unsent draft";
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    app.composer.editor.set("a long desk draft".into());
+    let (result, action) = run(&mut app, &vendor, BridgeCommand::End).await;
+    assert_eq!(result, Err(DRAFT.into()));
+    assert!(matches!(action, Action::Continue));
+    assert_eq!(app.composer.editor.text(), "a long desk draft");
+    app.composer.editor.take();
+    app.attach(crate::shell::Ran {
+        command: "ls".into(),
+        status: crate::shell::Status::Exited(0),
+        output: "file\n".into(),
+    });
+    let (result, action) = run(&mut app, &vendor, BridgeCommand::End).await;
+    assert_eq!(result, Err(DRAFT.into()));
+    assert!(matches!(action, Action::Continue));
+    app.composer.attachments.clear();
+    let dir = image_workspace("octet-remote-end-image", &["draft.png"]);
+    let image = octet_core::ImageAttachment::open(&dir.path().join("draft.png")).unwrap();
+    app.composer.images.push(image);
+    let (result, _) = run(&mut app, &vendor, BridgeCommand::End).await;
+    assert_eq!(result, Err(DRAFT.into()));
+    app.composer.images.clear();
+    let (result, action) = run(&mut app, &vendor, BridgeCommand::End).await;
+    assert_eq!(result, Ok("Ending".into()));
+    assert!(matches!(action, Action::Exit(Exit::Quit)));
 }
 
 #[tokio::test]
@@ -221,6 +296,7 @@ async fn remote_end_refuses_during_a_turn() {
 async fn remote_actions_are_noted_on_the_desk() {
     let mut app = app();
     app.event(approval(1, "first"));
+    crate::test_support::arm_remote_answers(&mut app);
     let vendor = RecordingVendor::default();
     let remote = |by: &str, command| Remote {
         peer: 1,

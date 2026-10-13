@@ -62,12 +62,21 @@ pub(crate) fn approval(id: u64, detail: &str) -> octet_core::Event {
     }
 }
 
+/// Ages every waiting approval past the arm delay, as if each had been open that long, so a remote
+/// answer is taken at once.
+pub(crate) fn arm_remote_answers(app: &mut App) {
+    for asked in &mut app.overlay.approvals {
+        asked.arrived = tokio::time::Instant::now() - crate::app::APPROVAL_ARM;
+    }
+}
+
 /// A waiting approval for `id` with a plain summary.
 pub(crate) fn asked(id: u64, detail: &str) -> crate::app::Asked {
     crate::app::Asked {
         id,
         detail: detail.into(),
         summary: octet_core::ApprovalSummary::new("Run a shell command"),
+        arrived: tokio::time::Instant::now(),
     }
 }
 

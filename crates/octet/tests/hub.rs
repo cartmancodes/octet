@@ -639,9 +639,12 @@ async fn a_phone_drives_a_live_interface_through_the_hub() {
     let id = phone.event("approval").await["event"]["data"]["id"]
         .as_u64()
         .expect("an approval id");
+    // The interface refuses an answer in the approval's first 400 ms, as the app's buttons wait.
+    sleep(Duration::from_millis(500)).await;
     phone
         .command(5, "answer", json!({"approval": id, "allow": true}))
         .await;
+    assert_eq!(phone.reply(5).await["type"], "ack");
     phone.event("finished").await;
     let (closed, finished) = (
         phone.seen.index("approval_closed"),
