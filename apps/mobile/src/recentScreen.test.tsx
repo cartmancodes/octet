@@ -182,8 +182,8 @@ describe("Recent", () => {
 
   it("offers Try again after a lost request too: recent only reads", async () => {
     const rig = await open();
-    // The client gives up on a request after 30 s, and on the link with it: it reconnects.
-    await act(async () => rig.clock.advance(31_000));
+    // A silent link: its unanswered ping takes it down, the request with it, and it reconnects.
+    await act(async () => rig.clock.advance(46_000));
     expect(screen.getByText(/Not sure this reached the Mac/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
     await act(async () => {
@@ -250,7 +250,7 @@ describe("Recent", () => {
       const rig = await open();
       await answer(rig, [item("one")]);
       await press(/^Resume/);
-      await act(async () => rig.clock.advance(31_000));
+      await act(async () => rig.clock.advance(46_000)); // past the request's 45 s
       expect(screen.getByText("Not sure this reached the Mac. Check the session before sending again.")).toBeTruthy();
       expect(button("Try again")).toBeNull();
     });

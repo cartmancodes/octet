@@ -42,7 +42,7 @@ export type Ack = AckFrame | RecentFrame;
  * A command that was not done. `code` is the hub's, or one of two the phone makes up:
  * - `unsent`: the command never left the phone (no link yet, or the socket was already closed).
  *   It is safe to offer the user a resend.
- * - `lost`: it was sent and the outcome is unknown (the link dropped, or no answer in 30 s). Never
+ * - `lost`: it was sent and the outcome is unknown (the link dropped, or no answer in 45 s). Never
  *   resend automatically, and offer a resend only after the user has looked at the session.
  * The hub's own `timeout` (a session that did not answer) is a `lost` too. Any other hub code is
  * a definite no: `busy`, `rate_limited` and `unavailable` may be offered again later, the rest
@@ -90,7 +90,10 @@ export interface HubClientOptions {
 export const SUBSCRIBE_RETRIES = 3;
 export const SUBSCRIBE_RETRY_MS = 5_000;
 
-export const REQUEST_TIMEOUT_MS = 30_000;
+/** Past the hub's own deadline for an answer (30 s, swept every 1 s), and the trip back. */
+export const REQUEST_TIMEOUT_MS = 45_000;
+/** A request that times out takes the link down only if nothing came over it for this long. */
+export const QUIET_MS = 10_000;
 export const HANDSHAKE_TIMEOUT_MS = 15_000;
 export const BATCH_INTERVAL_MS = 50;
 /** A link ready this long counts as good: its drop starts the backoff over. */
@@ -300,9 +303,11 @@ export class HubClient {
   }
 
   /** Sends a command and resolves with its `ack` (or `recent`) frame. Rejects with a
-   * `Refusal`: the hub's code and words, `lost` after 30 s, or `unsent` when not ready. A request
-   * with no answer in 30 s takes the link for dead: the socket is closed and the client reconnects
-   * with its backoff, resuming every session from its cursor. */
+   * `Refusal`: the hub's code and words, `lost` after 45 s, or `unsent` when not ready. The hub
+   * answers a command it gave up on (30 s, swept every second) with its own `timeout`, so the
+   * phone waits longer than that. A request with no answer in 45 s on a link that has also been
+   * silent for 10 s takes the link for dead: the socket is closed and the client reconnects with
+   * its backoff, resuming every session from its cursor. A link that is still talking is kept. */
   request(cmd: RequestBody): Promise<Ack> {
     const socket = this.socket;
     if (this.stateValue !== "ready" || !socket) {
@@ -314,8 +319,8 @@ export class HubClient {
         this.pending.delete(req);
         reject(new Refusal("lost", "The Mac did not answer in time"));
         // A hub that is up answers in time; a half-open link (Wi-Fi gone, the Mac asleep) only
-        // looks open. Its late answers die with it.
-        if (this.socket === socket) this.lost();
+        // looks open, and is silent. Its late answers die with it. One that spoke lately is alive.
+        if (this.socket === socket && this.now() - this.lastHeard >= QUIET_MS) this.lost();
       }, REQUEST_TIMEOUT_MS);
       this.pending.set(req, { resolve, reject, cancel });
       try {

@@ -1,6 +1,6 @@
 import type { Cursor } from "../protocol";
 import { FakeClock, Sockets } from "./fakes";
-import { HubClient, PING_INTERVAL_MS, PING_TIMEOUT_MS, Refusal, type BatchItem, type HubState } from "./HubClient";
+import { HubClient, PING_INTERVAL_MS, PING_TIMEOUT_MS, REQUEST_TIMEOUT_MS, Refusal, type BatchItem, type HubState } from "./HubClient";
 
 const URL = "wss://mac.tail1234.ts.net/";
 const TOKEN = "device-token";
@@ -53,6 +53,14 @@ const event = (session: string, journal: string, seq: number, data = "x") => ({
 });
 
 const flush = (r: Rig) => r.clock.advance(50);
+/** `ms` of a link that speaks every second (events of a session nobody wants: heard, then dropped). */
+let noise = 0;
+const chatter = (r: Rig, ms: number) => {
+  for (let t = 0; t < ms; t += 1_000) {
+    r.sockets.last.receive(event("unwanted", "z", ++noise));
+    r.clock.advance(Math.min(1_000, ms - t));
+  }
+};
 const delivered = (r: Rig): BatchItem[] => r.batches.flat();
 const eventSeqs = (frames: BatchItem[]) =>
   frames.flatMap((f) => (f.type === "event" ? [`${f.journal}:${f.seq}`] : []));
@@ -140,7 +148,7 @@ describe("pairing", () => {
     await expect(cut).rejects.toMatchObject({ code: "lost" });
 
     const silent = r.client.pair("s", "p", "ios");
-    r.clock.advance(30_000);
+    r.clock.advance(REQUEST_TIMEOUT_MS);
     await expect(silent).rejects.toMatchObject({ code: "lost" });
     expect(r.sockets.last.closed).toBe(true);
   });
@@ -215,18 +223,23 @@ describe("requests", () => {
     await expect(pending).rejects.toMatchObject({ code: "invalid" });
   });
 
-  it("requests_time_out_after_30s", async () => {
+  it("requests_time_out_after_45s: past the hub's own 30 s deadline and its sweep", async () => {
+    expect(REQUEST_TIMEOUT_MS).toBe(45_000);
     const r = rig();
     ready(r);
     let outcome: unknown = "pending";
     r.client.request({ type: "prompt", session: "s", text: "x" }).catch((e: unknown) => (outcome = e));
-    r.clock.advance(29_999);
+    chatter(r, 44_999);
     await Promise.resolve();
     expect(outcome).toBe("pending");
     r.clock.advance(1);
     await Promise.resolve();
     expect(outcome).toBeInstanceOf(Refusal);
     expect(outcome).toMatchObject({ code: "lost" }); // sent, outcome unknown
+    // The link spoke within the last 10 s: it is alive, and kept.
+    expect(r.sockets.all).toHaveLength(1);
+    expect(r.sockets.last.closed).toBe(false);
+    expect(r.states.at(-1)).toBe("ready");
     // A late answer, ack or refusal, is dropped, not shown as traffic.
     const req = r.sockets.all[0]?.commandsOf("prompt")[0]?.req;
     r.sockets.all[0]?.receive({ type: "ack", req, message: "late" });
@@ -235,7 +248,20 @@ describe("requests", () => {
     expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
   });
 
-  it("a request that times out takes the link for dead: it reconnects and resumes from the cursors", async () => {
+  it("a request that the hub times out is answered by the hub's refusal, and keeps the link", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "recent" }).catch((e: unknown) => e);
+    const req = r.sockets.last.commandsOf("recent")[0]?.req;
+    chatter(r, 31_000); // the hub's 30 s, its 1 s sweep
+    r.sockets.last.receive({ type: "refused", req, code: "timeout", reason: "The session did not answer in time" });
+    await expect(pending).resolves.toMatchObject({ code: "timeout" });
+    expect(r.sockets.all).toHaveLength(1);
+    expect(r.sockets.last.closed).toBe(false);
+    expect(r.states.at(-1)).toBe("ready");
+  });
+
+  it("a request that times out on a quiet link takes the link for dead: it reconnects and resumes from the cursors", async () => {
     const r = rig();
     ready(r);
     r.client.subscribe("s1");
@@ -245,10 +271,11 @@ describe("requests", () => {
     first.receive(event("s1", "a", 2));
     flush(r);
     const other = r.client.request({ type: "cancel", session: "s1" });
-    r.clock.advance(10_000);
+    chatter(r, 10_000);
     const timedOut = r.client.request({ type: "prompt", session: "s1", text: "x" });
     const errors = [other.catch((e: unknown) => e), timedOut.catch((e: unknown) => e)];
-    r.clock.advance(20_000); // the first request's 30 s are up
+    chatter(r, 24_000); // heard last near 34 s: the ping it would send is not due before 59 s
+    r.clock.advance(11_000); // the first request's 45 s are up, after 10 s and more of silence
     await expect(errors[0]).resolves.toMatchObject({ code: "lost" });
     // The old socket is closed at once, and whatever else waited on it is lost too.
     expect(first.closed).toBe(true);
