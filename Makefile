@@ -1,4 +1,4 @@
-.PHONY: help rust-check rust-build tui tui-demo gate
+.PHONY: help mobile-check mobile-export rust-check rust-build tui tui-demo gate
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?##' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?##"}{printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -8,6 +8,12 @@ rust-check: ## Check formatting, lint, docs and tests for the Rust workspace
 	scripts/rust-env.sh cargo clippy --locked --workspace --all-targets -- -D warnings
 	RUSTDOCFLAGS="-D warnings" scripts/rust-env.sh cargo doc --locked --workspace --no-deps
 	scripts/rust-env.sh cargo test --locked --workspace
+
+mobile-check: ## Type-check, lint and test the mobile app (needs Node 22)
+	cd apps/mobile && npm ci && npm run typecheck && npm run lint && npm test -- --ci
+
+mobile-export: ## Bundle the mobile app for iOS and Android (no native build)
+	cd apps/mobile && npm run export:check
 
 rust-build: ## Build the optimized terminal UI
 	scripts/rust-env.sh cargo build --release --locked -p octet

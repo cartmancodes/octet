@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "Octet",
+    "slug": "octet",
+    "scheme": "octet",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "bundleIdentifier": "dev.octet.mobile",
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "dev.octet.mobile"
+    },
+    "plugins": ["expo-router"]
+  }
+}

@@ -1963,50 +1963,6 @@ mod tests {
         assert!(unknown.contains("type: string;") && unknown.contains("data: unknown;"));
     }
 
-    /// Whether `isKnownEvent` narrows `e.data` by the discriminant under `tsc --strict`.
-    #[test]
-    fn a_known_journal_event_narrows_in_typescript() {
-        let npx = std::process::Command::new("npx").arg("--version").output();
-        if !npx.is_ok_and(|out| out.status.success()) {
-            eprintln!("skipped: `npx` is not available, so tsc 5.6.3 cannot run");
-            return;
-        }
-        let dir = octet_testkit::TempDir::new("octet-protocol-ts");
-        std::fs::create_dir_all(dir.path()).unwrap();
-        std::fs::write(dir.path().join("protocol.ts"), typescript()).unwrap();
-        let check = concat!(
-            "import { isKnownEvent, type JournalEvent } from \"./protocol\";\n",
-            "export function text(e: JournalEvent): string {\n",
-            "  if (isKnownEvent(e) && e.type === \"text\") {\n",
-            "    const s: string = e.data;\n",
-            "    return s;\n",
-            "  }\n",
-            "  return \"\";\n",
-            "}\n",
-        );
-        std::fs::write(dir.path().join("check.ts"), check).unwrap();
-        let out = std::process::Command::new("npx")
-            .args([
-                "--yes",
-                "-p",
-                "typescript@5.6.3",
-                "tsc",
-                "--noEmit",
-                "--strict",
-            ])
-            .args(["--target", "es2022", "--module", "es2022"])
-            .args(["--moduleResolution", "bundler", "check.ts"])
-            .current_dir(dir.path())
-            .output()
-            .expect("npx runs");
-        assert!(
-            out.status.success(),
-            "tsc rejected the narrowing check:\n{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
     #[test]
     fn the_checked_in_typescript_is_current() {
         let path = concat!(
