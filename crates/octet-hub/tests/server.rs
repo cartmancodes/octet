@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{
         TcpStream, UnixListener, UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
@@ -1521,6 +1521,129 @@ async fn at_most_eight_phone_started_sessions_run() {
             "8 sessions started from the phone are running; end one first"
         )
     );
+}
+
+/// A handshake from the owner with `headers` added (a header named again replaces the first).
+async fn connect_with(port: u16, headers: &[(&str, &str)]) -> Result<Phone, tungstenite::Error> {
+    let mut request = format!("ws://127.0.0.1:{port}/")
+        .into_client_request()
+        .expect("a request");
+    request
+        .headers_mut()
+        .insert("Tailscale-User-Login", OWNER.parse().expect("a header"));
+    for &(name, value) in headers {
+        let name = tungstenite::http::HeaderName::from_bytes(name.as_bytes()).expect("a name");
+        request
+            .headers_mut()
+            .insert(name, value.parse().expect("a header"));
+    }
+    timeout(WAIT, connect_async(request))
+        .await
+        .expect("the handshake ends")
+        .map(|(phone, _)| phone)
+}
+
+/// Whether a handshake was refused with `status`.
+fn refused_with(result: &Result<Phone, tungstenite::Error>, status: u16) -> bool {
+    matches!(result, Err(tungstenite::Error::Http(response)) if response.status() == status)
+}
+
+#[tokio::test]
+async fn a_web_page_of_another_site_is_refused_at_the_handshake() {
+    let mut env = Env::new();
+    env.start().await;
+    let here = format!("http://127.0.0.1:{}", env.port);
+    for origin in ["https://evil.example", "null", "https://127.0.0.2"] {
+        let result = connect_with(env.port, &[("Origin", origin)]).await;
+        assert!(refused_with(&result, 403), "{origin}: {result:?}");
+    }
+    // The app's own socket: no Origin, or the hub's own address.
+    assert!(connect_with(env.port, &[]).await.is_ok());
+    assert!(connect_with(env.port, &[("Origin", &here)]).await.is_ok());
+    // Through `tailscale serve`, the request names the published host.
+    let served = [
+        ("Host", "mac.tail1234.ts.net"),
+        ("Origin", "https://mac.tail1234.ts.net"),
+    ];
+    assert!(connect_with(env.port, &served).await.is_ok());
+    let forwarded = [
+        ("X-Forwarded-Host", "mac.tail1234.ts.net"),
+        ("Origin", "https://MAC.tail1234.ts.net"),
+    ];
+    assert!(connect_with(env.port, &forwarded).await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handshakes_that_stall_do_not_keep_a_phone_out() {
+    let mut env = Env::new();
+    env.start().await;
+    let token = env.pair("Test phone").await;
+    // Sixty sockets that start a request and never finish it.
+    let mut stalled = Vec::new();
+    for _ in 0..60 {
+        let mut socket = TcpStream::connect(("127.0.0.1", env.port))
+            .await
+            .expect("connects");
+        socket
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .expect("writes");
+        stalled.push(socket);
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (_phone, sessions) = timeout(Duration::from_secs(6), hello(env.port, &token))
+        .await
+        .expect("a phone gets in within 6 seconds");
+    assert_eq!(sessions["type"], "sessions");
+    // The newest stalled handshake is let go 5 seconds after it began.
+    let mut last = stalled.pop().expect("a socket");
+    let mut byte = [0; 1];
+    let ended = timeout(Duration::from_secs(5), last.read(&mut byte)).await;
+    assert!(
+        ended.is_ok_and(|read| read.is_err() || read.is_ok_and(|n| n == 0)),
+        "a stalled handshake is cut within 5 seconds"
+    );
+}
+
+#[tokio::test]
+async fn a_run_directory_that_is_a_symlink_is_refused() {
+    let root = PathBuf::from(format!("/tmp/ohs{}-link", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("target");
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    std::os::unix::fs::symlink(&elsewhere, root.join("run")).expect("planted symlink");
+    let serving = Hub::serve_with(
+        root.clone(),
+        0,
+        OWNER.to_owned(),
+        std::future::pending(),
+        oneshot::channel().0,
+        (fake_publisher, RECHECK),
+    );
+    let result = timeout(Duration::from_secs(2), serving).await;
+    let socket = elsewhere.join("hub.sock").exists();
+    let _ = std::fs::remove_dir_all(&root);
+    let error = result
+        .expect("the hub refuses to start")
+        .expect_err("a refusal");
+    assert!(
+        error.contains(&root.join("run").display().to_string()) && error.contains("symlink"),
+        "{error}"
+    );
+    assert!(!socket, "no socket appears where the symlink points");
+}
+
+#[tokio::test]
+async fn a_loose_run_directory_is_tightened() {
+    let mut env = Env::new();
+    std::fs::set_permissions(&env.run, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    env.start().await;
+    let mode = std::fs::symlink_metadata(&env.run)
+        .expect("run")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
 }
 
 /// Appends records `seqs` to the journal `name` of `env`, each padded with `pad` bytes.

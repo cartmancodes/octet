@@ -537,6 +537,16 @@ It then creates no socket and no file, and the hub and the phone never see it.
   readable by you alone, and the phone keeps the token in its secure storage.
   Another tailnet device, or another program on the Mac, can't connect
   without pairing.
+- A web page can't use your browser to connect. The hub refuses a
+  connection whose `Origin` names another site; the app sends none, or the
+  hub's own address.
+- Connections that stall mid-request can't keep a phone out. Each one must
+  finish connecting within 5 seconds, and once 32 are connecting at once, a new
+  one pushes out the oldest. A stalled one never counts against the 8 that may
+  wait to say hello.
+- The hub won't start if `run/` in the data directory is a symlink, isn't a
+  directory, or belongs to another user. It names the path. If `run/` is
+  readable by others, the hub makes it `0700`.
 - A lost or stolen phone: run `octet hub revoke NAME` on the Mac. Then
   remove the phone from the tailnet in the Tailscale admin console.
 - Every action from a phone (prompt, answer, mode, start and so on) is

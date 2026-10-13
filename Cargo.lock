@@ -589,6 +589,7 @@ dependencies = [
  "octet-core",
  "octet-store",
  "octet-testkit",
+ "rustix",
  "serde_json",
  "sha2",
  "tokio",

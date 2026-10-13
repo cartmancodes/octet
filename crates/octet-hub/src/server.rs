@@ -3,11 +3,16 @@
 //!
 //! # Connections
 //!
-//! The handshake turns away any request whose `Tailscale-User-Login` header is not exactly the
-//! owner's login (403). A connection then starts unauthenticated and accepts only `hello` (a
+//! A connection must finish its WebSocket upgrade within 5 seconds of being accepted, and at
+//! most 32 upgrade at once (a new one lets the oldest go), so sockets that stall mid-request
+//! cannot keep a phone out. The handshake turns away any request whose `Tailscale-User-Login`
+//! header is not exactly the owner's login, or whose `Origin` names a host the request does not
+//! (a web page of another site; the app sends none, or the hub's own), with 403, and one the hub
+//! has no room for (64 open, or 8 not past `hello`) with 503. A connection then starts
+//! unauthenticated and accepts only `hello` (a
 //! device token) and `pair` (a pairing secret); anything else, or a failed `hello` or `pair`,
-//! is refused and the socket closed, as is one silent for 30 seconds; at most 8 may wait at
-//! once. After `hello` it is authenticated as that device: every frame, text or not, first
+//! is refused and the socket closed, as is one silent for 30 seconds. After `hello` it is
+//! authenticated as that device: every frame, text or not, first
 //! checks that the device is still paired (a revoked one is told `revoked`, then closed) and takes a token
 //! from the device's bucket (60 a minute; an empty bucket refuses, it does not close). Every
 //! connection is pinged every 20 seconds, and one that misses two pongs is let go.
@@ -53,14 +58,14 @@ use octet_core::remote::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -76,7 +81,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Message,
         handshake::server::{Callback, ErrorResponse, Request, Response},
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         protocol::WebSocketConfig,
     },
 };
@@ -109,8 +114,10 @@ const REFRESH_EVERY: Duration = Duration::from_secs(1);
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 /// How long a connection may take to say hello (or pair) before it is closed.
 const HELLO_WITHIN: Duration = Duration::from_secs(30);
-/// How long the WebSocket handshake may take.
-const HANDSHAKE_WITHIN: Duration = Duration::from_secs(10);
+/// How long a connection may take from accept to a finished WebSocket upgrade.
+const HANDSHAKE_WITHIN: Duration = Duration::from_secs(5);
+/// Upgrades under way at once; a connection accepted past it lets the oldest go.
+const MAX_HANDSHAKES: usize = 32;
 /// How often the hub asks Tailscale again whether it is published.
 const PUBLISH_EVERY: Duration = Duration::from_secs(10);
 /// How long the closing handshake may take.
@@ -306,6 +313,63 @@ impl Liveness {
     }
 }
 
+/// The connections the hub holds: every open one, and those not past `hello` yet. A handshake
+/// takes a [`Seat`] before it upgrades, so a socket the hub has no room for is turned away
+/// (503) rather than upgraded and then dropped, and one that never finishes its request holds
+/// no place at all.
+#[derive(Debug, Default)]
+struct Room {
+    open: AtomicUsize,
+    waiting: AtomicUsize,
+}
+
+impl Room {
+    /// A place for one more connection, not past `hello` yet; `None` when the hub has
+    /// [`MAX_CONNECTIONS`] open or [`MAX_WAITING`] waiting.
+    fn seat(self: &Arc<Self>) -> Option<Seat> {
+        if self.open.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+            self.open.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        if self.waiting.fetch_add(1, Ordering::AcqRel) >= MAX_WAITING {
+            self.waiting.fetch_sub(1, Ordering::AcqRel);
+            self.open.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Seat {
+            room: Arc::clone(self),
+            waiting: true,
+        })
+    }
+}
+
+/// One connection's place in the [`Room`], given back when it drops.
+#[derive(Debug)]
+struct Seat {
+    room: Arc<Room>,
+    /// Not past `hello` yet.
+    waiting: bool,
+}
+
+impl Seat {
+    /// The connection said hello: it no longer waits.
+    fn said_hello(&mut self) {
+        if std::mem::take(&mut self.waiting) {
+            self.room.waiting.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.said_hello();
+        self.room.open.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// An upgraded connection and its place.
+type Upgraded = (WebSocketStream<TcpStream>, Seat);
+
 /// What a replay task has a connection's writer send.
 #[derive(Debug)]
 enum ReplayItem {
@@ -387,6 +451,8 @@ struct Conn {
     device: Option<Device>,
     /// The sessions it streams, by id.
     subscriptions: HashMap<String, Subscription>,
+    /// Its place in the hub's room, given back as it drops.
+    seat: Seat,
 }
 
 /// A command sent to a session and not yet answered.
@@ -567,7 +633,9 @@ impl Hub {
         let (events, mut inbox) = mpsc::channel(EVENT_QUEUE);
         let (dead_tokens, mut dead) = mpsc::channel(PUSH_QUEUE);
         let (streams, mut accepted) = mpsc::channel(16);
-        let accept_task = tokio::spawn(accept_tcp(listener, streams)).abort_handle();
+        let room = Arc::new(Room::default());
+        let accept_task =
+            tokio::spawn(accept_tcp(listener, owner.clone(), room, streams)).abort_handle();
         let (requests, mut controls) = mpsc::channel(16);
         let (published_in, published) = watch::channel(Publication::Unknown);
         let publish_task =
@@ -605,7 +673,7 @@ impl Hub {
             // `refresh` is not cancel-safe, so it runs in a handler, never as a branch.
             tokio::select! {
                 () = &mut shutdown => break,
-                Some(stream) = accepted.recv() => hub.accept(stream),
+                Some(upgraded) = accepted.recv() => hub.accept(upgraded),
                 Some(event) = inbox.recv() => hub.on_event(event).await,
                 update = hub.sessions.next() => hub.on_update(update),
                 Some(request) = controls.recv() => hub.on_control(request).await,
@@ -634,24 +702,13 @@ impl Hub {
         self.ids
     }
 
-    /// Starts the task that serves one TCP connection.
-    fn accept(&mut self, stream: TcpStream) {
-        let waiting = self.conns.values().filter(|c| c.device.is_none()).count();
-        if self.conns.len() >= MAX_CONNECTIONS || waiting >= MAX_WAITING {
-            return;
-        }
+    /// Starts the task that serves one upgraded connection, which brings its seat.
+    fn accept(&mut self, (ws, seat): Upgraded) {
         let conn = self.next_id();
         let (out, outbox) = mpsc::channel(OUTBOUND_QUEUE);
         let (replay, replays) = mpsc::channel(REPLAY_QUEUE);
-        let task = tokio::spawn(connection(
-            stream,
-            self.owner.clone(),
-            conn,
-            outbox,
-            replays,
-            self.events.clone(),
-        ))
-        .abort_handle();
+        let task =
+            tokio::spawn(connection(ws, conn, outbox, replays, self.events.clone())).abort_handle();
         self.conns.insert(
             conn,
             Conn {
@@ -661,6 +718,7 @@ impl Hub {
                 opened: Instant::now(),
                 device: None,
                 subscriptions: HashMap::new(),
+                seat,
             },
         );
     }
@@ -743,12 +801,15 @@ impl Hub {
                     self.close(conn);
                     return;
                 };
-                self.send(conn, &welcome(&device.name));
-                let rows = self.sessions.list();
-                self.send(conn, &sessions_frame(&rows));
+                let name = device.name.clone();
+                // Out of the waiting room before the phone hears it is in.
                 if let Some(state) = self.conns.get_mut(&conn) {
                     state.device = Some(device);
+                    state.seat.said_hello();
                 }
+                self.send(conn, &welcome(&name));
+                let rows = self.sessions.list();
+                self.send(conn, &sessions_frame(&rows));
             }
             PhoneCommand::Pair {
                 secret,
@@ -1587,10 +1648,22 @@ fn broadcast(watchers: &mut Vec<mpsc::Sender<String>>, frame: &str) {
     watchers.retain(|watcher| watcher.try_send(frame.to_owned()).is_ok());
 }
 
-/// Creates `run` owner-only, and tightens it to 0700 if it exists with more.
+/// Makes `run` ready for the hub's socket: creates it owner-only if missing, refuses one that is
+/// a symlink (it would put the socket elsewhere), not a directory, or not this user's, and
+/// tightens one looser than 0700, as the terminal UI does.
 async fn private_dir(run: &Path) -> std::io::Result<()> {
     octet_store::create_private_dir(run).await?;
-    if tokio::fs::metadata(run).await?.permissions().mode() & 0o077 != 0 {
+    let meta = tokio::fs::symlink_metadata(run).await?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::other("it is a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(std::io::Error::other("it is not a directory"));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(std::io::Error::other("it belongs to another user"));
+    }
+    if meta.mode() & 0o077 != 0 {
         tokio::fs::set_permissions(run, std::fs::Permissions::from_mode(0o700)).await?;
     }
     Ok(())
@@ -1615,14 +1688,36 @@ async fn bind_control(path: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
-/// Accepts TCP connections and hands them to the hub loop.
-async fn accept_tcp(listener: TcpListener, hub: mpsc::Sender<TcpStream>) {
+/// Accepts TCP connections and upgrades each in its own task, handing the upgraded ones, with
+/// their seats, to the hub loop. At most [`MAX_HANDSHAKES`] upgrade at once: one accepted past
+/// that lets the oldest go, so sockets that stall mid-request cannot keep a phone out, and each
+/// has [`HANDSHAKE_WITHIN`] in all.
+async fn accept_tcp(
+    listener: TcpListener,
+    owner: String,
+    room: Arc<Room>,
+    hub: mpsc::Sender<Upgraded>,
+) {
+    let mut upgrading: VecDeque<AbortHandle> = VecDeque::new();
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                if hub.send(stream).await.is_err() {
+                if hub.is_closed() {
                     return;
                 }
+                upgrading.retain(|task| !task.is_finished());
+                if upgrading.len() >= MAX_HANDSHAKES
+                    && let Some(oldest) = upgrading.pop_front()
+                {
+                    oldest.abort();
+                }
+                let (owner, room, hub) = (owner.clone(), Arc::clone(&room), hub.clone());
+                let task = tokio::spawn(async move {
+                    if let Some(upgraded) = handshake(stream, &owner, &room).await {
+                        let _ = hub.send(upgraded).await;
+                    }
+                });
+                upgrading.push_back(task.abort_handle());
             }
             // Out of descriptors, say: wait rather than spin.
             Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
@@ -1923,51 +2018,109 @@ async fn hand_off(job: HandOff) {
     }
 }
 
-/// Serves one TCP connection: the handshake, then frames both ways until either side ends.
+/// Serves one upgraded connection: frames both ways until either side ends.
 async fn connection(
-    stream: TcpStream,
-    owner: String,
+    ws: WebSocketStream<TcpStream>,
     conn: u64,
     mut outbox: mpsc::Receiver<Out>,
     mut replays: mpsc::Receiver<ReplayItem>,
     events: mpsc::Sender<ConnEvent>,
 ) {
-    if let Some(ws) = handshake(stream, &owner).await {
-        pump(ws, conn, &mut outbox, &mut replays, &events).await;
-    }
+    pump(ws, conn, &mut outbox, &mut replays, &events).await;
     let _ = events.send(ConnEvent::Closed { conn }).await;
 }
 
-/// The WebSocket handshake, refused with 403 unless `Tailscale-User-Login` is `owner`.
-async fn handshake(stream: TcpStream, owner: &str) -> Option<WebSocketStream<TcpStream>> {
+/// The WebSocket upgrade, refused as [`Gate`] says, within [`HANDSHAKE_WITHIN`]: the connection
+/// and the seat it took.
+async fn handshake(stream: TcpStream, owner: &str, room: &Arc<Room>) -> Option<Upgraded> {
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))
         .max_frame_size(Some(MAX_MESSAGE));
-    timeout(
+    let mut seat = None;
+    let gate = Gate {
+        owner,
+        room,
+        seat: &mut seat,
+    };
+    let ws = timeout(
         HANDSHAKE_WITHIN,
-        accept_hdr_async_with_config(stream, OwnerOnly(owner), Some(config)),
+        accept_hdr_async_with_config(stream, gate, Some(config)),
     )
     .await
     .ok()?
-    .ok()
+    .ok()?;
+    Some((ws, seat?))
 }
 
-/// The handshake check: the request must carry `Tailscale-User-Login` equal to the owner's.
+/// The handshake check: the request must carry `Tailscale-User-Login` equal to the owner's and
+/// come from no other site's web page (403), and the hub must have room for it (503). `seat`
+/// gets the place it took.
 #[derive(Debug)]
-struct OwnerOnly<'a>(&'a str);
+struct Gate<'a> {
+    owner: &'a str,
+    room: &'a Arc<Room>,
+    seat: &'a mut Option<Seat>,
+}
 
-impl Callback for OwnerOnly<'_> {
+impl Callback for Gate<'_> {
     fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
-        let login = request
-            .headers()
+        let headers = request.headers();
+        let login = headers
             .get("Tailscale-User-Login")
             .and_then(|value| value.to_str().ok());
-        if login == Some(self.0) {
-            return Ok(response);
+        if login != Some(self.owner) || foreign_origin(headers) {
+            return Err(refusal(StatusCode::FORBIDDEN, "Forbidden"));
         }
-        let mut forbidden = ErrorResponse::new(Some("Forbidden".into()));
-        *forbidden.status_mut() = StatusCode::FORBIDDEN;
-        Err(forbidden)
+        let Some(seat) = self.room.seat() else {
+            return Err(refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many connections",
+            ));
+        };
+        *self.seat = Some(seat);
+        Ok(response)
+    }
+}
+
+/// A handshake refusal with `status`.
+fn refusal(status: StatusCode, text: &str) -> ErrorResponse {
+    let mut response = ErrorResponse::new(Some(text.to_owned()));
+    *response.status_mut() = status;
+    response
+}
+
+/// Whether a web page of another site may have opened this socket: an `Origin` is there and its
+/// host is neither the `Host` the request names nor the `X-Forwarded-Host` that `tailscale
+/// serve` adds. A browser sends `Origin` with every WebSocket and cannot set the others; the
+/// app's socket sends none, or the hub's own address.
+fn foreign_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get("Origin") else {
+        return false;
+    };
+    let Some(origin) = origin
+        .to_str()
+        .ok()
+        .and_then(|origin| origin.split_once("://"))
+        .map(|(_, authority)| host_of(authority))
+    else {
+        return true;
+    };
+    let named = |name: &str| {
+        let value = headers.get(name)?.to_str().ok()?;
+        Some(host_of(value.split(',').next().unwrap_or_default()))
+    };
+    ![named("Host"), named("X-Forwarded-Host")]
+        .into_iter()
+        .flatten()
+        .any(|host| !host.is_empty() && host.eq_ignore_ascii_case(origin))
+}
+
+/// The host of `authority` (`host`, `host:port` or `[v6]:port`), without its port.
+fn host_of(authority: &str) -> &str {
+    let authority = authority.trim();
+    match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
     }
 }
 
@@ -2110,6 +2263,53 @@ mod tests {
         assert_eq!(got, ["one", "two", "three"]);
         let kept: Vec<String> = std::iter::from_fn(|| slow_lines.try_recv().ok()).collect();
         assert_eq!(kept, ["one", "two"], "what it had is still there to read");
+    }
+
+    #[test]
+    fn an_origin_counts_as_foreign_unless_it_names_the_requests_host() {
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for &(name, value) in pairs {
+                map.insert(name, value.parse().unwrap());
+            }
+            map
+        };
+        let host = ("Host", "mac.tail1234.ts.net");
+        assert!(!foreign_origin(&headers(&[host])), "no Origin");
+        for same in [
+            "https://mac.tail1234.ts.net",
+            "https://MAC.tail1234.ts.net:443",
+        ] {
+            assert!(
+                !foreign_origin(&headers(&[host, ("Origin", same)])),
+                "{same}"
+            );
+        }
+        for other in ["https://evil.example", "null", "mac.tail1234.ts.net", ""] {
+            assert!(
+                foreign_origin(&headers(&[host, ("Origin", other)])),
+                "{other}"
+            );
+        }
+        let v6 = headers(&[("Host", "[::1]:47823"), ("Origin", "http://[::1]:47823")]);
+        assert!(!foreign_origin(&v6));
+        let no_host = headers(&[("Origin", "https://mac.tail1234.ts.net")]);
+        assert!(foreign_origin(&no_host));
+    }
+
+    #[test]
+    fn a_seat_is_given_back_and_the_waiting_room_is_capped() {
+        let room = Arc::new(Room::default());
+        let mut seats: Vec<Seat> = (0..MAX_WAITING).filter_map(|_| room.seat()).collect();
+        assert_eq!(seats.len(), MAX_WAITING);
+        assert!(room.seat().is_none(), "the waiting room is full");
+        seats[0].said_hello();
+        let another = room.seat().expect("one said hello");
+        assert_eq!(room.open.load(Ordering::Acquire), MAX_WAITING + 1);
+        drop(another);
+        drop(seats);
+        assert_eq!(room.open.load(Ordering::Acquire), 0);
+        assert_eq!(room.waiting.load(Ordering::Acquire), 0);
     }
 
     #[test]
