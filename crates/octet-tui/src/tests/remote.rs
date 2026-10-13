@@ -403,6 +403,65 @@ async fn slash_text_is_refused_for_prompts_and_steers() {
 }
 
 #[tokio::test]
+async fn a_path_like_prompt_is_sent_as_on_the_desk() {
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    // The desk sends these as prompts: no command name contains a slash, and the demo is text.
+    for text in ["/usr/lib is broken, fix it", octet_core::APPROVAL_DEMO] {
+        idle(&mut app);
+        let (result, _) = run(&mut app, &vendor, prompt(text)).await;
+        assert!(result.is_ok(), "{text:?}: {result:?}");
+        assert!(
+            matches!(vendor.sent.borrow().last(), Some(Command::Prompt(sent)) if sent == text),
+            "{text:?}"
+        );
+    }
+    let steer = BridgeCommand::Steer {
+        text: "/usr/lib is broken".into(),
+    };
+    let (result, _) = run(&mut app, &vendor, steer).await;
+    assert!(result.is_ok(), "{result:?}");
+    // What the desk runs as a command is still refused.
+    for text in [
+        "/model x",
+        "/model",
+        "/skills",
+        " /quit\n",
+        "/unknown thing",
+    ] {
+        let (result, _) = run(&mut app, &vendor, prompt(text)).await;
+        assert_eq!(
+            result,
+            Err("Slash commands run on the desk".into()),
+            "{text:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_claude_steer_queues_with_the_words_the_desk_uses() {
+    const QUEUED: &str = "Claude cannot steer a running turn; queued as a follow-up";
+    let config = Config::new(Engine::CLAUDE, "claude", "/tmp");
+    let steer = BridgeCommand::Steer {
+        text: "look at docs".into(),
+    };
+    let vendor = RecordingVendor::default();
+    let mut remote = App::new(&config, "journal".into());
+    remote.conn.start_turn();
+    let (result, action) = run(&mut remote, &vendor, steer).await;
+    assert_eq!(result, Ok(QUEUED.into()));
+    assert!(matches!(action, Action::Continue));
+    // The desk's `/steer` does the same: it queues, and says so in the same words.
+    let mut desk = App::new(&config, "journal".into());
+    desk.conn.start_turn();
+    commands::command(&mut desk, &vendor, "/steer look at docs").await;
+    assert_eq!(desk.status_line, QUEUED);
+    assert_eq!(desk.composer.queue.len(), remote.composer.queue.len());
+    assert!(vendor.sent.borrow().is_empty(), "nothing went to Claude");
+}
+
+#[tokio::test]
 async fn device_names_are_one_short_line_in_desk_notes() {
     let mut app = app();
     idle(&mut app);

@@ -285,11 +285,12 @@ fn desk_has_draft(app: &App) -> bool {
         || !composer.images.is_empty()
 }
 
-/// `text` is something to send as a prompt, not blank and not a slash command.
+/// `text` is something to send as a prompt: not blank, and not what the desk would run as a slash
+/// command.
 fn plain_text(text: &str) -> Result<(), String> {
     if text.trim().is_empty() {
         Err("Nothing to send".into())
-    } else if text.trim_start().starts_with('/') {
+    } else if crate::input::is_command_line(text.trim()) {
         Err("Slash commands run on the desk".into())
     } else {
         Ok(())

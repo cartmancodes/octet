@@ -602,6 +602,17 @@ async fn stop_key(app: &mut App, vendor: &dyn Vendor, stop: Stop) -> Action {
     refresh_completion(app);
     Action::Continue
 }
+/// Whether Enter runs `draft` (trimmed) as a slash command rather than sending it as a prompt.
+/// "/usr/lib is broken" is a prompt: no command name contains a slash. A phone's text is judged
+/// the same way.
+pub(crate) fn is_command_line(draft: &str) -> bool {
+    let path_like = draft
+        .split_whitespace()
+        .next()
+        .and_then(|first| first.strip_prefix('/'))
+        .is_some_and(|name| name.contains('/'));
+    draft.starts_with('/') && draft != octet_core::APPROVAL_DEMO && !path_like
+}
 /// Enter: runs a `!` line, a `/command`, or sends the draft as a prompt.
 async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
     let draft = app.composer.editor.text().trim().to_owned();
@@ -626,12 +637,6 @@ async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
         app.remember(draft);
         return Action::RunShell { command, attach };
     }
-    // "/usr/lib is broken" is a prompt: no command name contains a slash.
-    let path_like = draft
-        .split_whitespace()
-        .next()
-        .and_then(|first| first.strip_prefix('/'))
-        .is_some_and(|name| name.contains('/'));
     if draft == "/model" {
         // `/model` alone opens the picker.
         app.composer.editor.set("/model ".into());
@@ -644,7 +649,7 @@ async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
         refresh_skill_picker(app);
         return Action::Continue;
     }
-    if draft.starts_with('/') && draft != octet_core::APPROVAL_DEMO && !path_like {
+    if is_command_line(&draft) {
         return match try_command(app, vendor, &draft).await {
             Some(action) => {
                 app.composer.editor.take();
