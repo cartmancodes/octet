@@ -5,6 +5,8 @@ import { act, render, screen } from "@testing-library/react-native";
 import { Profiler, useCallback } from "react";
 import { View } from "react-native";
 
+import type { Entry } from "./model/transcript";
+
 import type { BatchItem } from "./client/HubClient";
 import { SessionCard } from "./components/SessionCard";
 import { TranscriptRow } from "./components/TranscriptRow";
@@ -15,6 +17,18 @@ import * as rowWords from "./session";
 
 const BATCHES = 10;
 const EVENTS = 100;
+/** A reply of this many paragraphs is 3 bytes each: well inside the limits on text. */
+const PARAGRAPHS = 16_000;
+const CHUNKS = 10;
+// About 3x the time beside the other suites, so the budgets hold under the whole run's load.
+/** 10 chunks: 6-7 ms alone, 14-27 ms beside the other suites (it was 2,446 ms: every chunk
+ * split and drew all 16,000 paragraphs). */
+const STREAM_BUDGET_MS = 100;
+/** One finished reply of 16,000 fences: 62-64 ms alone, 125-222 ms beside the other suites (it
+ * was 501-650 ms: one view per block). */
+const DONE_BUDGET_MS = 450;
+/** Text nodes one reply may draw, however long it is. */
+const MAX_TEXT_NODES = 1_000;
 
 const store = createOctetStore();
 const { useEntries, useSessions } = bindHooks(store);
@@ -58,6 +72,42 @@ function Cards() {
 }
 
 afterEach(() => jest.restoreAllMocks());
+
+/** A reply of `n` short paragraphs, streaming or done. */
+const reply = (n: number, done: boolean, extra = ""): Extract<Entry, { kind: "reply" }> => ({
+  kind: "reply",
+  key: "1",
+  text: Array.from({ length: n }, (_, i) => `p${i}`).join("\n\n") + extra,
+  done,
+});
+const toggle = () => undefined;
+
+describe("one long reply", () => {
+  it(`streams ${CHUNKS} chunks into a reply of ${PARAGRAPHS} paragraphs in under ${STREAM_BUDGET_MS} ms`, async () => {
+    let entry = reply(PARAGRAPHS, false);
+    const view = await render(<TranscriptRow entry={entry} open={false} onToggle={toggle} />);
+    const started = performance.now();
+    for (let i = 0; i < CHUNKS; i++) {
+      entry = { ...entry, text: `${entry.text} more${i}` };
+      await view.rerender(<TranscriptRow entry={entry} open={false} onToggle={toggle} />);
+    }
+    const took = performance.now() - started;
+    console.log(`render: ${CHUNKS} chunks into ${PARAGRAPHS} paragraphs took ${took.toFixed(0)} ms`);
+    expect(took).toBeLessThan(STREAM_BUDGET_MS);
+    // What is drawn is bounded too, whatever the reply's length.
+    expect(screen.container.queryAll((n) => n.type === "Text").length).toBeLessThan(MAX_TEXT_NODES);
+  }, 60_000); // a slow run fails on the budget, with its time, not on jest's timeout
+
+  it(`draws a finished reply of ${PARAGRAPHS} code fences in under ${DONE_BUDGET_MS} ms`, async () => {
+    const entry: Entry = { kind: "reply", key: "2", text: "```\n".repeat(PARAGRAPHS), done: true };
+    const started = performance.now();
+    await render(<TranscriptRow entry={entry} open={false} onToggle={toggle} />);
+    const took = performance.now() - started;
+    console.log(`render: a finished reply of ${PARAGRAPHS} fences took ${took.toFixed(0)} ms`);
+    expect(took).toBeLessThan(DONE_BUDGET_MS);
+    expect(screen.container.queryAll((n) => n.type === "Text").length).toBeLessThan(MAX_TEXT_NODES);
+  });
+});
 
 describe("render budgets", () => {
   it("streams 100 text events into session A: its transcript draws once per batch, B's not at all", async () => {

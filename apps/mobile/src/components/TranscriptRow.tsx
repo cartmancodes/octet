@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { StyleSheet, Text, View, type TextStyle } from "react-native";
+import { StyleSheet, Text, View } from "react-native";
 
 import { Markdown } from "../markdown/Markdown";
 import type { Entry } from "../model/transcript";
@@ -26,35 +26,16 @@ function makeStyles(theme: Theme) {
     text: { ...type.body, color: theme.fg },
     note: { ...type.body, color: theme.muted },
     error: { ...type.body, color: theme.amber },
-    paragraphs: { gap: type.body.lineHeight },
   });
 }
 const DARK = makeStyles(dark);
 const LIGHT = makeStyles(light);
 
-const Paragraph = memo(function Paragraph({ text, style }: { text: string; style: TextStyle }) {
-  return <Text style={style}>{text}</Text>;
-});
-
-/** A reply still streaming, as plain text in paragraphs: a chunk changes only the last one, so
- * only its text is laid out again, however long the reply has grown. */
-const Streaming = memo(function Streaming({ text, style, gap }: { text: string; style: TextStyle; gap: object }) {
-  const parts = text.split("\n\n");
-  if (parts.length === 1) return <Paragraph text={text} style={style} />;
-  return (
-    <View style={gap}>
-      {parts.map((part, i) => (
-        <Paragraph key={i} text={part} style={style} />
-      ))}
-    </View>
-  );
-});
-
 /**
  * One transcript entry, labelled as the terminal UI labels it (YOU, OCTET, NOTE, ERROR). A reply
- * still streaming is plain text, cheap to redraw on every chunk; once done it is Markdown.
- * Memoised on the entry, which the store replaces only when it changes: while a reply streams,
- * only its row draws again.
+ * is Markdown, streaming or done; a streaming one parses only what came since its last whole
+ * block, so a chunk costs the same however long the reply has grown. Memoised on the entry,
+ * which the store replaces only when it changes: while a reply streams, only its row draws again.
  */
 export const TranscriptRow = memo(function TranscriptRow({ entry, open, onToggle }: TranscriptRowProps) {
   const theme = useTheme();
@@ -70,10 +51,8 @@ export const TranscriptRow = memo(function TranscriptRow({ entry, open, onToggle
   return (
     <View style={s.row}>
       <Text style={[s.label, s[role.tone]]}>{role.label}</Text>
-      {entry.kind === "reply" && entry.done ? (
-        <Markdown text={entry.text} />
-      ) : entry.kind === "reply" ? (
-        <Streaming text={entry.text} style={s.text} gap={s.paragraphs} />
+      {entry.kind === "reply" ? (
+        <Markdown text={entry.text} streaming={!entry.done} />
       ) : (
         <Text style={entry.kind === "error" ? s.error : entry.kind === "note" ? s.note : s.text}>{entry.text}</Text>
       )}

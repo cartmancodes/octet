@@ -5,6 +5,25 @@ import { TranscriptRow } from "./TranscriptRow";
 
 const noop = () => undefined;
 
+describe("a reply row", () => {
+  const paragraphs = (n: number) => Array.from({ length: n }, (_, i) => `p${i}`).join("\n\n");
+
+  it("draws a streaming reply of 16,000 paragraphs as at most 400 blocks, and the rest line", async () => {
+    await render(<TranscriptRow entry={{ kind: "reply", key: "1", text: paragraphs(16_000), done: false }} open={false} onToggle={noop} />);
+    expect(screen.getByText("p399")).toBeTruthy();
+    expect(screen.queryByText("p400")).toBeNull();
+    expect(screen.getByText("Rest of the reply is on the Mac (15600 more blocks)")).toBeTruthy();
+    expect(screen.container.queryAll((n) => n.type === "Text").length).toBeLessThan(1_000);
+  });
+
+  it("draws a finished reply of 16,000 code fences as at most 400 blocks", async () => {
+    const text = "```\n".repeat(16_000);
+    await render(<TranscriptRow entry={{ kind: "reply", key: "1", text, done: true }} open={false} onToggle={noop} />);
+    expect(screen.getByText(/^Rest of the reply is on the Mac \(\d+ more blocks\)$/)).toBeTruthy();
+    expect(screen.container.queryAll((n) => n.type === "Text").length).toBeLessThan(1_000);
+  });
+});
+
 describe("a tools row", () => {
   const entry: Entry = {
     kind: "tools",

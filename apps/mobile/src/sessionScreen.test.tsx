@@ -12,7 +12,6 @@ import Sessions from "../app/index";
 import Session from "../app/session/[id]";
 import { FakeClock, Sockets } from "./client/fakes";
 import { HubContext, HubController, TOKEN_KEY } from "./hub";
-import * as parser from "./markdown/parse";
 import { saveSettings } from "./persist";
 import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol";
 import * as words from "./session";
@@ -198,17 +197,15 @@ describe("the Session screen", () => {
     });
   });
 
-  it("draws a reply as plain text while it streams, and as Markdown once done", async () => {
+  it("draws a reply as Markdown while it streams, and once done", async () => {
     const rig = await launch([info("a")]);
     await open(rig, "a");
-    const parse = jest.spyOn(parser, "parse");
     await feed(rig, subscribed(), ev({ type: "text", data: "Use **bold** and " }), ev({ type: "text", data: "`code`" }));
-    expect(screen.getByText("Use **bold** and `code`")).toBeTruthy();
-    expect(parse).not.toHaveBeenCalled();
-    await feed(rig, ev({ type: "finished", data: "" }));
     expect(screen.queryByText("Use **bold** and `code`")).toBeNull();
     expect(StyleSheet.flatten(screen.getByText("bold").props.style).fontWeight).toBe("700");
-    expect(parse).toHaveBeenCalled();
+    await feed(rig, ev({ type: "finished", data: "" }));
+    expect(StyleSheet.flatten(screen.getByText("bold").props.style).fontWeight).toBe("700");
+    expect(StyleSheet.flatten(screen.getByText("code").props.style).fontFamily).toBe("Menlo");
   });
 
   it("draws a streaming reply in paragraphs, so a chunk lays out only the last", async () => {

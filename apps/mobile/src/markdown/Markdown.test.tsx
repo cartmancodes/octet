@@ -64,6 +64,24 @@ describe("markdown_is_inert (drawn)", () => {
     expect(screen.queryByText(/\*\*/)).toBeNull();
   });
 
+  it("draws at most 400 blocks of a reply, and says the rest is on the Mac", async () => {
+    const text = Array.from({ length: 1_000 }, (_, i) => `para ${i}`).join("\n\n");
+    for (const streaming of [false, true]) {
+      await render(<Markdown text={text} streaming={streaming} />);
+      expect(screen.getByText("para 399")).toBeTruthy();
+      expect(screen.queryByText("para 400")).toBeNull();
+      expect(screen.getByText("Rest of the reply is on the Mac (600 more blocks)")).toBeTruthy();
+    }
+    await render(<Markdown text="short" />);
+    expect(screen.queryByText(/Rest of the reply/)).toBeNull();
+  });
+
+  it("draws a reply still streaming as Markdown too", async () => {
+    await render(<Markdown text={"Some **strong** words\n\n```sh\nmake"} streaming />);
+    expect(style(screen.getByText("strong")).fontWeight).toBe("700");
+    expect(style(screen.getByText("make")).fontFamily).toBe("Menlo");
+  });
+
   it("parses once per text, not once per render", async () => {
     const parse = jest.spyOn(parser, "parse");
     const view = await render(<Markdown text="**a**" />);

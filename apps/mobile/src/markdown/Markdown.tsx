@@ -4,7 +4,8 @@ import { memo, useMemo, type ReactNode } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
-import { parse, type Block, type Span } from "./parse";
+import { doneBlocks, streamBlocks } from "./blocks";
+import type { Block, Span } from "./parse";
 
 function makeStyles(theme: Theme) {
   return StyleSheet.create({
@@ -30,12 +31,16 @@ function makeStyles(theme: Theme) {
     itemText: { ...type.body, color: theme.fg, flex: 1 },
     quote: { borderLeftWidth: 3, borderLeftColor: theme.edge, paddingLeft: spacing.md },
     quoteText: { ...type.body, color: theme.muted },
+    rest: { ...type.caption, color: theme.muted },
   });
 }
 
 type Styles = ReturnType<typeof makeStyles>;
 const DARK = makeStyles(dark);
 const LIGHT = makeStyles(light);
+
+/** What a reply says in place of the blocks it does not draw. */
+export const restOfReply = (n: number): string => `Rest of the reply is on the Mac (${n} more blocks)`;
 
 /** The spans of a block as nested <Text>; a link's URL follows its text, muted. */
 function spans(list: readonly Span[], s: Styles): ReactNode[] {
@@ -92,37 +97,25 @@ const BlockView = memo(function BlockView({ block, s }: { block: Block; s: Style
   }
 });
 
-/** Recent texts' blocks: FlashList recycles a row's component for another reply as the list
- * scrolls, which would otherwise parse each reply again as it comes back into view. */
-const PARSED = new Map<string, Block[]>();
-const PARSED_KEPT = 64;
+/** The drawn blocks: the same array draws nothing again, so a chunk that only grows a reply's
+ * hidden tail redraws only the count. */
+const Blocks = memo(function Blocks({ blocks, s }: { blocks: Block[]; s: Styles }) {
+  return blocks.map((block, i) => <BlockView key={i} block={block} s={s} />);
+});
 
-function blocksOf(text: string): Block[] {
-  const hit = PARSED.get(text);
-  if (hit) {
-    PARSED.delete(text); // most recent last
-    PARSED.set(text, hit);
-    return hit;
-  }
-  const blocks = parse(text);
-  PARSED.set(text, blocks);
-  if (PARSED.size > PARSED_KEPT) {
-    const oldest = PARSED.keys().next().value;
-    if (oldest !== undefined) PARSED.delete(oldest);
-  }
-  return blocks;
-}
-
-/** A finished reply, drawn as the Markdown subset. Parsed once per text. */
-export const Markdown = memo(function Markdown({ text }: { text: string }) {
+/**
+ * A reply, drawn as the Markdown subset: at most `MAX_BLOCKS` blocks, then a line saying how
+ * many more are on the Mac. A finished reply is parsed once per text; one `streaming` parses only
+ * what came since its last whole block, so a chunk costs the same however long the reply is.
+ */
+export const Markdown = memo(function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
-  const blocks = useMemo(() => blocksOf(text), [text]);
+  const shown = useMemo(() => (streaming ? streamBlocks(text) : doneBlocks(text)), [text, streaming]);
   return (
     <View style={s.root}>
-      {blocks.map((block, i) => (
-        <BlockView key={i} block={block} s={s} />
-      ))}
+      <Blocks blocks={shown.blocks} s={s} />
+      {shown.more > 0 ? <Text style={s.rest}>{restOfReply(shown.more)}</Text> : null}
     </View>
   );
 });

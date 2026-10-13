@@ -201,15 +201,28 @@ workspace. Tick each one on each phone.
   true }}` (it opens at the end and keeps its place when rows change), and `scrollEventThrottle`
   32 for the follow-the-output logic.
 - Rows (`TranscriptRow`, `SessionCard`, `RecentRow`) are `React.memo` with stable callbacks and no
-  inline object or function props. A reply that is still streaming draws as plain paragraphs, so
-  a chunk lays out only the last one; Markdown is parsed once the reply is done.
+  inline object or function props.
+- A reply is Markdown, whether it is streaming or done. A streaming reply keeps the blocks before
+  its last whole one and parses only what came since, so a chunk costs the same however long the
+  reply is. A finished reply is parsed once per text, in a cache of at most 2 MB that unpairing
+  clears.
+- A reply draws at most 400 blocks, then "Rest of the reply is on the Mac (N more blocks)".
+- A tool call costs a fixed 256 bytes toward the memory limits, even when its strings are empty.
+  A tools entry holds 500 calls, then "N more calls on the Mac". An end finds its call by id.
 - The client delivers frames in one batch at most every 50 ms; the store applies a batch in one
   `set`, and every part a batch did not change keeps its identity, so a screen that selects
   narrowly does not draw for another session's output.
-- Budgets that tests hold: 20,000 text and 2,000 tool events through the reducer and store in
-  under 1.5 s with another session's view untouched (`src/perf.test.ts`), and 100 streamed text
-  events drawing a session's transcript at most one time per batch plus two, and never another
-  session's transcript or a card (`src/perf.render.test.tsx`).
+- Budgets that tests hold, each about 3 times what the work takes alongside the other suites:
+  - `src/perf.test.ts`:
+    - 20,000 text and 2,000 tool events through the reducer and store in under 500 ms, with
+      another session's view untouched;
+    - a hostile turn of 20,000 empty tool calls in under 300 ms, in bounded memory;
+    - a turn of 5,000 Read calls in under 100 ms.
+  - `src/perf.render.test.tsx`:
+    - 100 streamed text events draw a session's transcript at most once per batch plus two, and
+      never another session's transcript or a card;
+    - 10 chunks into a streaming reply of 16,000 paragraphs in under 100 ms;
+    - a finished reply of 16,000 code fences in under 450 ms, with fewer than 1,000 text nodes.
 
 ## Troubleshooting
 

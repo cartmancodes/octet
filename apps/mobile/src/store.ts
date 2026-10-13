@@ -16,6 +16,7 @@ import {
   type SessionView,
   type TurnEnd,
 } from "./model/session";
+import { clearParsed } from "./markdown/blocks";
 import type { Entry } from "./model/transcript";
 import { FIELD_CHARS, field } from "./model/text";
 import { isKnownEvent, type CatalogInfo, type SessionInfo } from "./protocol";
@@ -108,6 +109,7 @@ export function createOctetStore(): OctetStore {
     taskOpen: false,
 
     reset() {
+      clearParsed(); // what the old Mac's replies parsed to
       set({ sessions: [], bySession: new Map(), hub: "offline", listed: false, taskOpen: false });
     },
 
