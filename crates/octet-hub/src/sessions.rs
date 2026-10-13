@@ -16,7 +16,7 @@
 //! or delivered live, so nothing is lost and nothing repeats.
 use crate::tail::{Tail, event_of, file_name};
 use octet_core::remote::{
-    protocol::{BridgeCommand, MAX_MESSAGE, VERSION, bridge_command_json},
+    protocol::{BridgeCommand, MAX_BRIDGE_LINE, VERSION, bridge_command_json},
     run::Registration,
 };
 use serde_json::{Value, json};
@@ -47,8 +47,8 @@ const WRITE_STALL: Duration = Duration::from_secs(30);
 const LINK_QUEUE: usize = 64;
 /// Frames read from bridges and not yet taken by [`Sessions::next`].
 const INBOUND_QUEUE: usize = 256;
-/// The longest line read from a bridge: a whole message, some slack and the newline.
-const LINE_LIMIT: u64 = MAX_MESSAGE as u64 + 1024;
+/// The longest line read from a bridge: a whole line and its newline.
+const LINE_LIMIT: u64 = MAX_BRIDGE_LINE as u64 + 1;
 /// The largest registration file read.
 const REGISTRATION_LIMIT: u64 = 1024 * 1024;
 /// The longest `goal` in a `sessions` row, in characters.

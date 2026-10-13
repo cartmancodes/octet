@@ -836,14 +836,14 @@ pub(crate) fn compose(app: &App, draft: &str) -> Result<Prompt, String> {
         images: app.composer.images.clone(),
     })
 }
-/// Sends `draft` as a prompt, or queues it behind the running turn. Its
-/// attachments go with it, and it joins the history. False, with a notice,
-/// when it could not go.
 /// Sends or queues a remote `text` as a plain prompt, leaving the desk's own attachments, images
 /// and history alone; whether it was taken.
 pub(crate) fn send_remote_prompt(app: &mut App, vendor: &dyn Vendor, text: String) -> bool {
     can_take_a_turn(app) && send_or_queue(app, vendor, Prompt::plain(text))
 }
+/// Sends `draft` as a prompt, or queues it behind the running turn. Its
+/// attachments go with it, and it joins the history. False, with a notice,
+/// when it could not go.
 pub(crate) fn submit(app: &mut App, vendor: &dyn Vendor, draft: String) -> bool {
     if !can_take_a_turn(app) {
         return false;

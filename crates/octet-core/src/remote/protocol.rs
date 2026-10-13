@@ -8,6 +8,9 @@ use std::fmt::Write as _;
 pub const VERSION: u64 = 1;
 /// The most bytes one message may take (a 64 KiB prompt, JSON-escaped, with room).
 pub const MAX_MESSAGE: usize = 96 * 1024;
+/// The most bytes one hub → bridge line may take: a phone's largest message, re-wrapped with the
+/// device's name, fits with room.
+pub const MAX_BRIDGE_LINE: usize = MAX_MESSAGE + 1024;
 /// What a client must type to confirm `full-access`.
 pub const FULL_ACCESS_CONFIRM: &str = "full access";
 
@@ -647,15 +650,15 @@ fn check_fields(
     }
 }
 
-/// Parses and checks one inbound message of `direction`: its `req`, its definition and its object.
+/// Parses and checks one inbound message of `direction`, at most `limit` bytes: its `req`, its
+/// definition and its object.
 fn parse_message(
     text: &str,
     direction: Direction,
+    limit: usize,
 ) -> Result<(u64, &'static Message, Map<String, Value>), String> {
-    if text.len() > MAX_MESSAGE {
-        return Err(format!(
-            "Message too large; the limit is {MAX_MESSAGE} bytes"
-        ));
+    if text.len() > limit {
+        return Err(format!("Message too large; the limit is {limit} bytes"));
     }
     let value: Value = serde_json::from_str(text).map_err(|e| format!("Invalid JSON: {e}"))?;
     let Value::Object(map) = value else {
@@ -735,7 +738,7 @@ fn flag(map: &Map<String, Value>, key: &str) -> bool {
 /// The reason, in words for the phone: a message too large, not JSON, of another version, of an
 /// unknown type, or with a field missing, mistyped or unexpected.
 pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
-    let (req, message, map) = parse_message(text_in, FromPhone)?;
+    let (req, message, map) = parse_message(text_in, FromPhone, MAX_MESSAGE)?;
     let m = &map;
     let command = match message.kind {
         "hello" => PhoneCommand::Hello {
@@ -826,14 +829,15 @@ pub fn bridge_command_json(req: u64, by: &str, command: &BridgeCommand) -> Value
     line
 }
 
-/// Parses one hub → bridge line: `(req, device, command)`, or the reason it was refused.
+/// Parses one hub → bridge line of at most [`MAX_BRIDGE_LINE`] bytes: `(req, device, command)`,
+/// or the reason it was refused.
 ///
 /// # Errors
 ///
 /// The reason: a line too large, not JSON, of another version, of an unknown type, or with a
 /// field missing, mistyped or unexpected.
 pub fn parse_bridge_command(line: &str) -> Result<(u64, String, BridgeCommand), String> {
-    let (req, message, map) = parse_message(line, ToBridge)?;
+    let (req, message, map) = parse_message(line, ToBridge, MAX_BRIDGE_LINE)?;
     let m = &map;
     let command = match message.kind {
         "prompt" => BridgeCommand::Prompt {

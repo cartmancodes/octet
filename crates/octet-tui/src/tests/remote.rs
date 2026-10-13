@@ -18,7 +18,7 @@ async fn run(
         by: "iPhone 15".into(),
         command,
     };
-    crate::bridge::handle_remote(app, vendor, remote).await
+    crate::bridge::handle_remote(app, vendor, remote, false).await
 }
 
 fn prompt(text: &str) -> BridgeCommand {
@@ -238,6 +238,7 @@ async fn remote_actions_are_noted_on_the_desk() {
                 allow: true,
             },
         ),
+        false,
     )
     .await;
     assert!(
@@ -246,7 +247,7 @@ async fn remote_actions_are_noted_on_the_desk() {
         app.entries_text()
     );
     idle(&mut app);
-    crate::bridge::handle_remote(&mut app, &vendor, remote("Gemini 10", prompt("hi"))).await;
+    crate::bridge::handle_remote(&mut app, &vendor, remote("Gemini 10", prompt("hi")), false).await;
     assert!(
         app.entries_text().contains("Prompt from Gemini 10"),
         "{}",
@@ -256,6 +257,7 @@ async fn remote_actions_are_noted_on_the_desk() {
         &mut app,
         &vendor,
         remote("a\u{1b}[31mb", BridgeCommand::Cancel),
+        false,
     )
     .await;
     let text = app.entries_text();
@@ -336,7 +338,7 @@ async fn device_names_are_one_short_line_in_desk_notes() {
         command: BridgeCommand::Cancel,
     };
     app.conn.start_turn();
-    crate::bridge::handle_remote(&mut app, &vendor, remote("My\niPhone \n\n  15")).await;
+    crate::bridge::handle_remote(&mut app, &vendor, remote("My\niPhone \n\n  15"), false).await;
     assert!(
         app.entries_text().contains("Cancelled from My iPhone 15"),
         "{}",
@@ -344,7 +346,7 @@ async fn device_names_are_one_short_line_in_desk_notes() {
     );
     let mut app = super::app();
     app.conn.start_turn();
-    crate::bridge::handle_remote(&mut app, &vendor, remote(&"é".repeat(500))).await;
+    crate::bridge::handle_remote(&mut app, &vendor, remote(&"é".repeat(500)), false).await;
     let text = app.entries_text();
     let name = text.strip_prefix("Cancelled from ").expect(&text);
     assert_eq!(name.chars().count(), 40, "{name}");
@@ -363,4 +365,80 @@ async fn full_access_from_a_phone_leaves_a_warning_note() {
         "{}",
         app.entries_text()
     );
+}
+
+/// Runs `command` from "iPhone 15" while the desk's external editor has the terminal.
+async fn run_editing(
+    app: &mut App,
+    vendor: &RecordingVendor,
+    command: BridgeCommand,
+) -> (Result<String, String>, Action) {
+    let remote = Remote {
+        peer: 1,
+        req: 5,
+        by: "iPhone 15".into(),
+        command,
+    };
+    crate::bridge::handle_remote(app, vendor, remote, true).await
+}
+
+#[tokio::test]
+async fn the_desks_editor_or_bang_command_is_never_ended_from_a_phone() {
+    const EDITING: &str = "The desk is editing a prompt";
+    const SHELL: &str = "A ! command is running at the desk";
+    let listed = octet_core::ModelInfo {
+        selection: "opus".into(),
+        id: Some("opus".into()),
+        name: "opus".into(),
+        description: String::new(),
+    };
+    let select = || BridgeCommand::SetModel {
+        selection: "opus".into(),
+    };
+    let vendor = RecordingVendor::default();
+    let mut app = app();
+    idle(&mut app);
+    app.models
+        .catalogs
+        .set(Engine::CLAUDE, vec![listed], std::time::SystemTime::now());
+    for (command, wanted) in [
+        (BridgeCommand::End, EDITING),
+        (select(), EDITING),
+        (mode("full-access", Some("full access")), EDITING),
+    ] {
+        let (result, action) = run_editing(&mut app, &vendor, command).await;
+        assert_eq!(result, Err(wanted.into()));
+        assert!(matches!(action, Action::Continue));
+    }
+    app.shell = Some(crate::test_support::running_shell(false));
+    for command in [
+        BridgeCommand::End,
+        select(),
+        mode("full-access", Some("full access")),
+    ] {
+        let (result, action) = run(&mut app, &vendor, command).await;
+        assert_eq!(result, Err(SHELL.into()));
+        assert!(matches!(action, Action::Continue));
+    }
+    // What cannot end the session still works: a prompt, and a mode change without a reconnect.
+    let (result, _) = run_editing(&mut app, &vendor, prompt("from the phone")).await;
+    assert!(result.is_ok(), "{result:?}");
+    idle(&mut app);
+    let (result, action) = run(&mut app, &vendor, mode("auto", None)).await;
+    assert_eq!(result, Ok("Switching to auto".into()));
+    assert!(matches!(action, Action::Continue));
+    assert!(app.shell.is_some(), "the ! command runs on");
+}
+
+#[tokio::test]
+async fn a_remote_model_may_not_look_like_an_option() {
+    let mut app = app();
+    idle(&mut app);
+    let vendor = RecordingVendor::default();
+    let select = BridgeCommand::SetModel {
+        selection: "-x".into(),
+    };
+    let (result, action) = run(&mut app, &vendor, select).await;
+    assert_eq!(result, Err("Name one model, without spaces".into()));
+    assert!(matches!(action, Action::Continue));
 }

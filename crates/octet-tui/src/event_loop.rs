@@ -214,7 +214,8 @@ impl Loop<'_> {
             Wake::Shell(ran) => shell_finished(app, ran),
             Wake::Remote(remote) => {
                 let (peer, req) = (remote.peer, remote.req);
-                let (result, action) = handle_remote(app, &session.handle, remote).await;
+                let (result, action) =
+                    handle_remote(app, &session.handle, remote, self.editing.is_some()).await;
                 self.bridge.reply(peer, req, result);
                 if let Some(exit) = self.apply(action, app)? {
                     return Ok(Some(exit));

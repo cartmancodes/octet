@@ -12,7 +12,7 @@ use crate::{
     vendor::Vendor,
 };
 use octet_core::remote::{
-    protocol::{self, BridgeCommand, MAX_MESSAGE},
+    protocol::{self, BridgeCommand, MAX_BRIDGE_LINE, MAX_MESSAGE},
     run::{Registration, run_dir},
 };
 use octet_core::{Config, Mode};
@@ -38,8 +38,8 @@ const PEER_QUEUE: usize = 256;
 const COMMAND_QUEUE: usize = 64;
 /// How long one write to a hub may take before the hub is let go.
 const WRITE_STALL: Duration = Duration::from_secs(30);
-/// The most a reader takes for one line: a whole message, its newline, and one byte over.
-const LINE_LIMIT: u64 = MAX_MESSAGE as u64 + 2;
+/// The most a reader takes for one line: a whole line, its newline, and one byte over.
+const LINE_LIMIT: u64 = MAX_BRIDGE_LINE as u64 + 2;
 /// The longest an approval's command is in a `state` frame, in bytes.
 const COMMAND_BYTES: usize = 4096;
 /// The longest an approval's working directory is, in bytes.
@@ -54,6 +54,10 @@ const ACTION_BYTES: usize = 512;
 const DEVICE_NAME: usize = 40;
 /// The longest a queued prompt's first line is in a `state` frame, in characters.
 const QUEUE_LINE: usize = 200;
+/// The refusal of an end or reconnect while the desk's external editor is open.
+const DESK_EDITING: &str = "The desk is editing a prompt";
+/// The refusal of an end or reconnect while a `!` command runs at the desk.
+const DESK_SHELL: &str = "A ! command is running at the desk";
 
 /// A command from a hub, for the interface to run.
 #[derive(Debug)]
@@ -133,10 +137,10 @@ async fn read_peer(
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
-        if buffer.last() != Some(&b'\n') && buffer.len() > MAX_MESSAGE {
+        if buffer.last() != Some(&b'\n') && buffer.len() > MAX_BRIDGE_LINE {
             refuse(
                 0,
-                &format!("Message too large; the limit is {MAX_MESSAGE} bytes"),
+                &format!("Message too large; the limit is {MAX_BRIDGE_LINE} bytes"),
             );
             return;
         }
@@ -194,14 +198,24 @@ async fn accept(
 }
 
 /// Runs one remote command as the matching key or slash command would; the reply's text, or the
-/// refusal, and what the interface then does.
+/// refusal, and what the interface then does. `editing` says the desk's external editor has the
+/// terminal.
 pub(crate) async fn handle_remote(
     app: &mut App,
     vendor: &dyn Vendor,
     remote: Remote,
+    editing: bool,
 ) -> (Result<String, String>, Action) {
     let mut action = Action::Continue;
-    let done = run_remote(app, vendor, remote.command, &mut action).await;
+    // Ending or reconnecting would kill the editor or the `!` command, and lose its work.
+    let desk = if editing {
+        Some(DESK_EDITING)
+    } else if app.shell.is_some() {
+        Some(DESK_SHELL)
+    } else {
+        None
+    };
+    let done = run_remote(app, vendor, remote.command, desk, &mut action).await;
     match done {
         Ok((what, reply)) => {
             let by = device_name(&remote.by);
@@ -245,10 +259,12 @@ fn device_name(name: &str) -> String {
 }
 
 /// What a remote command did: `(what the desk note says, the reply)`, or why it was refused.
+/// `desk` is why the desk cannot be ended or reconnected now, if it cannot.
 async fn run_remote(
     app: &mut App,
     vendor: &dyn Vendor,
     command: BridgeCommand,
+    desk: Option<&'static str>,
     action: &mut Action,
 ) -> Result<(String, String), String> {
     match command {
@@ -286,62 +302,92 @@ async fn run_remote(
             Ok(("Steer".into(), reply))
         }
         BridgeCommand::SetMode { mode, confirm } => {
-            let Some(target) = Mode::parse(&mode) else {
-                let shown: String = mode.chars().take(40).collect();
-                return Err(format!(
-                    "Unknown mode {}. Use ask, accept-edits, auto or full-access.",
-                    crate::text::clean(&shown)
-                ));
-            };
-            if !protocol::full_access_confirmed(target.label(), confirm.as_deref()) {
-                return Err(format!(
-                    "Full access needs confirm: \"{}\"",
-                    protocol::FULL_ACCESS_CONFIRM
-                ));
-            }
-            let was_pending = app.conn.mode_pending.is_some();
-            *action = mode_command(app, vendor, target.label());
-            let label = target.label();
-            let reply = match action {
-                Action::Exit(_) => format!("Reconnecting in {label}"),
-                _ if !was_pending && app.conn.mode_pending.is_some() => {
-                    format!("Switching to {label}")
-                }
-                _ => return Err(app.status_line.clone()),
-            };
-            let what = if target == Mode::FullAccess {
-                "⚠ Full access".into()
-            } else {
-                format!("Mode {label}")
-            };
-            Ok((what, reply))
+            remote_mode(app, vendor, &mode, confirm.as_deref(), desk, action)
         }
-        BridgeCommand::SetModel { selection } => {
-            let one_token = !selection.is_empty()
-                && !selection
-                    .chars()
-                    .any(|c| c.is_whitespace() || c.is_control());
-            // `list` and `refresh` are the desk's own picker commands, not models.
-            if !one_token || matches!(selection.as_str(), "list" | "refresh") {
-                return Err("Name one model, without spaces".into());
-            }
-            *action = model_command(app, &selection);
-            if matches!(action, Action::Exit(_)) {
-                Ok((
-                    format!("Model {selection}"),
-                    format!("Reconnecting with {selection}"),
-                ))
-            } else {
-                Err(app.status_line.clone())
-            }
-        }
+        BridgeCommand::SetModel { selection } => remote_model(app, &selection, desk, action),
         BridgeCommand::End => {
+            if let Some(busy) = desk {
+                return Err(busy.into());
+            }
             if app.turn_open() {
                 return Err(TURN_OPEN.into());
             }
             *action = Action::Exit(Exit::Quit);
             Ok(("Ended".into(), "Ending".into()))
         }
+    }
+}
+
+/// A remote `set_mode`, as `/mode` runs it; `desk` refuses one that would reconnect.
+fn remote_mode(
+    app: &mut App,
+    vendor: &dyn Vendor,
+    mode: &str,
+    confirm: Option<&str>,
+    desk: Option<&'static str>,
+    action: &mut Action,
+) -> Result<(String, String), String> {
+    let Some(target) = Mode::parse(mode) else {
+        let shown: String = mode.chars().take(40).collect();
+        return Err(format!(
+            "Unknown mode {}. Use ask, accept-edits, auto or full-access.",
+            crate::text::clean(&shown)
+        ));
+    };
+    if !protocol::full_access_confirmed(target.label(), confirm) {
+        return Err(format!(
+            "Full access needs confirm: \"{}\"",
+            protocol::FULL_ACCESS_CONFIRM
+        ));
+    }
+    let was_pending = app.conn.mode_pending.is_some();
+    *action = mode_command(app, vendor, target.label());
+    let label = target.label();
+    let reply = match action {
+        // The reconnect has not begun: nothing was changed on the way to it.
+        Action::Exit(_) if let Some(busy) = desk => {
+            *action = Action::Continue;
+            return Err(busy.into());
+        }
+        Action::Exit(_) => format!("Reconnecting in {label}"),
+        _ if !was_pending && app.conn.mode_pending.is_some() => format!("Switching to {label}"),
+        _ => return Err(app.status_line.clone()),
+    };
+    let what = if target == Mode::FullAccess {
+        "⚠ Full access".into()
+    } else {
+        format!("Mode {label}")
+    };
+    Ok((what, reply))
+}
+
+/// A remote `set_model`, as `/model NAME` runs it; `desk` refuses it, since it always reconnects.
+fn remote_model(
+    app: &mut App,
+    selection: &str,
+    desk: Option<&'static str>,
+    action: &mut Action,
+) -> Result<(String, String), String> {
+    let one_token = !selection.is_empty()
+        && !selection.starts_with('-')
+        && !selection
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control());
+    // `list` and `refresh` are the desk's own picker commands, not models.
+    if !one_token || matches!(selection, "list" | "refresh") {
+        return Err("Name one model, without spaces".into());
+    }
+    if let Some(busy) = desk {
+        return Err(busy.into());
+    }
+    *action = model_command(app, selection);
+    if matches!(action, Action::Exit(_)) {
+        Ok((
+            format!("Model {selection}"),
+            format!("Reconnecting with {selection}"),
+        ))
+    } else {
+        Err(app.status_line.clone())
     }
 }
 
@@ -1023,6 +1069,34 @@ mod tests {
             (worse["type"].as_str(), worse["req"].as_u64()),
             (Some("refused"), Some(0))
         );
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_command_a_little_over_a_phone_message_still_arrives() {
+        let temp = octet_testkit::TempDir::new("octet-bridge-slack");
+        let dir = temp.path().to_path_buf();
+        let mut bridge = Bridge::start(&dir, true, false).await;
+        let (app, config) = demo();
+        bridge.connected(&app, &config, &dir.join("j.jsonl")).await;
+        let regs = registrations(&run_dir(&dir)).await;
+        let (mut lines, mut write) = connect(&regs[0].socket).await;
+        let _ = first_line(&mut bridge, &app, &mut lines).await;
+        let _ = next_line(&mut lines).await;
+        // The hub wraps a phone's largest prompt with the device's name: a little over the limit.
+        let command = protocol::BridgeCommand::Prompt {
+            text: "x".repeat(MAX_MESSAGE),
+        };
+        let line = format!(
+            "{}\n",
+            protocol::bridge_command_json(3, "A phone", &command)
+        );
+        assert!(line.len() > MAX_MESSAGE + 2);
+        write.write_all(line.as_bytes()).await.unwrap();
+        let remote = timeout(Duration::from_secs(2), bridge.next_command())
+            .await
+            .expect("the command arrives");
+        assert_eq!(remote.command, command);
         bridge.stop().await;
     }
 
