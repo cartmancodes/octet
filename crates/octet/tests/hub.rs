@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::{
     fs::File,
     future::Future,
-    io::Read,
+    io::{Read, Write as _},
     os::{
         fd::FromRawFd,
         unix::{fs::PermissionsExt, process::CommandExt},
@@ -49,8 +49,9 @@ struct World {
     tui: Child,
     /// Everything the interface has written to its terminal so far.
     screen: Arc<Mutex<Vec<u8>>>,
-    /// The terminal's far end, kept open so the interface's reads and writes work.
-    _master: File,
+    /// The terminal's far end: what the desk types goes in here.
+    master: File,
+    /// Kept open so the interface's reads and writes work.
     _slave: File,
 }
 
@@ -108,7 +109,7 @@ impl World {
             hub,
             tui,
             screen,
-            _master: master,
+            master,
             _slave: slave,
         };
         world.hub_answers().await;
@@ -305,6 +306,36 @@ impl World {
         paired["token"].as_str().expect("a token").to_owned()
     }
 
+    /// Types `keys` at the desk.
+    fn type_keys(&self, keys: &[u8]) {
+        (&self.master).write_all(keys).expect("the desk types");
+    }
+
+    /// The `seq` of every record of each journal in the data directory, by file name.
+    fn journal_seqs(&self) -> Vec<(String, Vec<u64>)> {
+        let mut journals: Vec<(String, Vec<u64>)> = std::fs::read_dir(&self.dir)
+            .expect("the data directory")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension().is_none_or(|e| e != "jsonl") {
+                    return None;
+                }
+                let name = path.file_name()?.to_str()?.to_owned();
+                if !name.starts_with("session-") {
+                    return None;
+                }
+                let text = std::fs::read_to_string(&path).ok()?;
+                let seqs = text
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok()?["seq"].as_u64())
+                    .collect();
+                Some((name, seqs))
+            })
+            .collect();
+        journals.sort();
+        journals
+    }
+
     /// Waits for the interface process to exit.
     async fn interface_exits(&mut self) {
         let limit = tokio::time::Instant::now() + WAIT;
@@ -367,6 +398,23 @@ impl Events {
     /// The position of the first event of `kind`.
     fn index(&self, kind: &str) -> Option<usize> {
         self.kinds.iter().position(|(k, _)| k == kind)
+    }
+
+    /// The `seq` of every event of `journal`, in arrival order.
+    fn seqs(&self, journal: &str) -> Vec<u64> {
+        self.cursors
+            .iter()
+            .filter(|(j, _)| j == journal)
+            .map(|(_, seq)| *seq)
+            .collect()
+    }
+
+    /// Whether an event of `kind` from `journal` arrived.
+    fn has(&self, journal: &str, kind: &str) -> bool {
+        self.cursors
+            .iter()
+            .zip(&self.kinds)
+            .any(|((j, _), (k, _))| j == journal && k == kind)
     }
 }
 
@@ -538,6 +586,35 @@ impl<'a> Drive<'a> {
             .await;
     }
 
+    /// Frames until `done` holds for what has been seen.
+    async fn until_seen(&mut self, done: impl Fn(&Events) -> bool) {
+        let (world, seen) = (self.world, &mut self.seen);
+        while !done(seen) {
+            let frame = world.recv(&mut self.phone).await;
+            seen.note(&frame);
+        }
+    }
+
+    /// Frames, each noted, until none arrives for a moment (for at most [`WAIT`]).
+    async fn settle(&mut self) {
+        let limit = tokio::time::Instant::now() + WAIT;
+        loop {
+            let next = timeout(Duration::from_millis(700), self.world.recv(&mut self.phone)).await;
+            let Ok(frame) = next else { return };
+            self.seen.note(&frame);
+            assert!(
+                tokio::time::Instant::now() < limit,
+                "frames kept arriving\n{}",
+                self.world.evidence()
+            );
+        }
+    }
+
+    /// Waits until the session is connected, as the journal's `ready` record shows.
+    async fn ready(&mut self) {
+        self.until_seen(|seen| seen.index("ready").is_some()).await;
+    }
+
     /// Drops the connection and says hello again with the same token.
     async fn reconnect(&mut self) {
         let (phone, _) = self.world.hello(&self.token).await;
@@ -553,6 +630,7 @@ async fn a_phone_drives_a_live_interface_through_the_hub() {
     // Subscribing from the start replays the journal and ends with an ack.
     phone.command(3, "subscribe", json!({"after": null})).await;
     assert_eq!(phone.reply(3).await["type"], "ack");
+    phone.ready().await;
 
     // A prompt that makes the fake Codex ask for approval; allowing it ends the turn.
     phone
@@ -623,4 +701,60 @@ async fn a_phone_drives_a_live_interface_through_the_hub() {
             }
         })
         .await;
+}
+
+#[tokio::test]
+async fn a_model_switch_continues_the_phones_stream_into_the_next_journal() {
+    let world = World::start().await;
+    let mut phone = Drive::start(&world).await;
+    phone.command(3, "subscribe", json!({"after": null})).await;
+    assert_eq!(phone.reply(3).await["type"], "ack");
+    // A switch needs a connected session.
+    phone.ready().await;
+    let first = phone.seen.cursors[0].0.clone();
+
+    phone
+        .command(4, "set_model", json!({"selection": "picker-other"}))
+        .await;
+    let ack = phone.reply(4).await;
+    assert_eq!(ack["message"], "Reconnecting with picker-other", "{ack}");
+    // The interface reconnects into a new journal: its events follow on the same stream, and
+    // the old session's stop record still arrives.
+    phone
+        .until_seen(|seen| {
+            let next = seen.cursors.iter().find(|(j, _)| *j != first);
+            next.is_some_and(|(j, _)| seen.has(j, "ready")) && seen.has(&first, "stopped")
+        })
+        .await;
+    phone.settle().await;
+    // Every record of both journals arrived once and in order: no gap, no repeat.
+    let on_disk = world.journal_seqs();
+    assert_eq!(on_disk.len(), 2, "{on_disk:?}");
+    for (journal, seqs) in &on_disk {
+        assert_eq!(&phone.seen.seqs(journal), seqs, "{journal}");
+        assert!(
+            seqs.iter().copied().eq(0..seqs.len() as u64),
+            "{journal}: {seqs:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_approval_answered_at_the_desk_closes_on_the_phone() {
+    let world = World::start().await;
+    let mut phone = Drive::start(&world).await;
+    phone.command(3, "subscribe", json!({"after": null})).await;
+    assert_eq!(phone.reply(3).await["type"], "ack");
+    phone.ready().await;
+    phone
+        .command(4, "prompt", json!({"text": "approval"}))
+        .await;
+    let approval = phone.event("approval").await;
+    let id = approval["event"]["data"]["id"].clone();
+    // The desk's answer keys arm 400 ms after the approval shows.
+    sleep(Duration::from_millis(800)).await;
+    world.type_keys(b"A");
+    let closed = phone.event("approval_closed").await;
+    assert_eq!(closed["event"]["data"], id, "{closed}");
+    phone.event("finished").await;
 }
