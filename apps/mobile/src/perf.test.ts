@@ -11,18 +11,19 @@ const TEXT_EVENTS = 20_000;
 const TOOL_EVENTS = 2_000;
 /** The client delivers at most one batch per 50 ms; a busy one holds a few dozen frames. */
 const BATCH = 50;
-/** About 14 ms alone and 60-110 ms beside the other suites, on a Mac. */
-const BUDGET_MS = 500;
-// The tool-call budgets are totals about 3x the time beside the other suites, so they hold under
-// the load of the whole run. The worst batch is logged, not held: there one garbage collection
-// is most of the number. Before calls had a fixed cost, a cap per entry and a lookup by id, a
-// turn's batches grew dearer with every call, and both totals failed.
+// Times on a Mac: alone, beside the other suites, and beside them on a busy machine. Budgets
+// leave room for the last (a CI runner is no faster) and still fail what the code did before.
+/** 12-14 ms alone, 60-115 ms beside the other suites, 319 ms on a busy machine. */
+const BUDGET_MS = 1_000;
+// The tool-call budgets are totals. The worst batch is logged, not held: there one garbage
+// collection is most of the number. Before calls had a fixed cost, a cap per entry and a lookup
+// by id, a turn's batches grew dearer with every call, and both totals failed.
 /** A hostile hub's turn: calls with no name, target or detail, which once cost nothing. Now
- * 15-24 ms alone and about 100 ms beside the other suites (it was 2,009 ms alone). */
+ * 14-24 ms alone, 73-113 ms beside the other suites, 152 ms busy (it was 1,885-2,009 ms alone). */
 const HOSTILE_CALLS = 20_000;
-const HOSTILE_BUDGET_MS = 300;
-/** A real long turn: an agent reading file after file with no text between. Now 4-11 ms alone and
- * about 25 ms beside the other suites (it was 178 ms alone). */
+const HOSTILE_BUDGET_MS = 600;
+/** A real long turn: an agent reading file after file with no text between. Now 4-11 ms alone,
+ * 12-33 ms beside the other suites (it was 178-180 ms alone). */
 const READ_CALLS = 5_000;
 const READ_BUDGET_MS = 100;
 

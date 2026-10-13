@@ -20,13 +20,15 @@ const EVENTS = 100;
 /** A reply of this many paragraphs is 3 bytes each: well inside the limits on text. */
 const PARAGRAPHS = 16_000;
 const CHUNKS = 10;
-// About 3x the time beside the other suites, so the budgets hold under the whole run's load.
-/** 10 chunks: 6-7 ms alone, 14-27 ms beside the other suites (it was 2,446 ms: every chunk
- * split and drew all 16,000 paragraphs). */
-const STREAM_BUDGET_MS = 100;
+// Times on a Mac: alone, beside the other suites, and on a busy machine. Budgets leave room
+// for the last and still fail what the code did before.
+/** 10 chunks: 6-7 ms alone, 14-32 ms beside the other suites, 131 ms busy (it was 2,446 ms:
+ * every chunk split and drew all 16,000 paragraphs). */
+const STREAM_BUDGET_MS = 500;
 /** One finished reply of 16,000 fences: 62-64 ms alone, 125-222 ms beside the other suites (it
- * was 501-650 ms: one view per block). */
-const DONE_BUDGET_MS = 450;
+ * was 501-650 ms alone). The time is a guard; what failed before is the count of text nodes:
+ * one view per block, 16,000 of them. */
+const DONE_BUDGET_MS = 1_000;
 /** Text nodes one reply may draw, however long it is. */
 const MAX_TEXT_NODES = 1_000;
 

@@ -212,17 +212,17 @@ workspace. Tick each one on each phone.
 - The client delivers frames in one batch at most every 50 ms; the store applies a batch in one
   `set`, and every part a batch did not change keeps its identity, so a screen that selects
   narrowly does not draw for another session's output.
-- Budgets that tests hold, each about 3 times what the work takes alongside the other suites:
+- Budgets that tests hold, with room for a busy machine:
   - `src/perf.test.ts`:
-    - 20,000 text and 2,000 tool events through the reducer and store in under 500 ms, with
+    - 20,000 text and 2,000 tool events through the reducer and store in under 1 s, with
       another session's view untouched;
-    - a hostile turn of 20,000 empty tool calls in under 300 ms, in bounded memory;
+    - a hostile turn of 20,000 empty tool calls in under 600 ms, in bounded memory;
     - a turn of 5,000 Read calls in under 100 ms.
   - `src/perf.render.test.tsx`:
     - 100 streamed text events draw a session's transcript at most once per batch plus two, and
       never another session's transcript or a card;
-    - 10 chunks into a streaming reply of 16,000 paragraphs in under 100 ms;
-    - a finished reply of 16,000 code fences in under 450 ms, with fewer than 1,000 text nodes.
+    - 10 chunks into a streaming reply of 16,000 paragraphs in under 500 ms;
+    - a finished reply of 16,000 code fences with fewer than 1,000 text nodes.
 
 ## Troubleshooting
 
