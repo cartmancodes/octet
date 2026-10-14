@@ -8,6 +8,7 @@ import { AppState, View } from "react-native";
 import { useHubController, useHubSnapshot } from "../src/hub";
 import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
 import { useTheme } from "../src/theme";
+import { ToastHost } from "../src/ui";
 
 // The native splash stays up until the app knows whether it is paired; app.json paints it in the
 // theme's colours, so there is no flash between it and the first screen.
@@ -95,7 +96,7 @@ export default function RootLayout() {
         }}
       >
         <Stack.Protected guard={paired && !offer}>
-          <Stack.Screen name="index" options={{ title: "Sessions" }} />
+          <Stack.Screen name="index" options={{ title: "Inbox", headerShown: false }} />
           <Stack.Screen name="session/[id]" options={{ title: "Session" }} />
           <Stack.Screen name="recent" options={{ title: "Recent and new" }} />
           <Stack.Screen name="settings" options={{ title: "Settings" }} />
@@ -104,6 +105,7 @@ export default function RootLayout() {
           <Stack.Screen name="pair" options={{ title: "Pair", headerShown: false }} />
         </Stack.Protected>
       </Stack>
+      <ToastHost />
     </>
   );
 }

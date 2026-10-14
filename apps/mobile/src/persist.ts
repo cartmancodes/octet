@@ -12,9 +12,14 @@ export interface Settings {
   hubUrl: string | null;
   /** Push notifications are on: the Mac has this phone's token. Off unless the user turned it on. */
   notifications: boolean;
+  /** The transcript's text size in points, which `Aa` cycles. */
+  textSize: TextSize;
 }
 
-export const DEFAULT_SETTINGS: Settings = { deviceName: null, faceId: true, hubUrl: null, notifications: false };
+export const TEXT_SIZES = [12, 13, 14] as const;
+export type TextSize = (typeof TEXT_SIZES)[number];
+
+export const DEFAULT_SETTINGS: Settings = { deviceName: null, faceId: true, hubUrl: null, notifications: false, textSize: 13 };
 export const SETTINGS_KEY = "octet.settings.v1";
 /** What to tell the user when a settings write failed. */
 export const NOT_SAVED = "Couldn't save that setting";
@@ -24,6 +29,7 @@ const MAX_CHARS = 2_048;
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 const text = (x: unknown): string | null => (typeof x === "string" && x.length <= MAX_CHARS ? x : null);
+const textSize = (x: unknown): TextSize => (TEXT_SIZES as readonly unknown[]).includes(x) ? (x as TextSize) : DEFAULT_SETTINGS.textSize;
 
 /** The saved settings; each field that is missing or not the right type is its default. None
  * saved, or garbage saved, is the defaults: a save then writes over it. `ok: false` only when
@@ -46,6 +52,7 @@ export async function readSettings(): Promise<{ ok: true; settings: Settings } |
         faceId: typeof value.faceId === "boolean" ? value.faceId : DEFAULT_SETTINGS.faceId,
         hubUrl: text(value.hubUrl),
         notifications: typeof value.notifications === "boolean" ? value.notifications : DEFAULT_SETTINGS.notifications,
+        textSize: textSize(value.textSize),
       },
     };
   } catch {
@@ -82,6 +89,7 @@ async function write(patch: Partial<Settings>): Promise<boolean> {
         faceId: next.faceId,
         hubUrl: next.hubUrl,
         notifications: next.notifications,
+        textSize: next.textSize,
       }),
     );
     return true;

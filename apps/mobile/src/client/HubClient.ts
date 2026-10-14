@@ -137,7 +137,8 @@ const isUnpaired = (code: RefusalCode | null | undefined): boolean =>
  * caller's request rides on them.
  */
 export class HubClient {
-  private readonly url: string;
+  /** The hub's address, wss://... */
+  readonly url: string;
   private tokenValue: string | null;
   private readonly factory: SocketFactory;
   private readonly now: () => number;

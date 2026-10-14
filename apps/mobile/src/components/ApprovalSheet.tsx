@@ -1,26 +1,19 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AccessibilityInfo, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
-import { confirmBiometric } from "../auth";
-import { successTap } from "../haptics";
+import { useApprovalAnswer } from "../approvals";
 import { Mascot } from "../mascot/Mascot";
 import { poseFor } from "../mascot/state";
 import { foldCommand } from "../model/command";
 import type { PendingApproval } from "../model/session";
-import { loadSettings } from "../persist";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
-import { failure, useAlive, type Send } from "./send";
+import type { Send } from "./send";
 
-/** Allow and Deny stay dead this long after a request comes to the front: a tap meant for the one
- * before (or a thumb already on its way) must not answer the next. */
-export const ARM_MS = 400;
+export { ARM_MS, NO_FACE_ID } from "../approvals";
 /** Files listed before "+N more". */
 export const FILES_SHOWN = 5;
-export const NO_FACE_ID = "Face ID isn't set up on this phone. Turn it off in Settings to allow from here.";
 /** What VoiceOver says when a request comes to the front. */
 export const ANNOUNCED = "Approval waiting";
-/** The system prompt's sentence is short; the action can be long. */
-const REASON_CHARS = 80;
 /** Said when the command or the request is not whole on the phone: Allow runs the Mac's. */
 export const SHORTENED = "Shortened — the full command is on the Mac. Check the desk before allowing.";
 /** A command longer than this many lines says how many it has. */
@@ -156,74 +149,17 @@ interface RequestProps {
 function Request({ session, approval, more, send, offline, covered, isOpen, onAnswered }: RequestProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
-  const alive = useAlive();
-  const [armed, setArmed] = useState(false);
   const [full, setFull] = useState(false);
-  // "checking": the biometric prompt is up. "sending": the answer is out, waiting for its ack.
-  const [stage, setStage] = useState<"checking" | "sending" | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const out = useRef(false);
-  // For an answer that awaited Face ID: the link may have gone down meanwhile. A layout effect,
-  // like `open` above, so the commit that takes the link away is seen at once.
-  const down = useRef(offline);
-  useLayoutEffect(() => {
-    down.current = offline;
-  });
-
-  // The delay counts from when the request can be seen and answered: its arrival, the link
-  // coming back, or the sheet over it closing. Hidden or offline, it is dead.
-  const reachable = !offline && !covered;
-  if (!reachable && armed) setArmed(false);
-  useEffect(() => {
-    if (!reachable) return;
-    const timer = setTimeout(() => setArmed(true), ARM_MS);
-    return () => clearTimeout(timer);
-  }, [reachable]);
-
-  const { summary, detail, id } = approval;
-  const answer = useCallback(
-    async (allow: boolean) => {
-      if (out.current || !armed || down.current) return;
-      out.current = true;
-      setError(null);
-      setStage("checking");
-      try {
-        if (allow) {
-          // Read now, not at mount: a change in Settings counts at once.
-          const { faceId } = await loadSettings();
-          if (faceId) {
-            const reason = `Allow: ${summary.action.slice(0, REASON_CHARS)}`;
-            const checked = await confirmBiometric(reason);
-            if (checked === "unavailable") {
-              if (alive()) setError(NO_FACE_ID);
-              return;
-            }
-            if (checked === "failed") return; // cancelled or no match: nothing is sent
-          }
-        }
-        // Face ID takes a while: send only if this request is still on screen, still open, and so
-        // still the one the user looked at (the screen takes the sheet away once the session ends),
-        // and the Mac can still be reached.
-        if (!alive() || !isOpen(id) || down.current) return;
-        setStage("sending");
-        await send({ type: "answer", session, approval: id, allow });
-        if (allow) successTap();
-        onAnswered(id);
-      } catch (e) {
-        if (alive()) setError(failure(e).text);
-      } finally {
-        out.current = false;
-        if (alive()) setStage(null);
-      }
-    },
-    [armed, summary.action, session, id, send, isOpen, onAnswered, alive],
-  );
-  const allow = useCallback(() => void answer(true), [answer]);
-  const deny = useCallback(() => void answer(false), [answer]);
+  // The arm, Face ID, and the checks after it: the same for every surface that answers.
+  const answer = useApprovalAnswer(session, approval, { send, offline, covered, isOpen, onAnswered });
+  const { allow: allowNow, deny: denyNow } = answer;
+  const allow = useCallback(() => void allowNow(), [allowNow]);
+  const deny = useCallback(() => void denyNow(), [denyNow]);
   const toggle = useCallback(() => setFull((open) => !open), []);
 
-  const busy = stage !== null;
-  const canAnswer = armed && !busy && reachable;
+  const { summary, detail } = approval;
+  const { busy, canAnswer } = answer;
+  const error = answer.failure;
   const files = summary.files.slice(0, FILES_SHOWN);
   const rest = summary.files.length - files.length;
   const command = summary.command ? foldCommand(summary.command) : null;
@@ -262,7 +198,7 @@ function Request({ session, approval, more, send, offline, covered, isOpen, onAn
           <Text style={s.toggleText}>{full ? "Hide full request" : "Show full request"}</Text>
         </Pressable>
       ) : null}
-      {stage === "sending" ? <Text style={s.status}>Sending…</Text> : null}
+      {answer.sending ? <Text style={s.status}>Sending…</Text> : null}
       {error ? <Text style={s.error}>{error}</Text> : null}
       <View style={s.buttons}>
         <Pressable

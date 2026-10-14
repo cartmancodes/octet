@@ -2,17 +2,18 @@
 // batch, and nothing of another session. The harness is the hooks and memoised components the
 // Session and Sessions screens use, without the router, so the count is the app's own.
 import { act, render, screen } from "@testing-library/react-native";
-import { Profiler, useCallback } from "react";
+import { Profiler, useCallback, useMemo, useState } from "react";
 import { View } from "react-native";
 
 import type { Entry } from "./model/transcript";
 
 import type { BatchItem } from "./client/HubClient";
-import { SessionCard } from "./components/SessionCard";
+import { createAnswerLedger } from "./approvals";
+import { InboxCard } from "./components/InboxCard";
 import { TranscriptRow } from "./components/TranscriptRow";
+import * as cardWords from "./inbox";
 import { bindHooks, createOctetStore } from "./store";
 import type { SessionInfo } from "./protocol";
-import * as cardWords from "./sessions";
 import * as rowWords from "./session";
 
 const BATCHES = 10;
@@ -61,13 +62,21 @@ function Transcript({ session }: { session: string }) {
   );
 }
 
+/** The Inbox's cards, as its screen makes them. */
 function Cards() {
   const sessions = useSessions();
+  const items = useMemo(() => {
+    const inbox = cardWords.classify(sessions, new Map(sessions.map((s) => [s.id, s.approval ?? null])), { mac: "mac", now: 0 });
+    return [...inbox.needs, ...inbox.running, ...inbox.done];
+  }, [sessions]);
   const open = useCallback(() => undefined, []);
+  const send = useCallback(async () => undefined, []);
+  const isFront = useCallback(() => false, []);
+  const [ledger] = useState(createAnswerLedger);
   return (
     <View>
-      {sessions.map((s) => (
-        <SessionCard key={s.id} info={s} disabled={false} onOpen={open} />
+      {items.map((item) => (
+        <InboxCard key={item.id} item={item} offline={false} send={send} ledger={ledger} isFront={isFront} onOpen={open} />
       ))}
     </View>
   );
@@ -135,7 +144,7 @@ describe("render budgets", () => {
       </>,
     );
     const rows = jest.spyOn(rowWords, "rowRole");
-    const cards = jest.spyOn(cardWords, "engineLine");
+    const cards = jest.spyOn(cardWords, "cardLabel");
     commits.a = commits.b = commits.cards = 0;
 
     for (let b = 0; b < BATCHES; b++) {

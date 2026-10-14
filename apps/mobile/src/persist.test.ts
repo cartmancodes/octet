@@ -8,7 +8,7 @@ beforeEach(async () => {
 describe("settings", () => {
   it("default when nothing is saved", async () => {
     expect(await loadSettings()).toEqual(DEFAULT_SETTINGS);
-    expect(DEFAULT_SETTINGS).toEqual({ deviceName: null, faceId: true, hubUrl: null, notifications: false });
+    expect(DEFAULT_SETTINGS).toEqual({ deviceName: null, faceId: true, hubUrl: null, notifications: false, textSize: 13 });
   });
 
   it("round-trip, and a save merges into what is there", async () => {
@@ -19,6 +19,7 @@ describe("settings", () => {
       faceId: false,
       hubUrl: "wss://mac.tail1234.ts.net/",
       notifications: false,
+      textSize: 13,
     });
   });
 
@@ -54,12 +55,25 @@ describe("settings", () => {
       faceId: false,
       hubUrl: "wss://mac.tail1234.ts.net/",
       notifications: false,
+      textSize: 13,
     });
     await saveSettings({ notifications: true });
     expect((await loadSettings()).notifications).toBe(true);
     expect((await loadSettings()).deviceName).toBe("Old");
     await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ notifications: "yes" }));
     expect((await loadSettings()).notifications).toBe(false);
+  });
+
+  it("the transcript text size is 13 by default, 12, 13 or 14 when saved, and 13 for anything else", async () => {
+    expect((await loadSettings()).textSize).toBe(13);
+    for (const size of [12, 14, 13] as const) {
+      await saveSettings({ textSize: size });
+      expect((await loadSettings()).textSize).toBe(size);
+    }
+    for (const junk of [15, 11, 13.5, "14", null]) {
+      await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ textSize: junk }));
+      expect((await loadSettings()).textSize).toBe(13);
+    }
   });
 
   it("keep the good fields of a partly bad record, and bound strings", async () => {
@@ -81,12 +95,12 @@ describe("settings", () => {
 
   it("two saves at once both land", async () => {
     await Promise.all([saveSettings({ hubUrl: "wss://a/" }), saveSettings({ faceId: false }), saveSettings({ deviceName: "P" })]);
-    expect(await loadSettings()).toEqual({ deviceName: "P", faceId: false, hubUrl: "wss://a/", notifications: false });
+    expect(await loadSettings()).toEqual({ deviceName: "P", faceId: false, hubUrl: "wss://a/", notifications: false, textSize: 13 });
   });
 
   it("never hold a token", async () => {
     await saveSettings({ hubUrl: "wss://x/" });
     const raw = (await AsyncStorage.getItem(SETTINGS_KEY)) ?? "";
-    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "hubUrl", "notifications"]);
+    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "hubUrl", "notifications", "textSize"]);
   });
 });

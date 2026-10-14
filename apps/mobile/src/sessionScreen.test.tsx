@@ -15,7 +15,7 @@ import { HubContext, HubController, TOKEN_KEY } from "./hub";
 import { saveSettings } from "./persist";
 import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol";
 import * as words from "./session";
-import * as cardWords from "./sessions";
+import * as cardWords from "./inbox";
 import { octetStore } from "./store";
 import { dark, light } from "./theme";
 
@@ -97,9 +97,14 @@ const stateFrame = (state: Partial<StateInfo>, session = "a") => ({
   state: { phase: "running", queue: [], queued: 0, mode: "ask", approvals: [], ...state },
 });
 
-/** Taps the card of `id` on Sessions and waits for its screen. */
+/** Taps the card of `id` on the Inbox, on whichever tab it is, and waits for its screen. */
 async function open(rig: Rig, id: string) {
-  await fireEvent.press(screen.getByRole("button", { name: new RegExp(`^${id}, `) }));
+  const name = new RegExp(`^${id}, `);
+  for (const tab of [/^Needs you/, /^Running/, /^Done/]) {
+    if (screen.queryByRole("button", { name })) break;
+    await fireEvent.press(screen.getByRole("tab", { name: tab }));
+  }
+  await fireEvent.press(screen.getByRole("button", { name }));
   await screen.findByTestId("transcript");
 }
 
@@ -474,7 +479,7 @@ describe("the Session screen", () => {
     });
   });
 
-  it("100 text deltas re-render only the streaming row, once per batch, and no Sessions card", async () => {
+  it("100 text deltas re-render only the streaming row, once per batch, and no Inbox card", async () => {
     const rig = await launch([info("a"), info("b"), info("c")]);
     await open(rig, "a");
     await feed(
@@ -486,7 +491,7 @@ describe("the Session screen", () => {
       ev({ type: "text", data: "start" }),
     );
     const rows = jest.spyOn(words, "rowRole");
-    const cards = jest.spyOn(cardWords, "engineLine");
+    const cards = jest.spyOn(cardWords, "cardLabel");
     const batches = 10;
     for (let b = 0; b < batches; b++) {
       await act(async () => {

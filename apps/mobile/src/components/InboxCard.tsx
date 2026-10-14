@@ -1,0 +1,137 @@
+import { memo, useCallback } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+
+import { useApprovalAnswer, type AnswerLedger } from "../approvals";
+import { cardLabel, sameItem, type InboxItem } from "../inbox";
+import { Button } from "../ui";
+import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
+import type { Send } from "./send";
+
+/** Said on a card whose command the hub cut: Allow runs the whole of it. */
+export const CARD_SHORTENED = "Shortened — the full command is on the Mac. Review it before allowing.";
+
+interface InboxCardProps {
+  item: InboxItem;
+  /** The Mac can't be reached: the card is greyed and does nothing. */
+  offline: boolean;
+  /** The rest must be stable, or every card re-renders with the list. */
+  send: Send;
+  ledger: AnswerLedger;
+  /** Whether `id` is still the session's front approval, as the store has it now. */
+  isFront: (session: string, id: number) => boolean;
+  /** Opens the session. */
+  onOpen: (id: string) => void;
+}
+
+function makeStyles(theme: Theme) {
+  return StyleSheet.create({
+    card: { borderWidth: 1, borderRadius: radius.card, borderColor: theme.edge, paddingVertical: spacing.md, paddingHorizontal: 14, gap: 10 },
+    plain: { backgroundColor: theme.bg },
+    approval: { backgroundColor: theme.panel },
+    grey: { opacity: 0.5 },
+    top: { minHeight: 44 },
+    head: { flexDirection: "row", justifyContent: "space-between", gap: spacing.sm },
+    name: { ...type.body, color: theme.fg, fontWeight: "700", flexShrink: 1 },
+    ago: { ...type.body, color: theme.muted },
+    amber: { ...type.body, color: theme.amber },
+    accent: { ...type.body, color: theme.accent },
+    muted: { ...type.body, color: theme.muted },
+    note: { ...type.label, color: theme.amber },
+    buttons: { flexDirection: "row", gap: spacing.sm },
+    button: { flex: 1 },
+  });
+}
+const DARK = makeStyles(dark);
+const LIGHT = makeStyles(light);
+
+/**
+ * One session on the Inbox: its name and how long ago, the status line, and the excerpt. A card
+ * with an approval answers it here: Allow once (Face ID, then armed 400 ms after it shows) and
+ * Deny, or Review for a file edit. Every string is the Mac's and drawn as text.
+ */
+export const InboxCard = memo(function InboxCard({ item, offline, send, ledger, isFront, onOpen }: InboxCardProps) {
+  const theme = useTheme();
+  const s = theme === light ? LIGHT : DARK;
+  const { id, approval } = item;
+  const isOpen = useCallback((approvalId: number) => isFront(id, approvalId), [isFront, id]);
+  const answer = useApprovalAnswer(id, approval, { send, offline, isOpen, ledger });
+  const { allow: allowNow, deny: denyNow } = answer;
+  const open = useCallback(() => onOpen(id), [onOpen, id]);
+  const allow = useCallback(() => void allowNow(), [allowNow]);
+  const deny = useCallback(() => void denyNow(), [denyNow]);
+  const waiting = item.statusTone === "amber";
+  return (
+    <View testID={`inbox-card-${id}`} style={[s.card, waiting ? s.approval : s.plain, offline ? s.grey : null]}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={cardLabel(item)}
+        accessibilityState={offline ? DISABLED : ENABLED}
+        disabled={offline}
+        onPress={open}
+        style={s.top}
+      >
+        <View style={s.head}>
+          <Text numberOfLines={1} style={s.name}>
+            {item.name}
+          </Text>
+          <Text style={s.ago}>{item.ago}</Text>
+        </View>
+        {/* An approval's command shows whole (its gist is at most 200 characters): what Allow runs
+            is never cut off by the edge of the screen. */}
+        <Text numberOfLines={approval ? undefined : 1} style={s[item.statusTone]}>
+          {item.status}
+        </Text>
+        {item.shortened ? <Text style={s.note}>{CARD_SHORTENED}</Text> : null}
+        {item.line !== "" ? (
+          <Text numberOfLines={2} style={s.muted}>
+            {item.line}
+          </Text>
+        ) : null}
+      </Pressable>
+      {approval ? (
+        <View style={s.buttons}>
+          <Button
+            label="Allow once"
+            accessibilityLabel={`Allow once for ${item.name}`}
+            variant="accent"
+            disabled={!answer.canAnswer}
+            busy={answer.busy}
+            onPress={allow}
+            style={s.button}
+          />
+          {item.editApproval ? (
+            <Button label="Review" accessibilityLabel={`Review ${item.name}`} disabled={offline} onPress={open} style={s.button} />
+          ) : (
+            <Button
+              label="Deny"
+              accessibilityLabel={`Deny for ${item.name}`}
+              disabled={!answer.canAnswer}
+              busy={answer.busy}
+              onPress={deny}
+              style={s.button}
+            />
+          )}
+        </View>
+      ) : waiting ? (
+        <Button label="Review" accessibilityLabel={`Review ${item.name}`} disabled={offline} onPress={open} />
+      ) : null}
+      {answer.sending ? <Text style={s.muted}>Sending…</Text> : null}
+      {answer.failure ? <Text style={s.amber}>{answer.failure}</Text> : null}
+    </View>
+  );
+}, sameProps);
+
+/** A card draws again only for its own data: the list hands it a fresh item each time. */
+function sameProps(a: InboxCardProps, b: InboxCardProps): boolean {
+  return (
+    sameItem(a.item, b.item) &&
+    a.offline === b.offline &&
+    a.send === b.send &&
+    a.ledger === b.ledger &&
+    a.isFront === b.isFront &&
+    a.onOpen === b.onOpen
+  );
+}
+
+const DISABLED = { disabled: true } as const;
+const ENABLED = { disabled: false } as const;
