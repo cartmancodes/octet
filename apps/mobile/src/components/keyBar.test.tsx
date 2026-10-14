@@ -3,7 +3,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { act, fireEvent, render, screen, within } from "@testing-library/react-native";
 import * as LocalAuthentication from "expo-local-authentication";
-import { StyleSheet } from "react-native";
+import { Keyboard, StyleSheet } from "react-native";
 
 import { Refusal } from "../client/HubClient";
 import { saveSettings } from "../persist";
@@ -188,6 +188,79 @@ describe("the key bar", () => {
       await settle(400);
       expect(disabled(key(ESC_DENY))).toBe(false);
       expect(r.send).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("busy while its command is out", () => {
+    const busy = (name: string) => key(name).props.accessibilityState?.busy === true;
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it("esc while its cancel is out, ⇧tab while its set_mode is, ⏎ while its prompt is", async () => {
+      const r = rig();
+      await render(controls(r.send, { phase: "running" }));
+      expect(busy(ESC)).toBe(false);
+      await fireEvent.press(key(ESC));
+      expect(busy(ESC)).toBe(true);
+      expect(busy(MODE)).toBe(false);
+      expect(busy("Queue (⏎)")).toBe(false);
+      r.waiting[0]?.resolve();
+      await flush();
+      expect(busy(ESC)).toBe(false);
+      await fireEvent.press(key(MODE));
+      expect(busy(MODE)).toBe(true);
+      expect(busy(ESC)).toBe(false);
+      r.waiting[1]?.resolve();
+      await flush();
+      expect(busy(MODE)).toBe(false);
+      await fireEvent.changeText(input(), "more");
+      await fireEvent.press(key("Queue (⏎)"));
+      expect(busy("Queue (⏎)")).toBe(true);
+      r.waiting[2]?.resolve();
+      await flush();
+      expect(busy("Queue (⏎)")).toBe(false);
+    });
+
+    it("y n esc while the answer is out", async () => {
+      const r = rig();
+      await render(controls(r.send, { phase: "running", approvals: [approval(3)] }));
+      await settle(400);
+      for (const name of [ALLOW, DENY, ESC_DENY]) expect(busy(name)).toBe(false);
+      await fireEvent.press(key(DENY));
+      await flush();
+      for (const name of [ALLOW, DENY, ESC_DENY]) expect(busy(name)).toBe(true);
+    });
+  });
+
+  describe("the safe area under it", () => {
+    type Handler = () => void;
+    let handlers: Map<string, Handler>;
+    let removed: string[];
+    beforeEach(() => {
+      handlers = new Map();
+      removed = [];
+      jest.spyOn(Keyboard, "addListener").mockImplementation(((event: string, handler: Handler) => {
+        handlers.set(event, handler);
+        return { remove: () => void removed.push(event) } as never;
+      }) as never);
+    });
+    afterEach(() => jest.restoreAllMocks());
+    const pad = () => (StyleSheet.flatten(screen.getByTestId("key-bar").props.style) as { paddingBottom?: number }).paddingBottom;
+
+    it("pads the home indicator only while the keyboard is down, and stops listening when it goes", async () => {
+      const view = await render(controls(rig().send, { bottom: 34 }));
+      expect(pad()).toBe(34);
+      await act(async () => handlers.get("keyboardWillShow")?.());
+      expect(pad()).toBe(8);
+      await act(async () => handlers.get("keyboardWillHide")?.());
+      expect(pad()).toBe(34);
+      await view.unmount();
+      expect(removed.sort()).toEqual(["keyboardWillHide", "keyboardWillShow"]);
+    });
+
+    it("keeps a little room when there is no home indicator", async () => {
+      await render(controls(rig().send, { bottom: 0 }));
+      expect(pad()).toBe(8);
     });
   });
 

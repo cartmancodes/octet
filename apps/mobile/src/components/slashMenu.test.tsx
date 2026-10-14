@@ -8,7 +8,7 @@ import { onMenuRequest } from "../convoMenu";
 import { saveSettings } from "../persist";
 import { octetStore } from "../store";
 import { dark, light } from "../theme";
-import { controls, disabled, flush, input, key, rig } from "./controlsRig";
+import { approval, controls, disabled, flush, input, key, rig } from "./controlsRig";
 import { SLASH_COMMANDS, slashMatches } from "./SlashMenu";
 
 const row = (cmd: string) => screen.getByRole("button", { name: new RegExp(`^${cmd}, `) });
@@ -151,6 +151,52 @@ describe("the slash menu", () => {
     await render(controls(rig().send));
     await fireEvent.changeText(input(), "/mo");
     expect(screen.queryByText("Slash commands run on the desk")).toBeNull();
+  });
+
+  it("while an approval waits, the rows are off and return runs nothing: the words stay", async () => {
+    const opened = jest.fn();
+    unlisten = onMenuRequest("s", opened);
+    const r = rig();
+    await render(controls(r.send, { approvals: [approval(1)] }));
+    await fireEvent.changeText(input(), "/mode");
+    expect(disabled(row("/mode"))).toBe(true);
+    expect(disabled(row("/model"))).toBe(true);
+    await fireEvent.press(row("/mode"));
+    await fireEvent.changeText(input(), "/model");
+    await submit();
+    await flush();
+    expect(opened).not.toHaveBeenCalled();
+    expect(r.send).not.toHaveBeenCalled();
+    expect(input().props.value).toBe("/model");
+  });
+
+  it("while a command is out, the rows are off and keep the words", async () => {
+    const r = rig();
+    await render(controls(r.send, { phase: "running" }));
+    await fireEvent.press(key("Cancel (esc)"));
+    await fireEvent.changeText(input(), "/mode");
+    expect(disabled(row("/mode"))).toBe(true);
+    await fireEvent.press(row("/mode"));
+    await submit();
+    expect(r.sent.map((b) => b.type)).toEqual(["cancel"]);
+    expect(input().props.value).toBe("/mode");
+    r.waiting[0]?.resolve();
+    await flush();
+    expect(disabled(row("/mode"))).toBe(false);
+  });
+
+  it("clears the words only when the command ran", async () => {
+    const r = rig();
+    // No header is listening: /model opened nothing.
+    await render(controls(r.send, { mode: "ask", modes: ["ask"] }));
+    await fireEvent.changeText(input(), "/model");
+    await submit();
+    expect(input().props.value).toBe("/model");
+    // No other mode to go to: /mode sent nothing.
+    await fireEvent.changeText(input(), "/mode");
+    await submit();
+    expect(r.send).not.toHaveBeenCalled();
+    expect(input().props.value).toBe("/mode");
   });
 
   it("offline, a row sends nothing", async () => {

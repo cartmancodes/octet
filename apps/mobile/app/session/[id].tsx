@@ -244,7 +244,7 @@ export default function Session() {
                   send={send}
                   offline={offline}
                   covered={sheetOpen || drawerOpen}
-                  bottom={Math.max(insets.bottom, spacing.sm)}
+                  bottom={insets.bottom}
                   onPromptLayout={onPromptLayout}
                 />
               </>

@@ -11,7 +11,7 @@ import { saveSettings } from "../persist";
 import { octetStore } from "../store";
 import { dark, light } from "../theme";
 import { approval, controls, disabled, flush, input, key, rig, settle } from "./controlsRig";
-import { PLACEHOLDER, placeholderFor } from "./PromptLine";
+import { PLACEHOLDER, PROMPT_LINES, PROMPT_MAX_HEIGHT, PROMPT_PAD, placeholderFor } from "./PromptLine";
 import { APPROVAL_DEMO, isSlash } from "./send";
 
 const sendKey = (name = "Send (⏎)") => key(name);
@@ -25,10 +25,25 @@ beforeEach(async () => {
 });
 
 describe("the prompt line", () => {
-  it("is `>` and one field", async () => {
+  it("is `>` and a field that grows to 4 lines, then scrolls; return still sends", async () => {
     await render(controls(rig().send));
     expect(screen.getByText(">")).toBeTruthy();
-    expect(input().props.multiline).toBeFalsy();
+    expect(input().props.multiline).toBe(true);
+    expect(input().props.submitBehavior).toBe("submit");
+    expect(input().props.scrollEnabled).not.toBe(false);
+    expect(PROMPT_LINES).toBe(4);
+    const style = StyleSheet.flatten(input().props.style) as { maxHeight?: number; lineHeight?: number; minHeight?: number };
+    expect(style.maxHeight).toBe(PROMPT_MAX_HEIGHT);
+    expect(PROMPT_MAX_HEIGHT).toBe(4 * (style.lineHeight ?? 0) + 2 * PROMPT_PAD);
+    expect(style.minHeight).toBeGreaterThanOrEqual(44);
+  });
+
+  it("sends text of several lines as it is, from ⏎ or return", async () => {
+    const r = rig();
+    await render(controls(r.send));
+    await fireEvent.changeText(input(), "first\nsecond");
+    await fireEvent.press(sendKey());
+    expect(r.sent).toEqual([{ type: "prompt", session: "s", text: "first\nsecond" }]);
   });
 
   describe("placeholders follow the state", () => {
@@ -166,6 +181,21 @@ describe("the prompt line", () => {
     expect(input().props.value).toBe("");
     expect(screen.queryByText("Can't reach your Mac")).toBeNull();
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("Try again resends exactly what failed: a steer stays a steer after the turn ends", async () => {
+    const r = rig();
+    const view = await render(controls(r.send, { phase: "running", engine: "codex" }));
+    await fireEvent.changeText(input(), "go left");
+    await fireEvent.press(sendKey("Steer (⏎)"));
+    r.waiting[0]?.reject(new Refusal("unsent", "Can't reach your Mac"));
+    await flush();
+    await view.rerender(controls(r.send, { phase: "idle", engine: "codex" }));
+    await fireEvent.press(screen.getByRole("button", { name: "Try again" }));
+    expect(r.sent).toEqual([
+      { type: "steer", session: "s", text: "go left" },
+      { type: "steer", session: "s", text: "go left" },
+    ]);
   });
 
   it("never offers a resend of a lost prompt, and keeps the text", async () => {
@@ -349,7 +379,7 @@ describe("the prompt line", () => {
 
     it("sending denies the front approval, then sends the text as a prompt once the deny is acked", async () => {
       const r = rig();
-      await render(controls(r.send, { phase: "running", approvals: [approval(3), approval(4)] }));
+      await render(controls(r.send, { phase: "running", approvals: [approval(3)] }));
       await settle(400);
       await fireEvent.changeText(input(), "use the staging config instead");
       await submit();
@@ -369,6 +399,66 @@ describe("the prompt line", () => {
       r.waiting[1]?.resolve();
       await flush();
       expect(input().props.value).toBe("");
+    });
+
+    it("sends no prompt when another approval is at the front once the deny is acked, and keeps the words", async () => {
+      const r = rig();
+      await render(controls(r.send, { phase: "running", approvals: [approval(3), approval(4)] }));
+      await settle(400);
+      await fireEvent.changeText(input(), "use the staging config instead");
+      await submit();
+      await flush();
+      r.waiting[0]?.resolve();
+      await flush();
+      expect(r.sent).toEqual([{ type: "answer", session: "s", approval: 3, allow: false }]);
+      expect(screen.getByText("Run command 4")).toBeTruthy();
+      expect(input().props.value).toBe("use the staging config instead");
+    });
+
+    it("sends no prompt when a new approval came to the front while the deny was out", async () => {
+      const r = rig();
+      const view = await render(controls(r.send, { phase: "running", approvals: [approval(3)] }));
+      await settle(400);
+      await fireEvent.changeText(input(), "do it by hand");
+      await submit();
+      await flush();
+      await view.rerender(controls(r.send, { phase: "running", approvals: [approval(3), approval(5)] }));
+      r.waiting[0]?.resolve();
+      await flush();
+      expect(r.sent.map((b) => b.type)).toEqual(["answer"]);
+      expect(input().props.value).toBe("do it by hand");
+    });
+
+    it("Try again after a deny-then-prompt resends only the prompt, never a deny, and not while an approval is at the front", async () => {
+      const r = rig();
+      const view = await render(controls(r.send, { phase: "running", approvals: [approval(3)] }));
+      await settle(400);
+      await fireEvent.changeText(input(), "do it by hand");
+      await submit();
+      await flush();
+      r.waiting[0]?.resolve();
+      await flush();
+      await view.rerender(controls(r.send, { phase: "running", approvals: [] }));
+      r.waiting[1]?.reject(new Refusal("unsent", "Can't reach your Mac"));
+      await flush();
+      expect(r.sent.map((b) => b.type)).toEqual(["answer", "prompt"]);
+      // A new approval comes: Try again would send the words past it.
+      await view.rerender(controls(r.send, { phase: "running", approvals: [approval(5)] }));
+      await settle(400);
+      const retry = screen.getByRole("button", { name: "Try again" });
+      expect(disabled(retry)).toBe(true);
+      await fireEvent.press(retry);
+      await flush();
+      expect(r.sent.map((b) => b.type)).toEqual(["answer", "prompt"]);
+      expect(input().props.value).toBe("do it by hand");
+      // It is answered elsewhere: Try again resends the prompt as it was.
+      await view.rerender(controls(r.send, { phase: "running", approvals: [] }));
+      await fireEvent.press(screen.getByRole("button", { name: "Try again" }));
+      expect(r.sent).toEqual([
+        { type: "answer", session: "s", approval: 3, allow: false },
+        { type: "prompt", session: "s", text: "do it by hand" },
+        { type: "prompt", session: "s", text: "do it by hand" },
+      ]);
     });
 
     it("sends a prompt, not a steer, even while a Codex turn runs", async () => {
@@ -455,6 +545,7 @@ describe("the prompt line", () => {
       await fireEvent.changeText(input(), "and more");
       await act(async () => octetStore.getState().setDraft("s", "first words"));
       expect(input().props.value).toBe("first words\nand more");
+      expect(input().props.multiline).toBe(true); // shown on two lines, as typed
       expect(octetStore.getState().drafts.has("s")).toBe(false);
     });
 

@@ -30,6 +30,7 @@ export interface ControlsOpts {
   approvals?: PendingApproval[];
   offline?: boolean;
   covered?: boolean;
+  bottom?: number;
 }
 
 const NONE: PendingApproval[] = [];
@@ -47,7 +48,7 @@ export const controls = (send: Send, o: ControlsOpts = {}) => (
     send={send}
     offline={o.offline ?? false}
     covered={o.covered ?? false}
-    bottom={0}
+    bottom={o.bottom ?? 0}
   />
 );
 

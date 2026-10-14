@@ -1,5 +1,5 @@
-import { memo } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { memo, useEffect, useState } from "react";
+import { Keyboard, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { dark, light, spacing, type, useTheme, type Theme } from "../theme";
 
@@ -52,11 +52,13 @@ interface KeyProps {
   width: Width;
   tone: Tone;
   disabled: boolean;
+  /** Its command is out. */
+  busy?: boolean;
   /** Must be stable. */
   onPress: () => void;
 }
 
-const Key = memo(function Key({ glyph, label, width, tone, disabled, onPress }: KeyProps) {
+const Key = memo(function Key({ glyph, label, width, tone, disabled, busy = false, onPress }: KeyProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const boxes = BOXES.get(s) ?? boxLooks(s);
@@ -65,7 +67,7 @@ const Key = memo(function Key({ glyph, label, width, tone, disabled, onPress }: 
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={label}
-      accessibilityState={{ disabled }}
+      accessibilityState={{ disabled, busy }}
       disabled={disabled}
       onPress={onPress}
       style={boxes[look]}
@@ -91,7 +93,13 @@ export interface KeyBarProps {
   sendLabel: string;
   /** The front approval can be answered now (armed, nothing over it, no answer out). */
   canAnswer: boolean;
-  /** The safe area under the bar. */
+  /** Which key's command is out: esc's cancel, ⇧tab's set_mode, ⏎'s prompt (or its deny), or
+   * y n esc's answer. */
+  cancelBusy: boolean;
+  modeBusy: boolean;
+  sendBusy: boolean;
+  answerBusy: boolean;
+  /** The safe area under the bar (the home indicator): padded only while the keyboard is down. */
   bottom: number;
   /** Each must be stable. */
   onCancel: () => void;
@@ -101,6 +109,24 @@ export interface KeyBarProps {
   onSend: () => void;
   onAllow: () => void;
   onDeny: () => void;
+}
+
+/** The bar's own room at the bottom, with the keyboard up or no home indicator. */
+const GAP = spacing.sm;
+
+/** Whether the keyboard is up. iOS says so before it moves, Android after. */
+function useKeyboardUp(): boolean {
+  const [up, setUp] = useState(false);
+  useEffect(() => {
+    const ios = Platform.OS === "ios";
+    const show = Keyboard.addListener(ios ? "keyboardWillShow" : "keyboardDidShow", () => setUp(true));
+    const hide = Keyboard.addListener(ios ? "keyboardWillHide" : "keyboardDidHide", () => setUp(false));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+  return up;
 }
 
 /**
@@ -113,25 +139,27 @@ export const KeyBar = memo(function KeyBar(p: KeyBarProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const off = p.offline;
-  const pad = { paddingBottom: p.bottom };
+  // The keyboard covers the home indicator: its room is needed only while the keyboard is down.
+  const keyboard = useKeyboardUp();
+  const pad = { paddingBottom: keyboard ? GAP : Math.max(p.bottom, GAP) };
   if (p.approval) {
     const answerOff = off || !p.canAnswer;
     return (
       <View testID="key-bar" style={[s.bar, pad]}>
-        <Key glyph="y" label="Allow (y)" width="one" tone="accent" disabled={answerOff} onPress={p.onAllow} />
-        <Key glyph="n" label="Deny (n)" width="one" tone="fg" disabled={answerOff} onPress={p.onDeny} />
-        <Key glyph="esc" label="Deny (esc)" width="wide" tone="fg" disabled={answerOff} onPress={p.onDeny} />
+        <Key glyph="y" label="Allow (y)" width="one" tone="accent" disabled={answerOff} busy={p.answerBusy} onPress={p.onAllow} />
+        <Key glyph="n" label="Deny (n)" width="one" tone="fg" disabled={answerOff} busy={p.answerBusy} onPress={p.onDeny} />
+        <Key glyph="esc" label="Deny (esc)" width="wide" tone="fg" disabled={answerOff} busy={p.answerBusy} onPress={p.onDeny} />
       </View>
     );
   }
   const sendOff = off || !p.canSend;
   return (
     <View testID="key-bar" style={[s.bar, pad]}>
-      <Key glyph="esc" label="Cancel (esc)" width="one" tone={p.running ? "accent" : "fg"} disabled={off || !p.canCancel} onPress={p.onCancel} />
-      <Key glyph="⇧tab" label="Next mode (⇧tab)" width="wider" tone="fg" disabled={off || !p.canMode} onPress={p.onMode} />
+      <Key glyph="esc" label="Cancel (esc)" width="one" tone={p.running ? "accent" : "fg"} disabled={off || !p.canCancel} busy={p.cancelBusy} onPress={p.onCancel} />
+      <Key glyph="⇧tab" label="Next mode (⇧tab)" width="wider" tone="fg" disabled={off || !p.canMode} busy={p.modeBusy} onPress={p.onMode} />
       <Key glyph="↑" label="Last prompt (↑)" width="one" tone="fg" disabled={off || !p.canUp} onPress={p.onUp} />
       <Key glyph="/" label="Command (/)" width="one" tone="fg" disabled={off || !p.canSlash} onPress={p.onSlash} />
-      <Key glyph="⏎" label={`${p.sendLabel} (⏎)`} width="wide" tone={sendOff ? "muted" : "accent"} disabled={sendOff} onPress={p.onSend} />
+      <Key glyph="⏎" label={`${p.sendLabel} (⏎)`} width="wide" tone={sendOff ? "muted" : "accent"} disabled={sendOff} busy={p.sendBusy} onPress={p.onSend} />
     </View>
   );
 });

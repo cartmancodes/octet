@@ -26,6 +26,12 @@ export function placeholderFor({ approval, running, question }: { approval: bool
   return PLACEHOLDER.idle;
 }
 
+/** The field grows to this many lines, then scrolls. */
+export const PROMPT_LINES = 4;
+/** The field's room above and below its text: one line of it is 44 pt tall. */
+export const PROMPT_PAD = 12;
+export const PROMPT_MAX_HEIGHT = PROMPT_LINES * type.body.lineHeight + 2 * PROMPT_PAD;
+
 /** The modes ⇧tab and /mode cycle through. Full access is never among them: it has its own
  * guarded flow in the ▾ menu. */
 const CYCLE: readonly Mode[] = ["ask", "accept-edits", "auto"];
@@ -53,7 +59,7 @@ function makeStyles(theme: Theme) {
     off: { opacity: 0.4 },
     line: {
       flexDirection: "row",
-      alignItems: "center",
+      alignItems: "flex-start",
       gap: spacing.sm,
       marginHorizontal: 14,
       marginBottom: spacing.sm,
@@ -64,8 +70,18 @@ function makeStyles(theme: Theme) {
       borderColor: theme.edge,
     },
     ready: { borderColor: theme.accent },
-    caret: { ...type.body, color: theme.accent },
-    input: { ...type.body, flex: 1, minWidth: 0, minHeight: 44, paddingVertical: 0, color: theme.fg },
+    caret: { ...type.body, paddingTop: PROMPT_PAD, color: theme.accent },
+    input: {
+      ...type.body,
+      flex: 1,
+      minWidth: 0,
+      minHeight: type.body.lineHeight + 2 * PROMPT_PAD,
+      maxHeight: PROMPT_MAX_HEIGHT,
+      paddingTop: PROMPT_PAD,
+      paddingBottom: PROMPT_PAD,
+      textAlignVertical: "top",
+      color: theme.fg,
+    },
   });
 }
 type Styles = ReturnType<typeof makeStyles>;
@@ -100,10 +116,12 @@ interface PromptLineProps {
 }
 
 /**
- * The prompt line: `>` and one field, the slash menu over it and the key bar under it. What it
+ * The prompt line: `>` and a field of up to four lines (then it scrolls), the slash menu over it
+ * and the key bar under it. What it
  * sends follows the state: a `prompt` (which queues behind a running Claude turn), a `steer` while
  * a Codex turn runs, and, while an approval waits, a deny of the front one and then the text as a
- * prompt once the deny is acked. The text clears only when the Mac acks it, so a refusal or a lost
+ * prompt once the deny is acked — only for the approval that was at the front when the user sent,
+ * and only if no other approval is at the front by then. The text clears only when the Mac acks it, so a refusal or a lost
  * connection never costs the user their words. One command goes at a time; offline, none does.
  * A slash command other than the phone's own (/model, /mode) is the desk's, and is not sent.
  */
@@ -132,10 +150,17 @@ export const PromptLine = memo(function PromptLine({
   // A deny ahead of a prompt is out: the prompt waits for its ack.
   const [denying, setDenying] = useState(false);
   const denyOut = useRef(false);
+  // Which of the control's commands is out, for its key's busy state.
+  const [controlKind, setControlKind] = useState<"cancel" | "mode" | null>(null);
+  // The last prompt or steer sent, as it went: Try again sends exactly this.
+  const lastBody = useRef<{ kind: "prompt" | "steer"; text: string } | null>(null);
+  // The approvals waiting, front first, as of the last commit: read after the deny's await.
+  const waitingNow = useRef<readonly number[]>(permission.waiting);
   // Read after an await: whether the link is up now.
   const down = useRef(offline);
   useLayoutEffect(() => {
     down.current = offline;
+    waitingNow.current = permission.waiting;
   });
 
   // A first prompt the Mac did not take comes back into the field, ahead of anything typed,
@@ -182,6 +207,7 @@ export const PromptLine = memo(function PromptLine({
 
   const sendText = useCallback(
     (kind: "prompt" | "steer", sent: string) => {
+      lastBody.current = { kind, text: sent };
       runPrompt({ type: kind, session, text: sent }, () => {
         // Words typed while it was out are the user's: only an unchanged field is cleared.
         setText((current) => (current === sent ? "" : current));
@@ -193,8 +219,9 @@ export const PromptLine = memo(function PromptLine({
   );
 
   const denyThenPrompt = useCallback(
-    async (sent: string) => {
-      if (denyOut.current) return;
+    async (sent: string, pinned: number) => {
+      // Only the approval at the front when the user sent: if another is there now, nothing goes.
+      if (denyOut.current || waitingNow.current[0] !== pinned) return;
       denyOut.current = true;
       setDenying(true);
       let denied = false;
@@ -204,27 +231,36 @@ export const PromptLine = memo(function PromptLine({
         denyOut.current = false;
         if (alive()) setDenying(false);
       }
-      // The deny is the Mac's now; the prompt goes only if it took it and the link is still up.
-      if (denied && alive() && !down.current) sendText("prompt", sent);
+      // The deny is the Mac's now. The prompt goes only if it took it, the link is still up, and no
+      // other approval is at the front by now (one behind it, or one that came meanwhile): the
+      // words stay for the user to send once they have seen it.
+      if (!denied || !alive() || down.current) return;
+      if (waitingNow.current.some((id) => id !== pinned)) return;
+      sendText("prompt", sent);
     },
     [denyFront, alive, sendText],
   );
 
-  const cycle = useCallback(() => {
-    if (down.current || busy) return;
+  /** True if it sent a mode. */
+  const cycle = useCallback((): boolean => {
+    if (down.current || busy) return false;
     const next = nextMode(currentMode, modes);
-    if (next === null) return;
-    runControl({ type: "set_mode", session, mode: next }, () => setAssumed(next));
+    if (next === null) return false;
+    setControlKind("mode");
+    return runControl({ type: "set_mode", session, mode: next }, () => setAssumed(next));
   }, [busy, currentMode, modes, runControl, session]);
+  const cycleKey = useCallback(() => void cycle(), [cycle]);
 
+  // The slash menu's commands wait while an approval does (the keys are its) and while a command
+  // is out; the words clear only when the command ran.
+  const slashOff = offline || busy || front !== null;
   const runSlash = useCallback(
     (cmd: SlashCommand["cmd"]) => {
-      if (down.current || busy) return;
-      setText("");
-      if (cmd === "/model") requestMenu(session);
-      else cycle();
+      if (down.current || slashOff) return;
+      const ran = cmd === "/model" ? requestMenu(session) : cycle();
+      if (ran) setText("");
     },
-    [busy, session, cycle],
+    [slashOff, session, cycle],
   );
 
   const submit = useCallback(() => {
@@ -244,7 +280,7 @@ export const PromptLine = memo(function PromptLine({
       // Say what to do instead: the front approval is denied first, through its own guards.
       if (!canAnswer) return;
       lightTap();
-      void denyThenPrompt(sent);
+      void denyThenPrompt(sent, front.id);
       return;
     }
     lightTap();
@@ -253,8 +289,18 @@ export const PromptLine = memo(function PromptLine({
 
   const cancel = useCallback(() => {
     if (down.current || busy || !running) return;
+    setControlKind("cancel");
     runControl({ type: "cancel", session });
   }, [busy, running, runControl, session]);
+
+  // Try again: exactly the body that failed, never a deny, and not past an approval at the front.
+  const retryOff = offline || busy || front !== null;
+  const retry = useCallback(() => {
+    const body = lastBody.current;
+    if (down.current || retryOff || !body) return;
+    lightTap();
+    sendText(body.kind, body.text);
+  }, [retryOff, sendText]);
 
   // Where ↑ stands: -1 for an empty field, the entry shown, or null for the user's own words.
   const n = history.length;
@@ -293,7 +339,7 @@ export const PromptLine = memo(function PromptLine({
   const looks = LINES.get(s) ?? lineLooks(s);
   return (
     <View>
-      <SlashMenu matches={matches} values={values} disabled={offline} onRun={runSlash} />
+      <SlashMenu matches={matches} values={values} disabled={slashOff} onRun={runSlash} />
       {desk || failed ? (
         <View style={s.notes}>
           {desk ? <Text style={s.note}>{SLASH_NOTE}</Text> : null}
@@ -304,10 +350,10 @@ export const PromptLine = memo(function PromptLine({
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="Try again"
-                  accessibilityState={{ disabled: offline }}
-                  disabled={offline}
-                  onPress={submit}
-                  style={[s.retry, offline && s.off]}
+                  accessibilityState={{ disabled: retryOff }}
+                  disabled={retryOff}
+                  onPress={retry}
+                  style={[s.retry, retryOff && s.off]}
                 >
                   <Text style={s.retryText}>Try again</Text>
                 </Pressable>
@@ -327,6 +373,8 @@ export const PromptLine = memo(function PromptLine({
           onChangeText={onChange}
           onSubmitEditing={submit}
           onKeyPress={onKeyPress}
+          multiline
+          scrollEnabled
           submitBehavior="submit"
           returnKeyType="send"
           style={s.input}
@@ -343,9 +391,13 @@ export const PromptLine = memo(function PromptLine({
         canSend={canSend}
         sendLabel={sendLabel}
         canAnswer={canAnswer}
+        cancelBusy={control.busy && controlKind === "cancel"}
+        modeBusy={control.busy && controlKind === "mode"}
+        sendBusy={prompt.busy || denying}
+        answerBusy={answering}
         bottom={bottom}
         onCancel={cancel}
-        onMode={cycle}
+        onMode={cycleKey}
         onUp={up}
         onSlash={slash}
         onSend={submit}

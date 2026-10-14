@@ -24,6 +24,8 @@ export interface Permission {
   front: PendingApproval | null;
   /** How many wait behind it. */
   more: number;
+  /** The ids of the approvals waiting, front first. The same array until one comes or goes. */
+  waiting: readonly number[];
   /** The guards and the answer (`useApprovalAnswer`) for `front`. */
   answer: ApprovalAnswer;
   /** The front request as the user sees it: its id and what it asks. New for each request, and
@@ -75,7 +77,9 @@ export function usePermission(session: string, approvals: PendingApproval[], { s
   }, [frontId]);
   const answer = useApprovalAnswer(session, front, { send, offline, covered, isOpen, onAnswered });
   const look = front ? `${front.id}:${JSON.stringify(front.summary)}` : "";
-  return useMemo(() => ({ front, more, answer, look }), [front, more, answer, look]);
+  const ids = waiting.map((a) => a.id).join(",");
+  const waitingIds = useMemo(() => (ids === "" ? [] : ids.split(",").map(Number)), [ids]);
+  return useMemo(() => ({ front, more, waiting: waitingIds, answer, look }), [front, more, waitingIds, answer, look]);
 }
 
 function makeStyles(theme: Theme) {
@@ -169,14 +173,15 @@ function Card({ approval, more, answer }: CardProps) {
         {` #${approval.id}`}
       </Text>
       {approval.cut ? <Text style={s.shortened}>{SHORTENED}</Text> : null}
-      <ScrollView style={s.body} contentContainerStyle={s.rows}>
+      {/* Out of the scrolled body: however far a long command scrolls, its size stays in sight. */}
+      {command && command.lines > COUNT_PAST ? <Text style={s.muted}>{`${command.lines} lines`}</Text> : null}
+      <ScrollView testID="permission-body" style={s.body} contentContainerStyle={s.rows}>
         <Row label="TOOL" s={s}>
           <Text style={s.text}>{summary.action}</Text>
         </Row>
         {command ? (
           <Row label="CMD" s={s}>
             <Text style={s.text}>{command.text}</Text>
-            {command.lines > COUNT_PAST ? <Text style={s.muted}>{`${command.lines} lines`}</Text> : null}
           </Row>
         ) : null}
         {files.length > 0 ? (
