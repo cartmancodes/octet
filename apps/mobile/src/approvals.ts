@@ -45,14 +45,26 @@ export interface AnswerLedger {
   claim(key: string): boolean;
   /** The answer is back: `answered` when the Mac took it, so it is not sent again. */
   finish(key: string, answered: boolean): void;
+  /** The Mac took an answer to it from here. */
+  given(key: string): boolean;
   /** Forgets the answered requests not in `keys`: an id that left and came back is a new
    * request (a vendor numbers its approvals from 1 again after a provider switch). */
   keep(keys: Iterable<string>): void;
+  /** For `useSyncExternalStore`: `snapshot` is the requests given, a new set each time it
+   * changes. */
+  subscribe(listener: () => void): () => void;
+  snapshot(): ReadonlySet<string>;
 }
 
 export function createAnswerLedger(): AnswerLedger {
   const out = new Set<string>();
   const given = new Set<string>();
+  const listeners = new Set<() => void>();
+  let snapshot: ReadonlySet<string> = new Set();
+  const changed = () => {
+    snapshot = new Set(given);
+    for (const listener of [...listeners]) listener();
+  };
   return {
     claim(key) {
       if (out.has(key) || given.has(key)) return false;
@@ -61,12 +73,27 @@ export function createAnswerLedger(): AnswerLedger {
     },
     finish(key, answered) {
       out.delete(key);
-      if (answered) given.add(key);
+      if (answered && !given.has(key)) {
+        given.add(key);
+        changed();
+      }
     },
+    given: (key) => given.has(key),
     keep(keys) {
       const listed = new Set(keys);
-      for (const key of given) if (!listed.has(key)) given.delete(key);
+      let dropped = false;
+      for (const key of given) {
+        if (listed.has(key)) continue;
+        given.delete(key);
+        dropped = true;
+      }
+      if (dropped) changed();
     },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => void listeners.delete(listener);
+    },
+    snapshot: () => snapshot,
   };
 }
 
@@ -129,9 +156,13 @@ export function useApprovalAnswer(
   // awaiting Face ID, with no frame in between.
   const generation = useRef(key);
   const down = useRef(offline);
+  // Still armed: a link that dropped and came back while Face ID was up is armed again only 400
+  // ms on, and an answer in that window is not sent.
+  const armedNow = useRef(armed);
   useLayoutEffect(() => {
     generation.current = key;
     down.current = offline;
+    armedNow.current = armed;
   });
 
   const id = approval?.id;
@@ -158,8 +189,8 @@ export function useApprovalAnswer(
           }
         }
         // Face ID takes a while: send only if this request is still on screen, still the one the
-        // user looked at, still open, and the Mac can still be reached.
-        if (!alive() || generation.current !== asked || !isOpen(id) || down.current) return;
+        // user looked at, still armed, still open, and the Mac can still be reached.
+        if (!alive() || generation.current !== asked || !armedNow.current || !isOpen(id) || down.current) return;
         setStage("sending");
         await send({ type: "answer", session, approval: id, allow });
         given = true;

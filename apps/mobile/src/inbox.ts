@@ -23,8 +23,9 @@ export interface InboxItem {
   approval: ApprovalInfo | null;
   /** The approval edits files and runs no command: the card offers Review, not Deny. */
   editApproval: boolean;
-  /** The hub cut the approval's command (its gist is the first line, at most 200 characters):
-   * the card says so, since Allow runs the whole of it. */
+  /** The hub cut the approval's gist: its command (the first line, at most 200 characters) or
+   * its files (three, then "+N more"). What Allow would run is not all on the card, so the card
+   * offers Review in place of Allow once, and Allow all leaves it out. */
   shortened: boolean;
 }
 
@@ -44,6 +45,10 @@ export const NO_GIST_LINE = "Open the session to see what it asks.";
 const SOME_MAC = "Mac";
 /** How the hub marks a string it shortened. */
 const CLIP_MARK = "…";
+/** The hub's last entry of a file list it cut (`gist`, crates/octet-hub/src/sessions.rs). */
+const MORE_FILES = /^\+\d+ more$/;
+/** What a screen reader adds for a shortened request. */
+export const SHORTENED_LABEL = "Shortened: review it in the session";
 const LABEL_MAX = 63;
 
 /** The Mac's name: the first label of the hub's host ("studio-mac" from
@@ -100,7 +105,7 @@ function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Pick<Inb
     line: scope !== "" ? scope : (cwd ?? ""),
     approval,
     editApproval: !command && files.length > 0,
-    shortened: !!command && command.endsWith(CLIP_MARK),
+    shortened: (!!command && command.endsWith(CLIP_MARK)) || files.some((f) => MORE_FILES.test(f)),
   };
 }
 
@@ -146,9 +151,11 @@ export function classify(
 }
 
 /** What a screen reader says for a card: its name, how long ago, its status and its line, each
- * part clipped (a screen reader reads every word). */
+ * part clipped (a screen reader reads every word), and whether the request is shortened. */
 export function cardLabel(item: InboxItem): string {
-  return [item.name, item.ago, clipLabel(item.status), clipLabel(item.line)].filter((x) => x !== "").join(", ");
+  return [item.name, item.ago, clipLabel(item.status), clipLabel(item.line), item.shortened ? SHORTENED_LABEL : ""]
+    .filter((x) => x !== "")
+    .join(", ");
 }
 
 /** Two items that draw the same: a card re-renders only when this is false. */

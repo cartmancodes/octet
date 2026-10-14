@@ -7,9 +7,6 @@ import { Button } from "../ui";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
 import type { Send } from "./send";
 
-/** Said on a card whose command the hub cut: Allow runs the whole of it. */
-export const CARD_SHORTENED = "Shortened — the full command is on the Mac. Review it before allowing.";
-
 interface InboxCardProps {
   item: InboxItem;
   /** The Mac can't be reached: the card is greyed and does nothing. */
@@ -36,7 +33,6 @@ function makeStyles(theme: Theme) {
     amber: { ...type.body, color: theme.amber },
     accent: { ...type.body, color: theme.accent },
     muted: { ...type.body, color: theme.muted },
-    note: { ...type.label, color: theme.amber },
     buttons: { flexDirection: "row", gap: spacing.sm },
     button: { flex: 1 },
   });
@@ -47,7 +43,8 @@ const LIGHT = makeStyles(light);
 /**
  * One session on the Inbox: its name and how long ago, the status line, and the excerpt. A card
  * with an approval answers it here: Allow once (Face ID, then armed 400 ms after it shows) and
- * Deny, or Review for a file edit. Every string is the Mac's and drawn as text.
+ * Deny, or Review for a file edit. A request the hub shortened offers Review in place of Allow
+ * once. Every string is the Mac's and drawn as text.
  */
 export const InboxCard = memo(function InboxCard({ item, offline, send, ledger, isFront, onOpen }: InboxCardProps) {
   const theme = useTheme();
@@ -81,7 +78,6 @@ export const InboxCard = memo(function InboxCard({ item, offline, send, ledger, 
         <Text numberOfLines={approval ? undefined : 1} style={s[item.statusTone]}>
           {item.status}
         </Text>
-        {item.shortened ? <Text style={s.note}>{CARD_SHORTENED}</Text> : null}
         {item.line !== "" ? (
           <Text numberOfLines={2} style={s.muted}>
             {item.line}
@@ -90,17 +86,25 @@ export const InboxCard = memo(function InboxCard({ item, offline, send, ledger, 
       </Pressable>
       {approval ? (
         <View style={s.buttons}>
-          <Button
-            label="Allow once"
-            accessibilityLabel={`Allow once for ${item.name}`}
-            variant="accent"
-            disabled={!answer.canAnswer}
-            busy={answer.busy}
-            onPress={allow}
-            style={s.button}
-          />
-          {item.editApproval ? (
+          {/* A shortened request is not all on the card: it is reviewed in the session, never
+              allowed from here. One Review is enough; Deny still answers a command. */}
+          {item.shortened ? (
             <Button label="Review" accessibilityLabel={`Review ${item.name}`} disabled={offline} onPress={open} style={s.button} />
+          ) : (
+            <Button
+              label="Allow once"
+              accessibilityLabel={`Allow once for ${item.name}`}
+              variant="accent"
+              disabled={!answer.canAnswer}
+              busy={answer.busy}
+              onPress={allow}
+              style={s.button}
+            />
+          )}
+          {item.editApproval ? (
+            item.shortened ? null : (
+              <Button label="Review" accessibilityLabel={`Review ${item.name}`} disabled={offline} onPress={open} style={s.button} />
+            )
           ) : (
             <Button
               label="Deny"

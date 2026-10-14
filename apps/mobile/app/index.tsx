@@ -1,6 +1,6 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
 import { useIsFocused, useRouter } from "expo-router";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -16,7 +16,7 @@ import { Mascot } from "../src/mascot/Mascot";
 import type { ApprovalInfo } from "../src/protocol";
 import { octetStore, useHub, useListed, useSessions } from "../src/store";
 import { spacing, type, useTheme } from "../src/theme";
-import { Button, Segmented } from "../src/ui";
+import { BAR_GAP, BAR_HEIGHT, Button, Segmented } from "../src/ui";
 
 /** The mascot is drawn at one whole multiple of its 59-unit width. */
 const MASCOT = 59;
@@ -31,10 +31,10 @@ const ALL_FROM = 2;
 
 type Tab = "needs" | "running" | "done";
 
-const EMPTY: Record<Tab, { pose: "success" | "sleeping"; text: string }> = {
-  needs: { pose: "success", text: "Nothing needs you." },
-  running: { pose: "sleeping", text: "Nothing running." },
-  done: { pose: "sleeping", text: "No finished sessions." },
+const EMPTY: Record<Tab, { pose: "success" | "sleeping"; text: string; offline: string }> = {
+  needs: { pose: "success", text: "Nothing needs you.", offline: "Nothing needs you (offline)." },
+  running: { pose: "sleeping", text: "Nothing running.", offline: "Nothing running (offline)." },
+  done: { pose: "sleeping", text: "No finished sessions.", offline: "No finished sessions (offline)." },
 };
 
 const keyOf = (item: InboxItem): string => item.id;
@@ -79,42 +79,64 @@ export default function Inbox() {
     return classify(sessions, fronts, { mac, now });
   }, [sessions, mac, now]);
 
-  // The answers out and given from this screen, shared by the cards and Allow all.
+  // The answers out and given from this screen, shared by the cards and Allow all. What it has
+  // given is read as a store, so Allow all's count drops the moment a card's answer is taken.
   const [ledger] = useState(createAnswerLedger);
-  const answerable = useMemo(
-    () => inbox.needs.flatMap((i) => (i.approval ? [{ session: i.id, approval: i.approval }] : [])),
+  const given = useSyncExternalStore(ledger.subscribe, ledger.snapshot, ledger.snapshot);
+  // Every front approval listed: the ledger forgets an answer once its request is gone.
+  const listedKeys = useMemo(
+    () => inbox.needs.flatMap((i) => (i.approval ? [approvalKey(i.id, i.approval)] : [])),
     [inbox.needs],
   );
+  useEffect(() => ledger.keep(listedKeys), [ledger, listedKeys]);
+  // What Allow all may answer: whole requests (a shortened one is reviewed in its session) not
+  // already answered from a card.
+  const answerable = useMemo(
+    () =>
+      inbox.needs.flatMap((i) =>
+        i.approval && !i.shortened && !given.has(approvalKey(i.id, i.approval)) ? [{ session: i.id, approval: i.approval }] : [],
+      ),
+    [inbox.needs, given],
+  );
   const keys = useMemo(() => answerable.map((a) => approvalKey(a.session, a.approval)), [answerable]);
-  useEffect(() => ledger.keep(keys), [ledger, keys]);
+  const batchKey = keys.join("\n");
 
-  // What is on screen and whether the link is up, for an Allow all awaiting Face ID: layout
-  // effects, so a change is seen in the commit that makes it.
+  // Allow all shows, and arms, only on Needs you: coming back to it arms it again.
+  const showAll = tab === "needs" && answerable.length >= ALL_FROM;
+  const allArmed = useArm(batchKey, reachable && showAll);
+
+  // What is drawn and whether the link is up, for an Allow all awaiting Face ID: layout effects,
+  // so a change is seen in the commit that makes it. `drops` moves on with each render while the
+  // Mac can't be reached: a link that dropped and came back during Face ID answers nothing.
   const shown = useRef<ReadonlySet<string>>(new Set());
   const down = useRef(offline);
+  const drops = useRef(0);
   useLayoutEffect(() => {
-    shown.current = new Set(keys);
+    shown.current = new Set(showAll ? keys : []);
     down.current = offline;
+    if (offline) drops.current += 1;
   });
 
-  const showAll = answerable.length >= ALL_FROM;
-  const allArmed = useArm(keys.join("\n"), reachable && showAll);
   const [batchBusy, setBatchBusy] = useState(false);
-  const [batchFailure, setBatchFailure] = useState<string | null>(null);
+  // Belongs to the requests it was for: it goes when they change.
+  const [batchError, setBatchError] = useState<{ batch: string; text: string } | null>(null);
+  const batchFailure = batchError && batchError.batch === batchKey ? batchError.text : null;
   const batchOut = useRef(false);
   const allowEvery = useCallback(async () => {
     if (batchOut.current || !allArmed || down.current) return;
     batchOut.current = true;
+    const batch = batchKey;
+    const since = drops.current;
     setBatchBusy(true);
-    setBatchFailure(null);
-    let given = 0;
+    setBatchError(null);
+    let taken = 0;
     try {
       const result = await allowAll(answerable, async ({ session, approval }) => {
-        // Each still on screen as it was when tapped (so shown and armed), still the session's
-        // front one, and not answered from its card: a request that closed or arrived since is
-        // left alone.
+        // Each still drawn as it was when tapped (so shown and armed), still the session's front
+        // one, and not answered from its card; and the link never dropped meanwhile. A request
+        // that closed or arrived since is left alone.
         const key = approvalKey(session, approval);
-        if (!alive() || down.current || !shown.current.has(key)) return;
+        if (!alive() || down.current || drops.current !== since || !shown.current.has(key)) return;
         const front = frontNow(session);
         if (!front || approvalKey(session, front) !== key) return;
         if (!ledger.claim(key)) return;
@@ -122,20 +144,20 @@ export default function Inbox() {
         try {
           await send({ type: "answer", session, approval: approval.id, allow: true });
           ok = true;
-          given += 1;
+          taken += 1;
         } catch (e) {
-          if (alive()) setBatchFailure(failure(e).text);
+          if (alive()) setBatchError({ batch, text: failure(e).text });
         } finally {
           ledger.finish(key, ok);
         }
       });
-      if (result === "unavailable" && alive()) setBatchFailure(NO_FACE_ID);
-      if (given > 0) successTap();
+      if (result === "unavailable" && alive()) setBatchError({ batch, text: NO_FACE_ID });
+      if (taken > 0) successTap();
     } finally {
       batchOut.current = false;
       if (alive()) setBatchBusy(false);
     }
-  }, [allArmed, answerable, alive, ledger, send]);
+  }, [allArmed, answerable, batchKey, alive, ledger, send]);
   const pressAll = useCallback(() => void allowEvery(), [allowEvery]);
 
   const open = useCallback((id: string) => router.push({ pathname: "/session/[id]", params: { id } }), [router]);
@@ -199,7 +221,7 @@ export default function Inbox() {
       ) : (
         <View style={styles.empty}>
           <Mascot pose={EMPTY[tab].pose} size={MASCOT} />
-          <Text style={[type.body, { color: theme.muted }]}>{EMPTY[tab].text}</Text>
+          <Text style={[type.body, { color: theme.muted }]}>{reachable ? EMPTY[tab].text : EMPTY[tab].offline}</Text>
         </View>
       ),
     [listed, reachable, tab, theme],
@@ -235,7 +257,7 @@ export default function Inbox() {
         onRefresh={refresh}
         contentContainerStyle={styles.list}
       />
-      <View style={[styles.bottom, { paddingBottom: Math.max(insets.bottom, spacing.lg) }]}>
+      <View style={[styles.bottom, { paddingBottom: Math.max(insets.bottom, BAR_GAP) }]}>
         {batchFailure ? <Text style={[type.body, { color: theme.amber }]}>{batchFailure}</Text> : null}
         {showAll ? (
           <Button
@@ -269,5 +291,5 @@ const styles = StyleSheet.create({
   gap: { height: spacing.md },
   empty: { alignItems: "center", gap: 14, padding: spacing.xl },
   bottom: { paddingHorizontal: 20, paddingTop: spacing.md, gap: spacing.sm },
-  main: { minHeight: 52 },
+  main: { minHeight: BAR_HEIGHT },
 });

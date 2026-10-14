@@ -128,6 +128,15 @@ describe("classify", () => {
     expect(item?.shortened).toBe(true);
   });
 
+  it("a file list the hub cut (+N more) is shortened too; a whole one is not", () => {
+    const list = run([
+      info("a", { approvals: 1, approval: gist(1, { action: "Edit", command: null, files: ["a.rs", "b.rs", "c.rs", "+2 more"] }) }),
+      info("b", { approvals: 1, approval: gist(2, { action: "Edit", command: null, files: ["a.rs", "+2 more.rs"] }) }),
+    ]).needs;
+    expect(list.find((i) => i.id === "a")).toMatchObject({ shortened: true, editApproval: true });
+    expect(list.find((i) => i.id === "b")?.shortened).toBe(false);
+  });
+
   it("a session waiting without a gist still needs you, with nothing to answer from here", () => {
     const [item] = run([info("a", { approvals: 1 })]).needs;
     expect(item).toMatchObject({ statusTone: "amber", approval: null, editApproval: false, line: NO_GIST_LINE });
@@ -179,6 +188,12 @@ describe("classify", () => {
 });
 
 describe("cardLabel", () => {
+  it("says when the request is shortened, since the card offers Review then", () => {
+    const [item] = run([info("a", { approvals: 1, approval: gist(1, { command: "cat <<EOF…" }) })]).needs;
+    if (!item) throw new Error("no item");
+    expect(cardLabel(item)).toMatch(/, Shortened: review it in the session$/);
+  });
+
   it("reads the name, how long ago, the status and the line, each clipped", () => {
     const [item] = run([info("a", { goal: "g".repeat(500), last_activity: NOW_S - 60 })]).done;
     if (!item) throw new Error("no item");

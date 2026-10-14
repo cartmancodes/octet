@@ -16,6 +16,7 @@ import * as inboxWords from "./inbox";
 import { saveSettings } from "./persist";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { octetStore } from "./store";
+import { hideToast } from "./toast";
 import { dark, light } from "./theme";
 
 jest.mock("expo-camera", () => ({
@@ -58,7 +59,10 @@ beforeEach(async () => {
   auth.authenticateAsync.mockClear();
   jest.mocked(Haptics.notificationAsync).mockClear();
 });
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => {
+  hideToast();
+  jest.restoreAllMocks();
+});
 
 /** Opens the app on the Inbox, paired and connected to a Mac that lists `list`. */
 async function launch(list: SessionInfo[] | null) {
@@ -282,9 +286,52 @@ describe("the Inbox", () => {
       expect(rig.view.getPathname()).toBe("/session/a");
     });
 
-    it("says when the hub shortened the command", async () => {
-      await launch([waiting("a", gist(1, { command: "cat > x <<EOF…" }))]);
-      expect(inCard("a").getByText(/^Shortened/)).toBeTruthy();
+    it("a command the hub cut offers Review in place of Allow once, and still Deny", async () => {
+      const rig = await launch([waiting("a", gist(1, { command: "cat > x <<EOF…" }))]);
+      await wait(400);
+      const c = inCard("a");
+      expect(c.queryByRole("button", { name: /^Allow once/ })).toBeNull();
+      expect(c.getAllByRole("button", { name: "Review a" })).toHaveLength(1);
+      expect(c.getByRole("button", { name: "Deny for a" })).toBeTruthy();
+      // No note drawn on the card: the label says it.
+      expect(c.queryByText(/^Shortened/)).toBeNull();
+      expect(c.getByRole("button", { name: /^a, / }).props.accessibilityLabel).toMatch(/Shortened: review it in the session$/);
+      await fireEvent.press(c.getByRole("button", { name: "Review a" }));
+      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(answers(rig)).toEqual([]);
+    });
+
+    it("a file list the hub cut offers one Review and nothing to allow", async () => {
+      await launch([waiting("a", gist(1, { action: "Edit", command: null, files: ["a.rs", "b.rs", "c.rs", "+2 more"] }))]);
+      const c = inCard("a");
+      expect(c.queryByRole("button", { name: /^Allow once/ })).toBeNull();
+      expect(c.queryByRole("button", { name: /^Deny/ })).toBeNull();
+      expect(c.getAllByRole("button", { name: "Review a" })).toHaveLength(1);
+    });
+
+    it("sends nothing when the link drops and comes back while Face ID is up, and arms again", async () => {
+      await saveSettings({ faceId: true });
+      const rig = await launch([waiting("a", gist(1))]);
+      await wait(400);
+      const pass = deferAuth();
+      await fireEvent.press(inCard("a").getByRole("button", { name: "Allow once for a" }));
+      await flush();
+      await act(async () => {
+        rig.sockets.last.drop();
+      });
+      await act(async () => {
+        rig.clock.advance(60_000);
+        rig.sockets.last.open();
+        rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+        rig.clock.advance(50);
+      });
+      expect(screen.getByText("● studio-mac · online")).toBeTruthy();
+      await pass();
+      expect(answers(rig)).toEqual([]);
+      const allow = () => inCard("a").getByRole("button", { name: "Allow once for a" });
+      expect(disabled(allow())).toBe(true);
+      await wait(400);
+      expect(disabled(allow())).toBe(false);
     });
 
     it("draws hub strings as plain text", async () => {
@@ -404,6 +451,72 @@ describe("the Inbox", () => {
       expect(answered(rig)).toEqual([{ session: "b", approval: 2, allow: true }]);
     });
 
+    it("leaves out a shortened request: not counted, not answered", async () => {
+      const rig = await launch([
+        waiting("a", gist(1), { last_activity: 30 }),
+        waiting("b", gist(2, { command: "cat <<EOF…" }), { last_activity: 20 }),
+        waiting("c", gist(3), { last_activity: 10 }),
+      ]);
+      await wait(400);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow all 2 once" }));
+      await flush();
+      expect(answered(rig)).toEqual([
+        { session: "a", approval: 1, allow: true },
+        { session: "c", approval: 3, allow: true },
+      ]);
+    });
+
+    it("is New session with a shortened request and one other", async () => {
+      await launch([waiting("a", gist(1)), waiting("b", gist(2, { files: ["x", "+1 more"], command: null, action: "Edit" }))]);
+      expect(screen.queryByRole("button", { name: /^Allow all/ })).toBeNull();
+      expect(screen.getByRole("button", { name: "Start a new session" })).toBeTruthy();
+    });
+
+    it("shows only on Needs you, and arms again on coming back to it", async () => {
+      const rig = await launch([waiting("a", gist(1)), waiting("b", gist(2)), info("r", { phase: "running" })]);
+      await wait(400);
+      expect(disabled(screen.getByRole("button", { name: "Allow all 2 once" }))).toBe(false);
+      await fireEvent.press(tab("Running 1"));
+      expect(screen.queryByRole("button", { name: /^Allow all/ })).toBeNull();
+      expect(screen.getByRole("button", { name: "Start a new session" })).toBeTruthy();
+      await fireEvent.press(tab("Done"));
+      expect(screen.queryByRole("button", { name: /^Allow all/ })).toBeNull();
+      await fireEvent.press(tab("Needs you 2"));
+      const all = () => screen.getByRole("button", { name: "Allow all 2 once" });
+      expect(disabled(all())).toBe(true);
+      await fireEvent.press(all());
+      await flush();
+      expect(answers(rig)).toEqual([]);
+      await wait(400);
+      expect(disabled(all())).toBe(false);
+    });
+
+    it("does not count a request already answered from its card", async () => {
+      const rig = await launch([waiting("a", gist(1)), waiting("b", gist(2)), waiting("c", gist(3))]);
+      await wait(400);
+      await fireEvent.press(inCard("a").getByRole("button", { name: "Allow once for a" }));
+      await flush();
+      const [sent] = answers(rig);
+      await act(async () => {
+        rig.sockets.last.receive({ type: "ack", req: sent?.req, message: "ok" });
+      });
+      expect(screen.getByRole("button", { name: "Allow all 2 once" })).toBeTruthy();
+    });
+
+    it("its refusal clears when the requests change", async () => {
+      const rig = await launch([waiting("a", gist(1)), waiting("b", gist(2))]);
+      await wait(400);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow all 2 once" }));
+      await flush();
+      const [first] = answers(rig);
+      await act(async () => {
+        rig.sockets.last.receive({ type: "refused", req: first?.req, reason: "The Mac is busy", code: "busy" });
+      });
+      expect(screen.getByText("The Mac is busy")).toBeTruthy();
+      await hear(rig, [waiting("a", gist(1)), waiting("b", gist(2)), waiting("c", gist(3))]);
+      expect(screen.queryByText("The Mac is busy")).toBeNull();
+    });
+
     it("Allow all sends nothing when Face ID fails", async () => {
       await saveSettings({ faceId: true });
       auth.authenticateAsync.mockResolvedValueOnce({ success: false, error: "user_cancel" });
@@ -449,6 +562,18 @@ describe("the Inbox", () => {
       await fireEvent.press(tab("Done"));
       expect(screen.getByText("No finished sessions.")).toBeTruthy();
       expect(mascot().props.accessibilityLabel).toBe("Octet, sleeping");
+    });
+
+    it("offline, each says so", async () => {
+      const rig = await launch([]);
+      await act(async () => {
+        rig.sockets.last.drop();
+      });
+      expect(screen.getByText("Nothing needs you (offline).")).toBeTruthy();
+      await fireEvent.press(tab("Running"));
+      expect(screen.getByText("Nothing running (offline).")).toBeTruthy();
+      await fireEvent.press(tab("Done"));
+      expect(screen.getByText("No finished sessions (offline).")).toBeTruthy();
     });
 
     it("says it is loading until the Mac sends the list, not that there are none", async () => {

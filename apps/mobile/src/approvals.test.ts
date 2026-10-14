@@ -70,6 +70,27 @@ describe("the answer ledger", () => {
     expect(ledger.claim(key)).toBe(false);
   });
 
+  it("publishes what it has given as a new set on each change, for a screen to count", () => {
+    const ledger = createAnswerLedger();
+    const key = approvalKey("s", gist(1));
+    const heard = jest.fn();
+    const off = ledger.subscribe(heard);
+    const before = ledger.snapshot();
+    ledger.claim(key);
+    ledger.finish(key, false);
+    expect(heard).not.toHaveBeenCalled();
+    expect(ledger.snapshot()).toBe(before);
+    ledger.claim(key);
+    ledger.finish(key, true);
+    expect(heard).toHaveBeenCalledTimes(1);
+    expect(ledger.snapshot().has(key)).toBe(true);
+    expect(ledger.given(key)).toBe(true);
+    ledger.keep([]);
+    expect(heard).toHaveBeenCalledTimes(2);
+    expect(ledger.snapshot().has(key)).toBe(false);
+    off();
+  });
+
   it("forgets a request that is no longer listed, so one that comes back is new", () => {
     const ledger = createAnswerLedger();
     const key = approvalKey("s", gist(1));

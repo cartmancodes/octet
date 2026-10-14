@@ -1,9 +1,18 @@
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import { StyleSheet, Text } from "react-native";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { dark, light, radius, type } from "../theme";
 import { hideToast, showToast, TOAST_MS, toastStore } from "../toast";
-import { Button, Card, Chip, Label, Segmented, ToastHost } from "./index";
+import { BAR_HEIGHT, Button, Card, Chip, Label, Segmented, ToastHost as BareToastHost } from "./index";
+
+const METRICS = { frame: { x: 0, y: 0, width: 390, height: 844 }, insets: { top: 47, left: 0, right: 0, bottom: 34 } };
+/** The host as the app has it: inside the safe area. */
+const ToastHost = () => (
+  <SafeAreaProvider initialMetrics={METRICS}>
+    <BareToastHost />
+  </SafeAreaProvider>
+);
 
 const style = (node: { props: { style?: unknown } }) => StyleSheet.flatten(node.props.style as never) as Record<string, unknown>;
 
@@ -11,7 +20,10 @@ beforeEach(() => {
   jest.useFakeTimers();
   hideToast();
 });
-afterEach(() => jest.useRealTimers());
+afterEach(() => {
+  hideToast();
+  jest.useRealTimers();
+});
 
 describe("Card", () => {
   it("has a 1 px edge border, a 12 px radius, and its title notched into the top border", async () => {
@@ -168,6 +180,13 @@ describe("Toast", () => {
     await fireEvent.press(button);
     expect(view).toHaveBeenCalledTimes(1);
     expect(screen.queryByText("octet needs approval")).toBeNull();
+  });
+
+  it("sits above a screen's bottom button and the home indicator", async () => {
+    await render(<ToastHost />);
+    await act(async () => showToast("hello"));
+    const wrap = style(screen.getByTestId("toast-wrap"));
+    expect(Number(wrap.bottom)).toBeGreaterThanOrEqual(METRICS.insets.bottom + BAR_HEIGHT);
   });
 
   it("is a polite live region and draws the text as text", async () => {
