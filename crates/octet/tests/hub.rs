@@ -68,38 +68,9 @@ impl World {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("data directory");
         let hub_log = PathBuf::from("/tmp").join(format!("{id}.hub.log"));
-        let port = {
-            let probe = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
-            probe.local_addr().expect("an address").port()
-        };
-        let log = File::create(&hub_log).expect("hub log");
-        // The hub only pairs phones once `tailscale serve` publishes it, so a fake `tailscale`
-        // answers `serve status --json` with the hub's port proxied at a tailnet name.
         let bin = PathBuf::from("/tmp").join(format!("{id}.bin"));
         std::fs::create_dir_all(&bin).expect("fake tailscale directory");
-        let served = json!({
-            "TCP": {"443": {"HTTPS": true}},
-            "Web": {"mac.tail1234.ts.net:443": {"Handlers": {"/": {
-                "Proxy": format!("http://127.0.0.1:{port}")}}}},
-        });
-        let script = bin.join("tailscale");
-        std::fs::write(&script, format!("#!/bin/sh\necho '{served}'\n")).expect("fake tailscale");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let hub = Command::new(env!("CARGO_BIN_EXE_octet"))
-            .env("PATH", path)
-            .args(["hub", "--journal-dir"])
-            .arg(&dir)
-            .args(["--port", &port.to_string(), "--owner", OWNER])
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().expect("log handle"))
-            .stderr(log)
-            .spawn()
-            .expect("the hub starts");
+        let (hub, port) = spawn_hub(&dir, &hub_log, &bin).await;
         let (tui, screen, master, slave) = spawn_interface(&dir);
         let mut world = Self {
             dir,
@@ -420,6 +391,86 @@ impl Events {
 
 /// An `octet` interface on a PTY (`--engine codex` against the fake vendor), the output reader's
 /// shared buffer and the terminal's two ends.
+/// How many ports [`spawn_hub`] tries: a port found free can be taken by a parallel test before
+/// the hub binds it.
+const PORT_TRIES: usize = 5;
+
+/// Starts `octet hub` on a free loopback port, behind a fake `tailscale` in `bin` that answers
+/// `serve status --json` with that port proxied at a tailnet name (the hub only pairs phones once
+/// it is published). Another port is tried when the one found free was taken before the hub
+/// could listen on it.
+async fn spawn_hub(dir: &Path, hub_log: &Path, bin: &Path) -> (Child, u16) {
+    for _ in 0..PORT_TRIES {
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+            probe.local_addr().expect("an address").port()
+        };
+        let served = json!({
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"mac.tail1234.ts.net:443": {"Handlers": {"/": {
+                "Proxy": format!("http://127.0.0.1:{port}")}}}},
+        });
+        let script = bin.join("tailscale");
+        std::fs::write(&script, format!("#!/bin/sh\necho '{served}'\n")).expect("fake tailscale");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let log = File::create(hub_log).expect("hub log");
+        let mut hub = Command::new(env!("CARGO_BIN_EXE_octet"))
+            .env("PATH", path)
+            .args(["hub", "--journal-dir"])
+            .arg(dir)
+            .args(["--port", &port.to_string(), "--owner", OWNER])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().expect("log handle"))
+            .stderr(log)
+            .spawn()
+            .expect("the hub starts");
+        // The control socket is bound before the port, so only an answer to `status`, which
+        // the hub gives once both are bound, says the port is the hub's.
+        let limit = tokio::time::Instant::now() + WAIT;
+        loop {
+            if hub_status(dir).await.is_some() {
+                return (hub, port);
+            }
+            if let Some(status) = hub.try_wait().expect("wait") {
+                let output = std::fs::read_to_string(hub_log).unwrap_or_default();
+                assert!(
+                    output.contains("Address already in use"),
+                    "the hub exited early ({status})\n{output}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < limit,
+                "timed out: the hub answers on hub.sock\n{}",
+                std::fs::read_to_string(hub_log).unwrap_or_default()
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+    panic!("no free port held long enough for the hub in {PORT_TRIES} tries");
+}
+
+/// The hub's answer to `status` on its control socket, if it gives one within a second.
+async fn hub_status(dir: &Path) -> Option<Value> {
+    let ask = async {
+        let mut stream = UnixStream::connect(dir.join("run").join("hub.sock"))
+            .await
+            .ok()?;
+        stream.write_all(b"{\"type\":\"status\"}\n").await.ok()?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).await.ok()?;
+        serde_json::from_str::<Value>(&line)
+            .ok()
+            .filter(|v| v.get("port").is_some())
+    };
+    timeout(Duration::from_secs(1), ask).await.ok().flatten()
+}
+
 fn spawn_interface(dir: &Path) -> (Child, Arc<Mutex<Vec<u8>>>, File, File) {
     let mut master = -1;
     let mut slave = -1;

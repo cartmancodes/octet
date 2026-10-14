@@ -911,6 +911,19 @@ mod tests {
             UnixListener::bind(&registration.socket).unwrap()
         }
 
+        /// Waits until nothing listens on `registration`'s socket any more. On macOS a socket
+        /// is made close-on-exec only after it is made, so a child another test spawns in that
+        /// moment (a `sleep 5`, say) keeps a dropped listener open until it exits.
+        async fn refused(registration: &Registration) {
+            timeout(Duration::from_secs(10), async {
+                while std::os::unix::net::UnixStream::connect(&registration.socket).is_ok() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the dropped listener's socket refuses");
+        }
+
         fn journal(&self, name: &str, seqs: std::ops::Range<u64>) {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
@@ -1201,6 +1214,7 @@ mod tests {
         // A stale socket file nobody listens on.
         drop(Env::listen(&dead));
         assert!(dead.socket.exists());
+        Env::refused(&dead).await;
         let mut sessions = Sessions::new(env.run.clone());
         sessions.refresh().await;
         assert!(sessions.list().is_empty());
