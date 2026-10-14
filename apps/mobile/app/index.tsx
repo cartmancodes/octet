@@ -165,8 +165,7 @@ export default function Inbox() {
   const pressAll = useCallback(() => void allowEvery(), [allowEvery]);
 
   const open = useCallback((id: string) => router.push({ pathname: "/session/[id]", params: { id } }), [router]);
-  // New session is Task 4's screen; until then, Recent and new starts one.
-  const openNew = useCallback(() => router.push("/recent"), [router]);
+  const openNew = useCallback(() => router.push("/new"), [router]);
   const openMenu = useCallback(() => openDrawer(), []);
 
   const renderItem = useCallback<ListRenderItem<InboxItem>>(

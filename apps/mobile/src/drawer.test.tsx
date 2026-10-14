@@ -21,6 +21,7 @@ const waiting = (id: string, approval: ApprovalInfo, extra: Partial<SessionInfo>
 const ROUTES = {
   settings: () => <Text>Settings screen</Text>,
   recent: () => <Text>Recent screen</Text>,
+  new: () => <Text>New session screen</Text>,
 };
 
 beforeEach(async () => {
@@ -319,7 +320,7 @@ describe("the drawer", () => {
       expect(Number(style(plus).height)).toBeGreaterThanOrEqual(44);
       expect(Number(style(plus).width)).toBeGreaterThanOrEqual(44);
       await fireEvent.press(plus);
-      expect(rig.view.getPathname()).toBe("/recent");
+      expect(rig.view.getPathname()).toBe("/new");
       expect(drawerStore.getState().open).toBe(false);
     });
 

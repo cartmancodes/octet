@@ -74,6 +74,7 @@ async function launch(opts: { paired?: boolean } = {}) {
     pair: Pair,
     "session/[id]": () => null,
     recent: () => null,
+    new: () => null,
     settings: () => null,
   });
   await view;
@@ -103,7 +104,7 @@ describe("the app shell", () => {
       </HubContext.Provider>
     );
     const view = renderRouter(
-      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text>, recent: () => null, settings: () => null },
+      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text>, recent: () => null, new: () => null, settings: () => null },
       { initialUrl: "/session/x" },
     );
     await view;

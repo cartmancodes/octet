@@ -1,0 +1,274 @@
+import { Stack, useIsFocused, useRouter } from "expo-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { FullAccessConfirm } from "../src/components/FullAccessConfirm";
+import { FULL_ACCESS_WORDS, useFullAccessArm } from "../src/components/fullAccess";
+import { HubBanner } from "../src/components/HubBanner";
+import { NewChips } from "../src/components/NewChips";
+import { failure, isSlash, PROMPT_LIMIT, SLASH_NOTE, TOO_LONG, utf8Bytes } from "../src/components/send";
+import { lightTap } from "../src/haptics";
+import { useHubClient } from "../src/hub";
+import { macName } from "../src/inbox";
+import type { Engine, Mode } from "../src/protocol";
+import { modelsFor } from "../src/recent";
+import { sessionName } from "../src/sessions";
+import { NO_WORKSPACE, useStartSession, useWorkspaceChoices, type StartBody } from "../src/start";
+import { useCatalogs, useHub } from "../src/store";
+import { spacing, type, useTheme } from "../src/theme";
+import { showToast } from "../src/toast";
+
+const BIOMETRIC_REASON = "Start a session with full access";
+const EMPTY_PROMPT = "Write a prompt first.";
+const ARMED_HINT = `Type ${FULL_ACCESS_WORDS} below to start.`;
+
+const ENGINES: readonly Engine[] = ["claude", "codex"];
+/** What a tap on the mode chip cycles through: full access is never one of these. */
+const MODES: readonly Mode[] = ["ask", "accept-edits", "auto"];
+
+/** Why `text` cannot be the first prompt, or null. */
+function refusal(text: string): string | null {
+  if (text.trim() === "") return EMPTY_PROMPT;
+  if (isSlash(text)) return SLASH_NOTE;
+  if (utf8Bytes(text) > PROMPT_LIMIT) return TOO_LONG;
+  return null;
+}
+
+/**
+ * A new session: write the first prompt, choose where and how it runs, and Start. The Mac starts
+ * the session; when it is listed the prompt goes to it and the conversation opens. Full access
+ * asks for Face ID and then the typed words before it sends anything, every time.
+ */
+export default function NewSession() {
+  const theme = useTheme();
+  const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const focused = useIsFocused();
+  const hub = useHub();
+  const client = useHubClient();
+  const catalogs = useCatalogs();
+  const workspaces = useWorkspaceChoices();
+  const [text, setText] = useState("");
+  const [engine, setEngine] = useState<Engine>("claude");
+  const [folder, setFolder] = useState<string | null>(null);
+  const [mode, setMode] = useState<Mode>("ask");
+  // The prompt to send when the session shows: what the user started with.
+  const pending = useRef("");
+
+  const sendPrompt = useRef<(id: string, text: string) => void>(() => undefined);
+  // The first prompt goes to the launched session, and the conversation opens whether or not the
+  // Mac takes it: a refusal is a toast, in the hub's words.
+  const listed = useCallback(
+    (id: string) => {
+      sendPrompt.current(id, pending.current);
+      router.replace({ pathname: "/session/[id]", params: { id } });
+    },
+    [router],
+  );
+  const { send, start, failed, fail, locked, notice } = useStartSession(listed);
+  useEffect(() => {
+    sendPrompt.current = (id, prompt) => {
+      send({ type: "prompt", session: id, text: prompt }).catch((error: unknown) => showToast(failure(error).text));
+    };
+  }, [send]);
+
+  // A refused start (or a phone with no Face ID) is a toast.
+  useEffect(() => {
+    if (failed) showToast(failed.text);
+  }, [failed]);
+
+  // What will be sent: a workspace that has left the list is replaced by the first, and the
+  // full-access approval goes with it (it is part of its key).
+  const workspace = folder !== null && workspaces.includes(folder) ? folder : (workspaces[0] ?? null);
+  const model = modelsFor(catalogs, engine)[0] ?? null;
+  const selection = model?.selection ?? null;
+
+  const full = useFullAccessArm({
+    reason: BIOMETRIC_REASON,
+    key: JSON.stringify([engine, workspace, selection, null, "full-access"]),
+    failed,
+    fail,
+  });
+  const { armed, arm, disarm, checking } = full;
+
+  const bodyOf = useCallback(
+    (full: boolean): StartBody | null => {
+      if (workspace === null) return null;
+      return {
+        type: "start",
+        engine,
+        workspace,
+        ...(selection !== null ? { model: selection } : {}),
+        mode: full ? "full-access" : mode,
+        ...(full ? { confirm: FULL_ACCESS_WORDS } : {}),
+      };
+    },
+    [engine, workspace, selection, mode],
+  );
+
+  /** Checks the prompt and the workspace, then starts. Nothing is spent unless it sends. */
+  const begin = useCallback(
+    (fullAccess: boolean): boolean => {
+      const why = refusal(text);
+      if (why !== null) {
+        showToast(why);
+        return false;
+      }
+      const body = bodyOf(fullAccess);
+      if (body === null) {
+        showToast(NO_WORKSPACE);
+        return false;
+      }
+      lightTap();
+      pending.current = text;
+      start(body);
+      return true;
+    },
+    [text, bodyOf, start],
+  );
+
+  const onStart = useCallback(() => {
+    if (locked || checking()) return;
+    if (armed) {
+      showToast(ARMED_HINT);
+      return;
+    }
+    begin(false);
+  }, [locked, checking, armed, begin]);
+  const turnOn = useCallback(() => {
+    if (locked || !armed) return;
+    if (begin(true)) disarm(); // sent: the approval is spent
+  }, [locked, armed, begin, disarm]);
+  const cancelFull = useCallback(() => {
+    disarm();
+    fail(null);
+  }, [disarm, fail]);
+
+  const onMac = useCallback(() => showToast(`Sessions start on ${macName(client?.url)}.`), [client]);
+  const onFolder = useCallback(() => {
+    if (workspaces.length === 0) {
+      showToast(NO_WORKSPACE);
+      return;
+    }
+    disarm();
+    const at = workspace === null ? -1 : workspaces.indexOf(workspace);
+    setFolder(workspaces[(at + 1) % workspaces.length] ?? null);
+  }, [workspaces, workspace, disarm]);
+  const onEngine = useCallback(() => {
+    disarm();
+    setEngine((e) => ENGINES[(ENGINES.indexOf(e) + 1) % ENGINES.length] ?? "claude");
+  }, [disarm]);
+  const onMode = useCallback(() => {
+    disarm();
+    setMode((m) => MODES[(MODES.indexOf(m) + 1) % MODES.length] ?? "ask");
+  }, [disarm]);
+  // Face ID asks for exactly this form; a phone that is offline or busy asks nothing.
+  const onFullAccess = useCallback(() => {
+    if (locked || checking()) return;
+    fail(null);
+    disarm();
+    void arm();
+  }, [locked, checking, fail, disarm, arm]);
+
+  const cancel = useCallback(() => {
+    if (router.canGoBack()) router.back();
+    else router.replace("/");
+  }, [router]);
+  const resume = useCallback(() => router.push("/recent"), [router]);
+
+  const engineModel = `${engine} / ${model?.name ?? "default"}`;
+  const online = hub === "ready";
+  const startOff = locked;
+  const hasText = text.trim() !== "";
+  const startColor = hasText && !startOff ? theme.accent : theme.muted;
+  const styles = useMemo(() => makeStyles(insets.top, insets.bottom), [insets.top, insets.bottom]);
+
+  return (
+    <KeyboardAvoidingView
+      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      style={[styles.screen, { backgroundColor: theme.bg }]}
+    >
+      <Stack.Screen options={{ title: "New session", headerShown: false }} />
+      <View style={styles.header}>
+        <Pressable accessibilityRole="button" accessibilityLabel="Cancel" onPress={cancel} style={styles.side}>
+          <Text style={[type.body, { color: theme.muted }]}>Cancel</Text>
+        </Pressable>
+        <Text accessibilityRole="header" style={[type.body, styles.title, { color: theme.fg }]}>
+          New session
+        </Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Start session"
+          accessibilityState={{ disabled: startOff, busy: locked }}
+          disabled={startOff}
+          onPress={onStart}
+          style={styles.side}
+        >
+          <Text style={[type.body, styles.start, { color: startColor }]}>Start ↑</Text>
+        </Pressable>
+      </View>
+      <HubBanner state={hub} announce={focused} />
+      <TextInput
+        accessibilityLabel="What should the agent do?"
+        placeholder="What should the agent do?"
+        placeholderTextColor={theme.muted}
+        multiline
+        autoFocus
+        spellCheck={false}
+        textAlignVertical="top"
+        selectionColor={theme.accent}
+        cursorColor={theme.accent}
+        value={text}
+        onChangeText={setText}
+        style={[type.body, styles.field, { color: theme.fg }]}
+      />
+      {notice ? (
+        <Text accessibilityLiveRegion="polite" style={[type.body, styles.notice, { color: theme.muted }]}>
+          {notice}
+        </Text>
+      ) : null}
+      {armed ? <FullAccessConfirm busy={locked} onTurnOn={turnOn} onCancel={cancelFull} /> : null}
+      <NewChips
+        mac={macName(client?.url)}
+        online={online}
+        folder={workspace === null ? "" : sessionName(workspace)}
+        engineModel={engineModel}
+        mode={armed ? "full access" : mode}
+        fullAccess={armed}
+        onMac={onMac}
+        onFolder={onFolder}
+        onEngine={onEngine}
+        onMode={onMode}
+        onFullAccess={onFullAccess}
+      />
+      <Pressable accessibilityRole="button" accessibilityLabel="Resume a past session" onPress={resume} style={styles.resume}>
+        <Text style={[type.body, { color: theme.muted }]}>Resume a past session ›</Text>
+      </Pressable>
+    </KeyboardAvoidingView>
+  );
+}
+
+function makeStyles(top: number, bottom: number) {
+  return StyleSheet.create({
+    screen: { flex: 1, paddingTop: top },
+    header: {
+      height: 48,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      paddingHorizontal: spacing.md,
+    },
+    side: { minHeight: 44, minWidth: 44, justifyContent: "center", paddingHorizontal: spacing.sm },
+    title: { fontWeight: "700" },
+    start: { fontWeight: "700" },
+    field: { flex: 1, paddingHorizontal: 20, paddingVertical: spacing.lg },
+    notice: { paddingHorizontal: spacing.lg, paddingBottom: spacing.sm },
+    resume: {
+      minHeight: 44,
+      justifyContent: "center",
+      paddingHorizontal: spacing.lg + spacing.xs,
+      marginBottom: Math.max(bottom, spacing.lg),
+    },
+  });
+}

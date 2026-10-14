@@ -89,6 +89,7 @@ async function launch(list: SessionInfo[] | null) {
       return <Text testID="opened">{useLocalSearchParams<{ id: string }>().id}</Text>;
     },
     recent: () => <Text>Recent screen</Text>,
+    new: () => <Text>New session screen</Text>,
     settings: () => <Text>Settings screen</Text>,
   });
   await view;
@@ -158,7 +159,7 @@ describe("the Inbox", () => {
         expect(Number(style(b).minWidth)).toBeGreaterThanOrEqual(44);
       }
       await fireEvent.press(plus);
-      expect(view.getPathname()).toBe("/recent");
+      expect(view.getPathname()).toBe("/new");
     });
 
     it("the menu opens the drawer, and Settings stays in reach there", async () => {
@@ -470,7 +471,7 @@ describe("the Inbox", () => {
       const button = screen.getByRole("button", { name: "Start a new session" });
       expect(within(button).getByText("New session")).toBeTruthy();
       await fireEvent.press(button);
-      expect(view.getPathname()).toBe("/recent");
+      expect(view.getPathname()).toBe("/new");
     });
 
     it("is Allow all N once with two or more, armed 400 ms after they show", async () => {

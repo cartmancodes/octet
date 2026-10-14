@@ -232,10 +232,9 @@ export function Drawer() {
     closeDrawer();
     if (pathname !== "/settings") router.navigate("/settings");
   }, [pathname, router]);
-  // New session is Task 4's screen; until then, Recent and new starts one.
   const goNew = useCallback(() => {
     closeDrawer();
-    router.push("/recent");
+    router.push("/new");
   }, [router]);
   const goSession = useCallback(
     (id: string) => {
