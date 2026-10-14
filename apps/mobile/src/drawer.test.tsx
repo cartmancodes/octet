@@ -49,7 +49,7 @@ async function openFromMenu() {
   await wait(DRAWER_MS + 20);
 }
 
-/** The Conversation has no ☰ yet: its drawer opens from the edge, or here. */
+/** Opens the drawer straight from its store, as the edge swipe and the Conversation's ☰ do. */
 async function openFromStore() {
   await act(async () => openDrawer());
   await wait(DRAWER_MS + 20);

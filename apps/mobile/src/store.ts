@@ -21,6 +21,7 @@ import { clearParsed } from "./markdown/blocks";
 import type { Entry } from "./model/transcript";
 import { FIELD_CHARS, field } from "./model/text";
 import { isKnownEvent, type ApprovalInfo, type CatalogInfo, type SessionInfo } from "./protocol";
+import type { SessionHead } from "./session";
 
 export interface OctetState {
   /** The live sessions, as the hub listed them last. */
@@ -454,6 +455,16 @@ export function bindHooks(store: OctetStore) {
     /** The listed sessions; the same array until the list changes. */
     useSessions: (): SessionInfo[] => useStore(store, useShallow((s) => s.sessions)),
     useSessionInfo: (id: string): SessionInfo | undefined => useStore(store, (s) => s.sessions.find((x) => x.id === id)),
+    /** What a session's header says of it from the list (workspace, engine, model, mode): new only
+     * when one of those changes, not with its NOW line or phase. */
+    useSessionHead: (id: string): SessionHead =>
+      useStore(
+        store,
+        useShallow((s) => {
+          const info = s.sessions.find((x) => x.id === id);
+          return { workspace: info?.workspace, engine: info?.engine, model: info?.model ?? undefined, mode: info?.mode };
+        }),
+      ),
     /** A session's transcript entries: new only when an entry was added or changed. During a
      * replay from the start that has brought nothing yet, the entries shown before it. */
     useEntries: (id: string): Entry[] =>
@@ -512,6 +523,7 @@ export const {
   useSession,
   useSessions,
   useSessionInfo,
+  useSessionHead,
   useEntries,
   useSessionState,
   useSessionStatus,

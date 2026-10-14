@@ -3,7 +3,8 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { Entry } from "../model/transcript";
 import { callRows, moreCalls, moreLines, summary, toolRows, type ToolRow } from "../model/summary";
-import { dark, light, spacing, type, useTheme, type Theme } from "../theme";
+import { DEFAULT_SETTINGS, TEXT_SIZES, type TextSize } from "../persist";
+import { MONO, dark, light, spacing, useTheme, type Theme } from "../theme";
 
 export type ToolsEntry = Extract<Entry, { kind: "tools" }>;
 
@@ -13,19 +14,24 @@ interface ToolRunProps {
   open: boolean;
   /** Called with the entry's key. Must be stable, or every row re-renders with the list. */
   onToggle: (key: string) => void;
+  /** The transcript's text size. */
+  size?: TextSize;
 }
 
-function makeStyles(theme: Theme) {
+function makeStyles(theme: Theme, size: TextSize) {
+  const mono = { fontFamily: MONO, fontSize: size, lineHeight: size + 5 };
   return StyleSheet.create({
     run: { minHeight: 44, justifyContent: "center", gap: spacing.xs, paddingVertical: spacing.xs },
-    head: { ...type.mono, color: theme.muted },
-    failed: { ...type.mono, color: theme.amber },
-    detail: { ...type.mono, color: theme.muted, paddingLeft: spacing.lg },
+    head: { ...mono, color: theme.muted },
+    failed: { ...mono, color: theme.amber },
+    detail: { ...mono, color: theme.muted, paddingLeft: spacing.lg },
   });
 }
 type Styles = ReturnType<typeof makeStyles>;
-const DARK = makeStyles(dark);
-const LIGHT = makeStyles(light);
+const STYLES: Record<"dark" | "light", Record<TextSize, Styles>> = {
+  dark: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(dark, n)])) as Record<TextSize, Styles>,
+  light: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(light, n)])) as Record<TextSize, Styles>,
+};
 
 const EXPANDED = { expanded: true } as const;
 const COLLAPSED = { expanded: false } as const;
@@ -60,9 +66,9 @@ function spoken(entry: ToolsEntry, open: boolean): string {
  * command" for the calls done, "… Bash cargo test" per call running, and each failure open in
  * amber with its last lines. A tap lists every call with its whole detail.
  */
-export const ToolRun = memo(function ToolRun({ entry, open, onToggle }: ToolRunProps) {
+export const ToolRun = memo(function ToolRun({ entry, open, onToggle, size = DEFAULT_SETTINGS.textSize }: ToolRunProps) {
   const theme = useTheme();
-  const s = theme === light ? LIGHT : DARK;
+  const s = STYLES[theme === light ? "light" : "dark"][size];
   const rows = useMemo(() => {
     if (!open) return toolRows(entry.calls, entry.over);
     const head: ToolRow = { kind: "summary", head: summary(entry.calls), lines: [], more: 0 };

@@ -27,8 +27,9 @@ interface ApprovalSheetProps {
   send: Send;
   /** The Mac can't be reached: the request stays on screen and nothing can be answered. */
   offline?: boolean;
-  /** Another sheet (Mode and model) is over this one: nothing can be answered, and the arm
-   * delay starts again once it is gone, so a tap that closed it answers nothing. */
+  /** Something is over this one (the header's menu or Session info, or the drawer): nothing can
+   * be answered, and the arm delay starts again once it is gone, so a tap that closed it answers
+   * nothing. */
   covered?: boolean;
 }
 

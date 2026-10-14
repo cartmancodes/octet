@@ -12,13 +12,20 @@ import Sessions from "../app/index";
 import Session from "../app/session/[id]";
 import { FakeClock, Sockets } from "./client/fakes";
 import { HubContext, HubController, TOKEN_KEY } from "./hub";
+import { DRAWER_MS } from "./components/Drawer";
 import { closeDrawer, openDrawer } from "./drawer";
 import { saveSettings } from "./persist";
 import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol";
 import * as words from "./session";
 import * as cardWords from "./inbox";
 import { octetStore } from "./store";
+import { resetTextSize } from "./textSize";
 import { dark, light } from "./theme";
+
+jest.mock("expo-constants", () => ({
+  __esModule: true,
+  default: { expoConfig: { version: "4.5.6" } },
+}));
 
 jest.mock("expo-camera", () => ({
   CameraView: () => null,
@@ -43,6 +50,7 @@ beforeEach(async () => {
   await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
   await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
   octetStore.getState().reset();
+  resetTextSize();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
 });
 afterEach(() => {
@@ -332,12 +340,12 @@ describe("the Session screen", () => {
     const mascot = () => within(screen.getByTestId("session-mascot")).getByLabelText(/^Octet, /);
     const approvalEvent = (id: number, action: string) =>
       ev({ type: "approval", data: { id, detail: "", summary: { action, command: null, files: [], cwd: null, scope: "once" } } });
-    it("shows the session's state in the header: running, idle, and how the turn ended", async () => {
+    it("shows the session's state over the transcript: running, idle, and how the turn ended", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
       expect(mascot().props.accessibilityLabel).toBe("Octet, idle");
-      expect(mascot().props.width).toBe(59);
+      expect(mascot().props.width).toBe(44);
       await feed(rig, ev({ type: "started", data: null }), stateFrame({ phase: "running", now: "Running Edit src/main.rs" }));
       expect(mascot().props.accessibilityLabel).toBe("Octet, coding");
       await feed(rig, stateFrame({ phase: "running", now: "Thinking" }));
@@ -353,6 +361,90 @@ describe("the Session screen", () => {
       await open(rig, "a");
       await feed(rig, subscribed(), ev({ type: "error", data: "The model is overloaded" }), stateFrame({ phase: "idle" }));
       expect(mascot().props.accessibilityLabel).toBe("Octet, error");
+    });
+  });
+
+  describe("the header and the transcript header", () => {
+    const catalogFrame = (current_mode: string, session = "a") => ({
+      type: "catalog",
+      session,
+      catalog: {
+        modes: ["ask", "accept-edits", "auto", "full-access"],
+        current_mode,
+        models: [
+          { engine: "claude", selection: "sonnet", name: "Sonnet", id: "claude-sonnet-5" },
+          { engine: "claude", selection: "opus", name: "Opus", id: "claude-opus-5" },
+        ],
+        current: { engine: "claude", selection: "opus" },
+      },
+    });
+    const head = () => within(screen.getByTestId("transcript-header"));
+
+    it("the header has ☰, the session's name ▾ with model · mode, Aa and ⋯; ☰ opens the drawer", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), catalogFrame("auto"));
+      expect(screen.getByRole("button", { name: "a, Opus · auto" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Text size" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Session info" })).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Menu" }));
+      expect(screen.getByRole("button", { name: "Close menu" })).toBeTruthy();
+    });
+
+    it("says Octet's version and Mac, the mode · engine / model, and the phase · workspace", async () => {
+      const rig = await launch([info("a", { phase: "idle", workspace: "/Users/me/Projects/a" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), catalogFrame("auto"));
+      expect([dark.accent, light.accent]).toContain(color(head().getByText("Octet")));
+      expect(head().getByText("v4.5.6 · mac")).toBeTruthy();
+      expect([dark.accent, light.accent]).toContain(color(head().getByText("auto")));
+      expect(head().getByText("· claude / Opus")).toBeTruthy();
+      expect([dark.accent, light.accent]).toContain(color(head().getByText("IDLE")));
+      expect(head().getByText("· ~/Projects/a")).toBeTruthy();
+      // Ask is muted; an approval waiting is amber.
+      await feed(
+        rig,
+        catalogFrame("ask"),
+        ev({ type: "approval", data: { id: 1, detail: "", summary: { action: "Run tests", command: null, files: [], cwd: null, scope: "once" } } }),
+      );
+      expect([dark.muted, light.muted]).toContain(color(head().getByText("ask")));
+      expect([dark.amber, light.amber]).toContain(color(head().getByText("APPROVAL")));
+    });
+
+    it("Aa cycles the transcript's text size, and the next screen opens at it", async () => {
+      const rig = await launch([info("a", { phase: "idle" }), info("b", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), ev({ type: "user", data: "Fix the hub" }));
+      const size = () => StyleSheet.flatten(screen.getByText("Fix the hub").props.style).fontSize;
+      expect(size()).toBe(13);
+      await fireEvent.press(screen.getByRole("button", { name: "Text size" }));
+      expect(size()).toBe(14);
+      await fireEvent.press(screen.getByRole("button", { name: "Text size" }));
+      expect(size()).toBe(12);
+      expect(StyleSheet.flatten(head().getByText("IDLE").props.style).fontSize).toBe(12);
+    });
+
+    it("opens at the saved text size", async () => {
+      await saveSettings({ textSize: 14 });
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), ev({ type: "user", data: "Fix the hub" }));
+      expect(StyleSheet.flatten(screen.getByText("Fix the hub").props.style).fontSize).toBe(14);
+    });
+
+    it("dropdown_without_catalog: a session opened from the drawer before its catalog says it is waiting", async () => {
+      const rig = await launch([info("a", { phase: "idle" }), info("b", { phase: "idle" })]);
+      await open(rig, "a");
+      await act(async () => openDrawer());
+      await act(async () => void jest.advanceTimersByTime(DRAWER_MS + 20)); // renderRouter runs on fake timers
+      await fireEvent.press(screen.getByTestId("drawer-row-b"));
+      expect(rig.view.getPathname()).toBe("/session/b");
+      await act(async () => void jest.advanceTimersByTime(DRAWER_MS + 20));
+      await feed(rig, subscribed("b"));
+      await fireEvent.press(screen.getByRole("button", { name: /^b, / }));
+      expect(screen.getByText("Waiting for the Mac…")).toBeTruthy();
+      expect(screen.queryByText(/^MODEL · /)).toBeNull();
+      expect(screen.queryAllByRole("tab", { name: /^(ask|auto|accept-edits)$/ })).toHaveLength(0);
     });
   });
 
@@ -582,6 +674,8 @@ describe("the Session screen", () => {
       expect(screen.queryByRole("button", { name: "Allow" })).toBeNull();
     });
 
+    const titled = (name = "a") => screen.getByRole("button", { name: new RegExp(`^${name}, `) });
+
     it("changes the mode over the wire, and the catalog moves the current mark", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
@@ -590,24 +684,25 @@ describe("the Session screen", () => {
         session: "a",
         catalog: { modes: ["ask", "auto"], current_mode, models: [], current: null },
       });
-      expect(screen.queryByRole("button", { name: "Mode and model" })).toBeNull();
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }), catalog("ask"));
-      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
-      await fireEvent.press(screen.getByRole("button", { name: "Auto" }));
+      await fireEvent.press(titled());
+      await fireEvent.press(screen.getByRole("tab", { name: "auto" }));
       await act(async () => {});
       const sent = lastCommand(rig, "set_mode");
       expect(sent).toMatchObject({ session: "a", mode: "auto" });
       await feed(rig, { type: "ack", req: sent?.req, message: "ok" });
-      expect(screen.queryByRole("button", { name: "Auto" })).toBeNull(); // the sheet closed
       await feed(rig, catalog("auto"));
-      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
-      expect(screen.getByRole("button", { name: "Auto, current" })).toBeTruthy();
-      // An ended session takes no commands: the button goes with the controls.
+      expect(screen.getByRole("tab", { name: "auto" }).props.accessibilityState.selected).toBe(true);
+      expect(titled().props.accessibilityLabel).toBe("a, auto");
+      await fireEvent.press(screen.getByTestId("menu-scrim"));
+      expect(screen.queryByTestId("menu")).toBeNull();
+      // An ended session takes no commands: the menu goes with the controls.
       await feed(rig, { type: "sessions", sessions: [] });
-      expect(screen.queryByRole("button", { name: "Mode and model" })).toBeNull();
+      await fireEvent.press(titled());
+      expect(screen.queryByTestId("menu")).toBeNull();
     });
 
-    it("an approval that comes while the mode sheet is open is pointed out there", async () => {
+    it("an approval that comes while the menu is open is pointed out there", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }), {
@@ -615,13 +710,13 @@ describe("the Session screen", () => {
         session: "a",
         catalog: { modes: ["ask", "auto"], current_mode: "ask", models: [], current: null },
       });
-      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
+      await fireEvent.press(titled());
       expect(screen.queryByText("An approval is waiting \u2014 close this to answer it.")).toBeNull();
       await feed(rig, approvalEvent(1, "Run tests"));
       expect(screen.getByText("An approval is waiting \u2014 close this to answer it.")).toBeTruthy();
     });
 
-    it("an approval that came under the mode sheet arms 400 ms after the sheet closes", async () => {
+    it("an approval that came under the menu arms 400 ms after the menu closes", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }), {
@@ -629,10 +724,10 @@ describe("the Session screen", () => {
         session: "a",
         catalog: { modes: ["ask", "auto"], current_mode: "ask", models: [], current: null },
       });
-      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
+      await fireEvent.press(titled());
       await feed(rig, approvalEvent(1, "Run tests"));
       await wait(1_000);
-      await fireEvent.press(screen.getByTestId("scrim"));
+      await fireEvent.press(screen.getByTestId("menu-scrim"));
       const deny = () => screen.getByRole("button", { name: "Deny" });
       expect(deny().props.accessibilityState?.disabled).toBe(true);
       await wait(400);
@@ -694,7 +789,7 @@ describe("the Session screen", () => {
         expect(StyleSheet.flatten(screen.getByTestId("transcript-area").props.style).opacity).toBe(0.6);
         expect(screen.getByText("Fix the hub")).toBeTruthy();
         expect(screen.getByText("Run tests")).toBeTruthy();
-        for (const name of ["Allow", "Deny", "Send", "End session", "Mode and model"]) expect(isOff(name)).toBe(true);
+        for (const name of ["Allow", "Deny", "Send", "End session"]) expect(isOff(name)).toBe(true);
         await fireEvent.press(screen.getByRole("button", { name: "Send" }));
         await fireEvent.press(screen.getByRole("button", { name: "Deny" }));
         // A brief `connecting` keeps the typed words.
@@ -713,7 +808,7 @@ describe("the Session screen", () => {
         // The approval arms 400 ms after the link is back, as after it first came.
         expect(isOff("Deny")).toBe(true);
         await wait(400);
-        for (const name of ["Allow", "Deny", "Send", "End session", "Mode and model"]) expect(isOff(name)).toBe(false);
+        for (const name of ["Allow", "Deny", "Send", "End session"]) expect(isOff(name)).toBe(false);
         expect(rig.sockets.all.flatMap((s) => s.commandsOf("prompt").concat(s.commandsOf("answer")))).toEqual([]);
       });
 

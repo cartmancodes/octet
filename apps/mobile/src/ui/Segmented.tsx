@@ -13,15 +13,17 @@ interface SegmentedProps<K extends string> {
   value: K;
   /** Must be stable. */
   onChange: (key: K) => void;
+  /** Dimmed, and a tap does nothing. */
+  disabled?: boolean;
 }
 
 /** A row of tabs inside one bordered box; the selected one is filled and in accent. */
-function SegmentedImpl<K extends string>({ options, value, onChange }: SegmentedProps<K>) {
+function SegmentedImpl<K extends string>({ options, value, onChange, disabled = false }: SegmentedProps<K>) {
   const theme = useTheme();
   return (
-    <View accessibilityRole="tablist" style={[styles.box, { borderColor: theme.edge }]}>
+    <View accessibilityRole="tablist" style={[styles.box, { borderColor: theme.edge }, disabled ? styles.off : null]}>
       {options.map((o) => (
-        <Segment key={o.key} option={o} selected={o.key === value} onChange={onChange} theme={theme} />
+        <Segment key={o.key} option={o} selected={o.key === value} onChange={onChange} theme={theme} disabled={disabled} />
       ))}
     </View>
   );
@@ -34,15 +36,17 @@ interface SegmentProps<K extends string> {
   selected: boolean;
   onChange: (key: K) => void;
   theme: Theme;
+  disabled: boolean;
 }
 
-function SegmentImpl<K extends string>({ option, selected, onChange, theme }: SegmentProps<K>) {
+function SegmentImpl<K extends string>({ option, selected, onChange, theme, disabled }: SegmentProps<K>) {
   const press = useCallback(() => onChange(option.key), [onChange, option.key]);
   return (
     <Pressable
       accessibilityRole="tab"
       accessibilityLabel={option.label}
-      accessibilityState={{ selected }}
+      accessibilityState={{ selected, disabled }}
+      disabled={disabled}
       onPress={press}
       style={[styles.segment, selected ? { backgroundColor: theme.selected } : null]}
     >
@@ -57,5 +61,6 @@ const Segment = memo(SegmentImpl) as typeof SegmentImpl;
 
 const styles = StyleSheet.create({
   box: { flexDirection: "row", gap: 4, padding: 3, borderWidth: 1, borderRadius: radius.card },
+  off: { opacity: 0.4 },
   segment: { flex: 1, minHeight: 44, borderRadius: 9, alignItems: "center", justifyContent: "center", paddingHorizontal: 4 },
 });

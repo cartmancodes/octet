@@ -21,13 +21,16 @@ describe("rowRole", () => {
     [{ kind: "reply", key: "1", text: "x", done: true }, "OCTET"],
     [{ kind: "note", key: "1", text: "x" }, "NOTE"],
     [{ kind: "error", key: "1", text: "x" }, "ERROR"],
-    [{ kind: "tools", key: "1", calls: [], over: false }, ""],
+    [{ kind: "tools", key: "1", calls: [], over: false }, "TOOL"],
   ])("labels %p as the terminal UI does", (entry, label) => {
     expect(rowRole(entry).label).toBe(label);
   });
-  it("errors are amber, prompts accent", () => {
+  it("errors are amber, prompts accent, replies fg, tools and notes muted", () => {
     expect(rowRole({ kind: "error", key: "1", text: "x" }).tone).toBe("amber");
     expect(rowRole({ kind: "user", key: "1", text: "x" }).tone).toBe("accent");
+    expect(rowRole({ kind: "reply", key: "1", text: "x", done: true }).tone).toBe("fg");
+    expect(rowRole({ kind: "tools", key: "1", calls: [], over: false }).tone).toBe("muted");
+    expect(rowRole({ kind: "note", key: "1", text: "x" }).tone).toBe("muted");
   });
 });
 

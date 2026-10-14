@@ -1,25 +1,25 @@
 import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
-import { Stack, useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { ApprovalSheet } from "../../src/components/ApprovalSheet";
 import { Composer } from "../../src/components/Composer";
+import { ConvoHeader } from "../../src/components/ConvoHeader";
 import { useFollow } from "../../src/components/follow";
 import { HubBanner } from "../../src/components/HubBanner";
-import { ModeModelSheet } from "../../src/components/ModeModelSheet";
 import { useSend } from "../../src/components/send";
 import { SessionControls } from "../../src/components/SessionControls";
 import { TaskStrip } from "../../src/components/TaskStrip";
+import { TranscriptHeader } from "../../src/components/TranscriptHeader";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
 import { useDrawerOpen } from "../../src/drawer";
 import { useHubClient } from "../../src/hub";
-import { Mascot } from "../../src/mascot/Mascot";
-import type { PoseName } from "../../src/mascot/poses";
+import { macName } from "../../src/inbox";
 import type { Entry } from "../../src/model/transcript";
-import { nowLine, queueWords } from "../../src/session";
-import { poseOf, sessionName } from "../../src/sessions";
+import { engineModel, headMode, nowLine, queueWords, type SessionHead } from "../../src/session";
+import { poseOf } from "../../src/sessions";
 import {
   octetStore,
   releaseSession,
@@ -36,6 +36,7 @@ import {
   useTaskOpen,
   watch,
 } from "../../src/store";
+import { loadTextSize, useTextSize } from "../../src/textSize";
 import { radius, spacing, type, useTheme } from "../../src/theme";
 
 const keyOf = (entry: Entry): string => entry.key;
@@ -48,8 +49,8 @@ const NO_OPEN: ReadonlySet<string> = new Set();
 export const WAITING = "Waiting for your Mac…";
 
 /**
- * One session: its Task strip and transcript. Shown, it streams the session (`watch`); left, it
- * stops (`unwatch`) and lets an ended session go (`releaseSession`). It reads only this
+ * One session: its header, Task strip and transcript. Shown, it streams the session (`watch`);
+ * left, it stops (`unwatch`) and lets an ended session go (`releaseSession`). It reads only this
  * session's part of the store, so other sessions' output never draws it again.
  */
 export default function Session() {
@@ -84,10 +85,13 @@ export default function Session() {
     }, [client, id]),
   );
 
-  // The title outlives the session's place in the list.
+  // The workspace outlives the session's place in the list.
   const [workspace, setWorkspace] = useState(info?.workspace);
   if (info && info.workspace !== workspace) setWorkspace(info.workspace);
-  const title = sessionName(workspace);
+
+  // The transcript's text size, which the header's Aa cycles; the saved one is read once.
+  const size = useTextSize();
+  useEffect(() => void loadTextSize(), []);
 
   // Tools entries the user opened, by key: kept here, not in the row, which FlashList recycles.
   const [open, setOpen] = useState<ReadonlySet<string>>(NO_OPEN);
@@ -105,9 +109,10 @@ export default function Session() {
     });
   }, []);
   const renderItem = useCallback<ListRenderItem<Entry>>(
-    ({ item }) => <TranscriptRow entry={item} open={open.has(item.key)} onToggle={toggle} />,
-    [open, toggle],
+    ({ item }) => <TranscriptRow entry={item} open={open.has(item.key)} onToggle={toggle} size={size} />,
+    [open, toggle, size],
   );
+  const extra = useMemo(() => ({ open, size }), [open, size]);
 
   const list = useRef<FlashListRef<Entry>>(null);
   const follow = useFollow(list, entries[entries.length - 1]);
@@ -131,12 +136,19 @@ export default function Session() {
   const offline = hub !== "ready";
   const phase = state?.phase ?? info?.phase ?? "idle";
   const queued = queueWords(state).count;
-  // The mascot in the header: this session's state, by the same map as the Sessions list's.
+  // The mascot over the transcript: this session's state, by the same map as the Inbox's.
   const pose = poseOf({ approvals: approvals.length, phase, now: state?.now ?? info?.now, turn });
-  const header = useMemo(() => ({ title, headerRight: () => <HeaderMascot pose={pose} /> }), [title, pose]);
+  const mac = macName(client?.url);
+  const head: SessionHead = { workspace, engine: info?.engine, model: info?.model ?? undefined, mode: info?.mode };
+  const mode = headMode(catalog, head);
+  const line = engineModel(catalog, head);
+  const transcriptHeader = useMemo(
+    () => <TranscriptHeader pose={pose} mode={mode} engineModel={line} workspace={workspace ?? ""} mac={mac} size={size} />,
+    [pose, mode, line, workspace, mac, size],
+  );
   // The home indicator's room is only needed under the composer; the keyboard covers it.
   const [offset, setOffset] = useState(0);
-  // The Mode and model sheet covers the approval sheet: it waits until the sheet is gone.
+  // The header's menu or Session info covers the approval sheet: it waits until they are gone.
   const [sheetOpen, setSheetOpen] = useState(false);
   // The side drawer covers it too: a tap that closes the drawer must not answer.
   const drawerOpen = useDrawerOpen();
@@ -146,7 +158,15 @@ export default function Session() {
   return (
     <View ref={root} onLayout={measure} style={[styles.screen, { backgroundColor: theme.bg }]}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={offset} style={styles.screen}>
-        <Stack.Screen options={header} />
+        <ConvoHeader
+          session={id}
+          send={send}
+          top={insets.top}
+          live={live}
+          offline={offline}
+          approval={approvals.length > 0}
+          onCovered={setSheetOpen}
+        />
         <HubBanner state={hub} announce={focused} />
         {gone ? (
           <View style={styles.gone}>
@@ -172,8 +192,9 @@ export default function Session() {
                 ref={list}
                 testID="transcript"
                 data={entries}
-                extraData={open}
+                extraData={extra}
                 renderItem={renderItem}
+                ListHeaderComponent={transcriptHeader}
                 keyExtractor={keyOf}
                 getItemType={typeOf}
                 maintainVisibleContentPosition={KEEP_POSITION}
@@ -208,14 +229,6 @@ export default function Session() {
                   send={send}
                   offline={offline}
                 />
-                <ModeModelSheet
-                  session={id}
-                  catalog={catalog}
-                  send={send}
-                  offline={offline}
-                  approval={approvals.length > 0}
-                  onVisible={setSheetOpen}
-                />
                 <View style={{ paddingBottom: Math.max(insets.bottom, spacing.sm) }}>
                   <Composer session={id} phase={phase} queued={queued} send={send} offline={offline} />
                 </View>
@@ -224,18 +237,6 @@ export default function Session() {
           </>
         )}
       </KeyboardAvoidingView>
-    </View>
-  );
-}
-
-/** The mascot drawn at its smallest crisp size, 59 points (one whole multiple of its width). */
-const MASCOT = 59;
-
-/** The header's mascot. */
-function HeaderMascot({ pose }: { pose: PoseName }) {
-  return (
-    <View testID="session-mascot">
-      <Mascot pose={pose} size={MASCOT} />
     </View>
   );
 }

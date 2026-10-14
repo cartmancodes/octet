@@ -1,4 +1,4 @@
-// What turning on full access shares between the mode sheet and a new session: the words, and the
+// What turning on full access shares between the Conversation's model and mode menu and a new session: the words, and the
 // guard that makes Face ID and the typed words approve exactly one thing, once.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
@@ -25,7 +25,7 @@ export interface FullAccessArm {
 
 /**
  * Face ID, then (in the panel the caller draws while `armed`) the typed words, for one request.
- * `key` names exactly what Face ID approves (the session and mode for the sheet; the engine,
+ * `key` names exactly what Face ID approves (the session and mode for the menu; the engine,
  * workspace and model for a new session, whose mode is full access by being armed). The approval is for that key only: any change
  * of the key disarms it and voids a prompt still up, as do `disarm` (call it on a send, on a
  * close), a refusal (`failed`) and unmounting. Leaving the app disarms it too. So the words can never send anything but what
