@@ -63,7 +63,7 @@ export interface Cursor {
   seq: number;
 }
 
-/** One live session; `last_activity` is Unix seconds, `goal` a one-liner, `now` the NOW line, `tmux` the tmux session a phone started it in. */
+/** One live session; `last_activity` is Unix seconds, `goal` a one-liner, `now` the NOW line, `tmux` the tmux session a phone started it in, `approval` the first approval waiting (the count is `approvals`). */
 export interface SessionInfo {
   id: string;
   engine: Engine;
@@ -77,6 +77,7 @@ export interface SessionInfo {
   now?: string | null;
   from_phone: boolean;
   tmux?: string | null;
+  approval?: ApprovalInfo | null;
 }
 
 /** What an approval would do, as the dialog leads with it. */

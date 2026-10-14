@@ -316,6 +316,62 @@ describe("listed", () => {
   });
 });
 
+describe("a session's front approval", () => {
+  const summary = { action: "Run Bash", command: "ls", files: [], scope: "this call" };
+
+  it("comes with the sessions row, through useFrontApproval", async () => {
+    const hooks = bindHooks(store);
+    const front = await renderHook(() => hooks.useFrontApproval("a"));
+    expect(front.result.current).toBeNull();
+    await act(async () => store.getState().applyBatch([sessions(info("a", { approvals: 2, approval: { id: 4, summary } }))]));
+    expect(front.result.current).toEqual({ id: 4, summary });
+    await act(async () => store.getState().applyBatch([sessions(info("a"))]));
+    expect(front.result.current).toBeNull();
+    expect(bindHooks(store).useFrontApproval).toBeDefined();
+  });
+
+  it("is the same object while the row's approval does not change", async () => {
+    const hooks = bindHooks(store);
+    const front = await renderHook(() => hooks.useFrontApproval("a"));
+    const row = () => info("a", { approvals: 1, approval: { id: 4, summary: { ...summary, files: [...summary.files] } } });
+    await act(async () => store.getState().applyBatch([sessions(row())]));
+    const first = front.result.current;
+    expect(first).not.toBeNull();
+    const before = store.getState().sessions;
+    await act(async () => store.getState().applyBatch([sessions(row())]));
+    expect(front.result.current).toBe(first);
+    expect(store.getState().sessions).toBe(before);
+    await act(async () => store.getState().applyBatch([sessions({ ...row(), approval: { id: 5, summary } })]));
+    expect(front.result.current).not.toBe(first);
+    expect(front.result.current?.id).toBe(5);
+  });
+
+  it("is cleaned as a state approval is: control characters out, long text cut", async () => {
+    const hooks = bindHooks(store);
+    const front = await renderHook(() => hooks.useFrontApproval("a"));
+    const hostile = { action: "Run\u202E Bash\u0007", command: "ls\u202E", files: ["a\u0000b"], scope: "x".repeat(5000) };
+    await act(async () => store.getState().applyBatch([sessions(info("a", { approvals: 1, approval: { id: 1, summary: hostile } }))]));
+    store.getState().applyBatch([stateFrame("b", { approvals: [{ id: 1, summary: hostile }] })]);
+    const fromState = view("b").approvals[0]?.summary;
+    expect(front.result.current?.summary).toEqual(fromState);
+    expect(front.result.current?.summary.action).not.toMatch(/[\u202E\u0007]/);
+    expect(front.result.current?.summary.scope.length).toBeLessThan(5000);
+  });
+
+  it("is dropped when the row's approval is not one", async () => {
+    const hooks = bindHooks(store);
+    const front = await renderHook(() => hooks.useFrontApproval("a"));
+    const bad = [null, "x", { id: "1", summary }, { id: 1.5, summary }, { summary }];
+    for (const approval of bad) {
+      await act(async () => store.getState().applyBatch([sessions(info("a", { approval } as unknown as Partial<SessionInfo>))]));
+      expect(front.result.current).toBeNull();
+    }
+    // A summary that is not an object still gives an approval, with an empty summary.
+    await act(async () => store.getState().applyBatch([sessions(info("a", { approval: { id: 2, summary: "x" } } as unknown as Partial<SessionInfo>))]));
+    expect(front.result.current).toEqual({ id: 2, summary: { action: "", files: [], scope: "" } });
+  });
+});
+
 describe("state and catalog", () => {
   it("are stored per session", () => {
     store.getState().applyBatch([stateFrame("a", { now: "Reading", queue: ["next"], queued: 1 }), stateFrame("b", { now: "Idle" }), catalogFrame("a")]);

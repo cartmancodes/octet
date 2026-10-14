@@ -156,6 +156,13 @@ function cleanApprovals(raw: unknown, known: readonly PendingApproval[], closed:
   return out;
 }
 
+/** One approval of a `sessions` row (the session's front one), cleaned as a state frame's are;
+ * null when it is not an approval. */
+export function cleanFrontApproval(raw: unknown): ApprovalInfo | null {
+  const [approval] = cleanApprovals([raw], [], []);
+  return approval ? { id: approval.id, summary: approval.summary } : null;
+}
+
 function cleanGoal(raw: unknown): GoalInfo | null {
   if (!isObj(raw)) return null;
   return { objective: str(raw.objective, TEXT_CHARS), status: str(raw.status, SHORT_CHARS), turns: count(raw.turns), max: count(raw.max) };

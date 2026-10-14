@@ -303,9 +303,11 @@ pub static OBJECTS: &[Shape] = &[
             opt("now", Str),
             req("from_phone", Bool),
             opt("tmux", Str),
+            opt("approval", Object("ApprovalInfo")),
         ],
         doc: "One live session; `last_activity` is Unix seconds, `goal` a one-liner, `now` the \
-              NOW line, `tmux` the tmux session a phone started it in.",
+              NOW line, `tmux` the tmux session a phone started it in, `approval` the first \
+              approval waiting (the count is `approvals`).",
     },
     Shape {
         name: "ApprovalSummary",

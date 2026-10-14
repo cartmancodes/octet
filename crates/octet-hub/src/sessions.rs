@@ -169,6 +169,11 @@ impl Live {
         let approvals = state
             .and_then(|s| s.get("approvals")?.as_array())
             .map_or(0, Vec::len);
+        // The bridge already clips the summary, so the hub passes it on as it is.
+        let front = state
+            .and_then(|s| s.get("approvals")?.as_array()?.first())
+            .filter(|a| a.get("id").is_some_and(Value::is_u64))
+            .map(|a| json!({"id": a["id"], "summary": a.get("summary").cloned().unwrap_or_else(|| json!({}))}));
         let mut row = json!({
             "id": registration.id,
             "engine": registration.engine,
@@ -187,6 +192,7 @@ impl Live {
             ("goal", goal.map(|g| json!(g))),
             ("now", text("now").map(|now| json!(now))),
             ("tmux", registration.tmux.as_ref().map(|t| json!(t))),
+            ("approval", front),
         ];
         for (key, value) in optional {
             if let Some(value) = value {
@@ -1323,7 +1329,8 @@ mod tests {
             rows[0],
             json!({"id": id, "engine": "claude", "model": "opus", "workspace": "/work",
                 "mode": "ask", "phase": "running", "approvals": 2, "last_activity": mtime,
-                "goal": "ship it", "from_phone": false})
+                "goal": "ship it", "from_phone": false,
+                "approval": {"id": 1, "summary": {}}})
         );
         // The hub's commands reach the bridge as parsable lines.
         let command = BridgeCommand::Prompt {
@@ -1364,6 +1371,51 @@ mod tests {
         let id = "4011-1790000000".to_owned();
         assert_eq!(next(&mut sessions).await, SessionUpdate::State { id });
         assert_eq!(sessions.list()[0]["now"], "Running Bash cargo test");
+    }
+
+    #[tokio::test]
+    async fn a_row_carries_the_first_approval_while_one_waits() {
+        let env = Env::new();
+        let registration = env.registration(4012, &[]);
+        let bridge = Env::listen(&registration);
+        registration.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        let (stream, _) = bridge.accept().await.unwrap();
+        let (_read, mut write) = stream.into_split();
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        assert!(sessions.list()[0].get("approval").is_none());
+        let id = "4012-1790000000".to_owned();
+        let summary = |action: &str| {
+            json!({"action": action, "command": "rm -rf build", "files": [], "cwd": "/work",
+                "scope": "this call"})
+        };
+        let mut state = json!({"phase": "waiting", "queue": [], "queued": 0, "mode": "ask",
+            "approvals": [{"id": 7, "summary": summary("Run Bash")},
+                {"id": 8, "summary": summary("Edit")}]});
+        write
+            .write_all(format!("{}\n", bridge_state_frame(&state)).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            next(&mut sessions).await,
+            SessionUpdate::State { id: id.clone() }
+        );
+        let row = &sessions.list()[0];
+        assert_eq!(row["approvals"], 2);
+        assert_eq!(
+            row["approval"],
+            json!({"id": 7, "summary": summary("Run Bash")})
+        );
+        state["approvals"] = json!([]);
+        write
+            .write_all(format!("{}\n", bridge_state_frame(&state)).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(next(&mut sessions).await, SessionUpdate::State { id });
+        let row = &sessions.list()[0];
+        assert_eq!(row["approvals"], 0);
+        assert!(row.get("approval").is_none(), "{row}");
     }
 
     #[tokio::test]

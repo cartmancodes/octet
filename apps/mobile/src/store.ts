@@ -9,6 +9,7 @@ import type { BatchItem, HubClient, HubState } from "./client/HubClient";
 import { ENGINES, MODES, PHASES, count, member } from "./model/enums";
 import {
   EMPTY_VIEW,
+  cleanFrontApproval,
   reduceView,
   type Op,
   type PendingApproval,
@@ -19,7 +20,7 @@ import {
 import { clearParsed } from "./markdown/blocks";
 import type { Entry } from "./model/transcript";
 import { FIELD_CHARS, field } from "./model/text";
-import { isKnownEvent, type CatalogInfo, type SessionInfo } from "./protocol";
+import { isKnownEvent, type ApprovalInfo, type CatalogInfo, type SessionInfo } from "./protocol";
 
 export interface OctetState {
   /** The live sessions, as the hub listed them last. */
@@ -78,13 +79,22 @@ function cleanSession(raw: unknown): SessionInfo | null {
     if (value !== undefined) info[key] = value;
   }
   if (typeof raw.last_activity === "number" || raw.last_activity === null) info.last_activity = raw.last_activity;
+  const approval = cleanFrontApproval(raw.approval);
+  if (approval) info.approval = approval;
   return info;
 }
 
+/** Two cleaned approvals say the same (their summaries are small and bounded). */
+const sameApproval = (a: ApprovalInfo | null | undefined, b: ApprovalInfo | null | undefined): boolean =>
+  a === b || (!!a && !!b && a.id === b.id && JSON.stringify(a.summary) === JSON.stringify(b.summary));
+
 const sameSession = (a: SessionInfo, b: SessionInfo): boolean => {
   const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-  for (const k of keys) if ((a as unknown as Record<string, unknown>)[k] !== (b as unknown as Record<string, unknown>)[k]) return false;
-  return true;
+  for (const k of keys) {
+    if (k === "approval") continue;
+    if ((a as unknown as Record<string, unknown>)[k] !== (b as unknown as Record<string, unknown>)[k]) return false;
+  }
+  return sameApproval(a.approval, b.approval);
 };
 
 /** The listed sessions, reusing the previous object of each session that did not change, and the
@@ -437,6 +447,10 @@ export function bindHooks(store: OctetStore) {
     useListed: (): boolean => useStore(store, (s) => s.listed),
     /** The Task strip's open state, shared by every session's screen. */
     useTaskOpen: (): boolean => useStore(store, (s) => s.taskOpen),
+    /** The first approval waiting in a session, from the hub's sessions row, so a session that is
+     * not open can still be answered; null when none waits. The same object until it changes. */
+    useFrontApproval: (id: string): ApprovalInfo | null =>
+      useStore(store, (s) => s.sessions.find((x) => x.id === id)?.approval ?? null),
     useApprovals: (id: string): PendingApproval[] =>
       useStore(store, (s) => s.bySession.get(id)?.approvals ?? NO_APPROVALS),
     /** The modes and models a session offers, with the current ones marked; null until the Mac
@@ -472,6 +486,7 @@ export const {
   useSessionStatus,
   useListed,
   useTaskOpen,
+  useFrontApproval,
   useApprovals,
   useCatalog,
   useCatalogs,
