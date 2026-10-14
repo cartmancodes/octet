@@ -1,24 +1,22 @@
 import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
 import { useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View, type LayoutChangeEvent } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { ApprovalSheet } from "../../src/components/ApprovalSheet";
-import { Composer } from "../../src/components/Composer";
+import { ConvoControls } from "../../src/components/ConvoControls";
 import { ConvoHeader } from "../../src/components/ConvoHeader";
 import { useFollow } from "../../src/components/follow";
 import { HubBanner } from "../../src/components/HubBanner";
 import { useSend } from "../../src/components/send";
-import { SessionControls } from "../../src/components/SessionControls";
 import { TaskStrip } from "../../src/components/TaskStrip";
 import { TranscriptHeader } from "../../src/components/TranscriptHeader";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
-import { useDrawerOpen } from "../../src/drawer";
+import { clearEdgeBottom, setEdgeBottom, useDrawerOpen } from "../../src/drawer";
 import { useHubClient } from "../../src/hub";
 import { macName } from "../../src/inbox";
 import type { Entry } from "../../src/model/transcript";
-import { engineModel, headMode, nowLine, queueWords, type SessionHead } from "../../src/session";
+import { engineModel, headEngine, headMode, headModel, nowLine, type SessionHead } from "../../src/session";
 import { poseOf } from "../../src/sessions";
 import {
   octetStore,
@@ -135,25 +133,38 @@ export default function Session() {
   // until the link is back. Nothing unmounts, so typed words outlive a brief `connecting`.
   const offline = hub !== "ready";
   const phase = state?.phase ?? info?.phase ?? "idle";
-  const queued = queueWords(state).count;
   // The mascot over the transcript: this session's state, by the same map as the Inbox's.
   const pose = poseOf({ approvals: approvals.length, phase, now: state?.now ?? info?.now, turn });
   const mac = macName(client?.url);
   const head: SessionHead = { workspace, engine: info?.engine, model: info?.model ?? undefined, mode: info?.mode };
   const mode = headMode(catalog, head);
   const line = engineModel(catalog, head);
+  const engine = headEngine(catalog, head);
+  const model = headModel(catalog, head);
+  const modes = catalog?.modes ?? null;
   const transcriptHeader = useMemo(
     () => <TranscriptHeader pose={pose} mode={mode} engineModel={line} workspace={workspace ?? ""} mac={mac} size={size} />,
     [pose, mode, line, workspace, mac, size],
   );
-  // The home indicator's room is only needed under the composer; the keyboard covers it.
+  // Where the screen's body starts in the window: the keyboard's offset, and the prompt line's.
   const [offset, setOffset] = useState(0);
-  // The header's menu or Session info covers the approval sheet: it waits until they are gone.
+  // The header's menu or Session info covers the Permission card: it waits until they are gone.
   const [sheetOpen, setSheetOpen] = useState(false);
   // The side drawer covers it too: a tap that closes the drawer must not answer.
   const drawerOpen = useDrawerOpen();
   const root = useRef<View>(null);
   const measure = useCallback(() => root.current?.measureInWindow((_x, y) => setOffset(y)), []);
+
+  // The drawer's edge strip ends where the prompt line and key bar begin, wherever the keyboard
+  // has put them; only the screen in front says so, and it takes the bound away when it goes.
+  const [edgeOwner] = useState(() => ({}));
+  const [promptTop, setPromptTop] = useState<number | null>(null);
+  const onPromptLayout = useCallback((event: LayoutChangeEvent) => setPromptTop(event.nativeEvent.layout.y), []);
+  useEffect(() => {
+    if (!focused || !live || promptTop === null) return;
+    setEdgeBottom(edgeOwner, offset + promptTop);
+    return () => clearEdgeBottom(edgeOwner);
+  }, [focused, live, promptTop, offset, edgeOwner]);
 
   return (
     <View ref={root} onLayout={measure} style={[styles.screen, { backgroundColor: theme.bg }]}>
@@ -165,6 +176,7 @@ export default function Session() {
           live={live}
           offline={offline}
           approval={approvals.length > 0}
+          phase={phase}
           onCovered={setSheetOpen}
         />
         <HubBanner state={hub} announce={focused} />
@@ -221,17 +233,20 @@ export default function Session() {
             {live ? (
               <>
                 {offline ? <Text style={[type.caption, styles.waiting, { color: theme.muted }]}>{WAITING}</Text> : null}
-                <ApprovalSheet session={id} approvals={approvals} send={send} offline={offline} covered={sheetOpen || drawerOpen} />
-                <SessionControls
+                <ConvoControls
                   session={id}
                   phase={phase}
-                  engine={info?.engine ?? "claude"}
+                  engine={engine}
+                  mode={mode}
+                  modes={modes}
+                  model={model}
+                  approvals={approvals}
                   send={send}
                   offline={offline}
+                  covered={sheetOpen || drawerOpen}
+                  bottom={Math.max(insets.bottom, spacing.sm)}
+                  onPromptLayout={onPromptLayout}
                 />
-                <View style={{ paddingBottom: Math.max(insets.bottom, spacing.sm) }}>
-                  <Composer session={id} phase={phase} queued={queued} send={send} offline={offline} />
-                </View>
               </>
             ) : null}
           </>

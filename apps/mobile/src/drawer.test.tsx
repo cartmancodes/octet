@@ -3,8 +3,9 @@ import { router } from "expo-router";
 import * as SecureStore from "expo-secure-store";
 import { AccessibilityInfo, Animated, BackHandler, StyleSheet, Text } from "react-native";
 
-import { DRAWER_MS, DRAWER_WIDTH, EDGE_WIDTH } from "./components/Drawer";
-import { closeDrawer, drawerStore, openDrawer } from "./drawer";
+import Session from "../app/session/[id]";
+import { DRAWER_MS, DRAWER_WIDTH, EDGE_BOTTOM, EDGE_WIDTH, edgeBottom } from "./components/Drawer";
+import { clearEdgeBottom, closeDrawer, drawerStore, openDrawer, setEdgeBottom } from "./drawer";
 import { hear, info, launch, mount, pairedStorage } from "./screenRig";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { hideToast, showToast } from "./toast";
@@ -30,6 +31,7 @@ beforeEach(async () => {
 });
 afterEach(() => {
   closeDrawer();
+  drawerStore.setState({ edge: null });
   hideToast();
   jest.restoreAllMocks();
 });
@@ -97,14 +99,23 @@ function finger() {
  * node (capture phase, then bubble phase) whether it takes the touch; once it has, it is granted
  * and gets the rest of the moves. `offsets` are from `from`. Returns whether the node took it.
  */
-async function drag(node: { props: Record<string, (...args: never[]) => unknown> }, from: [number, number], offsets: [number, number][]) {
+async function drag(
+  node: { props: Record<string, (...args: never[]) => unknown> },
+  from: [number, number],
+  offsets: [number, number][],
+  { start = true, end = "release" }: { start?: boolean; end?: "release" | "terminate" } = {},
+) {
   const f = finger();
   const at = ([dx, dy]: [number, number]) => f.at(from[0] + dx, from[1] + dy);
   const p = node.props as Record<string, (e: unknown) => unknown>;
   let took = false;
-  await act(async () => {
-    p.onStartShouldSetResponderCapture?.(f.at(from[0], from[1]));
-  });
+  const down = f.at(from[0], from[1]);
+  // Without its start, the touch went down where the node did not hear it (another responder had it).
+  if (start) {
+    await act(async () => {
+      p.onStartShouldSetResponderCapture?.(down);
+    });
+  }
   for (const offset of offsets) {
     const event = at(offset);
     await act(async () => {
@@ -117,7 +128,9 @@ async function drag(node: { props: Record<string, (...args: never[]) => unknown>
     });
   }
   await act(async () => {
-    p.onResponderRelease?.(at(offsets[offsets.length - 1] ?? [0, 0]));
+    const last = at(offsets[offsets.length - 1] ?? [0, 0]);
+    if (end === "terminate") p.onResponderTerminate?.(last);
+    else p.onResponderRelease?.(last);
   });
   return took;
 }
@@ -136,7 +149,8 @@ function nativeScreens() {
 }
 
 /** A drag that starts in the 18 pt gutter at the screen's left edge (mid-height by default). */
-const dragEdge = (offsets: [number, number][], from: [number, number] = [8, 300]) => drag(screen.getByTestId("drawer-host", { hidden: true }), from, offsets);
+const dragEdge = (offsets: [number, number][], from: [number, number] = [8, 300], how?: Parameters<typeof drag>[3]) =>
+  drag(screen.getByTestId("drawer-host", { hidden: true }), from, offsets, how);
 /** A drag on the open drawer. */
 const dragPanel = (offsets: [number, number][]) => drag(drawer(), [250, 300], offsets);
 
@@ -458,6 +472,63 @@ describe("the drawer", () => {
       await act(async () => router.push("/settings"));
       await dragEdge([[40, 0]]);
       expect(drawerStore.getState().open).toBe(true);
+    });
+
+    it("forgets where a touch began once it is released: a later move with no start of its own is not the gutter's", async () => {
+      await open([info("a")]);
+      // Taken from the gutter, released short of 30 pt.
+      expect(await dragEdge([[12, 0]])).toBe(true);
+      expect(drawerStore.getState().open).toBe(false);
+      // A touch that went down out in the screen, which the host never heard start.
+      expect(await dragEdge([[20, 0], [60, 0]], [200, 300], { start: false })).toBe(false);
+      expect(drawerStore.getState().open).toBe(false);
+    });
+
+    it("forgets where a touch began once another responder takes it away", async () => {
+      await open([info("a")]);
+      expect(await dragEdge([[12, 0]], [8, 300], { end: "terminate" })).toBe(true);
+      expect(drawerStore.getState().open).toBe(false);
+      expect(await dragEdge([[20, 0], [60, 0]], [200, 300], { start: false })).toBe(false);
+      expect(drawerStore.getState().open).toBe(false);
+    });
+
+    it("leaves out what is under the prompt line, measured: its top, as the keyboard moves it", async () => {
+      await launch("/", { ...ROUTES, "session/[id]": Session }, [info("a")]);
+      await act(async () => router.push("/session/a"));
+      await screen.findByTestId("prompt-area");
+      await fireEvent(screen.getByTestId("prompt-area"), "layout", { nativeEvent: { layout: { x: 0, y: 900, width: 400, height: 140 } } });
+      expect(drawerStore.getState().edge?.bottom).toBe(900);
+      await dragEdge([[60, 0]], [8, 950]);
+      expect(drawerStore.getState().open).toBe(false);
+      await dragEdge([[60, 0]], [8, 850]);
+      expect(drawerStore.getState().open).toBe(true);
+      await act(async () => closeDrawer());
+      // The keyboard lifts the prompt line: the strip ends higher up.
+      await fireEvent(screen.getByTestId("prompt-area"), "layout", { nativeEvent: { layout: { x: 0, y: 500, width: 400, height: 140 } } });
+      expect(drawerStore.getState().edge?.bottom).toBe(500);
+      await dragEdge([[60, 0]], [8, 600]);
+      expect(drawerStore.getState().open).toBe(false);
+      // Leaving the conversation drops its bound.
+      await act(async () => router.push("/settings"));
+      expect(drawerStore.getState().edge).toBeNull();
+    });
+
+    it("without a measured prompt line, ends the safe-area inset plus a fixed offset above the bottom", () => {
+      expect(EDGE_BOTTOM).toBe(120);
+      expect(edgeBottom(1_000, 34, null)).toBe(1_000 - 34 - 120);
+      expect(edgeBottom(1_000, 0, null)).toBe(880);
+      expect(edgeBottom(1_000, 34, 700)).toBe(700);
+    });
+
+    it("a bound is dropped only by the screen that set it", () => {
+      const a = {};
+      const b = {};
+      setEdgeBottom(a, 700);
+      setEdgeBottom(b, 650);
+      clearEdgeBottom(a);
+      expect(drawerStore.getState().edge?.bottom).toBe(650);
+      clearEdgeBottom(b);
+      expect(drawerStore.getState().edge).toBeNull();
     });
 
     it("leaves the screens' own back-swipe off: the drawer owns the left edge", async () => {

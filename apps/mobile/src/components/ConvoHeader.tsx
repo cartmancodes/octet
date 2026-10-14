@@ -1,7 +1,9 @@
-import { memo, useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AccessibilityInfo, Modal, Pressable, StyleSheet, Text, View } from "react-native";
 
+import { onMenuRequest } from "../convoMenu";
 import { openDrawer } from "../drawer";
+import type { Phase } from "../protocol";
 import { engineModel, headEngine, headLine, headMode } from "../session";
 import { clipLabel, sessionName } from "../sessions";
 import { useCatalog, useSessionHead } from "../store";
@@ -9,7 +11,7 @@ import { cycleTextSize } from "../textSize";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
 import { Button, Label } from "../ui";
 import { ModelModeMenu } from "./ModelModeMenu";
-import type { Send } from "./send";
+import { useAction, type Send } from "./send";
 
 /** The header's height under the safe area. */
 export const HEADER_HEIGHT = 44;
@@ -42,6 +44,10 @@ function makeStyles(theme: Theme) {
     heading: { ...type.body, fontWeight: "700", color: theme.fg },
     field: { gap: 2 },
     value: { ...type.body, color: theme.fg },
+    end: { gap: spacing.sm, borderTopWidth: 1, borderTopColor: theme.edge, paddingTop: spacing.md },
+    endRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: spacing.sm },
+    question: { ...type.body, color: theme.fg },
+    failure: { ...type.body, color: theme.fg },
   });
 }
 const DARK = makeStyles(dark);
@@ -59,6 +65,8 @@ interface ConvoHeaderProps {
   offline: boolean;
   /** The session has an approval waiting. */
   approval: boolean;
+  /** Where the session's connection is: End is offered when it is idle. */
+  phase?: Phase;
   /** Told when the menu or the info sheet opens and closes: what is under them must not be
    * answered meanwhile. Must be stable. */
   onCovered: (covered: boolean) => void;
@@ -71,7 +79,7 @@ interface ConvoHeaderProps {
  * draws it again; Aa changes the size without reading it, so the header does not draw again for
  * that either.
  */
-export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live, offline, approval, onCovered }: ConvoHeaderProps) {
+export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live, offline, approval, phase, onCovered }: ConvoHeaderProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const head = useSessionHead(session);
@@ -99,6 +107,21 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
     setToInfo(false);
     setMenu((open) => !open);
   }, [live]);
+  // The prompt line's /model opens the menu (a session that takes no commands has none: the
+  // check above closes it again). Not over Session info: iOS shows one Modal at a time.
+  const infoUp = useRef(info);
+  useLayoutEffect(() => {
+    infoUp.current = info;
+  });
+  useEffect(
+    () =>
+      onMenuRequest(session, () => {
+        if (infoUp.current) return;
+        setToInfo(false);
+        setMenu(true);
+      }),
+    [session],
+  );
   const closeMenu = useCallback(() => setMenu(false), []);
   const menuToInfo = useCallback(() => {
     setMenu(false);
@@ -109,7 +132,34 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
     setInfo(true);
   }, []);
   const showInfo = useCallback(() => setInfo(true), []);
-  const hideInfo = useCallback(() => setInfo(false), []);
+
+  // End, in Session info, for an idle session; asked first. A new phase is a new situation: a
+  // half-made End means nothing now, and an End the Mac took waits for the session to leave.
+  const control = useAction(send);
+  const { run } = control;
+  const [ending, setEnding] = useState(false);
+  const [ended, setEnded] = useState(false);
+  const [seen, setSeen] = useState(phase);
+  if (seen !== phase) {
+    setSeen(phase);
+    setEnding(false);
+    setEnded(false);
+  }
+  const hideInfo = useCallback(() => {
+    setInfo(false);
+    setEnding(false);
+  }, []);
+  const askEnd = useCallback(() => {
+    if (!offline) setEnding(true);
+  }, [offline]);
+  const keep = useCallback(() => setEnding(false), []);
+  const end = useCallback(() => {
+    if (offline) return;
+    setEnding(false);
+    run({ type: "end", session }, () => setEnded(true));
+  }, [offline, run, session]);
+  const canEnd = live && phase === "idle";
+  const endOff = control.busy || ended || offline;
 
   return (
     <View style={{ paddingTop: top }}>
@@ -171,6 +221,31 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
               <Field label="Mode" value={headMode(catalog, head)} />
               <Field label="Workspace" value={workspace ?? ""} />
               <Field label="Session" value={session} />
+              {canEnd ? (
+                <View style={s.end}>
+                  {ending ? (
+                    <View style={s.endRow}>
+                      <Text style={s.question}>End this session?</Text>
+                      <Button label="Yes, end it" variant="accent" onPress={end} disabled={offline} />
+                      <Button label="Keep it" onPress={keep} />
+                    </View>
+                  ) : (
+                    <View style={s.endRow}>
+                      <Button
+                        label={ended ? "Ending…" : "End session"}
+                        onPress={askEnd}
+                        disabled={endOff}
+                        busy={control.busy || ended}
+                      />
+                    </View>
+                  )}
+                  {control.failed ? (
+                    <View accessibilityLiveRegion="polite">
+                      <Text style={s.failure}>{control.failed.text}</Text>
+                    </View>
+                  ) : null}
+                </View>
+              ) : null}
             </View>
           </View>
         </Modal>

@@ -865,3 +865,32 @@ describe("drafts", () => {
     expect(store.getState().drafts.size).toBe(0);
   });
 });
+
+describe("the texts sent from this phone, for ↑", () => {
+  it("keeps each session's, newest last, at most 20, and skips a repeat of the last", () => {
+    for (let i = 0; i < 25; i++) store.getState().remember("a", `t${i}`);
+    const a = store.getState().sent.get("a") ?? [];
+    expect(a).toHaveLength(20);
+    expect(a[0]).toBe("t5");
+    expect(a[19]).toBe("t24");
+    store.getState().remember("a", "t24");
+    expect(store.getState().sent.get("a")).toHaveLength(20);
+    expect(store.getState().sent.get("b")).toBeUndefined();
+  });
+
+  it("keeps at most 16 sessions', dropping the one sent to longest ago", () => {
+    for (let i = 0; i < 20; i++) store.getState().remember(`s${i}`, "x");
+    expect(store.getState().sent.size).toBe(16);
+    expect(store.getState().sent.has("s3")).toBe(false);
+    store.getState().remember("s4", "again");
+    store.getState().remember("new", "x");
+    expect(store.getState().sent.has("s4")).toBe(true);
+    expect(store.getState().sent.has("s5")).toBe(false);
+  });
+
+  it("is cleared by reset: an unpaired phone keeps none of them", () => {
+    store.getState().remember("a", "hello");
+    store.getState().reset();
+    expect(store.getState().sent.size).toBe(0);
+  });
+});

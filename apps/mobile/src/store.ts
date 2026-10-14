@@ -49,6 +49,10 @@ export interface OctetState {
   setDraft(session: string, text: string): void;
   /** The session's draft, which is then forgotten; "" when it has none. */
   takeDraft(session: string): string;
+  /** The texts the Mac took from this phone, by session, newest last, for the key bar's ↑. Kept
+   * in memory only: at most `MAX_SENT` a session, for at most `MAX_SENT_SESSIONS` sessions. */
+  sent: ReadonlyMap<string, readonly string[]>;
+  remember(session: string, text: string): void;
   /** Forgets everything the hub sent, for a phone unpaired from its Mac or paired with another. */
   reset(): void;
   /** The hub refused to stream `session` for good. */
@@ -64,6 +68,10 @@ export type OctetStore = StoreApi<OctetState>;
 const MAX_SESSIONS = 200;
 /** Drafts kept, at most. */
 const MAX_DRAFTS = 16;
+/** Texts sent kept for ↑, at most, per session; and the sessions they are kept for. */
+export const MAX_SENT = 20;
+const MAX_SENT_SESSIONS = 16;
+const NO_SENT: readonly string[] = [];
 const FIELD = FIELD_CHARS;
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
@@ -130,10 +138,24 @@ export function createOctetStore(): OctetStore {
     listed: false,
     taskOpen: false,
     drafts: new Map(),
+    sent: new Map(),
 
     reset() {
       clearParsed(); // what the old Mac's replies parsed to
-      set({ sessions: [], bySession: new Map(), hub: "offline", listed: false, taskOpen: false, drafts: new Map() });
+      set({ sessions: [], bySession: new Map(), hub: "offline", listed: false, taskOpen: false, drafts: new Map(), sent: new Map() });
+    },
+
+    remember(session, text) {
+      const old = get().sent.get(session) ?? NO_SENT;
+      if (old[old.length - 1] === text) return; // the same again: one is enough to bring back
+      const sent = new Map(get().sent);
+      sent.delete(session); // the session sent to last goes last
+      sent.set(session, [...old, text].slice(-MAX_SENT));
+      for (const oldest of sent.keys()) {
+        if (sent.size <= MAX_SENT_SESSIONS) break;
+        sent.delete(oldest);
+      }
+      set({ sent });
     },
 
     setDraft(session, text) {
@@ -487,6 +509,9 @@ export function bindHooks(store: OctetStore) {
     useListed: (): boolean => useStore(store, (s) => s.listed),
     /** A session's draft (its first prompt, not taken by the Mac), or undefined. */
     useDraft: (id: string): string | undefined => useStore(store, (s) => s.drafts.get(id)),
+    /** The texts the Mac took from this phone for a session, newest last; the same array until
+     * one more is sent. */
+    useSent: (id: string): readonly string[] => useStore(store, (s) => s.sent.get(id) ?? NO_SENT),
     /** The Task strip's open state, shared by every session's screen. */
     useTaskOpen: (): boolean => useStore(store, (s) => s.taskOpen),
     /** The first approval waiting in a session, from the hub's sessions row, so a session that is
@@ -530,6 +555,7 @@ export const {
   useListed,
   useTaskOpen,
   useDraft,
+  useSent,
   useFrontApproval,
   useApprovals,
   useCatalog,

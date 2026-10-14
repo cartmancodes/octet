@@ -1,10 +1,9 @@
-// What the Composer, the Steer field and the controls share: sending one command at a time, and
-// the words for a command that did not work.
+// What the prompt line, the key bar and the other controls share: sending one command at a time,
+// the limits on what is sent, and the words for a command that did not work.
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Refusal, type RequestBody } from "../client/HubClient";
 import { useHubClient } from "../hub";
-import { lightTap } from "../haptics";
 
 /** Sends a command to the Mac; resolves on its ack, rejects with a `Refusal`. */
 export type Send = (body: RequestBody) => Promise<unknown>;
@@ -128,58 +127,4 @@ export function useAction(send: Send): Action {
     [send, alive],
   );
   return { busy, failed, run, fail: setFailed };
-}
-
-export interface TextSender {
-  text: string;
-  setText: (text: string) => void;
-  busy: boolean;
-  failed: Failure | null;
-  slash: boolean;
-  canSend: boolean;
-  /** Sends the text as the command. It clears only after the ack. */
-  submit: () => void;
-  /** Puts words the user wrote before the ones in the box (a prompt the Mac did not take). */
-  restore: (words: string) => void;
-}
-
-/** A text box that sends its text as a `prompt` or a `steer` for `session`. `offline`: the Mac
- * can't be reached, so nothing is sent; the text stays for when it is back. */
-export function useTextSender(
-  send: Send,
-  session: string,
-  kind: "prompt" | "steer",
-  onSent?: () => void,
-  offline = false,
-): TextSender {
-  const [text, setTextState] = useState("");
-  const { busy, failed, run, fail } = useAction(send);
-  const slash = isSlash(text);
-  const canSend = !busy && !offline && text.trim() !== "" && !slash;
-  const setText = useCallback(
-    (next: string) => {
-      setTextState(next);
-      fail(null);
-    },
-    [fail],
-  );
-  const submit = useCallback(() => {
-    if (!canSend) return;
-    if (utf8Bytes(text) > PROMPT_LIMIT) {
-      fail({ text: TOO_LONG, retry: false });
-      return;
-    }
-    lightTap();
-    const sent = text;
-    run({ type: kind, session, text: sent }, () => {
-      // Words typed while it was out are the user's: only an unchanged box is cleared.
-      setTextState((current) => (current === sent ? "" : current));
-      onSent?.();
-    });
-  }, [canSend, text, kind, session, run, fail, onSent]);
-  const restore = useCallback(
-    (words: string) => setTextState((current) => (current === "" ? words : `${words}\n${current}`)),
-    [],
-  );
-  return { text, setText, busy, failed, slash, canSend, submit, restore };
 }

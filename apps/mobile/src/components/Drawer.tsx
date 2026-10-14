@@ -4,7 +4,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useState, type 
 import { AccessibilityInfo, Animated, BackHandler, PanResponder, Pressable, StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { closeDrawer, openDrawer, useDrawerEnabled, useDrawerOpen } from "../drawer";
+import { closeDrawer, openDrawer, useDrawerEnabled, useDrawerOpen, useEdgeBottom } from "../drawer";
 import { useHubClient } from "../hub";
 import { drawerList, drawerSub, macName, type DrawerRow } from "../inbox";
 import { useHub, useSessions } from "../store";
@@ -24,11 +24,18 @@ const SCRIM = 0.6;
 const CLAIM_DRAG = 8;
 /** How often the open drawer's "how long ago" moves on. */
 const AGO_TICK_MS = 30_000;
-/** The edge strip leaves the header and the composer alone. */
+/** The edge strip leaves the header and the prompt line alone: it starts this far under the safe
+ * area's top, and ends at the prompt line's measured top or, unmeasured, this far over the safe
+ * area's bottom. */
 const EDGE_TOP = 56;
-const EDGE_BOTTOM = 120;
+export const EDGE_BOTTOM = 120;
 /** The scrim is dark ink in both themes. */
 const INK = dark.bg;
+
+/** Where the edge strip ends, in window points: the prompt line's top when a screen measured it,
+ * else `EDGE_BOTTOM` over the safe area at the bottom of a window `height` tall. */
+export const edgeBottom = (height: number, insetBottom: number, measured: number | null): number =>
+  measured ?? height - insetBottom - EDGE_BOTTOM;
 
 /** Whether a drag of `dx` across and `dy` down is horizontal: at least twice as wide as tall. */
 const horizontal = (dx: number, dy: number): boolean => Math.abs(dx) >= 2 * Math.abs(dy);
@@ -338,6 +345,9 @@ export function Drawer() {
 const NONE: DrawerRow[] = [];
 const SCRIM_BOX = { backgroundColor: INK } as const;
 
+/** A touch start that is in no gutter. */
+const NOWHERE = Number.POSITIVE_INFINITY;
+
 /** What the edge swipe's responder reads: where the gutter is, and where the touch came down. A
  * plain object the render never reads (only the responder does), moved by `place`. */
 function makeZone() {
@@ -345,14 +355,21 @@ function makeZone() {
     enabled: false,
     top: 0,
     bottom: 0,
-    x: 0,
-    y: 0,
+    x: NOWHERE,
+    y: NOWHERE,
     dx: 0,
     dy: 0,
     place(enabled: boolean, top: number, bottom: number) {
       zone.enabled = enabled;
       zone.top = top;
       zone.bottom = bottom;
+    },
+    /** The touch is over: where it began says nothing of the next one. */
+    forget() {
+      zone.x = NOWHERE;
+      zone.y = NOWHERE;
+      zone.dx = 0;
+      zone.dy = 0;
     },
   };
   return zone;
@@ -362,7 +379,7 @@ function makeZone() {
  * Wraps the screens, so the drawer can take a swipe from the left edge. It claims nothing on touch
  * start, so a tap or a scroll that begins in the 18 pt gutter reaches the screen as usual; it takes a
  * touch only once it is a rightward drag, at least twice as wide as tall, that began in the gutter
- * (below the header, above the composer). Past 30 pt that opens the drawer; a vertical drag never does.
+ * (below the header, above the prompt line). Past 30 pt that opens the drawer; a vertical drag never does.
  * Where the drawer is off (Pair, New session) or already open it takes nothing.
  * While the drawer is open the screens under it are hidden from a screen reader on Android too (the
  * drawer is modal on iOS).
@@ -374,8 +391,9 @@ export function DrawerHost({ children }: { children: ReactNode }) {
   // Read by the responder, which is made once.
   const [zone] = useState(makeZone);
   const enabled = useDrawerEnabled() && !open;
+  const measured = useEdgeBottom();
   const top = insets.top + EDGE_TOP;
-  const bottom = height - EDGE_BOTTOM;
+  const bottom = edgeBottom(height, insets.bottom, measured);
   useLayoutEffect(() => {
     zone.place(enabled, top, bottom);
   }, [zone, enabled, top, bottom]);
@@ -403,6 +421,8 @@ export function DrawerHost({ children }: { children: ReactNode }) {
         const dy = zone.dy + g.dy;
         if (dx > OPEN_DRAG && horizontal(dx, dy)) openDrawer();
       },
+      onPanResponderRelease: zone.forget,
+      onPanResponderTerminate: zone.forget,
     }),
   );
   return (

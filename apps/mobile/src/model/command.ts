@@ -1,4 +1,4 @@
-// An approval's command as the sheet shows it: nothing of what Allow runs may sit out of sight
+// An approval's command as the Permission card shows it: nothing of what Allow runs may sit out of sight
 // below a wall of blank lines. Plain TypeScript.
 
 /** Blank lines in a row, from this many, are drawn as one line saying how many. */

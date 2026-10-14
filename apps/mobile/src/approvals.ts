@@ -1,6 +1,6 @@
-// Answering an approval from the phone, wherever it shows (the sheet on a session's screen, an
-// Inbox card, Allow all): the guards every Allow goes through. Allow is once only.
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+// Answering an approval from the phone, wherever it shows (a session's Permission card and its
+// y n esc keys, an Inbox card, Allow all): the guards every Allow goes through. Allow is once only.
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { confirmBiometric, type BiometricResult } from "./auth";
 import { failure, useAlive, type Send } from "./components/send";
@@ -125,15 +125,17 @@ export interface ApprovalAnswer {
   failure: string | null;
   /** Armed, not busy, reachable, and not already answered from here. */
   canAnswer: boolean;
-  allow(): Promise<void>;
-  deny(): Promise<void>;
+  /** Each resolves true once the Mac took the answer; false when nothing went (or it failed). */
+  allow(): Promise<boolean>;
+  deny(): Promise<boolean>;
 }
 
 /**
  * Answers `approval` of `session`, once. Allow asks for Face ID when the setting is on (read at
  * the tap, so a change in Settings counts at once). After Face ID the answer goes only if the
  * request is still on screen, still the same one (the generation), still open, and the Mac can
- * still be reached. Two taps send one answer.
+ * still be reached. Two taps send one answer. The object is the same until one of its parts
+ * changes, so a memoised surface does not draw again for nothing.
  */
 export function useApprovalAnswer(
   session: string,
@@ -168,10 +170,10 @@ export function useApprovalAnswer(
   const id = approval?.id;
   const action = approval?.summary.action ?? "";
   const answer = useCallback(
-    async (allow: boolean) => {
-      if (id === undefined || out.current || !armed || down.current || answeredKey === key) return;
+    async (allow: boolean): Promise<boolean> => {
+      if (id === undefined || out.current || !armed || down.current || answeredKey === key) return false;
       const asked = key;
-      if (ledger && !ledger.claim(asked)) return;
+      if (ledger && !ledger.claim(asked)) return false;
       out.current = true;
       let given = false;
       setError(null);
@@ -183,22 +185,24 @@ export function useApprovalAnswer(
             const checked = await confirmBiometric(`Allow: ${action.slice(0, REASON_CHARS)}`);
             if (checked === "unavailable") {
               if (alive()) setError({ key: asked, text: NO_FACE_ID });
-              return;
+              return false;
             }
-            if (checked === "failed") return; // cancelled or no match: nothing is sent
+            if (checked === "failed") return false; // cancelled or no match: nothing is sent
           }
         }
         // Face ID takes a while: send only if this request is still on screen, still the one the
         // user looked at, still armed, still open, and the Mac can still be reached.
-        if (!alive() || generation.current !== asked || !armedNow.current || !isOpen(id) || down.current) return;
+        if (!alive() || generation.current !== asked || !armedNow.current || !isOpen(id) || down.current) return false;
         setStage("sending");
         await send({ type: "answer", session, approval: id, allow });
         given = true;
         if (allow) successTap();
         if (alive()) setAnsweredKey(asked);
         onAnswered?.(id);
+        return true;
       } catch (e) {
         if (alive()) setError({ key: asked, text: failure(e).text });
+        return false;
       } finally {
         out.current = false;
         ledger?.finish(asked, given);
@@ -211,15 +215,13 @@ export function useApprovalAnswer(
   const deny = useCallback(() => answer(false), [answer]);
 
   const busy = stage !== null;
-  return {
-    armed,
-    busy,
-    sending: stage === "sending",
-    failure: error && error.key === key ? error.text : null,
-    canAnswer: armed && !busy && reachable && answeredKey !== key,
-    allow,
-    deny,
-  };
+  const sending = stage === "sending";
+  const shown = error && error.key === key ? error.text : null;
+  const canAnswer = armed && !busy && reachable && answeredKey !== key;
+  return useMemo(
+    () => ({ armed, busy, sending, failure: shown, canAnswer, allow, deny }),
+    [armed, busy, sending, shown, canAnswer, allow, deny],
+  );
 }
 
 /** How Allow all ended: the batch was answered, or Face ID did not pass. */

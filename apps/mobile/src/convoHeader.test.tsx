@@ -12,7 +12,8 @@ import { ConvoHeader } from "./components/ConvoHeader";
 import { APPROVAL_WAITING, FULL_ACCESS_ON, MENU_DISMISS_MS, MODE_HELP, ModelModeMenu, WAITING_FOR_MAC } from "./components/ModelModeMenu";
 import { closeDrawer, drawerStore, setDrawerEnabled } from "./drawer";
 import { SETTINGS_KEY, saveSettings } from "./persist";
-import type { CatalogInfo, SessionInfo } from "./protocol";
+import { requestMenu } from "./convoMenu";
+import type { CatalogInfo, Phase, SessionInfo } from "./protocol";
 import { octetStore } from "./store";
 import { resetTextSize, textSizeStore } from "./textSize";
 import { dark, light } from "./theme";
@@ -67,6 +68,7 @@ const flush = () => act(async () => void (await new Promise((resolve) => setTime
 
 interface Opts {
   live?: boolean;
+  phase?: Phase;
   offline?: boolean;
   approval?: boolean;
   onCovered?: (covered: boolean) => void;
@@ -79,6 +81,7 @@ const header = (r: Rig, o: Opts = {}) => (
     live={o.live ?? true}
     offline={o.offline ?? false}
     approval={o.approval ?? false}
+    phase={o.phase}
     onCovered={o.onCovered ?? noop}
   />
 );
@@ -252,9 +255,137 @@ describe("the conversation header", () => {
       expect(within(screen.getByTestId("info")).getByText(SESSION)).toBeTruthy();
     });
   });
+
+  // Moved from the old session controls: End lives in Session info now.
+  describe("End, in ⋯ Session info", () => {
+    const openInfo = () => press("Session info");
+    const disabledNow = (name: string) => screen.getByRole("button", { name }).props.accessibilityState?.disabled === true;
+
+    it("shows End only when idle, and asks first", async () => {
+      await hear(CATALOG);
+      const r = rig();
+      const view = await render(header(r, { phase: "idle" }));
+      await openInfo();
+      expect(button("End session")).toBeTruthy();
+      await press("End session");
+      expect(r.send).not.toHaveBeenCalled();
+      expect(screen.getByText("End this session?")).toBeTruthy();
+      await press("Keep it");
+      expect(screen.queryByText("End this session?")).toBeNull();
+      expect(r.send).not.toHaveBeenCalled();
+      await press("End session");
+      await press("Yes, end it");
+      expect(r.sent).toEqual([{ type: "end", session: SESSION }]);
+      await view.rerender(header(r, { phase: "running" }));
+      expect(button("End session")).toBeNull();
+      for (const phase of ["connecting", "stopped"] as const) {
+        await view.rerender(header(r, { phase }));
+        expect(button("End session")).toBeNull();
+      }
+    });
+
+    it("is not offered for a session that takes no commands", async () => {
+      await hear(CATALOG);
+      await render(header(rig(), { phase: "idle", live: false }));
+      await openInfo();
+      expect(button("End session")).toBeNull();
+    });
+
+    it("shows the refusal of an end, in fg, and the confirmation goes", async () => {
+      await hear(CATALOG);
+      const r = rig();
+      await render(header(r, { phase: "idle" }));
+      await openInfo();
+      await press("End session");
+      await press("Yes, end it");
+      r.waiting[0]?.reject(new Refusal("turn_open", "A turn is still open"));
+      await flush();
+      expect([dark.fg, light.fg]).toContain(color(screen.getByText("A turn is still open")));
+      expect(screen.queryByText("End this session?")).toBeNull();
+    });
+
+    it("forgets a half-made End when the phase changes", async () => {
+      await hear(CATALOG);
+      const r = rig();
+      const view = await render(header(r, { phase: "idle" }));
+      await openInfo();
+      await press("End session");
+      expect(screen.getByText("End this session?")).toBeTruthy();
+      await view.rerender(header(r, { phase: "running" }));
+      await view.rerender(header(r, { phase: "idle" }));
+      expect(screen.queryByText("End this session?")).toBeNull();
+      expect(button("End session")).toBeTruthy();
+    });
+
+    it("forgets a half-made End when the sheet closes", async () => {
+      await hear(CATALOG);
+      await render(header(rig(), { phase: "idle" }));
+      await openInfo();
+      await press("End session");
+      await press("Close");
+      await openInfo();
+      expect(screen.queryByText("End this session?")).toBeNull();
+    });
+
+    it("says Ending… after End's ack, disabled, until the phase moves on", async () => {
+      await hear(CATALOG);
+      const r = rig();
+      const view = await render(header(r, { phase: "idle" }));
+      await openInfo();
+      await press("End session");
+      await press("Yes, end it");
+      r.waiting[0]?.resolve();
+      await flush();
+      expect(button("End session")).toBeNull();
+      expect(disabledNow("Ending…")).toBe(true);
+      await press("Ending…");
+      expect(r.send).toHaveBeenCalledTimes(1);
+      await view.rerender(header(r, { phase: "running" }));
+      await view.rerender(header(r, { phase: "idle" }));
+      expect(button("End session")).toBeTruthy();
+    });
+
+    it("offline, End sends nothing, then comes back with the link", async () => {
+      await hear(CATALOG);
+      const r = rig();
+      const view = await render(header(r, { phase: "idle", offline: true }));
+      await openInfo();
+      expect(disabledNow("End session")).toBe(true);
+      await press("End session");
+      expect(button("Yes, end it")).toBeNull();
+      expect(r.send).not.toHaveBeenCalled();
+      await view.rerender(header(r, { phase: "idle" }));
+      expect(disabledNow("End session")).toBe(false);
+    });
+
+    it("a half-made End cannot be confirmed once the link drops", async () => {
+      await hear(CATALOG);
+      const r = rig();
+      const view = await render(header(r, { phase: "idle" }));
+      await openInfo();
+      await press("End session");
+      await view.rerender(header(r, { phase: "idle", offline: true }));
+      expect(disabledNow("Yes, end it")).toBe(true);
+      await press("Yes, end it");
+      expect(r.send).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("the ▾ menu", () => {
+  it("opens for the prompt line's /model, for this session only, and not for one that takes no commands", async () => {
+    await hear(CATALOG);
+    const view = await render(header(rig()));
+    await act(async () => void requestMenu("someone-else"));
+    expect(screen.queryByTestId("menu")).toBeNull();
+    await act(async () => void requestMenu(SESSION));
+    expect(screen.getByTestId("menu")).toBeTruthy();
+    await press("Close");
+    await view.rerender(header(rig(), { live: false }));
+    await act(async () => void requestMenu(SESSION));
+    expect(screen.queryByTestId("menu")).toBeNull();
+  });
+
   it("lists the session engine's models with ✓ on the current one, and other engines' after", async () => {
     await hear(CATALOG);
     await render(header(rig()));

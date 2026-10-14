@@ -617,16 +617,64 @@ describe("the Session screen", () => {
     // renderRouter runs on fake timers.
     const wait = (ms: number) => act(async () => void jest.advanceTimersByTime(ms));
 
-    it("a live session has the composer and, idle, End; a running one has Cancel", async () => {
+    it("a live session has the prompt line and the key bar; idle, End is in Session info; running, esc cancels", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
       expect(screen.getByLabelText("Message")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Cancel (esc)" }).props.accessibilityState?.disabled).toBe(true);
+      await fireEvent.press(screen.getByRole("button", { name: "Session info" }));
       expect(screen.getByRole("button", { name: "End session" })).toBeTruthy();
-      expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+      await fireEvent.press(screen.getByRole("button", { name: "Close" }));
       await feed(rig, stateFrame({ phase: "running", queued: 2 }));
-      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
-      expect(screen.getByText("Queue · 2 queued")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Cancel (esc)" }).props.accessibilityState?.disabled).toBe(false);
+      expect(screen.getByRole("button", { name: "Queue (⏎)" })).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Cancel (esc)" }));
+      expect(lastCommand(rig, "cancel")).toMatchObject({ session: "a" });
+    });
+
+    it("ends the session from Session info over the wire, after asking", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Session info" }));
+      await fireEvent.press(screen.getByRole("button", { name: "End session" }));
+      expect(rig.sockets.last.commandsOf("end")).toEqual([]);
+      await fireEvent.press(screen.getByRole("button", { name: "Yes, end it" }));
+      expect(lastCommand(rig, "end")).toMatchObject({ session: "a" });
+    });
+
+    it("keys_follow_state_and_never_double_send: esc with an approval waiting denies exactly the front one, once", async () => {
+      await saveSettings({ faceId: false });
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"), approvalEvent(2, "Edit config"));
+      await wait(450);
+      await fireEvent.press(screen.getByRole("button", { name: "Deny (esc)" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Deny (esc)" }));
+      await act(async () => {});
+      expect(rig.sockets.last.commandsOf("answer")).toEqual([expect.objectContaining({ session: "a", approval: 1, allow: false })]);
+      await feed(rig, { type: "ack", req: lastCommand(rig, "answer")?.req, message: "ok" });
+      expect(screen.getByText("Edit config")).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Deny (esc)" }));
+      await act(async () => {});
+      expect(rig.sockets.last.commandsOf("answer")).toHaveLength(1); // the next one arms first
+    });
+
+    it("text sent while an approval waits denies it, then goes as a prompt after the deny's ack", async () => {
+      await saveSettings({ faceId: false });
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"));
+      await wait(450);
+      await fireEvent.changeText(screen.getByLabelText("Message"), "use the staging config");
+      await fireEvent(screen.getByLabelText("Message"), "submitEditing");
+      await act(async () => {});
+      const answer = lastCommand(rig, "answer");
+      expect(answer).toMatchObject({ approval: 1, allow: false });
+      expect(rig.sockets.last.commandsOf("prompt")).toEqual([]);
+      await feed(rig, { type: "ack", req: answer?.req, message: "ok" });
+      expect(lastCommand(rig, "prompt")).toMatchObject({ session: "a", text: "use the staging config" });
     });
 
     it("sends a prompt over the wire and clears the box when the Mac acks", async () => {
@@ -634,7 +682,7 @@ describe("the Session screen", () => {
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
       await fireEvent.changeText(screen.getByLabelText("Message"), "fix the hub");
-      await fireEvent.press(screen.getByRole("button", { name: "Send" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Send (⏎)" }));
       const sent = lastCommand(rig, "prompt");
       expect(sent).toMatchObject({ session: "a", text: "fix the hub" });
       expect(screen.getByLabelText("Message").props.value).toBe("fix the hub");
@@ -648,7 +696,7 @@ describe("the Session screen", () => {
       await open(rig, "a");
       await feed(rig, subscribed(), approvalEvent(1, "Run tests"), approvalEvent(2, "Edit config"));
       expect(screen.getByText("Run tests")).toBeTruthy();
-      expect(screen.getByText("$ make test")).toBeTruthy();
+      expect(screen.getByText("make test")).toBeTruthy();
       await wait(450);
       await fireEvent.press(screen.getByRole("button", { name: "Allow" }));
       await act(async () => {});
@@ -669,9 +717,12 @@ describe("the Session screen", () => {
       await feed(rig, { type: "sessions", sessions: [info("b")] });
       expect(screen.getByText("This session ended")).toBeTruthy();
       expect(screen.queryByLabelText("Message")).toBeNull();
-      expect(screen.queryByRole("button", { name: "End session" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Cancel (esc)" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Allow (y)" })).toBeNull();
       expect(screen.queryByText("Run tests")).toBeNull();
       expect(screen.queryByRole("button", { name: "Allow" })).toBeNull();
+      await fireEvent.press(screen.getByRole("button", { name: "Session info" }));
+      expect(screen.queryByRole("button", { name: "End session" })).toBeNull();
     });
 
     const titled = (name = "a") => screen.getByRole("button", { name: new RegExp(`^${name}, `) });
@@ -763,6 +814,7 @@ describe("the Session screen", () => {
     });
 
     describe("while the Mac can't be reached", () => {
+      const KEYS = ["Allow", "Deny", "Allow (y)", "Deny (n)", "Deny (esc)"];
       const isOff = (name: string) =>
         screen.getByRole("button", { name }).props.accessibilityState?.disabled === true;
 
@@ -789,9 +841,10 @@ describe("the Session screen", () => {
         expect(StyleSheet.flatten(screen.getByTestId("transcript-area").props.style).opacity).toBe(0.6);
         expect(screen.getByText("Fix the hub")).toBeTruthy();
         expect(screen.getByText("Run tests")).toBeTruthy();
-        for (const name of ["Allow", "Deny", "Send", "End session"]) expect(isOff(name)).toBe(true);
-        await fireEvent.press(screen.getByRole("button", { name: "Send" }));
+        for (const name of KEYS) expect(isOff(name)).toBe(true);
+        await fireEvent(screen.getByLabelText("Message"), "submitEditing");
         await fireEvent.press(screen.getByRole("button", { name: "Deny" }));
+        await fireEvent.press(screen.getByRole("button", { name: "Deny (esc)" }));
         // A brief `connecting` keeps the typed words.
         await act(async () => {
           rig.clock.advance(500);
@@ -808,7 +861,7 @@ describe("the Session screen", () => {
         // The approval arms 400 ms after the link is back, as after it first came.
         expect(isOff("Deny")).toBe(true);
         await wait(400);
-        for (const name of ["Allow", "Deny", "Send", "End session"]) expect(isOff(name)).toBe(false);
+        for (const name of KEYS) expect(isOff(name)).toBe(false);
         expect(rig.sockets.all.flatMap((s) => s.commandsOf("prompt").concat(s.commandsOf("answer")))).toEqual([]);
       });
 

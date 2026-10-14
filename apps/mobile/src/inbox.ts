@@ -96,7 +96,7 @@ function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Pick<Inb
     };
   }
   const { action, command, files, scope, cwd } = approval.summary;
-  // The hidden-padding fold, as the sheet draws a command: nothing Allow runs is pushed out of sight.
+  // The hidden-padding fold, as the Permission card draws a command: nothing Allow runs is pushed out of sight.
   const what = command ? foldCommand(command).text : (files[0] ?? null);
   return {
     ...base,
