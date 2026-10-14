@@ -1,4 +1,4 @@
-import { NO_GIST_LINE, cardLabel, classify, macName, shortAgo } from "./inbox";
+import { NO_GIST_LINE, cardLabel, classify, drawerList, drawerSub, macName, shortAgo } from "./inbox";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 
 const NOW_MS = 1_800_000_000 * 1000;
@@ -137,6 +137,13 @@ describe("classify", () => {
     expect(list.find((i) => i.id === "b")?.shortened).toBe(false);
   });
 
+  it("a file path the hub clipped (ends with …) is shortened too", () => {
+    const { needs } = run([
+      info("a", { approvals: 1, approval: gist(1, { action: "Edit", command: null, files: ["src/a.rs", `${"d/".repeat(99)}file…`] }) }),
+    ]);
+    expect(needs[0]).toMatchObject({ shortened: true, editApproval: true });
+  });
+
   it("a session waiting without a gist still needs you, with nothing to answer from here", () => {
     const [item] = run([info("a", { approvals: 1 })]).needs;
     expect(item).toMatchObject({ statusTone: "amber", approval: null, editApproval: false, line: NO_GIST_LINE });
@@ -202,5 +209,56 @@ describe("cardLabel", () => {
     expect(parts[1]).toBe("1m");
     expect(parts.every((p) => p.length <= 120)).toBe(true);
     expect(parts.some((p) => p.startsWith("ggg") && p.endsWith("…"))).toBe(true);
+  });
+});
+
+describe("drawerList", () => {
+  const waitingInfo = (id: string) => info(id, { approvals: 1, phase: "running", approval: gist(1) });
+
+  const rows = (list: SessionInfo[]) => drawerList(list, NOW_MS).rows;
+
+  it("lists needs first, then running, then the rest, each newest first like the Inbox", () => {
+    const list = [
+      info("old", { last_activity: NOW_S - 7200 }),
+      info("run", { phase: "running", last_activity: NOW_S - 30, now: "Writing reply" }),
+      info("ask", { approvals: 1, phase: "running", approval: gist(1), last_activity: NOW_S - 90 }),
+      info("new", { last_activity: NOW_S - 600 }),
+    ];
+    expect(rows(list).map((r) => r.id)).toEqual(["ask", "run", "new", "old"]);
+  });
+
+  it("counts the sessions that need you and the ones that run with nothing waiting", () => {
+    const list = [waitingInfo("a"), waitingInfo("b"), info("c", { phase: "running" }), info("d")];
+    expect(drawerList(list, NOW_MS)).toMatchObject({ needs: 2, running: 1 });
+  });
+
+  it("says approve in amber for a waiting approval, even without its gist", () => {
+    const [row] = rows([info("a", { approvals: 2, phase: "running" })]);
+    expect(row).toMatchObject({ id: "a", name: "a", status: "approve", tone: "amber" });
+  });
+
+  it("says the phase word in the accent for a running turn", () => {
+    const [row] = rows([info("a", { phase: "running", now: "Thinking" })]);
+    expect(row).toMatchObject({ status: "thinking", tone: "accent" });
+  });
+
+  it("says how long ago, muted, for a quiet session; nothing when that is unknown", () => {
+    const list = [info("a", { last_activity: NOW_S - 180 }), info("b")];
+    expect(rows(list)).toEqual([
+      expect.objectContaining({ id: "a", status: "3m", tone: "muted" }),
+      expect.objectContaining({ id: "b", status: "", tone: "muted" }),
+    ]);
+  });
+});
+
+describe("drawerSub", () => {
+  it("counts what needs you and what runs", () => {
+    expect(drawerSub(2, 3)).toBe("2 need you · 3 running");
+    expect(drawerSub(1, 0)).toBe("1 need you · 0 running");
+  });
+
+  it("leaves out the needs when none", () => {
+    expect(drawerSub(0, 2)).toBe("2 running");
+    expect(drawerSub(0, 0)).toBe("0 running");
   });
 });

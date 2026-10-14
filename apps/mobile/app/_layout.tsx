@@ -1,10 +1,12 @@
-import { Stack, useRouter } from "expo-router";
+import { Stack, usePathname, useRouter } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import * as SystemUI from "expo-system-ui";
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { AppState, View } from "react-native";
 
+import { Drawer, DrawerEdge } from "../src/components/Drawer";
+import { drawerScreen, setDrawerEnabled } from "../src/drawer";
 import { useHubController, useHubSnapshot } from "../src/hub";
 import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
 import { useTheme } from "../src/theme";
@@ -24,6 +26,15 @@ export default function RootLayout() {
   const hub = useHubController();
   const router = useRouter();
   const { status, offer } = useHubSnapshot();
+  const pathname = usePathname();
+
+  // The drawer belongs to the Inbox, a Conversation and Settings of a paired phone: anywhere else
+  // (Pair, New session) it is closed and disabled. A layout effect, so no frame shows it open there.
+  const drawerHere = status === "paired" && !offer && drawerScreen(pathname);
+  useLayoutEffect(() => {
+    setDrawerEnabled(drawerHere);
+    return () => setDrawerEnabled(false);
+  }, [drawerHere]);
 
   useEffect(() => {
     // The socket and its timers live only while the app is in the foreground. `inactive` is a
@@ -106,6 +117,12 @@ export default function RootLayout() {
         </Stack.Protected>
       </Stack>
       <ToastHost />
+      {paired && !offer ? (
+        <>
+          <DrawerEdge />
+          <Drawer />
+        </>
+      ) : null}
     </>
   );
 }

@@ -105,7 +105,7 @@ function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Pick<Inb
     line: scope !== "" ? scope : (cwd ?? ""),
     approval,
     editApproval: !command && files.length > 0,
-    shortened: (!!command && command.endsWith(CLIP_MARK)) || files.some((f) => MORE_FILES.test(f)),
+    shortened: (!!command && command.endsWith(CLIP_MARK)) || files.some((f) => MORE_FILES.test(f) || f.endsWith(CLIP_MARK)),
   };
 }
 
@@ -172,3 +172,51 @@ export function sameItem(a: InboxItem, b: InboxItem): boolean {
     a.shortened === b.shortened
   );
 }
+
+/** One row of the drawer's session list. */
+export interface DrawerRow {
+  id: string;
+  name: string;
+  /** "approve", a phase word ("thinking"), "done", or how long ago; empty when none is known. */
+  status: string;
+  tone: Tone;
+}
+
+/** The drawer's session list, with the counts under its title. */
+export interface DrawerList {
+  rows: DrawerRow[];
+  /** Sessions with an approval waiting. */
+  needs: number;
+  /** Sessions with a turn running and nothing waiting. */
+  running: number;
+}
+
+/**
+ * The drawer's sessions, in the Inbox's order (needs you, running, then the rest, each newest
+ * first). A session waiting on an approval says "approve"; one running says what it is doing in a
+ * word; one that finished well says "done"; any other says how long ago it last did anything.
+ * `now` is the clock in milliseconds.
+ */
+export function drawerList(sessions: readonly SessionInfo[], now: number): DrawerList {
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+  const { needs, running, done } = classify(sessions, new Map(), { mac: "", now });
+  const rows: DrawerRow[] = [];
+  for (const item of [...needs, ...running, ...done]) {
+    const s = byId.get(item.id);
+    const base = { id: item.id, name: item.name };
+    if (item.statusTone === "amber") {
+      rows.push({ ...base, status: "approve", tone: "amber" });
+    } else if (s && item.statusTone === "accent") {
+      rows.push({ ...base, status: sessionPose(s), tone: "accent" });
+    } else if (s && sessionPose(s) === "success") {
+      rows.push({ ...base, status: "done", tone: "accent" });
+    } else {
+      rows.push({ ...base, status: item.ago, tone: "muted" });
+    }
+  }
+  return { rows, needs: needs.length, running: running.length };
+}
+
+/** The line under "Octet" in the drawer: "2 need you · 3 running", or just "3 running". */
+export const drawerSub = (needs: number, running: number): string =>
+  needs > 0 ? `${needs} need you · ${running} running` : `${running} running`;

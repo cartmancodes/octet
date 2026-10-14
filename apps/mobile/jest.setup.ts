@@ -71,6 +71,13 @@ jest.mock("expo-splash-screen", () => ({
   hideAsync: jest.fn(async () => undefined),
 }));
 
+// There is no native animation driver under test (its values never move), so animations run on the
+// JS driver: a test sees an opening drawer's scrim reach its opacity.
+const animatedHelper = jest.requireActual<{ default: { shouldUseNativeDriver: () => boolean } }>(
+  "react-native/src/private/animated/NativeAnimatedHelper",
+).default;
+animatedHelper.shouldUseNativeDriver = () => false;
+
 beforeEach(() => {
   // The app is in front, as it is for anyone tapping it. React Native's mock leaves it unset.
   const { AppState } = jest.requireActual<typeof import("react-native")>("react-native");

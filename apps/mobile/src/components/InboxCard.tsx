@@ -11,6 +11,8 @@ interface InboxCardProps {
   item: InboxItem;
   /** The Mac can't be reached: the card is greyed and does nothing. */
   offline: boolean;
+  /** The drawer is over the card: it answers nothing, and arms again once the drawer is gone. */
+  covered: boolean;
   /** The rest must be stable, or every card re-renders with the list. */
   send: Send;
   ledger: AnswerLedger;
@@ -46,12 +48,12 @@ const LIGHT = makeStyles(light);
  * Deny, or Review for a file edit. A request the hub shortened offers Review in place of Allow
  * once. Every string is the Mac's and drawn as text.
  */
-export const InboxCard = memo(function InboxCard({ item, offline, send, ledger, isFront, onOpen }: InboxCardProps) {
+export const InboxCard = memo(function InboxCard({ item, offline, covered, send, ledger, isFront, onOpen }: InboxCardProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const { id, approval } = item;
   const isOpen = useCallback((approvalId: number) => isFront(id, approvalId), [isFront, id]);
-  const answer = useApprovalAnswer(id, approval, { send, offline, isOpen, ledger });
+  const answer = useApprovalAnswer(id, approval, { send, offline, covered, isOpen, ledger });
   const { allow: allowNow, deny: denyNow } = answer;
   const open = useCallback(() => onOpen(id), [onOpen, id]);
   const allow = useCallback(() => void allowNow(), [allowNow]);
@@ -130,6 +132,7 @@ function sameProps(a: InboxCardProps, b: InboxCardProps): boolean {
   return (
     sameItem(a.item, b.item) &&
     a.offline === b.offline &&
+    a.covered === b.covered &&
     a.send === b.send &&
     a.ledger === b.ledger &&
     a.isFront === b.isFront &&

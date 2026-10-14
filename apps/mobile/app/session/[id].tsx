@@ -13,6 +13,7 @@ import { useSend } from "../../src/components/send";
 import { SessionControls } from "../../src/components/SessionControls";
 import { TaskStrip } from "../../src/components/TaskStrip";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
+import { useDrawerOpen } from "../../src/drawer";
 import { useHubClient } from "../../src/hub";
 import { Mascot } from "../../src/mascot/Mascot";
 import type { PoseName } from "../../src/mascot/poses";
@@ -137,6 +138,8 @@ export default function Session() {
   const [offset, setOffset] = useState(0);
   // The Mode and model sheet covers the approval sheet: it waits until the sheet is gone.
   const [sheetOpen, setSheetOpen] = useState(false);
+  // The side drawer covers it too: a tap that closes the drawer must not answer.
+  const drawerOpen = useDrawerOpen();
   const root = useRef<View>(null);
   const measure = useCallback(() => root.current?.measureInWindow((_x, y) => setOffset(y)), []);
 
@@ -197,7 +200,7 @@ export default function Session() {
             {live ? (
               <>
                 {offline ? <Text style={[type.caption, styles.waiting, { color: theme.muted }]}>{WAITING}</Text> : null}
-                <ApprovalSheet session={id} approvals={approvals} send={send} offline={offline} covered={sheetOpen} />
+                <ApprovalSheet session={id} approvals={approvals} send={send} offline={offline} covered={sheetOpen || drawerOpen} />
                 <SessionControls
                   session={id}
                   phase={phase}

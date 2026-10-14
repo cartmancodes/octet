@@ -9,6 +9,7 @@ import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { HubBanner } from "../src/components/HubBanner";
 import { InboxCard } from "../src/components/InboxCard";
 import { failure, useAlive, useSend } from "../src/components/send";
+import { openDrawer, useDrawerOpen } from "../src/drawer";
 import { successTap } from "../src/haptics";
 import { useHubClient } from "../src/hub";
 import { classify, macName, type InboxItem } from "../src/inbox";
@@ -59,6 +60,8 @@ export default function Inbox() {
   const hub = useHub();
   const listed = useListed();
   const focused = useIsFocused();
+  // The drawer is over the cards: they answer nothing while it is up, and arm again once it closes.
+  const covered = useDrawerOpen();
   const send = useSend();
   const alive = useAlive();
   const reachable = hub === "ready";
@@ -103,17 +106,18 @@ export default function Inbox() {
 
   // Allow all shows, and arms, only on Needs you: coming back to it arms it again.
   const showAll = tab === "needs" && answerable.length >= ALL_FROM;
-  const allArmed = useArm(batchKey, reachable && showAll);
+  const allArmed = useArm(batchKey, reachable && showAll && !covered);
 
-  // What is drawn and whether the link is up, for an Allow all awaiting Face ID: layout effects,
-  // so a change is seen in the commit that makes it. `drops` moves on with each render while the
-  // Mac can't be reached: a link that dropped and came back during Face ID answers nothing.
+  // What is drawn, and whether the link is down or the drawer is over the cards, for an Allow all
+  // awaiting Face ID: layout effects, so a change is seen in the commit that makes it. `drops` moves
+  // on with each render while the Mac can't be reached: a link that dropped and came back during
+  // Face ID answers nothing.
   const shown = useRef<ReadonlySet<string>>(new Set());
   const down = useRef(offline);
   const drops = useRef(0);
   useLayoutEffect(() => {
     shown.current = new Set(showAll ? keys : []);
-    down.current = offline;
+    down.current = offline || covered;
     if (offline) drops.current += 1;
   });
 
@@ -163,12 +167,11 @@ export default function Inbox() {
   const open = useCallback((id: string) => router.push({ pathname: "/session/[id]", params: { id } }), [router]);
   // New session is Task 4's screen; until then, Recent and new starts one.
   const openNew = useCallback(() => router.push("/recent"), [router]);
-  // The drawer is Task 3's; until then the menu opens Settings.
-  const openMenu = useCallback(() => router.push("/settings"), [router]);
+  const openMenu = useCallback(() => openDrawer(), []);
 
   const renderItem = useCallback<ListRenderItem<InboxItem>>(
-    ({ item }) => <InboxCard item={item} offline={offline} send={send} ledger={ledger} isFront={isFront} onOpen={open} />,
-    [offline, send, ledger, open],
+    ({ item }) => <InboxCard item={item} offline={offline} covered={covered} send={send} ledger={ledger} isFront={isFront} onOpen={open} />,
+    [offline, covered, send, ledger, open],
   );
 
   // On a live link the sessions are pushed as they change, so a pull keeps the link (no offline
@@ -248,7 +251,7 @@ export default function Inbox() {
       <FlashList
         testID="inbox-list"
         data={inbox[tab]}
-        extraData={offline}
+        extraData={Number(offline) * 2 + Number(covered)}
         renderItem={renderItem}
         keyExtractor={keyOf}
         ItemSeparatorComponent={Gap}

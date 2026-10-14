@@ -45,9 +45,9 @@ export async function pairedStorage(): Promise<void> {
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
 }
 
-/** Opens the app at `url` with `routes` beside the shell, Sessions and Pair. The Mac welcomes the
- * phone and lists `list`. */
-export async function launch(url: string, routes: Record<string, ComponentType>, list: SessionInfo[] = []) {
+/** Opens the app at `url` with `routes` beside the shell, Sessions and Pair. Nothing is waited for:
+ * a phone that is not paired never opens a socket. */
+export async function mount(url: string, routes: Record<string, ComponentType>) {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const hub = new HubController({
@@ -76,7 +76,14 @@ export async function launch(url: string, routes: Record<string, ComponentType>,
     { initialUrl: url },
   );
   await view;
-  const rig = { hub, sockets, clock, view };
+  return { hub, sockets, clock, view };
+}
+
+/** Opens the app at `url` with `routes` beside the shell, Sessions and Pair. The Mac welcomes the
+ * phone and lists `list`. */
+export async function launch(url: string, routes: Record<string, ComponentType>, list: SessionInfo[] = []) {
+  const rig = await mount(url, routes);
+  const { sockets } = rig;
   await waitFor(() => expect(sockets.all.length).toBeGreaterThan(0));
   await hear(rig, list);
   return rig;

@@ -12,6 +12,7 @@ import Inbox from "../app/index";
 import Pair from "../app/pair";
 import { FakeClock, Sockets } from "./client/fakes";
 import { HubContext, HubController, TOKEN_KEY } from "./hub";
+import { closeDrawer } from "./drawer";
 import * as inboxWords from "./inbox";
 import { saveSettings } from "./persist";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
@@ -60,6 +61,7 @@ beforeEach(async () => {
   jest.mocked(Haptics.notificationAsync).mockClear();
 });
 afterEach(() => {
+  closeDrawer();
   hideToast();
   jest.restoreAllMocks();
 });
@@ -159,9 +161,12 @@ describe("the Inbox", () => {
       expect(view.getPathname()).toBe("/recent");
     });
 
-    it("the menu opens Settings for now", async () => {
+    it("the menu opens the drawer, and Settings stays in reach there", async () => {
       const { view } = await launch([info("a")]);
       await fireEvent.press(screen.getByRole("button", { name: "Menu" }));
+      expect(view.getPathname()).toBe("/");
+      expect(screen.getByTestId("drawer")).toBeTruthy();
+      await fireEvent.press(within(screen.getByTestId("drawer")).getByRole("button", { name: "Settings" }));
       expect(view.getPathname()).toBe("/settings");
     });
   });
@@ -397,6 +402,68 @@ describe("the Inbox", () => {
     });
   });
 
+  describe("under the drawer", () => {
+    // The drawer is modal, so what is under it is hidden from a screen reader (and from queries).
+    const under = { hidden: true } as const;
+    const cardUnder = (id: string) => within(screen.getByTestId(`inbox-card-${id}`, under));
+    const menu = () => screen.getByRole("button", { name: "Menu" });
+    const scrim = () => screen.getByRole("button", { name: "Close menu" });
+
+    it("a card answers nothing while the drawer is open, and a tap that closes it answers nothing either", async () => {
+      const rig = await launch([waiting("a", gist(1))]);
+      await wait(400);
+      const allow = () => cardUnder("a").getByRole("button", { name: "Allow once for a", ...under });
+      const deny = () => cardUnder("a").getByRole("button", { name: "Deny for a", ...under });
+      expect(disabled(allow())).toBe(false);
+      await fireEvent.press(menu());
+      expect(disabled(allow())).toBe(true);
+      expect(disabled(deny())).toBe(true);
+      await fireEvent.press(allow());
+      await fireEvent.press(deny());
+      // The tap on the scrim closes the drawer; the card under it stays dead until it arms again.
+      await fireEvent.press(scrim());
+      expect(disabled(allow())).toBe(true);
+      await fireEvent.press(allow());
+      await fireEvent.press(deny());
+      await flush();
+      expect(answers(rig)).toEqual([]);
+      await wait(399);
+      expect(disabled(allow())).toBe(true);
+      await wait(1);
+      expect(disabled(allow())).toBe(false);
+      await fireEvent.press(allow());
+      await flush();
+      expect(answered(rig)).toEqual([{ session: "a", approval: 1, allow: true }]);
+    });
+
+    it("Allow all waits too: dead while the drawer is open, armed again 400 ms after it closes", async () => {
+      const rig = await launch([waiting("a", gist(1)), waiting("b", gist(2))]);
+      await wait(400);
+      const all = () => screen.getByRole("button", { name: "Allow all 2 once", ...under });
+      expect(disabled(all())).toBe(false);
+      await fireEvent.press(menu());
+      expect(disabled(all())).toBe(true);
+      await fireEvent.press(scrim());
+      await fireEvent.press(all());
+      await flush();
+      expect(answers(rig)).toEqual([]);
+      await wait(400);
+      expect(disabled(all())).toBe(false);
+    });
+
+    it("the drawer opening while Face ID is up sends nothing", async () => {
+      await saveSettings({ faceId: true });
+      const rig = await launch([waiting("a", gist(1))]);
+      await wait(400);
+      const pass = deferAuth();
+      await fireEvent.press(cardUnder("a").getByRole("button", { name: "Allow once for a" }));
+      await flush();
+      await fireEvent.press(menu());
+      await pass();
+      expect(answers(rig)).toEqual([]);
+    });
+  });
+
   describe("the bottom button", () => {
     it("is New session with fewer than two approvals, and opens a new session", async () => {
       const { view } = await launch([waiting("a", gist(1))]);
@@ -449,6 +516,31 @@ describe("the Inbox", () => {
       await pass();
       expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
       expect(answered(rig)).toEqual([{ session: "b", approval: 2, allow: true }]);
+    });
+
+    it("sends nothing when the link drops and comes back while Face ID is up", async () => {
+      await saveSettings({ faceId: true });
+      const rig = await launch([waiting("a", gist(1), { last_activity: 30 }), waiting("b", gist(2), { last_activity: 20 })]);
+      await wait(400);
+      const pass = deferAuth();
+      await fireEvent.press(screen.getByRole("button", { name: "Allow all 2 once" }));
+      await flush();
+      expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        rig.sockets.last.drop();
+      });
+      expect(screen.getByText("Can't reach your Mac")).toBeTruthy();
+      await act(async () => {
+        rig.clock.advance(60_000);
+        rig.sockets.last.open();
+        rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+        rig.sockets.last.receive({ type: "sessions", sessions: [waiting("a", gist(1), { last_activity: 30 }), waiting("b", gist(2), { last_activity: 20 })] });
+        rig.clock.advance(50);
+      });
+      expect(screen.queryByText("Can't reach your Mac")).toBeNull();
+      await pass();
+      expect(answers(rig)).toEqual([]);
+      expect(Haptics.notificationAsync).not.toHaveBeenCalled();
     });
 
     it("leaves out a shortened request: not counted, not answered", async () => {

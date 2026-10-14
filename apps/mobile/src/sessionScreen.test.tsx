@@ -12,6 +12,7 @@ import Sessions from "../app/index";
 import Session from "../app/session/[id]";
 import { FakeClock, Sockets } from "./client/fakes";
 import { HubContext, HubController, TOKEN_KEY } from "./hub";
+import { closeDrawer, openDrawer } from "./drawer";
 import { saveSettings } from "./persist";
 import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol";
 import * as words from "./session";
@@ -44,7 +45,10 @@ beforeEach(async () => {
   octetStore.getState().reset();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
 });
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => {
+  closeDrawer();
+  jest.restoreAllMocks();
+});
 
 let seq = 0;
 
@@ -633,6 +637,28 @@ describe("the Session screen", () => {
       expect(deny().props.accessibilityState?.disabled).toBe(true);
       await wait(400);
       expect(deny().props.accessibilityState?.disabled).toBe(false);
+    });
+
+    it("an approval under the drawer: a tap that closes the drawer answers nothing, and it arms 400 ms later", async () => {
+      await saveSettings({ faceId: false });
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"));
+      await wait(450);
+      const hid = { hidden: true } as const; // the drawer is modal: what is under it is hidden from queries
+      const off = (name: string) => screen.getByRole("button", { name, ...hid }).props.accessibilityState?.disabled === true;
+      expect(off("Allow")).toBe(false);
+      await act(async () => openDrawer());
+      expect(off("Allow")).toBe(true);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow", ...hid }));
+      await fireEvent.press(screen.getByRole("button", { name: "Close menu" }));
+      expect(off("Allow")).toBe(true);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow", ...hid }));
+      await fireEvent.press(screen.getByRole("button", { name: "Deny", ...hid }));
+      await act(async () => {});
+      expect(rig.sockets.last.commandsOf("answer")).toEqual([]);
+      await wait(400);
+      expect(off("Allow")).toBe(false);
     });
 
     it("has none of them for a session that is gone", async () => {
