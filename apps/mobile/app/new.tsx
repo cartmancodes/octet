@@ -15,17 +15,20 @@ import type { Engine, Mode } from "../src/protocol";
 import { modelsFor } from "../src/recent";
 import { sessionName } from "../src/sessions";
 import { NO_WORKSPACE, useStartSession, useWorkspaceChoices, type StartBody } from "../src/start";
-import { useCatalogs, useHub } from "../src/store";
+import { octetStore, useCatalogs, useHub } from "../src/store";
 import { spacing, type, useTheme } from "../src/theme";
 import { showToast } from "../src/toast";
 
 const BIOMETRIC_REASON = "Start a session with full access";
 const EMPTY_PROMPT = "Write a prompt first.";
+const LOADING_FOLDERS = "Loading the Mac's folders…";
+const KEPT_TEXT = "Your text is in the prompt.";
 const ARMED_HINT = `Type ${FULL_ACCESS_WORDS} below to start.`;
 
 const ENGINES: readonly Engine[] = ["claude", "codex"];
-/** What a tap on the mode chip cycles through: full access is never one of these. */
-const MODES: readonly Mode[] = ["ask", "accept-edits", "auto"];
+/** What a tap on the mode chip cycles through, null (the Mac's default) first: full access is
+ * never one of these. */
+const MODES: readonly (Mode | null)[] = [null, "ask", "accept-edits", "auto"];
 
 /** Why `text` cannot be the first prompt, or null. */
 function refusal(text: string): string | null {
@@ -48,17 +51,18 @@ export default function NewSession() {
   const hub = useHub();
   const client = useHubClient();
   const catalogs = useCatalogs();
-  const workspaces = useWorkspaceChoices();
+  const { choices: workspaces, loaded: foldersLoaded } = useWorkspaceChoices();
   const [text, setText] = useState("");
   const [engine, setEngine] = useState<Engine>("claude");
   const [folder, setFolder] = useState<string | null>(null);
-  const [mode, setMode] = useState<Mode>("ask");
+  const [mode, setMode] = useState<Mode | null>(null);
   // The prompt to send when the session shows: what the user started with.
   const pending = useRef("");
 
   const sendPrompt = useRef<(id: string, text: string) => void>(() => undefined);
   // The first prompt goes to the launched session, and the conversation opens whether or not the
-  // Mac takes it: a refusal is a toast, in the hub's words.
+  // Mac takes it. A refusal is a toast in the hub's words, and the text goes back to that
+  // session's prompt box.
   const listed = useCallback(
     (id: string) => {
       sendPrompt.current(id, pending.current);
@@ -69,7 +73,10 @@ export default function NewSession() {
   const { send, start, failed, fail, locked, notice } = useStartSession(listed);
   useEffect(() => {
     sendPrompt.current = (id, prompt) => {
-      send({ type: "prompt", session: id, text: prompt }).catch((error: unknown) => showToast(failure(error).text));
+      send({ type: "prompt", session: id, text: prompt }).catch((error: unknown) => {
+        octetStore.getState().setDraft(id, prompt);
+        showToast(`${failure(error).text.replace(/\.$/, "")}. ${KEPT_TEXT}`);
+      });
     };
   }, [send]);
 
@@ -86,7 +93,7 @@ export default function NewSession() {
 
   const full = useFullAccessArm({
     reason: BIOMETRIC_REASON,
-    key: JSON.stringify([engine, workspace, selection, null, "full-access"]),
+    key: JSON.stringify(["new", engine, workspace, selection, "full-access"]),
     failed,
     fail,
   });
@@ -100,8 +107,8 @@ export default function NewSession() {
         engine,
         workspace,
         ...(selection !== null ? { model: selection } : {}),
-        mode: full ? "full-access" : mode,
-        ...(full ? { confirm: FULL_ACCESS_WORDS } : {}),
+        // No mode unless one was chosen: the Mac's own default stands.
+        ...(full ? { mode: "full-access" as const, confirm: FULL_ACCESS_WORDS } : mode !== null ? { mode } : {}),
       };
     },
     [engine, workspace, selection, mode],
@@ -117,15 +124,15 @@ export default function NewSession() {
       }
       const body = bodyOf(fullAccess);
       if (body === null) {
-        showToast(NO_WORKSPACE);
+        showToast(foldersLoaded ? NO_WORKSPACE : LOADING_FOLDERS);
         return false;
       }
-      lightTap();
+      if (!start(body)) return false; // a start is already out: this press is a second tap
       pending.current = text;
-      start(body);
+      lightTap();
       return true;
     },
-    [text, bodyOf, start],
+    [text, bodyOf, start, foldersLoaded],
   );
 
   const onStart = useCallback(() => {
@@ -148,20 +155,20 @@ export default function NewSession() {
   const onMac = useCallback(() => showToast(`Sessions start on ${macName(client?.url)}.`), [client]);
   const onFolder = useCallback(() => {
     if (workspaces.length === 0) {
-      showToast(NO_WORKSPACE);
+      showToast(foldersLoaded ? NO_WORKSPACE : LOADING_FOLDERS);
       return;
     }
     disarm();
     const at = workspace === null ? -1 : workspaces.indexOf(workspace);
     setFolder(workspaces[(at + 1) % workspaces.length] ?? null);
-  }, [workspaces, workspace, disarm]);
+  }, [workspaces, workspace, disarm, foldersLoaded]);
   const onEngine = useCallback(() => {
     disarm();
     setEngine((e) => ENGINES[(ENGINES.indexOf(e) + 1) % ENGINES.length] ?? "claude");
   }, [disarm]);
   const onMode = useCallback(() => {
     disarm();
-    setMode((m) => MODES[(MODES.indexOf(m) + 1) % MODES.length] ?? "ask");
+    setMode((m) => MODES[(MODES.indexOf(m) + 1) % MODES.length] ?? null);
   }, [disarm]);
   // Face ID asks for exactly this form; a phone that is offline or busy asks nothing.
   const onFullAccess = useCallback(() => {
@@ -233,8 +240,9 @@ export default function NewSession() {
         mac={macName(client?.url)}
         online={online}
         folder={workspace === null ? "" : sessionName(workspace)}
+        loading={workspace === null && !foldersLoaded}
         engineModel={engineModel}
-        mode={armed ? "full access" : mode}
+        mode={armed ? "full access" : (mode ?? "default mode")}
         fullAccess={armed}
         onMac={onMac}
         onFolder={onFolder}

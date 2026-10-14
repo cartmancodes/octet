@@ -5,6 +5,7 @@ import { StyleSheet } from "react-native";
 
 import NewSession from "../app/new";
 import Recent from "../app/recent";
+import Session from "../app/session/[id]";
 import { hear, info, launch, pairedStorage, type Rig } from "./screenRig";
 import type { CatalogInfo, RecentInfo } from "./protocol";
 import { octetStore } from "./store";
@@ -48,10 +49,17 @@ const hearCatalog = async (rig: Rig, models = MODELS) => {
 
 /** Sessions first, then New session on top of it, as the user gets there. */
 async function open(list = [info("live")]) {
-  const rig = await launch("/", { new: NewSession, recent: Recent }, list);
+  const rig = await launch("/", { new: NewSession, recent: Recent, "session/[id]": Session }, list);
   await act(async () => router.push("/new"));
   await flush();
   return rig;
+}
+async function answerRecent(rig: Rig, items: RecentInfo[]) {
+  await act(async () => {
+    rig.sockets.last.receive({ type: "recent", req: lastReq(rig, "recent"), items });
+    rig.clock.advance(50);
+  });
+  await flush();
 }
 async function ack(rig: Rig, type: string, message: string) {
   await act(async () => {
@@ -167,10 +175,32 @@ describe("New session", () => {
 
     it("with no workspace known the folder chip says so and Start explains", async () => {
       const rig = await open([]);
+      await answerRecent(rig, []);
+      expect(chip(/^Folder/).props.accessibilityLabel).toBe("Folder none");
       await write("go");
       await start();
       expect(screen.getByText("Start a session on the Mac first, or add a workspace to hub.json.")).toBeTruthy();
       expect(starts(rig)).toHaveLength(0);
+    });
+
+    it("before the Mac's folders arrive the chip says loading, and Start says so rather than none", async () => {
+      const rig = await open([]);
+      expect(chip(/^Folder/).props.accessibilityLabel).toBe("Folder loading…");
+      expect(screen.getByText("loading…")).toBeTruthy();
+      await write("go");
+      await start();
+      expect(screen.getByText("Loading the Mac's folders…")).toBeTruthy();
+      expect(screen.queryByText(/hub\.json/)).toBeNull();
+      expect(starts(rig)).toHaveLength(0);
+      await answerRecent(rig, [{ engine: "claude", workspace: "/Users/me/Projects/zeta", session: "s", title: "t", started: 1 }]);
+      expect(chip(/^Folder/).props.accessibilityLabel).toBe("Folder zeta");
+    });
+
+    it("a failed folder request ends the loading: the live sessions' folders stand", async () => {
+      const rig = await open([]);
+      await refuse(rig, "recent", "Too many requests", "rate_limited");
+      await flush();
+      expect(chip(/^Folder/).props.accessibilityLabel).toBe("Folder none");
     });
 
     it("the engine chip cycles claude and codex with each engine's first model, or default", async () => {
@@ -191,27 +221,42 @@ describe("New session", () => {
       await write("go");
       await start();
       expect(starts(rig)[0]).not.toHaveProperty("model");
-      expect(starts(rig)[0]).toMatchObject({ type: "start", engine: "claude", workspace: "/Users/me/Projects/live", mode: "ask" });
+      expect(starts(rig)[0]).toMatchObject({ type: "start", engine: "claude", workspace: "/Users/me/Projects/live" });
       expect(starts(rig)[0]).not.toHaveProperty("confirm");
     });
 
-    it("the mode chip cycles ask, accept-edits, auto and back, and Start sends it", async () => {
+    it("the mode chip starts at default mode and a default Start sends no mode", async () => {
       const rig = await open();
-      const label = () => chip(/^Mode/).props.accessibilityLabel;
-      expect(label()).toBe("Mode ask");
-      await press(/^Mode/);
-      expect(label()).toBe("Mode accept-edits");
-      await press(/^Mode/);
-      expect(label()).toBe("Mode auto");
+      expect(chip(/^Mode/).props.accessibilityLabel).toBe("Mode default mode");
       await write("go");
       await start();
-      expect(starts(rig)[0]).toMatchObject({ mode: "auto" });
+      expect(starts(rig)[0]).not.toHaveProperty("mode");
+      expect(starts(rig)[0]).not.toHaveProperty("confirm");
+    });
+
+    it("the mode chip cycles default, ask, accept-edits, auto and back, and Start sends it", async () => {
+      const rig = await open();
+      const label = () => chip(/^Mode/).props.accessibilityLabel;
+      const seen = [label()];
+      for (let i = 0; i < 4; i++) {
+        await press(/^Mode/);
+        seen.push(label());
+      }
+      expect(seen).toEqual(["Mode default mode", "Mode ask", "Mode accept-edits", "Mode auto", "Mode default mode"]);
+      await press(/^Mode/); // ask
+      await press(/^Mode/); // accept-edits
+      await write("go");
+      await start();
+      expect(starts(rig)[0]).toMatchObject({ mode: "accept-edits" });
       expect(starts(rig)[0]).not.toHaveProperty("confirm");
     });
 
     it("a tap never reaches full access, however many cycle", async () => {
       const rig = await open();
-      for (let i = 0; i < 7; i++) await press(/^Mode/);
+      for (let i = 0; i < 9; i++) {
+        await press(/^Mode/);
+        expect(chip(/^Mode/).props.accessibilityLabel).not.toBe("Mode full access");
+      }
       await write("go");
       await start();
       expect(starts(rig)[0]?.mode).not.toBe("full-access");
@@ -283,8 +328,31 @@ describe("New session", () => {
       await flush();
       expect(rig.view.getPathname()).toBe("/session/fresh");
       await refuse(rig, "prompt", "That session is busy", "busy");
-      expect(screen.getByText("That session is busy")).toBeTruthy();
+      expect(screen.getByText("That session is busy. Your text is in the prompt.")).toBeTruthy();
       expect(rig.view.getPathname()).toBe("/session/fresh");
+    });
+
+    it("a refused first prompt keeps the text as that session's draft, in its composer", async () => {
+      const rig = await open();
+      await write("hello there");
+      await start();
+      await ack(rig, "start", "Starting octet-0a1b2c in /w");
+      await hear(rig, [info("live"), info("fresh", { tmux: "octet-0a1b2c" })]);
+      await flush();
+      expect(rig.view.getPathname()).toBe("/session/fresh");
+      await refuse(rig, "prompt", "That session is busy", "busy");
+      expect(screen.getByText("That session is busy. Your text is in the prompt.")).toBeTruthy();
+      expect(screen.getByLabelText("Message").props.value).toBe("hello there");
+    });
+
+    it("a draft waiting for a conversation fills its composer when it opens", async () => {
+      const rig = await open();
+      octetStore.getState().setDraft("fresh", "kept words");
+      await act(async () => router.push("/session/fresh"));
+      await hear(rig, [info("live"), info("fresh")]);
+      await flush();
+      expect(screen.getByLabelText("Message").props.value).toBe("kept words");
+      expect(octetStore.getState().drafts.has("fresh")).toBe(false); // taken
     });
 
     it("shows a refused start as a toast with the hub's words, and allows another try", async () => {
@@ -326,6 +394,35 @@ describe("New session", () => {
       await flush();
       expect(prompts(rig)).toEqual([expect.objectContaining({ session: "late", text: "go" })]);
       expect(rig.view.getPathname()).toBe("/session/late");
+    });
+
+    it("two presses in one frame send one start", async () => {
+      const rig = await open();
+      await write("go");
+      const button = screen.getByRole("button", { name: "Start session" });
+      // both presses reach the handler before React renders in between
+      const click = button.props.onClick as (event: object) => void;
+      const onPress = () => click({ stopPropagation() {}, nativeEvent: {} });
+      await act(async () => {
+        onPress();
+        onPress();
+      });
+      await flush();
+      expect(starts(rig)).toHaveLength(1);
+    });
+
+    it("an ack that names no session keeps Start locked for 10 s while the notice shows", async () => {
+      const rig = await open();
+      await write("go");
+      await start();
+      await ack(rig, "start", "ok");
+      expect(screen.getByText("Started — it will appear in Sessions")).toBeTruthy();
+      expect(button("Start session")?.props.accessibilityState.disabled).toBe(true);
+      await act(async () => void jest.advanceTimersByTime(9_000));
+      expect(button("Start session")?.props.accessibilityState.disabled).toBe(true);
+      await act(async () => void jest.advanceTimersByTime(2_000));
+      expect(button("Start session")?.props.accessibilityState.disabled).toBe(false);
+      expect(screen.getByText("Started — it will appear in Sessions")).toBeTruthy();
     });
 
     it("tells the user it started when the hub's words name no session, and sends no prompt", async () => {
@@ -431,7 +528,7 @@ describe("New session", () => {
       const rig = await open();
       await arm();
       expect(typed()).toBeNull();
-      expect(chip(/^Mode/).props.accessibilityLabel).toBe("Mode ask");
+      expect(chip(/^Mode/).props.accessibilityLabel).toBe("Mode default mode");
       expect(starts(rig)).toHaveLength(0);
     });
 
@@ -469,7 +566,7 @@ describe("New session", () => {
       await arm();
       await press("Cancel full access");
       expect(typed()).toBeNull();
-      expect(chip(/^Mode/).props.accessibilityLabel).toBe("Mode ask");
+      expect(chip(/^Mode/).props.accessibilityLabel).toBe("Mode default mode");
       for (const change of [/^Mode/, /^Folder/, /^Engine and model/]) {
         await arm();
         expect(typed()).toBeTruthy();
@@ -511,7 +608,7 @@ describe("New session", () => {
       await refuse(rig, "start", "Full access is off on this Mac", "not_allowed");
       expect(screen.getByText("Full access is off on this Mac")).toBeTruthy();
       expect(typed()).toBeNull();
-      expect(chip(/^Mode/).props.accessibilityLabel).toBe("Mode ask");
+      expect(chip(/^Mode/).props.accessibilityLabel).toBe("Mode default mode");
       await arm();
       expect(auth.authenticateAsync).toHaveBeenCalledTimes(2);
       expect((typed() as never as { props: { value: string } }).props.value).toBe("");
@@ -529,9 +626,9 @@ describe("New session", () => {
       expect(typed()).toBeNull();
       expect(button("Turn on full access")).toBeNull();
       await start();
-      // what Start sends now is an ordinary ask start: the words were spent
+      // what Start sends now is an ordinary default start: the words were spent
       expect(starts(rig)).toHaveLength(2);
-      expect(starts(rig)[1]).toMatchObject({ mode: "ask" });
+      expect(starts(rig)[1]).not.toHaveProperty("mode");
       expect(starts(rig)[1]).not.toHaveProperty("confirm");
       expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
     });

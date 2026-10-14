@@ -11,9 +11,11 @@ interface NewChipsProps {
   online: boolean;
   /** The folder of the chosen workspace; empty when none is known. */
   folder: string;
+  /** The Mac's folders have not arrived: the folder chip says so. */
+  loading: boolean;
   /** "claude / Sonnet". */
   engineModel: string;
-  /** "ask", "accept-edits", "auto" or "full access". */
+  /** "default mode", "ask", "accept-edits", "auto" or "full access". */
   mode: string;
   /** Full access is armed: the mode chip is amber. */
   fullAccess: boolean;
@@ -31,6 +33,7 @@ export const NewChips = memo(function NewChips({
   mac,
   online,
   folder,
+  loading,
   engineModel,
   mode,
   fullAccess,
@@ -46,7 +49,11 @@ export const NewChips = memo(function NewChips({
       <Label style={styles.label}>Tap to change</Label>
       <View style={styles.row}>
         <Chip label={mac} dot="●" dotColor={online ? theme.accent : theme.muted} accessibilityLabel={`Mac ${mac}`} onPress={onMac} />
-        <Chip label={folder === "" ? "no folder" : folder} accessibilityLabel={`Folder ${folder === "" ? "none" : folder}`} onPress={onFolder} />
+        <Chip
+          label={loading ? "loading…" : folder === "" ? "no folder" : folder}
+          accessibilityLabel={`Folder ${loading ? "loading…" : folder === "" ? "none" : folder}`}
+          onPress={onFolder}
+        />
         <Chip label={engineModel} accessibilityLabel={`Engine and model ${engineModel}`} onPress={onEngine} />
         <Chip
           label={mode}

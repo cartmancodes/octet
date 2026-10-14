@@ -336,6 +336,8 @@ describe("Recent", () => {
       await press(/^Resume/);
       await ack(rig, "start", "ok");
       expect(screen.getByText("Started — it will appear in Sessions")).toBeTruthy();
+      expect(button(/^Resume/)?.props.accessibilityState.disabled).toBe(true); // locked for 10 s
+      await act(async () => void jest.advanceTimersByTime(11_000));
       expect(button(/^Resume/)?.props.accessibilityState.disabled).toBe(false);
     });
   });

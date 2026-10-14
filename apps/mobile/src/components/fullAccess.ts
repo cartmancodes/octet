@@ -25,8 +25,8 @@ export interface FullAccessArm {
 
 /**
  * Face ID, then (in the panel the caller draws while `armed`) the typed words, for one request.
- * `key` names exactly what Face ID approves (the session and mode for the sheet; engine,
- * workspace, model and resume for a new session). The approval is for that key only: any change
+ * `key` names exactly what Face ID approves (the session and mode for the sheet; the engine,
+ * workspace and model for a new session, whose mode is full access by being armed). The approval is for that key only: any change
  * of the key disarms it and voids a prompt still up, as do `disarm` (call it on a send, on a
  * close), a refusal (`failed`) and unmounting. Leaving the app disarms it too. So the words can never send anything but what
  * Face ID was asked about, and never twice.

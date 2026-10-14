@@ -15,8 +15,11 @@ export const NO_WORKSPACE = "Start a session on the Mac first, or add a workspac
 /** A launched session that has not shown in Sessions by now is probably not coming. */
 export const APPEAR_MS = 30_000;
 
+/** How long Start stays locked after an ack that names no session. */
+export const UNNAMED_MS = 10_000;
+
 /** A start whose session is awaited: `tmux` is the name from the ack, null when the hub's words
- * did not carry one; `late` once 30 seconds have passed. */
+ * did not carry one; `late` once 30 seconds (10 without a name) have passed. */
 export interface Launch {
   tmux: string | null;
   late: boolean;
@@ -33,14 +36,15 @@ export function launchNotice(launch: Launch | null): string | null {
 
 export interface StartSession {
   send: Send;
-  /** Sends `body` (a `start`) unless one is out; forgets any earlier launch. */
-  start: (body: StartBody) => void;
+  /** Sends `body` (a `start`) unless one is out, and forgets any earlier launch if it sent.
+   * True if it sent. */
+  start: (body: StartBody) => boolean;
   /** A start is out. */
   busy: boolean;
   /** The last start's failure. */
   failed: Action["failed"];
   fail: Action["fail"];
-  /** The launched session is awaited (its tmux name is known and 30 s have not passed). */
+  /** The launched session is awaited (30 s, or 10 s when the ack named none, have not passed). */
   waiting: boolean;
   /** Nothing may start now: one is out, the session is awaited, or the Mac can't be reached. */
   locked: boolean;
@@ -65,25 +69,30 @@ export function useStartSession(onListed: (sessionId: string) => void): StartSes
     listed.current = onListed;
   });
 
-  const waiting = launch !== null && launch.tmux !== null && !launch.late;
+  const waiting = launch !== null && !launch.late;
   const locked = busy || hub !== "ready" || waiting;
 
   const started = useCallback((ack: unknown) => setLaunch({ tmux: tmuxOfAck(ack), late: false }), []);
   const start = useCallback(
-    (body: StartBody) => {
+    (body: StartBody): boolean => {
+      // A start already out is left alone: its watch is the one to keep.
+      if (!run(body, started)) return false;
       opened.current = false;
       setLaunch(null); // the first start's session is no longer the one to open
-      run(body, started);
+      return true;
     },
     [run, started],
   );
 
   const tmux = launch?.tmux ?? null;
   useEffect(() => {
-    if (tmux === null) return;
-    const timer = setTimeout(() => setLaunch((l) => (l && l.tmux === tmux ? { ...l, late: true } : l)), APPEAR_MS);
+    if (launch === null || launch.late) return;
+    const timer = setTimeout(
+      () => setLaunch((l) => (l === launch ? { ...l, late: true } : l)),
+      launch.tmux === null ? UNNAMED_MS : APPEAR_MS,
+    );
     return () => clearTimeout(timer);
-  }, [tmux]);
+  }, [launch]);
   useEffect(() => {
     if (tmux === null || opened.current) return;
     const found = sessions.find((s) => s.tmux === tmux);
@@ -95,23 +104,37 @@ export function useStartSession(onListed: (sessionId: string) => void): StartSes
   return { send, start, busy, failed, fail, waiting, locked, notice: launchNotice(launch) };
 }
 
+export interface Workspaces {
+  /** The workspaces a new session may start in. */
+  choices: string[];
+  /** The Mac has answered the request for its recent folders (or refused it), so none may yet
+   * be on its way. */
+  loaded: boolean;
+}
+
 /** The workspaces a new session may start in: the live sessions' and the recent items' (asked of
  * the Mac once the connection is ready; if it fails, the live sessions' alone). */
-export function useWorkspaceChoices(): string[] {
+export function useWorkspaceChoices(): Workspaces {
   const send = useSend();
   const alive = useAlive();
   const hub = useHub();
   const sessions = useSessions();
   const [recent, setRecent] = useState<RecentInfo[]>([]);
+  const [loaded, setLoaded] = useState(false);
   useEffect(() => {
     if (hub !== "ready") return;
     send({ type: "recent" }).then(
       (frame) => {
+        if (!alive()) return;
         const items = recentItems(frame);
-        if (items && alive()) setRecent(items);
+        if (items) setRecent(items);
+        setLoaded(true);
       },
-      () => undefined,
+      () => {
+        if (alive()) setLoaded(true);
+      },
     );
   }, [hub, send, alive]);
-  return useMemo(() => workspaceChoices(sessions, recent), [sessions, recent]);
+  const choices = useMemo(() => workspaceChoices(sessions, recent), [sessions, recent]);
+  return { choices, loaded };
 }

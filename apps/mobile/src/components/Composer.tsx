@@ -1,7 +1,8 @@
-import { memo } from "react";
+import { memo, useEffect } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 
 import type { Phase } from "../protocol";
+import { octetStore, useDraft } from "../store";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
 import { SLASH_NOTE, useTextSender, type Send } from "./send";
 
@@ -73,13 +74,21 @@ export const hintFor = (phase: Phase, queued: number): string =>
 export const Composer = memo(function Composer({ session, phase, queued, send, offline = false }: ComposerProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
-  const { text, setText, busy, failed, slash, canSend, submit } = useTextSender(
+  const { text, setText, busy, failed, slash, canSend, submit, restore } = useTextSender(
     send,
     session,
     "prompt",
     undefined,
     offline,
   );
+  // A first prompt the Mac did not take comes back into the box, whether it was refused before
+  // this screen opened or after.
+  const draft = useDraft(session);
+  useEffect(() => {
+    if (draft === undefined) return;
+    const words = octetStore.getState().takeDraft(session);
+    if (words !== "") restore(words);
+  }, [draft, session, restore]);
   const verb = phase === "running" ? "Queue" : "Send";
   return (
     <View style={s.box}>

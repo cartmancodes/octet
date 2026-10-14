@@ -837,3 +837,31 @@ describe("selectors", () => {
     expect(hub.result.current).toBe("ready");
   });
 });
+
+describe("drafts", () => {
+  it("keeps a session's unsent first prompt until it is taken, once", () => {
+    store.getState().setDraft("a", "hello");
+    expect(store.getState().drafts.get("a")).toBe("hello");
+    expect(store.getState().takeDraft("a")).toBe("hello");
+    expect(store.getState().takeDraft("a")).toBe("");
+    expect(store.getState().drafts.has("a")).toBe(false);
+  });
+
+  it("holds at most 16, dropping the oldest, and a new draft for a session replaces its old one", () => {
+    for (let i = 0; i < 20; i++) store.getState().setDraft(`s${i}`, `t${i}`);
+    expect(store.getState().drafts.size).toBe(16);
+    expect(store.getState().drafts.has("s3")).toBe(false);
+    expect(store.getState().drafts.has("s4")).toBe(true);
+    store.getState().setDraft("s4", "again");
+    store.getState().setDraft("new", "x");
+    expect(store.getState().drafts.size).toBe(16);
+    expect(store.getState().drafts.get("s4")).toBe("again");
+    expect(store.getState().drafts.has("s5")).toBe(false); // s4 was refreshed, so s5 was the oldest
+  });
+
+  it("is cleared by reset", () => {
+    store.getState().setDraft("a", "hello");
+    store.getState().reset();
+    expect(store.getState().drafts.size).toBe(0);
+  });
+});

@@ -42,6 +42,12 @@ export interface OctetState {
   taskOpen: boolean;
   setTaskOpen(open: boolean): void;
   setHub(state: HubState): void;
+  /** The first prompt of a session that the Mac did not take, keyed by session: the user's words,
+   * kept for that session's prompt box. At most `MAX_DRAFTS`, the oldest dropped. */
+  drafts: ReadonlyMap<string, string>;
+  setDraft(session: string, text: string): void;
+  /** The session's draft, which is then forgotten; "" when it has none. */
+  takeDraft(session: string): string;
   /** Forgets everything the hub sent, for a phone unpaired from its Mac or paired with another. */
   reset(): void;
   /** The hub refused to stream `session` for good. */
@@ -55,6 +61,8 @@ export type OctetStore = StoreApi<OctetState>;
 
 /** Sessions listed, at most. */
 const MAX_SESSIONS = 200;
+/** Drafts kept, at most. */
+const MAX_DRAFTS = 16;
 const FIELD = FIELD_CHARS;
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
@@ -120,10 +128,31 @@ export function createOctetStore(): OctetStore {
     hub: "offline",
     listed: false,
     taskOpen: false,
+    drafts: new Map(),
 
     reset() {
       clearParsed(); // what the old Mac's replies parsed to
-      set({ sessions: [], bySession: new Map(), hub: "offline", listed: false, taskOpen: false });
+      set({ sessions: [], bySession: new Map(), hub: "offline", listed: false, taskOpen: false, drafts: new Map() });
+    },
+
+    setDraft(session, text) {
+      const drafts = new Map(get().drafts);
+      drafts.delete(session); // a fresh one goes last
+      drafts.set(session, text);
+      for (const oldest of drafts.keys()) {
+        if (drafts.size <= MAX_DRAFTS) break;
+        drafts.delete(oldest);
+      }
+      set({ drafts });
+    },
+
+    takeDraft(session) {
+      const text = get().drafts.get(session);
+      if (text === undefined) return "";
+      const drafts = new Map(get().drafts);
+      drafts.delete(session);
+      set({ drafts });
+      return text;
     },
 
     setTaskOpen(taskOpen) {
@@ -445,6 +474,8 @@ export function bindHooks(store: OctetStore) {
       ),
     /** A sessions frame came since the store began or was reset. */
     useListed: (): boolean => useStore(store, (s) => s.listed),
+    /** A session's draft (its first prompt, not taken by the Mac), or undefined. */
+    useDraft: (id: string): string | undefined => useStore(store, (s) => s.drafts.get(id)),
     /** The Task strip's open state, shared by every session's screen. */
     useTaskOpen: (): boolean => useStore(store, (s) => s.taskOpen),
     /** The first approval waiting in a session, from the hub's sessions row, so a session that is
@@ -486,6 +517,7 @@ export const {
   useSessionStatus,
   useListed,
   useTaskOpen,
+  useDraft,
   useFrontApproval,
   useApprovals,
   useCatalog,

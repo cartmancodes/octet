@@ -91,8 +91,9 @@ export function useAlive(): () => boolean {
 export interface Action {
   busy: boolean;
   failed: Failure | null;
-  /** Sends `body` unless a send is out; `onAck` runs, with the Mac's answer, when it acks. */
-  run: (body: RequestBody, onAck?: (ack: unknown) => void) => void;
+  /** Sends `body` unless a send is out; `onAck` runs, with the Mac's answer, when it acks. True
+   * if it sent. */
+  run: (body: RequestBody, onAck?: (ack: unknown) => void) => boolean;
   fail: (failed: Failure | null) => void;
 }
 
@@ -104,7 +105,7 @@ export function useAction(send: Send): Action {
   const alive = useAlive();
   const run = useCallback(
     (body: RequestBody, onAck?: (ack: unknown) => void) => {
-      if (out.current) return;
+      if (out.current) return false;
       out.current = true;
       setBusy(true);
       setFailed(null);
@@ -122,6 +123,7 @@ export function useAction(send: Send): Action {
           setFailed(failure(error));
         },
       );
+      return true;
     },
     [send, alive],
   );
@@ -137,6 +139,8 @@ export interface TextSender {
   canSend: boolean;
   /** Sends the text as the command. It clears only after the ack. */
   submit: () => void;
+  /** Puts words the user wrote before the ones in the box (a prompt the Mac did not take). */
+  restore: (words: string) => void;
 }
 
 /** A text box that sends its text as a `prompt` or a `steer` for `session`. `offline`: the Mac
@@ -173,5 +177,9 @@ export function useTextSender(
       onSent?.();
     });
   }, [canSend, text, kind, session, run, fail, onSent]);
-  return { text, setText, busy, failed, slash, canSend, submit };
+  const restore = useCallback(
+    (words: string) => setTextState((current) => (current === "" ? words : `${words}\n${current}`)),
+    [],
+  );
+  return { text, setText, busy, failed, slash, canSend, submit, restore };
 }
