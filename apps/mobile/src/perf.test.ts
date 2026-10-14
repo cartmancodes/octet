@@ -27,9 +27,10 @@ const HOSTILE_BUDGET_MS = 600;
 const READ_CALLS = 5_000;
 const READ_BUDGET_MS = 100;
 /** Text, then a call, again and again in one turn: each pair makes two entries, so old ones are
- * trimmed all along. Before round 1 it took 136 ms; with a call map copied per batch, 6.3 s. */
+ * trimmed all along. Before round 1 it took 136 ms; with a call map copied per batch, 6.3 s. The budget
+ * is far under that, but loose enough for a loaded machine: it once took 548 ms beside a build. */
 const PAIRS = 60_000;
-const PAIRS_BUDGET_MS = 400;
+const PAIRS_BUDGET_MS = 1000;
 /** One batch's worst case: 3-10 ms alone, 26 ms beside a Rust build; the copied map's was 148. */
 const PAIRS_BATCH_MS = 50;
 

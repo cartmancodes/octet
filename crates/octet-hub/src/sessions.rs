@@ -135,6 +135,60 @@ struct Previous {
     until: Instant,
 }
 
+/// Most characters of a gist's text, and files in it.
+const GIST_CHARS: usize = 200;
+const GIST_FILES: usize = 3;
+
+/// `text` cut to `GIST_CHARS` characters (on a character boundary), with "…" when it was cut.
+fn clip(text: &str) -> String {
+    match text.char_indices().nth(GIST_CHARS) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
+}
+
+/// A command's first line, clipped; "…" also marks the lines left out.
+fn clip_command(command: &str) -> String {
+    let command = command.trim_start();
+    let (first, rest) = command.split_once('\n').unwrap_or((command, ""));
+    let mut line = clip(first.trim_end());
+    if !rest.trim().is_empty() && !line.ends_with('…') {
+        line.push('…');
+    }
+    line
+}
+
+/// An approval of the bridge's state as the `sessions` row carries it: just its gist, so a row
+/// stays small whatever the summary holds. The session's own state frame has the whole summary.
+/// None when the entry has no numeric id or no object summary.
+fn gist(approval: &Value) -> Option<Value> {
+    let id = approval.get("id")?.as_u64()?;
+    let summary = approval.get("summary")?.as_object()?;
+    let text = |key: &str| summary.get(key)?.as_str();
+    let mut out = serde_json::Map::new();
+    for key in ["action", "scope", "cwd"] {
+        if let Some(value) = text(key) {
+            out.insert(key.into(), json!(clip(value)));
+        }
+    }
+    if let Some(command) = text("command") {
+        out.insert("command".into(), json!(clip_command(command)));
+    }
+    if let Some(files) = summary.get("files").and_then(Value::as_array) {
+        let mut shown: Vec<String> = files
+            .iter()
+            .filter_map(Value::as_str)
+            .take(GIST_FILES)
+            .map(clip)
+            .collect();
+        if files.len() > GIST_FILES {
+            shown.push(format!("+{} more", files.len() - GIST_FILES));
+        }
+        out.insert("files".into(), json!(shown));
+    }
+    Some(json!({"id": id, "summary": out}))
+}
+
 /// One session: its registration, bridge link, journal tails and what the bridge last said.
 #[derive(Debug)]
 struct Live {
@@ -169,11 +223,9 @@ impl Live {
         let approvals = state
             .and_then(|s| s.get("approvals")?.as_array())
             .map_or(0, Vec::len);
-        // The bridge already clips the summary, so the hub passes it on as it is.
         let front = state
             .and_then(|s| s.get("approvals")?.as_array()?.first())
-            .filter(|a| a.get("id").is_some_and(Value::is_u64))
-            .map(|a| json!({"id": a["id"], "summary": a.get("summary").cloned().unwrap_or_else(|| json!({}))}));
+            .and_then(gist);
         let mut row = json!({
             "id": registration.id,
             "engine": registration.engine,
@@ -1279,7 +1331,8 @@ mod tests {
         let (read, mut write) = stream.into_split();
         let state = json!({"phase": "running", "queue": [], "queued": 0, "mode": "ask",
             "goal": {"objective": "ship it\nplease", "status": "active", "turns": 1, "max": 9},
-            "approvals": [{"id": 1, "summary": {}}, {"id": 2, "summary": {}}]});
+            "approvals": [{"id": 1, "summary": {"action": "Run Bash", "command": "ls",
+                "files": [], "scope": "this call"}}, {"id": 2, "summary": {"action": "Edit"}}]});
         let lines = [
             bridge_state_frame(&state),
             bridge_catalog_frame(&json!({"modes": ["ask"]})),
@@ -1330,7 +1383,8 @@ mod tests {
             json!({"id": id, "engine": "claude", "model": "opus", "workspace": "/work",
                 "mode": "ask", "phase": "running", "approvals": 2, "last_activity": mtime,
                 "goal": "ship it", "from_phone": false,
-                "approval": {"id": 1, "summary": {}}})
+                "approval": {"id": 1, "summary": {"action": "Run Bash", "command": "ls",
+                    "files": [], "scope": "this call"}}})
         );
         // The hub's commands reach the bridge as parsable lines.
         let command = BridgeCommand::Prompt {
@@ -1371,6 +1425,102 @@ mod tests {
         let id = "4011-1790000000".to_owned();
         assert_eq!(next(&mut sessions).await, SessionUpdate::State { id });
         assert_eq!(sessions.list()[0]["now"], "Running Bash cargo test");
+    }
+
+    /// The worst summary the bridge's clip lets through: a 4 KiB command, 20 files of 512 bytes,
+    /// and long action, scope and cwd.
+    fn worst_summary() -> Value {
+        json!({"action": "A".repeat(2000), "command": "é".repeat(4096), "scope": "S".repeat(2000),
+            "cwd": "/w".repeat(1000),
+            "files": (0..20).map(|i| format!("{i}{}", "f".repeat(511))).collect::<Vec<_>>()})
+    }
+
+    fn live_with(env: &Env, pid: u32, state: Value) -> Live {
+        Live {
+            registration: env.registration(pid, &[]),
+            link: None,
+            tail: None,
+            previous: Vec::new(),
+            state: Some(state),
+            catalog: None,
+            last_activity: None,
+        }
+    }
+
+    #[test]
+    fn the_rows_approval_is_a_gist_of_the_summary() {
+        let env = Env::new();
+        let state = json!({"phase": "waiting", "approvals": [
+            {"id": 3, "summary": worst_summary()}]});
+        let row = live_with(&env, 4030, state).row();
+        let approval = &row["approval"];
+        assert_eq!(approval["id"], 3);
+        let summary = &approval["summary"];
+        let cut = |c: &str| format!("{}…", c.repeat(200));
+        assert_eq!(summary["action"], cut("A"));
+        assert_eq!(summary["command"], cut("é"));
+        assert_eq!(summary["scope"], cut("S"));
+        assert_eq!(summary["cwd"], format!("{}…", "/w".repeat(100)));
+        let files = summary["files"].as_array().unwrap();
+        assert_eq!(files.len(), 4);
+        for (i, file) in files.iter().take(3).enumerate() {
+            assert_eq!(*file, json!(format!("{i}{}…", "f".repeat(199))));
+        }
+        assert_eq!(files[3], "+17 more");
+    }
+
+    #[test]
+    fn the_gist_keeps_a_commands_first_line_and_short_text_whole() {
+        let env = Env::new();
+        let summary = json!({"action": "Run Bash", "command": "\n\nls -la\nrm -rf /", "files": ["a", "b", "c"],
+            "scope": "once"});
+        let state = json!({"approvals": [{"id": 1, "summary": summary}]});
+        let row = live_with(&env, 4031, state).row();
+        assert_eq!(
+            row["approval"]["summary"],
+            json!({"action": "Run Bash", "command": "ls -la…", "files": ["a", "b", "c"],
+                "scope": "once"})
+        );
+        let one = json!({"approvals": [{"id": 1, "summary": {"command": "ls\n"}}]});
+        assert_eq!(
+            live_with(&env, 4032, one).row()["approval"]["summary"]["command"],
+            "ls"
+        );
+    }
+
+    #[test]
+    fn a_front_approval_without_an_object_summary_is_left_out() {
+        let env = Env::new();
+        for approval in [
+            json!({"id": 1}),
+            json!({"id": 1, "summary": "rm"}),
+            json!({"id": 1, "summary": null}),
+            json!({"id": "1", "summary": {}}),
+            json!({"summary": {}}),
+        ] {
+            let row = live_with(&env, 4033, json!({"approvals": [approval]})).row();
+            assert!(row.get("approval").is_none(), "{row}");
+            assert_eq!(row["approvals"], 1);
+        }
+    }
+
+    #[test]
+    fn sixteen_worst_case_rows_fit_one_sessions_frame() {
+        let env = Env::new();
+        let rows: Vec<Value> = (0..16)
+            .map(|i| {
+                let state = json!({"phase": "waiting", "now": "n".repeat(300),
+                    "goal": {"objective": "g".repeat(5000)},
+                    "approvals": [{"id": i, "summary": worst_summary()}]});
+                live_with(&env, 4100 + i, state).row()
+            })
+            .collect();
+        let frame = json!({"v": 1, "type": "sessions", "sessions": rows}).to_string();
+        assert!(
+            frame.len() < octet_core::remote::protocol::MAX_MESSAGE,
+            "{} bytes",
+            frame.len()
+        );
     }
 
     #[tokio::test]
