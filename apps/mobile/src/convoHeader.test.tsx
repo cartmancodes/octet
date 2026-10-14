@@ -9,7 +9,7 @@ import { AppState, StyleSheet } from "react-native";
 
 import { Refusal, type BatchItem, type RequestBody } from "./client/HubClient";
 import { ConvoHeader } from "./components/ConvoHeader";
-import { APPROVAL_WAITING, MODE_HELP, ModelModeMenu, WAITING_FOR_MAC } from "./components/ModelModeMenu";
+import { APPROVAL_WAITING, FULL_ACCESS_ON, MENU_DISMISS_MS, MODE_HELP, ModelModeMenu, WAITING_FOR_MAC } from "./components/ModelModeMenu";
 import { closeDrawer, drawerStore, setDrawerEnabled } from "./drawer";
 import { SETTINGS_KEY, saveSettings } from "./persist";
 import type { CatalogInfo, SessionInfo } from "./protocol";
@@ -245,7 +245,10 @@ describe("the conversation header", () => {
       await openMenu();
       expect(screen.getByText("a1b2c3 ›")).toBeTruthy();
       await press("Session info, a1b2c3");
+      // The info sheet waits for the menu's Modal to go (iOS drops a Modal shown over one leaving).
       expect(screen.queryByTestId("menu")).toBeNull();
+      expect(screen.queryByTestId("info")).toBeNull();
+      await act(async () => void (await new Promise((resolve) => setTimeout(resolve, MENU_DISMISS_MS + 50))));
       expect(within(screen.getByTestId("info")).getByText(SESSION)).toBeTruthy();
     });
   });
@@ -395,6 +398,31 @@ describe("the ▾ menu", () => {
     expect(screen.queryByTestId("menu")).toBeNull();
   });
 
+  it("a screen reader closes it by its Close button, or by escape, but not while a change is out", async () => {
+    await hear(CATALOG);
+    const r = rig();
+    await render(header(r));
+    await openMenu();
+    const closer = () => screen.getByRole("button", { name: "Close" });
+    expect(closer().props.accessibilityState).toMatchObject({ disabled: false });
+    await press("Close");
+    expect(screen.queryByTestId("menu")).toBeNull();
+    await openMenu();
+    await act(async () => screen.getByTestId("menu-panel").props.onAccessibilityEscape());
+    expect(screen.queryByTestId("menu")).toBeNull();
+    // A change is out: Close is off, and neither it nor escape closes the menu.
+    await openMenu();
+    await press("Opus");
+    expect(closer().props.accessibilityState).toMatchObject({ disabled: true });
+    await fireEvent.press(closer());
+    await act(async () => screen.getByTestId("menu-panel").props.onAccessibilityEscape());
+    expect(screen.getByTestId("menu")).toBeTruthy();
+    await act(async () => r.waiting[0]?.reject(new Refusal("busy", "Finish the turn first")));
+    expect(closer().props.accessibilityState).toMatchObject({ disabled: false });
+    await press("Close");
+    expect(screen.queryByTestId("menu")).toBeNull();
+  });
+
   it("cannot be closed while a change is out; the refusal lands in it", async () => {
     await hear(CATALOG);
     const r = rig();
@@ -436,6 +464,7 @@ describe("the ▾ menu", () => {
   it("is not offered for a session that takes no commands", async () => {
     await hear(CATALOG);
     await render(header(rig(), { live: false }));
+    expect(title().props.accessibilityState).toMatchObject({ disabled: true });
     await openMenu();
     expect(screen.queryByTestId("menu")).toBeNull();
     expect(screen.queryByText("▾")).toBeNull();
@@ -446,6 +475,31 @@ describe("the ▾ menu", () => {
     await render(header(rig()));
     await openMenu();
     expect(screen.getByRole("button", { name: /^MMM/ }).props.accessibilityLabel.length).toBeLessThanOrEqual(130);
+  });
+
+  it("marks no model current when the catalog names none", async () => {
+    await hear({ ...CATALOG, current: null });
+    await render(header(rig()));
+    await openMenu();
+    expect(button("Sonnet, current")).toBeNull();
+    expect(screen.queryByText("✓")).toBeNull();
+    await fireEvent.press(screen.getByTestId("menu-scrim"));
+    const { current: _drop, ...bare } = CATALOG;
+    void _drop;
+    await hear(bare);
+    await openMenu();
+    expect(button("Sonnet, current")).toBeNull();
+    expect(screen.queryByText("✓")).toBeNull();
+  });
+
+  it("treats every model as the same engine when none is current", async () => {
+    await hear({ ...CATALOG, current: null });
+    const r = rig();
+    await render(header(r));
+    await openMenu();
+    await press("GPT");
+    expect(screen.queryByText(/Switches to/)).toBeNull();
+    expect(r.sent).toEqual([{ type: "set_model", session: SESSION, selection: "gpt" }]);
   });
 
   it("lists a duplicated model once", async () => {
@@ -517,6 +571,38 @@ describe("full access from the menu", () => {
     expect(screen.getAllByRole("tab").every((t) => !t.props.accessibilityState.selected)).toBe(true);
     await press("Full access, current");
     expect(auth.authenticateAsync).not.toHaveBeenCalled();
+    expect(r.send).not.toHaveBeenCalled();
+    // The help line says it is on, rather than repeating the row's warning.
+    expect(screen.getByText(FULL_ACCESS_ON)).toBeTruthy();
+    expect(FULL_ACCESS_ON).toBe("Full access is on.");
+    expect(screen.getAllByText("The agent can run any command without asking.")).toHaveLength(1);
+  });
+
+  it("says it needs Face ID when the phone has no biometric hardware", async () => {
+    auth.hasHardwareAsync.mockResolvedValueOnce(false);
+    const r = rig();
+    await render(menu(r));
+    await press(FULL);
+    expect(screen.getByText("Full access needs Face ID set up on this phone.")).toBeTruthy();
+    expect(r.send).not.toHaveBeenCalled();
+  });
+
+  it("focuses the field", async () => {
+    await render(menu(rig()));
+    await press(FULL);
+    expect(field().props.autoFocus).toBe(true);
+  });
+
+  it("arms nothing when the desk changes the mode while Face ID is up", async () => {
+    let finish: (r: LocalAuthentication.LocalAuthenticationResult) => void = () => {};
+    auth.authenticateAsync.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+    const r = rig();
+    const view = await render(menu(r));
+    await fireEvent.press(screen.getByRole("button", { name: FULL }));
+    await flush();
+    await view.rerender(menu(r, { ...CATALOG, current_mode: "auto" }));
+    await act(async () => finish({ success: true }));
+    expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
     expect(r.send).not.toHaveBeenCalled();
   });
 
@@ -630,6 +716,49 @@ describe("full access from the menu", () => {
       expect(field()).toBeTruthy();
       await change("background");
       await change("active");
+      expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      expect(r.send).not.toHaveBeenCalled();
+    });
+
+    it("a prompt still up when the app goes to the background arms nothing when it passes", async () => {
+      let pass: () => void = () => {};
+      auth.authenticateAsync.mockImplementationOnce(() => new Promise((resolve) => (pass = () => resolve({ success: true }))));
+      const r = rig();
+      await render(menu(r));
+      await fireEvent.press(screen.getByRole("button", { name: FULL }));
+      await change("inactive");
+      await change("background");
+      await act(async () => pass());
+      await change("active");
+      expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      expect(r.send).not.toHaveBeenCalled();
+    });
+
+    it("asks for no Face ID while the app is not in front", async () => {
+      const r = rig();
+      await render(menu(r));
+      const state = jest.replaceProperty(AppState, "currentState", "background");
+      try {
+        await fireEvent.press(screen.getByRole("button", { name: FULL }));
+        await flush();
+        expect(auth.authenticateAsync).not.toHaveBeenCalled();
+        expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
+      } finally {
+        state.restore();
+      }
+    });
+
+    it("forgets it on the app switcher too, but not while its own Face ID prompt is up", async () => {
+      let pass: () => void = () => {};
+      auth.authenticateAsync.mockImplementationOnce(() => new Promise((resolve) => (pass = () => resolve({ success: true }))));
+      const r = rig();
+      await render(menu(r));
+      await fireEvent.press(screen.getByRole("button", { name: FULL }));
+      await change("inactive"); // the system prompt itself
+      await act(async () => pass());
+      await change("active");
+      expect(field()).toBeTruthy();
+      await change("inactive");
       expect(screen.queryByLabelText("Type full access to confirm")).toBeNull();
       expect(r.send).not.toHaveBeenCalled();
     });

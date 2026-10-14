@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 import type { RequestBody } from "../client/HubClient";
@@ -17,13 +17,17 @@ export const WAITING_FOR_MAC = "Waiting for the Mac…";
 /** Over the open menu while the session has an approval waiting: the menu covers the approval. */
 export const APPROVAL_WAITING = "An approval is waiting — close this to answer it.";
 
+/** The line under the permission modes while full access is the current mode. */
+export const FULL_ACCESS_ON = "Full access is on.";
 /** The line under the permission modes, for the current one. */
 export const MODE_HELP: Record<Mode, string> = {
   ask: "Ask before every command and edit.",
   "accept-edits": "Edit files without asking; still ask before commands.",
   auto: "Run commands and edits without asking.",
-  "full-access": FULL_ACCESS_WARNING,
+  "full-access": FULL_ACCESS_ON,
 };
+/** How long a hidden menu waits on iOS for its Modal's `onDismiss` before calling itself gone. */
+export const MENU_DISMISS_MS = 400;
 
 /** The modes the segmented control offers; full access has its own guarded row. */
 const PLAIN_MODES: readonly Mode[] = ["ask", "accept-edits", "auto"];
@@ -192,6 +196,11 @@ interface ModelModeMenuProps {
   approval?: boolean;
   /** Where the panel hangs from: the header's bottom edge. */
   top: number;
+  /** False while the menu leaves for the Session info sheet: its Modal dismisses, then
+   * `onDismissed` says it is gone (iOS drops a Modal presented while another is still leaving). */
+  visible?: boolean;
+  /** Called once the hidden menu's Modal has gone. Must be stable. */
+  onDismissed?: () => void;
   /** Closes the menu. Must be stable. */
   onClose: () => void;
   /** Opens the Session info sheet in the menu's place. Must be stable. */
@@ -214,6 +223,8 @@ export const ModelModeMenu = memo(function ModelModeMenu({
   offline,
   approval = false,
   top,
+  visible = true,
+  onDismissed,
   onClose,
   onInfo,
 }: ModelModeMenuProps) {
@@ -310,17 +321,55 @@ export const ModelModeMenu = memo(function ModelModeMenu({
     if (!busy) onInfo();
   }, [busy, onInfo]);
 
+  // Hidden: nothing it armed survives, and once its Modal is gone (iOS says so with `onDismiss`;
+  // elsewhere the next frame), the caller hears of it, once.
+  const dismissed = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    if (visible) return;
+    disarm();
+    let gone = false;
+    const finish = () => {
+      if (gone) return;
+      gone = true;
+      onDismissed?.();
+    };
+    dismissed.current = finish;
+    if (Platform.OS === "ios") {
+      // A fallback for an `onDismiss` that never comes.
+      const timer = setTimeout(finish, MENU_DISMISS_MS);
+      return () => {
+        gone = true;
+        clearTimeout(timer);
+      };
+    }
+    const frame = requestAnimationFrame(finish);
+    return () => {
+      gone = true;
+      cancelAnimationFrame(frame);
+    };
+  }, [visible, disarm, onDismissed]);
+  const onDismiss = useCallback(() => dismissed.current?.(), []);
+
   const waiting = busy ? pending : null;
   const held = busy || offline;
   const fullCurrent = currentMode === "full-access";
   const short = shortId(session);
 
   return (
-    <Modal testID="menu" visible transparent animationType="fade" onRequestClose={close}>
+    <Modal testID="menu" visible={visible} transparent animationType="fade" onRequestClose={close} onDismiss={onDismiss}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={s.root}>
         <View style={[s.scrim, { top }]} />
-        <Pressable testID="menu-scrim" accessible={false} onPress={close} style={StyleSheet.absoluteFill} />
-        <View style={[s.panel, { marginTop: top + 2 }]}>
+        {/* A screen reader's way out: the scrim is the Close button (off while a change is out). */}
+        <Pressable
+          testID="menu-scrim"
+          accessibilityRole="button"
+          accessibilityLabel="Close"
+          accessibilityState={{ disabled: busy }}
+          disabled={busy}
+          onPress={close}
+          style={StyleSheet.absoluteFill}
+        />
+        <View testID="menu-panel" onAccessibilityEscape={close} style={[s.panel, { marginTop: top + 2 }]}>
           <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={s.content}>
             {approval ? (
               <View accessibilityLiveRegion="polite">

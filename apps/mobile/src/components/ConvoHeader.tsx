@@ -84,19 +84,31 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
   const line = headLine(catalog, head);
 
   const [menu, setMenu] = useState(false);
+  // The menu is leaving for the Session info sheet, which opens once its Modal has gone.
+  const [toInfo, setToInfo] = useState(false);
   const [info, setInfo] = useState(false);
   // A session that stops taking commands takes its menu with it (and any Face ID still up).
-  if (!live && menu) setMenu(false);
-  useEffect(() => onCovered(menu || info), [menu, info, onCovered]);
+  if (!live && (menu || toInfo)) {
+    setMenu(false);
+    setToInfo(false);
+  }
+  useEffect(() => onCovered(menu || toInfo || info), [menu, toInfo, info, onCovered]);
 
   const toggleMenu = useCallback(() => {
-    if (live) setMenu((open) => !open);
+    if (!live) return;
+    setToInfo(false);
+    setMenu((open) => !open);
   }, [live]);
   const closeMenu = useCallback(() => setMenu(false), []);
-  const showInfo = useCallback(() => {
+  const menuToInfo = useCallback(() => {
     setMenu(false);
+    setToInfo(true);
+  }, []);
+  const menuGone = useCallback(() => {
+    setToInfo(false);
     setInfo(true);
   }, []);
+  const showInfo = useCallback(() => setInfo(true), []);
   const hideInfo = useCallback(() => setInfo(false), []);
 
   return (
@@ -108,7 +120,8 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
           accessibilityRole="button"
           accessibilityLabel={`${clipLabel(title)}, ${clipLabel(line)}`}
           accessibilityHint={live ? "Changes the model and mode" : undefined}
-          accessibilityState={live ? { expanded: menu } : undefined}
+          accessibilityState={live ? { expanded: menu } : { disabled: true }}
+          disabled={!live}
           onPress={toggleMenu}
           style={s.title}
         >
@@ -127,7 +140,7 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
           <Text style={s.more}>⋯</Text>
         </Pressable>
       </View>
-      {live && menu ? (
+      {live && (menu || toInfo) ? (
         <ModelModeMenu
           session={session}
           engine={headEngine(catalog, head)}
@@ -136,8 +149,10 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
           offline={offline}
           approval={approval}
           top={top + HEADER_HEIGHT}
+          visible={menu}
+          onDismissed={menuGone}
           onClose={closeMenu}
-          onInfo={showInfo}
+          onInfo={menuToInfo}
         />
       ) : null}
       {info ? (
