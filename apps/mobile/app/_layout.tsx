@@ -5,8 +5,8 @@ import * as SystemUI from "expo-system-ui";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { AppState, View } from "react-native";
 
-import { Drawer, DrawerEdge } from "../src/components/Drawer";
-import { drawerScreen, setDrawerEnabled } from "../src/drawer";
+import { Drawer, DrawerHost } from "../src/components/Drawer";
+import { closeDrawer, drawerScreen, setDrawerEnabled } from "../src/drawer";
 import { useHubController, useHubSnapshot } from "../src/hub";
 import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
 import { useTheme } from "../src/theme";
@@ -15,6 +15,11 @@ import { ToastHost } from "../src/ui";
 // The native splash stays up until the app knows whether it is paired; app.json paints it in the
 // theme's colours, so there is no flash between it and the first screen.
 SplashScreen.preventAutoHideAsync().catch(() => undefined);
+
+/** The drawer owns the left edge on the Inbox, a Conversation and Settings, so those screens give
+ * up the system's back-swipe (a swipe from the edge, or from anywhere). Their header buttons and
+ * Android back still go back. */
+const OWN_EDGE = { gestureEnabled: false, fullScreenGestureEnabled: false } as const;
 
 /**
  * The shell. The app makes one hub connection (`hub` in src/hub.ts, the context's default).
@@ -35,6 +40,8 @@ export default function RootLayout() {
     setDrawerEnabled(drawerHere);
     return () => setDrawerEnabled(false);
   }, [drawerHere]);
+  // Any navigation (a notification tap, a link, a tap on a drawer row) leaves the drawer shut.
+  useEffect(() => closeDrawer(), [pathname]);
 
   useEffect(() => {
     // The socket and its timers live only while the app is in the foreground. `inactive` is a
@@ -98,31 +105,28 @@ export default function RootLayout() {
   return (
     <>
       <StatusBar style="auto" />
-      <Stack
-        screenOptions={{
-          headerStyle: { backgroundColor: theme.panel },
-          headerTintColor: theme.fg,
-          headerShadowVisible: false,
-          contentStyle: { backgroundColor: theme.bg },
-        }}
-      >
-        <Stack.Protected guard={paired && !offer}>
-          <Stack.Screen name="index" options={{ title: "Inbox", headerShown: false }} />
-          <Stack.Screen name="session/[id]" options={{ title: "Session" }} />
-          <Stack.Screen name="recent" options={{ title: "Recent and new" }} />
-          <Stack.Screen name="settings" options={{ title: "Settings" }} />
-        </Stack.Protected>
-        <Stack.Protected guard={!paired || offer}>
-          <Stack.Screen name="pair" options={{ title: "Pair", headerShown: false }} />
-        </Stack.Protected>
-      </Stack>
+      <DrawerHost>
+        <Stack
+          screenOptions={{
+            headerStyle: { backgroundColor: theme.panel },
+            headerTintColor: theme.fg,
+            headerShadowVisible: false,
+            contentStyle: { backgroundColor: theme.bg },
+          }}
+        >
+          <Stack.Protected guard={paired && !offer}>
+            <Stack.Screen name="index" options={{ title: "Inbox", headerShown: false, ...OWN_EDGE }} />
+            <Stack.Screen name="session/[id]" options={{ title: "Session", ...OWN_EDGE }} />
+            <Stack.Screen name="recent" options={{ title: "Recent and new" }} />
+            <Stack.Screen name="settings" options={{ title: "Settings", ...OWN_EDGE }} />
+          </Stack.Protected>
+          <Stack.Protected guard={!paired || offer}>
+            <Stack.Screen name="pair" options={{ title: "Pair", headerShown: false }} />
+          </Stack.Protected>
+        </Stack>
+      </DrawerHost>
       <ToastHost />
-      {paired && !offer ? (
-        <>
-          <DrawerEdge />
-          <Drawer />
-        </>
-      ) : null}
+      {paired && !offer ? <Drawer /> : null}
     </>
   );
 }

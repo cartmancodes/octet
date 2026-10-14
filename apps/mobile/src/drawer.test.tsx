@@ -5,7 +5,7 @@ import { AccessibilityInfo, Animated, BackHandler, StyleSheet, Text } from "reac
 
 import { DRAWER_MS, DRAWER_WIDTH, EDGE_WIDTH } from "./components/Drawer";
 import { closeDrawer, drawerStore, openDrawer } from "./drawer";
-import { hear, info, launch, mount, pairedStorage, type Rig } from "./screenRig";
+import { hear, info, launch, mount, pairedStorage } from "./screenRig";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { hideToast, showToast } from "./toast";
 import { TOKEN_KEY } from "./hub";
@@ -54,17 +54,19 @@ async function openFromStore() {
   await wait(DRAWER_MS + 20);
 }
 
-/** A finger on the screen: each `at` is a touch event `x`, `y` points from where it came down. */
+/** A finger on the screen, in page coordinates: `at` is a touch event for the finger at `x`, `y`. */
 function finger() {
   let t = 1_000;
-  let last = { x: 0, y: 0 };
+  let last: { x: number; y: number } | null = null;
+  let down = { x: 0, y: 0 };
   return {
     at(x: number, y: number) {
-      const previous = last;
+      const previous = last ?? { x, y };
+      if (last === null) down = { x, y };
       last = { x, y };
       t += 16;
       return {
-        nativeEvent: { touches: [{ pageX: x, pageY: y }] },
+        nativeEvent: { pageX: x, pageY: y, touches: [{ pageX: x, pageY: y }] },
         touchHistory: {
           indexOfSingleActiveTouch: 0,
           mostRecentTimeStamp: t,
@@ -72,8 +74,8 @@ function finger() {
           touchBank: [
             {
               touchActive: true,
-              startPageX: 0,
-              startPageY: 0,
+              startPageX: down.x,
+              startPageY: down.y,
               startTimeStamp: 1_000,
               currentPageX: x,
               currentPageY: y,
@@ -89,44 +91,53 @@ function finger() {
   };
 }
 
-/** A drag on the edge zone: down at its left, then through `points`, then up. */
-async function dragEdge(points: [number, number][]) {
-  const zone = screen.getByTestId("drawer-edge");
+/**
+ * A drag as the responder system plays it on `node`: the touch starts at `from`; each move asks the
+ * node (capture phase, then bubble phase) whether it takes the touch; once it has, it is granted
+ * and gets the rest of the moves. `offsets` are from `from`. Returns whether the node took it.
+ */
+async function drag(node: { props: Record<string, (...args: never[]) => unknown> }, from: [number, number], offsets: [number, number][]) {
   const f = finger();
-  await fireEvent(zone, "responderGrant", f.at(0, 0));
-  for (const [x, y] of points) await fireEvent(zone, "responderMove", f.at(x, y));
-  const [x, y] = points[points.length - 1] ?? [0, 0];
-  await fireEvent(zone, "responderRelease", f.at(x, y));
-}
-
-/** A drag on the open drawer, as the responder system plays it: the panel is asked to take a move
- * (before its children), then is granted the touch, then gets the moves. Returns whether it took it. */
-async function dragPanel(points: [number, number][]): Promise<boolean> {
-  const panel = drawer();
-  const f = finger();
-  const [first, ...rest] = points;
-  if (!first) return false;
+  const at = ([dx, dy]: [number, number]) => f.at(from[0] + dx, from[1] + dy);
+  const p = node.props as Record<string, (e: unknown) => unknown>;
   let took = false;
   await act(async () => {
-    panel.props.onStartShouldSetResponderCapture(f.at(0, 0));
+    p.onStartShouldSetResponderCapture?.(f.at(from[0], from[1]));
   });
-  await act(async () => {
-    took = panel.props.onMoveShouldSetResponderCapture(f.at(first[0], first[1])) === true;
-  });
-  if (!took) return false;
-  await act(async () => {
-    panel.props.onResponderGrant(f.at(first[0], first[1]));
-  });
-  for (const [x, y] of rest) {
+  for (const offset of offsets) {
+    const event = at(offset);
     await act(async () => {
-      panel.props.onResponderMove(f.at(x, y));
+      if (took) {
+        p.onResponderMove?.(event);
+        return;
+      }
+      took = p.onMoveShouldSetResponderCapture?.(event) === true || p.onMoveShouldSetResponder?.(event) === true;
+      if (took) p.onResponderGrant?.(event);
     });
   }
   await act(async () => {
-    panel.props.onResponderRelease(f.at(0, 0));
+    p.onResponderRelease?.(at(offsets[offsets.length - 1] ?? [0, 0]));
   });
-  return true;
+  return took;
 }
+
+/** The native screens the stack has made, in order (what react-native-screens received). */
+function nativeScreens() {
+  const found: { props: Record<string, unknown> }[] = [];
+  const walk = (node: unknown) => {
+    if (!node || typeof node === "string") return;
+    const n = node as { type: string; props: Record<string, unknown>; children?: unknown[] };
+    if (n.type === "RNSScreen") found.push(n);
+    for (const child of n.children ?? []) walk(child);
+  };
+  walk(screen.toJSON());
+  return found;
+}
+
+/** A drag that starts in the 18 pt gutter at the screen's left edge (mid-height by default). */
+const dragEdge = (offsets: [number, number][], from: [number, number] = [8, 300]) => drag(screen.getByTestId("drawer-host", { hidden: true }), from, offsets);
+/** A drag on the open drawer. */
+const dragPanel = (offsets: [number, number][]) => drag(drawer(), [250, 300], offsets);
 
 describe("the drawer", () => {
   describe("opening and closing", () => {
@@ -324,20 +335,72 @@ describe("the drawer", () => {
     });
   });
 
+  describe("while it is open", () => {
+    it("closes when the screen changes: a notification tap, a link, any navigation", async () => {
+      await open([info("a")]);
+      await openFromMenu();
+      await act(async () => router.push("/session/a"));
+      expect(drawerStore.getState().open).toBe(false);
+      await wait(DRAWER_MS + 20);
+      expect(isOpen()).toBe(false);
+      await openFromStore();
+      await act(async () => router.replace("/settings"));
+      expect(drawerStore.getState().open).toBe(false);
+    });
+
+    it("keeps the ago texts moving: the clock ticks every 30 s, and is read afresh when it opens", async () => {
+      const ago = (id: string) => within(screen.getByTestId(`drawer-row-${id}`)).getByText(/^\d+[mhd]$/);
+      await open([info("a", { last_activity: Date.now() / 1000 - 60 })]);
+      // shut for ten minutes: nothing is drawn, and it opens on the time it is
+      await wait(600_000);
+      await openFromMenu();
+      expect(ago("a").props.children).toBe("11m");
+      await wait(150_000);
+      expect(ago("a").props.children).toBe("13m");
+    });
+
+    it("hides what is under it from a screen reader on Android too", async () => {
+      await open([info("a")]);
+      const host = () => screen.getByTestId("drawer-host", { hidden: true });
+      expect(host().props.importantForAccessibility).toBe("auto");
+      await openFromMenu();
+      expect(host().props.importantForAccessibility).toBe("no-hide-descendants");
+      await fireEvent.press(scrim());
+      expect(host().props.importantForAccessibility).toBe("auto");
+    });
+  });
+
   describe("gestures", () => {
-    it("an 18 pt edge zone sits on the Inbox, and a horizontal drag of more than 30 pt opens the drawer", async () => {
+    it("a horizontal drag of more than 30 pt from the 18 pt gutter opens the drawer", async () => {
       await open([info("a")]);
       expect(EDGE_WIDTH).toBe(18);
-      expect(Number(style(screen.getByTestId("drawer-edge")).width)).toBe(18);
-      await dragEdge([
-        [12, 1],
-        [34, 4],
-      ]);
+      expect(
+        await dragEdge([
+          [12, 1],
+          [34, 4],
+        ]),
+      ).toBe(true);
       expect(drawerStore.getState().open).toBe(true);
       await wait(DRAWER_MS + 20);
       expect(isOpen()).toBe(true);
-      // and the zone gets out of the way
-      expect(screen.queryByTestId("drawer-edge")).toBeNull();
+    });
+
+    it("opens on a single fast move past 30 pt too", async () => {
+      await open([info("a")]);
+      await dragEdge([[45, 3]]);
+      expect(drawerStore.getState().open).toBe(true);
+    });
+
+    it("starts only in the gutter: 18 pt in, not 19, and not up in the header or down at the composer", async () => {
+      await open([info("a")]);
+      await dragEdge([[60, 0]], [19, 300]);
+      expect(drawerStore.getState().open).toBe(false);
+      await dragEdge([[60, 0]], [8, 10]);
+      expect(drawerStore.getState().open).toBe(false);
+      await dragEdge([[60, 0]], [8, 1_300]);
+      expect(drawerStore.getState().open).toBe(false);
+      await dragEdge([[60, 0]], [18, 300]);
+      expect(drawerStore.getState().open).toBe(true);
     });
 
     it("a_vertical_drag_never_opens_the_drawer", async () => {
@@ -370,14 +433,50 @@ describe("the drawer", () => {
       expect(drawerStore.getState().open).toBe(false);
     });
 
+    it("a tap or a vertical scroll that starts in the gutter is not taken: the content under still gets it", async () => {
+      await open([info("a")]);
+      const host = screen.getByTestId("drawer-host", { hidden: true });
+      const p = host.props as Record<string, (e: unknown) => unknown>;
+      const f = finger();
+      // The gutter claims nothing on touch start, so a tap lands on what is under it.
+      expect(p.onStartShouldSetResponderCapture?.(f.at(8, 300))).toBeFalsy();
+      expect(p.onStartShouldSetResponder?.(f.at(8, 300))).toBeFalsy();
+      expect(await dragEdge([[1, 0]])).toBe(false);
+      expect(await dragEdge([[0, 40], [1, 120]])).toBe(false);
+      expect(drawerStore.getState().open).toBe(false);
+      // and no strip sits over the gutter to swallow a tap
+      expect(screen.queryByTestId("drawer-edge", { hidden: true })).toBeNull();
+    });
+
     it("is on the Conversation and Settings too", async () => {
       await open([info("a")]);
       await act(async () => router.push("/session/a"));
-      expect(screen.getByTestId("drawer-edge")).toBeTruthy();
-      await act(async () => router.push("/settings"));
-      expect(screen.getByTestId("drawer-edge")).toBeTruthy();
       await dragEdge([[40, 0]]);
       expect(drawerStore.getState().open).toBe(true);
+      await act(async () => closeDrawer());
+      await act(async () => router.push("/settings"));
+      await dragEdge([[40, 0]]);
+      expect(drawerStore.getState().open).toBe(true);
+    });
+
+    it("leaves the screens' own back-swipe off: the drawer owns the left edge", async () => {
+      await open([info("a")]);
+      await act(async () => router.push("/session/a"));
+      await act(async () => router.push("/settings"));
+      const screens = nativeScreens();
+      expect(screens).toHaveLength(3);
+      for (const s of screens) {
+        expect(s.props.gestureEnabled).toBe(false);
+        // react-native-screens takes this one as the string "false"
+        expect(String(s.props.fullScreenSwipeEnabled)).toBe("false");
+      }
+    });
+
+    it("a single fast drag left of more than 40 pt closes the drawer too", async () => {
+      await open([info("a")]);
+      await openFromMenu();
+      await dragPanel([[-70, 2]]);
+      expect(drawerStore.getState().open).toBe(false);
     });
 
     it("a drag left of more than 40 pt on the drawer closes it", async () => {
@@ -404,10 +503,11 @@ describe("the drawer", () => {
   });
 
   describe("hidden", () => {
-    it("has no edge zone and no drawer on Pair", async () => {
+    it("has no edge swipe and no drawer on Pair", async () => {
       await SecureStore.deleteItemAsync(TOKEN_KEY);
       await mount("/pair", ROUTES);
-      expect(screen.queryByTestId("drawer-edge")).toBeNull();
+      expect(await dragEdge([[60, 0]])).toBe(false);
+      expect(drawerStore.getState().open).toBe(false);
       expect(screen.queryByTestId("drawer")).toBeNull();
     });
 
@@ -418,7 +518,7 @@ describe("the drawer", () => {
       expect(drawerStore.getState().open).toBe(false);
       await wait(DRAWER_MS + 20);
       expect(isOpen()).toBe(false);
-      expect(screen.queryByTestId("drawer-edge")).toBeNull();
+      expect(await dragEdge([[60, 0]])).toBe(false);
       // and nothing opens it there
       await act(async () => openDrawer());
       expect(drawerStore.getState().open).toBe(false);

@@ -1,7 +1,7 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
 import { usePathname, useRouter } from "expo-router";
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { AccessibilityInfo, Animated, BackHandler, PanResponder, Pressable, StyleSheet, Text, View } from "react-native";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useState, type ReactNode } from "react";
+import { AccessibilityInfo, Animated, BackHandler, PanResponder, Pressable, StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { closeDrawer, openDrawer, useDrawerEnabled, useDrawerOpen } from "../drawer";
@@ -22,6 +22,8 @@ export const CLOSE_DRAG = 40;
 const SCRIM = 0.6;
 /** A leftward drag this long, and mostly horizontal, is the drawer's to take from its children. */
 const CLAIM_DRAG = 8;
+/** How often the open drawer's "how long ago" moves on. */
+const AGO_TICK_MS = 30_000;
 /** The edge strip leaves the header and the composer alone. */
 const EDGE_TOP = 56;
 const EDGE_BOTTOM = 120;
@@ -130,7 +132,7 @@ const readClock = (): number => Date.now();
 
 /**
  * The side drawer: the Inbox, the Mac's sessions and Settings. Mounted once, over the stack, in
- * app/_layout.tsx. It opens from the ☰ buttons or a swipe from the edge (`DrawerEdge`), and closes
+ * app/_layout.tsx. It opens from the ☰ buttons or a swipe from the edge (`DrawerHost`), and closes
  * on a tap on the scrim, a drag left, or Android back. Its open state is `src/drawer.ts`, which the
  * screens under it read: nothing there answers an approval while it is up.
  */
@@ -189,6 +191,11 @@ export function Drawer() {
     return PanResponder.create({
       onMoveShouldSetPanResponderCapture: (_event, g) => {
         if (g.dx > -CLAIM_DRAG || !horizontal(g.dx, g.dy)) return false;
+        // A fast drag can pass the distance in its first move: it closes at once.
+        if (g.dx < -CLOSE_DRAG) {
+          closeDrawer();
+          return false;
+        }
         lead.dx = g.dx;
         lead.dy = g.dy;
         return true;
@@ -201,7 +208,20 @@ export function Drawer() {
     });
   });
 
-  const list = useMemo(() => (mounted ? drawerList(sessions, readClock()) : null), [mounted, sessions]);
+  // The clock the "ago" texts count from: read afresh each time it opens, then every 30 s while
+  // it is open (nothing is drawn while it is shut).
+  const [clock, setClock] = useState(readClock);
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (open) setClock(readClock());
+  }
+  useEffect(() => {
+    if (!open) return;
+    const timer = setInterval(() => setClock(readClock()), AGO_TICK_MS);
+    return () => clearInterval(timer);
+  }, [open]);
+  const list = useMemo(() => (mounted ? drawerList(sessions, clock) : null), [mounted, sessions, clock]);
   const rows = list?.rows ?? NONE;
 
   const goInbox = useCallback(() => {
@@ -319,26 +339,78 @@ export function Drawer() {
 const NONE: DrawerRow[] = [];
 const SCRIM_BOX = { backgroundColor: INK } as const;
 
+/** What the edge swipe's responder reads: where the gutter is, and where the touch came down. A
+ * plain object the render never reads (only the responder does), moved by `place`. */
+function makeZone() {
+  const zone = {
+    enabled: false,
+    top: 0,
+    bottom: 0,
+    x: 0,
+    y: 0,
+    dx: 0,
+    dy: 0,
+    place(enabled: boolean, top: number, bottom: number) {
+      zone.enabled = enabled;
+      zone.top = top;
+      zone.bottom = bottom;
+    },
+  };
+  return zone;
+}
+
 /**
- * The strip along the screen's left edge that a swipe opens the drawer from: a drag to the right
- * of more than 30 pt that is at least twice as wide as it is tall. A vertical drag never opens it.
- * Present only where the drawer is (the Inbox, a Conversation, Settings) and while it is shut.
+ * Wraps the screens, so the drawer can take a swipe from the left edge. It claims nothing on touch
+ * start, so a tap or a scroll that begins in the 18 pt gutter reaches the screen as usual; it takes a
+ * touch only once it is a rightward drag, at least twice as wide as tall, that began in the gutter
+ * (below the header, above the composer). Past 30 pt that opens the drawer; a vertical drag never does.
+ * Where the drawer is off (Pair, New session) or already open it takes nothing.
+ * While the drawer is open the screens under it are hidden from a screen reader on Android too (the
+ * drawer is modal on iOS).
  */
-export function DrawerEdge() {
+export function DrawerHost({ children }: { children: ReactNode }) {
   const insets = useSafeAreaInsets();
-  const enabled = useDrawerEnabled();
+  const { height } = useWindowDimensions();
   const open = useDrawerOpen();
+  // Read by the responder, which is made once.
+  const [zone] = useState(makeZone);
+  const enabled = useDrawerEnabled() && !open;
+  const top = insets.top + EDGE_TOP;
+  const bottom = height - EDGE_BOTTOM;
+  useLayoutEffect(() => {
+    zone.place(enabled, top, bottom);
+  }, [zone, enabled, top, bottom]);
   const [pan] = useState(() =>
     PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: (event) => {
+        zone.x = event.nativeEvent.pageX;
+        zone.y = event.nativeEvent.pageY;
+        return false;
+      },
+      onMoveShouldSetPanResponder: (_event, g) => {
+        if (!zone.enabled || zone.x > EDGE_WIDTH || zone.y < zone.top || zone.y > zone.bottom) return false;
+        if (g.dx < CLAIM_DRAG || !horizontal(g.dx, g.dy)) return false;
+        // A fast drag can pass the distance in its first move: it opens at once.
+        if (g.dx > OPEN_DRAG) {
+          openDrawer();
+          return false;
+        }
+        zone.dx = g.dx;
+        zone.dy = g.dy;
+        return true;
+      },
       onPanResponderMove: (_event, g) => {
-        if (g.dx > OPEN_DRAG && horizontal(g.dx, g.dy)) openDrawer();
+        const dx = zone.dx + g.dx;
+        const dy = zone.dy + g.dy;
+        if (dx > OPEN_DRAG && horizontal(dx, dy)) openDrawer();
       },
     }),
   );
-  const place = useMemo(() => ({ top: insets.top + EDGE_TOP, bottom: EDGE_BOTTOM }), [insets.top]);
-  if (!enabled || open) return null;
-  return <View testID="drawer-edge" accessible={false} importantForAccessibility="no" {...pan.panHandlers} style={[EDGE, place]} />;
+  return (
+    <View testID="drawer-host" importantForAccessibility={open ? "no-hide-descendants" : "auto"} {...pan.panHandlers} style={HOST}>
+      {children}
+    </View>
+  );
 }
 
-const EDGE = { position: "absolute", left: 0, width: EDGE_WIDTH } as const;
+const HOST = { flex: 1 } as const;

@@ -72,7 +72,11 @@ jest.mock("expo-splash-screen", () => ({
 }));
 
 // There is no native animation driver under test (its values never move), so animations run on the
-// JS driver: a test sees an opening drawer's scrim reach its opacity.
+// JS driver: a test sees an opening drawer's scrim reach its opacity. RN decides this in
+// `shouldUseNativeDriver`, which only its private (non-exported) NativeAnimatedHelper module holds, so
+// the test reaches into that path. It is a plain require: if a React Native upgrade moves or renames
+// the file, every test fails loudly at set-up ("Cannot find module"), rather than animations
+// silently stopping. Fix the path (or drop this) then.
 const animatedHelper = jest.requireActual<{ default: { shouldUseNativeDriver: () => boolean } }>(
   "react-native/src/private/animated/NativeAnimatedHelper",
 ).default;
