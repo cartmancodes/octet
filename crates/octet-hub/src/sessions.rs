@@ -57,8 +57,12 @@ const INBOUND_QUEUE: usize = 256;
 const LINE_LIMIT: u64 = MAX_BRIDGE_LINE as u64 + 1;
 /// The largest registration file read.
 const REGISTRATION_LIMIT: u64 = 1024 * 1024;
-/// The longest `goal` in a `sessions` row, in characters.
+/// The longest `goal` and `now` in a `sessions` row, in characters.
 const GOAL_CHARS: usize = 200;
+/// The most a `sessions` frame's rows take with their approval gists, in bytes. Past it, the
+/// least recently active rows lose their gists (keeping their counts), so the frame stays well
+/// under a message however many sessions wait.
+const GISTS_BUDGET: usize = 64 * 1024;
 /// How long a journal the session has moved on from is still read for its last records.
 const FOLLOW_PREVIOUS: Duration = Duration::from_secs(10);
 
@@ -242,7 +246,10 @@ impl Live {
             ),
             ("last_activity", self.last_activity.map(|t| json!(t))),
             ("goal", goal.map(|g| json!(g))),
-            ("now", text("now").map(|now| json!(now))),
+            (
+                "now",
+                text("now").map(|now| json!(now.chars().take(GOAL_CHARS).collect::<String>())),
+            ),
             ("tmux", registration.tmux.as_ref().map(|t| json!(t))),
             ("approval", front),
         ];
@@ -380,9 +387,28 @@ impl Sessions {
         }
     }
 
-    /// The `sessions` frame's rows, oldest session first.
+    /// The `sessions` frame's rows, oldest session first. Rows over [`GISTS_BUDGET`] lose their
+    /// approval gists, least recently active first, until they fit.
     pub(crate) fn list(&self) -> Vec<Value> {
-        self.live.iter().map(Live::row).collect()
+        let mut rows: Vec<Value> = self.live.iter().map(Live::row).collect();
+        let mut total: usize = rows.iter().map(|row| row.to_string().len() + 1).sum();
+        if total <= GISTS_BUDGET {
+            return rows;
+        }
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by_key(|&i| (self.live[i].last_activity, i));
+        for i in order {
+            if total <= GISTS_BUDGET {
+                break;
+            }
+            if let Some(gist) = rows[i]
+                .as_object_mut()
+                .and_then(|row| row.remove("approval"))
+            {
+                total = total.saturating_sub(gist.to_string().len() + r#","approval":"#.len());
+            }
+        }
+        rows
     }
 
     /// What each session looks like to the pusher: its journals, phase and open approval ids.
@@ -1520,6 +1546,76 @@ mod tests {
             frame.len() < octet_core::remote::protocol::MAX_MESSAGE,
             "{} bytes",
             frame.len()
+        );
+    }
+
+    #[test]
+    fn the_rows_now_is_clipped_like_the_goal() {
+        let env = Env::new();
+        let state = json!({"phase": "running", "now": "é".repeat(5000), "approvals": []});
+        let row = live_with(&env, 4040, state).row();
+        assert_eq!(row["now"], "é".repeat(200));
+        let short = json!({"phase": "running", "now": "Running Bash ls", "approvals": []});
+        assert_eq!(live_with(&env, 4041, short).row()["now"], "Running Bash ls");
+    }
+
+    #[test]
+    fn sixty_worst_case_rows_fit_and_the_most_recent_keep_their_gists() {
+        let env = Env::new();
+        let mut sessions = Sessions::new(env.run.clone());
+        for i in 0..60u32 {
+            let state = json!({"phase": "waiting", "now": "é".repeat(300),
+                "goal": {"objective": "é".repeat(5000)},
+                "approvals": [{"id": i, "summary": worst_summary()}]});
+            let mut live = live_with(&env, 4200 + i, state);
+            // The newest activity is in the middle of the list, the oldest at its ends.
+            live.last_activity = Some(1_790_000_000 + u64::from(30 - i.abs_diff(30)));
+            sessions.live.push(live);
+        }
+        let rows = sessions.list();
+        assert_eq!(rows.len(), 60);
+        let frame = json!({"v": 1, "type": "sessions", "sessions": rows}).to_string();
+        assert!(
+            frame.len() < octet_core::remote::protocol::MAX_MESSAGE,
+            "{} bytes",
+            frame.len()
+        );
+        assert!(rows.iter().all(|row| row["approvals"] == 1));
+        assert!(
+            rows[30].get("approval").is_some(),
+            "the newest keeps its gist"
+        );
+        assert!(
+            rows[0].get("approval").is_none(),
+            "the oldest loses its gist"
+        );
+        let kept = rows
+            .iter()
+            .filter(|row| row.get("approval").is_some())
+            .count();
+        assert!(kept > 0 && kept < 60, "{kept}");
+        // Every row that kept its gist is at least as recent as every row that lost one.
+        let recency = |row: &Value| row["last_activity"].as_u64().unwrap();
+        let newest_lost = rows
+            .iter()
+            .filter(|row| row.get("approval").is_none())
+            .map(recency)
+            .max()
+            .unwrap();
+        let oldest_kept = rows
+            .iter()
+            .filter(|row| row.get("approval").is_some())
+            .map(recency)
+            .min()
+            .unwrap();
+        assert!(oldest_kept >= newest_lost);
+        // A few rows are under the budget and keep every gist.
+        sessions.live.truncate(4);
+        assert!(
+            sessions
+                .list()
+                .iter()
+                .all(|row| row.get("approval").is_some())
         );
     }
 

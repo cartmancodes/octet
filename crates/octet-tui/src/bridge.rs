@@ -935,9 +935,37 @@ fn clipped_files(files: &[String]) -> Vec<String> {
     shown
 }
 
+/// How many files a summary's clipped `files` stood for: each listed file, plus the count its
+/// closing "+N more" gives.
+fn files_count(files: &[Value]) -> usize {
+    let more: Option<usize> = files
+        .last()
+        .and_then(Value::as_str)
+        .and_then(|last| last.strip_prefix('+')?.strip_suffix(" more")?.parse().ok());
+    match more {
+        Some(more) if files.len() > FILES_SHOWN => FILES_SHOWN + more,
+        _ => files.len(),
+    }
+}
+
+/// `summary` reduced to its action and scope, marking what it removed: a command becomes "…"
+/// and files become "+N more", so a phone never shows a reduced approval as an empty one.
+fn reduced_summary(summary: &Value) -> Value {
+    let mut reduced = json!({"action": summary["action"], "files": [], "scope": summary["scope"]});
+    if summary["command"].is_string() {
+        reduced["command"] = json!("…");
+    }
+    let files = summary["files"].as_array().map_or(0, |f| files_count(f));
+    if files > 0 {
+        reduced["files"] = json!([format!("+{files} more")]);
+    }
+    reduced
+}
+
 /// The `state` frame line for `state`. One that would not fit in a message is rebuilt without
-/// the queue, with each approval reduced to its action and scope, and without the goal if
-/// that is still too much, so a hub always accepts it and the approval ids still get through.
+/// the queue, with each approval reduced to its action and scope (marking the command and files
+/// it removed), and without the goal if that is still too much, so a hub always accepts it and
+/// the approval ids still get through.
 fn state_line(state: &Value) -> String {
     let line = frame_line(&protocol::bridge_state_frame(state));
     if line.len() <= MAX_MESSAGE {
@@ -947,9 +975,7 @@ fn state_line(state: &Value) -> String {
     reduced["queue"] = json!([]);
     if let Some(approvals) = reduced["approvals"].as_array_mut() {
         for approval in approvals {
-            let summary = &approval["summary"];
-            approval["summary"] =
-                json!({"action": summary["action"], "files": [], "scope": summary["scope"]});
+            approval["summary"] = reduced_summary(&approval["summary"]);
         }
     }
     let mut line = frame_line(&protocol::bridge_state_frame(&reduced));
@@ -1753,9 +1779,59 @@ mod tests {
         let approvals = reduced["state"]["approvals"].as_array().unwrap();
         assert_eq!(approvals.len(), 40);
         assert_eq!(approvals[3]["summary"]["action"], "Run a shell command");
-        assert!(approvals[3]["summary"].get("command").is_none());
+        assert_eq!(approvals[3]["summary"]["command"], "…");
+        assert_eq!(approvals[3]["summary"]["files"], json!([]));
         conforms("StateInfo", &reduced["state"]);
         conforms("ApprovalSummary", &approvals[3]["summary"]);
+    }
+
+    #[test]
+    fn a_reduced_state_marks_what_it_removed() {
+        let (mut app, _) = demo();
+        crate::test_support::idle(&mut app);
+        let event = |id, summary| octet_core::Event::Approval {
+            id,
+            detail: String::new(),
+            summary,
+        };
+        for id in 0..30 {
+            app.event(event(
+                id,
+                octet_core::ApprovalSummary {
+                    command: Some("c".repeat(4_000)),
+                    ..octet_core::ApprovalSummary::new("Run a shell command")
+                },
+            ));
+        }
+        app.event(event(
+            30,
+            octet_core::ApprovalSummary {
+                files: (0..25).map(|n| format!("{n}.rs")).collect(),
+                ..octet_core::ApprovalSummary::new("Edit 25 files")
+            },
+        ));
+        app.event(event(
+            31,
+            octet_core::ApprovalSummary {
+                files: vec!["a.rs".into(), "b.rs".into()],
+                ..octet_core::ApprovalSummary::new("Edit 2 files")
+            },
+        ));
+        app.event(event(32, octet_core::ApprovalSummary::new("Fetch a page")));
+        let state = state_json(&app);
+        assert!(frame_line(&protocol::bridge_state_frame(&state)).len() > MAX_MESSAGE);
+        let reduced: Value = serde_json::from_str(&state_line(&state)).unwrap();
+        let summary = |id: usize| reduced["state"]["approvals"][id]["summary"].clone();
+        assert_eq!(summary(0)["command"], "…");
+        assert_eq!(summary(0)["files"], json!([]));
+        assert!(summary(30).get("command").is_none());
+        assert_eq!(summary(30)["files"], json!(["+25 more"]));
+        assert_eq!(summary(31)["files"], json!(["+2 more"]));
+        assert!(summary(32).get("command").is_none());
+        assert_eq!(summary(32)["files"], json!([]));
+        for id in [0, 30, 31, 32] {
+            conforms("ApprovalSummary", &summary(id));
+        }
     }
 
     #[tokio::test]
