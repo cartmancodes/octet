@@ -43,11 +43,11 @@
 //! journal read again. Live frames go through a queue of
 //! 512: a phone that lets it fill is dropped.
 use crate::{
-    git::{self, Git, Listing},
+    git::{self, Git, Listing, TURN_FIRST},
     launch::{self, Launches, StartRequest, clip as clip_to},
     owner::published_url,
     push::{self, Pusher, Sender},
-    sessions::{SessionUpdate, Sessions},
+    sessions::{Place, SessionUpdate, Sessions},
     store::{Device, SECRET_REFUSED, Store},
     tail::{self, file_name},
 };
@@ -175,8 +175,6 @@ const JOB_WITHIN: Duration = Duration::from_secs(30);
 /// The refusal for a `diff` of a path the connection's last `changes` for the session did not
 /// list.
 const ASK_FOR_CHANGES: &str = "Ask for the changes first";
-/// The refusal for a commit while a turn runs or an approval waits.
-const TURN_FIRST: &str = "Finish or cancel the current turn first";
 /// The refusal for a commit to a session whose turn the hub cannot see.
 const NOT_CONNECTED: &str = "The session is not connected";
 /// The refusal for a git command naming a session the hub does not have.
@@ -208,10 +206,12 @@ enum ConnEvent {
         /// The audit line to write: device, session and what.
         audit: Option<(String, String, String)>,
     },
-    /// A `changes` finished: the listing to keep for `session` and the frame, or the refusal.
+    /// A `changes` finished: the listing to keep for `session` and the frame, or the refusal;
+    /// `ticket` orders it among the connection's listings.
     Listed {
         conn: u64,
         req: u64,
+        ticket: u64,
         session: String,
         result: Result<git::Changes, git::Refusal>,
     },
@@ -297,12 +297,14 @@ impl std::fmt::Debug for ConnEvent {
             Self::Listed {
                 conn,
                 req,
+                ticket,
                 session,
                 result,
             } => f
                 .debug_struct("Listed")
                 .field("conn", conn)
                 .field("req", req)
+                .field("ticket", ticket)
                 .field("session", session)
                 .field(
                     "result",
@@ -501,36 +503,54 @@ struct Conn {
 }
 
 /// One connection's last listing of each session, for at most [`LISTED_SESSIONS`] sessions;
-/// each holds at most [`git::FILES_LIMIT`] paths.
+/// each holds at most [`git::FILES_LIMIT`] paths. Each `changes` takes a ticket as it starts, so
+/// a slower, older answer never replaces a newer listing.
 #[derive(Debug, Default)]
 struct Listings {
-    /// By session: when it was kept, and the listing.
+    /// By session: the ticket of the `changes` it came from, and the listing.
     by_session: HashMap<String, (u64, Listing)>,
-    /// The last stamp given.
-    stamp: u64,
+    /// The last ticket given.
+    tickets: u64,
 }
 
 impl Listings {
-    /// Keeps `listing` as `session`'s, in place of the last; a ninth session lets the least
-    /// recently listed go.
-    fn keep(&mut self, session: String, listing: Listing) {
-        if !self.by_session.contains_key(&session) && self.by_session.len() >= LISTED_SESSIONS {
-            let oldest = self
-                .by_session
-                .iter()
-                .min_by_key(|(_, (stamp, _))| *stamp)
-                .map(|(id, _)| id.clone());
-            if let Some(oldest) = oldest {
-                self.by_session.remove(&oldest);
-            }
-        }
-        self.stamp += 1;
-        self.by_session.insert(session, (self.stamp, listing));
+    /// The ticket of a `changes` starting now: later than any before.
+    fn ticket(&mut self) -> u64 {
+        self.tickets += 1;
+        self.tickets
     }
 
-    /// Forgets `session`'s listing.
-    fn forget(&mut self, session: &str) {
-        self.by_session.remove(session);
+    /// Keeps `listing` as `session`'s unless one of a later ticket is kept, and says whether it
+    /// was; a ninth session lets the least recently listed go.
+    fn keep(&mut self, session: String, ticket: u64, listing: Listing) -> bool {
+        match self.by_session.get(&session) {
+            Some((kept, _)) if *kept > ticket => return false,
+            None if self.by_session.len() >= LISTED_SESSIONS => {
+                let oldest = self
+                    .by_session
+                    .iter()
+                    .min_by_key(|(_, (kept, _))| *kept)
+                    .map(|(id, _)| id.clone());
+                if let Some(oldest) = oldest {
+                    self.by_session.remove(&oldest);
+                }
+            }
+            // Its own older listing, or room for another session.
+            _ => {}
+        }
+        self.by_session.insert(session, (ticket, listing));
+        true
+    }
+
+    /// Forgets `session`'s listing, unless it came from a later ticket than `ticket`.
+    fn forget(&mut self, session: &str, ticket: u64) {
+        if self
+            .by_session
+            .get(session)
+            .is_some_and(|(kept, _)| *kept < ticket)
+        {
+            self.by_session.remove(session);
+        }
     }
 
     /// `session`'s last listing.
@@ -627,6 +647,9 @@ pub struct Hub {
     scanning: Arc<AtomicBool>,
     /// Runs git in sessions' workspaces, two calls at a time.
     git: Git,
+    /// Whether each session with a commit under way may still commit, kept current as its
+    /// state arrives; the commit looks again just before it stages.
+    turns: HashMap<String, watch::Sender<bool>>,
     /// Where seqs are in the journals, for replays after a cursor.
     index: tail::SharedIndex,
     /// Given to each connection and replay task.
@@ -740,6 +763,7 @@ impl Hub {
             launches: Launches::default(),
             scanning: Arc::new(AtomicBool::new(false)),
             git: Git::new(),
+            turns: HashMap::new(),
             index: tail::SharedIndex::default(),
             owner,
             port,
@@ -855,9 +879,10 @@ impl Hub {
             ConnEvent::Listed {
                 conn,
                 req,
+                ticket,
                 session,
                 result,
-            } => self.on_listed(conn, req, session, result),
+            } => self.on_listed(conn, req, ticket, session, result),
             ConnEvent::Stalled { conn } | ConnEvent::Closed { conn } => self.drop_conn(conn),
         }
     }
@@ -1150,6 +1175,9 @@ impl Hub {
             Ok(slot) => slot,
             Err((code, reason)) => return self.refuse(conn, req, code, &reason),
         };
+        let Some(ticket) = self.conns.get_mut(&conn).map(|c| c.listings.ticket()) else {
+            return;
+        };
         let (git, events) = (self.git.clone(), self.events.clone());
         tokio::spawn(async move {
             let result = git.changes(&place.workspace).await;
@@ -1157,6 +1185,7 @@ impl Hub {
             let done = ConnEvent::Listed {
                 conn,
                 req,
+                ticket,
                 session,
                 result,
             };
@@ -1165,11 +1194,13 @@ impl Hub {
     }
 
     /// A `changes` finished: the connection keeps the listing, which replaces its last one of
-    /// the session, before the phone hears it. A refusal forgets the last one.
+    /// the session unless a later `changes` already did, before the phone hears it. A refusal
+    /// forgets an older one.
     fn on_listed(
         &mut self,
         conn: u64,
         req: u64,
+        ticket: u64,
         session: String,
         result: Result<git::Changes, git::Refusal>,
     ) {
@@ -1178,11 +1209,11 @@ impl Hub {
         };
         match result {
             Ok(changes) => {
-                state.listings.keep(session, changes.listing);
+                state.listings.keep(session, ticket, changes.listing);
                 self.send(conn, &changes_frame(req, &changes.info));
             }
             Err((code, reason)) => {
-                state.listings.forget(&session);
+                state.listings.forget(&session, ticket);
                 self.refuse(conn, req, code, &reason);
             }
         }
@@ -1224,35 +1255,37 @@ impl Hub {
     }
 
     /// Commits everything in session `session`'s workspace, in the background, while no turn
-    /// runs and no approval waits. The audit names the device and the session, never the
-    /// message: `commit`, or `commit failed` when git may have staged files and then refused.
+    /// runs and no approval waits: checked now, and again by the commit just before it stages,
+    /// against the latest state (see [`update_turns`](Self::update_turns)). The audit names the
+    /// device and the session, never the message: `commit`, or `commit failed` when git was
+    /// refused after `add` ran.
     fn commit(&mut self, conn: u64, device: &str, req: u64, session: String, message: String) {
         let Some(place) = self.sessions.place(&session) else {
             return self.refuse(conn, req, Code::Unavailable, NO_SUCH_SESSION);
         };
-        match place.phase.as_deref() {
-            None => return self.refuse(conn, req, Code::NotConnected, NOT_CONNECTED),
-            Some("idle" | "stopped") if place.approvals == 0 => {}
-            Some(_) => return self.refuse(conn, req, Code::TurnOpen, TURN_FIRST),
+        if let Err((code, reason)) = may_commit(Some(&place)) {
+            return self.refuse(conn, req, code, reason);
         }
         let slot = match self.git.begin() {
             Ok(slot) => slot,
             Err((code, reason)) => return self.refuse(conn, req, code, &reason),
         };
+        let clear = self
+            .turns
+            .entry(session.clone())
+            .or_insert_with(|| watch::channel(true).0)
+            .subscribe();
         let (git, events, device) = (self.git.clone(), self.events.clone(), device.to_owned());
         tokio::spawn(async move {
-            let result = git.commit(&place.workspace, &message).await;
-            drop(slot);
-            let (frame, what) = match result {
+            let commit = git.commit(&place.workspace, &message, &clear).await;
+            drop((slot, clear));
+            let (frame, what) = match commit.result {
                 Ok(hash) if hash.is_empty() => (ack(req, "Committed"), Some("commit")),
                 Ok(hash) => (ack(req, &format!("Committed {hash}")), Some("commit")),
-                Err((code, reason)) => {
-                    let staged = matches!(code, Code::NotAllowed | Code::Timeout);
-                    (
-                        refused(req, code, &reason),
-                        staged.then_some("commit failed"),
-                    )
-                }
+                Err((code, reason)) => (
+                    refused(req, code, &reason),
+                    commit.added.then_some("commit failed"),
+                ),
             };
             let done = ConnEvent::Answer {
                 conn,
@@ -1261,6 +1294,16 @@ impl Hub {
                 audit: what.map(|what| (device, session, what.to_owned())),
             };
             let _ = events.send(done).await;
+        });
+    }
+
+    /// Tells each commit under way whether its session may still commit, from the latest
+    /// state; a session no commit waits on any more is let go.
+    fn update_turns(&mut self) {
+        let sessions = &self.sessions;
+        self.turns.retain(|session, clear| {
+            clear.send_replace(may_commit(sessions.place(session).as_ref()).is_ok());
+            clear.receiver_count() > 0
         });
     }
 
@@ -1453,6 +1496,7 @@ impl Hub {
                 record,
             } => self.on_journal_event(&id, &journal, seq, &record),
             SessionUpdate::State { id } => {
+                self.update_turns();
                 if let Some(state) = self.sessions.state(&id) {
                     let frame = state_frame(&id, state).to_string();
                     self.tell_subscribers(&id, &frame);
@@ -1489,6 +1533,7 @@ impl Hub {
                 self.send(pending.conn, &frame);
             }
             SessionUpdate::Changed => {
+                self.update_turns();
                 self.refuse_ended();
                 self.relist();
                 self.observe_push();
@@ -1831,6 +1876,19 @@ impl Hub {
             }
         }
         Some(state)
+    }
+}
+
+/// Whether a session at `place` may commit: it is there, its bridge said its state, its phase
+/// is idle or stopped, and no approval waits.
+fn may_commit(place: Option<&Place>) -> Result<(), (Code, &'static str)> {
+    let Some(place) = place else {
+        return Err((Code::Unavailable, NO_SUCH_SESSION));
+    };
+    match place.phase.as_deref() {
+        None => Err((Code::NotConnected, NOT_CONNECTED)),
+        Some("idle" | "stopped") if place.approvals == 0 => Ok(()),
+        Some(_) => Err((Code::TurnOpen, TURN_FIRST)),
     }
 }
 
@@ -2670,17 +2728,33 @@ mod tests {
     fn a_connection_keeps_the_last_listing_of_eight_sessions() {
         let mut listings = Listings::default();
         for n in 0..LISTED_SESSIONS {
-            listings.keep(format!("s{n}"), Listing::default());
+            let ticket = listings.ticket();
+            assert!(listings.keep(format!("s{n}"), ticket, Listing::default()));
         }
         // Listing s0 again makes it the most recent, so s1 goes first.
-        listings.keep("s0".into(), Listing::default());
-        listings.keep("s8".into(), Listing::default());
+        let ticket = listings.ticket();
+        listings.keep("s0".into(), ticket, Listing::default());
+        let ticket = listings.ticket();
+        listings.keep("s8".into(), ticket, Listing::default());
         assert_eq!(listings.by_session.len(), LISTED_SESSIONS);
         assert!(listings.get("s0").is_some());
         assert!(listings.get("s1").is_none());
         assert!(listings.get("s8").is_some());
-        listings.forget("s8");
+        let ticket = listings.ticket();
+        listings.forget("s8", ticket);
         assert!(listings.get("s8").is_none());
+    }
+
+    #[test]
+    fn an_older_listing_never_replaces_a_newer_one() {
+        let mut listings = Listings::default();
+        let (older, newer) = (listings.ticket(), listings.ticket());
+        assert!(listings.keep("s".into(), newer, Listing::default()));
+        assert!(!listings.keep("s".into(), older, Listing::default()));
+        assert_eq!(listings.by_session["s"].0, newer);
+        // Nor does an older refusal forget it.
+        listings.forget("s", older);
+        assert!(listings.get("s").is_some());
     }
 
     #[test]

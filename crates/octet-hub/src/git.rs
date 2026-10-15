@@ -3,12 +3,24 @@
 //!
 //! The workspace comes from the session's registration, never from the phone, and the hub fixes
 //! every argument: the phone names a session, a path from the hub's own last listing, or a
-//! message that goes on stdin. Each call runs `git -C <workspace>` (a diff, the repository's top
-//! that git itself reported for it) with `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0` and
-//! `LC_ALL=C`, without `GIT_DIR`, `GIT_WORK_TREE` or `GIT_INDEX_FILE`; read calls add
-//! `--no-optional-locks`. A call runs in a process group of its own, which is killed when the
-//! call takes over 10 seconds (hooks included), and the child is killed if its caller goes away.
-//! At most two calls run at once; a third is refused as busy.
+//! message that goes on stdin.
+//!
+//! - **Scope.** Each call runs `git -c core.fsmonitor=false -C <workspace>`, and what it lists,
+//!   stages and commits is limited to the workspace with the pathspec `.`: in a workspace below
+//!   its repository's top, files outside it are never listed, staged or committed, and what was
+//!   already staged outside stays staged. A diff runs at the top git itself reported for the
+//!   workspace (the listed paths are relative to it), naming a listed path only.
+//! - **Environment.** Every `GIT_*` variable of the hub's own environment is removed (a
+//!   `GIT_DIR`, a `GIT_CONFIG_PARAMETERS`, an identity), then `GIT_TERMINAL_PROMPT=0`,
+//!   `GIT_OPTIONAL_LOCKS=0` and `LC_ALL=C` are set. Read calls add `--no-optional-locks`.
+//! - **Programs the repository names.** No fsmonitor hook runs (`core.fsmonitor=false`), and
+//!   diffs and numstat take `--no-ext-diff --no-textconv`, so no `diff.external` or textconv
+//!   driver runs. A `filter.<name>.clean` that `.gitattributes` names still runs when numstat or
+//!   `add` reads a changed file, and the commit hooks run: that is the user's own configured
+//!   filter and hooks, doing what they do at the desk (accepted).
+//! - **Time.** A call runs in a process group of its own, which is killed when the call takes
+//!   over 10 seconds, or when the call is dropped before git ended, so no hook outlives it. At
+//!   most two calls run at once; a third is refused as busy.
 use octet_core::remote::protocol::{
     ChangesInfo, Code, DiffInfo, FileChange, FileStatus, MAX_MESSAGE,
 };
@@ -18,8 +30,8 @@ use rustix::{
 };
 use std::{
     collections::HashMap,
-    ffi::OsStr,
-    os::unix::ffi::OsStrExt as _,
+    ffi::{OsStr, OsString},
+    os::unix::ffi::{OsStrExt as _, OsStringExt as _},
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{
@@ -31,7 +43,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     time::timeout,
 };
 
@@ -64,6 +76,8 @@ const FRAME_ROOM: usize = MAX_MESSAGE - 4096;
 const ENTRY_COST: usize = 100;
 /// The top-level option every read call takes.
 const READ_ONLY: &str = "--no-optional-locks";
+/// The pathspec that keeps a call to the workspace.
+const HERE: &str = ".";
 
 /// The refusal for a workspace that is not a git work tree (none, bare or corrupt).
 pub(crate) const NOT_A_REPOSITORY: &str = "This folder isn't a git repository";
@@ -71,6 +85,8 @@ pub(crate) const NOT_A_REPOSITORY: &str = "This folder isn't a git repository";
 pub(crate) const GIT_BUSY: &str = "Git is busy; try again";
 /// The refusal for a commit with nothing changed.
 pub(crate) const NOTHING_TO_COMMIT: &str = "Nothing to commit";
+/// The refusal for a commit while a turn runs or an approval waits.
+pub(crate) const TURN_FIRST: &str = "Finish or cancel the current turn first";
 /// The refusal for a git call past [`GIT_WITHIN`].
 pub(crate) const GIT_TIMED_OUT: &str = "Git took too long; try again";
 /// The refusal when git cannot be started.
@@ -95,6 +111,32 @@ pub(crate) struct Git {
     slots: Arc<Semaphore>,
     within: Duration,
     calls: Arc<AtomicUsize>,
+    /// The most bytes of `status` or `numstat` output read.
+    list_limit: usize,
+    /// The environment git's is made from; the hub's own when none.
+    environment: Option<Arc<Vec<(OsString, OsString)>>>,
+}
+
+/// What a commit did: its short hash or refusal, and whether `add` had run (so files may be
+/// staged even though it was refused).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Commit {
+    pub(crate) result: Result<String, Refusal>,
+    pub(crate) added: bool,
+}
+
+/// Kills git's process group as it drops, unless git was waited for first: a call dropped or
+/// timed out takes the hooks git started with it.
+#[derive(Debug)]
+struct Group(Option<Pid>);
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        // Git has not been waited for, so its pid still names its group.
+        if let Some(group) = self.0.take() {
+            let _ = kill_process_group(group, Signal::KILL);
+        }
+    }
 }
 
 /// One of the two places to run git; given back as it drops.
@@ -117,6 +159,8 @@ struct Ran {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Listed {
     raw: Vec<u8>,
+    /// A rename's old name, diffed with it so the pairing shows.
+    orig: Option<Vec<u8>>,
     untracked: bool,
     binary: bool,
 }
@@ -177,6 +221,8 @@ struct Status {
 #[derive(Debug)]
 struct Entry {
     raw: Vec<u8>,
+    /// A rename's old name.
+    orig: Option<Vec<u8>>,
     status: FileStatus,
 }
 
@@ -192,6 +238,26 @@ impl Git {
             slots: Arc::new(Semaphore::new(SLOTS)),
             within,
             calls: Arc::new(AtomicUsize::new(0)),
+            list_limit: LIST_OUTPUT,
+            environment: None,
+        }
+    }
+
+    /// Git that reads at most `limit` bytes of `status` or `numstat`.
+    #[cfg(test)]
+    fn with_list_limit(limit: usize) -> Self {
+        Self {
+            list_limit: limit,
+            ..Self::new()
+        }
+    }
+
+    /// Git as if the hub's environment were `environment`.
+    #[cfg(test)]
+    fn with_environment(environment: Vec<(OsString, OsString)>) -> Self {
+        Self {
+            environment: Some(Arc::new(environment)),
+            ..Self::new()
         }
     }
 
@@ -229,19 +295,34 @@ impl Git {
             "--branch",
             "-z",
             "--untracked-files=all",
+            "--",
+            HERE,
         ];
-        let ran = self.run(ws, &status, None, LIST_OUTPUT).await?;
-        if !ran.status.success() {
+        let ran = self.run(ws, &status, None, self.list_limit).await?;
+        // Output past its limit was cut off by the hub: what came is listed, and `more` says
+        // there was more.
+        if !ran.status.success() && !ran.clipped {
             return Err(not_a_repository());
         }
+        let cut_short = ran.clipped;
         let status = parse_status(&ran.stdout);
         let base = if status.unborn {
             self.empty_tree(ws).await?
         } else {
             "HEAD".to_owned()
         };
-        let numstat = [READ_ONLY, "diff", "--numstat", "-z", base.as_str(), "--"];
-        let ran = self.run(ws, &numstat, None, LIST_OUTPUT).await?;
+        let numstat = [
+            READ_ONLY,
+            "diff",
+            "--numstat",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-z",
+            base.as_str(),
+            "--",
+            HERE,
+        ];
+        let ran = self.run(ws, &numstat, None, self.list_limit).await?;
         if !ran.status.success() && !ran.clipped {
             return Err((Code::Unavailable, words(&ran)));
         }
@@ -280,6 +361,7 @@ impl Git {
                 });
                 let file = Listed {
                     raw: entry.raw,
+                    orig: entry.orig,
                     untracked,
                     binary,
                 };
@@ -289,7 +371,7 @@ impl Git {
         timeout(self.within, gather)
             .await
             .map_err(|_| refusal(Code::Timeout, GIT_TIMED_OUT))?;
-        let more = (total - files.len()) as u64;
+        let more = (total - files.len()) as u64 + u64::from(cut_short);
         Ok(Changes {
             info: ChangesInfo {
                 branch: status.branch,
@@ -314,33 +396,32 @@ impl Git {
     ///
     /// A timeout, or git's own words (the file went since it was listed, say).
     pub(crate) async fn diff(&self, target: &DiffTarget) -> Result<DiffInfo, Refusal> {
-        let raw = OsStr::from_bytes(&target.file.raw);
-        let ran = if target.file.untracked {
-            let args: [&OsStr; 8] = [
-                READ_ONLY.as_ref(),
-                "diff".as_ref(),
-                "--no-color".as_ref(),
-                "--no-ext-diff".as_ref(),
-                "--no-index".as_ref(),
-                "--".as_ref(),
-                "/dev/null".as_ref(),
-                raw,
-            ];
-            self.run(&target.top, &args, None, DIFF_BYTES).await?
+        let mut args: Vec<OsString> = [
+            READ_ONLY,
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        if target.file.untracked {
+            // `-` alone would be stdin.
+            let raw = &target.file.raw;
+            let path = if raw == b"-" { &b"./-"[..] } else { raw };
+            args.extend(["--no-index", "--", "/dev/null"].map(OsString::from));
+            args.push(OsStr::from_bytes(path).to_owned());
         } else {
-            // A literal pathspec: a name such as `*` or `:(glob)x` is only itself.
-            let spec = [&b":(literal)"[..], &target.file.raw].concat();
-            let args: [&OsStr; 7] = [
-                READ_ONLY.as_ref(),
-                "diff".as_ref(),
-                "--no-color".as_ref(),
-                "--no-ext-diff".as_ref(),
-                target.base.as_ref(),
-                "--".as_ref(),
-                OsStr::from_bytes(&spec),
-            ];
-            self.run(&target.top, &args, None, DIFF_BYTES).await?
-        };
+            // A literal pathspec: a name such as `*` or `:(glob)x` is only itself. A rename is
+            // diffed over both its names, so it shows as one.
+            let literal = |raw: &[u8]| OsString::from_vec([&b":(literal)"[..], raw].concat());
+            args.extend(["-M", target.base.as_str(), "--"].map(OsString::from));
+            args.push(literal(&target.file.raw));
+            if let Some(orig) = &target.file.orig {
+                args.push(literal(orig));
+            }
+        }
+        let ran = self.run(&target.top, &args, None, DIFF_BYTES).await?;
         // `--no-index` exits 1 for differences, and for a file it cannot read (saying so on
         // stderr, with no diff); anything cut short was cut off by the hub.
         let fine = match ran.status.code() {
@@ -374,14 +455,30 @@ impl Git {
         })
     }
 
-    /// Stages everything in `ws` and commits it with `message` on stdin, the repository's hooks
-    /// running; the new commit's short hash (empty if git would not say it).
-    ///
-    /// # Errors
-    ///
-    /// Not a repository, nothing to commit, a timeout, or git's own words (a hook that failed,
-    /// say), clipped to 2,000 characters.
-    pub(crate) async fn commit(&self, ws: &Path, message: &str) -> Result<String, Refusal> {
+    /// Stages everything in `ws` (and nothing outside it) and commits it with `message` on
+    /// stdin, the repository's hooks running: the new commit's short hash (empty if git would
+    /// not say it). `clear` is the hub's latest word on whether the session's turn allows a
+    /// commit; it is looked at again just before `add`. A turn that starts after that look is
+    /// not seen (the window is the time `add` takes to start, and the hub only learns of a
+    /// turn when its bridge says so).
+    pub(crate) async fn commit(
+        &self,
+        ws: &Path,
+        message: &str,
+        clear: &watch::Receiver<bool>,
+    ) -> Commit {
+        let mut added = false;
+        let result = self.committing(ws, message, clear, &mut added).await;
+        Commit { result, added }
+    }
+
+    async fn committing(
+        &self,
+        ws: &Path,
+        message: &str,
+        clear: &watch::Receiver<bool>,
+        added: &mut bool,
+    ) -> Result<String, Refusal> {
         self.top(ws).await?;
         let status = [
             READ_ONLY,
@@ -389,6 +486,8 @@ impl Git {
             "--porcelain=v2",
             "-z",
             "--untracked-files=all",
+            "--",
+            HERE,
         ];
         let ran = self.run(ws, &status, None, WORDS_OUTPUT).await?;
         if !ran.status.success() && !ran.clipped {
@@ -397,11 +496,17 @@ impl Git {
         if ran.stdout.is_empty() {
             return Err(refusal(Code::Invalid, NOTHING_TO_COMMIT));
         }
-        let ran = self.run(ws, &["add", "-A"], None, WORDS_OUTPUT).await?;
+        if !*clear.borrow() {
+            return Err(refusal(Code::TurnOpen, TURN_FIRST));
+        }
+        *added = true;
+        let ran = self
+            .run(ws, &["add", "-A", "--", HERE], None, WORDS_OUTPUT)
+            .await?;
         if !ran.status.success() {
             return Err((Code::NotAllowed, words(&ran)));
         }
-        let commit = ["commit", "-F", "-"];
+        let commit = ["commit", "-F", "-", "--", HERE];
         let ran = self
             .run(ws, &commit, Some(message.as_bytes()), WORDS_OUTPUT)
             .await?;
@@ -468,17 +573,24 @@ impl Git {
         limit: usize,
     ) -> Result<Ran, Refusal> {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        let inherited = match &self.environment {
+            Some(environment) => environment.to_vec(),
+            None => std::env::vars_os().collect(),
+        };
         let mut command = Command::new("git");
+        command.env_clear();
+        for (key, value) in inherited {
+            if !key.as_bytes().starts_with(b"GIT_") {
+                command.env(key, value);
+            }
+        }
         command
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("LC_ALL", "C")
+            .args(["-c", "core.fsmonitor=false", "-C"])
+            .arg(dir)
+            .args(args)
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -491,10 +603,12 @@ impl Git {
         let mut child = command
             .spawn()
             .map_err(|_| refusal(Code::Unavailable, NO_GIT))?;
-        let group = child
-            .id()
-            .and_then(|id| i32::try_from(id).ok())
-            .and_then(Pid::from_raw);
+        let mut group = Group(
+            child
+                .id()
+                .and_then(|id| i32::try_from(id).ok())
+                .and_then(Pid::from_raw),
+        );
         let (stdin, stdout, stderr) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let work = async {
@@ -508,8 +622,14 @@ impl Git {
                 read_capped(stdout, limit),
                 read_capped(stderr, WORDS_OUTPUT)
             );
-            (child.wait().await, stdout, stderr, clipped)
+            let status = child.wait().await;
+            if status.is_ok() {
+                // Waited for: its pid may be another's now.
+                group.0 = None;
+            }
+            (status, stdout, stderr, clipped)
         };
+        // Past the time limit, or dropped before git ended, `group` kills git and its hooks.
         match timeout(self.within, work).await {
             Ok((Ok(status), stdout, stderr, clipped)) => Ok(Ran {
                 status,
@@ -518,14 +638,7 @@ impl Git {
                 clipped,
             }),
             Ok((Err(_), ..)) => Err(refusal(Code::Unavailable, NO_GIT)),
-            Err(_) => {
-                // Git has not been waited for, so its pid still names its group; the hooks it
-                // started go with it.
-                if let Some(group) = group {
-                    let _ = kill_process_group(group, Signal::KILL);
-                }
-                Err(refusal(Code::Timeout, GIT_TIMED_OUT))
-            }
+            Err(_) => Err(refusal(Code::Timeout, GIT_TIMED_OUT)),
         }
     }
 }
@@ -657,6 +770,7 @@ fn parse_status(out: &[u8]) -> Status {
     while at < pieces.len() {
         let record = pieces[at];
         at += 1;
+        let mut orig_name = None;
         let (kind, rest) = (record.first(), record.get(2..).unwrap_or_default());
         let entry = match kind {
             Some(b'#') => {
@@ -675,10 +789,11 @@ fn parse_status(out: &[u8]) -> Status {
             }
             Some(b'2') => {
                 // The original name follows as a record of its own.
-                if at == pieces.len() {
+                let Some(orig) = pieces.get(at) else {
                     break;
-                }
+                };
                 at += 1;
+                orig_name = Some(orig.to_vec());
                 after_fields(record, 9).map(|path| (path, FileStatus::Renamed))
             }
             Some(b'u') => after_fields(record, 10).map(|path| (path, FileStatus::Unmerged)),
@@ -688,6 +803,7 @@ fn parse_status(out: &[u8]) -> Status {
         if let Some((path, file)) = entry.filter(|(path, _)| !path.is_empty()) {
             status.entries.push(Entry {
                 raw: path.to_vec(),
+                orig: orig_name,
                 status: file,
             });
         }
@@ -820,6 +936,34 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
+    /// Commits with the session's turn clear throughout.
+    async fn commit(git: &Git, ws: &Path, message: &str) -> Result<String, Refusal> {
+        let (_clear, turn) = watch::channel(true);
+        git.commit(ws, message, &turn).await.result
+    }
+
+    /// A program the repository's config could name: it leaves a mark in `marks`, then does
+    /// what a harmless one would (`cat` its file, or for fsmonitor, say nothing is known).
+    fn marker(bin: &Path, marks: &Path, name: &str) -> String {
+        std::fs::create_dir_all(marks).expect("marks");
+        std::fs::create_dir_all(bin).expect("bin");
+        let script = bin.join(format!("{name}.sh"));
+        let body = format!(
+            "#!/bin/sh\ntouch '{}/{name}-'$$\n[ -f \"$1\" ] && cat \"$1\"\nexit 0\n",
+            marks.display()
+        );
+        std::fs::write(&script, body).expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        script.to_str().expect("a UTF-8 temp path").to_owned()
+    }
+
+    fn marks_left(marks: &Path) -> Vec<String> {
+        std::fs::read_dir(marks)
+            .expect("marks")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
     fn paths(changes: &Changes) -> Vec<&str> {
         changes.info.files.iter().map(|f| f.path.as_str()).collect()
     }
@@ -856,6 +1000,8 @@ mod tests {
             ]
         );
 
+        assert_eq!(status.entries[2].orig.as_deref(), Some(&b"from me.txt"[..]));
+        assert_eq!(status.entries[0].orig, None);
         let fresh = parse_status(b"# branch.oid (initial)\0# branch.head (detached)\0");
         assert!(fresh.unborn);
         assert_eq!(fresh.branch, None);
@@ -907,7 +1053,7 @@ mod tests {
                 "{}",
                 ws.display()
             );
-            let refusal = git.commit(ws, "Message").await.expect_err("refused");
+            let refusal = commit(&git, ws, "Message").await.expect_err("refused");
             assert_eq!(refusal, (Code::Unavailable, NOT_A_REPOSITORY.to_owned()));
         }
         // Git is still there for the next caller.
@@ -938,6 +1084,7 @@ mod tests {
             "$(touch pwned)",
             ":(glob)*",
             "HEAD",
+            "-",
         ];
         std::fs::create_dir_all(ws.join("dir")).expect("dir");
         let nested = "dir/..hidden";
@@ -1050,24 +1197,235 @@ mod tests {
             .expect("diff");
         assert!(diff.text.contains("+a\n+b\n"), "{}", diff.text);
         // A first commit works too.
-        let hash = git.commit(ws, "First").await.expect("committed");
+        let hash = commit(&git, ws, "First").await.expect("committed");
         assert_eq!(hash, git_in(ws, &["rev-parse", "--short", "HEAD"]).trim());
     }
 
     #[tokio::test]
-    async fn a_workspace_below_the_top_lists_the_whole_repository() {
+    async fn a_workspace_below_the_top_lists_and_commits_only_itself() {
         let git = Git::new();
-        let dir = committed("octet-git-below");
-        std::fs::create_dir_all(dir.path().join("sub")).expect("sub");
-        std::fs::write(dir.path().join("sub/inner.txt"), "x\n").expect("write");
-        std::fs::write(dir.path().join("tracked.txt"), "changed\n").expect("write");
-        let changes = git.changes(&dir.path().join("sub")).await.expect("changes");
+        let dir = repo("octet-git-below");
+        let top = dir.path();
+        let ws = top.join("ws");
+        std::fs::create_dir_all(top.join("other")).expect("other");
+        std::fs::create_dir_all(&ws).expect("ws");
+        for (path, text) in [
+            (".bashrc", "dot\n"),
+            ("other/o.txt", "o\n"),
+            ("ws/keep.txt", "k\n"),
+            ("ws/old.txt", "r\n"),
+        ] {
+            std::fs::write(top.join(path), text).expect("write");
+        }
+        git_in(top, &["add", "-A"]);
+        git_in(top, &["commit", "-q", "-m", "First"]);
+        std::fs::write(top.join(".bashrc"), "dot\nchanged\n").expect("write");
+        std::fs::write(top.join("other/new.txt"), "x\n").expect("write");
+        git_in(top, &["add", "other/new.txt"]);
+        std::fs::write(ws.join("keep.txt"), "k\nw\n").expect("write");
+        git_in(top, &["mv", "ws/old.txt", "ws/renamed.txt"]);
+        std::fs::write(ws.join("new.txt"), "n\n").expect("write");
+
+        let changes = git.changes(&ws).await.expect("changes");
         let mut listed = paths(&changes);
         listed.sort_unstable();
-        assert_eq!(listed, ["sub/inner.txt", "tracked.txt"]);
+        assert_eq!(listed, ["ws/keep.txt", "ws/new.txt", "ws/renamed.txt"]);
+        assert_eq!(changes.info.more, 0);
         for path in listed {
             let target = changes.listing.target(path).expect("listed");
             assert!(git.diff(&target).await.is_ok_and(|d| !d.text.is_empty()));
+        }
+        // A rename shows as one, from its old name.
+        let target = changes.listing.target("ws/renamed.txt").expect("listed");
+        let diff = git.diff(&target).await.expect("diff");
+        assert!(
+            diff.text.contains("rename from ws/old.txt"),
+            "{}",
+            diff.text
+        );
+        assert!(
+            diff.text.contains("rename to ws/renamed.txt"),
+            "{}",
+            diff.text
+        );
+
+        commit(&git, &ws, "Only the workspace")
+            .await
+            .expect("committed");
+        let committed = git_in(
+            top,
+            &["show", "--no-renames", "--name-only", "--format=", "HEAD"],
+        );
+        let mut committed: Vec<&str> = committed.lines().collect();
+        committed.sort_unstable();
+        assert_eq!(
+            committed,
+            ["ws/keep.txt", "ws/new.txt", "ws/old.txt", "ws/renamed.txt"]
+        );
+        // What was staged outside stays staged, and the rest of the top is untouched.
+        assert_eq!(
+            git_in(top, &["diff", "--cached", "--name-only"]).trim(),
+            "other/new.txt"
+        );
+        assert_eq!(git_in(top, &["diff", "--name-only"]).trim(), ".bashrc");
+        assert_eq!(
+            commit(&git, &ws, "Again").await,
+            Err((Code::Invalid, NOTHING_TO_COMMIT.to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_repository_runs_no_programs_of_its_own() {
+        let git = Git::new();
+        let dir = committed("octet-git-programs");
+        let ws = dir.path();
+        let (bin, marks) = (
+            TempDir::new("octet-git-bin"),
+            TempDir::new("octet-git-marks"),
+        );
+        let textconv = marker(bin.path(), marks.path(), "textconv");
+        let fsmonitor = marker(bin.path(), marks.path(), "fsmonitor");
+        let external = marker(bin.path(), marks.path(), "external");
+        std::fs::write(ws.join(".gitattributes"), "*.txt diff=evil\n").expect("attributes");
+        git_in(ws, &["add", "-A"]);
+        git_in(ws, &["commit", "-q", "-m", "Attributes"]);
+        for (key, value) in [
+            ("diff.evil.textconv", textconv.as_str()),
+            ("diff.external", external.as_str()),
+            ("core.fsmonitor", fsmonitor.as_str()),
+        ] {
+            git_in(ws, &["config", key, value]);
+        }
+        std::fs::write(ws.join("tracked.txt"), "one\ntwo\nthree\n").expect("write");
+        std::fs::write(ws.join("loose.txt"), "loose\n").expect("write");
+        let changes = git.changes(ws).await.expect("changes");
+        for path in ["tracked.txt", "loose.txt"] {
+            let target = changes.listing.target(path).expect("listed");
+            let diff = git.diff(&target).await.expect("diff");
+            assert!(diff.text.contains("@@"), "{path}: {}", diff.text);
+        }
+        commit(&git, ws, "No programs").await.expect("committed");
+        assert_eq!(marks_left(marks.path()), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn the_hubs_own_git_environment_never_reaches_git() {
+        let dir = committed("octet-git-environment");
+        let ws = dir.path();
+        let elsewhere = committed("octet-git-elsewhere");
+        let inherited = [
+            ("GIT_CONFIG_PARAMETERS", "'user.name'='Evil'".to_owned()),
+            ("GIT_AUTHOR_NAME", "Evil".to_owned()),
+            ("GIT_COMMITTER_NAME", "Evil".to_owned()),
+            (
+                "GIT_DIR",
+                elsewhere.path().join(".git").display().to_string(),
+            ),
+            ("GIT_INDEX_FILE", "/nonexistent/index".to_owned()),
+        ];
+        let git = Git::with_environment(
+            std::env::vars_os()
+                .chain(inherited.map(|(k, v)| (k.into(), v.into())))
+                .collect(),
+        );
+        std::fs::write(ws.join("new.txt"), "new\n").expect("write");
+        let changes = git.changes(ws).await.expect("changes");
+        assert_eq!(paths(&changes), ["new.txt"]);
+        commit(&git, ws, "Mine").await.expect("committed");
+        assert_eq!(
+            git_in(ws, &["log", "-1", "--format=%an %cn"]).trim(),
+            "Test Test"
+        );
+        assert_eq!(
+            git_in(elsewhere.path(), &["rev-list", "--count", "HEAD"]).trim(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clipped_status_lists_what_it_has() {
+        let git = Git::with_list_limit(2000);
+        let dir = committed("octet-git-clipped");
+        // About 13 bytes a file, over 128 KiB in all: more than a pipe holds, so git is still
+        // writing when the hub stops reading, and is cut off.
+        for n in 0..10_000 {
+            std::fs::write(dir.path().join(format!("f{n:05}.txt")), "x\n").expect("write");
+        }
+        let changes = git.changes(dir.path()).await.expect("changes");
+        let shown = changes.info.files.len();
+        assert!(shown > 0 && shown < 10_000, "{shown}");
+        assert!(changes.info.more >= 1);
+        assert_eq!(changes.info.files[0].path, "f00000.txt");
+    }
+
+    #[tokio::test]
+    async fn a_commit_stops_before_add_when_a_turn_starts() {
+        let git = Git::new();
+        let dir = committed("octet-git-turn");
+        let ws = dir.path();
+        std::fs::write(ws.join("new.txt"), "new\n").expect("write");
+        let (clear, turn) = watch::channel(true);
+        clear.send_replace(false);
+        let commit = git.commit(ws, "Too late", &turn).await;
+        assert_eq!(commit.result, Err((Code::TurnOpen, TURN_FIRST.to_owned())));
+        assert!(!commit.added);
+        assert_eq!(git_in(ws, &["diff", "--cached", "--name-only"]), "");
+        // Once git has staged, a refusal says so.
+        hook(ws, "pre-commit", "exit 1");
+        clear.send_replace(true);
+        let commit = git.commit(ws, "Refused", &turn).await;
+        assert!(commit.result.is_err() && commit.added);
+        let fresh = committed("octet-git-turn-clean");
+        let commit = git.commit(fresh.path(), "Nothing", &turn).await;
+        assert_eq!(
+            (commit.result, commit.added),
+            (Err((Code::Invalid, NOTHING_TO_COMMIT.to_owned())), false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_takes_its_hooks_with_it() {
+        let git = Git::new();
+        let dir = committed("octet-git-dropped");
+        let ws = dir.path().to_owned();
+        std::fs::write(ws.join("new.txt"), "new\n").expect("write");
+        let pid_file = dir.path().join(".git/hook.pid");
+        hook(
+            &ws,
+            "pre-commit",
+            &format!("echo $$ > '{}'\nsleep 30", pid_file.display()),
+        );
+        let call = tokio::spawn(async move { commit(&git, &ws, "Hangs").await });
+        let began = Instant::now();
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "the hook never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        call.abort();
+        let _ = call.await;
+        let alive = |pid: i32| {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let began = Instant::now();
+        while alive(pid) {
+            assert!(
+                began.elapsed() < Duration::from_secs(3),
+                "the hook outlived its call"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -1077,7 +1435,7 @@ mod tests {
         let dir = committed("octet-git-commit");
         let ws = dir.path();
         assert_eq!(
-            git.commit(ws, "Nothing here").await,
+            commit(&git, ws, "Nothing here").await,
             Err((Code::Invalid, NOTHING_TO_COMMIT.to_owned()))
         );
 
@@ -1087,8 +1445,7 @@ mod tests {
             "pre-commit",
             "echo \"lint failed: $(printf 'x%.0s' $(seq 1 3000))\" >&2\nexit 1",
         );
-        let (code, words) = git
-            .commit(ws, "Add new")
+        let (code, words) = commit(&git, ws, "Add new")
             .await
             .expect_err("the hook refuses");
         assert_eq!(code, Code::NotAllowed);
@@ -1102,7 +1459,7 @@ mod tests {
         let quick = Git::with_timeout(Duration::from_secs(1));
         let began = Instant::now();
         assert_eq!(
-            quick.commit(ws, "Add new").await,
+            commit(&quick, ws, "Add new").await,
             Err((Code::Timeout, GIT_TIMED_OUT.to_owned()))
         );
         assert!(
@@ -1116,7 +1473,7 @@ mod tests {
 
         std::fs::remove_file(ws.join(".git/hooks/pre-commit")).expect("unhook");
         let message = "-m evil --amend\n\nThe body; $(touch pwned)\n";
-        let hash = git.commit(ws, message).await.expect("committed");
+        let hash = commit(&git, ws, message).await.expect("committed");
         assert_eq!(hash, git_in(ws, &["rev-parse", "--short", "HEAD"]).trim());
         assert_eq!(
             git_in(ws, &["log", "-1", "--format=%B"]).trim_end(),
@@ -1125,7 +1482,7 @@ mod tests {
         assert_eq!(git_in(ws, &["rev-list", "--count", "HEAD"]).trim(), "2");
         assert!(!ws.join("pwned").exists());
         assert_eq!(
-            git.commit(ws, "Again").await,
+            commit(&git, ws, "Again").await,
             Err((Code::Invalid, NOTHING_TO_COMMIT.to_owned()))
         );
     }

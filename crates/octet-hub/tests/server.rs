@@ -2087,6 +2087,18 @@ async fn a_commit_waits_for_the_turn_and_is_audited_without_its_message() {
         refused(11, Code::Invalid, "Write a commit message")
     );
 
+    // A hook that refuses gives git's words; git staged first, so the audit says it failed.
+    let hook = workspace.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(hook.parent().expect("hooks")).expect("hooks directory");
+    std::fs::write(&hook, "#!/bin/sh\necho 'tests failed' >&2\nexit 1\n").expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    send(&mut phone, commit(14, "Secret plans, refused")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(14, Code::NotAllowed, "tests failed")
+    );
+    std::fs::remove_file(&hook).expect("unhook");
+
     send(&mut phone, commit(12, "Secret plans for the phone")).await;
     let done = recv_kind(&mut phone, "ack").await;
     let hash = git_in(&workspace, &["rev-parse", "--short", "HEAD"]);
@@ -2111,6 +2123,12 @@ async fn a_commit_waits_for_the_turn_and_is_audited_without_its_message() {
     assert_eq!(commits.len(), 1, "{audit}");
     assert_eq!(commits[0]["device"], "Test phone");
     assert_eq!(commits[0]["session"], bridge.id);
+    // Only the refusal after git staged is a failed commit; the earlier refusals ran no git.
+    let failed = audit
+        .lines()
+        .filter(|l| l.contains("\"commit failed\""))
+        .count();
+    assert_eq!(failed, 1, "{audit}");
     assert!(!audit.contains("Secret plans"), "{audit}");
 }
 
