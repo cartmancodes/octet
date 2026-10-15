@@ -6,7 +6,7 @@ import { act, fireEvent, screen, within } from "@testing-library/react-native";
 import { router } from "expo-router";
 import { StyleSheet } from "react-native";
 
-import Changes from "../app/changes";
+import Changes, { ASK_AGAIN, LOADING_DIFF } from "../app/changes";
 import Session from "../app/session/[id]";
 import Usage from "../app/usage";
 import { BINARY_NOTE, CLIPPED_NOTE, NO_TESTS } from "./changes";
@@ -259,12 +259,145 @@ describe("the files", () => {
     expect(screen.queryAllByRole("link")).toHaveLength(0);
     expect(screen.queryByText(/evil\.test/)).toBeNull();
     expect(screen.queryByText(/\u001b/)).toBeNull();
-    // The diff is asked for by the cleaned path, the one the screen shows.
+    // The diff is asked for by the hub's own path, never drawn.
     await tap(`docs/${name}`);
-    expect(requests(rig, "diff").at(-1)).toMatchObject({ path: `docs/${name}` });
+    expect(requests(rig, "diff").at(-1)?.path).toBe(hostile);
     await answerDiff(rig, "@@ -0,0 +1 @@\n+<script>alert(1)</script>\u001b]8;;https://evil.test\u0007x\u001b]8;;\u0007\n");
     expect(screen.getByText("<script>alert(1)</script>x").type).toBe("Text");
     expect(screen.queryAllByRole("link")).toHaveLength(0);
+  });
+});
+
+describe("the hub's own path", () => {
+  it("is what a diff is asked for by, and only the cleaned path shows", async () => {
+    const rig = await open();
+    const raw = "src/z\u200bw\u200fx\ry.ts";
+    await answer(rig, [file(raw)]);
+    const shown = "src/zwx y.ts"; // the label's newline, as a screen reader's whitespace
+    expect(screen.getByText("zwx\ny.ts")).toBeTruthy();
+    expect(screen.queryByText(/[\u200b\u200f\r]/)).toBeNull();
+    await tap(shown);
+    expect(requests(rig, "diff").at(-1)?.path).toBe(raw);
+    await answerDiff(rig, DIFF);
+    expect(screen.getAllByTestId("diff-line")).toHaveLength(4);
+    expect(screen.queryByText(/[\u200b\u200f\r]/)).toBeNull();
+  });
+
+  it("keeps two paths that clean alike apart: two rows, two diffs", async () => {
+    const rig = await open();
+    const first = "a\u200b.ts";
+    const second = "a\u200f.ts";
+    await answer(rig, [file(first, 1, 0), file(second, 2, 0)]);
+    const rows = () => screen.getAllByRole("button", { name: /^a\.ts, / });
+    expect(rows()).toHaveLength(2);
+    await fireEvent.press(rows()[0]!);
+    await flush();
+    expect(requests(rig, "diff").at(-1)?.path).toBe(first);
+    await answerDiff(rig, "@@ -0,0 +1 @@\n+first\n");
+    await fireEvent.press(rows()[1]!);
+    await flush();
+    expect(requests(rig, "diff").at(-1)?.path).toBe(second);
+    await answerDiff(rig, "@@ -0,0 +1 @@\n+second\n");
+    expect(screen.getByText("first")).toBeTruthy();
+    expect(screen.getByText("second")).toBeTruthy();
+    expect(rows().map((r) => r.props.accessibilityState.expanded)).toEqual([true, true]);
+    // Closing one leaves the other open.
+    await fireEvent.press(rows()[0]!);
+    await flush();
+    expect(screen.queryByText("first")).toBeNull();
+    expect(screen.getByText("second")).toBeTruthy();
+  });
+
+  it("an edited file that two cleaned paths both name opens neither", async () => {
+    const rig = await open({ file: "/Users/me/Projects/octet/a.ts" });
+    await answer(rig, [file("a\u200b.ts"), file("a\u200f.ts")]);
+    expect(screen.getAllByRole("button", { name: /^a\.ts, / }).map((r) => r.props.accessibilityState.expanded)).toEqual([false, false]);
+    expect(requests(rig, "diff")).toHaveLength(0);
+  });
+});
+
+describe("a diff past what is drawn", () => {
+  it("ends with the note when the phone stops short of the hub's lines", async () => {
+    // A parent tall enough for FlashList to draw all 2,000 lines (each measures 100).
+    (measureParentSize as jest.Mock).mockReturnValue({ x: 0, y: 0, width: 400, height: 300_000 });
+    const rig = await open();
+    await answer(rig);
+    await tap("src/app.ts");
+    await answerDiff(rig, `@@ -1 +1 @@\n${"+x\n".repeat(2_050)}`, { clipped: false });
+    expect(screen.getAllByTestId("diff-line")).toHaveLength(2_000);
+    expect(screen.getByText(CLIPPED_NOTE)).toBeTruthy();
+  });
+});
+
+describe("late answers", () => {
+  it("drops a diff that answers a request from before a pull", async () => {
+    const rig = await open();
+    await answer(rig);
+    await tap("src/app.ts");
+    const before = requests(rig, "diff").at(-1);
+    await pull();
+    await act(async () => {
+      rig.sockets.last.receive({ type: "diff", req: Number(before?.req), path: "src/app.ts", text: "@@ -1 +1 @@\n+stale\n", clipped: false, binary: false });
+    });
+    await flush();
+    expect(screen.queryByText("stale")).toBeNull();
+    await answer(rig);
+    expect(requests(rig, "diff")).toHaveLength(2);
+    await answerDiff(rig, "@@ -1 +1 @@\n+fresh\n");
+    expect(screen.getByText("fresh")).toBeTruthy();
+    expect(screen.queryByText("stale")).toBeNull();
+  });
+
+  it("drops a diff that answers after the screen left", async () => {
+    const error = jest.spyOn(console, "error").mockImplementation(() => {});
+    const rig = await open();
+    await answer(rig);
+    await tap("src/app.ts");
+    await act(async () => router.back());
+    await flush();
+    await answerDiff(rig, DIFF);
+    expect(screen.queryAllByTestId("diff-line")).toHaveLength(0);
+    expect(error).not.toHaveBeenCalled();
+  });
+});
+
+describe("a reload that is not a pull", () => {
+  /** The link drops and comes back: the screen lists again on the new one. */
+  async function reconnect(rig: Rig) {
+    await act(async () => rig.sockets.last.drop());
+    await act(async () => {
+      rig.clock.advance(60_000);
+      rig.sockets.last.open();
+      rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+      rig.clock.advance(50);
+    });
+    await flush();
+  }
+
+  it("keeps a diff whose file is as it was", async () => {
+    const rig = await open();
+    await answer(rig);
+    await tap("src/app.ts");
+    await answerDiff(rig, DIFF);
+    await reconnect(rig);
+    await answer(rig);
+    expect(rig.sockets.all.flatMap((x) => x.commandsOf("diff"))).toHaveLength(1);
+    expect(screen.getAllByTestId("diff-line")).toHaveLength(4);
+  });
+
+  it.each([
+    ["its lines added", { add: 9 }],
+    ["its lines deleted", { del: 9 }],
+    ["its status", { status: "R" as const }],
+  ])("asks again for a diff whose file changed %s", async (_what, change) => {
+    const rig = await open();
+    await answer(rig);
+    await tap("src/app.ts");
+    await answerDiff(rig, DIFF);
+    await reconnect(rig);
+    await answer(rig, [file("src/app.ts", 3, 1, change), FILES[1]!]);
+    expect(requests(rig, "diff")).toEqual([expect.objectContaining({ path: "src/app.ts" })]);
+    expect(screen.getByText(LOADING_DIFF)).toBeTruthy();
   });
 });
 
@@ -314,6 +447,29 @@ describe("pull to refresh", () => {
 });
 
 describe("refusals", () => {
+  it("an opening while the listing has failed says to ask for the changes again", async () => {
+    const rig = await open();
+    await answer(rig);
+    await pull();
+    await refuse(rig, "changes", "Git is busy; try again", "busy");
+    await tap("src/app.ts");
+    expect(requests(rig, "diff")).toHaveLength(0);
+    expect(screen.getByText(ASK_AGAIN)).toBeTruthy();
+    expect(screen.queryByText(LOADING_DIFF)).toBeNull();
+    await fireEvent.press(screen.getByRole("button", { name: "Try again" }));
+    await flush();
+    expect(screen.queryByText(ASK_AGAIN)).toBeNull();
+    await answer(rig);
+    expect(requests(rig, "diff")).toEqual([expect.objectContaining({ path: "src/app.ts" })]);
+  });
+
+  it("the not-a-repository words under another code are an ordinary refusal", async () => {
+    const rig = await open();
+    await refuse(rig, "changes", "This folder isn't a git repository", "invalid");
+    expect(screen.getByText("This folder isn't a git repository")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+  });
+
   it("shows the hub's words in fg, with Try again", async () => {
     const rig = await open();
     await refuse(rig, "changes", "Git is busy; try again", "busy");

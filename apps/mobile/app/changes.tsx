@@ -15,54 +15,65 @@ import {
   matchFile,
   type DiffLine,
 } from "../src/changes";
+import type { ChangesAnswer, ListedFile } from "../src/client/answers";
 import { Refusal } from "../src/client/HubClient";
 import { DiffLineRow, DiffNote, FileRow, SIDE } from "../src/components/FileRow";
 import { HubBanner } from "../src/components/HubBanner";
 import { failure, useAlive, useSend, type Failure } from "../src/components/send";
 import { useHubClient } from "../src/hub";
 import { FIELD_CHARS, field } from "../src/model/text";
-import type { ChangesFrame, DiffFrame, FileChange } from "../src/protocol";
+import type { DiffFrame, FileChange } from "../src/protocol";
 import { sessionName } from "../src/sessions";
 import { octetStore, unwatch, useEntries, useHub, useSessionHead, watch } from "../src/store";
-import { radius, spacing, type, useTheme } from "../src/theme";
+import { dark, light, radius, spacing, type, useTheme, type Theme } from "../src/theme";
 import { Button, Card } from "../src/ui";
 
-/** The hub's words for a workspace that is not in a repository (crates/octet-hub/src/git.rs):
- * the screen's empty state, not a failure. */
+/** The hub's refusal of a workspace that is not in a repository, `unavailable` with these words
+ * (`not_a_repository`, crates/octet-hub/src/git.rs): the screen's empty state, not a failure. */
 export const NOT_A_REPOSITORY = "This folder isn't a git repository";
+const NOT_A_REPOSITORY_CODE = "unavailable";
+/** Under a file opened while the listing failed: no diff can be asked for until one is in. */
+export const ASK_AGAIN = "Ask for the changes again";
 export const LOADING = "Loading changes…";
 export const LOADING_DIFF = "Loading the diff…";
 export const NO_CHANGES = "Nothing changed since the last commit";
 const WRONG: Failure = { text: "Something went wrong. Try again.", retry: true };
 
-/** A file's diff, kept for the screen's life (a pull to refresh forgets them all). */
+/** What a diff was of: the listed file's lines and status when it was asked for. */
+type Stamp = Pick<FileChange, "add" | "del" | "status">;
+const sameStamp = (a: Stamp, b: Stamp | undefined): boolean =>
+  b !== undefined && a.add === b.add && a.del === b.del && a.status === b.status;
+
+/** A file's diff, by its raw path, kept for the screen's life: a pull forgets them all, and any
+ * other reload the ones of files that changed since. `truncated`: lines past what is drawn. */
 type Diff =
   | { state: "loading" }
-  | { state: "ready"; lines: DiffLine[]; clipped: boolean; binary: boolean }
+  | { state: "ready"; of: Stamp; lines: DiffLine[]; clipped: boolean; truncated: boolean; binary: boolean }
   | { state: "failed"; text: string };
 
-/** One row of the list: a file, a line of an open file's diff, or a note under an open file. */
+/** One row of the list: a file, a line of an open file's diff, or a note under an open file.
+ * Keys are the raw path's: two raw paths can clean to the same text. */
 type Item =
-  | { kind: "file"; key: string; file: FileChange; open: boolean }
+  | { kind: "file"; key: string; file: ListedFile; open: boolean }
   | { kind: "line"; key: string; line: DiffLine }
   | { kind: "note"; key: string; text: string; words: boolean };
 
 interface Listing {
   /** `loading` until the first answer; `norepo` when the workspace is not in a repository. */
   state: "loading" | "ready" | "norepo";
-  frame: ChangesFrame | null;
+  frame: ChangesAnswer | null;
   /** Whether a load that follows an earlier one is out (the pull spinner). */
   pulling: boolean;
   failed: Failure | null;
 }
 
-const NO_FILES: FileChange[] = [];
+const NO_FILES: ListedFile[] = [];
 const NONE: ReadonlySet<string> = new Set();
 const NO_DIFFS: ReadonlyMap<string, Diff> = new Map();
 const keyOf = (item: Item): string => item.key;
 const typeOf = (item: Item): string => item.kind;
 
-const isChanges = (x: unknown): x is ChangesFrame => typeof x === "object" && x !== null && (x as { type?: unknown }).type === "changes";
+const isChanges = (x: unknown): x is ChangesAnswer => typeof x === "object" && x !== null && (x as { type?: unknown }).type === "changes";
 const isDiff = (x: unknown): x is DiffFrame => typeof x === "object" && x !== null && (x as { type?: unknown }).type === "diff";
 
 /**
@@ -71,8 +82,9 @@ const isDiff = (x: unknown): x is DiffFrame => typeof x === "object" && x !== nu
  * against HEAD, each file's diff on a tap, the last test run (Checks) and the branch.
  *
  * The hub lets a phone ask for a diff only of a path its last `changes` answer on this connection
- * listed, so the screen asks for the listing whenever the connection is (again) ready, and asks
- * for diffs only once it is in. Everything the hub sent is drawn as plain text.
+ * listed, exactly as listed, so the screen asks for the listing whenever the connection is (again)
+ * ready, asks for diffs only once it is in, and asks by the raw path the client kept. Everything
+ * the hub sent is drawn cleaned, as plain text; the raw path never is.
  */
 export default function Changes() {
   const theme = useTheme();
@@ -120,8 +132,8 @@ export default function Changes() {
     diffsRef.current = next;
     setDiffsState(next);
   }, []);
-  const keepDiffs = useCallback((keep: (diff: Diff) => boolean) => {
-    const next = new Map([...diffsRef.current].filter(([, d]) => keep(d)));
+  const keepDiffs = useCallback((keep: (diff: Diff, raw: string) => boolean) => {
+    const next = new Map([...diffsRef.current].filter(([raw, d]) => keep(d, raw)));
     diffsRef.current = next;
     setDiffsState(next);
   }, []);
@@ -132,24 +144,30 @@ export default function Changes() {
   const fresh = useRef(false);
   /** The route's file was looked for in a listing. */
   const routed = useRef(false);
+  /** The newest listing's files, by raw path. */
+  const listed = useRef<ReadonlyMap<string, ListedFile>>(new Map());
 
+  /** Asks for the diff of the listed file whose raw path is `raw`, by that path. */
   const askDiff = useCallback(
-    (path: string) => {
+    (raw: string) => {
       const under = loadId.current;
-      setDiff(path, { state: "loading" });
-      send({ type: "diff", session: id, path }).then(
+      const of = listed.current.get(raw);
+      if (of === undefined) return;
+      const stamp: Stamp = { add: of.add, del: of.del, status: of.status };
+      setDiff(raw, { state: "loading" });
+      send({ type: "diff", session: id, path: raw }).then(
         (frame) => {
           if (!alive() || loadId.current !== under) return;
-          setDiff(
-            path,
-            isDiff(frame)
-              ? { state: "ready", lines: diffLines(frame.text), clipped: frame.clipped, binary: frame.binary }
-              : { state: "failed", text: WRONG.text },
-          );
+          if (!isDiff(frame)) {
+            setDiff(raw, { state: "failed", text: WRONG.text });
+            return;
+          }
+          const { lines, truncated } = diffLines(frame.text);
+          setDiff(raw, { state: "ready", of: stamp, lines, clipped: frame.clipped, truncated, binary: frame.binary });
         },
         (error: unknown) => {
           if (!alive() || loadId.current !== under) return;
-          setDiff(path, { state: "failed", text: failure(error).text });
+          setDiff(raw, { state: "failed", text: failure(error).text });
         },
       );
     },
@@ -172,21 +190,25 @@ export default function Changes() {
             setListing((l) => ({ ...l, pulling: false, failed: WRONG }));
             return;
           }
-          const paths = new Set(frame.files.map((f) => f.path));
-          const open = new Set([...expandedRef.current].filter((p) => paths.has(p)));
+          const byRaw = new Map(frame.files.map((f) => [f.raw, f]));
+          listed.current = byRaw;
+          // A kept diff of a file whose lines or status changed is of an older file.
+          keepDiffs((d, raw) => d.state === "ready" && sameStamp(d.of, byRaw.get(raw)));
+          const open = new Set([...expandedRef.current].filter((raw) => byRaw.has(raw)));
           if (!routed.current) {
             routed.current = true;
-            const named = file === "" ? null : matchFile([...paths], file);
-            if (named !== null) open.add(named);
+            const named = file === "" ? null : matchFile(frame.files.map((f) => f.path), file);
+            const hits = named === null ? [] : frame.files.filter((f) => f.path === named);
+            if (hits.length === 1 && hits[0]) open.add(hits[0].raw);
           }
           fresh.current = true;
           setExpanded(open);
           setListing({ state: "ready", frame, pulling: false, failed: null });
-          for (const path of open) if (diffsRef.current.get(path)?.state !== "ready") askDiff(path);
+          for (const raw of open) if (diffsRef.current.get(raw)?.state !== "ready") askDiff(raw);
         },
         (error: unknown) => {
           if (!alive() || loadId.current !== mine) return;
-          if (error instanceof Refusal && error.message === NOT_A_REPOSITORY) {
+          if (error instanceof Refusal && error.code === NOT_A_REPOSITORY_CODE && error.message === NOT_A_REPOSITORY) {
             setListing({ state: "norepo", frame: null, pulling: false, failed: null });
             return;
           }
@@ -209,21 +231,22 @@ export default function Changes() {
   const pull = useCallback(() => load(true), [load]);
   const retry = useCallback(() => load(false), [load]);
 
-  // A tap opens a file and asks for its diff, once per opening: a diff that came is kept, one
-  // that failed is asked for again. Before the listing is in, the diff waits for it.
+  // A tap opens a file (by its raw path) and asks for its diff, once per opening: a diff that
+  // came is kept, one that failed is asked for again. Before the listing is in, the diff waits
+  // for it.
   const toggle = useCallback(
-    (path: string) => {
+    (raw: string) => {
       const next = new Set(expandedRef.current);
-      const diff = diffsRef.current.get(path);
-      if (next.delete(path)) {
-        if (diff?.state === "failed") setDiff(path, null);
+      const diff = diffsRef.current.get(raw);
+      if (next.delete(raw)) {
+        if (diff?.state === "failed") setDiff(raw, null);
         setExpanded(next);
         return;
       }
-      next.add(path);
+      next.add(raw);
       setExpanded(next);
-      if (fresh.current && (diff === undefined || diff.state === "failed")) askDiff(path);
-      else if (diff?.state === "failed") setDiff(path, null);
+      if (fresh.current && (diff === undefined || diff.state === "failed")) askDiff(raw);
+      else if (diff?.state === "failed") setDiff(raw, null);
     },
     [askDiff, setDiff, setExpanded],
   );
@@ -235,24 +258,27 @@ export default function Changes() {
 
   const files = listing.frame?.files ?? NO_FILES;
   const more = listing.frame?.more ?? 0;
+  // With the listing failed, nothing is fresh: a diff not in waits for the next listing.
+  const stuck = listing.failed !== null;
   const items = useMemo(() => {
     const out: Item[] = [];
-    files.forEach((f, i) => {
-      const key = `${i}:${f.path}`;
-      const open = expanded.has(f.path);
+    for (const f of files) {
+      const key = f.raw;
+      const open = expanded.has(f.raw);
       out.push({ kind: "file", key, file: f, open });
-      if (!open) return;
-      const diff = diffs.get(f.path);
-      if (diff === undefined || diff.state === "loading") out.push({ kind: "note", key: `${key}\nloading`, text: LOADING_DIFF, words: false });
+      if (!open) continue;
+      const diff = diffs.get(f.raw);
+      if (diff === undefined && stuck) out.push({ kind: "note", key: `${key}\nask`, text: ASK_AGAIN, words: false });
+      else if (diff === undefined || diff.state === "loading") out.push({ kind: "note", key: `${key}\nloading`, text: LOADING_DIFF, words: false });
       else if (diff.state === "failed") out.push({ kind: "note", key: `${key}\nfailed`, text: diff.text, words: true });
       else if (diff.binary) out.push({ kind: "note", key: `${key}\nbinary`, text: BINARY_NOTE, words: false });
       else {
         diff.lines.forEach((line, n) => out.push({ kind: "line", key: `${key}\n${n}`, line }));
-        if (diff.clipped) out.push({ kind: "note", key: `${key}\nclipped`, text: CLIPPED_NOTE, words: false });
+        if (diff.clipped || diff.truncated) out.push({ kind: "note", key: `${key}\nclipped`, text: CLIPPED_NOTE, words: false });
       }
-    });
+    }
     return out;
-  }, [files, expanded, diffs]);
+  }, [files, expanded, diffs, stuck]);
 
   // While the Mac can't be reached the screen shows its last state, greyed, and takes no tap.
   const offline = hub !== "ready";
@@ -371,21 +397,33 @@ export default function Changes() {
   );
 }
 
+function cardStyles(theme: Theme) {
+  return StyleSheet.create({
+    line: { ...type.body, color: theme.fg },
+    detail: { ...type.body, color: theme.muted },
+    pass: { color: theme.accent },
+    fail: { color: theme.amber },
+  });
+}
+const DARK_CARDS = cardStyles(dark);
+const LIGHT_CARDS = cardStyles(light);
+const cardsOf = (theme: Theme) => (theme === light ? LIGHT_CARDS : DARK_CARDS);
+
 /** Checks: the session's last test run, by the heuristic in src/changes.ts. It reads the
  * session's view itself, so streamed output draws only this card. */
 const ChecksCard = memo(function ChecksCard({ session }: { session: string }) {
-  const theme = useTheme();
+  const c = cardsOf(useTheme());
   const entries = useEntries(session);
   const checks = useMemo(() => lastChecks(entries), [entries]);
   return (
     <Card title="Checks" testID="checks">
       {checks ? (
-        <Text style={[type.body, { color: theme.fg }]}>
-          <Text style={{ color: checks.passed ? theme.accent : theme.amber }}>{checks.passed ? "✓" : "✗"}</Text>
+        <Text style={c.line}>
+          <Text style={checks.passed ? c.pass : c.fail}>{checks.passed ? "✓" : "✗"}</Text>
           {` ${checks.command}`}
         </Text>
       ) : (
-        <Text style={[type.body, { color: theme.muted }]}>{NO_TESTS}</Text>
+        <Text style={c.detail}>{NO_TESTS}</Text>
       )}
     </Card>
   );
@@ -393,11 +431,11 @@ const ChecksCard = memo(function ChecksCard({ session }: { session: string }) {
 
 /** Branch: the branch, and how far ahead of its upstream it is or whether anything is uncommitted. */
 const BranchCard = memo(function BranchCard({ name, detail }: { name: string; detail: string }) {
-  const theme = useTheme();
+  const c = cardsOf(useTheme());
   return (
     <Card title="Branch" testID="branch">
-      <Text style={[type.body, { color: theme.fg }]}>{name}</Text>
-      <Text style={[type.body, { color: theme.muted }]}>{detail}</Text>
+      <Text style={c.line}>{name}</Text>
+      <Text style={c.detail}>{detail}</Text>
     </Card>
   );
 });

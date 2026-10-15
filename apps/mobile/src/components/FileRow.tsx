@@ -2,7 +2,7 @@ import { memo, useCallback } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { BAR_CELLS, STATUS_WORDS, barCells, splitPath, type DiffLine } from "../changes";
-import type { FileChange } from "../protocol";
+import type { ListedFile } from "../client/answers";
 import { MONO, dark, light, spacing, type, useTheme, type Theme } from "../theme";
 
 /** The page's side margin, which a diff's lines run past to the screen's edges. */
@@ -50,12 +50,12 @@ const OPEN_OFF = { expanded: true, disabled: true } as const;
 const SHUT_OFF = { expanded: false, disabled: true } as const;
 
 interface FileRowProps {
-  /** Cleaned by the client: drawn as plain text. */
-  file: FileChange;
+  /** `path` cleaned by the client, drawn as plain text; `raw` the hub's own, never drawn. */
+  file: ListedFile;
   open: boolean;
   /** The Mac can't be reached: the row takes no tap. */
   off: boolean;
-  /** Called with the file's path. Must be stable, or every row draws again with the list. */
+  /** Called with the file's raw path. Must be stable, or every row draws again with the list. */
   onToggle: (path: string) => void;
 }
 
@@ -65,7 +65,7 @@ export const FileRow = memo(function FileRow({ file, open, off, onToggle }: File
   const s = stylesOf(useTheme());
   const { name, dir } = splitPath(file.path);
   const on = barCells(file.add, file.del);
-  const toggle = useCallback(() => onToggle(file.path), [onToggle, file.path]);
+  const toggle = useCallback(() => onToggle(file.raw), [onToggle, file.raw]);
   return (
     <Pressable
       accessibilityRole="button"

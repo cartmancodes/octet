@@ -215,6 +215,7 @@ describe("requests", () => {
     await expect(pending).resolves.toMatchObject({ type: "recent", items: [] });
   });
 
+  const OSC_PATH = "src/\u001b]8;;https://evil.test\u0007a.ts\u001b]8;;\u0007";
   it("a changes frame answers its request, its strings cleaned and its numbers whole", async () => {
     const r = rig();
     ready(r);
@@ -230,8 +231,8 @@ describe("requests", () => {
       behind: -3,
       more: "9",
       files: [
-        { path: "src/\u001b]8;;https://evil.test\u0007a.ts\u001b]8;;\u0007", add: 3, del: 1, binary: false, status: "M" },
-        { path: "b‏c.png", add: -1, del: Number.MAX_VALUE, binary: true, status: "A" },
+        { path: OSC_PATH, add: 3, del: 1, binary: false, status: "M" },
+        { path: "b\u200fc.png", add: -1, del: Number.MAX_VALUE, binary: true, status: "A" },
         { path: "weird", add: 1, del: 0, binary: "yes", status: "Z" },
         { path: 7, add: 1, del: 0, binary: false, status: "M" },
         "not a file",
@@ -247,11 +248,35 @@ describe("requests", () => {
       behind: 0,
       more: 0,
       files: [
-        { path: "src/a.ts", add: 3, del: 1, binary: false, status: "M" },
-        { path: "bc.png", add: 0, del: Number.MAX_SAFE_INTEGER, binary: true, status: "A" },
-        { path: "weird", add: 1, del: 0, binary: false, status: "?" },
+        // The hub's own path is kept beside the cleaned one, exactly, to ask for its diff by.
+        { path: "src/a.ts", raw: OSC_PATH, add: 3, del: 1, binary: false, status: "M" },
+        { path: "bc.png", raw: "b\u200fc.png", add: 0, del: Number.MAX_SAFE_INTEGER, binary: true, status: "A" },
+        { path: "weird", raw: "weird", add: 1, del: 0, binary: false, status: "?" },
       ],
     });
+  });
+
+  it("a changes frame keeps a raw path up to the hub's 4,096 characters, and drops a longer one", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "changes", session: "s" });
+    const req = r.sockets.last.commandsOf("changes")[0]?.req;
+    const longest = `\u200b${"a".repeat(4_095)}`;
+    r.sockets.last.receive({
+      type: "changes",
+      req,
+      ahead: 0,
+      behind: 0,
+      more: 0,
+      files: [
+        { path: longest, add: 1, del: 0, binary: false, status: "M" },
+        { path: "b".repeat(4_097), add: 1, del: 0, binary: false, status: "M" },
+      ],
+    });
+    const frame = (await pending) as { files: { path: string; raw: string }[] };
+    expect(frame.files).toHaveLength(1);
+    expect(frame.files[0]?.raw).toBe(longest);
+    expect(frame.files[0]?.path).toBe("a".repeat(4_095));
   });
 
   it("a changes frame with no branch says so", async () => {

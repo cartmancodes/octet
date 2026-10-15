@@ -1,6 +1,5 @@
 import type {
   AckFrame,
-  ChangesFrame,
   Cursor,
   DiffFrame,
   FromPhone,
@@ -11,7 +10,7 @@ import type {
 } from "../protocol";
 import { PROTOCOL_VERSION } from "../protocol";
 import { SHORT_CHARS, field } from "../model/text";
-import { cleanChanges, cleanDiff } from "./answers";
+import { cleanChanges, cleanDiff, type ChangesAnswer } from "./answers";
 import { Backoff } from "./backoff";
 import { Cursors } from "./cursors";
 import { parseFrame } from "./frames";
@@ -40,7 +39,7 @@ export type BatchItem = ToPhone | ReplayedMark;
 
 /** What answers a request: `ack`, or the frame of the same name for `recent`, `changes` and
  * `diff` (the last two cleaned, answers.ts). */
-export type Ack = AckFrame | RecentFrame | ChangesFrame | DiffFrame;
+export type Ack = AckFrame | RecentFrame | ChangesAnswer | DiffFrame;
 
 /**
  * A command that was not done. `code` is the hub's, or one of two the phone makes up:

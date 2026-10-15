@@ -98,16 +98,17 @@ export interface DiffLine {
 }
 
 /** A diff's lines from its first hunk on (git's header lines say nothing the row does not), or
- * every line, plain, when it has no hunk (a mode change). At most `MAX_DIFF_LINES`. */
-export function diffLines(text: string): DiffLine[] {
-  if (text === "") return [];
+ * every line, plain, when it has no hunk (a mode change). At most `MAX_DIFF_LINES`; `truncated`
+ * when lines were left out to keep to that (a cleaned CR can make more lines than the hub sent). */
+export function diffLines(text: string): { lines: DiffLine[]; truncated: boolean } {
+  if (text === "") return { lines: [], truncated: false };
   const all = text.split("\n");
   if (all[all.length - 1] === "") all.pop();
   const first = all.findIndex((line) => line.startsWith("@@"));
   const lines = first < 0 ? all : all.slice(first);
   const out: DiffLine[] = [];
   for (const line of lines) {
-    if (out.length === MAX_DIFF_LINES) break;
+    if (out.length === MAX_DIFF_LINES) return { lines: out, truncated: true };
     if (first < 0) out.push({ kind: "plain", sign: "", code: line });
     else if (line.startsWith("@@")) out.push({ kind: "hunk", sign: "", code: line });
     else if (line.startsWith("+")) out.push({ kind: "add", sign: "+", code: line.slice(1) });
@@ -115,7 +116,7 @@ export function diffLines(text: string): DiffLine[] {
     else if (line.startsWith(" ")) out.push({ kind: "plain", sign: " ", code: line.slice(1) });
     else out.push({ kind: "plain", sign: "", code: line });
   }
-  return out;
+  return { lines: out, truncated: false };
 }
 
 /** Tools whose target is a file they wrote. */
@@ -131,18 +132,29 @@ export function editedFile(entry: Entry): string | null {
 }
 
 /**
- * The listed path that `file` (a tool's target: absolute, or relative to the workspace) names,
- * or null. The listing's paths are from the repository's top, which may be the workspace or a
- * folder above it, so the longest path that ends the target, or that the target ends, wins.
+ * The one listed path that `file` (a tool's target: absolute, or relative to the workspace)
+ * names, or null when none or several do. The listing's paths are from the repository's top:
+ * - the path itself, listed once;
+ * - else the longest path that ends an absolute (or longer) target: the most of it that matches;
+ * - else the one path that ends in the target, which is relative to a workspace below the top.
+ *   Two such paths ("a/x.ts" and "b/x.ts" for "x.ts") are no one file, so neither is named.
  */
 export function matchFile(paths: readonly string[], file: string): string | null {
   if (file === "") return null;
-  if (paths.includes(file)) return file;
-  let best: string | null = null;
+  const exact = paths.filter((p) => p === file).length;
+  if (exact > 0) return exact === 1 ? file : null;
+  let within: string | null = null;
+  let below: string | null = null;
+  let belowCount = 0;
   for (const path of paths) {
     if (path === "") continue;
-    const fits = file.endsWith(`/${path}`) || path.endsWith(`/${file}`);
-    if (fits && (best === null || path.length > best.length)) best = path;
+    if (file.endsWith(`/${path}`)) {
+      if (within === null || path.length > within.length) within = path;
+    } else if (path.endsWith(`/${file}`)) {
+      below = path;
+      belowCount += 1;
+    }
   }
-  return best;
+  if (within !== null) return paths.filter((p) => p === within).length === 1 ? within : null;
+  return belowCount === 1 ? below : null;
 }

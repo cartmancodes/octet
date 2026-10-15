@@ -154,7 +154,8 @@ describe("a diff's lines", () => {
   ].join("\n");
 
   it("starts at the first hunk, with a sign and a kind per line", () => {
-    expect(diffLines(text)).toEqual([
+    expect(diffLines(text).truncated).toBe(false);
+    expect(diffLines(text).lines).toEqual([
       { kind: "hunk", sign: "", code: "@@ -1,3 +1,3 @@ export" },
       { kind: "plain", sign: " ", code: "const a = 1;" },
       { kind: "del", sign: "−", code: "const b = 2;" },
@@ -164,18 +165,23 @@ describe("a diff's lines", () => {
   });
 
   it("is every line, plain, with no hunk", () => {
-    expect(diffLines("diff --git a/x b/x\nold mode 100644\nnew mode 100755\n")).toEqual([
+    expect(diffLines("diff --git a/x b/x\nold mode 100644\nnew mode 100755\n").lines).toEqual([
       { kind: "plain", sign: "", code: "diff --git a/x b/x" },
       { kind: "plain", sign: "", code: "old mode 100644" },
       { kind: "plain", sign: "", code: "new mode 100755" },
     ]);
-    expect(diffLines("")).toEqual([]);
+    expect(diffLines("")).toEqual({ lines: [], truncated: false });
   });
 
-  it("stops at the most the hub sends", () => {
+  it("stops at the most the hub sends, and says so", () => {
     const long = `@@ -1 +1 @@\n${"+x\n".repeat(MAX_DIFF_LINES + 50)}`;
     expect(MAX_DIFF_LINES).toBe(2_000);
-    expect(diffLines(long)).toHaveLength(MAX_DIFF_LINES);
+    expect(diffLines(long).lines).toHaveLength(MAX_DIFF_LINES);
+    expect(diffLines(long).truncated).toBe(true);
+    // Exactly the most is not cut.
+    const full = `@@ -1 +1 @@\n${"+x\n".repeat(MAX_DIFF_LINES - 1)}`;
+    expect(diffLines(full)).toMatchObject({ truncated: false });
+    expect(diffLines(full).lines).toHaveLength(MAX_DIFF_LINES);
   });
 
   it("has its notes", () => {
@@ -215,6 +221,16 @@ describe("matching an edited file to the listing", () => {
 
   it("takes a path under the workspace when the repository is above it", () => {
     expect(matchFile(["apps/mobile/src/x.ts"], "src/x.ts")).toBe("apps/mobile/src/x.ts");
+  });
+
+  it("is nothing when a short target fits several paths equally", () => {
+    expect(matchFile(["a/x.ts", "b/x.ts"], "x.ts")).toBeNull();
+    expect(matchFile(["a/x.ts", "b/x.ts", "src/c/x.ts"], "x.ts")).toBeNull();
+    expect(matchFile(["a/src/x.ts", "b/src/x.ts"], "src/x.ts")).toBeNull();
+    // An absolute target names one: the longest listed path that ends it.
+    expect(matchFile(["x.ts", "c/x.ts"], "/w/c/x.ts")).toBe("c/x.ts");
+    // An exact path listed twice (two raw paths that clean alike) is no one file either.
+    expect(matchFile(["x.ts", "x.ts"], "x.ts")).toBeNull();
   });
 
   it("is nothing for a file not listed, or a name that only ends alike", () => {
