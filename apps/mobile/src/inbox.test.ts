@@ -95,15 +95,53 @@ describe("classify", () => {
       approval: gist(3),
       editApproval: false,
       shortened: false,
+      files: [],
     });
   });
 
-  it("an approval without a command shows its first file, and is a file edit", () => {
+  it("an approval without a command lists every file of its gist, each on its own line, and is a file edit", () => {
+    const [item] = run([
+      info("a", { approvals: 1, approval: gist(1, { action: "Edit", command: null, files: ["src/main.rs", "b.rs", "c.rs"] }) }),
+    ]).needs;
+    expect(item?.status).toBe("● Edit");
+    expect(item?.files).toEqual(["src/main.rs", "b.rs", "c.rs"]);
+    expect(item?.editApproval).toBe(true);
+    expect(item?.shortened).toBe(false);
+  });
+
+  it("a command approval that also lists files shows them under the command", () => {
+    const [item] = run([info("a", { approvals: 1, approval: gist(1, { files: ["x.rs", "y.rs"] }) })]).needs;
+    expect(item?.status).toBe("● Bash · cargo test");
+    expect(item?.files).toEqual(["x.rs", "y.rs"]);
+  });
+
+  it("a cut file list keeps its +N more as the last line", () => {
+    const [item] = run([
+      info("a", { approvals: 1, approval: gist(1, { action: "Edit", command: null, files: ["a.rs", "b.rs", "c.rs", "+2 more"] }) }),
+    ]).needs;
+    expect(item?.files).toEqual(["a.rs", "b.rs", "c.rs", "+2 more"]);
+  });
+
+  it("a card's label reads its files too", () => {
     const [item] = run([
       info("a", { approvals: 1, approval: gist(1, { action: "Edit", command: null, files: ["src/main.rs", "b.rs"] }) }),
     ]).needs;
-    expect(item?.status).toBe("● Edit · src/main.rs");
-    expect(item?.editApproval).toBe(true);
+    if (!item) throw new Error("no item");
+    expect(cardLabel(item)).toContain("src/main.rs, b.rs");
+  });
+
+  it("an approval with neither command nor files is review only: Allow would run what the card can't show", () => {
+    const [item] = run([info("a", { approvals: 1, approval: gist(1, { action: "Run Bash", command: null, files: [], scope: "once" }) })]).needs;
+    expect(item).toMatchObject({ shortened: true, editApproval: false });
+  });
+
+  it("the bridge's reduced summaries are shortened: a command of just … and files of just +N more", () => {
+    const list = run([
+      info("a", { approvals: 1, approval: gist(1, { command: "…", files: [] }) }),
+      info("b", { approvals: 1, approval: gist(2, { action: "Edit", command: null, files: ["+25 more"] }) }),
+    ]).needs;
+    expect(list.find((i) => i.id === "a")?.shortened).toBe(true);
+    expect(list.find((i) => i.id === "b")?.shortened).toBe(true);
   });
 
   it("the line falls back to the folder it runs in when there is no scope", () => {
@@ -116,7 +154,7 @@ describe("classify", () => {
       info("a", { approvals: 1, approval: gist(1, { action: "Fetch", command: null, files: [] }) }),
       info("b", { approvals: 1, approval: gist(2, { files: ["x.rs"] }) }),
     ]).needs;
-    expect(list.find((i) => i.id === "a")).toMatchObject({ status: "● Fetch", editApproval: false });
+    expect(list.find((i) => i.id === "a")).toMatchObject({ status: "● Fetch", editApproval: false, shortened: true });
     expect(list.find((i) => i.id === "b")?.editApproval).toBe(false);
   });
 

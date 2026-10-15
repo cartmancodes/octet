@@ -807,6 +807,29 @@ describe("the Session screen", () => {
       expect(off("Allow")).toBe(false);
     });
 
+    it("an approval out of sight behind another screen arms again 400 ms after coming back", async () => {
+      await saveSettings({ faceId: false });
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"));
+      await wait(450);
+      const off = (name: string) => screen.getByRole("button", { name }).props.accessibilityState?.disabled === true;
+      expect(off("Allow")).toBe(false);
+      await act(async () => router.push("/settings"));
+      await wait(1_000);
+      await act(async () => router.back());
+      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(off("Allow")).toBe(true);
+      expect(off("Deny")).toBe(true);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow" }));
+      await act(async () => {});
+      expect(rig.sockets.last.commandsOf("answer")).toEqual([]);
+      await wait(399);
+      expect(off("Allow")).toBe(true);
+      await wait(1);
+      expect(off("Allow")).toBe(false);
+    });
+
     it("has none of them for a session that is gone", async () => {
       await launch([info("a")], "/session/zzz");
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();

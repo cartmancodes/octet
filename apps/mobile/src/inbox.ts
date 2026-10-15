@@ -19,13 +19,17 @@ export interface InboxItem {
   statusTone: Tone;
   /** The muted excerpt under the status. */
   line: string;
+  /** An approval's files, as its gist has them (at most three, then "+N more"): each drawn on its
+   * own line under the status, so everything Allow touches is on the card. Empty otherwise. */
+  files: readonly string[];
   /** The approval a card answers: the session's front one, as its row has it. */
   approval: ApprovalInfo | null;
   /** The approval edits files and runs no command: the card offers Review, not Deny. */
   editApproval: boolean;
   /** The hub cut the approval's gist: its command (the first line, at most 200 characters) or
-   * its files (three, then "+N more"). What Allow would run is not all on the card, so the card
-   * offers Review in place of Allow once, and Allow all leaves it out. */
+   * its files (three, then "+N more"); or the gist has neither command nor files, as when the
+   * bridge reduced it to fit. What Allow would run is not all on the card, so the card offers
+   * Review in place of Allow once, and Allow all leaves it out. */
   shortened: boolean;
 }
 
@@ -47,6 +51,8 @@ const SOME_MAC = "Mac";
 const CLIP_MARK = "…";
 /** The hub's last entry of a file list it cut (`gist`, crates/octet-hub/src/sessions.rs). */
 const MORE_FILES = /^\+\d+ more$/;
+/** The files of a card that has none: one array, so a card's props stay the same. */
+const NO_FILES: readonly string[] = [];
 /** What a screen reader adds for a shortened request. */
 export const SHORTENED_LABEL = "Shortened: review it in the session";
 const LABEL_MAX = 63;
@@ -90,6 +96,7 @@ function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Pick<Inb
       status: `● approval · ${s.engine}`,
       statusTone: "amber",
       line: NO_GIST_LINE,
+      files: NO_FILES,
       approval: null,
       editApproval: false,
       shortened: false,
@@ -97,15 +104,19 @@ function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Pick<Inb
   }
   const { action, command, files, scope, cwd } = approval.summary;
   // The hidden-padding fold, as the Permission card draws a command: nothing Allow runs is pushed out of sight.
-  const what = command ? foldCommand(command).text : (files[0] ?? null);
+  const what = command ? foldCommand(command).text : null;
   return {
     ...base,
     status: what ? `● ${action} · ${what}` : `● ${action}`,
     statusTone: "amber",
     line: scope !== "" ? scope : (cwd ?? ""),
+    files: files.length > 0 ? files : NO_FILES,
     approval,
     editApproval: !command && files.length > 0,
-    shortened: (!!command && command.endsWith(CLIP_MARK)) || files.some((f) => MORE_FILES.test(f) || f.endsWith(CLIP_MARK)),
+    shortened:
+      (!command && files.length === 0) ||
+      (!!command && command.endsWith(CLIP_MARK)) ||
+      files.some((f) => MORE_FILES.test(f) || f.endsWith(CLIP_MARK)),
   };
 }
 
@@ -131,6 +142,7 @@ export function classify(
         status: `● ${sessionPose(s).toUpperCase()} · ${s.engine}`,
         statusTone: "accent",
         line: s.now ? s.now : phaseWords(s.phase),
+        files: NO_FILES,
         approval: null,
         editApproval: false,
         shortened: false,
@@ -141,6 +153,7 @@ export function classify(
         status: `${mac} · ${s.engine}`,
         statusTone: "muted",
         line: s.goal ? s.goal : phaseWords(s.phase).toLowerCase(),
+        files: NO_FILES,
         approval: null,
         editApproval: false,
         shortened: false,
@@ -150,10 +163,18 @@ export function classify(
   return out;
 }
 
-/** What a screen reader says for a card: its name, how long ago, its status and its line, each
- * part clipped (a screen reader reads every word), and whether the request is shortened. */
+/** What a screen reader says for a card: its name, how long ago, its status, its files and its
+ * line, each part clipped (a screen reader reads every word), and whether the request is
+ * shortened. */
 export function cardLabel(item: InboxItem): string {
-  return [item.name, item.ago, clipLabel(item.status), clipLabel(item.line), item.shortened ? SHORTENED_LABEL : ""]
+  return [
+    item.name,
+    item.ago,
+    clipLabel(item.status),
+    ...item.files.map((file) => clipLabel(file)),
+    clipLabel(item.line),
+    item.shortened ? SHORTENED_LABEL : "",
+  ]
     .filter((x) => x !== "")
     .join(", ");
 }
@@ -167,6 +188,7 @@ export function sameItem(a: InboxItem, b: InboxItem): boolean {
     a.status === b.status &&
     a.statusTone === b.statusTone &&
     a.line === b.line &&
+    a.files === b.files &&
     a.approval === b.approval &&
     a.editApproval === b.editApproval &&
     a.shortened === b.shortened

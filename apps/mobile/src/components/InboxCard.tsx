@@ -35,6 +35,7 @@ function makeStyles(theme: Theme) {
     amber: { ...type.body, color: theme.amber },
     accent: { ...type.body, color: theme.accent },
     muted: { ...type.body, color: theme.muted },
+    file: { ...type.body, color: theme.fg, paddingLeft: spacing.md },
     buttons: { flexDirection: "row", gap: spacing.sm },
     button: { flex: 1 },
   });
@@ -80,6 +81,12 @@ export const InboxCard = memo(function InboxCard({ item, offline, covered, send,
         <Text numberOfLines={approval ? undefined : 1} style={s[item.statusTone]}>
           {item.status}
         </Text>
+        {/* Every file of the gist, each on its own line: all Allow touches is on the card. */}
+        {item.files.map((file, i) => (
+          <Text key={`${i}:${file}`} style={s.file}>
+            {file}
+          </Text>
+        ))}
         {item.line !== "" ? (
           <Text numberOfLines={2} style={s.muted}>
             {item.line}

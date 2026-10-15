@@ -2,7 +2,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { act, fireEvent, within } from "@testing-library/react-native";
 import * as Haptics from "expo-haptics";
 import * as LocalAuthentication from "expo-local-authentication";
-import { useLocalSearchParams } from "expo-router";
+import { router, useLocalSearchParams } from "expo-router";
 import { renderRouter, screen } from "expo-router/testing-library";
 import * as SecureStore from "expo-secure-store";
 import { AccessibilityInfo, AppState, StyleSheet, Text } from "react-native";
@@ -278,11 +278,57 @@ describe("the Inbox", () => {
 
     it("a file edit offers Review, which opens the session, in place of Deny", async () => {
       const rig = await launch([waiting("a", gist(1, { action: "Edit", command: null, files: ["src/main.rs"] }))]);
-      expect(inCard("a").getByText("● Edit · src/main.rs")).toBeTruthy();
+      expect(inCard("a").getByText("● Edit")).toBeTruthy();
+      expect(inCard("a").getByText("src/main.rs")).toBeTruthy();
       expect(inCard("a").queryByRole("button", { name: "Deny for a" })).toBeNull();
       await fireEvent.press(inCard("a").getByRole("button", { name: "Review a" }));
       expect(rig.view.getPathname()).toBe("/session/a");
       expect(answers(rig)).toEqual([]);
+    });
+
+    it("a file edit shows every file of its gist, each on its own line, before Allow once", async () => {
+      await launch([waiting("a", gist(1, { action: "Edit", command: null, files: ["src/main.rs", "src/lib.rs", "README.md"] }))]);
+      const c = inCard("a");
+      expect(c.getByText("● Edit")).toBeTruthy();
+      for (const file of ["src/main.rs", "src/lib.rs", "README.md"]) expect(c.getByText(file)).toBeTruthy();
+      expect(c.getByRole("button", { name: "Allow once for a" })).toBeTruthy();
+    });
+
+    it("a command that also lists files shows them under the command", async () => {
+      await launch([waiting("a", gist(1, { command: "cargo fmt", files: ["a.rs", "b.rs"] }))]);
+      const c = inCard("a");
+      expect(c.getByText("● Bash · cargo fmt")).toBeTruthy();
+      expect(c.getByText("a.rs")).toBeTruthy();
+      expect(c.getByText("b.rs")).toBeTruthy();
+    });
+
+    it("an approval with neither command nor files can only be reviewed, and Allow all leaves it out", async () => {
+      const rig = await launch([
+        waiting("a", gist(1, { action: "Run Bash", command: null, files: [] })),
+        waiting("b", gist(2)),
+        waiting("c", gist(3)),
+      ]);
+      await wait(400);
+      const c = inCard("a");
+      expect(c.queryByRole("button", { name: /^Allow once/ })).toBeNull();
+      expect(c.getByRole("button", { name: "Review a" })).toBeTruthy();
+      const all = screen.getByRole("button", { name: "Allow all 2 once" });
+      await fireEvent.press(all);
+      await flush();
+      expect(answered(rig).map((a) => a.session).sort()).toEqual(["b", "c"]);
+    });
+
+    it("a reduced summary (command … or files +N more) can only be reviewed", async () => {
+      await launch([
+        waiting("a", gist(1, { command: "…" })),
+        waiting("b", gist(2, { action: "Edit", command: null, files: ["+25 more"] })),
+      ]);
+      await wait(400);
+      for (const id of ["a", "b"]) {
+        expect(inCard(id).queryByRole("button", { name: /^Allow once/ })).toBeNull();
+        expect(inCard(id).getByRole("button", { name: `Review ${id}` })).toBeTruthy();
+      }
+      expect(screen.queryByRole("button", { name: /^Allow all/ })).toBeNull();
     });
 
     it("a session waiting without a gist can only be opened", async () => {
@@ -400,6 +446,32 @@ describe("the Inbox", () => {
         await pass();
         expect(answers(rig)).toEqual([]);
       });
+    });
+  });
+
+  describe("out of sight", () => {
+    it("a card and Allow all arm again 400 ms after the Inbox comes back into view", async () => {
+      const rig = await launch([waiting("a", gist(1)), waiting("b", gist(2))]);
+      await wait(400);
+      const allow = () => inCard("a").getByRole("button", { name: "Allow once for a" });
+      const all = () => screen.getByRole("button", { name: "Allow all 2 once" });
+      expect(disabled(allow())).toBe(false);
+      expect(disabled(all())).toBe(false);
+      await act(async () => router.push("/settings"));
+      await wait(1_000);
+      await act(async () => router.back());
+      expect(rig.view.getPathname()).toBe("/");
+      expect(disabled(allow())).toBe(true);
+      expect(disabled(all())).toBe(true);
+      await fireEvent.press(allow());
+      await fireEvent.press(all());
+      await flush();
+      expect(answers(rig)).toEqual([]);
+      await wait(399);
+      expect(disabled(allow())).toBe(true);
+      await wait(1);
+      expect(disabled(allow())).toBe(false);
+      expect(disabled(all())).toBe(false);
     });
   });
 

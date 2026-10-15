@@ -150,7 +150,8 @@ export default function Session() {
   const [offset, setOffset] = useState(0);
   // The header's menu or Session info covers the Permission card: it waits until they are gone.
   const [sheetOpen, setSheetOpen] = useState(false);
-  // The side drawer covers it too: a tap that closes the drawer must not answer.
+  // The side drawer covers it too, and so does another screen over this one: a tap that closes
+  // the drawer, or the first after coming back, must not answer.
   const drawerOpen = useDrawerOpen();
   const root = useRef<View>(null);
   const measure = useCallback(() => root.current?.measureInWindow((_x, y) => setOffset(y)), []);
@@ -243,7 +244,7 @@ export default function Session() {
                   approvals={approvals}
                   send={send}
                   offline={offline}
-                  covered={sheetOpen || drawerOpen}
+                  covered={sheetOpen || drawerOpen || !focused}
                   bottom={insets.bottom}
                   onPromptLayout={onPromptLayout}
                 />

@@ -4,6 +4,9 @@
 /** Blank lines in a row, from this many, are drawn as one line saying how many. */
 export const FOLD_BLANKS = 3;
 
+/** A line break: CRLF, or a newline, carriage return, line or paragraph separator alone. */
+const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/;
+
 /** The line standing for `n` blank (or whitespace-only) lines. */
 export const blankLines = (n: number): string => `⋯ ${n} blank lines ⋯`;
 
@@ -24,7 +27,8 @@ export const blankChars = (n: number): string => ` ⋯ ${n} blank characters ⋯
  * how many, each long blank run inside a line shortened the same way, and how many lines the
  * command has. */
 export function foldCommand(command: string): { text: string; lines: number } {
-  const all = command.split("\n");
+  // Every line break the phone draws as one: a carriage return, CRLF, a line or paragraph separator.
+  const all = command.split(LINE_BREAK);
   const out: string[] = [];
   let blanks = 0;
   const flush = () => {

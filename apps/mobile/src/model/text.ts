@@ -9,7 +9,9 @@ export const EARLIER_BYTES = utf8Length(EARLIER);
 
 /** Where an escape string is, between calls: escapes can cross streaming records. */
 export interface Esc {
-  mode: "text" | "escape" | "intermediate" | "csi" | "string" | "stringEscape";
+  /** "cr": text, just after a carriage return (drawn as a newline), so a newline next is part of
+   * it and dropped. */
+  mode: "text" | "cr" | "escape" | "intermediate" | "csi" | "string" | "stringEscape";
   /** Characters of the string dropped so far. */
   len: number;
 }
@@ -36,7 +38,9 @@ const isSurrogate = (cp: number): boolean => cp >= 0xd800 && cp <= 0xdfff;
 /**
  * `text` without terminal escapes, control characters (but newlines), bidi controls and lone
  * surrogates, tabs as four spaces; and where the escape state ends. Lone surrogates cannot be
- * in a Rust string, and dropping them keeps byte counts exact.
+ * in a Rust string, and dropping them keeps byte counts exact. Every line break is a newline: a
+ * line or paragraph separator (U+2028, U+2029), a lone carriage return, and CRLF as one, so
+ * the command fold sees (and counts) each line the phone would draw.
  */
 export function sanitize(text: string, from: Esc): { out: string; esc: Esc } {
   if (from.mode === "text" && PLAIN.test(text)) return { out: text, esc: from };
@@ -44,6 +48,10 @@ export function sanitize(text: string, from: Esc): { out: string; esc: Esc } {
   let out = "";
   for (const c of text) {
     const cp = c.codePointAt(0) ?? 0;
+    if (mode === "cr") {
+      mode = "text";
+      if (cp === 0x0a) continue; // CRLF: the carriage return was its newline
+    }
     switch (mode) {
       case "text":
         if (cp === 0x1b) mode = "escape";
@@ -51,8 +59,11 @@ export function sanitize(text: string, from: Esc): { out: string; esc: Esc } {
         else if (cp === 0x90 || cp === 0x98 || cp === 0x9d || cp === 0x9e || cp === 0x9f) {
           mode = "string";
           len = 0;
-        } else if (cp === 0x0a) out += c;
-        else if (cp === 0x09) out += "    ";
+        } else if (cp === 0x0a || cp === 0x2028 || cp === 0x2029) out += "\n";
+        else if (cp === 0x0d) {
+          out += "\n";
+          mode = "cr";
+        } else if (cp === 0x09) out += "    ";
         else if (!isControl(cp) && !isBidi(cp) && !isSurrogate(cp) && !isInvisible(cp)) out += c;
         break;
       case "escape":

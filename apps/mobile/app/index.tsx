@@ -60,8 +60,10 @@ export default function Inbox() {
   const hub = useHub();
   const listed = useListed();
   const focused = useIsFocused();
-  // The drawer is over the cards: they answer nothing while it is up, and arm again once it closes.
-  const covered = useDrawerOpen();
+  // The drawer is over the cards, or another screen is: they answer nothing then, and arm again
+  // 400 ms after the Inbox is in view once more.
+  const drawerOpen = useDrawerOpen();
+  const covered = drawerOpen || !focused;
   const send = useSend();
   const alive = useAlive();
   const reachable = hub === "ready";
