@@ -1207,16 +1207,8 @@ impl Hub {
         let Some(state) = self.conns.get_mut(&conn) else {
             return;
         };
-        match result {
-            Ok(changes) => {
-                state.listings.keep(session, ticket, changes.listing);
-                self.send(conn, &changes_frame(req, &changes.info));
-            }
-            Err((code, reason)) => {
-                state.listings.forget(&session, ticket);
-                self.refuse(conn, req, code, &reason);
-            }
-        }
+        let frame = listed_answer(&mut state.listings, req, ticket, session, result);
+        self.send(conn, &frame);
     }
 
     /// One file's diff, in the background; `path` must be one this connection's last `changes`
@@ -1270,11 +1262,7 @@ impl Hub {
             Ok(slot) => slot,
             Err((code, reason)) => return self.refuse(conn, req, code, &reason),
         };
-        let clear = self
-            .turns
-            .entry(session.clone())
-            .or_insert_with(|| watch::channel(true).0)
-            .subscribe();
+        let clear = fresh_turn(&mut self.turns, &session);
         let (git, events, device) = (self.git.clone(), self.events.clone(), device.to_owned());
         tokio::spawn(async move {
             let commit = git.commit(&place.workspace, &message, &clear).await;
@@ -1877,6 +1865,47 @@ impl Hub {
         }
         Some(state)
     }
+}
+
+/// The refusal for a `changes` answer that a later `changes` on the connection overtook.
+const SUPERSEDED: &str = "Superseded; ask again";
+
+/// What the phone is told of a finished `changes`: the frame, once `listings` keeps its
+/// listing; busy when a later `changes` on the connection already gave a newer one (the phone
+/// waits on every req, so it hears); or the refusal.
+fn listed_answer(
+    listings: &mut Listings,
+    req: u64,
+    ticket: u64,
+    session: String,
+    result: Result<git::Changes, git::Refusal>,
+) -> Value {
+    match result {
+        Ok(changes) => {
+            if listings.keep(session, ticket, changes.listing) {
+                changes_frame(req, &changes.info)
+            } else {
+                refused(req, Code::Busy, SUPERSEDED)
+            }
+        }
+        Err((code, reason)) => {
+            listings.forget(&session, ticket);
+            refused(req, code, &reason)
+        }
+    }
+}
+
+/// A receiver for a commit to `session` starting now, just after its turn was found clear: the
+/// sender says so again, so a false left from an earlier commit cannot refuse this one.
+fn fresh_turn(
+    turns: &mut HashMap<String, watch::Sender<bool>>,
+    session: &str,
+) -> watch::Receiver<bool> {
+    let sender = turns
+        .entry(session.to_owned())
+        .or_insert_with(|| watch::channel(true).0);
+    sender.send_replace(true);
+    sender.subscribe()
 }
 
 /// Whether a session at `place` may commit: it is there, its bridge said its state, its phase
@@ -2755,6 +2784,38 @@ mod tests {
         // Nor does an older refusal forget it.
         listings.forget("s", older);
         assert!(listings.get("s").is_some());
+    }
+
+    #[test]
+    fn an_answer_that_lost_to_a_newer_listing_is_refused() {
+        let mut listings = Listings::default();
+        let (older, newer) = (listings.ticket(), listings.ticket());
+        let changes = || git::Changes {
+            info: octet_core::remote::protocol::ChangesInfo::default(),
+            listing: Listing::default(),
+        };
+        let frame = listed_answer(&mut listings, 2, newer, "s".into(), Ok(changes()));
+        assert_eq!(frame["type"], "changes", "{frame}");
+        let frame = listed_answer(&mut listings, 1, older, "s".into(), Ok(changes()));
+        assert_eq!(frame, refused(1, Code::Busy, SUPERSEDED));
+        assert_eq!(listings.by_session["s"].0, newer);
+        // A refusal is the phone's answer whichever listing is kept.
+        let refusal = (Code::Unavailable, "No".to_owned());
+        let frame = listed_answer(&mut listings, 3, older, "s".into(), Err(refusal));
+        assert_eq!(frame, refused(3, Code::Unavailable, "No"));
+        assert!(listings.get("s").is_some());
+    }
+
+    #[test]
+    fn a_new_commit_starts_with_its_turn_clear() {
+        let mut turns = HashMap::new();
+        let (stale, held) = watch::channel(false);
+        turns.insert("s".to_owned(), stale);
+        let clear = fresh_turn(&mut turns, "s");
+        assert!(*clear.borrow());
+        assert!(*held.borrow(), "every commit waiting on it sees the same");
+        let other = fresh_turn(&mut turns, "t");
+        assert!(*other.borrow());
     }
 
     #[test]

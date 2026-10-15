@@ -15,9 +15,9 @@
 //!   `GIT_OPTIONAL_LOCKS=0` and `LC_ALL=C` are set. Read calls add `--no-optional-locks`.
 //! - **Programs the repository names.** No fsmonitor hook runs (`core.fsmonitor=false`), and
 //!   diffs and numstat take `--no-ext-diff --no-textconv`, so no `diff.external` or textconv
-//!   driver runs. A `filter.<name>.clean` that `.gitattributes` names still runs when numstat or
-//!   `add` reads a changed file, and the commit hooks run: that is the user's own configured
-//!   filter and hooks, doing what they do at the desk (accepted).
+//!   driver runs. A `filter.<name>.clean` that `.gitattributes` names still runs when numstat,
+//!   a tracked file's diff or `add` reads a changed file, and the commit hooks run: that is the
+//!   user's own configured filter and hooks, doing what they do at the desk (accepted).
 //! - **Time.** A call runs in a process group of its own, which is killed when the call takes
 //!   over 10 seconds, or when the call is dropped before git ended, so no hook outlives it. At
 //!   most two calls run at once; a third is refused as busy.
@@ -78,6 +78,15 @@ const ENTRY_COST: usize = 100;
 const READ_ONLY: &str = "--no-optional-locks";
 /// The pathspec that keeps a call to the workspace.
 const HERE: &str = ".";
+/// What git leaves in its directory while a merge, rebase, cherry-pick or revert is under way.
+const UNDER_WAY: [&str; 6] = [
+    "MERGE_HEAD",
+    "REBASE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+];
 
 /// The refusal for a workspace that is not a git work tree (none, bare or corrupt).
 pub(crate) const NOT_A_REPOSITORY: &str = "This folder isn't a git repository";
@@ -87,6 +96,8 @@ pub(crate) const GIT_BUSY: &str = "Git is busy; try again";
 pub(crate) const NOTHING_TO_COMMIT: &str = "Nothing to commit";
 /// The refusal for a commit while a turn runs or an approval waits.
 pub(crate) const TURN_FIRST: &str = "Finish or cancel the current turn first";
+/// The refusal for a commit while a merge, rebase, cherry-pick or revert is under way.
+pub(crate) const MERGE_FIRST: &str = "Finish the merge at the desk first";
 /// The refusal for a git call past [`GIT_WITHIN`].
 pub(crate) const GIT_TIMED_OUT: &str = "Git took too long; try again";
 /// The refusal when git cannot be started.
@@ -457,7 +468,8 @@ impl Git {
 
     /// Stages everything in `ws` (and nothing outside it) and commits it with `message` on
     /// stdin, the repository's hooks running: the new commit's short hash (empty if git would
-    /// not say it). `clear` is the hub's latest word on whether the session's turn allows a
+    /// not say it). It is refused, before anything is staged, while a merge, rebase,
+    /// cherry-pick or revert is under way. `clear` is the hub's latest word on whether the session's turn allows a
     /// commit; it is looked at again just before `add`. A turn that starts after that look is
     /// not seen (the window is the time `add` takes to start, and the hub only learns of a
     /// turn when its bridge says so).
@@ -480,6 +492,9 @@ impl Git {
         added: &mut bool,
     ) -> Result<String, Refusal> {
         self.top(ws).await?;
+        if self.under_way(ws).await? {
+            return Err(refusal(Code::Busy, MERGE_FIRST));
+        }
         let status = [
             READ_ONLY,
             "status",
@@ -549,6 +564,27 @@ impl Git {
             return Err(not_a_repository());
         }
         Ok(PathBuf::from(OsStr::from_bytes(&out)))
+    }
+
+    /// Whether a merge, rebase, cherry-pick or revert is under way in `ws`'s repository: a
+    /// partial commit would fail then, after `add` had staged the conflict away.
+    async fn under_way(&self, ws: &Path) -> Result<bool, Refusal> {
+        let mut args = vec![READ_ONLY, "rev-parse"];
+        for marker in UNDER_WAY {
+            args.extend(["--git-path", marker]);
+        }
+        let ran = self.run(ws, &args, None, WORDS_OUTPUT).await?;
+        if !ran.status.success() || ran.clipped {
+            return Err(not_a_repository());
+        }
+        for line in ran.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            // Relative to the directory git ran in.
+            let path = ws.join(OsStr::from_bytes(line));
+            if tokio::fs::symlink_metadata(&path).await.is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The empty tree's id in `ws`'s object format.
@@ -1381,6 +1417,84 @@ mod tests {
             (commit.result, commit.added),
             (Err((Code::Invalid, NOTHING_TO_COMMIT.to_owned())), false)
         );
+    }
+
+    /// Runs git in `dir` as the desk would, and says whether it succeeded.
+    fn git_tries(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("git runs")
+            .status
+            .success()
+    }
+
+    #[tokio::test]
+    async fn a_commit_during_a_merge_is_refused_before_add() {
+        let git = Git::new();
+        let dir = committed("octet-git-merge");
+        let ws = dir.path();
+        let main = git_in(ws, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let main = main.trim();
+        git_in(ws, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(ws.join("tracked.txt"), "theirs\n").expect("write");
+        git_in(ws, &["commit", "-q", "-am", "Theirs"]);
+        git_in(ws, &["checkout", "-q", main]);
+        std::fs::write(ws.join("tracked.txt"), "ours\n").expect("write");
+        git_in(ws, &["commit", "-q", "-am", "Ours"]);
+        assert!(
+            !git_tries(ws, &["merge", "-q", "other"]),
+            "the merge conflicts"
+        );
+        std::fs::write(ws.join("loose.txt"), "loose\n").expect("write");
+        let index = git_in(ws, &["ls-files", "--stage"]);
+        assert!(index.contains(" 3\ttracked.txt"), "{index}");
+
+        let commit = git.commit(ws, "Mid-merge", &watch::channel(true).1).await;
+        assert_eq!(
+            (commit.result, commit.added),
+            (Err((Code::Busy, MERGE_FIRST.to_owned())), false)
+        );
+        assert_eq!(git_in(ws, &["ls-files", "--stage"]), index);
+        assert_eq!(git_in(ws, &["rev-list", "--count", "HEAD"]).trim(), "2");
+
+        // A rebase or a cherry-pick under way is the same.
+        git_in(ws, &["merge", "--abort"]);
+        for marker in ["rebase-merge", "rebase-apply"] {
+            std::fs::create_dir(ws.join(".git").join(marker)).expect("marker");
+            assert_eq!(
+                commit_now(&git, ws).await,
+                Err((Code::Busy, MERGE_FIRST.to_owned())),
+                "{marker}"
+            );
+            std::fs::remove_dir(ws.join(".git").join(marker)).expect("unmark");
+        }
+        for marker in [
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "REBASE_HEAD",
+            "MERGE_HEAD",
+        ] {
+            let head = git_in(ws, &["rev-parse", "HEAD"]);
+            std::fs::write(ws.join(".git").join(marker), head).expect("marker");
+            assert_eq!(
+                commit_now(&git, ws).await,
+                Err((Code::Busy, MERGE_FIRST.to_owned())),
+                "{marker}"
+            );
+            std::fs::remove_file(ws.join(".git").join(marker)).expect("unmark");
+        }
+        assert_eq!(git_in(ws, &["diff", "--cached", "--name-only"]), "");
+        assert!(commit_now(&git, ws).await.is_ok());
+    }
+
+    async fn commit_now(git: &Git, ws: &Path) -> Result<String, Refusal> {
+        commit(git, ws, "Now").await
     }
 
     #[tokio::test]
