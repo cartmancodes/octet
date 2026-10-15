@@ -746,46 +746,59 @@ async fn the_help_text_names_what_the_phone_can_run() {
     assert!(matches!(action, Action::Continue));
 }
 
-#[tokio::test]
-async fn export_answers_with_the_desk_words() {
-    let workspace = octet_testkit::TempDir::new("octet-remote-export");
-    let data = octet_testkit::TempDir::new("octet-remote-export-data");
+/// An idle app whose journal is a real file in a data directory, and whose workspace is another.
+fn exportable(name: &str) -> (App, octet_testkit::TempDir, octet_testkit::TempDir) {
+    let workspace = octet_testkit::TempDir::new(&format!("octet-remote-{name}"));
+    let data = octet_testkit::TempDir::new(&format!("octet-remote-{name}-data"));
     std::fs::create_dir_all(workspace.path()).unwrap();
     std::fs::create_dir_all(data.path()).unwrap();
     let journal = data.path().join("session-7.jsonl");
     std::fs::write(&journal, b"{}\n").unwrap();
-    let vendor = RecordingVendor::default();
     let mut app = app();
     idle(&mut app);
     app.composer.root = workspace.path().to_path_buf();
     app.conn.journal = journal;
+    (app, workspace, data)
+}
+
+#[tokio::test]
+async fn export_answers_with_the_desk_words() {
+    let (mut app, workspace, _data) = exportable("export");
+    let vendor = RecordingVendor::default();
     // Always the desk's default: the workspace and the journal's file name.
     let target = workspace.path().join("session-7.jsonl");
     let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
     assert_eq!(
         result,
-        Ok(format!("Exporting the journal to {}", target.display()))
+        Ok(format!("Exported the journal to {}", target.display()))
     );
-    assert!(matches!(&action, Action::Job(job) if job.label == "Exporting the journal…"));
-    // The job is the desk's own, and its outcome reaches the desk as it does for `/export`.
-    run_job(&mut app, action).await;
-    assert!(
-        app.entries_text()
-            .contains(&format!("Exported journal to {}", target.display())),
-        "{}",
-        app.entries_text()
-    );
+    // The copy was done inline: no job, and the file is there.
+    assert!(matches!(action, Action::Continue));
+    assert!(app.job.is_none());
     let before = std::fs::read(&target).unwrap();
-    // A file of that name is already there: the desk's export refuses to overwrite, in its words,
-    // and the phone's command still only starts the job.
-    let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
-    assert!(result.is_ok(), "{result:?}");
-    run_job(&mut app, action).await;
+    assert_eq!(before, b"{}\n");
     assert!(
-        app.entries_text().contains("Export failed: Cannot create"),
+        app.entries_text()
+            .contains("Exported the journal from iPhone 15"),
         "{}",
         app.entries_text()
     );
+    // A file of that name is already there: the desk's export refuses to overwrite, in its words.
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    let Err(reason) = result else {
+        panic!("overwrote an export")
+    };
+    assert!(
+        reason.starts_with("Export failed: Cannot create ") && reason.contains("exist"),
+        "{reason}"
+    );
+    assert!(matches!(action, Action::Continue));
+    let text = app.entries_text();
+    assert!(
+        text.contains("Export from iPhone 15 failed: Cannot create "),
+        "{text}"
+    );
+    assert!(!text.contains("Refused from"), "{text}");
     assert_eq!(
         std::fs::read(&target).unwrap(),
         before,
@@ -794,23 +807,44 @@ async fn export_answers_with_the_desk_words() {
 }
 
 #[tokio::test]
-async fn export_failing_or_waiting_says_what_the_desk_says() {
+async fn an_export_that_cannot_be_written_or_read_fails_in_the_desk_words() {
     let vendor = RecordingVendor::default();
-    // A workspace that is not there: the desk's export job reports its own error.
-    let mut app = app();
-    idle(&mut app);
+    // A workspace that is not there to write in.
+    let (mut app, _workspace, _data) = exportable("export-unwritable");
     app.composer.root = "/nonexistent-octet-workspace/inner".into();
     let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
-    assert!(result.is_ok(), "{result:?}");
-    run_job(&mut app, action).await;
+    let Err(reason) = result else {
+        panic!("exported nowhere")
+    };
     assert!(
-        app.entries_text().contains("Export failed"),
+        reason.starts_with("Export failed: Cannot create "),
+        "{reason}"
+    );
+    assert!(matches!(action, Action::Continue));
+    assert!(
+        app.entries_text()
+            .contains("Export from iPhone 15 failed: Cannot create "),
         "{}",
         app.entries_text()
     );
-    // A job already running: the desk's `Wait for` words, and no second job.
-    let mut busy = self::app();
-    idle(&mut busy);
+    // A journal that is not there to read.
+    let (mut app, workspace, _data) = exportable("export-unreadable");
+    app.conn.journal = workspace.path().join("missing.jsonl");
+    let (result, _) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    let Err(reason) = result else {
+        panic!("exported nothing")
+    };
+    assert!(
+        reason.starts_with("Export failed: Cannot read journal "),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn export_waits_for_a_job_and_for_a_turn_like_the_desk() {
+    let vendor = RecordingVendor::default();
+    // A job already running: the desk's `Wait for` words, nothing written.
+    let (mut busy, workspace, _data) = exportable("export-busy");
     busy.job = Some(crate::jobs::Running::spawn(crate::jobs::Job {
         label: "Reading recent sessions…",
         must_finish: false,
@@ -819,6 +853,14 @@ async fn export_failing_or_waiting_says_what_the_desk_says() {
     let (result, action) = run(&mut busy, &vendor, typed(CommandName::Export)).await;
     assert_eq!(result, Err("Wait for: Reading recent sessions…".into()));
     assert!(matches!(action, Action::Continue));
+    assert!(!workspace.path().join("session-7.jsonl").exists());
+    // A turn: `/export` is refused then too.
+    let (mut turn, workspace, _data) = exportable("export-turn");
+    turn.conn.start_turn();
+    let (result, action) = run(&mut turn, &vendor, typed(CommandName::Export)).await;
+    assert_eq!(result, Err(TURN_OPEN.into()));
+    assert!(matches!(action, Action::Continue));
+    assert!(!workspace.path().join("session-7.jsonl").exists());
 }
 
 #[tokio::test]
@@ -828,10 +870,9 @@ async fn each_typed_command_leaves_a_desk_note_naming_the_device() {
         (CommandName::New, "New conversation from iPhone 15"),
         (CommandName::Session, "Session from iPhone 15"),
         (CommandName::Help, "Help from iPhone 15"),
-        (CommandName::Export, "Export from iPhone 15"),
+        (CommandName::Export, "Exported the journal from iPhone 15"),
     ] {
-        let mut app = app();
-        idle(&mut app);
+        let (mut app, _workspace, _data) = exportable("note");
         let (result, _) = run(&mut app, &vendor, typed(name)).await;
         assert!(result.is_ok(), "{name:?}: {result:?}");
         assert!(

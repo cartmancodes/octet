@@ -6,10 +6,9 @@
 use crate::{
     Action, Exit,
     app::{APPROVAL_ARM, App, CANCELLING, ConnPhase, StatusKind},
-    commands::{
-        export_job, export_path, mode_command, model_command, session_text, start_job, steer_with,
-    },
+    commands::{export_path, mode_command, model_command, session_text, steer_with, wait_for},
     input::{answer_approval, cancel_turn, send_remote_prompt},
+    jobs::{EXPORT_FAILED, export_failure},
     registry::TURN_OPEN,
     vendor::Vendor,
 };
@@ -285,6 +284,14 @@ pub(crate) async fn handle_remote(
             }
             (Ok(reply), action)
         }
+        // An export that was tried and failed is not a refusal; the note says what happened.
+        Err(reason) if reason.starts_with(EXPORT_FAILED) => {
+            app.note(format!(
+                "Export from {by} failed: {}",
+                &reason[EXPORT_FAILED.len()..]
+            ));
+            (Err(reason), Action::Continue)
+        }
         Err(reason) => {
             // The desk's own refusal text, put there by the command run for the phone, says who
             // asked: the desk user typed none of it.
@@ -435,7 +442,7 @@ async fn run_remote(
             remote_mode(app, vendor, &mode, confirm.as_deref(), desk, action)
         }
         BridgeCommand::SetModel { selection } => remote_model(app, &selection, desk, action),
-        BridgeCommand::Command { name } => remote_command(app, name, desk, action),
+        BridgeCommand::Command { name } => remote_command(app, name, desk, action).await,
         BridgeCommand::End => {
             ends_cleanly(app, desk)?;
             *action = Action::Exit(Exit::Quit);
@@ -465,8 +472,8 @@ const PHONE_HELP: &str = "Commands from the phone: /model · /mode · /new · /s
 
 /// A remote `command`, run by the desk's own handler: `/new`, `/session`, `/help` or `/export`.
 /// None takes an argument, so nothing from the phone reaches a path.
-fn remote_command(
-    app: &mut App,
+async fn remote_command(
+    app: &App,
     name: CommandName,
     desk: Option<&'static str>,
     action: &mut Action,
@@ -483,16 +490,23 @@ fn remote_command(
         CommandName::Session => Ok(("Session".into(), session_text(app))),
         CommandName::Help => Ok(("Help".into(), PHONE_HELP.into())),
         CommandName::Export => {
-            // As `/export` with no argument does: the workspace and the journal's file name.
+            // `/export` with no argument: refused during a turn or while another job runs, else
+            // the workspace and the journal's file name. The phone is told how the copy went, so
+            // it is made here rather than as a job.
+            if app.turn_open() {
+                return Err(TURN_OPEN.into());
+            }
+            if let Some(running) = &app.job {
+                return Err(wait_for(running));
+            }
             let path = export_path(app, "");
-            let Some(started) = start_job(app, export_job(app, "")) else {
-                return Err(app.status_line.clone());
-            };
-            *action = started;
-            Ok((
-                "Export".into(),
-                format!("Exporting the journal to {}", path.display()),
-            ))
+            match octet_core::export_journal(&app.conn.journal, &path).await {
+                Ok(()) => Ok((
+                    "Exported the journal".into(),
+                    format!("Exported the journal to {}", path.display()),
+                )),
+                Err(error) => Err(export_failure(&error)),
+            }
         }
     }
 }

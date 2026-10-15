@@ -362,7 +362,7 @@ export interface SetModelCommand {
 }
 
 /** Run one of the desk's own commands: `new`, `session`, `help` or `export` (the journal, to the desk's default file). */
-export interface CommandCommand {
+export interface RunCommand {
   v: 1;
   type: "command";
   req: number;
@@ -455,7 +455,7 @@ export interface BridgeSetModelCommand {
 }
 
 /** Run one of the desk's own commands. */
-export interface BridgeCommandCommand {
+export interface BridgeRunCommand {
   v: 1;
   type: "command";
   req: number;
@@ -527,7 +527,7 @@ export type FromPhone =
   | SteerCommand
   | SetModeCommand
   | SetModelCommand
-  | CommandCommand
+  | RunCommand
   | RecentCommand
   | StartCommand
   | EndCommand;
@@ -539,7 +539,7 @@ export type ToBridge =
   | BridgeSteerCommand
   | BridgeSetModeCommand
   | BridgeSetModelCommand
-  | BridgeCommandCommand
+  | BridgeRunCommand
   | BridgeEndCommand;
 
 export type FromBridge =

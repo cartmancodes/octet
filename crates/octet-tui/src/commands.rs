@@ -394,10 +394,15 @@ pub(crate) fn session_text(app: &App) -> String {
     )
 }
 
+/// Why a command that starts a job waits: the running job's label.
+pub(crate) fn wait_for(running: &crate::jobs::Running) -> String {
+    format!("Wait for: {}", running.label)
+}
+
 /// Starts `job`, unless one is running: then the draft stays for later.
-pub(crate) fn start_job(app: &mut App, job: Job) -> Option<Action> {
+fn start_job(app: &mut App, job: Job) -> Option<Action> {
     if let Some(running) = &app.job {
-        app.hint(format!("Wait for: {}", running.label));
+        app.hint(wait_for(running));
         return None;
     }
     Some(Action::Job(job))
@@ -715,7 +720,7 @@ pub(crate) fn export_path(app: &App, argument: &str) -> std::path::PathBuf {
         resolve_path(&app.composer.root, argument.trim())
     }
 }
-pub(crate) fn export_job(app: &App, argument: &str) -> Job {
+fn export_job(app: &App, argument: &str) -> Job {
     Job::export(app.conn.journal.clone(), export_path(app, argument))
 }
 pub(crate) async fn command(app: &mut App, vendor: &dyn Vendor, input: &str) -> Action {

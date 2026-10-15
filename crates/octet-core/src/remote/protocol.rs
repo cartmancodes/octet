@@ -1427,7 +1427,12 @@ fn pascal(kind: &str) -> String {
 
 /// The TypeScript interface name of a message: its direction keeps same-named kinds apart.
 fn interface_name(message: &Message) -> String {
-    let kind = pascal(message.kind);
+    // `command` would read `CommandCommand`.
+    let kind = if message.kind == "command" {
+        "Run".to_owned()
+    } else {
+        pascal(message.kind)
+    };
     match message.direction {
         ToPhone => format!("{kind}Frame"),
         FromPhone => format!("{kind}Command"),
@@ -2115,6 +2120,21 @@ mod tests {
         }
         assert_eq!(CommandName::parse("help"), Some(CommandName::Help));
         assert_eq!(CommandName::parse("nope"), None);
+    }
+
+    #[test]
+    fn the_command_kind_generates_run_command_names() {
+        let named = |direction: Direction| {
+            MESSAGES
+                .iter()
+                .find(|m| m.direction == direction && m.kind == "command")
+                .map(interface_name)
+        };
+        assert_eq!(named(FromPhone).as_deref(), Some("RunCommand"));
+        assert_eq!(named(ToBridge).as_deref(), Some("BridgeRunCommand"));
+        let ts = typescript();
+        assert!(!ts.contains("CommandCommand"), "a doubled name");
+        assert!(ts.contains("type: \"command\";"), "the wire kind stays");
     }
 
     #[test]

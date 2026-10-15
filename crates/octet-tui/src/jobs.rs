@@ -22,6 +22,14 @@ pub(crate) enum Done {
     },
 }
 
+/// What a failed export says before the reason; the desk's job and a phone's `export` share it.
+pub(crate) const EXPORT_FAILED: &str = "Export failed: ";
+
+/// The words for a failed export.
+pub(crate) fn export_failure(error: &octet_core::ExportError) -> String {
+    format!("{EXPORT_FAILED}{error}")
+}
+
 /// A job a command asked for: its name for the status line, and its work.
 pub(crate) struct Job {
     pub(crate) label: &'static str,
@@ -153,7 +161,7 @@ pub(crate) fn apply(app: &mut App, ended: Ended) {
         Done::Sessions(listed) => crate::commands::show_sessions(app, listed),
         Done::Exported { path, result } => match result {
             Ok(()) => app.note(format!("Exported journal to {}", path.display())),
-            Err(error) => app.error(format!("Export failed: {error}")),
+            Err(error) => app.error(export_failure(&error)),
         },
     }
 }
