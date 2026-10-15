@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { Pressable, StyleSheet, Text } from "react-native";
+import { Pressable, StyleSheet, Text, type AccessibilityActionEvent, type AccessibilityActionInfo } from "react-native";
 
 import { spacing, type, useTheme } from "../theme";
 
@@ -15,16 +15,36 @@ interface ChipProps {
   onPress: () => void;
   onLongPress?: () => void;
   accessibilityLabel?: string;
+  /** What a screen reader adds, such as what a long press does. */
+  accessibilityHint?: string;
+  /** A screen reader's way to what a gesture does. Must be stable, with its handler. */
+  accessibilityActions?: readonly AccessibilityActionInfo[];
+  onAccessibilityAction?: (event: AccessibilityActionEvent) => void;
   disabled?: boolean;
 }
 
 /** A rounded choice that cycles its value on a tap: at least 44 pt high. */
-export const Chip = memo(function Chip({ label, dot, dotColor, color, onPress, onLongPress, accessibilityLabel, disabled = false }: ChipProps) {
+export const Chip = memo(function Chip({
+  label,
+  dot,
+  dotColor,
+  color,
+  onPress,
+  onLongPress,
+  accessibilityLabel,
+  accessibilityHint,
+  accessibilityActions,
+  onAccessibilityAction,
+  disabled = false,
+}: ChipProps) {
   const theme = useTheme();
   return (
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityHint={accessibilityHint}
+      accessibilityActions={accessibilityActions}
+      onAccessibilityAction={onAccessibilityAction}
       accessibilityState={{ disabled }}
       disabled={disabled}
       onPress={onPress}

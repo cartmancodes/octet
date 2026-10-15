@@ -1,5 +1,5 @@
-import { memo } from "react";
-import { StyleSheet, View } from "react-native";
+import { memo, useCallback } from "react";
+import { StyleSheet, View, type AccessibilityActionEvent } from "react-native";
 
 import { spacing, useTheme } from "../theme";
 import { Chip, Label } from "../ui";
@@ -27,8 +27,12 @@ interface NewChipsProps {
   onFullAccess: () => void;
 }
 
+/** A screen reader's way to the mode chip's long press. */
+const FULL_ACCESS_ACTIONS = [{ name: "fullAccess", label: "full access" }] as const;
+const FULL_ACCESS_HINT = "Long-press for full access";
+
 /** The four choices under the field: tap to change. Each cycles its value; a long press on the
- * mode starts the guarded full-access flow. */
+ * mode (or its "full access" action, for a screen reader) starts the guarded full-access flow. */
 export const NewChips = memo(function NewChips({
   mac,
   online,
@@ -44,6 +48,12 @@ export const NewChips = memo(function NewChips({
   onFullAccess,
 }: NewChipsProps) {
   const theme = useTheme();
+  const onAction = useCallback(
+    (event: AccessibilityActionEvent) => {
+      if (event.nativeEvent.actionName === "fullAccess") onFullAccess();
+    },
+    [onFullAccess],
+  );
   return (
     <View style={styles.box}>
       <Label style={styles.label}>Tap to change</Label>
@@ -59,6 +69,9 @@ export const NewChips = memo(function NewChips({
           label={mode}
           color={fullAccess ? theme.amber : undefined}
           accessibilityLabel={`Mode ${mode}`}
+          accessibilityHint={FULL_ACCESS_HINT}
+          accessibilityActions={FULL_ACCESS_ACTIONS}
+          onAccessibilityAction={onAction}
           onPress={onMode}
           onLongPress={onFullAccess}
         />

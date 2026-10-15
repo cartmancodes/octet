@@ -182,7 +182,8 @@ export default function NewSession() {
     if (router.canGoBack()) router.back();
     else router.replace("/");
   }, [router]);
-  const resume = useCallback(() => router.push("/recent"), [router]);
+  // Resume takes New's place, so back from the resumed session (which takes Recent's) is the Inbox.
+  const resume = useCallback(() => router.replace("/recent"), [router]);
 
   const engineModel = `${engine} / ${model?.name ?? "default"}`;
   const online = hub === "ready";

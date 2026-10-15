@@ -4,7 +4,7 @@ import { act, fireEvent, screen } from "@testing-library/react-native";
 import { router } from "expo-router";
 import { Text } from "react-native";
 
-import { newApproval } from "./components/ApprovalToasts";
+import { freshApprovals } from "./components/ApprovalToasts";
 import { closeDrawer } from "./drawer";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { hear, info, launch, pairedStorage, type Rig } from "./screenRig";
@@ -16,6 +16,10 @@ const gist = (id: number): ApprovalInfo => ({
 });
 const waiting = (id: string, approvalId: number, extra: Partial<SessionInfo> = {}): SessionInfo =>
   info(id, { approvals: 1, phase: "running", approval: gist(approvalId), ...extra });
+
+/** The first of `freshApprovals`, or null. */
+const newApproval = (before: readonly SessionInfo[], next: readonly SessionInfo[], toasted?: ReadonlyMap<string, number>): SessionInfo | null =>
+  freshApprovals(before, next, toasted)[0] ?? null;
 
 const ROUTES = {
   settings: () => <Text>Settings screen</Text>,

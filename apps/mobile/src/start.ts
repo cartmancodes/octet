@@ -12,7 +12,7 @@ export type StartBody = Extract<RequestBody, { type: "start" }>;
 
 export const NO_WORKSPACE = "Start a session on the Mac first, or add a workspace to hub.json.";
 
-/** A launched session that has not shown in Sessions by now is probably not coming. */
+/** A launched session that has not shown in the Inbox by now is probably not coming. */
 export const APPEAR_MS = 30_000;
 
 /** How long Start stays locked after an ack that names no session. */
@@ -28,10 +28,10 @@ export interface Launch {
 /** The status line for a launch, or null without one. */
 export function launchNotice(launch: Launch | null): string | null {
   if (launch === null) return null;
-  if (launch.tmux === null) return "Started — it will appear in Sessions";
+  if (launch.tmux === null) return "Started — it will appear in the Inbox";
   return launch.late
     ? `${launch.tmux} hasn't appeared yet. Check tmux on the Mac.`
-    : `Starting ${launch.tmux} — it will appear in Sessions`;
+    : `Starting ${launch.tmux} — it will appear in the Inbox`;
 }
 
 export interface StartSession {

@@ -15,7 +15,8 @@ import { SETTINGS_KEY, saveSettings } from "./persist";
 import { requestMenu } from "./convoMenu";
 import type { CatalogInfo, Phase, SessionInfo } from "./protocol";
 import { octetStore } from "./store";
-import { resetTextSize, textSizeStore } from "./textSize";
+import { textSizeStore } from "./textSize";
+import { resetTextSize } from "./textSizeRig";
 import { dark, light } from "./theme";
 
 const auth = LocalAuthentication as jest.Mocked<typeof LocalAuthentication>;

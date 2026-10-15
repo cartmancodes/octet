@@ -254,7 +254,7 @@ workspace. Tick each one on each phone.
 
 ## Troubleshooting
 
-**The Sessions list shows "Can't reach your Mac".** The phone must be on the tailnet:
+**The Inbox shows "Can't reach your Mac".** The phone must be on the tailnet:
 open the Tailscale app, check it is connected and signed in to the same tailnet as the Mac, and
 that the Mac itself is online there. The hub is reachable only through your tailnet; there is no
 other route. Check that `octet hub` is still running on the Mac.
@@ -279,7 +279,7 @@ Deny never needs it.
 `tmux ls` for an `octet-...` session (`tmux attach -t octet-NAME` shows what it says): tmux must
 be installed, the workspace must be one the hub allows (a folder from your recent sessions, or in
 `hub.json`'s `workspaces`), and at most eight phone-started sessions run at once. Pull down on the
-Sessions list to refresh it; after a Start the app says "NAME hasn't appeared yet. Check tmux on the Mac." when the session is late.
+Inbox to refresh it; after a Start the app says "NAME hasn't appeared yet. Check tmux on the Mac." when the session is late.
 
 **Pairing says the code is invalid or expired.** Codes work once and last 10 minutes. Run
 `/remote-control pair` again for a new one.

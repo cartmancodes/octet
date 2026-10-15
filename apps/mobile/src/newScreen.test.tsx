@@ -132,6 +132,20 @@ describe("New session", () => {
       await press("Resume a past session");
       expect(rig.view.getPathname()).toBe("/recent");
     });
+
+    it("Resume takes New's place: back from the resumed session returns to the Inbox", async () => {
+      const rig = await open();
+      await press("Resume a past session");
+      expect(rig.view.getPathname()).toBe("/recent");
+      await answerRecent(rig, [{ engine: "claude", session: "s-1", workspace: "/Users/me/Projects/octet", title: "one", started: 1 }]);
+      await press(/^Resume one/);
+      await ack(rig, "start", "Starting octet-a1b2c3 in /Users/me/Projects/octet");
+      await hear(rig, [info("live"), info("new-id", { tmux: "octet-a1b2c3", from_phone: true })]);
+      await flush();
+      expect(rig.view.getPathname()).toBe("/session/new-id");
+      await act(async () => router.back());
+      expect(rig.view.getPathname()).toBe("/");
+    });
   });
 
   describe("the chips", () => {
@@ -282,7 +296,7 @@ describe("New session", () => {
       expect(starts(rig)).toHaveLength(1);
       expect(prompts(rig)).toHaveLength(0); // not before the session exists
       await ack(rig, "start", "Starting octet-0a1b2c in /Users/me/Projects/live");
-      expect(screen.getByText("Starting octet-0a1b2c — it will appear in Sessions")).toBeTruthy();
+      expect(screen.getByText("Starting octet-0a1b2c — it will appear in the Inbox")).toBeTruthy();
       expect(prompts(rig)).toHaveLength(0);
       await hear(rig, [info("live"), info("other", { tmux: "octet-ffffff" })]); // not the one waited for
       expect(prompts(rig)).toHaveLength(0);
@@ -416,13 +430,13 @@ describe("New session", () => {
       await write("go");
       await start();
       await ack(rig, "start", "ok");
-      expect(screen.getByText("Started — it will appear in Sessions")).toBeTruthy();
+      expect(screen.getByText("Started — it will appear in the Inbox")).toBeTruthy();
       expect(button("Start session")?.props.accessibilityState.disabled).toBe(true);
       await act(async () => void jest.advanceTimersByTime(9_000));
       expect(button("Start session")?.props.accessibilityState.disabled).toBe(true);
       await act(async () => void jest.advanceTimersByTime(2_000));
       expect(button("Start session")?.props.accessibilityState.disabled).toBe(false);
-      expect(screen.getByText("Started — it will appear in Sessions")).toBeTruthy();
+      expect(screen.getByText("Started — it will appear in the Inbox")).toBeTruthy();
     });
 
     it("tells the user it started when the hub's words name no session, and sends no prompt", async () => {
@@ -430,7 +444,7 @@ describe("New session", () => {
       await write("go");
       await start();
       await ack(rig, "start", "ok");
-      expect(screen.getByText("Started — it will appear in Sessions")).toBeTruthy();
+      expect(screen.getByText("Started — it will appear in the Inbox")).toBeTruthy();
       await hear(rig, [info("live"), info("x")]);
       expect(prompts(rig)).toHaveLength(0);
     });
@@ -497,6 +511,18 @@ describe("New session", () => {
       await fireEvent(chip(FULL), "longPress");
       await flush();
     };
+
+    it("a screen reader hears the long press, and can start it from the chip's actions", async () => {
+      await open();
+      const mode = chip(FULL);
+      expect(mode.props.accessibilityHint).toBe("Long-press for full access");
+      expect(mode.props.accessibilityActions).toEqual(expect.arrayContaining([{ name: "fullAccess", label: "full access" }]));
+      expect(auth.authenticateAsync).not.toHaveBeenCalled();
+      await act(async () => mode.props.onAccessibilityAction({ nativeEvent: { actionName: "fullAccess" } }));
+      await flush();
+      expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
+      expect(chip(FULL).props.accessibilityLabel).toBe("Mode full access");
+    });
 
     it("a long press asks for Face ID, then the exact words, then sends with confirm", async () => {
       const rig = await open();

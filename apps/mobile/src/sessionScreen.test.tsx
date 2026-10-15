@@ -19,7 +19,7 @@ import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol"
 import * as words from "./session";
 import * as cardWords from "./inbox";
 import { octetStore } from "./store";
-import { resetTextSize } from "./textSize";
+import { resetTextSize } from "./textSizeRig";
 import { dark, light } from "./theme";
 
 jest.mock("expo-constants", () => ({
@@ -535,7 +535,8 @@ describe("the Session screen", () => {
     it("a session the phone knows nothing of and the Mac does not list is gone, with a way back", async () => {
       const rig = await launch([info("a")], "/session/zzz");
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();
-      await fireEvent.press(screen.getByRole("button", { name: "Back to sessions" }));
+      expect(screen.getByText("Back to the Inbox")).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Back to the Inbox" }));
       expect(rig.view.getPathname()).toBe("/");
     });
 
@@ -547,7 +548,7 @@ describe("the Session screen", () => {
       expect(octetStore.getState().bySession.get("zzz")?.failed).toBe("No such session");
       expect(screen.getByText("This session isn't running anymore")).toBeTruthy();
       expect(screen.queryByTestId("transcript")).toBeNull();
-      await fireEvent.press(screen.getByRole("button", { name: "Back to sessions" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Back to the Inbox" }));
       expect(rig.view.getPathname()).toBe("/");
       expect(octetStore.getState().bySession.has("zzz")).toBe(false);
     });

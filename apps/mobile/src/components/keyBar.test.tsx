@@ -258,6 +258,14 @@ describe("the key bar", () => {
       expect(removed.sort()).toEqual(["keyboardWillHide", "keyboardWillShow"]);
     });
 
+    it("starts from the keyboard as it is: one already up when the bar mounts needs no room", async () => {
+      jest.spyOn(Keyboard, "isVisible").mockReturnValue(true);
+      await render(controls(rig().send, { bottom: 34 }));
+      expect(pad()).toBe(8);
+      await act(async () => handlers.get("keyboardWillHide")?.());
+      expect(pad()).toBe(34);
+    });
+
     it("keeps a little room when there is no home indicator", async () => {
       await render(controls(rig().send, { bottom: 0 }));
       expect(pad()).toBe(8);

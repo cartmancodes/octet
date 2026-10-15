@@ -189,11 +189,11 @@ export default function Session() {
             </Text>
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel="Back to sessions"
+              accessibilityLabel="Back to the Inbox"
               onPress={back}
               style={[styles.button, { borderColor: theme.accent }]}
             >
-              <Text style={[type.body, { color: theme.accent }]}>Back to sessions</Text>
+              <Text style={[type.body, { color: theme.accent }]}>Back to the Inbox</Text>
             </Pressable>
           </View>
         ) : (

@@ -250,7 +250,7 @@ describe("Recent", () => {
       await answer(rig, [item("one")]);
       await press(/^Resume/);
       await ack(rig, "start", "Starting octet-a1b2c3 in /Users/me/Projects/octet");
-      expect(screen.getByText("Starting octet-a1b2c3 — it will appear in Sessions")).toBeTruthy();
+      expect(screen.getByText("Starting octet-a1b2c3 — it will appear in the Inbox")).toBeTruthy();
       // A session that is not the one waited for changes nothing.
       await hear(rig, [info("live"), info("other", { tmux: "octet-ffffff" })]);
       expect(rig.view.getPathname()).toBe("/recent");
@@ -278,10 +278,10 @@ describe("Recent", () => {
       await press(/^Resume/);
       await ack(rig, "start", "Starting octet-a1b2c3 in /w");
       await act(async () => void jest.advanceTimersByTime(29_000));
-      expect(screen.getByText("Starting octet-a1b2c3 — it will appear in Sessions")).toBeTruthy();
+      expect(screen.getByText("Starting octet-a1b2c3 — it will appear in the Inbox")).toBeTruthy();
       await act(async () => void jest.advanceTimersByTime(2_000));
       expect(screen.getByText("octet-a1b2c3 hasn't appeared yet. Check tmux on the Mac.")).toBeTruthy();
-      expect(screen.queryByText(/it will appear in Sessions/)).toBeNull();
+      expect(screen.queryByText(/it will appear in the Inbox/)).toBeNull();
       await hear(rig, [info("late", { tmux: "octet-a1b2c3" })]);
       await flush();
       expect(rig.view.getPathname()).toBe("/session/late");
@@ -335,7 +335,7 @@ describe("Recent", () => {
       await answer(rig, [item("one")]);
       await press(/^Resume/);
       await ack(rig, "start", "ok");
-      expect(screen.getByText("Started — it will appear in Sessions")).toBeTruthy();
+      expect(screen.getByText("Started — it will appear in the Inbox")).toBeTruthy();
       expect(button(/^Resume/)?.props.accessibilityState.disabled).toBe(true); // locked for 10 s
       await act(async () => void jest.advanceTimersByTime(11_000));
       expect(button(/^Resume/)?.props.accessibilityState.disabled).toBe(false);

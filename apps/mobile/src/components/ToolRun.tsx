@@ -3,8 +3,9 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { Entry } from "../model/transcript";
 import { callRows, moreCalls, moreLines, summary, toolRows, type ToolRow } from "../model/summary";
-import { DEFAULT_SETTINGS, TEXT_SIZES, type TextSize } from "../persist";
-import { MONO, dark, light, spacing, useTheme, type Theme } from "../theme";
+import { DEFAULT_SETTINGS, type TextSize } from "../persist";
+import { sizedStyles, transcriptText } from "../sizedStyles";
+import { spacing, useTheme, type Theme } from "../theme";
 
 export type ToolsEntry = Extract<Entry, { kind: "tools" }>;
 
@@ -19,7 +20,7 @@ interface ToolRunProps {
 }
 
 function makeStyles(theme: Theme, size: TextSize) {
-  const mono = { fontFamily: MONO, fontSize: size, lineHeight: size + 5 };
+  const mono = transcriptText(size);
   return StyleSheet.create({
     run: { minHeight: 44, justifyContent: "center", gap: spacing.xs, paddingVertical: spacing.xs },
     head: { ...mono, color: theme.muted },
@@ -28,10 +29,7 @@ function makeStyles(theme: Theme, size: TextSize) {
   });
 }
 type Styles = ReturnType<typeof makeStyles>;
-const STYLES: Record<"dark" | "light", Record<TextSize, Styles>> = {
-  dark: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(dark, n)])) as Record<TextSize, Styles>,
-  light: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(light, n)])) as Record<TextSize, Styles>,
-};
+const stylesFor = sizedStyles(makeStyles);
 
 const EXPANDED = { expanded: true } as const;
 const COLLAPSED = { expanded: false } as const;
@@ -68,7 +66,7 @@ function spoken(entry: ToolsEntry, open: boolean): string {
  */
 export const ToolRun = memo(function ToolRun({ entry, open, onToggle, size = DEFAULT_SETTINGS.textSize }: ToolRunProps) {
   const theme = useTheme();
-  const s = STYLES[theme === light ? "light" : "dark"][size];
+  const s = stylesFor(theme, size);
   const rows = useMemo(() => {
     if (!open) return toolRows(entry.calls, entry.over);
     const head: ToolRow = { kind: "summary", head: summary(entry.calls), lines: [], more: 0 };

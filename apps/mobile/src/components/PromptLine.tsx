@@ -27,6 +27,8 @@ export function placeholderFor({ approval, running, question }: { approval: bool
 }
 
 /** The field grows to this many lines, then scrolls. */
+/** Said beside the prompt for a return in the 400 ms after an approval came: nothing was sent. */
+export const JUST_APPEARED = "Wait a moment — the approval just appeared";
 export const PROMPT_LINES = 4;
 /** The field's room above and below its text: one line of it is 44 pt tall. */
 export const PROMPT_PAD = 12;
@@ -187,7 +189,11 @@ export const PromptLine = memo(function PromptLine({
   const [recall, setRecall] = useState<number | null>(null);
 
   const front = permission.front;
-  const { deny: denyFront, allow: allowFront, canAnswer, busy: answering } = permission.answer;
+  const { deny: denyFront, allow: allowFront, canAnswer, armed, busy: answering } = permission.answer;
+  // A return before the approval armed: the request it was for, so the note goes with it, and
+  // once the arm passes.
+  const [early, setEarly] = useState<string | null>(null);
+  const tooEarly = early !== null && early === permission.look && !armed;
   const running = phase === "running";
   const steers = running && engine === "codex";
   const matches = slashMatches(text);
@@ -277,15 +283,19 @@ export const PromptLine = memo(function PromptLine({
       return;
     }
     if (front) {
-      // Say what to do instead: the front approval is denied first, through its own guards.
-      if (!canAnswer) return;
+      // Say what to do instead: the front approval is denied first, through its own guards. Too
+      // soon after it came, nothing goes, and the note says why.
+      if (!canAnswer) {
+        if (!armed) setEarly(permission.look);
+        return;
+      }
       lightTap();
       void denyThenPrompt(sent, front.id);
       return;
     }
     lightTap();
     sendText(steers ? "steer" : "prompt", sent);
-  }, [busy, blank, text, runSlash, failPrompt, front, canAnswer, denyThenPrompt, sendText, steers]);
+  }, [busy, blank, text, runSlash, failPrompt, front, canAnswer, armed, permission.look, denyThenPrompt, sendText, steers]);
 
   const cancel = useCallback(() => {
     if (down.current || busy || !running) return;
@@ -340,9 +350,14 @@ export const PromptLine = memo(function PromptLine({
   return (
     <View>
       <SlashMenu matches={matches} values={values} disabled={slashOff} onRun={runSlash} />
-      {desk || failed ? (
+      {desk || failed || tooEarly ? (
         <View style={s.notes}>
           {desk ? <Text style={s.note}>{SLASH_NOTE}</Text> : null}
+          {tooEarly ? (
+            <Text accessibilityLiveRegion="polite" style={s.note}>
+              {JUST_APPEARED}
+            </Text>
+          ) : null}
           {failed ? (
             <View style={s.failure} accessibilityLiveRegion="polite">
               <Text style={s.failureText}>{failed.text}</Text>

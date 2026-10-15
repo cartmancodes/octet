@@ -44,10 +44,6 @@ export function freshApprovals(
 
 const NONE: ReadonlyMap<string, number> = new Map();
 
-/** The first of `freshApprovals`, or null. */
-export const newApproval = (before: readonly SessionInfo[], next: readonly SessionInfo[], toasted?: ReadonlyMap<string, number>): SessionInfo | null =>
-  freshApprovals(before, next, toasted)[0] ?? null;
-
 /** The session a Conversation path shows, or null on any other screen. */
 const SESSION_PATH = /^\/session\/([^/]+)$/;
 function onScreen(pathname: string): string | null {

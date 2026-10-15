@@ -4,16 +4,17 @@ import { StyleSheet, Text, View } from "react-native";
 
 import { Mascot } from "../mascot/Mascot";
 import type { PoseName } from "../mascot/poses";
-import { TEXT_SIZES, type TextSize } from "../persist";
+import { type TextSize } from "../persist";
+import { sizedStyles, transcriptText } from "../sizedStyles";
 import type { Mode } from "../protocol";
 import { homePath, poseWord } from "../session";
-import { MONO, dark, light, spacing, useTheme, type Theme } from "../theme";
+import { spacing, useTheme, type Theme } from "../theme";
 
 /** The mascot over the transcript, in points. */
 export const TRANSCRIPT_MASCOT = 44;
 
 function makeStyles(theme: Theme, size: TextSize) {
-  const text = { fontFamily: MONO, fontSize: size, lineHeight: size + 5 };
+  const text = transcriptText(size);
   return StyleSheet.create({
     head: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: spacing.lg, paddingTop: 6, paddingBottom: spacing.sm },
     lines: { flex: 1, minWidth: 0 },
@@ -25,11 +26,7 @@ function makeStyles(theme: Theme, size: TextSize) {
     muted: { ...text, color: theme.muted },
   });
 }
-type Styles = ReturnType<typeof makeStyles>;
-const STYLES: Record<"dark" | "light", Record<TextSize, Styles>> = {
-  dark: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(dark, n)])) as Record<TextSize, Styles>,
-  light: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(light, n)])) as Record<TextSize, Styles>,
-};
+const stylesFor = sizedStyles(makeStyles);
 
 const VERSION = Constants.expoConfig?.version;
 
@@ -52,7 +49,7 @@ interface TranscriptHeaderProps {
  */
 export const TranscriptHeader = memo(function TranscriptHeader({ pose, mode, engineModel, workspace, mac, size }: TranscriptHeaderProps) {
   const theme = useTheme();
-  const s = STYLES[theme === light ? "light" : "dark"][size];
+  const s = stylesFor(theme, size);
   const alarm = pose === "approval" || pose === "error";
   return (
     <View testID="transcript-header" style={s.head}>

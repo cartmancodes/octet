@@ -1,5 +1,5 @@
 import type { SessionInfo } from "./protocol";
-import { clipLabel, engineLine, folderName, headerPose, nowText, poseOf, sessionName, sessionPose, sortSessions } from "./sessions";
+import { clipLabel, folderName, poseOf, sessionName, sessionPose } from "./sessions";
 
 const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
   id,
@@ -53,43 +53,6 @@ describe("clipLabel", () => {
   });
 });
 
-describe("engineLine", () => {
-  it("names the engine and the model", () => {
-    expect(engineLine(info("a", { engine: "claude", model: "sonnet-5" }))).toBe("Claude · sonnet-5");
-    expect(engineLine(info("a", { engine: "codex" }))).toBe("Codex");
-    expect(engineLine(info("a", { engine: "demo", model: "" }))).toBe("Demo");
-  });
-});
-
-describe("nowText", () => {
-  it("is the NOW line, else the phase in words", () => {
-    expect(nowText(info("a", { now: "Running Bash cargo test", phase: "running" }))).toBe("Running Bash cargo test");
-    expect(nowText(info("a", { now: "", phase: "idle" }))).toBe("Idle");
-    expect(nowText(info("a", { phase: "running" }))).toBe("Running");
-    expect(nowText(info("a", { now: null, phase: "stopped" }))).toBe("Stopped");
-    expect(nowText(info("a", { phase: "connecting" }))).toBe("Connecting");
-  });
-});
-
-describe("sortSessions", () => {
-  it("puts approvals waiting first, then the newest activity", () => {
-    const list = [
-      info("old", { last_activity: 100 }),
-      info("new", { last_activity: 300 }),
-      info("wait-old", { approvals: 1, last_activity: 50 }),
-      info("wait-new", { approvals: 2, last_activity: 200 }),
-      info("none"),
-    ];
-    expect(sortSessions(list).map((s) => s.id)).toEqual(["wait-new", "wait-old", "new", "old", "none"]);
-  });
-
-  it("is stable by id on a tie and does not change its input", () => {
-    const list = [info("b", { last_activity: 1 }), info("a", { last_activity: 1 })];
-    expect(sortSessions(list).map((s) => s.id)).toEqual(["a", "b"]);
-    expect(list.map((s) => s.id)).toEqual(["b", "a"]);
-  });
-});
-
 describe("sessionPose", () => {
   it("is approval when one waits, whatever else is going on", () => {
     expect(sessionPose(info("a", { approvals: 1, phase: "running", now: "Running Bash ls" }))).toBe("approval");
@@ -133,33 +96,5 @@ describe("poseOf: one session's pose, with how its last turn ended", () => {
     expect(poseOf({ approvals: 0, phase: "stopped", turn: "failed" })).toBe("error");
     expect(poseOf({ approvals: 1, phase: "stopped", turn: "failed" })).toBe("approval");
     expect(poseOf({ approvals: 0, phase: "running", now: "Thinking", turn: "failed" })).toBe("thinking");
-  });
-});
-
-describe("headerPose: the worst state across the sessions", () => {
-  it("is sleeping while the hub cannot be reached, even with a list", () => {
-    expect(headerPose([info("a", { approvals: 1 })], "offline")).toBe("sleeping");
-  });
-  it("is idle with nothing running", () => {
-    expect(headerPose([], "ready")).toBe("idle");
-    expect(headerPose([info("a"), info("b")], "ready")).toBe("idle");
-  });
-  it("is the running session's pose", () => {
-    const list = [info("a"), info("b", { phase: "running", now: "Running Bash rg x", last_activity: 5 })];
-    expect(headerPose(list, "ready")).toBe("searching");
-  });
-  it("takes the newest of several running sessions", () => {
-    const list = [
-      info("a", { phase: "running", now: "Running Edit x", last_activity: 1 }),
-      info("b", { phase: "running", now: "Thinking", last_activity: 9 }),
-    ];
-    expect(headerPose(list, "ready")).toBe("thinking");
-  });
-  it("is approval when any session waits, over a running one", () => {
-    const list = [info("a", { phase: "running", now: "Running Edit x" }), info("b", { approvals: 3 })];
-    expect(headerPose(list, "ready")).toBe("approval");
-  });
-  it("does not call a reconnecting hub asleep", () => {
-    expect(headerPose([info("a")], "connecting")).toBe("idle");
   });
 });

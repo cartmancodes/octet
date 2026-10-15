@@ -3,14 +3,15 @@
 import { memo, useMemo, type ReactNode } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
-import { DEFAULT_SETTINGS, TEXT_SIZES, type TextSize } from "../persist";
-import { MONO, dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
+import { DEFAULT_SETTINGS, type TextSize } from "../persist";
+import { sizedStyles, transcriptText } from "../sizedStyles";
+import { radius, spacing, type, useTheme, type Theme } from "../theme";
 import { doneBlocks, streamBlocks } from "./blocks";
 import type { Block, Span } from "./parse";
 
 /** The transcript's text at `size` (`Aa`): monospace, 5 points of leading. */
 function makeStyles(theme: Theme, size: TextSize) {
-  const body = { fontFamily: MONO, fontSize: size, lineHeight: size + 5 };
+  const body = transcriptText(size);
   return StyleSheet.create({
     root: { gap: spacing.sm },
     text: { ...body, color: theme.fg },
@@ -39,10 +40,7 @@ function makeStyles(theme: Theme, size: TextSize) {
 }
 
 type Styles = ReturnType<typeof makeStyles>;
-const STYLES: Record<"dark" | "light", Record<TextSize, Styles>> = {
-  dark: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(dark, n)])) as Record<TextSize, Styles>,
-  light: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(light, n)])) as Record<TextSize, Styles>,
-};
+const stylesFor = sizedStyles(makeStyles);
 
 /** What a reply says, at its top, in place of the earlier blocks it does not draw. */
 export const earlierBlocks = (n: number): string => `${n} earlier blocks of this reply are on the Mac`;
@@ -125,7 +123,7 @@ export const Markdown = memo(function Markdown({
   size?: TextSize;
 }) {
   const theme = useTheme();
-  const s = STYLES[theme === light ? "light" : "dark"][size];
+  const s = stylesFor(theme, size);
   const shown = useMemo(() => (streaming ? streamBlocks(text) : doneBlocks(text)), [text, streaming]);
   return (
     <View style={s.root}>

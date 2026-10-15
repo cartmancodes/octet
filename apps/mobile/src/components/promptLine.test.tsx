@@ -11,7 +11,7 @@ import { saveSettings } from "../persist";
 import { octetStore } from "../store";
 import { dark, light } from "../theme";
 import { approval, controls, disabled, flush, input, key, rig, settle } from "./controlsRig";
-import { PLACEHOLDER, PROMPT_LINES, PROMPT_MAX_HEIGHT, PROMPT_PAD, placeholderFor } from "./PromptLine";
+import { JUST_APPEARED, PLACEHOLDER, PROMPT_LINES, PROMPT_MAX_HEIGHT, PROMPT_PAD, placeholderFor } from "./PromptLine";
 import { APPROVAL_DEMO, isSlash } from "./send";
 
 const sendKey = (name = "Send (⏎)") => key(name);
@@ -495,6 +495,24 @@ describe("the prompt line", () => {
       await flush();
       expect(r.send).not.toHaveBeenCalled();
       expect(input().props.value).toBe("do something else");
+    });
+
+    it("a return before the arm says to wait, in muted text, until the arm passes", async () => {
+      const r = rig();
+      await render(controls(r.send, { phase: "running", approvals: [approval(3)] }));
+      expect(screen.queryByText(JUST_APPEARED)).toBeNull();
+      await fireEvent.changeText(input(), "do something else");
+      await submit();
+      await flush();
+      expect(JUST_APPEARED).toBe("Wait a moment — the approval just appeared");
+      const hint = screen.getByText(JUST_APPEARED);
+      expect([dark.muted, light.muted]).toContain(StyleSheet.flatten(hint.props.style).color);
+      expect(r.send).not.toHaveBeenCalled();
+      await settle(400);
+      expect(screen.queryByText(JUST_APPEARED)).toBeNull();
+      await submit();
+      await flush();
+      expect(r.sent).toEqual([{ type: "answer", session: "s", approval: 3, allow: false }]);
     });
 
     it("covered (the menu or the drawer is up), sends nothing", async () => {

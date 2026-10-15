@@ -116,7 +116,8 @@ const GAP = spacing.sm;
 
 /** Whether the keyboard is up. iOS says so before it moves, Android after. */
 function useKeyboardUp(): boolean {
-  const [up, setUp] = useState(false);
+  // A keyboard already up when the bar mounts (the field kept focus) counts from the start.
+  const [up, setUp] = useState(() => Keyboard.isVisible());
   useEffect(() => {
     const ios = Platform.OS === "ios";
     const show = Keyboard.addListener(ios ? "keyboardWillShow" : "keyboardDidShow", () => setUp(true));

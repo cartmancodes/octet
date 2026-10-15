@@ -3,9 +3,10 @@ import { StyleSheet, Text, View } from "react-native";
 
 import { Markdown } from "../markdown/Markdown";
 import type { Entry } from "../model/transcript";
-import { DEFAULT_SETTINGS, TEXT_SIZES, type TextSize } from "../persist";
+import { DEFAULT_SETTINGS, type TextSize } from "../persist";
+import { sizedStyles, transcriptText } from "../sizedStyles";
 import { rowRole } from "../session";
-import { MONO, dark, light, spacing, useTheme, type Theme } from "../theme";
+import { spacing, useTheme, type Theme } from "../theme";
 import { ToolRun } from "./ToolRun";
 
 interface TranscriptRowProps {
@@ -19,7 +20,7 @@ interface TranscriptRowProps {
 }
 
 function makeStyles(theme: Theme, size: TextSize) {
-  const text = { fontFamily: MONO, fontSize: size, lineHeight: size + 5 };
+  const text = transcriptText(size);
   const label = { ...text, fontWeight: "700" as const };
   return StyleSheet.create({
     row: { paddingHorizontal: spacing.lg, paddingVertical: spacing.sm },
@@ -32,11 +33,7 @@ function makeStyles(theme: Theme, size: TextSize) {
     error: { ...text, color: theme.amber },
   });
 }
-type Styles = ReturnType<typeof makeStyles>;
-const STYLES: Record<"dark" | "light", Record<TextSize, Styles>> = {
-  dark: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(dark, n)])) as Record<TextSize, Styles>,
-  light: Object.fromEntries(TEXT_SIZES.map((n) => [n, makeStyles(light, n)])) as Record<TextSize, Styles>,
-};
+const stylesFor = sizedStyles(makeStyles);
 
 /**
  * One transcript entry under its bold label, as the terminal UI labels it (YOU, OCTET, TOOL, NOTE,
@@ -47,7 +44,7 @@ const STYLES: Record<"dark" | "light", Record<TextSize, Styles>> = {
  */
 export const TranscriptRow = memo(function TranscriptRow({ entry, open, onToggle, size = DEFAULT_SETTINGS.textSize }: TranscriptRowProps) {
   const theme = useTheme();
-  const s = STYLES[theme === light ? "light" : "dark"][size];
+  const s = stylesFor(theme, size);
   const role = rowRole(entry);
   return (
     <View style={s.row}>

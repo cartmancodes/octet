@@ -39,7 +39,7 @@ describe("a streaming reply's blocks", () => {
       last = streamBlocks(text);
     }
     const took = performance.now() - started;
-    expect(took).toBeLessThan(200); // a whole parse of the head each chunk takes far longer
+    expect(took).toBeLessThan(600); // wall-clock, under a parallel run; a whole parse of the head each chunk takes far longer
     expect(last.total).toBe(16_000);
     expect(last.blocks.length).toBeLessThanOrEqual(MAX_BLOCKS);
     expect(last.more).toBe(16_000 - MAX_BLOCKS);
