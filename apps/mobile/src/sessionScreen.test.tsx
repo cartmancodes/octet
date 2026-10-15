@@ -759,6 +759,74 @@ describe("the Session screen", () => {
       expect(screen.getByLabelText("Message").props.value).toBe("");
     });
 
+    describe("a session that ended on a question", () => {
+      const asking = (extra: Partial<SessionInfo> = {}) => info("a", { phase: "idle", question: true, ...extra });
+      const field = () => screen.getByLabelText("Message");
+
+      it("asks for an answer in the prompt's placeholder, and says the usual words otherwise", async () => {
+        const rig = await launch([asking()]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        expect(field().props.placeholder).toBe("Answer, or describe a change");
+        await feed(rig, { type: "sessions", sessions: [info("a", { phase: "idle" })] });
+        expect(field().props.placeholder).toBe("Ask, describe a change, or /help");
+      });
+
+      it("a running turn or an approval keeps its own placeholder", async () => {
+        const rig = await launch([asking({ phase: "running" })]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "running" }));
+        expect(field().props.placeholder).toBe("Working… esc cancels");
+      });
+
+      it("clears locally once the user sends anything, though the Mac's row still says question, until a row without it", async () => {
+        const rig = await launch([asking()]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        await fireEvent.changeText(field(), "yes, go ahead");
+        await fireEvent.press(screen.getByRole("button", { name: "Send (⏎)" }));
+        expect(field().props.placeholder).toBe("Answer, or describe a change"); // not before the Mac takes it
+        await feed(rig, { type: "ack", req: lastCommand(rig, "prompt")?.req, message: "sent" });
+        expect(field().props.placeholder).toBe("Ask, describe a change, or /help");
+        // A row from before the Mac saw the answer still says question: the phone does not ask again.
+        await feed(rig, { type: "sessions", sessions: [asking({ last_activity: 9 })] });
+        expect(field().props.placeholder).toBe("Ask, describe a change, or /help");
+        // The Mac caught up; the next question is a new one.
+        await feed(rig, { type: "sessions", sessions: [info("a", { phase: "idle" })] });
+        await feed(rig, { type: "sessions", sessions: [asking({ last_activity: 12 })] });
+        expect(field().props.placeholder).toBe("Answer, or describe a change");
+      });
+
+      it("a prompt the Mac refuses leaves the question", async () => {
+        const rig = await launch([asking()]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        await fireEvent.changeText(field(), "yes");
+        await fireEvent.press(screen.getByRole("button", { name: "Send (⏎)" }));
+        await feed(rig, { type: "refused", req: lastCommand(rig, "prompt")?.req, code: "invalid", reason: "No" });
+        expect(field().props.placeholder).toBe("Answer, or describe a change");
+      });
+
+      it("Reply from the Inbox focuses the prompt when the conversation opens", async () => {
+        const rig = await launch([asking()]);
+        await fireEvent.press(screen.getByRole("button", { name: "Reply to a" }));
+        await screen.findByTestId("transcript");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        expect(field().props.autoFocus).toBe(true);
+        expect(octetStore.getState().replyTo).toBe("a");
+      });
+
+      it("a plain open does not focus the prompt, and the ask is spent when the conversation closes", async () => {
+        const rig = await launch([asking()]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        expect(field().props.autoFocus).toBeFalsy();
+        await act(async () => octetStore.getState().setReplyTo("a"));
+        await act(async () => router.back());
+        expect(octetStore.getState().replyTo).toBeNull();
+      });
+    });
+
     it("shows an approval, answers it over the wire, and drops one closed elsewhere", async () => {
       await saveSettings({ faceId: false });
       const rig = await launch([info("a")]);

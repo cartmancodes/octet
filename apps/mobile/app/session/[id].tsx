@@ -257,6 +257,7 @@ export default function Session() {
                   approvals={approvals}
                   send={send}
                   offline={offline}
+                  question={info?.question === true}
                   covered={sheetOpen || drawerOpen || !focused}
                   bottom={insets.bottom}
                   onPromptLayout={onPromptLayout}

@@ -104,22 +104,23 @@ describe("Settings", () => {
       expect(screen.getByText("offline")).toBeTruthy();
     });
 
-    it("has 'An action needs approval' and a disabled 'A turn finishes' with its note, and no error switch", async () => {
+    it("has three notification switches: approval, a turn finishing and a session error, none with the old note", async () => {
       await open();
-      expect(screen.getByRole("switch", { name: "An action needs approval" })).toBeTruthy();
-      const turn = screen.getByRole("switch", { name: "A turn finishes" });
-      expect(turn.props.disabled).toBe(true);
-      expect(turn.props.accessibilityHint).toBe("Coming with the next hub update");
-      expect(screen.getByText("Coming with the next hub update")).toBeTruthy();
-      expect(screen.queryByText("A session hits an error")).toBeNull();
+      for (const name of ["An action needs approval", "A turn finishes", "A session hits an error"]) {
+        expect(screen.getByRole("switch", { name })).toBeTruthy();
+      }
+      expect(screen.queryByText("Coming with the next hub update")).toBeNull();
+      expect(screen.getByRole("switch", { name: "A turn finishes" }).props.accessibilityHint).toBeUndefined();
     });
 
-    it("'A turn finishes' shows the same value as the approval switch", async () => {
+    it("shows each switch from the saved kinds, and all off while notifications are off", async () => {
       mockConfig = { extra: { eas: { projectId: "11111111-2222-3333-4444-555555555555" } } };
-      await saveSettings({ notifications: true });
+      await saveSettings({ notifications: true, pushKinds: { approvals: false, errors: true, turns: true } });
       await open();
+      expect(screen.getByRole("switch", { name: "An action needs approval" }).props.value).toBe(false);
+      expect(screen.getByRole("switch", { name: "A session hits an error" }).props.value).toBe(true);
       expect(screen.getByRole("switch", { name: "A turn finishes" }).props.value).toBe(true);
-      expect(screen.getByRole("switch", { name: "An action needs approval" }).props.value).toBe(true);
+      expect(screen.getByRole("switch", { name: "A turn finishes" }).props.disabled).toBeFalsy();
       mockConfig = { version: "4.5.6" };
     });
   });
@@ -329,9 +330,9 @@ describe("Settings", () => {
       expect(switchOf().props.value).toBe(false);
     });
 
-    it("off: sends a null token and saves it off, with no biometrics", async () => {
+    it("off, with nothing else on: sends a null token and saves it off, with no biometrics", async () => {
       mockConfig = { extra: { eas: { projectId: PROJECT } } };
-      await saveSettings({ notifications: true });
+      await saveSettings({ notifications: true, pushKinds: { approvals: true, errors: false, turns: false } });
       const rig = await open();
       await reply(rig, { type: "ack", message: "Notifications on" }); // the registration made at ready
       await flip(false);
@@ -381,6 +382,114 @@ describe("Settings", () => {
       expect(screen.getByText("Can't reach your Mac")).toBeTruthy();
       expect(switchOf().props.value).toBe(true);
       expect((await loadSettings()).notifications).toBe(true);
+    });
+
+    describe("each kind", () => {
+      const NAMES = {
+        approvals: "An action needs approval",
+        errors: "A session hits an error",
+        turns: "A turn finishes",
+      } as const;
+      const kindSwitch = (kind: keyof typeof NAMES) => screen.getByRole("switch", { name: NAMES[kind] });
+      const flipKind = async (kind: keyof typeof NAMES, on: boolean) => {
+        await fireEvent(kindSwitch(kind), "valueChange", on);
+        await flush();
+      };
+      const live = async (kinds = { approvals: true, errors: true, turns: false }) => {
+        mockConfig = { extra: { eas: { projectId: PROJECT } } };
+        await saveSettings({ notifications: true, pushKinds: kinds });
+        const rig = await open();
+        await reply(rig, { type: "ack", message: "Notifications on" }); // the registration made at ready
+        return rig;
+      };
+
+      it.each([
+        ["approvals", false, { approvals: false, errors: true, turns: false }],
+        ["errors", false, { approvals: true, errors: false, turns: false }],
+        ["turns", true, { approvals: true, errors: true, turns: true }],
+      ] as const)("%s switched to %s sends the token with all three kinds, and moves on the Mac's ack", async (kind, on, kinds) => {
+        const rig = await live();
+        await flipKind(kind, on);
+        expect(registered(rig).at(-1)).toMatchObject({ token: "ExponentPushToken[abc-123_XYZ]", kinds });
+        expect(kindSwitch(kind).props.value).toBe(!on); // not before the Mac says so
+        await reply(rig, { type: "ack", message: "Notifications on" });
+        expect(kindSwitch(kind).props.value).toBe(on);
+        expect((await loadSettings()).pushKinds).toEqual(kinds);
+        expect((await loadSettings()).notifications).toBe(true);
+      });
+
+      it("shows its working words, and every switch waits meanwhile", async () => {
+        const rig = await live();
+        await flipKind("turns", true);
+        expect(screen.getByText("Turning on…")).toBeTruthy();
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.disabled).toBe(true);
+        await reply(rig, { type: "ack", message: "Notifications on" });
+        expect(screen.queryByText("Turning on…")).toBeNull();
+        await flipKind("turns", false);
+        expect(screen.getByText("Turning off…")).toBeTruthy();
+        await reply(rig, { type: "ack", message: "Notifications on" });
+        expect(screen.queryByText("Turning off…")).toBeNull();
+      });
+
+      it("a refusal puts the switch back and shows the Mac's words", async () => {
+        const rig = await live();
+        await flipKind("turns", true);
+        await reply(rig, { type: "refused", code: "invalid", reason: "Bad kinds" });
+        expect(screen.getByText("Bad kinds")).toBeTruthy();
+        expect(kindSwitch("turns").props.value).toBe(false);
+        expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: true, turns: false });
+      });
+
+      it("offline, the switch does not move, and says so", async () => {
+        const rig = await live();
+        await act(async () => rig.sockets.last.drop());
+        await flipKind("turns", true);
+        await act(async () => {
+          rig.clock.advance(8_000);
+        });
+        await flush();
+        expect(screen.getByText("Can't reach your Mac")).toBeTruthy();
+        expect(kindSwitch("turns").props.value).toBe(false);
+        expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: true, turns: false });
+      });
+
+      it("the last one turned off sends a null token and puts every switch off", async () => {
+        const rig = await live({ approvals: true, errors: false, turns: false });
+        await flipKind("approvals", false);
+        expect(registered(rig).at(-1)).toMatchObject({ token: null });
+        await reply(rig, { type: "ack", message: "Notifications off" });
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.value).toBe(false);
+        expect((await loadSettings()).notifications).toBe(false);
+      });
+
+      it("one turned on while notifications are off turns them on, through the permission flow, with only that kind", async () => {
+        mockConfig = { extra: { eas: { projectId: PROJECT } } };
+        const rig = await open();
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.value).toBe(false);
+        await flipKind("errors", true);
+        expect(notifications.requestPermissionsAsync).toHaveBeenCalledTimes(1);
+        expect(registered(rig)).toEqual([
+          expect.objectContaining({ token: "ExponentPushToken[abc-123_XYZ]", kinds: { approvals: false, errors: true, turns: false } }),
+        ]);
+        await reply(rig, { type: "ack", message: "Notifications on" });
+        expect(kindSwitch("errors").props.value).toBe(true);
+        expect(kindSwitch("approvals").props.value).toBe(false);
+        expect((await loadSettings()).notifications).toBe(true);
+      });
+
+      it("is disabled, with the project-id words, when the app has no EAS project id", async () => {
+        await open();
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.disabled).toBe(true);
+        expect(screen.getByText(NO_ID)).toBeTruthy();
+      });
+
+      it("has the switch role, a label and a 44-point hit area on the new switches", async () => {
+        await live();
+        for (const kind of ["errors", "turns"] as const) {
+          const slop = kindSwitch(kind).props.hitSlop as { top: number; bottom: number; left: number; right: number };
+          expect(31 + slop.top + slop.bottom).toBeGreaterThanOrEqual(44);
+        }
+      });
     });
 
     it("has a label, the switch role and a 44-point hit area", async () => {

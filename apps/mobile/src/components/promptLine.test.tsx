@@ -4,6 +4,8 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import * as Haptics from "expo-haptics";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { StyleSheet } from "react-native";
 
 import { Refusal } from "../client/HubClient";
@@ -44,6 +46,59 @@ describe("the prompt line", () => {
     await fireEvent.changeText(input(), "first\nsecond");
     await fireEvent.press(sendKey());
     expect(r.sent).toEqual([{ type: "prompt", session: "s", text: "first\nsecond" }]);
+  });
+
+  it("takes its question placeholder from the question it is given", async () => {
+    const view = await render(controls(rig().send, { question: true }));
+    expect(input().props.placeholder).toBe(PLACEHOLDER.question);
+    await view.rerender(controls(rig().send, { question: true, phase: "running" }));
+    expect(input().props.placeholder).toBe(PLACEHOLDER.running);
+    await view.rerender(controls(rig().send));
+    expect(input().props.placeholder).toBe(PLACEHOLDER.idle);
+  });
+
+  it("marks the session's question answered when the Mac takes a prompt, and not when it refuses", async () => {
+    const row = { id: "s", engine: "claude", workspace: "/w", mode: "ask", phase: "idle", approvals: 0, from_phone: false, question: true };
+    octetStore.getState().applyBatch([{ v: 1, type: "sessions", sessions: [row] } as never]);
+    const r = rig();
+    await render(controls(r.send, { question: true }));
+    await fireEvent.changeText(input(), "yes");
+    await fireEvent.press(sendKey());
+    await flush();
+    r.waiting[0]?.reject(new Refusal("invalid", "No"));
+    await flush();
+    expect(octetStore.getState().sessions[0]?.question).toBe(true);
+    await fireEvent.press(sendKey());
+    await flush();
+    r.waiting[1]?.resolve();
+    await flush();
+    expect(octetStore.getState().sessions[0]?.question).toBeUndefined();
+  });
+
+  it("focuses the field when the Inbox's Reply asked for it, and says the ask is spent when it goes", async () => {
+    octetStore.getState().setReplyTo("s");
+    const view = await render(controls(rig().send));
+    expect(input().props.autoFocus).toBe(true);
+    await view.unmount();
+    expect(octetStore.getState().replyTo).toBeNull();
+  });
+
+  it("does not focus the field for another session's Reply", async () => {
+    octetStore.getState().setReplyTo("other");
+    await render(controls(rig().send));
+    expect(input().props.autoFocus).toBeFalsy();
+    expect(octetStore.getState().replyTo).toBe("other");
+  });
+
+  it("documents the field's height on PROMPT_LINES, and the early-return note on JUST_APPEARED", () => {
+    const source = readFileSync(path.join(__dirname, "PromptLine.tsx"), "utf8").split("\n");
+    const before = (name: string): string => {
+      const at = source.findIndex((line) => line.startsWith(`export const ${name} `));
+      expect(at).toBeGreaterThan(0);
+      return source[at - 1] ?? "";
+    };
+    expect(before("PROMPT_LINES")).toBe("/** The field grows to this many lines, then scrolls. */");
+    expect(before("JUST_APPEARED")).toBe("/** Said beside the prompt for a return in the 400 ms after an approval came: nothing was sent. */");
   });
 
   describe("placeholders follow the state", () => {
@@ -513,6 +568,37 @@ describe("the prompt line", () => {
       await submit();
       await flush();
       expect(r.sent).toEqual([{ type: "answer", session: "s", approval: 3, allow: false }]);
+    });
+
+    it("the note does not come back once the approval has armed, when it is disarmed and armed again", async () => {
+      const r = rig();
+      const view = await render(controls(r.send, { phase: "running", approvals: [approval(3)] }));
+      await fireEvent.changeText(input(), "do something else");
+      await submit();
+      await flush();
+      expect(screen.getByText(JUST_APPEARED)).toBeTruthy();
+      await settle(400);
+      expect(screen.queryByText(JUST_APPEARED)).toBeNull();
+      // The link drops and comes back: the approval arms again, and until it does nothing is
+      // wrong that the user needs telling about; they have not sent anything since.
+      await view.rerender(controls(r.send, { phase: "running", approvals: [approval(3)], offline: true }));
+      await view.rerender(controls(r.send, { phase: "running", approvals: [approval(3)] }));
+      await flush();
+      expect(screen.queryByText(JUST_APPEARED)).toBeNull();
+      await settle(400);
+      expect(screen.queryByText(JUST_APPEARED)).toBeNull();
+    });
+
+    it("a return in that new window says to wait again", async () => {
+      const r = rig();
+      const view = await render(controls(r.send, { phase: "running", approvals: [approval(3)] }));
+      await settle(400);
+      await view.rerender(controls(r.send, { phase: "running", approvals: [approval(3)], offline: true }));
+      await view.rerender(controls(r.send, { phase: "running", approvals: [approval(3)] }));
+      await fireEvent.changeText(input(), "do something else");
+      await submit();
+      await flush();
+      expect(screen.getByText(JUST_APPEARED)).toBeTruthy();
     });
 
     it("covered (the menu or the drawer is up), sends nothing", async () => {

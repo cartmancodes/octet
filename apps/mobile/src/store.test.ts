@@ -61,6 +61,74 @@ describe("reset", () => {
   });
 });
 
+describe("a question answered from the phone", () => {
+  const question = (id: string, extra: Partial<SessionInfo> = {}) => info(id, { question: true, ...extra });
+
+  it("is cleared from the row at once, and the row is a new object", () => {
+    store.getState().applyBatch([sessions(question("a"), question("b"))]);
+    const before = store.getState().sessions;
+    store.getState().markAnswered("a");
+    const after = store.getState().sessions;
+    expect(after[0]?.question).toBeUndefined();
+    expect(after[1]).toBe(before[1]);
+  });
+
+  it("stays cleared through rows that still say question (the Mac has not caught up), but not through a new question", () => {
+    store.getState().applyBatch([sessions(question("a"))]);
+    store.getState().markAnswered("a");
+    store.getState().applyBatch([sessions(question("a", { last_activity: 5 }))]);
+    expect(store.getState().sessions[0]?.question).toBeUndefined();
+    expect(store.getState().sessions[0]?.last_activity).toBe(5);
+    // The Mac caught up (its row has no question); the next question is a new one.
+    store.getState().applyBatch([sessions(info("a", { last_activity: 6 }))]);
+    store.getState().applyBatch([sessions(question("a", { last_activity: 9 }))]);
+    expect(store.getState().sessions[0]?.question).toBe(true);
+  });
+
+  it("keeps the row's identity while a stale question row repeats", () => {
+    store.getState().applyBatch([sessions(question("a"))]);
+    store.getState().markAnswered("a");
+    const row = store.getState().sessions;
+    store.getState().applyBatch([sessions(question("a"))]);
+    expect(store.getState().sessions).toBe(row);
+  });
+
+  it("marks nothing for a session that is not asking: a later question must still show", () => {
+    store.getState().applyBatch([sessions(info("a"))]);
+    store.getState().markAnswered("a");
+    store.getState().markAnswered("missing");
+    store.getState().applyBatch([sessions(question("a"))]);
+    expect(store.getState().sessions[0]?.question).toBe(true);
+  });
+
+  it("forgets the mark when the session leaves the list, and on reset", () => {
+    store.getState().applyBatch([sessions(question("a"))]);
+    store.getState().markAnswered("a");
+    store.getState().applyBatch([sessions(info("b"))]);
+    store.getState().applyBatch([sessions(question("a"))]);
+    expect(store.getState().sessions.find((s) => s.id === "a")?.question).toBe(true);
+    store.getState().markAnswered("a");
+    store.getState().reset();
+    store.getState().applyBatch([sessions(question("a"))]);
+    expect(store.getState().sessions[0]?.question).toBe(true);
+  });
+});
+
+describe("asking to reply", () => {
+  it("is one session at a time, cleared by null and by reset", () => {
+    expect(store.getState().replyTo).toBeNull();
+    store.getState().setReplyTo("a");
+    expect(store.getState().replyTo).toBe("a");
+    store.getState().setReplyTo("b");
+    expect(store.getState().replyTo).toBe("b");
+    store.getState().setReplyTo(null);
+    expect(store.getState().replyTo).toBeNull();
+    store.getState().setReplyTo("a");
+    store.getState().reset();
+    expect(store.getState().replyTo).toBeNull();
+  });
+});
+
 describe("the sessions list", () => {
   it("is updated by a sessions frame", () => {
     store.getState().applyBatch([sessions(info("a"), info("b", { goal: "ship it" }))]);

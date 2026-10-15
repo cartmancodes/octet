@@ -14,6 +14,7 @@ import { FakeClock, Sockets } from "./client/fakes";
 import { HubContext, HubController, TOKEN_KEY } from "./hub";
 import { closeDrawer } from "./drawer";
 import * as inboxWords from "./inbox";
+import * as navigation from "./navigation";
 import { saveSettings } from "./persist";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { octetStore } from "./store";
@@ -905,5 +906,94 @@ describe("the Inbox", () => {
     const parts = String(open.props.accessibilityLabel).split(", ");
     expect(parts.every((p) => p.length <= 120)).toBe(true);
     expect(inCard("a").getByText(goal)).toBeTruthy();
+  });
+
+  describe("a session that ended on a question", () => {
+    const asking = (id: string, extra: Partial<SessionInfo> = {}) => info(id, { question: true, ...extra });
+
+    it("is a card in Needs you: ● question, 'Ended on a question' and a Reply button, and no Allow, Deny or Review", async () => {
+      await launch([asking("a")]);
+      expect(screen.getByRole("tab", { name: "Needs you 1" })).toBeTruthy();
+      const c = inCard("a");
+      expect(c.getByText("● question")).toBeTruthy();
+      expect(c.getByText("Ended on a question")).toBeTruthy();
+      expect(c.getByRole("button", { name: "Reply to a" })).toBeTruthy();
+      expect(c.queryByRole("button", { name: /^Allow once/ })).toBeNull();
+      expect(c.queryByRole("button", { name: /^Deny/ })).toBeNull();
+      expect(c.queryByRole("button", { name: /^Review/ })).toBeNull();
+      expect([dark.amber, light.amber]).toContain(style(c.getByText("● question")).color);
+    });
+
+    it("is not in Running or Done", async () => {
+      await launch([asking("a"), info("b")]);
+      await fireEvent.press(tab("Done"));
+      expect(screen.queryByTestId("inbox-card-a")).toBeNull();
+      expect(screen.getByTestId("inbox-card-b")).toBeTruthy();
+    });
+
+    it("Reply opens the conversation and asks for its prompt to be focused", async () => {
+      const rig = await launch([asking("a")]);
+      expect(octetStore.getState().replyTo).toBeNull();
+      await fireEvent.press(inCard("a").getByRole("button", { name: "Reply to a" }));
+      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(octetStore.getState().replyTo).toBe("a");
+      expect(answers(rig)).toEqual([]);
+    });
+
+    it("tapping the card itself opens the conversation without asking for the prompt", async () => {
+      const rig = await launch([asking("a")]);
+      octetStore.getState().setReplyTo("zzz");
+      await fireEvent.press(inCard("a").getByRole("button", { name: /^a, / }));
+      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(octetStore.getState().replyTo).toBeNull();
+    });
+
+    it("Reply does nothing while the Mac can't be reached", async () => {
+      const rig = await launch([asking("a")]);
+      await act(async () => {
+        rig.sockets.last.drop();
+      });
+      const reply = inCard("a").getByRole("button", { name: "Reply to a" });
+      expect(disabled(reply)).toBe(true);
+      await fireEvent.press(reply);
+      expect(rig.view.getPathname()).toBe("/");
+    });
+
+    it("has a 44-point Reply button", async () => {
+      await launch([asking("a")]);
+      expect(Number(style(inCard("a").getByRole("button", { name: "Reply to a" })).minHeight)).toBeGreaterThanOrEqual(44);
+    });
+
+    it("leaves Allow all to the approvals", async () => {
+      await launch([waiting("a", gist(1)), waiting("b", gist(2)), asking("c")]);
+      await wait(400);
+      expect(screen.getByRole("button", { name: "Allow all 2 once" })).toBeTruthy();
+    });
+
+    it("goes when the Mac's row stops saying question", async () => {
+      const rig = await launch([asking("a")]);
+      await hear(rig, [info("a")]);
+      expect(screen.queryByTestId("inbox-card-a")).toBeNull();
+    });
+  });
+
+  describe("opening a session from a card", () => {
+    it("goes through openSession, so a conversation already in the stack is not opened twice", async () => {
+      const open = jest.spyOn(navigation, "openSession");
+      const rig = await launch([info("a")]);
+      await fireEvent.press(tab("Done"));
+      await fireEvent.press(inCard("a").getByRole("button", { name: /^a, / }));
+      expect(open).toHaveBeenCalledTimes(1);
+      expect(open.mock.calls[0]?.[2]).toBe("/");
+      expect(open.mock.calls[0]?.[3]).toBe("a");
+      expect(rig.view.getPathname()).toBe("/session/a");
+    });
+
+    it("Review goes through it too", async () => {
+      const open = jest.spyOn(navigation, "openSession");
+      await launch([waiting("a", gist(1, { action: "Edit", command: null, files: ["x.rs"] }))]);
+      await fireEvent.press(inCard("a").getByRole("button", { name: "Review a" }));
+      expect(open).toHaveBeenCalledWith(expect.anything(), expect.anything(), "/", "a");
+    });
   });
 });

@@ -127,7 +127,7 @@ function Cards() {
   return (
     <View>
       {items.map((item) => (
-        <InboxCard key={item.id} item={item} offline={false} covered={false} send={send} ledger={ledger} isFront={isFront} onOpen={open} />
+        <InboxCard key={item.id} item={item} offline={false} covered={false} send={send} ledger={ledger} isFront={isFront} onOpen={open} onReply={open} />
       ))}
     </View>
   );

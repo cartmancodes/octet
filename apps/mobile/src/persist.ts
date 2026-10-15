@@ -3,6 +3,8 @@
 // saved, so a cold start subscribes fresh.
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
+import type { PushKinds } from "./protocol";
+
 export interface Settings {
   /** The name this phone pairs under; null until chosen. */
   deviceName: string | null;
@@ -12,6 +14,9 @@ export interface Settings {
   hubUrl: string | null;
   /** Push notifications are on: the Mac has this phone's token. Off unless the user turned it on. */
   notifications: boolean;
+  /** What the Mac pushes this phone while notifications are on. Missing is the Mac's own default
+   * for a new pairing: approvals and errors on, finished turns off. */
+  pushKinds: PushKinds;
   /** The transcript's text size in points, which `Aa` cycles. */
   textSize: TextSize;
 }
@@ -19,7 +24,17 @@ export interface Settings {
 export const TEXT_SIZES = [12, 13, 14] as const;
 export type TextSize = (typeof TEXT_SIZES)[number];
 
-export const DEFAULT_SETTINGS: Settings = { deviceName: null, faceId: true, hubUrl: null, notifications: false, textSize: 13 };
+/** What the hub sends a newly paired device, which is what an app with nothing saved shows. */
+export const DEFAULT_PUSH_KINDS: PushKinds = { approvals: true, errors: true, turns: false };
+
+export const DEFAULT_SETTINGS: Settings = {
+  deviceName: null,
+  faceId: true,
+  hubUrl: null,
+  notifications: false,
+  pushKinds: DEFAULT_PUSH_KINDS,
+  textSize: 13,
+};
 export const SETTINGS_KEY = "octet.settings.v1";
 /** What to tell the user when a settings write failed. */
 export const NOT_SAVED = "Couldn't save that setting";
@@ -29,6 +44,15 @@ const MAX_CHARS = 2_048;
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 const text = (x: unknown): string | null => (typeof x === "string" && x.length <= MAX_CHARS ? x : null);
+/** Each kind that is missing or not a boolean is the default's. */
+function pushKinds(x: unknown): PushKinds {
+  if (!isObj(x)) return DEFAULT_PUSH_KINDS;
+  const kind = (k: keyof PushKinds): boolean => {
+    const v = x[k];
+    return typeof v === "boolean" ? v : DEFAULT_PUSH_KINDS[k];
+  };
+  return { approvals: kind("approvals"), errors: kind("errors"), turns: kind("turns") };
+}
 const textSize = (x: unknown): TextSize => (TEXT_SIZES as readonly unknown[]).includes(x) ? (x as TextSize) : DEFAULT_SETTINGS.textSize;
 
 /** The saved settings; each field that is missing or not the right type is its default. None
@@ -52,6 +76,7 @@ export async function readSettings(): Promise<{ ok: true; settings: Settings } |
         faceId: typeof value.faceId === "boolean" ? value.faceId : DEFAULT_SETTINGS.faceId,
         hubUrl: text(value.hubUrl),
         notifications: typeof value.notifications === "boolean" ? value.notifications : DEFAULT_SETTINGS.notifications,
+        pushKinds: pushKinds(value.pushKinds),
         textSize: textSize(value.textSize),
       },
     };
@@ -89,6 +114,7 @@ async function write(patch: Partial<Settings>): Promise<boolean> {
         faceId: next.faceId,
         hubUrl: next.hubUrl,
         notifications: next.notifications,
+        pushKinds: next.pushKinds,
         textSize: next.textSize,
       }),
     );

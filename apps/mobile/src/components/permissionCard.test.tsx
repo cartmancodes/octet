@@ -604,6 +604,52 @@ describe("what Allow runs is never out of sight", () => {
     expect(screen.getByText(SHORTENED)).toBeTruthy();
   });
 
+  describe("the bridge's reduced edit summary, whose files are just +N more", () => {
+    const edit = (files: string[]): PendingApproval => {
+      const v = reduceView(EMPTY_VIEW, [
+        { op: "event", ev: { type: "approval", data: { id: 1, detail: "{}", summary: { action: "Edit files", files, scope: "once" } } } },
+      ]);
+      const a = v.approvals[0];
+      if (!a) throw new Error("no approval");
+      return a;
+    };
+
+    it("is shortened: none of the files is shown", async () => {
+      await render(<Card approvals={[edit(["+25 more"])]} send={rig().send} />);
+      expect(screen.getByText(SHORTENED)).toBeTruthy();
+    });
+
+    it("is shortened when a state frame brings it too", async () => {
+      const v = reduceView(EMPTY_VIEW, [
+        {
+          op: "state",
+          state: {
+            phase: "running",
+            queue: [],
+            queued: 0,
+            mode: "ask",
+            approvals: [{ id: 2, summary: { action: "Edit files", files: ["+3 more"], scope: "once" } }],
+          },
+        },
+      ]);
+      expect(v.approvals[0]?.cut).toBe(true);
+    });
+
+    it("is not shortened with files shown, even with +N more after them, or with a real file list", async () => {
+      const view = await render(<Card approvals={[edit(["a.rs", "b.rs", "+2 more"])]} send={rig().send} />);
+      expect(screen.queryByText(SHORTENED)).toBeNull();
+      await view.rerender(<Card approvals={[edit(["a.rs"])]} send={rig().send} />);
+      expect(screen.queryByText(SHORTENED)).toBeNull();
+      await view.rerender(<Card approvals={[edit([])]} send={rig().send} />);
+      expect(screen.queryByText(SHORTENED)).toBeNull();
+    });
+
+    it("a file named like the marker, among others, is not taken for one", async () => {
+      await render(<Card approvals={[edit(["+25 more", "real.rs"])]} send={rig().send} />);
+      expect(screen.queryByText(SHORTENED)).toBeNull();
+    });
+  });
+
   it.each([
     ["line separators", "\u2028"],
     ["paragraph separators", "\u2029"],

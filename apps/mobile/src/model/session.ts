@@ -135,16 +135,20 @@ const optStr = (x: unknown, limit: number): string | null | undefined =>
  * command to 4 KiB and ends it with this (`clip`, crates/octet-tui/src/bridge.rs). */
 const HUB_CLIP_MARK = "…";
 
-/** A summary cleaned and bounded, and whether its command is not whole. */
+/** The bridge's reduced summary of an edit lists no file, only how many there were: `+N more`. */
+const ONLY_MORE_FILES = /^\+\d+ more$/;
+
+/** A summary cleaned and bounded, and whether its command is not whole, or its files are not
+ * shown at all (the bridge's reduced edit: `["+N more"]`). */
 function cleanSummary(raw: unknown): { summary: ApprovalSummary; cut: boolean } {
   const s = isObj(raw) ? raw : {};
   const files = Array.isArray(s.files) ? s.files.slice(0, MAX_FILES).map((f) => str(f, SHORT_CHARS * 4)) : [];
   const out: ApprovalSummary = { action: str(s.action, TEXT_CHARS), files, scope: str(s.scope, SHORT_CHARS) };
-  let cut = false;
+  let cut = files.length === 1 && ONLY_MORE_FILES.test(files[0] ?? "");
   if (typeof s.command === "string") {
     const command = fieldCut(s.command, DETAIL_CHARS);
     out.command = command.text;
-    cut = command.cut || command.text.endsWith(HUB_CLIP_MARK);
+    cut = cut || command.cut || command.text.endsWith(HUB_CLIP_MARK);
   } else if (s.command !== undefined) out.command = null;
   const cwd = optStr(s.cwd, SHORT_CHARS * 4);
   if (cwd !== undefined) out.cwd = cwd;

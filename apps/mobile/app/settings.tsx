@@ -12,6 +12,7 @@ import { useHubController, useHubSnapshot } from "../src/hub";
 import { macName } from "../src/inbox";
 import { NO_PROJECT_ID, projectId } from "../src/notifications";
 import { NOT_SAVED, loadSettings, saveSettings, type Settings as Saved } from "../src/persist";
+import type { PushKinds } from "../src/protocol";
 import { useHub } from "../src/store";
 import { spacing, type, useTheme } from "../src/theme";
 import { Button, Card } from "../src/ui";
@@ -23,8 +24,6 @@ export const UNPAIR_BODY =
 
 /** The footer's words, after the app's name and version. */
 const FOOTER = "talks to your Macs directly over your tailnet; nothing passes through a relay.";
-/** Said under "A turn finishes", which has no setting of its own until the hub tells turns apart. */
-export const TURN_NOTE = "Coming with the next hub update";
 
 /** This phone's settings: the Mac it is paired with (and Unpair), what to notify it about, and
  * whether Allow asks for Face ID. */
@@ -81,17 +80,20 @@ export default function Settings() {
     [change],
   );
 
-  const changePush = useCallback(
-    async (on: boolean) => {
+  // One kind of push on or off: the Mac is told first, and the switch moves on its ack.
+  const changeKind = useCallback(
+    async (kind: keyof PushKinds, on: boolean) => {
       if (pushing.current) return;
       pushing.current = true;
       try {
         setPushError(null);
         setWorking(on ? "on" : "off");
-        const result = await (on ? hub.turnOnNotifications() : hub.turnOffNotifications());
+        const result = await hub.setPushKind(kind, on);
         if (!alive()) return;
-        if (result.ok) setSaved((s) => (s ? { ...s, notifications: on } : s));
-        else setPushError(result.message);
+        if (result.ok) {
+          const now = await loadSettings();
+          if (alive()) setSaved((s) => (s ? { ...s, notifications: now.notifications, pushKinds: now.pushKinds } : s));
+        } else setPushError(result.message);
       } finally {
         pushing.current = false;
         if (alive()) setWorking(null);
@@ -100,12 +102,9 @@ export default function Settings() {
     [alive, hub],
   );
 
-  const flipPush = useCallback(
-    (on: boolean) => {
-      void changePush(on);
-    },
-    [changePush],
-  );
+  const flipApprovals = useCallback((on: boolean) => void changeKind("approvals", on), [changeKind]);
+  const flipTurns = useCallback((on: boolean) => void changeKind("turns", on), [changeKind]);
+  const flipErrors = useCallback((on: boolean) => void changeKind("errors", on), [changeKind]);
 
   const openMenu = useCallback(() => openDrawer(), []);
 
@@ -119,7 +118,9 @@ export default function Settings() {
   if (saved === null) return <View style={[styles.screen, { backgroundColor: theme.bg }]} />;
   const version = Constants.expoConfig?.version;
   const hasProject = projectId() !== null;
-  const pushOn = hasProject && saved.notifications;
+  // With notifications off every switch shows off, whatever kinds are kept.
+  const shows = (kind: keyof PushKinds): boolean => hasProject && saved.notifications && saved.pushKinds[kind];
+  const stuck = !hasProject || working !== null;
   const pushWords =
     working === "on" ? "Turning on…" : working === "off" ? "Turning off…" : (pushError ?? (hasProject ? pushNotice : NO_PROJECT_ID));
   const mac = macName(saved.hubUrl);
@@ -155,13 +156,9 @@ export default function Settings() {
         </Card>
 
         <Card title="Notify me when">
-          <SwitchRow
-            label="An action needs approval"
-            value={pushOn}
-            disabled={!hasProject || working !== null}
-            onValueChange={flipPush}
-          />
-          <SwitchRow label="A turn finishes" value={pushOn} disabled note={TURN_NOTE} hint={TURN_NOTE} first={false} />
+          <SwitchRow label="An action needs approval" value={shows("approvals")} disabled={stuck} onValueChange={flipApprovals} />
+          <SwitchRow label="A turn finishes" value={shows("turns")} disabled={stuck} first={false} onValueChange={flipTurns} />
+          <SwitchRow label="A session hits an error" value={shows("errors")} disabled={stuck} first={false} onValueChange={flipErrors} />
           {pushWords !== null ? (
             <View accessibilityLiveRegion="polite" style={styles.words}>
               <Text style={[type.caption, { color: theme.fg }]}>{pushWords}</Text>
@@ -193,28 +190,22 @@ interface SwitchRowProps {
   accessibilityLabel?: string;
   value: boolean;
   disabled?: boolean;
-  /** A muted line under the label. */
-  note?: string;
-  /** What a screen reader adds to the switch. */
-  hint?: string;
   /** Not the first row of its card: a rule above it. */
   first?: boolean;
   onValueChange?: (on: boolean) => void;
 }
 
-/** One row of switches: the label (and its note) on the left, the switch on the right. */
-const SwitchRow = memo(function SwitchRow({ label, accessibilityLabel, value, disabled = false, note, hint, first = true, onValueChange }: SwitchRowProps) {
+/** One row of switches: the label on the left, the switch on the right. */
+const SwitchRow = memo(function SwitchRow({ label, accessibilityLabel, value, disabled = false, first = true, onValueChange }: SwitchRowProps) {
   const theme = useTheme();
   return (
     <View style={[styles.switchRow, first ? null : [styles.rule, { borderTopColor: theme.edge }]]}>
       <View style={styles.grow}>
         <Text style={[type.body, { color: disabled ? theme.muted : theme.fg }]}>{label}</Text>
-        {note ? <Text style={[type.label, { color: theme.muted }]}>{note}</Text> : null}
       </View>
       <Switch
         accessibilityRole="switch"
         accessibilityLabel={accessibilityLabel ?? label}
-        accessibilityHint={hint}
         value={value}
         disabled={disabled}
         onValueChange={onValueChange}

@@ -1,4 +1,4 @@
-import { NO_GIST_LINE, cardLabel, classify, drawerList, drawerSub, macName, shortAgo } from "./inbox";
+import { NO_GIST_LINE, cardLabel, classify, drawerList, drawerSub, macName, sameItem, shortAgo } from "./inbox";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 
 const NOW_MS = 1_800_000_000 * 1000;
@@ -95,7 +95,60 @@ describe("classify", () => {
       approval: gist(3),
       editApproval: false,
       shortened: false,
+      question: false,
       files: [],
+    });
+  });
+
+  describe("a session that ended on a question", () => {
+    it("goes in Needs you, as '● question' in amber with its line and nothing to answer from the card", () => {
+      const { needs, running, done } = run([info("a", { question: true, last_activity: NOW_S - 120 })]);
+      expect(running).toEqual([]);
+      expect(done).toEqual([]);
+      expect(needs).toEqual([
+        {
+          id: "a",
+          name: "a",
+          ago: "2m",
+          status: "● question",
+          statusTone: "amber",
+          line: "Ended on a question",
+          files: [],
+          approval: null,
+          editApproval: false,
+          shortened: false,
+          question: true,
+        },
+      ]);
+    });
+
+    it("an approval comes first: a row with both is an approval card, not a question", () => {
+      const [item] = run([info("a", { question: true, approvals: 1, approval: gist(1) })]).needs;
+      expect(item).toMatchObject({ status: "● Bash · cargo test", question: false });
+    });
+
+    it("only `true` is a question", () => {
+      const { needs } = run([info("a", { question: false }), info("b", { question: null }), info("c")]);
+      expect(needs).toEqual([]);
+    });
+
+    it("sorts among the approvals by last activity", () => {
+      const { needs } = run([
+        info("q", { question: true, last_activity: NOW_S - 50 }),
+        info("w", { approvals: 1, approval: gist(1), last_activity: NOW_S - 10 }),
+        info("q2", { question: true, last_activity: NOW_S - 500 }),
+      ]);
+      expect(needs.map((i) => i.id)).toEqual(["w", "q", "q2"]);
+    });
+
+    it("its label reads the status and the line, and sameItem tells it from a quiet card", () => {
+      const [item] = run([info("a", { question: true })]).needs;
+      if (!item) throw new Error("no item");
+      expect(cardLabel(item)).toBe("a, ● question, Ended on a question");
+      const [quiet] = run([info("a")]).done;
+      expect(sameItem(item, { ...item })).toBe(true);
+      expect(sameItem(item, { ...item, question: false })).toBe(false);
+      expect(quiet).toBeDefined();
     });
   });
 
@@ -273,6 +326,12 @@ describe("drawerList", () => {
   it("says approve in amber for a waiting approval, even without its gist", () => {
     const [row] = rows([info("a", { approvals: 2, phase: "running" })]);
     expect(row).toMatchObject({ id: "a", name: "a", status: "approve", tone: "amber" });
+  });
+
+  it("says question in amber for a session that ended on one, and counts it as needing you", () => {
+    const list = [info("a", { question: true }), waitingInfo("b")];
+    expect(drawerList(list, NOW_MS)).toMatchObject({ needs: 2 });
+    expect(rows(list).find((r) => r.id === "a")).toMatchObject({ status: "question", tone: "amber" });
   });
 
   it("says the phase word in the accent for a running turn", () => {

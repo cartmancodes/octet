@@ -31,10 +31,13 @@ export interface InboxItem {
    * bridge reduced it to fit. What Allow would run is not all on the card, so the card offers
    * Review in place of Allow once, and Allow all leaves it out. */
   shortened: boolean;
+  /** No approval waits, but the last turn ended on a question (the hub's heuristic): the card
+   * offers Reply. */
+  question: boolean;
 }
 
 export interface Inbox {
-  /** An approval waits. */
+  /** An approval waits, or the last turn ended on a question. */
   needs: InboxItem[];
   /** A turn is running. */
   running: InboxItem[];
@@ -44,6 +47,9 @@ export interface Inbox {
 
 /** The excerpt of a session waiting for an approval its row does not describe. */
 export const NO_GIST_LINE = "Open the session to see what it asks.";
+
+/** The excerpt of a session whose last turn ended on a question. */
+export const QUESTION_LINE = "Ended on a question";
 
 /** The name for the Mac when the hub's address says nothing. */
 const SOME_MAC = "Mac";
@@ -100,6 +106,7 @@ function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Pick<Inb
       approval: null,
       editApproval: false,
       shortened: false,
+      question: false,
     };
   }
   const { action, command, files, scope, cwd } = approval.summary;
@@ -117,6 +124,7 @@ function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Pick<Inb
       (!command && files.length === 0) ||
       (!!command && command.endsWith(CLIP_MARK)) ||
       files.some((f) => MORE_FILES.test(f) || f.endsWith(CLIP_MARK)),
+    question: false,
   };
 }
 
@@ -136,6 +144,18 @@ export function classify(
     const base = { id: s.id, name: sessionName(s.workspace), ago: shortAgo(s.last_activity, now) };
     if (s.approvals > 0) {
       out.needs.push(needsItem(s, fronts.get(s.id) ?? null, base));
+    } else if (s.question === true) {
+      out.needs.push({
+        ...base,
+        status: "● question",
+        statusTone: "amber",
+        line: QUESTION_LINE,
+        files: NO_FILES,
+        approval: null,
+        editApproval: false,
+        shortened: false,
+        question: true,
+      });
     } else if (s.phase === "running") {
       out.running.push({
         ...base,
@@ -146,6 +166,7 @@ export function classify(
         approval: null,
         editApproval: false,
         shortened: false,
+        question: false,
       });
     } else {
       out.done.push({
@@ -157,6 +178,7 @@ export function classify(
         approval: null,
         editApproval: false,
         shortened: false,
+        question: false,
       });
     }
   }
@@ -191,7 +213,8 @@ export function sameItem(a: InboxItem, b: InboxItem): boolean {
     a.files === b.files &&
     a.approval === b.approval &&
     a.editApproval === b.editApproval &&
-    a.shortened === b.shortened
+    a.shortened === b.shortened &&
+    a.question === b.question
   );
 }
 
@@ -199,7 +222,7 @@ export function sameItem(a: InboxItem, b: InboxItem): boolean {
 export interface DrawerRow {
   id: string;
   name: string;
-  /** "approve", a phase word ("thinking"), "done", or how long ago; empty when none is known. */
+  /** "approve", "question", a phase word ("thinking"), "done", or how long ago; empty when none is known. */
   status: string;
   tone: Tone;
 }
@@ -215,7 +238,8 @@ export interface DrawerList {
 
 /**
  * The drawer's sessions, in the Inbox's order (needs you, running, then the rest, each newest
- * first). A session waiting on an approval says "approve"; one running says what it is doing in a
+ * first). A session waiting on an approval says "approve"; one that ended on a question says
+ * "question"; one running says what it is doing in a
  * word; one that finished well says "done"; any other says how long ago it last did anything.
  * `now` is the clock in milliseconds.
  */
@@ -226,7 +250,9 @@ export function drawerList(sessions: readonly SessionInfo[], now: number): Drawe
   for (const item of [...needs, ...running, ...done]) {
     const s = byId.get(item.id);
     const base = { id: item.id, name: item.name };
-    if (item.statusTone === "amber") {
+    if (item.question) {
+      rows.push({ ...base, status: "question", tone: "amber" });
+    } else if (item.statusTone === "amber") {
       rows.push({ ...base, status: "approve", tone: "amber" });
     } else if (s && item.statusTone === "accent") {
       rows.push({ ...base, status: sessionPose(s), tone: "accent" });

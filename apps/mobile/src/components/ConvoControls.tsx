@@ -20,6 +20,8 @@ interface ConvoControlsProps {
   send: Send;
   /** The Mac can't be reached: everything stays on screen, and nothing is sent. */
   offline: boolean;
+  /** The session's last turn ended on a question. */
+  question?: boolean;
   /** The header's menu, Session info or the drawer is over the approval: it cannot be answered. */
   covered: boolean;
   /** The safe area under the key bar. */
@@ -46,6 +48,7 @@ export const ConvoControls = memo(function ConvoControls({
   approvals,
   send,
   offline,
+  question = false,
   covered,
   bottom,
   onPromptLayout,
@@ -67,6 +70,7 @@ export const ConvoControls = memo(function ConvoControls({
           permission={permission}
           send={send}
           offline={offline}
+          question={question}
           bottom={bottom}
           onCovered={setSheetUp}
         />

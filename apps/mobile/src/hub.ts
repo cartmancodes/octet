@@ -8,8 +8,9 @@ import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from ".
 import { NOT_A_LINK, isHubUrl, pairLinkProblem, parsePairLink } from "./client/link";
 import { webSocketFactory } from "./client/socket";
 import { isDevBuild } from "./build";
-import { NOT_SAVED, loadSettings, readSettings, saveSettings } from "./persist";
+import { DEFAULT_PUSH_KINDS, NOT_SAVED, loadSettings, readSettings, saveSettings } from "./persist";
 import { DENIED, askForToken, currentToken, dropPushRegistration, onTokenChange, projectId } from "./notifications";
+import type { PushKinds } from "./protocol";
 import { connectStore, octetStore, type OctetStore } from "./store";
 
 /** The keychain item holding the device token. A development build keeps its own, so that it
@@ -41,6 +42,10 @@ export interface HubSnapshot {
    * one), for Settings to show; null when the last registration worked or none was tried. */
   pushNotice: string | null;
 }
+
+/** Whether any kind of push is wanted. */
+const anyKind = (kinds: PushKinds): boolean => kinds.approvals || kinds.errors || kinds.turns;
+const NO_KINDS: PushKinds = { approvals: false, errors: false, turns: false };
 
 /** The outcome of turning notifications on or off: done, or the words for why not. */
 export type PushResult = { ok: true } | { ok: false; message: string };
@@ -243,7 +248,7 @@ export class HubController {
       this.release();
       // Before any await: a foreground event now finds no client to start.
       this.set({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
-      const address = await saveSettings({ hubUrl: null, notifications: false });
+      const address = await saveSettings({ hubUrl: null, notifications: false, pushKinds: DEFAULT_PUSH_KINDS });
       let token = await this.tokens.clear().then(() => true, () => false);
       if (!token) token = await this.tokens.clear().then(() => true, () => false);
       if (!address || !token) this.set({ notice: UNPAIR_FAILED_NOTICE });
@@ -281,14 +286,17 @@ export class HubController {
   // Notifications
 
   /** Turns notifications on: permission, the token, the Mac's ack, and only then the setting.
-   * The answer is the words to show; nothing is saved on a failure. A link that is coming back
-   * is waited for, briefly. */
+   * The kinds sent are the saved ones (the defaults when none is on). The answer is the words to
+   * show; nothing is saved on a failure. A link that is coming back is waited for, briefly. */
   async turnOnNotifications(): Promise<PushResult> {
     const client = this.current.client;
     if (client === null) return { ok: false, message: UNREACHABLE };
     const got = await askForToken();
     if (!got.ok) return got;
-    return this.register(client, got.token, true);
+    return this.inTurn(async () => {
+      const saved = (await loadSettings()).pushKinds;
+      return this.push(client, got.token, anyKind(saved) ? saved : DEFAULT_PUSH_KINDS);
+    });
   }
 
   /** Turns notifications off: the Mac is told first (a null token), then the setting is saved.
@@ -296,7 +304,28 @@ export class HubController {
   async turnOffNotifications(): Promise<PushResult> {
     const client = this.current.client;
     if (client === null) return { ok: false, message: UNREACHABLE };
-    return this.register(client, null, false);
+    return this.inTurn(() => this.push(client, null, null));
+  }
+
+  /**
+   * Turns one kind of push on or off. The Mac is sent the token with all three kinds, and the
+   * kinds are saved only on its ack. With notifications off, turning a kind on turns them on
+   * through the permission flow, from no kinds but this one (the switches all showed off); with
+   * them on, the token is the current one and the phone's permission is never asked again.
+   * Turning the last kind off is turning notifications off: a null token. The answer is the
+   * words to show when it did not work; the saved kinds are then as they were.
+   */
+  async setPushKind(kind: keyof PushKinds, on: boolean): Promise<PushResult> {
+    const client = this.current.client;
+    if (client === null) return { ok: false, message: UNREACHABLE };
+    return this.inTurn(async () => {
+      const saved = await loadSettings();
+      const next: PushKinds = { ...(saved.notifications ? saved.pushKinds : NO_KINDS), [kind]: on };
+      if (!anyKind(next)) return this.push(client, null, next);
+      const got = saved.notifications ? await currentToken() : await askForToken();
+      if (!got.ok) return got;
+      return this.push(client, got.token, next);
+    });
   }
 
   /** Runs `job` after every push job before it, whether those worked or not. */
@@ -306,21 +335,24 @@ export class HubController {
     return run;
   }
 
-  private register(client: HubClient, token: string | null, on: boolean): Promise<PushResult> {
-    return this.inTurn(async (): Promise<PushResult> => {
-      if (!(await this.whenReady(client)) || client !== this.current.client) return { ok: false, message: UNREACHABLE };
-      try {
-        await client.request({ type: "register_push", token });
-      } catch (error) {
-        return { ok: false, message: wordsOf(error) };
-      }
-      // An ack that comes after the unpair is for a pairing that is gone: it saves nothing.
-      if (client !== this.current.client) return { ok: false, message: UNREACHABLE };
-      // The Mac has the change; if the save fails the setting lags it, and the user is told so.
-      if (!(await saveSettings({ notifications: on }))) return { ok: false, message: NOT_SAVED };
-      this.notify(null);
-      return { ok: true };
-    });
+  /** Sends the Mac `register_push` (with `kinds`, when given and there is a token) and, on its
+   * ack, saves the setting: on when there is a token, else off; and the kinds, when given. Runs
+   * inside `inTurn`. */
+  private async push(client: HubClient, token: string | null, kinds: PushKinds | null): Promise<PushResult> {
+    if (!(await this.whenReady(client)) || client !== this.current.client) return { ok: false, message: UNREACHABLE };
+    try {
+      // "No token" says everything: kinds are saved here, but not sent with it.
+      await client.request(token !== null && kinds ? { type: "register_push", token, kinds } : { type: "register_push", token });
+    } catch (error) {
+      return { ok: false, message: wordsOf(error) };
+    }
+    // An ack that comes after the unpair is for a pairing that is gone: it saves nothing.
+    if (client !== this.current.client) return { ok: false, message: UNREACHABLE };
+    // The Mac has the change; if the save fails the setting lags it, and the user is told so.
+    const saved = await saveSettings({ notifications: token !== null, ...(kinds ? { pushKinds: kinds } : {}) });
+    if (!saved) return { ok: false, message: NOT_SAVED };
+    this.notify(null);
+    return { ok: true };
   }
 
   /** Resolves true when `client` is ready, now or within `READY_WAIT_MS`; false when it is not. */
@@ -356,8 +388,10 @@ export class HubController {
     return this.inTurn(async () => {
       if (!(await loadSettings()).notifications) return;
       const got = await currentToken();
-      // The user may have turned it off while the token was coming.
-      if (!(await loadSettings()).notifications) return;
+      // The user may have turned it off while the token was coming; the kinds are read again
+      // too, since they may have changed.
+      const settings = await loadSettings();
+      if (!settings.notifications) return;
       if (client !== this.current.client || client.state !== "ready") return;
       if (!got.ok) {
         if (got.message === DENIED) {
@@ -368,7 +402,9 @@ export class HubController {
         return;
       }
       try {
-        await client.request({ type: "register_push", token: got.token });
+        // The phone's kinds are the truth: a Mac that still has the ones from before kinds
+        // existed (all three on) is brought to them.
+        await client.request({ type: "register_push", token: got.token, kinds: settings.pushKinds });
         if (client === this.current.client) this.notify(null);
       } catch (error) {
         if (client !== this.current.client) return;
@@ -430,7 +466,7 @@ export class HubController {
     }
     // The Mac forgot this phone's token with the phone: a new pairing starts with notifications
     // off, and its notifications step asks again.
-    await saveSettings({ notifications: false });
+    await saveSettings({ notifications: false, pushKinds: DEFAULT_PUSH_KINDS });
     if (client !== this.current.client) return;
     this.set({ status: "unpaired", notice: UNPAIRED_NOTICE, client: null, offer: false, pushNotice: null });
   }

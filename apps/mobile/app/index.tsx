@@ -1,5 +1,5 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
-import { useIsFocused, useRouter } from "expo-router";
+import { useIsFocused, useNavigationContainerRef, usePathname, useRouter } from "expo-router";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -14,6 +14,7 @@ import { successTap } from "../src/haptics";
 import { useHubClient } from "../src/hub";
 import { classify, macName, type InboxItem } from "../src/inbox";
 import { Mascot } from "../src/mascot/Mascot";
+import { openSession } from "../src/navigation";
 import type { ApprovalInfo } from "../src/protocol";
 import { octetStore, useHub, useListed, useSessions } from "../src/store";
 import { spacing, type, useTheme } from "../src/theme";
@@ -54,6 +55,13 @@ const frontNow = (session: string): ApprovalInfo | null =>
 export default function Inbox() {
   const theme = useTheme();
   const router = useRouter();
+  const nav = useNavigationContainerRef();
+  // The screen showing, for a card tap to read: a tap never makes the cards draw again.
+  const pathname = usePathname();
+  const here = useRef(pathname);
+  useLayoutEffect(() => {
+    here.current = pathname;
+  });
   const insets = useSafeAreaInsets();
   const client = useHubClient();
   const sessions = useSessions();
@@ -166,13 +174,28 @@ export default function Inbox() {
   }, [allArmed, answerable, batchKey, alive, ledger, send]);
   const pressAll = useCallback(() => void allowEvery(), [allowEvery]);
 
-  const open = useCallback((id: string) => router.push({ pathname: "/session/[id]", params: { id } }), [router]);
+  // A card opens its session the one way every other surface does: back to it when it is
+  // already in the stack. A plain open spends any earlier Reply; Reply asks for the prompt.
+  const open = useCallback(
+    (id: string) => {
+      octetStore.getState().setReplyTo(null);
+      openSession(router, nav.getRootState(), here.current, id);
+    },
+    [router, nav],
+  );
+  const reply = useCallback(
+    (id: string) => {
+      octetStore.getState().setReplyTo(id);
+      openSession(router, nav.getRootState(), here.current, id);
+    },
+    [router, nav],
+  );
   const openNew = useCallback(() => router.push("/new"), [router]);
   const openMenu = useCallback(() => openDrawer(), []);
 
   const renderItem = useCallback<ListRenderItem<InboxItem>>(
-    ({ item }) => <InboxCard item={item} offline={offline} covered={covered} send={send} ledger={ledger} isFront={isFront} onOpen={open} />,
-    [offline, covered, send, ledger, open],
+    ({ item }) => <InboxCard item={item} offline={offline} covered={covered} send={send} ledger={ledger} isFront={isFront} onOpen={open} onReply={reply} />,
+    [offline, covered, send, ledger, open, reply],
   );
 
   // On a live link the sessions are pushed as they change, so a pull keeps the link (no offline

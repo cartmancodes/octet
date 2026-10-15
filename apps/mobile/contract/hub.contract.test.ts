@@ -30,6 +30,7 @@ const OWNER = "test@example";
 const PHONE = "Contract phone";
 const JOURNAL = "session-1-1.jsonl";
 const PUSH_TOKEN = "ExponentPushToken[contract-test-token]";
+const SESSION_TEXT = "Claude Code · opus · ask mode · /work";
 const run = existsSync(BINARY) ? describe : describe.skip;
 
 type Obj = Record<string, unknown>;
@@ -220,7 +221,8 @@ run("the app's hub client against the real octet hub", () => {
       v: 1,
       type: "ack",
       req: line.req,
-      message: line.type === "prompt" ? "queued" : "answered",
+      // A desk command answers with its text, as the terminal UI's `session` does.
+      message: line.type === "prompt" ? "queued" : line.type === "command" ? SESSION_TEXT : "answered",
     }));
     await bridge.listen();
     writeFileSync(
@@ -380,6 +382,20 @@ run("the app's hub client against the real octet hub", () => {
     expect(ack).toMatchObject({ type: "ack", message: "pong" });
   });
 
+  it("runs a desk command through the hub: the bridge gets the name and the device, and its text comes back", async () => {
+    const ack = await client?.request({ type: "command", session: sessionId, name: "session" });
+    expect(ack).toMatchObject({ type: "ack", message: SESSION_TEXT });
+    expect(bridge?.lines.find((l) => l.type === "command")).toMatchObject({ type: "command", by: PHONE, name: "session" });
+  });
+
+  it("refuses a command that is not on the closed list, and the bridge never hears it", async () => {
+    const before = bridge?.lines.length;
+    await expect(
+      client?.request({ type: "command", session: sessionId, name: "rm" as never }),
+    ).rejects.toMatchObject({ code: "invalid" });
+    expect(bridge?.lines.length).toBe(before);
+  });
+
   it("turns notifications on, and pushes a content-free message once the phone is in the background", async () => {
     const on = await client?.request({ type: "register_push", token: PUSH_TOKEN });
     expect(on).toMatchObject({ type: "ack", message: "Notifications on" });
@@ -426,6 +442,49 @@ run("the app's hub client against the real octet hub", () => {
     await until("the client to be ready", () => client?.state === "ready");
     const off = await client?.request({ type: "register_push", token: null });
     expect(off).toMatchObject({ type: "ack", message: "Notifications off" });
+  });
+
+  it("registers with kinds: only the kinds asked for are pushed, an error under its own channel", async () => {
+    const kinds = { approvals: false, errors: true, turns: false };
+    const on = await client?.request({ type: "register_push", token: PUSH_TOKEN, kinds });
+    expect(on).toMatchObject({ type: "ack", message: "Notifications on" });
+    // A second registration with no kinds keeps them, as an older app's would.
+    const again = await client?.request({ type: "register_push", token: PUSH_TOKEN });
+    expect(again).toMatchObject({ type: "ack", message: "Notifications on" });
+
+    client?.stop();
+    await sleep(500);
+    const pushes = pushFake?.bodies.length ?? 0;
+    // An approval, which this device did not ask for: nothing is pushed for it.
+    bridge?.send(bridgeState([]));
+    bridge?.send(bridgeState([9]));
+    // An error record in the journal: this is pushed, with nothing of its text.
+    journal("error", "boom: /work/private.txt");
+    const body = await until("the error push at the local fake", () => pushFake?.bodies[pushes], 15_000);
+    expect(JSON.parse(body)).toEqual([
+      {
+        to: PUSH_TOKEN,
+        title: "Octet",
+        body: "Session error",
+        data: { session: sessionId },
+        priority: "high",
+        channelId: "errors",
+      },
+    ]);
+    expect(body).not.toContain("boom");
+    expect(body).not.toContain("private");
+    await sleep(3500);
+    expect(pushFake?.bodies).toHaveLength(pushes + 1);
+
+    // Asking for approvals too: the approval still open now is news the next time it changes.
+    client?.start();
+    await until("the client to be ready", () => client?.state === "ready");
+    const both = await client?.request({
+      type: "register_push",
+      token: PUSH_TOKEN,
+      kinds: { approvals: true, errors: true, turns: false },
+    });
+    expect(both).toMatchObject({ type: "ack", message: "Notifications on" });
   });
 
   it("is unpaired once the Mac revokes the phone", async () => {

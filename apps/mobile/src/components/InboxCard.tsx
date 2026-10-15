@@ -20,6 +20,8 @@ interface InboxCardProps {
   isFront: (session: string, id: number) => boolean;
   /** Opens the session. */
   onOpen: (id: string) => void;
+  /** Opens the session with its prompt focused, to answer the question it ended on. */
+  onReply: (id: string) => void;
 }
 
 function makeStyles(theme: Theme) {
@@ -47,9 +49,10 @@ const LIGHT = makeStyles(light);
  * One session on the Inbox: its name and how long ago, the status line, and the excerpt. A card
  * with an approval answers it here: Allow once (Face ID, then armed 400 ms after it shows) and
  * Deny, or Review for a file edit. A request the hub shortened offers Review in place of Allow
- * once. Every string is the Mac's and drawn as text.
+ * once. A session that ended on a question offers Reply, which opens it with the prompt ready.
+ * Every string is the Mac's and drawn as text.
  */
-export const InboxCard = memo(function InboxCard({ item, offline, covered, send, ledger, isFront, onOpen }: InboxCardProps) {
+export const InboxCard = memo(function InboxCard({ item, offline, covered, send, ledger, isFront, onOpen, onReply }: InboxCardProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const { id, approval } = item;
@@ -57,6 +60,7 @@ export const InboxCard = memo(function InboxCard({ item, offline, covered, send,
   const answer = useApprovalAnswer(id, approval, { send, offline, covered, isOpen, ledger });
   const { allow: allowNow, deny: denyNow } = answer;
   const open = useCallback(() => onOpen(id), [onOpen, id]);
+  const reply = useCallback(() => onReply(id), [onReply, id]);
   const allow = useCallback(() => void allowNow(), [allowNow]);
   const deny = useCallback(() => void denyNow(), [denyNow]);
   const waiting = item.statusTone === "amber";
@@ -125,6 +129,8 @@ export const InboxCard = memo(function InboxCard({ item, offline, covered, send,
             />
           )}
         </View>
+      ) : item.question ? (
+        <Button label="Reply" accessibilityLabel={`Reply to ${item.name}`} variant="accent" disabled={offline} onPress={reply} />
       ) : waiting ? (
         <Button label="Review" accessibilityLabel={`Review ${item.name}`} disabled={offline} onPress={open} />
       ) : null}
@@ -143,7 +149,8 @@ function sameProps(a: InboxCardProps, b: InboxCardProps): boolean {
     a.send === b.send &&
     a.ledger === b.ledger &&
     a.isFront === b.isFront &&
-    a.onOpen === b.onOpen
+    a.onOpen === b.onOpen &&
+    a.onReply === b.onReply
   );
 }
 

@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { DEFAULT_SETTINGS, SETTINGS_KEY, loadSettings, saveSettings } from "./persist";
+import { DEFAULT_PUSH_KINDS, DEFAULT_SETTINGS, SETTINGS_KEY, loadSettings, saveSettings } from "./persist";
 
 beforeEach(async () => {
   await AsyncStorage.clear();
@@ -8,7 +8,14 @@ beforeEach(async () => {
 describe("settings", () => {
   it("default when nothing is saved", async () => {
     expect(await loadSettings()).toEqual(DEFAULT_SETTINGS);
-    expect(DEFAULT_SETTINGS).toEqual({ deviceName: null, faceId: true, hubUrl: null, notifications: false, textSize: 13 });
+    expect(DEFAULT_SETTINGS).toEqual({
+      deviceName: null,
+      faceId: true,
+      hubUrl: null,
+      notifications: false,
+      pushKinds: { approvals: true, errors: true, turns: false },
+      textSize: 13,
+    });
   });
 
   it("round-trip, and a save merges into what is there", async () => {
@@ -19,6 +26,7 @@ describe("settings", () => {
       faceId: false,
       hubUrl: "wss://mac.tail1234.ts.net/",
       notifications: false,
+      pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
     });
   });
@@ -55,6 +63,7 @@ describe("settings", () => {
       faceId: false,
       hubUrl: "wss://mac.tail1234.ts.net/",
       notifications: false,
+      pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
     });
     await saveSettings({ notifications: true });
@@ -62,6 +71,19 @@ describe("settings", () => {
     expect((await loadSettings()).deviceName).toBe("Old");
     await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ notifications: "yes" }));
     expect((await loadSettings()).notifications).toBe(false);
+  });
+
+  it("push kinds default to approvals and errors on, turns off, round-trip, and each junk field is its default", async () => {
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: true, turns: false });
+    await saveSettings({ pushKinds: { approvals: false, errors: true, turns: true } });
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: false, errors: true, turns: true });
+    // Each field alone: one that is missing or not a boolean is the default's.
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ pushKinds: { approvals: false, errors: "yes" } }));
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: false, errors: true, turns: false });
+    for (const junk of [null, 5, "all", [], [true, true, true]]) {
+      await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ pushKinds: junk }));
+      expect((await loadSettings()).pushKinds).toEqual(DEFAULT_PUSH_KINDS);
+    }
   });
 
   it("the transcript text size is 13 by default, 12, 13 or 14 when saved, and 13 for anything else", async () => {
@@ -95,12 +117,19 @@ describe("settings", () => {
 
   it("two saves at once both land", async () => {
     await Promise.all([saveSettings({ hubUrl: "wss://a/" }), saveSettings({ faceId: false }), saveSettings({ deviceName: "P" })]);
-    expect(await loadSettings()).toEqual({ deviceName: "P", faceId: false, hubUrl: "wss://a/", notifications: false, textSize: 13 });
+    expect(await loadSettings()).toEqual({
+      deviceName: "P",
+      faceId: false,
+      hubUrl: "wss://a/",
+      notifications: false,
+      pushKinds: DEFAULT_PUSH_KINDS,
+      textSize: 13,
+    });
   });
 
   it("never hold a token", async () => {
     await saveSettings({ hubUrl: "wss://x/" });
     const raw = (await AsyncStorage.getItem(SETTINGS_KEY)) ?? "";
-    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "hubUrl", "notifications", "textSize"]);
+    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "hubUrl", "notifications", "pushKinds", "textSize"]);
   });
 });

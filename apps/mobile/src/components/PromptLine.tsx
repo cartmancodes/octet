@@ -5,7 +5,7 @@ import { requestMenu } from "../convoMenu";
 import { lightTap } from "../haptics";
 import type { CommandName, Engine, Mode, Phase } from "../protocol";
 import { shortId } from "../session";
-import { octetStore, useDraft, useSent } from "../store";
+import { octetStore, useDraft, useReplying, useSent } from "../store";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
 import { CommandSheet, FreshConfirm } from "./CommandSheet";
 import { useDeskCommand } from "./deskCommand";
@@ -29,9 +29,9 @@ export function placeholderFor({ approval, running, question }: { approval: bool
   return PLACEHOLDER.idle;
 }
 
-/** The field grows to this many lines, then scrolls. */
 /** Said beside the prompt for a return in the 400 ms after an approval came: nothing was sent. */
 export const JUST_APPEARED = "Wait a moment — the approval just appeared";
+/** The field grows to this many lines, then scrolls. */
 export const PROMPT_LINES = 4;
 /** The field's room above and below its text: one line of it is 44 pt tall. */
 export const PROMPT_PAD = 12;
@@ -122,7 +122,7 @@ interface PromptLineProps {
   send: Send;
   /** The Mac can't be reached: the words stay, and nothing is sent. */
   offline: boolean;
-  /** The agent asked the user something (Phase B). */
+  /** The agent's last turn ended on a question: the placeholder asks for an answer. */
   question?: boolean;
   /** The safe area under the key bar. */
   bottom: number;
@@ -195,6 +195,18 @@ export const PromptLine = memo(function PromptLine({
   // A first prompt the Mac did not take comes back into the field, ahead of anything typed,
   // whether it was refused before this screen opened or after.
   const restore = useCallback((words: string) => setText((current) => (current === "" ? words : `${words}\n${current}`)), []);
+  // The Inbox's Reply: the field is focused as the conversation opens (or, when it is already
+  // open under another screen, as it comes into view). The ask is spent when this goes.
+  const replying = useReplying(session);
+  useEffect(() => {
+    if (replying) field.current?.focus();
+  }, [replying]);
+  useEffect(
+    () => () => {
+      if (octetStore.getState().replyTo === session) octetStore.getState().setReplyTo(null);
+    },
+    [session],
+  );
   const draft = useDraft(session);
   useEffect(() => {
     if (draft === undefined) return;
@@ -221,6 +233,9 @@ export const PromptLine = memo(function PromptLine({
   // once the arm passes.
   const [early, setEarly] = useState<string | null>(null);
   const tooEarly = early !== null && early === permission.look && !armed;
+  // Once armed the note has done its work: it does not come back when the arm is lost and
+  // regained (the link dropped), since nothing was sent in between.
+  if (early !== null && armed) setEarly(null);
   const running = phase === "running";
   const steers = running && engine === "codex";
   const matches = slashMatches(text);
@@ -247,6 +262,8 @@ export const PromptLine = memo(function PromptLine({
         setText((current) => (current === sent ? "" : current));
         setRecall(null);
         octetStore.getState().remember(session, sent);
+        // Whatever it said, the user has answered: the question goes until the Mac asks again.
+        octetStore.getState().markAnswered(session);
       });
     },
     [runPrompt, session],
@@ -443,6 +460,7 @@ export const PromptLine = memo(function PromptLine({
           onChangeText={onChange}
           onSubmitEditing={submit}
           onKeyPress={onKeyPress}
+          autoFocus={replying}
           multiline
           scrollEnabled
           submitBehavior="submit"

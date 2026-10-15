@@ -53,6 +53,16 @@ export interface OctetState {
    * in memory only: at most `MAX_SENT` a session, for at most `MAX_SENT_SESSIONS` sessions. */
   sent: ReadonlyMap<string, readonly string[]>;
   remember(session: string, text: string): void;
+  /** Sessions whose question the user answered from this phone, whose rows the Mac may not have
+   * caught up with: such a row's `question` is not kept. A session leaves this when a row of
+   * it comes without a question (the Mac caught up), when it leaves the list, and on reset. */
+  answered: ReadonlySet<string>;
+  /** The user sent something to `session`: its row stops asking, at once. Nothing for a session
+   * that is not asking now (a question that comes later must show). */
+  markAnswered(session: string): void;
+  /** The session whose prompt the Inbox's Reply asked to focus; null for none. */
+  replyTo: string | null;
+  setReplyTo(session: string | null): void;
   /** Forgets everything the hub sent, for a phone unpaired from its Mac or paired with another. */
   reset(): void;
   /** The hub refused to stream `session` for good. */
@@ -76,6 +86,7 @@ const MAX_DRAFTS = 16;
 export const MAX_SENT = 20;
 const MAX_SENT_SESSIONS = 16;
 const NO_SENT: readonly string[] = [];
+const NO_ANSWERED: ReadonlySet<string> = new Set();
 const FIELD = FIELD_CHARS;
 /** The longest usage line kept: the hub clips it to this too. */
 const USAGE_CHARS = 200;
@@ -124,19 +135,33 @@ const sameSession = (a: SessionInfo, b: SessionInfo): boolean => {
 };
 
 /** The listed sessions, reusing the previous object of each session that did not change, and the
- * previous array when none did. */
-function reconcile(prev: SessionInfo[], raw: unknown[]): SessionInfo[] {
+ * previous array when none did. A session in `answered` that still says question is shown as not
+ * asking, and stays in the set; one whose row no longer asks (the Mac caught up), or that is not
+ * listed, leaves it. */
+function reconcile(
+  prev: SessionInfo[],
+  raw: unknown[],
+  answered: ReadonlySet<string>,
+): { sessions: SessionInfo[]; answered: ReadonlySet<string> } {
   const before = new Map(prev.map((s) => [s.id, s]));
   const next: SessionInfo[] = [];
   const seen = new Set<string>();
+  const kept = new Set<string>();
   for (const item of raw.slice(0, MAX_SESSIONS)) {
     const info = cleanSession(item);
     if (!info || seen.has(info.id)) continue;
     seen.add(info.id);
+    if (info.question && answered.has(info.id)) {
+      delete info.question;
+      kept.add(info.id);
+    }
     const old = before.get(info.id);
     next.push(old && sameSession(old, info) ? old : info);
   }
-  return next.length === prev.length && next.every((s, i) => s === prev[i]) ? prev : next;
+  return {
+    sessions: next.length === prev.length && next.every((s, i) => s === prev[i]) ? prev : next,
+    answered: kept.size === answered.size && [...kept].every((id) => answered.has(id)) ? answered : kept,
+  };
 }
 
 export function createOctetStore(): OctetStore {
@@ -148,10 +173,22 @@ export function createOctetStore(): OctetStore {
     taskOpen: false,
     drafts: new Map(),
     sent: new Map(),
+    answered: NO_ANSWERED,
+    replyTo: null,
 
     reset() {
       clearParsed(); // what the old Mac's replies parsed to
-      set({ sessions: [], bySession: new Map(), hub: "offline", listed: false, taskOpen: false, drafts: new Map(), sent: new Map() });
+      set({
+        sessions: [],
+        bySession: new Map(),
+        hub: "offline",
+        listed: false,
+        taskOpen: false,
+        drafts: new Map(),
+        sent: new Map(),
+        answered: NO_ANSWERED,
+        replyTo: null,
+      });
     },
 
     remember(session, text) {
@@ -187,13 +224,29 @@ export function createOctetStore(): OctetStore {
       return text;
     },
 
+    markAnswered(session) {
+      const { sessions, answered } = get();
+      const at = sessions.findIndex((x) => x.id === session);
+      const row = sessions[at];
+      if (!row?.question) return;
+      const { question: _asked, ...quiet } = row;
+      const next = sessions.slice();
+      next[at] = quiet;
+      set({ sessions: next, answered: new Set(answered).add(session) });
+    },
+
+    setReplyTo(replyTo) {
+      if (get().replyTo !== replyTo) set({ replyTo });
+    },
+
     setTaskOpen(taskOpen) {
       if (get().taskOpen !== taskOpen) set({ taskOpen });
     },
 
     applyBatch(frames) {
-      const { sessions: before, bySession, listed: wasListed } = get();
+      const { sessions: before, bySession, listed: wasListed, answered: wasAnswered } = get();
       let sessions = before;
+      let answered = wasAnswered;
       let listed = wasListed;
       const ops = new Map<string, Op[]>();
       const push = (session: string, op: Op) => {
@@ -205,7 +258,7 @@ export function createOctetStore(): OctetStore {
         switch (frame.type) {
           case "sessions":
             if (Array.isArray(frame.sessions)) {
-              sessions = reconcile(sessions, frame.sessions);
+              ({ sessions, answered } = reconcile(sessions, frame.sessions, answered));
               listed = true;
             }
             break;
@@ -255,8 +308,13 @@ export function createOctetStore(): OctetStore {
         if (next === old || (old === undefined && next === EMPTY_VIEW)) continue;
         (views ??= new Map(bySession)).set(session, next);
       }
-      if (views === null && sessions === before && listed === wasListed) return ended;
-      set({ sessions, ...(views ? { bySession: views } : {}), ...(listed !== wasListed ? { listed } : {}) });
+      if (views === null && sessions === before && listed === wasListed && answered === wasAnswered) return ended;
+      set({
+        sessions,
+        ...(views ? { bySession: views } : {}),
+        ...(listed !== wasListed ? { listed } : {}),
+        ...(answered !== wasAnswered ? { answered } : {}),
+      });
       return ended;
     },
 
@@ -555,6 +613,8 @@ export function bindHooks(store: OctetStore) {
     /** The texts the Mac took from this phone for a session, newest last; the same array until
      * one more is sent. */
     useSent: (id: string): readonly string[] => useStore(store, (s) => s.sent.get(id) ?? NO_SENT),
+    /** The Inbox's Reply asked for this session's prompt to be focused. */
+    useReplying: (id: string): boolean => useStore(store, (s) => s.replyTo === id),
     /** The Task strip's open state, shared by every session's screen. */
     useTaskOpen: (): boolean => useStore(store, (s) => s.taskOpen),
     /** The first approval waiting in a session, from the hub's sessions row, so a session that is
@@ -607,6 +667,7 @@ export const {
   useSessionStatus,
   useListed,
   useTaskOpen,
+  useReplying,
   useDraft,
   useSent,
   useFrontApproval,

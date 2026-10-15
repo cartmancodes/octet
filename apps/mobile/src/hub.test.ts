@@ -855,6 +855,158 @@ describe("turning notifications on and off", () => {
   });
 });
 
+describe("per-kind notifications", () => {
+  const KINDS = { approvals: true, errors: true, turns: false };
+  /** Ready, with the master switch on and `kinds` saved; the registration made at ready is answered. */
+  const on = async (kinds = KINDS) => {
+    await saveSettings({ pushKinds: kinds });
+    const r = await readyWithPush(true);
+    answer(r);
+    await settle();
+    return r;
+  };
+  const last = (r: Rig) => registrations(r).at(-1);
+
+  it("turning a kind on sends the token with all three kinds, and saves them after the ack", async () => {
+    const r = await on();
+    const done = r.hub.setPushKind("turns", true);
+    await settle();
+    expect(last(r)).toMatchObject({ type: "register_push", token: PUSH, kinds: { approvals: true, errors: true, turns: true } });
+    expect((await loadSettings()).pushKinds).toEqual(KINDS); // not before the Mac says so
+    answer(r);
+    await expect(done).resolves.toEqual({ ok: true });
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: true, turns: true });
+    expect((await loadSettings()).notifications).toBe(true);
+  });
+
+  it("turning a kind off sends the rest as they are and keeps notifications on", async () => {
+    const r = await on();
+    const done = r.hub.setPushKind("errors", false);
+    await settle();
+    expect(last(r)).toMatchObject({ token: PUSH, kinds: { approvals: true, errors: false, turns: false } });
+    answer(r);
+    await expect(done).resolves.toEqual({ ok: true });
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: false, turns: false });
+    expect((await loadSettings()).notifications).toBe(true);
+  });
+
+  it("turning the last kind off sends a null token: notifications are off", async () => {
+    const r = await on({ approvals: false, errors: true, turns: false });
+    const done = r.hub.setPushKind("errors", false);
+    await settle();
+    expect(last(r)).toMatchObject({ type: "register_push", token: null });
+    answer(r, "Notifications off");
+    await expect(done).resolves.toEqual({ ok: true });
+    const saved = await loadSettings();
+    expect(saved.notifications).toBe(false);
+    expect(saved.pushKinds).toEqual({ approvals: false, errors: false, turns: false });
+  });
+
+  it("turning a kind on while notifications are off asks permission, turns them on, and sends only that kind", async () => {
+    const r = await readyWithPush(false);
+    const done = r.hub.setPushKind("errors", true);
+    await settle();
+    expect(n.requestPermissionsAsync).toHaveBeenCalledTimes(1);
+    expect(registrations(r)).toEqual([expect.objectContaining({ token: PUSH, kinds: { approvals: false, errors: true, turns: false } })]);
+    expect((await loadSettings()).notifications).toBe(false);
+    answer(r);
+    await expect(done).resolves.toEqual({ ok: true });
+    const saved = await loadSettings();
+    expect(saved.notifications).toBe(true);
+    expect(saved.pushKinds).toEqual({ approvals: false, errors: true, turns: false });
+  });
+
+  it("with notifications off and the permission denied, sends nothing and changes nothing", async () => {
+    n.requestPermissionsAsync.mockResolvedValueOnce({ granted: false, canAskAgain: false, status: "denied" } as never);
+    const r = await readyWithPush(false);
+    await expect(r.hub.setPushKind("turns", true)).resolves.toEqual({
+      ok: false,
+      message: "Notifications are off for Octet in the phone's settings.",
+    });
+    expect(registrations(r)).toHaveLength(0);
+    expect((await loadSettings()).notifications).toBe(false);
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+  });
+
+  it("with notifications on and the permission taken away, never prompts, sends nothing, and changes nothing", async () => {
+    const r = await on();
+    n.getPermissionsAsync.mockResolvedValueOnce({ granted: false, canAskAgain: false, status: "denied" } as never);
+    await expect(r.hub.setPushKind("turns", true)).resolves.toMatchObject({ ok: false });
+    expect(n.requestPermissionsAsync).not.toHaveBeenCalled();
+    expect(registrations(r)).toHaveLength(1);
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+  });
+
+  it("the Mac refusing it leaves the kinds as they were and says the Mac's words", async () => {
+    const r = await on();
+    const done = r.hub.setPushKind("turns", true);
+    await settle();
+    r.sockets.last.receive({ type: "refused", req: last(r)?.req, code: "invalid", reason: "Bad kinds" });
+    await expect(done).resolves.toEqual({ ok: false, message: "Bad kinds" });
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+  });
+
+  it("with the Mac out of reach waits a few seconds, then leaves the kinds as they were", async () => {
+    const r = await on();
+    r.sockets.last.drop();
+    const done = r.hub.setPushKind("turns", true);
+    await settle();
+    r.clock.advance(8_000);
+    await expect(done).resolves.toEqual({ ok: false, message: "Can't reach your Mac" });
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+    expect((await loadSettings()).notifications).toBe(true);
+  });
+
+  it("with no connection fails the same way", async () => {
+    const r = rig();
+    await r.hub.init();
+    await expect(r.hub.setPushKind("turns", true)).resolves.toEqual({ ok: false, message: "Can't reach your Mac" });
+  });
+
+  it("two at once go one after the other, each from what the one before saved", async () => {
+    const r = await on();
+    const a = r.hub.setPushKind("turns", true);
+    const b = r.hub.setPushKind("errors", false);
+    await settle();
+    expect(registrations(r)).toHaveLength(2); // the one at ready, and the first
+    answer(r);
+    await expect(a).resolves.toEqual({ ok: true });
+    await settle();
+    expect(last(r)).toMatchObject({ kinds: { approvals: true, errors: false, turns: true } });
+    answer(r);
+    await expect(b).resolves.toEqual({ ok: true });
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: false, turns: true });
+  });
+
+  it("the registration made at ready carries the saved kinds", async () => {
+    await saveSettings({ pushKinds: { approvals: false, errors: true, turns: true } });
+    const r = await readyWithPush(true);
+    expect(registrations(r)).toEqual([expect.objectContaining({ token: PUSH, kinds: { approvals: false, errors: true, turns: true } })]);
+  });
+
+  it("turning notifications on (the step after pairing) sends the saved kinds, or the defaults when none is on", async () => {
+    const r = await readyWithPush(false);
+    const done = r.hub.turnOnNotifications();
+    await settle();
+    expect(last(r)).toMatchObject({ token: PUSH, kinds: KINDS });
+    answer(r);
+    await done;
+    await saveSettings({ notifications: false, pushKinds: { approvals: false, errors: false, turns: false } });
+    const again = r.hub.turnOnNotifications();
+    await settle();
+    expect(last(r)).toMatchObject({ token: PUSH, kinds: KINDS });
+    answer(r);
+    await again;
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+  });
+
+  it("unpairing puts the kinds back to the defaults: a new pairing starts there on the Mac", async () => {
+    const r = await on({ approvals: false, errors: false, turns: true });
+    await r.hub.unpair();
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+  });
+});
+
 describe("the notifications step after pairing", () => {
   it("offers itself after a pairing when the app has a project id, and holds Pair until it is done", async () => {
     const r = rig();
