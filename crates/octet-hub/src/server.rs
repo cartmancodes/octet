@@ -1632,6 +1632,10 @@ fn bridge_command(command: PhoneCommand) -> Option<(String, BridgeCommand, Strin
             let what = format!("set_model {}", clip(&selection));
             Some((session, BridgeCommand::SetModel { selection }, what))
         }
+        PhoneCommand::Command { session, name } => {
+            let what = format!("command {}", name.as_str());
+            Some((session, BridgeCommand::Command { name }, what))
+        }
         _ => None,
     }
 }

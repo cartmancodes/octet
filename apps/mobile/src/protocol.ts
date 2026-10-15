@@ -16,6 +16,9 @@ export type ReplayFrom = "cursor" | "start";
 /** Where a tool call is. */
 export type ToolPhase = "running" | "done" | "failed";
 
+/** A desk command a phone may run: a closed set, none of which takes an argument. */
+export type CommandName = "new" | "session" | "help" | "export";
+
 /** Why a command was refused, for a client to act on; `reason` is the words to show. */
 export type RefusalCode = "unpaired" | "revoked" | "rate_limited" | "not_allowed" | "turn_open" | "not_connected" | "invalid" | "unavailable" | "busy" | "too_large" | "timeout";
 
@@ -358,6 +361,15 @@ export interface SetModelCommand {
   selection: string;
 }
 
+/** Run one of the desk's own commands: `new`, `session`, `help` or `export` (the journal, to the desk's default file). */
+export interface CommandCommand {
+  v: 1;
+  type: "command";
+  req: number;
+  session: string;
+  name: CommandName;
+}
+
 /** List recent sessions, optionally of one workspace. */
 export interface RecentCommand {
   v: 1;
@@ -442,6 +454,15 @@ export interface BridgeSetModelCommand {
   selection: string;
 }
 
+/** Run one of the desk's own commands. */
+export interface BridgeCommandCommand {
+  v: 1;
+  type: "command";
+  req: number;
+  by: string;
+  name: CommandName;
+}
+
 /** Quit the terminal UI. */
 export interface BridgeEndCommand {
   v: 1;
@@ -506,6 +527,7 @@ export type FromPhone =
   | SteerCommand
   | SetModeCommand
   | SetModelCommand
+  | CommandCommand
   | RecentCommand
   | StartCommand
   | EndCommand;
@@ -517,6 +539,7 @@ export type ToBridge =
   | BridgeSteerCommand
   | BridgeSetModeCommand
   | BridgeSetModelCommand
+  | BridgeCommandCommand
   | BridgeEndCommand;
 
 export type FromBridge =

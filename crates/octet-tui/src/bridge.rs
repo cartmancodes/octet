@@ -6,13 +6,15 @@
 use crate::{
     Action, Exit,
     app::{APPROVAL_ARM, App, CANCELLING, ConnPhase, StatusKind},
-    commands::{mode_command, model_command, steer_with},
+    commands::{
+        export_job, export_path, mode_command, model_command, session_text, start_job, steer_with,
+    },
     input::{answer_approval, cancel_turn, send_remote_prompt},
     registry::TURN_OPEN,
     vendor::Vendor,
 };
 use octet_core::remote::{
-    protocol::{self, BridgeCommand, Code, MAX_BRIDGE_LINE, MAX_MESSAGE},
+    protocol::{self, BridgeCommand, Code, CommandName, MAX_BRIDGE_LINE, MAX_MESSAGE},
     run::{Registration, run_dir},
 };
 use octet_core::{Config, Mode};
@@ -329,6 +331,7 @@ fn refusal_code(reason: &str) -> Code {
         || reason == APPROVAL_OPENING
         || reason.starts_with("The queue is full")
         || reason.starts_with("Mode change pending")
+        || reason.starts_with("Wait for: ")
     {
         Code::Busy
     } else if reason.starts_with("Full access needs confirm") {
@@ -432,18 +435,64 @@ async fn run_remote(
             remote_mode(app, vendor, &mode, confirm.as_deref(), desk, action)
         }
         BridgeCommand::SetModel { selection } => remote_model(app, &selection, desk, action),
+        BridgeCommand::Command { name } => remote_command(app, name, desk, action),
         BridgeCommand::End => {
-            if let Some(busy) = desk {
-                return Err(busy.into());
-            }
-            if app.turn_open() {
-                return Err(TURN_OPEN.into());
-            }
-            if desk_has_draft(app) {
-                return Err(DESK_DRAFT.into());
-            }
+            ends_cleanly(app, desk)?;
             *action = Action::Exit(Exit::Quit);
             Ok(("Ended".into(), "Ending".into()))
+        }
+    }
+}
+
+/// Why the desk's session may not be ended now: the editor or a `!` command (`desk`), a turn, or
+/// a draft.
+fn ends_cleanly(app: &App, desk: Option<&'static str>) -> Result<(), String> {
+    if let Some(busy) = desk {
+        return Err(busy.into());
+    }
+    if app.turn_open() {
+        return Err(TURN_OPEN.into());
+    }
+    if desk_has_draft(app) {
+        return Err(DESK_DRAFT.into());
+    }
+    Ok(())
+}
+
+/// What `help` answers a phone with.
+const PHONE_HELP: &str = "Commands from the phone: /model · /mode · /new · /session · /export · \
+                          /help. Everything else runs at the desk.";
+
+/// A remote `command`, run by the desk's own handler: `/new`, `/session`, `/help` or `/export`.
+/// None takes an argument, so nothing from the phone reaches a path.
+fn remote_command(
+    app: &mut App,
+    name: CommandName,
+    desk: Option<&'static str>,
+    action: &mut Action,
+) -> Result<(String, String), String> {
+    match name {
+        CommandName::New => {
+            ends_cleanly(app, desk)?;
+            *action = Action::Exit(Exit::New);
+            Ok((
+                "New conversation".into(),
+                "Starting a fresh conversation".into(),
+            ))
+        }
+        CommandName::Session => Ok(("Session".into(), session_text(app))),
+        CommandName::Help => Ok(("Help".into(), PHONE_HELP.into())),
+        CommandName::Export => {
+            // As `/export` with no argument does: the workspace and the journal's file name.
+            let path = export_path(app, "");
+            let Some(started) = start_job(app, export_job(app, "")) else {
+                return Err(app.status_line.clone());
+            };
+            *action = started;
+            Ok((
+                "Export".into(),
+                format!("Exporting the journal to {}", path.display()),
+            ))
         }
     }
 }
@@ -1275,6 +1324,7 @@ mod tests {
                 "Message too large; the limit is 99328 bytes",
                 Code::TooLarge,
             ),
+            ("Wait for: Exporting the journal…", Code::Busy),
             ("No approval 9 is waiting", Code::Invalid),
             ("Slash commands run on the desk", Code::Invalid),
         ] {

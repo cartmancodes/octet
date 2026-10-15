@@ -2,7 +2,10 @@
 use super::*;
 use crate::bridge::Remote;
 use crate::test_support::{approval, idle};
-use octet_core::{Mode, remote::protocol::BridgeCommand};
+use octet_core::{
+    Mode,
+    remote::protocol::{BridgeCommand, CommandName},
+};
 
 const CONFIRM: &str = "Full access needs confirm: \"full access\"";
 
@@ -646,4 +649,195 @@ async fn a_remote_model_may_not_look_like_an_option() {
     let (result, action) = run(&mut app, &vendor, select).await;
     assert_eq!(result, Err("Name one model, without spaces".into()));
     assert!(matches!(action, Action::Continue));
+}
+
+fn typed(name: CommandName) -> BridgeCommand {
+    BridgeCommand::Command { name }
+}
+
+#[tokio::test]
+async fn new_is_refused_like_the_desk() {
+    const EDITING: &str = "The desk is editing a prompt";
+    const SHELL: &str = "A ! command is running at the desk";
+    const DRAFT: &str = "The desk has an unsent draft";
+    let vendor = RecordingVendor::default();
+    let mut app = app();
+    idle(&mut app);
+    // The external editor.
+    let (result, action) = run_editing(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(EDITING.into()));
+    assert!(matches!(action, Action::Continue));
+    // A `!` command.
+    app.shell = Some(crate::test_support::running_shell(false));
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(SHELL.into()));
+    assert!(matches!(action, Action::Continue));
+    app.shell = None;
+    // A draft: typed text, `!` output, or images.
+    app.composer.editor.set("a long desk draft".into());
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(DRAFT.into()));
+    assert!(matches!(action, Action::Continue));
+    assert_eq!(app.composer.editor.text(), "a long desk draft");
+    app.composer.editor.take();
+    app.attach(crate::shell::Ran {
+        command: "ls".into(),
+        status: crate::shell::Status::Exited(0),
+        output: "file\n".into(),
+    });
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(DRAFT.into()));
+    assert!(matches!(action, Action::Continue));
+    app.composer.attachments.clear();
+    // A turn.
+    app.conn.start_turn();
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(TURN_OPEN.into()));
+    assert!(matches!(action, Action::Continue));
+    // Idle, it starts afresh, as `/new` does at the desk.
+    let mut app = self::app();
+    idle(&mut app);
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Ok("Starting a fresh conversation".into()));
+    assert!(matches!(action, Action::Exit(Exit::New)));
+    assert!(
+        vendor.sent.take().is_empty(),
+        "nothing was sent to the vendor"
+    );
+}
+
+#[tokio::test]
+async fn the_session_text_is_the_desks_own() {
+    let vendor = RecordingVendor::default();
+    let mut remote = app();
+    idle(&mut remote);
+    let (result, action) = run(&mut remote, &vendor, typed(CommandName::Session)).await;
+    let reply = result.expect("the text");
+    assert!(matches!(action, Action::Continue));
+    assert_eq!(reply, commands::session_text(&remote));
+    assert!(reply.contains("Session: thread-1"), "{reply}");
+    assert!(reply.contains("Journal: journal"), "{reply}");
+    assert!(reply.contains("Workspace: "), "{reply}");
+    // The desk's `/session` puts those words in the transcript.
+    let mut desk = app();
+    idle(&mut desk);
+    command(&mut desk, "/session").await;
+    assert!(
+        desk.entries_text().contains(&reply),
+        "{}",
+        desk.entries_text()
+    );
+}
+
+#[tokio::test]
+async fn the_help_text_names_what_the_phone_can_run() {
+    let vendor = RecordingVendor::default();
+    let mut app = app();
+    idle(&mut app);
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::Help)).await;
+    assert_eq!(
+        result,
+        Ok(
+            "Commands from the phone: /model · /mode · /new · /session · /export · /help. \
+            Everything else runs at the desk."
+                .into()
+        )
+    );
+    assert!(matches!(action, Action::Continue));
+}
+
+#[tokio::test]
+async fn export_answers_with_the_desk_words() {
+    let workspace = octet_testkit::TempDir::new("octet-remote-export");
+    let data = octet_testkit::TempDir::new("octet-remote-export-data");
+    std::fs::create_dir_all(workspace.path()).unwrap();
+    std::fs::create_dir_all(data.path()).unwrap();
+    let journal = data.path().join("session-7.jsonl");
+    std::fs::write(&journal, b"{}\n").unwrap();
+    let vendor = RecordingVendor::default();
+    let mut app = app();
+    idle(&mut app);
+    app.composer.root = workspace.path().to_path_buf();
+    app.conn.journal = journal;
+    // Always the desk's default: the workspace and the journal's file name.
+    let target = workspace.path().join("session-7.jsonl");
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    assert_eq!(
+        result,
+        Ok(format!("Exporting the journal to {}", target.display()))
+    );
+    assert!(matches!(&action, Action::Job(job) if job.label == "Exporting the journal…"));
+    // The job is the desk's own, and its outcome reaches the desk as it does for `/export`.
+    run_job(&mut app, action).await;
+    assert!(
+        app.entries_text()
+            .contains(&format!("Exported journal to {}", target.display())),
+        "{}",
+        app.entries_text()
+    );
+    let before = std::fs::read(&target).unwrap();
+    // A file of that name is already there: the desk's export refuses to overwrite, in its words,
+    // and the phone's command still only starts the job.
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    assert!(result.is_ok(), "{result:?}");
+    run_job(&mut app, action).await;
+    assert!(
+        app.entries_text().contains("Export failed: Cannot create"),
+        "{}",
+        app.entries_text()
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        before,
+        "the first export is kept"
+    );
+}
+
+#[tokio::test]
+async fn export_failing_or_waiting_says_what_the_desk_says() {
+    let vendor = RecordingVendor::default();
+    // A workspace that is not there: the desk's export job reports its own error.
+    let mut app = app();
+    idle(&mut app);
+    app.composer.root = "/nonexistent-octet-workspace/inner".into();
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    assert!(result.is_ok(), "{result:?}");
+    run_job(&mut app, action).await;
+    assert!(
+        app.entries_text().contains("Export failed"),
+        "{}",
+        app.entries_text()
+    );
+    // A job already running: the desk's `Wait for` words, and no second job.
+    let mut busy = self::app();
+    idle(&mut busy);
+    busy.job = Some(crate::jobs::Running::spawn(crate::jobs::Job {
+        label: "Reading recent sessions…",
+        must_finish: false,
+        work: Box::pin(std::future::pending()),
+    }));
+    let (result, action) = run(&mut busy, &vendor, typed(CommandName::Export)).await;
+    assert_eq!(result, Err("Wait for: Reading recent sessions…".into()));
+    assert!(matches!(action, Action::Continue));
+}
+
+#[tokio::test]
+async fn each_typed_command_leaves_a_desk_note_naming_the_device() {
+    let vendor = RecordingVendor::default();
+    for (name, wanted) in [
+        (CommandName::New, "New conversation from iPhone 15"),
+        (CommandName::Session, "Session from iPhone 15"),
+        (CommandName::Help, "Help from iPhone 15"),
+        (CommandName::Export, "Export from iPhone 15"),
+    ] {
+        let mut app = app();
+        idle(&mut app);
+        let (result, _) = run(&mut app, &vendor, typed(name)).await;
+        assert!(result.is_ok(), "{name:?}: {result:?}");
+        assert!(
+            app.entries_text().contains(wanted),
+            "{name:?}: {}",
+            app.entries_text()
+        );
+    }
 }

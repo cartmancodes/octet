@@ -1244,6 +1244,78 @@ async fn push_commands_before_hello_are_refused_as_unpaired() {
     }
 }
 
+#[tokio::test]
+async fn a_typed_command_needs_hello_names_its_session_and_is_audited() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5013, 0..1).await;
+    env.start().await;
+    let (mut read, mut write) = bridge.accept().await;
+    let command = |req: u64, session: &str, name: &str| json!({"v": 1, "req": req, "type": "command", "session": session, "name": name});
+    // Before hello it is refused as unpaired, and the connection closes.
+    let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
+    send(&mut stranger, command(1, &bridge.id, "new")).await;
+    let refusal = recv(&mut stranger).await;
+    assert_eq!(
+        (refusal["type"].clone(), refusal["code"].clone()),
+        (json!("refused"), json!("unpaired"))
+    );
+    assert!(closes(&mut stranger).await);
+    assert!(bridge_quiet(&mut read).await, "the bridge receives nothing");
+
+    let (mut phone, _) = env.phone("Test phone").await;
+    // An unknown session is unavailable, and an unknown name or a path is invalid.
+    send(&mut phone, command(2, "nobody", "help")).await;
+    assert_eq!(
+        recv(&mut phone).await,
+        refused(2, Code::Unavailable, "No such session")
+    );
+    for (req, name) in [(3, "model"), (4, "export /tmp/x")] {
+        send(&mut phone, command(req, &bridge.id, name)).await;
+        let refusal = recv(&mut phone).await;
+        assert_eq!(refusal["code"], "invalid", "{refusal}");
+    }
+    assert!(bridge_quiet(&mut read).await, "the bridge receives nothing");
+
+    // A known one reaches the bridge as a typed command, and is audited with the device.
+    for (req, name) in [(5, "new"), (6, "session"), (7, "help"), (8, "export")] {
+        send(&mut phone, command(req, &bridge.id, name)).await;
+        let line = bridge_line(&mut read).await;
+        assert_eq!(
+            (
+                line["type"].clone(),
+                line["name"].clone(),
+                line["by"].clone()
+            ),
+            (json!("command"), json!(name), json!("Test phone"))
+        );
+        let asked = line["req"].as_u64().expect("a req");
+        bridge_write(&mut write, ack(asked, "done")).await;
+        assert_eq!(recv_kind(&mut phone, "ack").await["message"], "done");
+    }
+    let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
+    let lines: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .filter(|line: &Value| line["what"] != "paired")
+        .collect();
+    let what: Vec<&str> = lines.iter().map(|l| l["what"].as_str().unwrap()).collect();
+    assert_eq!(
+        what,
+        [
+            "command new",
+            "command session",
+            "command help",
+            "command export"
+        ]
+    );
+    for line in &lines {
+        assert_eq!(
+            (&line["device"], &line["session"]),
+            (&json!("Test phone"), &json!(bridge.id))
+        );
+    }
+}
+
 /// How many commands a device may send at once before the hub rate limits it: the hub's
 /// `COMMANDS_PER_MINUTE` in `server.rs` (the flood test above spells it 60 too).
 const BURST: usize = 60;

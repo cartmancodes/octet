@@ -186,6 +186,11 @@ pub static CHOICES: &[Choices] = &[
         doc: "Where a tool call is.",
     },
     Choices {
+        name: "CommandName",
+        values: &["new", "session", "help", "export"],
+        doc: "A desk command a phone may run: a closed set, none of which takes an argument.",
+    },
+    Choices {
         name: "RefusalCode",
         values: &[
             "unpaired",
@@ -577,6 +582,13 @@ pub static MESSAGES: &[Message] = &[
         "Switch the model.",
     ),
     message(
+        "command",
+        FromPhone,
+        &[req("session", Str), req("name", Choice("CommandName"))],
+        "Run one of the desk's own commands: `new`, `session`, `help` or `export` (the \
+         journal, to the desk's default file).",
+    ),
+    message(
         "recent",
         FromPhone,
         &[opt("workspace", Str)],
@@ -640,6 +652,12 @@ pub static MESSAGES: &[Message] = &[
         ToBridge,
         &[req("by", Str), req("selection", Str)],
         "Switch the model.",
+    ),
+    message(
+        "command",
+        ToBridge,
+        &[req("by", Str), req("name", Choice("CommandName"))],
+        "Run one of the desk's own commands.",
     ),
     message("end", ToBridge, &[req("by", Str)], "Quit the terminal UI."),
     message(
@@ -766,6 +784,47 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// A desk command a phone may run. The set is closed and none takes an argument, so no text
+/// from the phone reaches a path or a shell. The spellings are [`CHOICES`]' `CommandName`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandName {
+    /// `/new`: start a fresh conversation.
+    New,
+    /// `/session`: the session's details.
+    Session,
+    /// `/help`: what the phone can run.
+    Help,
+    /// `/export`: write the journal to the desk's default file.
+    Export,
+}
+
+impl CommandName {
+    /// Every name, in [`CHOICES`]' order.
+    pub const ALL: [CommandName; 4] = [
+        CommandName::New,
+        CommandName::Session,
+        CommandName::Help,
+        CommandName::Export,
+    ];
+
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommandName::New => "new",
+            CommandName::Session => "session",
+            CommandName::Help => "help",
+            CommandName::Export => "export",
+        }
+    }
+
+    /// The name spelled `text`, if there is one.
+    pub fn parse(text: &str) -> Option<CommandName> {
+        CommandName::ALL
+            .into_iter()
+            .find(|name| name.as_str() == text)
+    }
+}
+
 /// A phone → hub command, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhoneCommand {
@@ -846,6 +905,13 @@ pub enum PhoneCommand {
         /// The model selection.
         selection: String,
     },
+    /// Run one of the desk's own commands.
+    Command {
+        /// The session id.
+        session: String,
+        /// Which command.
+        name: CommandName,
+    },
     /// List recent sessions.
     Recent {
         /// Only this workspace's.
@@ -906,6 +972,11 @@ pub enum BridgeCommand {
     SetModel {
         /// The model selection.
         selection: String,
+    },
+    /// Run one of the desk's own commands.
+    Command {
+        /// Which command.
+        name: CommandName,
     },
     /// Quit the terminal UI.
     End,
@@ -1117,6 +1188,14 @@ fn push_token(map: &Map<String, Value>) -> Result<Option<Secret>, String> {
     }
 }
 
+/// The `name` of a `command`: one of [`CommandName`], or a refusal that does not echo the text.
+fn command_name(map: &Map<String, Value>) -> Result<CommandName, String> {
+    map.get("name")
+        .and_then(Value::as_str)
+        .and_then(CommandName::parse)
+        .ok_or_else(|| "name must be new, session, help or export".into())
+}
+
 /// Parses one phone message: `(req, command)`, or the reason it was refused.
 ///
 /// # Errors
@@ -1174,6 +1253,10 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
             session: text(m, "session"),
             selection: text(m, "selection"),
         },
+        "command" => PhoneCommand::Command {
+            session: text(m, "session"),
+            name: command_name(m)?,
+        },
         "recent" => PhoneCommand::Recent {
             workspace: maybe(m, "workspace"),
         },
@@ -1210,6 +1293,7 @@ pub fn bridge_command_json(req: u64, by: &str, command: &BridgeCommand) -> Value
             ("set_mode", fields)
         }
         BridgeCommand::SetModel { selection } => ("set_model", json!({ "selection": selection })),
+        BridgeCommand::Command { name } => ("command", json!({ "name": name.as_str() })),
         BridgeCommand::End => ("end", json!({})),
     };
     let mut line = json!({ "v": VERSION, "req": req, "type": kind, "by": by });
@@ -1247,6 +1331,9 @@ pub fn parse_bridge_command(line: &str) -> Result<(u64, String, BridgeCommand), 
         },
         "set_model" => BridgeCommand::SetModel {
             selection: text(m, "selection"),
+        },
+        "command" => BridgeCommand::Command {
+            name: command_name(m)?,
         },
         "end" => BridgeCommand::End,
         other => return Err(format!("Unknown message {}", clip(other))),
@@ -1495,6 +1582,7 @@ mod tests {
             r#"{"v":1,"req":12,"type":"start","engine":"claude","workspace":"/w","resume":"abc"}"#,
             r#"{"v":1,"req":13,"type":"end","session":"12-34"}"#,
             r#"{"v":1,"req":14,"type":"unsubscribe","session":"12-34"}"#,
+            r#"{"v":1,"req":15,"type":"command","session":"12-34","name":"new"}"#,
         ];
         for (n, case) in cases.iter().enumerate() {
             let (req, _) = parse_phone(case).unwrap_or_else(|e| panic!("{case}: {e}"));
@@ -1949,6 +2037,8 @@ mod tests {
         assert_eq!(values("Mode"), modes);
         let codes: Vec<&str> = Code::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(values("RefusalCode"), codes);
+        let names: Vec<&str> = CommandName::ALL.iter().map(|n| n.as_str()).collect();
+        assert_eq!(values("CommandName"), names);
         for code in Code::ALL {
             assert_eq!(Code::parse(code.as_str()), Some(code));
         }
@@ -1966,6 +2056,65 @@ mod tests {
         for name in all.flat_map(every_choice) {
             assert!(CHOICES.iter().any(|c| c.name == name), "no choice {name}");
         }
+    }
+
+    #[test]
+    fn a_command_is_one_of_four_names_and_nothing_else() {
+        for (name, wanted) in [
+            ("new", CommandName::New),
+            ("session", CommandName::Session),
+            ("help", CommandName::Help),
+            ("export", CommandName::Export),
+        ] {
+            let text =
+                format!(r#"{{"v":1,"req":3,"type":"command","session":"s","name":"{name}"}}"#);
+            let (req, command) = parse_phone(&text).unwrap();
+            assert_eq!(req, 3);
+            assert_eq!(
+                command,
+                PhoneCommand::Command {
+                    session: "s".into(),
+                    name: wanted
+                }
+            );
+            assert_eq!(wanted.as_str(), name);
+            let (_, by, bridge) = parse_bridge_command(
+                &bridge_command_json(9, "iPhone", &BridgeCommand::Command { name: wanted })
+                    .to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                (by.as_str(), bridge),
+                ("iPhone", BridgeCommand::Command { name: wanted })
+            );
+        }
+        for name in [
+            "model",
+            "New",
+            "/new",
+            "export /tmp/x",
+            "export ",
+            "",
+            "quit",
+        ] {
+            let text = format!(
+                r#"{{"v":1,"req":3,"type":"command","session":"s","name":{}}}"#,
+                json!(name)
+            );
+            assert!(parse_phone(&text).is_err(), "{name:?} was taken");
+        }
+        // A path, an argument or any other field is refused, as is a name that is not a string.
+        for text in [
+            r#"{"v":1,"req":3,"type":"command","session":"s","name":"export","path":"/tmp/x"}"#,
+            r#"{"v":1,"req":3,"type":"command","session":"s","name":"export","argument":""}"#,
+            r#"{"v":1,"req":3,"type":"command","session":"s","name":7}"#,
+            r#"{"v":1,"req":3,"type":"command","session":"s"}"#,
+            r#"{"v":1,"req":3,"type":"command","name":"help"}"#,
+        ] {
+            assert!(parse_phone(text).is_err(), "{text}");
+        }
+        assert_eq!(CommandName::parse("help"), Some(CommandName::Help));
+        assert_eq!(CommandName::parse("nope"), None);
     }
 
     #[test]
