@@ -101,6 +101,7 @@ describe("/new marks the fresh start", () => {
     octetStore.getState().applyBatch([
       { v: 1, type: "subscribed", session: "s", from: "start", journals: ["j1"] },
       { v: 1, type: "event", session: "s", journal: "j1", seq: 1, event: { type: "user", data: "old question" } },
+      { v: 1, type: "replayed", session: "s" } as never, // the replay is over
     ]);
   const notes = () => (octetStore.getState().bySession.get("s")?.transcript.entries ?? []).filter((e) => e.kind === "note");
 

@@ -239,6 +239,28 @@ describe("a local note", () => {
     expect(after.transcript.bytes).toBe(after.transcript.entries.reduce((n, e) => n + entrySize(e), 0));
   });
 
+  it("waits for the replay to be over when the old conversation is still coming: it lands after it", () => {
+    const old = view([ev({ type: "user", data: "old" })]);
+    let v = view([{ op: "reset" }, note()], old); // a replay from the start began, and the note came
+    expect(v.transcript.entries).toHaveLength(0);
+    v = view([ev({ type: "user", data: "old" }), ev({ type: "text", data: "old reply" })], v);
+    expect(v.transcript.entries.map((e) => e.kind)).toEqual(["user", "reply"]);
+    v = view([{ op: "replayed" }, ev({ type: "user", data: "new" })], v);
+    expect(v.transcript.entries.map((e) => [e.kind, "text" in e ? e.text : ""])).toEqual([
+      ["user", "old"],
+      ["reply", "old reply"],
+      ["note", "Fresh conversation — the earlier one is above."],
+      ["user", "new"],
+    ]);
+  });
+
+  it("a second note while one waits changes nothing, and a failed replay lets it through", () => {
+    const waiting = view([{ op: "reset" }, note()]);
+    expect(view([note()], waiting)).toBe(waiting);
+    const failed = view([{ op: "failed", reason: "x" }], waiting);
+    expect(failed.transcript.entries.map((e) => e.kind)).toEqual(["note"]);
+  });
+
   it("is cleaned like any hub text", () => {
     const v = view([{ op: "note", text: "a\u001b[31mb\u0007" }]);
     expect(v.transcript.entries[0]).toMatchObject({ kind: "note", text: "ab" });

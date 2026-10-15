@@ -653,6 +653,32 @@ describe("with a client", () => {
     off();
   });
 
+  it("the re-stream of a re-listed session adds no screen hold: one unwatch ends it and it is no longer shown", () => {
+    const { sockets, clock, client, off } = rig();
+    watch(store, client, "a");
+    const first = sockets.last.commandsOf("subscribe")[0]?.req;
+    sockets.last.receive({ type: "refused", req: first, reason: "No such session", code: "invalid" });
+    sockets.last.receive({ type: "sessions", sessions: [info("a")] });
+    clock.advance(50);
+    expect(sockets.last.commandsOf("subscribe")).toHaveLength(2);
+    sockets.last.receive({ type: "subscribed", session: "a", from: "start", journals: ["j1"] });
+    sockets.last.receive({ type: "event", session: "a", journal: "j1", seq: 1, event: { type: "user", data: "hi a" } });
+    clock.advance(50);
+    unwatch(client, "a");
+    expect(sockets.last.commandsOf("unsubscribe")).toHaveLength(1);
+    // Not shown any more: four sessions seen after it push its transcript out.
+    const others = ["b", "c", "d", "e"];
+    sockets.last.receive({ type: "sessions", sessions: ["a", ...others].map((id) => info(id)) });
+    for (const id of others) {
+      watch(store, client, id);
+      sockets.last.receive({ type: "subscribed", session: id, from: "start", journals: ["j1"] });
+      sockets.last.receive({ type: "event", session: id, journal: "j1", seq: 1, event: { type: "user", data: `hi ${id}` } });
+      clock.advance(50);
+    }
+    expect(view("a").transcript.entries).toHaveLength(0);
+    off();
+  });
+
   it("a session refused and listed again is not streamed when no screen holds it", () => {
     const { sockets, clock, client, off } = rig();
     watch(store, client, "a");
@@ -997,7 +1023,7 @@ describe("a fresh start marked in the transcript", () => {
   const lines = (id: string) => view(id).transcript.entries.map((e) => [e.kind, "text" in e ? e.text : ""]);
 
   it("addNote puts the divider after the old conversation once, and new-journal events land below it", async () => {
-    await apply(sessions(info("a")), subscribed("a", "start"), user("a", "old"), text("a", "old reply"));
+    await apply(sessions(info("a")), subscribed("a", "start"), user("a", "old"), text("a", "old reply"), { v: 1, type: "replayed", session: "a" } as never);
     expect(store.getState().addNote("a", NOTE)).toBe(true);
     expect(store.getState().addNote("a", NOTE)).toBe(true); // a repeated ack: nothing more
     await apply(
@@ -1010,6 +1036,21 @@ describe("a fresh start marked in the transcript", () => {
       ["note", NOTE],
       ["user", "new"],
       ["reply", "new reply"],
+    ]);
+  });
+
+  it("a /new acked while a replay from the start still holds the old entries lands after them and before the new journal", async () => {
+    await apply(sessions(info("a")), subscribed("a", "start"), user("a", "old question"));
+    // The screen comes back: a replay from the start begins, and has brought nothing yet.
+    await apply(subscribed("a", "start"));
+    expect(view("a").replaying).toBe(true);
+    expect(store.getState().addNote("a", NOTE)).toBe(true);
+    await apply(user("a", "old question"), { v: 1, type: "replayed", session: "a" } as never);
+    await apply({ v: 1, type: "event", session: "a", journal: "j2", seq: 1, event: { type: "user", data: "new question" } });
+    expect(lines("a")).toEqual([
+      ["user", "old question"],
+      ["note", NOTE],
+      ["user", "new question"],
     ]);
   });
 

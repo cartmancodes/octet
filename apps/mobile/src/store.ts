@@ -363,7 +363,8 @@ export function connectStore(store: OctetStore, client: HubClient, options: Conn
     // A failure the list ended: the screen showing the session streams it again.
     for (const session of failed) {
       if (shown(client).has(session) && store.getState().bySession.get(session)?.failed === null) {
-        watch(store, client, session);
+        // The screen already holds it: streaming again adds no hold of its own.
+        stream(store, client, session);
       }
     }
   });
@@ -467,6 +468,11 @@ function keepRecent(store: OctetStore, client: HubClient): void {
 export function watch(store: OctetStore, client: HubClient, session: string): void {
   const holds = holdsOf(client);
   holds.set(session, (holds.get(session) ?? 0) + 1);
+  stream(store, client, session);
+}
+
+/** Streams `session` for the screens that hold it (`watch` counts them; this does not). */
+function stream(store: OctetStore, client: HubClient, session: string): void {
   const fresh = !store.getState().bySession.has(session) && !requested(client).has(session);
   requested(client).add(session);
   shown(client).add(session);

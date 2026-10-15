@@ -67,6 +67,11 @@ export interface SessionView {
   /** The `finished` records seen since the last replay from the start: the turns taken. Counted
    * here, not from the entries, which the view bounds and drops from the top. */
   turns: number;
+  /** A replay from the start began and its end (the hub's ack) has not come: the old
+   * conversation is still arriving. */
+  catchingUp: boolean;
+  /** A local note asked for meanwhile, to go after the replay's last record. */
+  pendingNote: string | null;
 }
 
 export const EMPTY_VIEW: SessionView = {
@@ -87,6 +92,8 @@ export const EMPTY_VIEW: SessionView = {
   epoch: 0,
   turn: null,
   turns: 0,
+  catchingUp: false,
+  pendingNote: null,
 };
 
 /** One change to a session's view, in the order the hub sent it. */
@@ -255,6 +262,15 @@ function approve(approvals: PendingApproval[], data: unknown): PendingApproval[]
   return approvals.length >= MAX_APPROVALS ? approvals : [...approvals, made];
 }
 
+/** The replay is over (or will not be): a note that waited for it goes in now. */
+function endCatchUp(v: SessionView, own: () => TranscriptDraft): void {
+  v.catchingUp = false;
+  if (v.pendingNote !== null) {
+    own().addLocalNote(v.pendingNote);
+    v.pendingNote = null;
+  }
+}
+
 /**
  * The view after `ops`, in order. Returns `view` itself when nothing changed, and keeps the
  * identity of every part that did not: the transcript's entries, an unchanged state or catalog.
@@ -277,6 +293,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         v.epoch += 1;
         v.turn = null;
         v.turns = 0; // the replay brings every finished record again
+        v.catchingUp = true;
         // What the latest state frame listed is still waiting; the replay fills it in or closes it.
         if (!alike(v.approvals, v.stated)) v.approvals = v.stated;
         if (v.closed.length > 0) v.closed = [];
@@ -293,15 +310,19 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
           v.replaying = false;
           v.held = null;
         }
+        endCatchUp(v, own);
         break;
       case "ended":
         v.ended = op.ended;
         break;
       case "note":
-        own().addLocalNote(op.text);
+        // The old conversation is still replaying: the note goes after its last record.
+        if (v.catchingUp) v.pendingNote = op.text;
+        else own().addLocalNote(op.text);
         break;
       case "failed":
         v.failed = op.reason;
+        if (op.reason !== null) endCatchUp(v, own); // the replay will not finish
         break;
       case "state": {
         const state = cleanState(op.state, v.approvals, v.closed);
@@ -395,6 +416,8 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.held === view.held &&
     v.epoch === view.epoch &&
     v.turn === view.turn &&
-    v.turns === view.turns;
+    v.turns === view.turns &&
+    v.catchingUp === view.catchingUp &&
+    v.pendingNote === view.pendingNote;
   return same ? view : v;
 }

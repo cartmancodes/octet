@@ -7,7 +7,7 @@ import { FreshConfirm } from "../src/components/CommandSheet";
 import { useDeskCommand } from "../src/components/deskCommand";
 import { useSend } from "../src/components/send";
 import { useHubClient } from "../src/hub";
-import { field, FIELD_CHARS } from "../src/model/text";
+import { field } from "../src/model/text";
 import { engineModel, shortId } from "../src/session";
 import { sessionName } from "../src/sessions";
 import type { SessionInfo } from "../src/protocol";
@@ -30,6 +30,8 @@ import { Button, Card } from "../src/ui";
 
 /** Said for USAGE, and for Today, when no session has reported any. */
 export const NO_USAGE = "No usage reported yet";
+/** The most characters of a workspace the route can carry. */
+const ROUTE_CHARS = 512;
 /** Said for WORKSPACE when the session is not in the list and the route did not say. */
 export const NOT_LISTED = "Not listed";
 /** Said for JOURNAL before the hub has listed one. */
@@ -57,7 +59,7 @@ export default function Usage() {
   const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{ id?: string | string[]; workspace?: string | string[] }>();
   const id = typeof params.id === "string" ? params.id : "";
-  const routed = typeof params.workspace === "string" ? field(params.workspace, FIELD_CHARS) : "";
+  const routed = typeof params.workspace === "string" ? field(params.workspace, ROUTE_CHARS) : "";
   const info = useSessionInfo(id);
   const head = useSessionHead(id);
   const client = useHubClient();

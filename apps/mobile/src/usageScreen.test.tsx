@@ -191,6 +191,17 @@ describe("This session: who", () => {
   });
 });
 
+describe("the workspace param", () => {
+  it("is clipped to 512 characters", async () => {
+    seq = 0;
+    await launch("/", { usage: Usage }, [info("other")]);
+    await act(async () => router.push({ pathname: "/usage", params: { id: SESSION, workspace: `/w/${"x".repeat(2_000)}` } }));
+    await flush();
+    const shown = within(screen.getByTestId("this-session")).getByText(/^\/w\/x+$/);
+    expect(String(shown.props.children).length).toBe(512);
+  });
+});
+
 describe("live", () => {
   it("watches the session while it is in front: subscribe on focus, unsubscribe on blur", async () => {
     const rig = await open();
