@@ -9,6 +9,7 @@ import { COMMIT_CHARS, COMMIT_REASON, PR_COMMAND, PR_INTRO, firstPrompt } from "
 import { useEntries } from "../store";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
 import { Button } from "../ui";
+import { Refusal } from "../client/HubClient";
 import { failure, useAlive, useSend } from "./send";
 
 /** Said in the sheet when the phone can't ask for Face ID: nothing is committed without it. */
@@ -66,6 +67,10 @@ interface CommitSheetProps {
   blocked: boolean;
   /** The Mac committed; runs with its ack even when the sheet has gone. Must be stable. */
   onCommitted: (ack: unknown) => void;
+  /** The commit went and its answer was lost: it may have committed. The sheet stays, with the
+   * words that say so; the screen asks for the changes again, which show whether it did. Runs
+   * even when the sheet has gone. Must be stable. */
+  onLost: () => void;
   /** Must be stable. */
   onClose: () => void;
 }
@@ -77,7 +82,7 @@ interface CommitSheetProps {
  * the sheet stays until the commit's answer is in, so it is seen and no second sheet can send
  * another. A refusal is shown in the hub's words, and the message stays.
  */
-export const CommitSheet = memo(function CommitSheet({ session, blocked, onCommitted, onClose }: CommitSheetProps) {
+export const CommitSheet = memo(function CommitSheet({ session, blocked, onCommitted, onLost, onClose }: CommitSheetProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const entries = useEntries(session);
@@ -115,13 +120,14 @@ export const CommitSheet = memo(function CommitSheet({ session, blocked, onCommi
       const ack = await send({ type: "commit", session, message: text });
       onCommitted(ack);
     } catch (error) {
+      if (error instanceof Refusal && error.code === "lost") onLost();
       if (alive()) setFailed(failure(error).text);
     } finally {
       out.current = false;
       sending.current = false;
       if (alive()) setStage(null);
     }
-  }, [message, send, session, alive, onCommitted]);
+  }, [message, send, session, alive, onCommitted, onLost]);
   const press = useCallback(() => void commit(), [commit]);
   const close = useCallback(() => {
     if (!sending.current) onClose();

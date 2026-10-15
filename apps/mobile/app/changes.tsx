@@ -263,7 +263,9 @@ export default function Changes() {
   );
 
   // The commit and PR sheets. A commit's ack toasts even if the screen has gone (the Mac did
-  // commit); with the screen still here, the sheet closes and the listing is asked for again.
+  // commit); with the screen still here, the sheet closes and the listing is asked for again. A
+  // commit whose answer was lost may have gone through: the listing is asked for again, and the
+  // sheet stays with the words that say so.
   const [sheet, setSheet] = useState<"commit" | "pr" | null>(null);
   const openCommit = useCallback(() => setSheet("commit"), []);
   const openPr = useCallback(() => setSheet("pr"), []);
@@ -277,6 +279,9 @@ export default function Changes() {
     },
     [alive, load],
   );
+  const relist = useCallback(() => {
+    if (alive()) load(false);
+  }, [alive, load]);
 
   const back = useCallback(() => {
     if (router.canGoBack()) router.back();
@@ -454,7 +459,7 @@ export default function Changes() {
           </Pressable>
         </View>
       </View>
-      {sheet === "commit" ? <CommitSheet session={id} blocked={offline || waiting} onCommitted={committed} onClose={closeSheet} /> : null}
+      {sheet === "commit" ? <CommitSheet session={id} blocked={offline || waiting} onCommitted={committed} onLost={relist} onClose={closeSheet} /> : null}
       {sheet === "pr" ? <PrSheet onClose={closeSheet} /> : null}
     </View>
   );

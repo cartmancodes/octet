@@ -581,6 +581,8 @@ The hub refuses a commit:
   first`);
 - when nothing changed (`Nothing to commit`) or the message is empty
   (`Write a commit message`);
+- while the session's terminal UI has no link to the hub, or hasn't yet told
+  it what it is doing (`The session is not connected`);
 - while two other git calls run (`Git is busy; try again`).
 
 The repository's commit hooks run, as they do at the desk. If a hook fails,
@@ -612,12 +614,12 @@ hooks included, is stopped after 10 seconds (`Git took too long; try again`).
   remove the phone from the tailnet in the Tailscale admin console.
 - Every action from a phone (prompt, answer, mode, start and so on) is
   recorded with the phone's name in `hub-audit.jsonl`, without the prompt
-  text. A commit is recorded as `commit` with the phone's name and the
-  session, never the message; `commit failed` means git refused it after
-  `git add` ran. The desk shows no note for a commit. Listing changes and
-  reading diffs aren't recorded. The desk also shows a note naming the phone. Pairing (`paired`) and
-  `octet hub revoke` (`revoked`) are recorded too, with the phone's name and
-  never a token or pairing code.
+  text. The desk also shows a note naming the phone. A commit is recorded as
+  `commit` with the phone's name and the session, never the message, and
+  `commit failed` means git refused it after `git add` ran; the desk shows no
+  note for a commit. Listing changes and reading diffs aren't recorded.
+  Pairing (`paired`) and `octet hub revoke` (`revoked`) are recorded too, with
+  the phone's name and never a token or pairing code.
 - A command that was waiting when a session's link dropped is refused with
   `Lost the link to that session; check it before sending again`. The command
   may have run, so look before you send it again. `The session ended` means

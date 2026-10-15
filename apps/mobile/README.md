@@ -156,8 +156,9 @@ side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Se
     nothing. The Mac commits everything in the workspace (`git add -A`, then `git commit`), and
     its hooks run. A toast says `Committed <hash> on <branch>`, and the list refreshes. A refusal
     (a turn running, a merge under way, nothing to commit, a hook that failed) shows the Mac's
-    words in the sheet and keeps the message. **Commit** is off while the Mac can't be reached or
-    an approval waits.
+    words in the sheet and keeps the message. If the answer is lost, the sheet says so and the
+    list is asked for again, which shows whether it committed. **Commit** is off while the Mac
+    can't be reached or an approval waits.
   - **Open PR on the desk** shows `gh pr create` to run at the Mac, and sends nothing. The phone
     can't push, open a pull request or commit only some files.
 - **Settings.** Three cards. **Machines**: the Mac with ● online or ○ offline, this phone's name,

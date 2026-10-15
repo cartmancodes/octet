@@ -8,7 +8,8 @@ import { router } from "expo-router";
 import { StyleSheet } from "react-native";
 
 import Changes from "../app/changes";
-import type { BatchItem } from "./client/HubClient";
+import { REQUEST_TIMEOUT_MS, type BatchItem } from "./client/HubClient";
+import { LOST } from "./components/send";
 import { saveSettings } from "./persist";
 import type { FileChange, JournalEvent, SessionInfo } from "./protocol";
 import { info, launch, pairedStorage, type Rig } from "./screenRig";
@@ -89,6 +90,15 @@ async function press(node: Parameters<typeof fireEvent.press>[0]) {
 async function openSheet(rig: Rig) {
   await answer(rig);
   await press(commitButton());
+}
+/** What a press of `node` (a Pressable's host view) runs: its pressability config's `onPress`,
+ * which React Native exposes under test, as the testing library's own press does. */
+function onPressOf(node: ReturnType<typeof screen.getByRole>): () => void {
+  type Config = { onPress?: () => void };
+  const responder = (node.props as { onStartShouldSetResponder?: { testOnly_pressabilityConfig?: () => Config } }).onStartShouldSetResponder;
+  const onPress = responder?.testOnly_pressabilityConfig?.().onPress;
+  if (onPress === undefined) throw new Error("no onPress");
+  return onPress;
 }
 /** A Face ID prompt that stays up until the test settles it. */
 function holdFaceId() {
@@ -228,10 +238,10 @@ describe("the commit sheet", () => {
     await fireEvent.changeText(field(), "Fix it");
     const settle = holdFaceId();
     // Two taps in one frame: the second lands before the first has drawn the button busy.
-    const button = confirm();
-    await act(async () => {
-      fireEvent.press(button);
-      fireEvent.press(button);
+    const tapCommit = onPressOf(confirm());
+    await act(() => {
+      tapCommit();
+      tapCommit();
     });
     await flush();
     expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
@@ -244,6 +254,47 @@ describe("the commit sheet", () => {
     await refuse(rig, "Git is busy; try again", "busy");
     await press(confirm());
     expect(requests(rig, "commit")).toHaveLength(2);
+  });
+
+  it("a commit whose answer was lost keeps the sheet with the words, and the list is asked for again", async () => {
+    const rig = await open();
+    await openSheet(rig);
+    await fireEvent.changeText(field(), "Fix it");
+    await press(confirm());
+    expect(requests(rig, "commit")).toHaveLength(1);
+    const listings = requests(rig, "changes").length;
+    // The Mac stays on the line (it answers every ping, and lists the sessions now and then) but
+    // never answers the commit.
+    const answered = new Set<number>();
+    for (let waited = 0; waited <= REQUEST_TIMEOUT_MS; waited += 5_000) {
+      await act(async () => {
+        rig.clock.advance(5_000);
+        rig.sockets.last.receive({ type: "sessions", sessions: [A()] });
+        for (const ping of requests(rig, "ping")) {
+          const req = Number(ping.req);
+          if (answered.has(req)) continue;
+          answered.add(req);
+          rig.sockets.last.receive({ type: "ack", req, message: "pong" });
+        }
+      });
+    }
+    await flush();
+    expect(rig.sockets.all).toHaveLength(1); // the link stayed up
+    expect(sheet().getByText(LOST)).toBeTruthy();
+    expect(field().props.value).toBe("Fix it");
+    expect(toastStore.getState().toast).toBeNull();
+    // It may have committed: the list says whether it did.
+    expect(requests(rig, "changes")).toHaveLength(listings + 1);
+  });
+
+  it("a refusal that is a definite no asks for nothing more", async () => {
+    const rig = await open();
+    await openSheet(rig);
+    await fireEvent.changeText(field(), "Fix it");
+    await press(confirm());
+    const listings = requests(rig, "changes").length;
+    await refuse(rig, "Nothing to commit", "invalid");
+    expect(requests(rig, "changes")).toHaveLength(listings);
   });
 
   it("stays open while the commit is out, so its answer is seen", async () => {

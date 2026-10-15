@@ -441,6 +441,7 @@ run("the app's hub client against the real octet hub", () => {
   });
 
   it("commits everything once the bridge says the session is idle, then has nothing to commit", async () => {
+    // It commits the edit to README.md and the new notes.txt that the test before made.
     // The hub lets a phone commit only once the bridge has said its phase, idle, with no approval.
     const states = frames("state").length;
     bridge?.send(bridgeState([]));
