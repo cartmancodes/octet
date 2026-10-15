@@ -45,7 +45,6 @@ export interface HubSnapshot {
 
 /** Whether any kind of push is wanted. */
 const anyKind = (kinds: PushKinds): boolean => kinds.approvals || kinds.errors || kinds.turns;
-const NO_KINDS: PushKinds = { approvals: false, errors: false, turns: false };
 
 /** The outcome of turning notifications on or off: done, or the words for why not. */
 export type PushResult = { ok: true } | { ok: false; message: string };
@@ -310,8 +309,8 @@ export class HubController {
   /**
    * Turns one kind of push on or off. The Mac is sent the token with all three kinds, and the
    * kinds are saved only on its ack. With notifications off, turning a kind on turns them on
-   * through the permission flow, from no kinds but this one (the switches all showed off); with
-   * them on, the token is the current one and the phone's permission is never asked again.
+   * through the permission flow, with the Mac's defaults (approvals and errors) plus this kind,
+   * whatever kinds were kept from before; with them on, the token is the current one and the phone's permission is never asked again.
    * Turning the last kind off is turning notifications off: a null token. The answer is the
    * words to show when it did not work; the saved kinds are then as they were.
    */
@@ -320,7 +319,7 @@ export class HubController {
     if (client === null) return { ok: false, message: UNREACHABLE };
     return this.inTurn(async () => {
       const saved = await loadSettings();
-      const next: PushKinds = { ...(saved.notifications ? saved.pushKinds : NO_KINDS), [kind]: on };
+      const next: PushKinds = { ...(saved.notifications ? saved.pushKinds : DEFAULT_PUSH_KINDS), [kind]: on };
       if (!anyKind(next)) return this.push(client, null, next);
       const got = saved.notifications ? await currentToken() : await askForToken();
       if (!got.ok) return got;

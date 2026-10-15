@@ -462,18 +462,17 @@ describe("Settings", () => {
         expect((await loadSettings()).notifications).toBe(false);
       });
 
-      it("one turned on while notifications are off turns them on, through the permission flow, with only that kind", async () => {
+      it("one turned on while notifications are off turns them on, through the permission flow, with the defaults plus that kind", async () => {
         mockConfig = { extra: { eas: { projectId: PROJECT } } };
         const rig = await open();
         for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.value).toBe(false);
-        await flipKind("errors", true);
+        await flipKind("turns", true);
         expect(notifications.requestPermissionsAsync).toHaveBeenCalledTimes(1);
         expect(registered(rig)).toEqual([
-          expect.objectContaining({ token: "ExponentPushToken[abc-123_XYZ]", kinds: { approvals: false, errors: true, turns: false } }),
+          expect.objectContaining({ token: "ExponentPushToken[abc-123_XYZ]", kinds: { approvals: true, errors: true, turns: true } }),
         ]);
         await reply(rig, { type: "ack", message: "Notifications on" });
-        expect(kindSwitch("errors").props.value).toBe(true);
-        expect(kindSwitch("approvals").props.value).toBe(false);
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.value).toBe(true);
         expect((await loadSettings()).notifications).toBe(true);
       });
 

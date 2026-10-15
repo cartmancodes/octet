@@ -813,17 +813,14 @@ describe("the Session screen", () => {
         await screen.findByTestId("transcript");
         await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
         expect(field().props.autoFocus).toBe(true);
-        expect(octetStore.getState().replyTo).toBe("a");
+        expect(octetStore.getState().replyTo).toBeNull(); // used
       });
 
-      it("a plain open does not focus the prompt, and the ask is spent when the conversation closes", async () => {
+      it("a plain open does not focus the prompt", async () => {
         const rig = await launch([asking()]);
         await open(rig, "a");
         await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
         expect(field().props.autoFocus).toBeFalsy();
-        await act(async () => octetStore.getState().setReplyTo("a"));
-        await act(async () => router.back());
-        expect(octetStore.getState().replyTo).toBeNull();
       });
     });
 

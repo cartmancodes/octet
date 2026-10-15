@@ -902,18 +902,28 @@ describe("per-kind notifications", () => {
     expect(saved.pushKinds).toEqual({ approvals: false, errors: false, turns: false });
   });
 
-  it("turning a kind on while notifications are off asks permission, turns them on, and sends only that kind", async () => {
+  it("turning a kind on while notifications are off asks permission, turns them on, and sends the defaults plus that kind", async () => {
     const r = await readyWithPush(false);
-    const done = r.hub.setPushKind("errors", true);
+    const done = r.hub.setPushKind("turns", true);
     await settle();
     expect(n.requestPermissionsAsync).toHaveBeenCalledTimes(1);
-    expect(registrations(r)).toEqual([expect.objectContaining({ token: PUSH, kinds: { approvals: false, errors: true, turns: false } })]);
+    expect(registrations(r)).toEqual([expect.objectContaining({ token: PUSH, kinds: { approvals: true, errors: true, turns: true } })]);
     expect((await loadSettings()).notifications).toBe(false);
     answer(r);
     await expect(done).resolves.toEqual({ ok: true });
     const saved = await loadSettings();
     expect(saved.notifications).toBe(true);
-    expect(saved.pushKinds).toEqual({ approvals: false, errors: true, turns: false });
+    expect(saved.pushKinds).toEqual({ approvals: true, errors: true, turns: true });
+  });
+
+  it("the defaults, not the kinds kept from before, are what a first kind brings when notifications are off", async () => {
+    await saveSettings({ pushKinds: { approvals: false, errors: false, turns: false } });
+    const r = await readyWithPush(false);
+    const done = r.hub.setPushKind("approvals", true);
+    await settle();
+    expect(registrations(r)).toEqual([expect.objectContaining({ kinds: { approvals: true, errors: true, turns: false } })]);
+    answer(r);
+    await done;
   });
 
   it("with notifications off and the permission denied, sends nothing and changes nothing", async () => {

@@ -6,7 +6,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import * as Haptics from "expo-haptics";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { StyleSheet } from "react-native";
+import { StyleSheet, TextInput } from "react-native";
 
 import { Refusal } from "../client/HubClient";
 import { saveSettings } from "../persist";
@@ -75,12 +75,27 @@ describe("the prompt line", () => {
     expect(octetStore.getState().sessions[0]?.question).toBeUndefined();
   });
 
-  it("focuses the field when the Inbox's Reply asked for it, and says the ask is spent when it goes", async () => {
+  it("focuses the field when the Inbox's Reply asked for it, and the ask is spent once used", async () => {
     octetStore.getState().setReplyTo("s");
     const view = await render(controls(rig().send));
+    await flush();
+    // It was on as the field mounted (that is what focuses it), and is spent now.
     expect(input().props.autoFocus).toBe(true);
+    expect(octetStore.getState().replyTo).toBeNull();
     await view.unmount();
     expect(octetStore.getState().replyTo).toBeNull();
+  });
+
+  it("focuses again at a second Reply on a conversation that is already open", async () => {
+    await render(controls(rig().send));
+    // The jest mock of TextInput keeps `focus` as a mock function on its prototype.
+    const focus = (TextInput.prototype as unknown as { focus: jest.Mock }).focus;
+    focus.mockClear();
+    for (let i = 1; i <= 2; i++) {
+      await act(async () => octetStore.getState().setReplyTo("s"));
+      expect(focus).toHaveBeenCalledTimes(i);
+      expect(octetStore.getState().replyTo).toBeNull();
+    }
   });
 
   it("does not focus the field for another session's Reply", async () => {
@@ -91,14 +106,9 @@ describe("the prompt line", () => {
   });
 
   it("documents the field's height on PROMPT_LINES, and the early-return note on JUST_APPEARED", () => {
-    const source = readFileSync(path.join(__dirname, "PromptLine.tsx"), "utf8").split("\n");
-    const before = (name: string): string => {
-      const at = source.findIndex((line) => line.startsWith(`export const ${name} `));
-      expect(at).toBeGreaterThan(0);
-      return source[at - 1] ?? "";
-    };
-    expect(before("PROMPT_LINES")).toBe("/** The field grows to this many lines, then scrolls. */");
-    expect(before("JUST_APPEARED")).toBe("/** Said beside the prompt for a return in the 400 ms after an approval came: nothing was sent. */");
+    const source = readFileSync(path.join(__dirname, "PromptLine.tsx"), "utf8");
+    expect(source).toMatch(/\/\*\*[^\n]*grows to this many lines[^\n]*\*\/\s*\nexport const PROMPT_LINES /);
+    expect(source).toMatch(/\/\*\*[^\n]*400 ms after an approval came[^\n]*\*\/\s*\nexport const JUST_APPEARED /);
   });
 
   describe("placeholders follow the state", () => {

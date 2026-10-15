@@ -195,11 +195,15 @@ export const PromptLine = memo(function PromptLine({
   // A first prompt the Mac did not take comes back into the field, ahead of anything typed,
   // whether it was refused before this screen opened or after.
   const restore = useCallback((words: string) => setText((current) => (current === "" ? words : `${words}\n${current}`)), []);
-  // The Inbox's Reply: the field is focused as the conversation opens (or, when it is already
-  // open under another screen, as it comes into view). The ask is spent when this goes.
+  // The Inbox's Reply: the field is focused as the conversation opens (`autoFocus`, from what was
+  // asked when it mounted) or, when it is already open under another screen, as the ask comes.
+  // The ask is spent once used, so that a second Reply focuses again; and when this goes.
   const replying = useReplying(session);
+  const [focusOnMount] = useState(replying);
   useEffect(() => {
-    if (replying) field.current?.focus();
+    if (!replying) return;
+    field.current?.focus();
+    octetStore.getState().setReplyTo(null);
   }, [replying]);
   useEffect(
     () => () => {
@@ -460,7 +464,7 @@ export const PromptLine = memo(function PromptLine({
           onChangeText={onChange}
           onSubmitEditing={submit}
           onKeyPress={onKeyPress}
-          autoFocus={replying}
+          autoFocus={focusOnMount}
           multiline
           scrollEnabled
           submitBehavior="submit"

@@ -56,7 +56,8 @@ export default function Inbox() {
   const theme = useTheme();
   const router = useRouter();
   const nav = useNavigationContainerRef();
-  // The screen showing, for a card tap to read: a tap never makes the cards draw again.
+  // The screen showing, for a card tap to read from a ref, so that the tap's callbacks stay the same
+  // as it changes (the cards draw again only for their own data).
   const pathname = usePathname();
   const here = useRef(pathname);
   useLayoutEffect(() => {

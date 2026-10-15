@@ -230,7 +230,7 @@ export interface DrawerRow {
 /** The drawer's session list, with the counts under its title. */
 export interface DrawerList {
   rows: DrawerRow[];
-  /** Sessions with an approval waiting. */
+  /** Sessions that need you: an approval waiting, or a turn that ended on a question. */
   needs: number;
   /** Sessions with a turn running and nothing waiting. */
   running: number;
