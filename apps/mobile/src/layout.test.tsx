@@ -90,7 +90,7 @@ function connected({ sockets }: { sockets: Sockets }): void {
 describe("the app shell", () => {
   it("opens on Pair without a token", async () => {
     const { sockets } = await launch();
-    expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
+    expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
     expect(screen.queryByText("Sessions list")).toBeNull();
     expect(sockets.all).toHaveLength(0);
   });
@@ -108,7 +108,7 @@ describe("the app shell", () => {
       { initialUrl: "/session/x" },
     );
     await view;
-    expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
+    expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
     expect(screen.queryByText("Session x")).toBeNull();
     expect(view.getPathname()).toBe("/pair");
     expect(sockets.all).toHaveLength(0);
@@ -117,7 +117,7 @@ describe("the app shell", () => {
   it("opens on Sessions with a token, and connects once", async () => {
     const { sockets } = await launch({ paired: true });
     expect(await screen.findByText("Sessions list")).toBeTruthy();
-    expect(screen.queryByText("Scan the code from octet pair")).toBeNull();
+    expect(screen.queryByText("Scan the code from /remote-control pair")).toBeNull();
     expect(sockets.all).toHaveLength(1);
   });
 
@@ -174,7 +174,7 @@ describe("the app shell", () => {
     await act(async () => {
       sockets.last.receive({ type: "refused", req: 0, reason: "This device was revoked", code: "revoked" });
     });
-    expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
+    expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
     expect(screen.getByText(UNPAIRED_NOTICE)).toBeTruthy();
     expect(screen.queryByText("Sessions list")).toBeNull();
     expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
@@ -198,7 +198,7 @@ describe("the app shell", () => {
       jest.mocked(SystemUI.setBackgroundColorAsync).mockClear();
       jest.spyOn(ReactNative, "useColorScheme").mockReturnValue("dark");
       await launch();
-      await screen.findByText("Scan the code from octet pair");
+      await screen.findByText("Scan the code from /remote-control pair");
       expect(SystemUI.setBackgroundColorAsync).toHaveBeenLastCalledWith(dark.bg);
     });
 
@@ -206,7 +206,7 @@ describe("the app shell", () => {
       jest.mocked(SystemUI.setBackgroundColorAsync).mockClear();
       jest.spyOn(ReactNative, "useColorScheme").mockReturnValue("light");
       await launch();
-      await screen.findByText("Scan the code from octet pair");
+      await screen.findByText("Scan the code from /remote-control pair");
       expect(SystemUI.setBackgroundColorAsync).toHaveBeenLastCalledWith(light.bg);
     });
   });
@@ -251,7 +251,7 @@ describe("notifications", () => {
 
   it("a tap while unpaired goes to Pair", async () => {
     const { view } = await launch();
-    await screen.findByText("Scan the code from octet pair");
+    await screen.findByText("Scan the code from /remote-control pair");
     await act(async () => listener()?.(tap({ session: SESSION })));
     expect(view.getPathname()).toBe("/pair");
   });
@@ -274,7 +274,7 @@ describe("notifications", () => {
   it("a cold start from a tap while unpaired lands on Pair", async () => {
     n.getLastNotificationResponse.mockReturnValue(tap({ session: SESSION }));
     const { view } = await launch();
-    await screen.findByText("Scan the code from octet pair");
+    await screen.findByText("Scan the code from /remote-control pair");
     expect(view.getPathname()).toBe("/pair");
   });
 

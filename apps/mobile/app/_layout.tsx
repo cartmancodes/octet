@@ -127,9 +127,10 @@ export default function RootLayout() {
           </Stack.Protected>
         </Stack>
       </DrawerHost>
-      <ToastHost />
       {paired && !offer ? <ApprovalToasts /> : null}
       {paired && !offer ? <Drawer /> : null}
+      {/* Last, so a toast draws over the drawer and its scrim: its action still works there. */}
+      <ToastHost />
     </>
   );
 }

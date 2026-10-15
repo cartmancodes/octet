@@ -12,19 +12,40 @@ export const APPROVAL_TOAST = " needs approval";
 const VIEW = "View";
 
 /**
- * The first session of `next` that an approval newly came to since `before`: its count of waiting
- * approvals rose, or its front approval is another one. A session the phone did not know before has
- * no approvals behind it, so one with an approval waiting counts. O(n).
+ * The sessions of `next` that an approval newly came to since `before`, in the list's order: the
+ * count of waiting approvals rose, or the count held and the front approval is another one. A fall
+ * in the count (the Mac answered one, and the next became the front) is not news, and neither is
+ * a front approval that `toasted` (the last front id each session showed) already has:
+ * a session's row can lose its front for a moment and show it again. O(n).
  */
-export function newApproval(before: readonly SessionInfo[], next: readonly SessionInfo[]): SessionInfo | null {
+export function freshApprovals(
+  before: readonly SessionInfo[],
+  next: readonly SessionInfo[],
+  toasted: ReadonlyMap<string, number> = NONE,
+): SessionInfo[] {
   const was = new Map(before.map((s) => [s.id, s]));
+  const fresh: SessionInfo[] = [];
   for (const s of next) {
     if (s.approvals <= 0) continue;
     const old = was.get(s.id);
-    if (!old || s.approvals > old.approvals || (s.approval != null && s.approval.id !== old.approval?.id)) return s;
+    const from = old?.approvals ?? 0;
+    const front = s.approval?.id ?? null;
+    const announced = front !== null && toasted.get(s.id) === front;
+    if (s.approvals > from) {
+      // From nothing, the same front again is the one already announced; one more behind a front is new.
+      if (from > 0 || !announced) fresh.push(s);
+    } else if (s.approvals === from && front !== null && front !== (old?.approval?.id ?? null) && !announced) {
+      fresh.push(s);
+    }
   }
-  return null;
+  return fresh;
 }
+
+const NONE: ReadonlyMap<string, number> = new Map();
+
+/** The first of `freshApprovals`, or null. */
+export const newApproval = (before: readonly SessionInfo[], next: readonly SessionInfo[], toasted?: ReadonlyMap<string, number>): SessionInfo | null =>
+  freshApprovals(before, next, toasted)[0] ?? null;
 
 /** The session a Conversation path shows, or null on any other screen. */
 const SESSION_PATH = /^\/session\/([^/]+)$/;
@@ -55,12 +76,20 @@ export const ApprovalToasts = memo(function ApprovalToasts() {
     here.current = pathname;
   });
   const seen = useRef<{ listed: boolean; sessions: readonly SessionInfo[] }>({ listed: false, sessions: [] });
+  // The front approval each session last showed, so that one returning after a gap is not news.
+  const toasted = useRef(new Map<string, number>());
 
   useEffect(() => {
     const before = seen.current;
     seen.current = { listed, sessions };
-    if (!listed || !before.listed) return;
-    const fresh = newApproval(before.sessions, sessions);
+    const memory = toasted.current;
+    // A session with nothing waiting is forgotten, and one gone from the list.
+    const live = new Set(sessions.filter((x) => x.approvals > 0).map((x) => x.id));
+    for (const id of memory.keys()) if (!live.has(id)) memory.delete(id);
+    // The first listing is the baseline: what waits then is not news.
+    const news = listed && before.listed ? freshApprovals(before.sessions, sessions, memory) : [];
+    for (const x of sessions) if (x.approvals > 0 && x.approval) memory.set(x.id, x.approval.id);
+    const fresh = news[0];
     if (!fresh || here.current === "/" || onScreen(here.current) === fresh.id) return;
     const id = fresh.id;
     showToast(

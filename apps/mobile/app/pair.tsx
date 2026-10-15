@@ -137,8 +137,9 @@ export default function Pair() {
         <DevBuildBanner inset />
         <Text accessibilityRole="header" style={[type.body, styles.heading, { color: theme.fg }]}>
           {"Scan the code from "}
-          <Text style={styles.bold}>octet pair</Text>
+          <Text style={styles.bold}>/remote-control pair</Text>
         </Text>
+        <Text style={[type.label, styles.hint, { color: theme.muted }]}>On your Mac, run /remote-control pair in Octet.</Text>
 
         <View style={styles.scan}>
           <View testID="scan-frame" style={styles.frame}>
@@ -299,7 +300,8 @@ function NotificationsStep() {
 
 const styles = StyleSheet.create({
   content: { flexGrow: 1 },
-  heading: { paddingHorizontal: spacing.xl, paddingVertical: spacing.sm },
+  heading: { paddingHorizontal: spacing.xl, paddingTop: spacing.sm },
+  hint: { paddingHorizontal: spacing.xl, paddingBottom: spacing.sm },
   bold: { fontWeight: "700" },
   scan: { flex: 1, minHeight: FRAME + 2 * spacing.xl, alignItems: "center", justifyContent: "center" },
   frame: { width: FRAME, height: FRAME, borderRadius: radius.card, overflow: "hidden", alignItems: "center", justifyContent: "center" },

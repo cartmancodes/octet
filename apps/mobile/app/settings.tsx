@@ -1,6 +1,5 @@
 import Constants from "expo-constants";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { memo } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Alert, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -162,7 +161,7 @@ export default function Settings() {
             disabled={!hasProject || working !== null}
             onValueChange={flipPush}
           />
-          <SwitchRow label="A turn finishes" value={pushOn} disabled note={TURN_NOTE} first={false} />
+          <SwitchRow label="A turn finishes" value={pushOn} disabled note={TURN_NOTE} hint={TURN_NOTE} first={false} />
           {pushWords !== null ? (
             <View accessibilityLiveRegion="polite" style={styles.words}>
               <Text style={[type.caption, { color: theme.fg }]}>{pushWords}</Text>
@@ -196,13 +195,15 @@ interface SwitchRowProps {
   disabled?: boolean;
   /** A muted line under the label. */
   note?: string;
+  /** What a screen reader adds to the switch. */
+  hint?: string;
   /** Not the first row of its card: a rule above it. */
   first?: boolean;
   onValueChange?: (on: boolean) => void;
 }
 
 /** One row of switches: the label (and its note) on the left, the switch on the right. */
-const SwitchRow = memo(function SwitchRow({ label, accessibilityLabel, value, disabled = false, note, first = true, onValueChange }: SwitchRowProps) {
+const SwitchRow = memo(function SwitchRow({ label, accessibilityLabel, value, disabled = false, note, hint, first = true, onValueChange }: SwitchRowProps) {
   const theme = useTheme();
   return (
     <View style={[styles.switchRow, first ? null : [styles.rule, { borderTopColor: theme.edge }]]}>
@@ -213,6 +214,7 @@ const SwitchRow = memo(function SwitchRow({ label, accessibilityLabel, value, di
       <Switch
         accessibilityRole="switch"
         accessibilityLabel={accessibilityLabel ?? label}
+        accessibilityHint={hint}
         value={value}
         disabled={disabled}
         onValueChange={onValueChange}

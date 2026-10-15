@@ -467,7 +467,7 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
   `curl` every push fails (the hub logs `Push failed` and carries on). macOS
   and most Linux systems have it in `/usr/bin`; the service `octet hub install`
   writes carries a `PATH` that includes `/usr/bin`, so it finds it.
-- **Turn it off.** Switch **Notifications** off in the app's Settings (the
+- **Turn it off.** Switch **An action needs approval** off in the app's Settings (the
   hub forgets the token at once). Unpairing the phone, or `octet hub revoke
   "NAME"` on the Mac, removes its token as well. Stopping the hub stops
   every push.

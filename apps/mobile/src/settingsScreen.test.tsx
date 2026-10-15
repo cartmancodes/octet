@@ -109,6 +109,7 @@ describe("Settings", () => {
       expect(screen.getByRole("switch", { name: "An action needs approval" })).toBeTruthy();
       const turn = screen.getByRole("switch", { name: "A turn finishes" });
       expect(turn.props.disabled).toBe(true);
+      expect(turn.props.accessibilityHint).toBe("Coming with the next hub update");
       expect(screen.getByText("Coming with the next hub update")).toBeTruthy();
       expect(screen.queryByText("A session hits an error")).toBeNull();
     });
@@ -232,7 +233,7 @@ describe("Settings", () => {
       expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
       expect((await loadSettings()).hubUrl).toBeNull();
       expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
-      expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
+      expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
       expect(rig.view.getPathname()).toBe("/pair");
       expect(screen.queryByText("This phone was unpaired on the Mac")).toBeNull();
     });

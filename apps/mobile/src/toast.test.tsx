@@ -63,6 +63,20 @@ describe("newApproval", () => {
     expect(newApproval([row("a", 0)], [row("a", 0)])).toBeNull();
   });
 
+  it("a front approval that goes missing for a moment and returns is not announced again", () => {
+    const toasted = new Map([["a", 1]]);
+    expect(newApproval([row("a", 1, 1)], [row("a", 1)], toasted)).toBeNull(); // the front is gone
+    expect(newApproval([row("a", 1)], [row("a", 1, 1)], toasted)).toBeNull(); // and back
+    // The same, from nothing waiting, for a front already announced.
+    expect(newApproval([], [row("a", 1, 1)], toasted)).toBeNull();
+    // Another approval is news.
+    expect(newApproval([row("a", 1)], [row("a", 1, 2)], toasted)?.id).toBe("a");
+  });
+
+  it("a count that falls, with the next approval now at the front, is not news", () => {
+    expect(newApproval([row("a", 2, 1)], [row("a", 1, 2)])).toBeNull();
+  });
+
   it("takes the first of several, in the list's order", () => {
     expect(newApproval([row("a", 0), row("b", 0)], [row("a", 1, 1), row("b", 1, 1)])?.id).toBe("a");
   });
@@ -94,12 +108,27 @@ describe("the approval toast", () => {
     expect(toastText()).toBeNull(); // the same approval
     await hear(rig, [waiting("b", 2)]);
     expect(toastText()).toBe("b needs approval"); // its front approval changed
-    hideToast();
+    await act(async () => hideToast());
     await hear(rig, [waiting("b", 2, { approvals: 2 })]);
     expect(toastText()).toBe("b needs approval"); // one more waiting
-    hideToast();
+    await act(async () => hideToast());
     await hear(rig, [waiting("b", 2, { approvals: 1 })]);
     expect(toastText()).toBeNull(); // fewer waiting
+  });
+
+  it("announces each approval once: not when its front goes missing and returns, nor when one is answered and the next fronts", async () => {
+    const rig = await openAt("/settings", [info("b")]);
+    await hear(rig, [waiting("b", 1, { approvals: 2 })]);
+    expect(toastText()).toBe("b needs approval");
+    await act(async () => hideToast());
+    await hear(rig, [waiting("b", 2, { approvals: 1 })]); // the Mac answered 1; 2 is at the front
+    expect(toastText()).toBeNull();
+    await hear(rig, [info("b", { approvals: 1, phase: "running" })]); // the front is missing a moment
+    expect(toastText()).toBeNull();
+    await hear(rig, [waiting("b", 2)]); // and back
+    expect(toastText()).toBeNull();
+    await hear(rig, [waiting("b", 3)]); // another approval
+    expect(toastText()).toBe("b needs approval");
   });
 
   it("stays quiet for the approvals already waiting when the phone connects", async () => {

@@ -3,8 +3,6 @@
 // truth. The drawer itself is src/components/Drawer.tsx, mounted once in app/_layout.tsx.
 import { createStore, useStore } from "zustand";
 
-import { hideToast } from "./toast";
-
 interface DrawerState {
   open: boolean;
   /** The screen showing has a drawer (see `drawerScreen`). Set by the shell. */
@@ -40,12 +38,11 @@ export function setDrawerEnabled(enabled: boolean): void {
   drawerStore.setState(enabled ? { enabled } : { enabled, open: false });
 }
 
-/** Opens the drawer, and takes a toast down (it would sit under the scrim). Does nothing where
- * there is no drawer. */
+/** Opens the drawer. A toast stays up over it (the host draws last). Does nothing where there is
+ * no drawer. */
 export function openDrawer(): void {
   const { open, enabled } = drawerStore.getState();
   if (open || !enabled) return;
-  hideToast();
   drawerStore.setState({ open: true });
 }
 

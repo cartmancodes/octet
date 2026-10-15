@@ -115,7 +115,7 @@ run:android`. The same rule applies: never pair that build with your everyday Ma
 
 1. On the Mac, start the hub and publish it (see [the guide](../../docs/remote-control.md#phone-app-hub)).
 2. In an Octet session on the Mac, type `/remote-control pair`. It shows a QR code and a link.
-3. Open the app. Until it is paired it shows **Scan the code from octet pair**: point the camera at
+3. Open the app. Until it is paired it shows **Scan the code from /remote-control pair**: point the camera at
    the code, inside the four corner brackets. Or tap **Enter code instead** and paste the link into
    **Paste link** (with the camera off, those fields show at once). Once the link is valid the app
    says `Pair with <the hub's address>?` and the **Pair** button turns on (it is dimmed until then).
@@ -158,7 +158,7 @@ The Mac's hub sends the pushes through Expo's push service, only to a phone that
 connection to it, and shows nothing while the app is open. Push tokens belong to an EAS project, so
 notifications need the app's **EAS project id**: it is not in this repository (it is yours). `eas
 init` (see [Building the app for a phone](#building-the-app-for-a-phone)) writes it to `app.json`
-as `extra.eas.projectId`; build again after that. Without it the **Notifications** switch in
+as `extra.eas.projectId`; build again after that. Without it the **An action needs approval** switch in
 Settings is off and says so, and pairing skips the notifications step. On iOS, EAS also sets up the
 Apple push credentials for the build; on Android, push needs a Firebase (FCM) credential added to
 the EAS project. Neither is in this repository.
@@ -265,7 +265,7 @@ your Tailscale configuration), as described in
 [docs/remote-control.md](../../docs/remote-control.md#put-it-on-your-tailnet). The hub looks again
 every 10 seconds, so it can take that long to notice.
 
-**The app is back on "Pair with your Mac", saying "This phone was unpaired on the Mac".** The Mac
+**The app is back on the pairing screen ("Scan the code from /remote-control pair"), saying "This phone was unpaired on the Mac".** The Mac
 removed this phone (`octet hub revoke NAME`), so the hub no longer knows its token. Pair again with
 `/remote-control pair`. `octet hub devices` lists the phones the Mac knows.
 

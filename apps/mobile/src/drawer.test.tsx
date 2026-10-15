@@ -219,12 +219,29 @@ describe("the drawer", () => {
       expect(handlers).toHaveLength(before);
     });
 
-    it("takes a toast down when it opens", async () => {
+    it("keeps a toast up over the drawer, and its action still works", async () => {
+      const run = jest.fn();
       await open([info("a")]);
-      await act(async () => showToast("Copied"));
-      expect(screen.getByTestId("toast")).toBeTruthy();
-      await fireEvent.press(menu());
-      expect(screen.queryByTestId("toast")).toBeNull();
+      await act(async () => showToast("b needs approval", run, "View"));
+      await openFromMenu();
+      expect(isOpen()).toBe(true);
+      // (The drawer is a modal view to a screen reader, which sets its siblings aside: the toast is for touch here.)
+      const hidden = { includeHiddenElements: true };
+      expect(screen.getByTestId("toast", hidden)).toBeTruthy();
+      // The host is drawn after the drawer, so it is over the drawer and its scrim.
+      const order: string[] = [];
+      const walk = (node: unknown): void => {
+        if (Array.isArray(node)) return node.forEach(walk);
+        if (node === null || typeof node !== "object") return;
+        const { props, children } = node as { props?: { testID?: string }; children?: unknown };
+        if (props?.testID) order.push(props.testID);
+        walk(children);
+      };
+      walk(screen.toJSON());
+      expect(order.indexOf("toast-wrap")).toBeGreaterThan(order.indexOf("drawer"));
+      await fireEvent.press(screen.getByRole("button", { name: "View", ...hidden }));
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(screen.queryByTestId("toast", hidden)).toBeNull();
     });
   });
 

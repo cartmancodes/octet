@@ -104,9 +104,10 @@ beforeEach(async () => {
 });
 
 describe("the Pair screen", () => {
-  it("is a panel with 'Scan the code from octet pair', the camera in four accent corner brackets, and a sheet", async () => {
+  it("is a panel with 'Scan the code from /remote-control pair', with a hint,, the camera in four accent corner brackets, and a sheet", async () => {
     await open();
-    expect(screen.getByText("Scan the code from octet pair")).toBeTruthy();
+    expect(screen.getByText("Scan the code from /remote-control pair")).toBeTruthy();
+    expect(screen.getByText("On your Mac, run /remote-control pair in Octet.")).toBeTruthy();
     const style = (el: { props: { style?: unknown } }) => StyleSheet.flatten(el.props.style as never) as Record<string, unknown>;
     const frame = style(screen.getByTestId("scan-frame"));
     expect(frame.width).toBe(240);
