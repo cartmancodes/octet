@@ -343,8 +343,9 @@ later) the screen takes the size of whichever of them was used last; add
 
 The hub is a small server on the Mac that shares your running Octet sessions
 with a phone app, over your tailnet. The phone sees each session's transcript,
-sends prompts, answers approvals, changes mode and model, and can start a
-session or resume a recent one. You can still sit at the Mac and join any
+sends prompts, answers approvals, changes mode and model, runs a few safe desk
+commands (`/new`, `/session`, `/export`, `/help`), and can start a session or
+resume a recent one. You can still sit at the Mac and join any
 session: a session started from the phone runs in tmux (`tmux attach -t
 octet-NAME`), and one started at the desk shows up on the phone.
 
@@ -433,19 +434,26 @@ environment, even after a login with no tmux running. The service doesn't use
 
 ### Push notifications
 
-When an agent needs your approval, or finishes a turn, the hub can tell a phone
-that isn't looking at the app. The phone turns this on itself (Settings in the
-app, or the step after pairing; [the app's
+When an agent needs your approval, hits an error, or finishes a turn, the hub
+can tell a phone that isn't looking at the app. The phone turns this on itself
+(Settings in the app, or the step after pairing; [the app's
 README](../apps/mobile/README.md#notifications) covers the one-time setup with
 your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
 
 - **What is sent.** Exactly this and nothing else: the title `Octet`, the body
-  `Approval waiting` or `Turn finished`, and `data` holding the hub's opaque
-  session id so a tap opens that session, plus the fixed delivery fields
+  `Approval waiting`, `Session error` or `Turn finished`, and `data` holding
+  the hub's opaque session id so a tap opens that session, plus the fixed delivery fields
   Expo needs (`to`, which is the phone's push token, and `sound`, `priority`
-  and `channelId`, which are constants). No prompt, command, file name,
-  workspace, model or reply text ever goes in a push, so the push services
-  never see what you are working on.
+  and `channelId`, which are constants: `approvals`, `errors` or `turns`). No
+  prompt, command, file name, workspace, model, error or reply text ever goes in
+  a push, so the push services never see what you are working on.
+- **Which kinds.** Each phone has three switches, kept by the hub per phone:
+  approvals (`Approval waiting`), errors (`Session error`, for an `error` record
+  in a session's journal) and finished turns (`Turn finished`). A phone paired
+  now starts with approvals and errors on and finished turns off. A phone paired
+  before the switches existed keeps getting all three until it changes one. The
+  app sends its switches with its push token (`register_push`); an older app
+  that sends none keeps what the hub has.
 - **Where it goes.** The hub posts each push to Expo's push service, `https://exp.host/--/api/v2/push/send`,
   which hands it to Apple or Google. That request is the only thing the hub
   sends outside your Mac and your tailnet, and it carries the phone's Expo
@@ -459,16 +467,19 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
   waiting when the app goes to the background is pushed then, once (within the
   same limits).
 - **How often.** One push per approval, however often it is shown again; one per
-  finished turn. Pushes to a phone collect for about two seconds and go out as
-  one (an approval wins over a finished turn), and a phone gets at most six
-  in any minute. A phone Expo reports as gone has its token cleared.
+  finished turn; and errors, however many, once per collecting window. Pushes to
+  a phone collect for about two seconds and go out as one, ranked approval, then
+  error, then finished turn, and a phone gets at most six in any minute, so a
+  session that keeps failing can't flood it. A phone Expo reports as gone has
+  its token cleared.
 - **curl.** The hub sends each push by running `curl` from its `PATH`, with
   `-q` so it ignores any `~/.curlrc`. Without
   `curl` every push fails (the hub logs `Push failed` and carries on). macOS
   and most Linux systems have it in `/usr/bin`; the service `octet hub install`
   writes carries a `PATH` that includes `/usr/bin`, so it finds it.
-- **Turn it off.** Switch **An action needs approval** off in the app's Settings (the
-  hub forgets the token at once). Unpairing the phone, or `octet hub revoke
+- **Turn it off.** Switch each kind off in the app's Settings; with all three
+  off, notifications are off and the hub forgets the token at once. Unpairing
+  the phone, or `octet hub revoke
   "NAME"` on the Mac, removes its token as well. Stopping the hub stops
   every push.
 
@@ -572,8 +583,22 @@ It then creates no socket and no file, and the hub and the phone never see it.
 - The phone can start sessions only in workspaces that appear in your recent
   sessions or in the `workspaces` list of `hub.json` in the data directory,
   and at most eight phone-started sessions run at once.
-- The phone can't run slash commands, `!` shell commands or `/goal`, edit
-  files outside a session, or see sessions started with `--no-remote`.
+- The phone runs exactly these desk commands and no others: `/model`,
+  `/mode`, `/new`, `/session`, `/help` and `/export`. The last four go as one
+  `command` request naming one of `new`, `session`, `help` or `export`, with
+  no argument, so nothing from the phone reaches a shell or a path. Like every
+  phone request it is refused before the phone says hello, counted against the
+  same per-phone rate limit, and audited with the phone's name (`command new`
+  and so on). The desk runs its own handler and answers with its own words:
+  - `/new` is refused while a turn runs, while the desk's external editor is
+    open or a `!` command runs there, or while the desk has an unsent draft;
+    otherwise it starts a fresh conversation, as at the desk.
+  - `/session` and `/help` only read. `/help` lists the phone's commands.
+  - `/export` writes the journal to the desk's default path, the workspace and
+    the journal's file name, exactly as `/export` with no argument does at the
+    desk. It is refused during a turn or while another desk job runs.
+- The phone can't run any other slash command, `!` shell commands or `/goal`,
+  edit files outside a session, or see sessions started with `--no-remote`.
 - Pairing codes, device tokens and push tokens are never written to logs or
   journals.
 

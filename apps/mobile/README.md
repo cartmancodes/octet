@@ -142,9 +142,13 @@ side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Se
 - **Conversation.** The transcript, the model and mode menu, the permission card, the prompt line
   with its slash menu, and a key bar for the terminal's keys.
 - **Settings.** Three cards. **Machines**: the Mac with ● online or ○ offline, this phone's name,
-  and **Unpair**. **Notify me when**: **An action needs approval** turns notifications on or off
-  (the switch moves only when the Mac acknowledges; a refusal or an unreachable Mac is said below
-  it); **A turn finishes** shows the same setting and is disabled until the next hub update.
+  and **Unpair**. **Notify me when**: three switches, **An action needs approval**, **A turn
+  finishes** and **A session hits an error**, one per kind of push. A switch moves only when the
+  Mac acknowledges (a refusal or an unreachable Mac is said below them). Turning one on while
+  notifications are off asks the phone's permission and turns on approvals and errors with it;
+  turning the last one off turns notifications off. A phone paired now starts with approvals and
+  errors on and finished turns off; an app updated from before the switches, with notifications
+  on, shows all three on, which is what the Mac was sending it.
   **Face ID to allow**: turns the Face ID check on allowing an approval on or off (turning it off
   asks for Face ID; full access always asks). The footer names the app version.
 - **Toasts.** One line at the bottom of a screen. When an approval newly arrives for a session
@@ -153,13 +157,14 @@ side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Se
 
 ## Notifications
 
-The app can notify you when an agent needs approval or finishes a turn, while the app is closed.
+The app can notify you when an agent needs approval, hits an error, or finishes a turn, while the
+app is closed.
 The Mac's hub sends the pushes through Expo's push service, only to a phone that has no open
 connection to it, and shows nothing while the app is open. Push tokens belong to an EAS project, so
 notifications need the app's **EAS project id**: it is not in this repository (it is yours). `eas
 init` (see [Building the app for a phone](#building-the-app-for-a-phone)) writes it to `app.json`
-as `extra.eas.projectId`; build again after that. Without it the **An action needs approval** switch in
-Settings is off and says so, and pairing skips the notifications step. On iOS, EAS also sets up the
+as `extra.eas.projectId`; build again after that. Without it the **Notify me when** switches in
+Settings are off and say so, and pairing skips the notifications step. On iOS, EAS also sets up the
 Apple push credentials for the build; on Android, push needs a Firebase (FCM) credential added to
 the EAS project. Neither is in this repository.
 
@@ -191,8 +196,10 @@ unpair the Mac doesn't hear (it is out of reach) drops the phone's push registra
 the Mac's next push bounces and it forgets the token. Taking the permission away in the phone's
 settings also tells the Mac to stop, on the next connection; give it back and the app registers
 again. Tapping a notification opens that session, and opening the app clears its notifications
-from the tray. A push says only `Octet` and `Approval waiting` or `Turn
-finished`; what the hub sends, where, and when is in [the guide](../../docs/remote-control.md#push-notifications).
+from the tray. A push says only `Octet` and one of `Approval waiting`, `Session error` or `Turn
+finished`. On Android each goes to its own channel (**Approvals**, **Session errors**, **Finished
+turns**), which the phone's settings can silence one by one; approvals and errors sound, finished
+turns don't. What the hub sends, where, and when is in [the guide](../../docs/remote-control.md#push-notifications).
 
 ## Device pass
 
@@ -206,7 +213,13 @@ workspace. Tick each one on each phone.
 - [ ] Tap that push: the app opens on that session (from locked, from the background, and from a
       closed app).
 - [ ] Allow behind biometrics: the approval needs Face ID or the fingerprint, and the turn goes on.
-- [ ] A finished turn on a locked phone pushes `Turn finished`; with the app open, nothing does.
+- [ ] With **A turn finishes** on, a finished turn on a locked phone pushes `Turn finished`; with
+      the app open, nothing does. With it off, nothing is pushed for it.
+- [ ] A session error on a locked phone (an `error` record in its journal: a turn that fails) pushes
+      `Session error`, on the iPhone and on Android (where it arrives on the **Session errors**
+      channel, with sound). With **A session hits an error** off, nothing is pushed for it.
+- [ ] Each switch in **Notify me when** moves only after the Mac acknowledges, and survives a
+      restart of the app.
 - [ ] An approval that arrives with the app open, still waiting when you leave the app: one push.
 - [ ] With `octet hub install`, after a fresh login and no tmux running, start a Claude session
       from the phone.
@@ -215,7 +228,7 @@ workspace. Tick each one on each phone.
 - [ ] Change the model and the mode; full access asks for the typed confirmation.
 - [ ] Resume a recent session and start a new one, then join it from the desk with `tmux attach`.
 - [ ] Return to the app after a long background: it reconnects at once, without a pull to refresh.
-- [ ] Notifications off in Settings: no more pushes. Revoke the phone on the Mac
+- [ ] All three switches off in Settings: no more pushes. Revoke the phone on the Mac
       (`octet hub revoke`): the app says it is unpaired.
 
 ## Performance notes

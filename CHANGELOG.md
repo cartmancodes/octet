@@ -11,6 +11,20 @@ Claude Code and Codex CLIs.
 
 ### Added
 
+- Safe desk commands, usage, error pushes and questions on the phone. The
+  slash menu runs `/new` (after a confirm), `/session`, `/export` and `/help`
+  through one `command` request that names the command and takes no argument:
+  the desk runs its own handler and answers with its own words, `/new` is
+  refused while a turn runs or the desk has a draft, and `/export` writes only
+  to the desk's default path and is refused during a turn. A Usage screen
+  shows the session's engine, latest usage line, turns and journal, and every
+  session's usage today. The hub pushes `Session error` for an error in a
+  session's journal (ranked after an approval and before a finished turn,
+  within the same limits), and each phone chooses its kinds: approvals,
+  errors and finished turns, with approvals and errors on for a new pairing
+  and all three kept for a phone paired before. A session whose last turn
+  ended on a question shows in the Inbox's Needs you with Reply, until you
+  send it something or start afresh.
 - Push for the phone app, and a hub that keeps itself running: the hub tells a
   phone that is not looking at the app when an approval is waiting or a turn
   finished, through Expo's push service. The message is only `Octet` and
