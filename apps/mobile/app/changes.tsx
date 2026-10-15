@@ -10,6 +10,7 @@ import {
   NO_TESTS,
   branchLines,
   changeSummary,
+  committedText,
   diffLines,
   lastChecks,
   matchFile,
@@ -17,6 +18,7 @@ import {
 } from "../src/changes";
 import type { ChangesAnswer, ListedFile } from "../src/client/answers";
 import { Refusal } from "../src/client/HubClient";
+import { CommitSheet, PrSheet } from "../src/components/CommitSheet";
 import { DiffLineRow, DiffNote, FileRow, SIDE } from "../src/components/FileRow";
 import { HubBanner } from "../src/components/HubBanner";
 import { failure, useAlive, useSend, type Failure } from "../src/components/send";
@@ -24,7 +26,8 @@ import { useHubClient } from "../src/hub";
 import { FIELD_CHARS, field } from "../src/model/text";
 import type { DiffFrame, FileChange } from "../src/protocol";
 import { sessionName } from "../src/sessions";
-import { octetStore, unwatch, useEntries, useHub, useSessionHead, watch } from "../src/store";
+import { octetStore, unwatch, useApprovals, useEntries, useHub, useSessionHead, watch } from "../src/store";
+import { showToast } from "../src/toast";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../src/theme";
 import { Button, Card } from "../src/ui";
 
@@ -85,6 +88,10 @@ const isDiff = (x: unknown): x is DiffFrame => typeof x === "object" && x !== nu
  * listed, exactly as listed, so the screen asks for the listing whenever the connection is (again)
  * ready, asks for diffs only once it is in, and asks by the raw path the client kept. Everything
  * the hub sent is drawn cleaned, as plain text; the raw path never is.
+ *
+ * Under the list, Commit opens the commit sheet (Face ID every time, then `commit` of everything
+ * in the workspace; off while the Mac can't be reached or an approval waits), and "Open PR on the
+ * desk" shows the command to run at the Mac and sends nothing.
  */
 export default function Changes() {
   const theme = useTheme();
@@ -99,6 +106,7 @@ export default function Changes() {
   const head = useSessionHead(id);
   const send = useSend();
   const alive = useAlive();
+  const waiting = useApprovals(id).length > 0;
 
   // The session streams while this screen is in front, as it does for Usage: Checks is live.
   useFocusEffect(
@@ -146,6 +154,8 @@ export default function Changes() {
   const routed = useRef(false);
   /** The newest listing's files, by raw path. */
   const listed = useRef<ReadonlyMap<string, ListedFile>>(new Map());
+  /** The newest listing's branch, for the commit toast; null when HEAD is detached. */
+  const branchNow = useRef<string | null>(null);
 
   /** Asks for the diff of the listed file whose raw path is `raw`, by that path. */
   const askDiff = useCallback(
@@ -192,6 +202,7 @@ export default function Changes() {
           }
           const byRaw = new Map(frame.files.map((f) => [f.raw, f]));
           listed.current = byRaw;
+          branchNow.current = frame.branch ?? null;
           // A kept diff of a file whose lines or status changed is of an older file.
           keepDiffs((d, raw) => d.state === "ready" && sameStamp(d.of, byRaw.get(raw)));
           const open = new Set([...expandedRef.current].filter((raw) => byRaw.has(raw)));
@@ -251,6 +262,22 @@ export default function Changes() {
     [askDiff, setDiff, setExpanded],
   );
 
+  // The commit and PR sheets. A commit's ack toasts even if the screen has gone (the Mac did
+  // commit); with the screen still here, the sheet closes and the listing is asked for again.
+  const [sheet, setSheet] = useState<"commit" | "pr" | null>(null);
+  const openCommit = useCallback(() => setSheet("commit"), []);
+  const openPr = useCallback(() => setSheet("pr"), []);
+  const closeSheet = useCallback(() => setSheet(null), []);
+  const committed = useCallback(
+    (ack: unknown) => {
+      showToast(committedText(ack, branchNow.current));
+      if (!alive()) return;
+      setSheet(null);
+      load(false);
+    },
+    [alive, load],
+  );
+
   const back = useCallback(() => {
     if (router.canGoBack()) router.back();
     else router.replace("/");
@@ -282,6 +309,9 @@ export default function Changes() {
 
   // While the Mac can't be reached the screen shows its last state, greyed, and takes no tap.
   const offline = hub !== "ready";
+  // Commit is off offline, while an approval waits (the hub refuses a commit then), and in a
+  // folder that is not a repository.
+  const commitOff = offline || waiting || listing.state === "norepo";
   const renderItem = useCallback<ListRenderItem<Item>>(
     ({ item }) =>
       item.kind === "file" ? (
@@ -323,7 +353,21 @@ export default function Changes() {
         retry: { ...type.body, color: theme.accent },
         footer: { gap: spacing.xl, paddingHorizontal: SIDE, paddingTop: spacing.lg },
         more: { ...type.label, color: theme.muted },
-        actions: { paddingHorizontal: SIDE, paddingTop: spacing.md },
+        actions: { flexDirection: "row", gap: spacing.sm, paddingHorizontal: SIDE, paddingTop: spacing.md },
+        action: {
+          minHeight: 52,
+          minWidth: 44,
+          alignItems: "center",
+          justifyContent: "center",
+          paddingHorizontal: spacing.md,
+          borderRadius: radius.card,
+          borderWidth: 1,
+        },
+        commit: { flex: 1, borderColor: theme.edge },
+        commitLabel: { ...type.body, color: theme.fg },
+        pr: { flex: 1.5, borderColor: theme.accent, backgroundColor: theme.accent },
+        prLabel: { ...type.body, fontWeight: "700", color: theme.bg },
+        actionOff: { opacity: 0.4 },
       }),
     [theme],
   );
@@ -390,9 +434,28 @@ export default function Changes() {
           onRefresh={offline ? undefined : pull}
           contentContainerStyle={s.list}
         />
-        {/* Commit and Open PR go here (the next task): the list ends above them. */}
-        <View testID="changes-actions" style={[s.actions, { paddingBottom: Math.max(insets.bottom, spacing.xl) }]} />
+        <View testID="changes-actions" style={[s.actions, { paddingBottom: Math.max(insets.bottom, spacing.xl) }]}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Commit"
+            accessibilityState={{ disabled: commitOff }}
+            disabled={commitOff}
+            onPress={openCommit}
+            style={[s.action, s.commit, commitOff && s.actionOff]}
+          >
+            <Text numberOfLines={1} style={s.commitLabel}>
+              Commit
+            </Text>
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel="Open PR on the desk" onPress={openPr} style={[s.action, s.pr]}>
+            <Text numberOfLines={1} style={s.prLabel}>
+              Open PR on the desk
+            </Text>
+          </Pressable>
+        </View>
       </View>
+      {sheet === "commit" ? <CommitSheet session={id} blocked={offline || waiting} onCommitted={committed} onClose={closeSheet} /> : null}
+      {sheet === "pr" ? <PrSheet onClose={closeSheet} /> : null}
     </View>
   );
 }

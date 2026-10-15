@@ -12,7 +12,7 @@
 //   one stays on its PATH behind the stand-in directory. Nothing here reaches Expo.
 // - the WebSocket factory sets `Tailscale-User-Login`, which `tailscale serve` adds in real life.
 //   The app itself never sends that header.
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import http from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, appendFileSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import net from "node:net";
@@ -173,6 +173,8 @@ run("the app's hub client against the real octet hub", () => {
   let hubLog = "";
   let port = 0;
   let sessionId = "";
+  /** The session's workspace: a git repository with one commit, made in the temp root. */
+  let workspace = "";
   let bridge: FakeBridge | null = null;
   let pushFake: PushFake | null = null;
   let seq = 0;
@@ -188,6 +190,11 @@ run("the app's hub client against the real octet hub", () => {
   const events = (): EventFrame[] => batches.filter((b): b is EventFrame => b.type === "event");
   const eventSeqs = (): number[] => events().map((e) => e.seq);
   const frames = (type: string): ToPhone[] => batches.filter((b): b is ToPhone => b.type === type);
+  /** git in the workspace, as the test (not the hub) runs it, with no GIT_* of the caller's (a
+   * hook running this test would point git at its own repository). */
+  const gitEnv: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of Object.keys(gitEnv)) if (name.startsWith("GIT_")) delete gitEnv[name];
+  const git = (args: string[]): string => execFileSync("git", ["-C", workspace, ...args], { encoding: "utf8", env: gitEnv });
 
   beforeAll(async () => {
     root = mkdtempSync(path.join(tmpdir(), "omc"));
@@ -217,6 +224,18 @@ run("the app's hub client against the real octet hub", () => {
     const pid = process.pid;
     sessionId = `${pid}-1790000000`;
     for (let i = 0; i < 3; i++) journal("text", `hello ${i}`);
+    // The workspace: a git repository with one committed file. The hub takes every GIT_* out of
+    // its git's environment, so who commits is set in the repository's own config, with no
+    // signing (a key the machine has would prompt or fail).
+    workspace = path.join(root, "ws");
+    mkdirSync(workspace);
+    git(["init", "-q"]);
+    git(["config", "user.name", "Contract Test"]);
+    git(["config", "user.email", "contract@example.test"]);
+    git(["config", "commit.gpgsign", "false"]);
+    writeFileSync(path.join(workspace, "README.md"), "# Work\n\nFirst line.\n");
+    git(["add", "README.md"]);
+    git(["commit", "-q", "-m", "First"]);
     bridge = new FakeBridge(path.join(runDir, `${pid}.sock`), (line) => ({
       v: 1,
       type: "ack",
@@ -233,7 +252,7 @@ run("the app's hub client against the real octet hub", () => {
         started: 1_790_000_000,
         socket: bridge.socketPath,
         engine: "claude",
-        workspace: "/work",
+        workspace,
         model: "opus",
         mode: "ask",
         vendor_session: "",
@@ -396,6 +415,63 @@ run("the app's hub client against the real octet hub", () => {
     expect(bridge?.lines.length).toBe(before);
   });
 
+  it("lists the workspace's changes, diffs a listed file and refuses an unlisted one", async () => {
+    writeFileSync(path.join(workspace, "README.md"), "# Work\n\nEdited from the contract test.\n");
+    writeFileSync(path.join(workspace, "notes.txt"), "one\ntwo\n");
+    const changes = await client?.request({ type: "changes", session: sessionId });
+    if (changes?.type !== "changes") throw new Error(`not a changes answer: ${JSON.stringify(changes)}`);
+    expect(changes.files.map((f) => [f.path, f.status]).sort()).toEqual([
+      ["README.md", "M"],
+      ["notes.txt", "?"],
+    ]);
+    expect(changes.files.find((f) => f.path === "notes.txt")).toMatchObject({ add: 2, del: 0, binary: false });
+    expect(changes.more).toBe(0);
+
+    const diff = await client?.request({ type: "diff", session: sessionId, path: "README.md" });
+    if (diff?.type !== "diff") throw new Error(`not a diff answer: ${JSON.stringify(diff)}`);
+    expect(diff.path).toBe("README.md");
+    expect(diff.text).toContain("+Edited from the contract test.");
+    expect(diff.text).toContain("-First line.");
+    expect(diff).toMatchObject({ clipped: false, binary: false });
+
+    await expect(client?.request({ type: "diff", session: sessionId, path: "hub-audit.jsonl" })).rejects.toMatchObject({
+      code: "invalid",
+      message: "Ask for the changes first",
+    });
+  });
+
+  it("commits everything once the bridge says the session is idle, then has nothing to commit", async () => {
+    // The hub lets a phone commit only once the bridge has said its phase, idle, with no approval.
+    const states = frames("state").length;
+    bridge?.send(bridgeState([]));
+    await until("the idle state", () => frames("state").length > states);
+
+    const ack = await client?.request({ type: "commit", session: sessionId, message: "Edit from the phone\n\nWith a body." });
+    expect(ack).toMatchObject({ type: "ack" });
+    const message = (ack as { message?: unknown } | undefined)?.message;
+    expect(message).toMatch(/^Committed [0-9a-f]{4,40}$/);
+    const hash = String(message).slice("Committed ".length);
+    const head = git(["rev-parse", "--short", "HEAD"]).trim();
+    expect(head).toBe(hash);
+    expect(git(["log", "-1", "--format=%B"]).trim()).toBe("Edit from the phone\n\nWith a body.");
+    expect(git(["status", "--porcelain"])).toBe("");
+
+    await expect(client?.request({ type: "commit", session: sessionId, message: "Again" })).rejects.toMatchObject({
+      code: "invalid",
+      message: "Nothing to commit",
+    });
+    // The audit names the phone and the commit, never its message.
+    const audit = readFileSync(path.join(root, "hub-audit.jsonl"), "utf8");
+    const commits = audit
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as Obj)
+      .filter((line) => line.what === "commit");
+    expect(commits).toEqual([expect.objectContaining({ device: PHONE, session: sessionId, what: "commit" })]);
+    expect(audit).not.toContain("Edit from the phone");
+    expect(audit).not.toContain("With a body");
+  });
+
   it("turns notifications on, and pushes a content-free message once the phone is in the background", async () => {
     const on = await client?.request({ type: "register_push", token: PUSH_TOKEN });
     expect(on).toMatchObject({ type: "ack", message: "Notifications on" });
@@ -419,7 +495,7 @@ run("the app's hub client against the real octet hub", () => {
       },
     ]);
     // Nothing of the approval, the workspace, the model or the engine is in it, and it came once.
-    for (const secret of ["/work", "rm -rf", "secret-dir", "private", "opus", "claude"]) {
+    for (const secret of ["/work", workspace, "rm -rf", "secret-dir", "private", "opus", "claude"]) {
       expect(body).not.toContain(secret);
     }
     await sleep(3500);

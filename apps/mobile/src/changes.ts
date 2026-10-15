@@ -1,7 +1,9 @@
 // What the Changes screen derives from the hub's `changes` and `diff` answers and from the
 // session's view: a file's bar, the header's summary, the Checks and Branch cards, a diff's lines,
-// and which file a tool entry edited. Pure; the screen draws what these return.
+// which file a tool entry edited, and the commit sheet's words. Pure; the screen draws what these
+// return.
 import { label } from "./model/summary";
+import { SHORT_CHARS, field } from "./model/text";
 import type { Entry } from "./model/transcript";
 import type { FileChange, FileStatus } from "./protocol";
 
@@ -157,4 +159,36 @@ export function matchFile(paths: readonly string[], file: string): string | null
   }
   if (within !== null) return paths.filter((p) => p === within).length === 1 ? within : null;
   return belowCount === 1 ? below : null;
+}
+
+/** The most characters of the session's first prompt the commit message is prefilled with. */
+export const PREFILL_CHARS = 72;
+/** The longest commit message, in characters: the hub's `COMMIT_MESSAGE_LIMIT`
+ * (crates/octet-core/src/remote/protocol.rs), which it counts in code points. A text field counts
+ * UTF-16 units, so a message it lets through is never over. */
+export const COMMIT_CHARS = 2_000;
+/** What the Face ID prompt says before a commit, which it always asks for. */
+export const COMMIT_REASON = "Commit the changes";
+/** What "Open PR on the desk" tells the user to run at the Mac: the phone never pushes or opens
+ * a pull request itself. */
+export const PR_COMMAND = "gh pr create";
+export const PR_INTRO = "Run this on the Mac:";
+
+/** The commit message's prefill: the earliest user entry in the session's view as one line, its
+ * whitespace collapsed and trimmed, clipped at `PREFILL_CHARS` characters (a surrogate pair kept
+ * whole) with any space the clip leaves at the end dropped. Empty with no prompt in view. */
+export function firstPrompt(entries: readonly Entry[]): string {
+  const first = entries.find((e) => e.kind === "user");
+  if (first?.kind !== "user") return "";
+  const line = first.text.replace(/\s+/g, " ").trim();
+  return Array.from(line).slice(0, PREFILL_CHARS).join("").trimEnd();
+}
+
+/** The toast for a commit's ack, "Committed <hash>": "Committed <hash> on <branch>", or without
+ * " on <branch>" on a detached HEAD (`branch` null). The hash is taken only when it is one: hex. */
+export function committedText(ack: unknown, branch: string | null): string {
+  const message = typeof ack === "object" && ack !== null ? (ack as { message?: unknown }).message : undefined;
+  const hash = /^Committed ([0-9a-f]{4,64})$/.exec(field(message, SHORT_CHARS).trim())?.[1];
+  const head = hash === undefined ? "Committed" : `Committed ${hash}`;
+  return branch ? `${head} on ${branch}` : head;
 }

@@ -344,8 +344,9 @@ later) the screen takes the size of whichever of them was used last; add
 The hub is a small server on the Mac that shares your running Octet sessions
 with a phone app, over your tailnet. The phone sees each session's transcript,
 sends prompts, answers approvals, changes mode and model, runs a few safe desk
-commands (`/new`, `/session`, `/export`, `/help`), and can start a session or
-resume a recent one. You can still sit at the Mac and join any
+commands (`/new`, `/session`, `/export`, `/help`), shows what a session's
+workspace changed and commits it, and can start a session or resume a recent
+one. You can still sit at the Mac and join any
 session: a session started from the phone runs in tmux (`tmux attach -t
 octet-NAME`), and one started at the desk shows up on the phone.
 
@@ -542,6 +543,50 @@ octet --no-remote
 
 It then creates no socket and no file, and the hub and the phone never see it.
 
+### Changes and commits from the phone
+
+A session's **Changes** screen shows what its workspace changed since the last
+commit. Open it from **view ›** beside a tool entry that edited a file, from
+**Changes ›** in Usage, or from Session info. It shows:
+
+- each changed file with its status, `+added −removed` lines and a small bar;
+  tap one for its diff;
+- **Checks**, the last test command the session ran (`cargo test`, `npm test`,
+  `pytest`, `go test`, `jest`, `vitest` and the like) with ✓ or ✗;
+- **Branch**, the branch and how far it is ahead of its upstream.
+
+What the phone can do with git, and nothing more:
+
+- **Read** the list of changed files (at most 500, then "N more files on the
+  Mac") and the diff of a listed file (at most 64 KiB or 2,000 lines; the
+  rest stays on the Mac).
+- **Commit everything** in the workspace with a message you write (at most
+  2,000 characters). The message starts as the session's first prompt, on one
+  line of at most 72 characters. **Commit** asks for Face ID every time,
+  whatever the **Face ID to allow** setting says. The Mac runs `git add -A`
+  and `git commit -F -` with the message on standard input, limited to the
+  workspace's own files. A toast names the new commit's short hash and the
+  branch.
+
+The phone can't push, open a pull request, amend, choose which files to
+commit, or run any other git command. **Open PR on the desk** only shows
+`gh pr create` to run at the Mac, and sends nothing.
+
+The hub refuses a commit:
+
+- while a turn runs or an approval waits (`Finish or cancel the current turn
+  first`); the app turns **Commit** off while an approval waits or the Mac
+  can't be reached;
+- during a merge, rebase, cherry-pick or revert (`Finish the merge at the desk
+  first`);
+- when nothing changed (`Nothing to commit`) or the message is empty
+  (`Write a commit message`);
+- while two other git calls run (`Git is busy; try again`).
+
+The repository's commit hooks run, as they do at the desk. If a hook fails,
+the phone shows git's own words, and the files stay staged. A git call,
+hooks included, is stopped after 10 seconds (`Git took too long; try again`).
+
 ### Hub security notes
 
 - The hub listens on `127.0.0.1` only. The only way in from outside is
@@ -567,7 +612,10 @@ It then creates no socket and no file, and the hub and the phone never see it.
   remove the phone from the tailnet in the Tailscale admin console.
 - Every action from a phone (prompt, answer, mode, start and so on) is
   recorded with the phone's name in `hub-audit.jsonl`, without the prompt
-  text. The desk also shows a note naming the phone. Pairing (`paired`) and
+  text. A commit is recorded as `commit` with the phone's name and the
+  session, never the message; `commit failed` means git refused it after
+  `git add` ran. The desk shows no note for a commit. Listing changes and
+  reading diffs aren't recorded. The desk also shows a note naming the phone. Pairing (`paired`) and
   `octet hub revoke` (`revoked`) are recorded too, with the phone's name and
   never a token or pairing code.
 - A command that was waiting when a session's link dropped is refused with
@@ -597,8 +645,17 @@ It then creates no socket and no file, and the hub and the phone never see it.
   - `/export` writes the journal to the desk's default path, the workspace and
     the journal's file name, exactly as `/export` with no argument does at the
     desk. It is refused during a turn or while another desk job runs.
+- Git from the phone runs in the session's own workspace, which the hub takes
+  from the session's registration, never from the phone. The hub fixes every
+  argument: the phone names only the session, a path from the hub's own last
+  listing for that phone (any other is refused with `Ask for the changes
+  first`), or a commit message, which goes on standard input. The hub removes
+  every `GIT_*` variable from git's environment, turns off fsmonitor, and runs
+  diffs with no external diff or textconv program. A clean filter that the
+  repository's `.gitattributes` names still runs, as it does at the desk.
 - The phone can't run any other slash command, `!` shell commands or `/goal`,
-  edit files outside a session, or see sessions started with `--no-remote`.
+  edit files outside a session, push or open a pull request, or see sessions
+  started with `--no-remote`.
 - Pairing codes, device tokens and push tokens are never written to logs or
   journals.
 

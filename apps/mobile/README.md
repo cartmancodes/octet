@@ -1,8 +1,8 @@
 # Octet for your phone
 
 An Expo app (React Native, SDK 57) that lists the Octet sessions running on your Mac, shows each
-transcript, sends prompts, answers approvals, changes mode and model, and starts or resumes a
-session. It talks to `octet hub` on your Mac over your tailnet; it holds no vendor credentials and
+transcript, sends prompts, answers approvals, changes mode and model, shows and commits what a
+session changed, and starts or resumes a session. It talks to `octet hub` on your Mac over your tailnet; it holds no vendor credentials and
 no SSH keys. Why the hub is built the way it is, and how to set up the Mac side, is in
 [docs/remote-control.md](../../docs/remote-control.md#phone-app-hub).
 
@@ -41,8 +41,13 @@ build. Never pair a development build with the Mac you use every day: see
 `npm run contract` (or `make mobile-contract`) starts `target/debug/octet hub` on a free port with
 a fake session (a Unix socket, a registration and a journal in a temp directory), pairs, and drives
 `HubClient` through hello, sessions, subscribe, replay, a live event, a prompt, an approval
-answer, a dropped connection with a cursor (no duplicates), a ping, notifications on (a push to a
-local fake, never to Expo, with the exact content-free body), notifications off, and a revoke. It builds nothing:
+answer, a dropped connection with a cursor (no duplicates), a ping, a desk command, the
+workspace's changes, a diff of a listed file (and the refusal of one not listed), a commit and
+then "Nothing to commit", notifications on (a push to a local fake, never to Expo, with the exact
+content-free body), notifications off, and a revoke. The fake session's workspace is a git
+repository the test makes in its temp directory, with its own `user.name`, `user.email` and
+`commit.gpgsign=false` (the hub takes every `GIT_*` variable out of git's environment), so the
+test needs `git` on the `PATH`. It builds nothing:
 run `scripts/rust-env.sh cargo build -p octet` first. Without that binary it skips. It never
 touches Tailscale: the hub is given a stand-in `tailscale` on its `PATH`, and the test's socket
 adds the `Tailscale-User-Login` header that `tailscale serve` adds in real life. The app never
@@ -141,6 +146,20 @@ side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Se
   the prompt and start; or resume a recent session.
 - **Conversation.** The transcript, the model and mode menu, the permission card, the prompt line
   with its slash menu, and a key bar for the terminal's keys.
+- **Changes.** What the session's workspace changed since the last commit, opened from **view ›**
+  beside a tool entry that edited a file, or **Changes ›** in Usage or Session info. Each file shows
+  its status, `+added −removed` and a bar, and a tap opens its diff; **Checks** shows the last test
+  command with ✓ or ✗, and **Branch** the branch and how far ahead it is. Pull down to ask again.
+  - **Commit** opens a sheet with the message, prefilled with the session's first prompt as one
+    line of at most 72 characters; edit it (up to 2,000 characters) and tap **Commit**. Face ID is
+    asked every time, whatever **Face ID to allow** says, and a failed or cancelled check sends
+    nothing. The Mac commits everything in the workspace (`git add -A`, then `git commit`), and
+    its hooks run. A toast says `Committed <hash> on <branch>`, and the list refreshes. A refusal
+    (a turn running, a merge under way, nothing to commit, a hook that failed) shows the Mac's
+    words in the sheet and keeps the message. **Commit** is off while the Mac can't be reached or
+    an approval waits.
+  - **Open PR on the desk** shows `gh pr create` to run at the Mac, and sends nothing. The phone
+    can't push, open a pull request or commit only some files.
 - **Settings.** Three cards. **Machines**: the Mac with ● online or ○ offline, this phone's name,
   and **Unpair**. **Notify me when**: three switches, **An action needs approval**, **A turn
   finishes** and **A session hits an error**, one per kind of push. A switch moves only when the

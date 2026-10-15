@@ -11,6 +11,21 @@ Claude Code and Codex CLIs.
 
 ### Added
 
+- Changes and commits on the phone. A session's Changes screen lists what its
+  workspace changed since the last commit (at most 500 files), opens a listed
+  file's diff (at most 64 KiB or 2,000 lines), and shows the last test run and
+  the branch. **Commit** sends a message you edit, prefilled from the
+  session's first prompt, after Face ID every time: the hub runs `git add -A`
+  and `git commit -F -` limited to the workspace, with the repository's hooks,
+  and the app toasts the short hash and the branch. The hub refuses a commit
+  while a turn runs or an approval waits, during a merge, rebase, cherry-pick
+  or revert, and when nothing changed, and audits it as `commit` with the
+  phone's name, never the message. Only paths from the hub's own last listing
+  can be diffed, and git runs with no `GIT_*` from the hub's environment, no
+  fsmonitor, and no external diff or textconv program. The phone can't push,
+  open a pull request or commit part of the changes: **Open PR on the desk**
+  shows `gh pr create` to run at the Mac. The contract test covers `changes`,
+  `diff` and `commit` on a temp git repository.
 - Safe desk commands, usage, error pushes and questions on the phone. The
   slash menu runs `/new` (after a confirm), `/session`, `/export` and `/help`
   through one `command` request that names the command and takes no argument:

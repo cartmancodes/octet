@@ -5,11 +5,14 @@ import {
   CLIPPED_NOTE,
   MAX_DIFF_LINES,
   NO_TESTS,
+  PREFILL_CHARS,
   barCells,
   branchLines,
   changeSummary,
+  committedText,
   diffLines,
   editedFile,
+  firstPrompt,
   lastChecks,
   matchFile,
   splitPath,
@@ -237,5 +240,46 @@ describe("matching an edited file to the listing", () => {
     expect(matchFile(paths, "/Users/me/octet/README.md")).toBeNull();
     expect(matchFile(paths, "/Users/me/octet/myapp.ts")).toBeNull();
     expect(matchFile(paths, "")).toBeNull();
+  });
+});
+
+describe("firstPrompt", () => {
+  const user = (text: string): Entry => ({ kind: "user", key: String(++key), text });
+  const reply = (text: string): Entry => ({ kind: "reply", key: String(++key), text, done: true });
+
+  it("is the earliest user entry, as one line: whitespace collapsed and trimmed", () => {
+    expect(firstPrompt([reply("Hi"), user("  Fix   the\nlogin\t bug \r\n"), user("Then the tests")])).toBe("Fix the login bug");
+  });
+
+  it("is clipped at 72 characters, a surrogate pair never cut in two", () => {
+    expect(PREFILL_CHARS).toBe(72);
+    expect(firstPrompt([user("a".repeat(100))])).toBe("a".repeat(72));
+    expect(firstPrompt([user(`${"b".repeat(71)}😀😀`)])).toBe(`${"b".repeat(71)}😀`);
+    // A space the clip leaves at the end goes too.
+    expect(firstPrompt([user(`${"c".repeat(71)} dee`)])).toBe("c".repeat(71));
+  });
+
+  it("is empty with no user entry, or one that is only space", () => {
+    expect(firstPrompt([])).toBe("");
+    expect(firstPrompt([reply("Hello"), tools(call("Bash", "ls"))])).toBe("");
+    expect(firstPrompt([user(" \n\t ")])).toBe("");
+  });
+});
+
+describe("committedText", () => {
+  const ack = (message: unknown) => ({ type: "ack", req: 1, message });
+
+  it("names the short hash and the branch", () => {
+    expect(committedText(ack("Committed 1a2b3c4"), "main")).toBe("Committed 1a2b3c4 on main");
+  });
+
+  it("names only the hash on a detached HEAD", () => {
+    expect(committedText(ack("Committed 1a2b3c4"), null)).toBe("Committed 1a2b3c4");
+  });
+
+  it("says Committed when the Mac gave no hash, or something that is not one", () => {
+    expect(committedText(ack("Committed"), "main")).toBe("Committed on main");
+    expect(committedText(ack("Committed \u001b[2Jzz"), null)).toBe("Committed");
+    expect(committedText(ack(undefined), "main")).toBe("Committed on main");
   });
 });
