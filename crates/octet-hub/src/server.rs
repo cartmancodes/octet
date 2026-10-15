@@ -43,6 +43,7 @@
 //! journal read again. Live frames go through a queue of
 //! 512: a phone that lets it fill is dropped.
 use crate::{
+    git::{self, Git, Listing},
     launch::{self, Launches, StartRequest, clip as clip_to},
     owner::published_url,
     push::{self, Pusher, Sender},
@@ -55,8 +56,8 @@ use octet_core::PROMPT_LIMIT;
 use octet_core::remote::{
     protocol::{
         BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, ack, catalog_frame,
-        event_frame, full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of,
-        sessions_frame, state_frame, subscribed_frame, welcome,
+        changes_frame, diff_frame, event_frame, full_access_confirmed, paired, parse_phone,
+        recent_frame, refused, req_of, sessions_frame, state_frame, subscribed_frame, welcome,
     },
     run::run_dir,
 };
@@ -171,6 +172,17 @@ const PUSH_NOT_SAVED: &str = "Could not save the notification setting; try again
 const PUSH_QUEUE: usize = 16;
 /// How long a scan or a start may take in all.
 const JOB_WITHIN: Duration = Duration::from_secs(30);
+/// The refusal for a `diff` of a path the connection's last `changes` for the session did not
+/// list.
+const ASK_FOR_CHANGES: &str = "Ask for the changes first";
+/// The refusal for a commit while a turn runs or an approval waits.
+const TURN_FIRST: &str = "Finish or cancel the current turn first";
+/// The refusal for a commit to a session whose turn the hub cannot see.
+const NOT_CONNECTED: &str = "The session is not connected";
+/// The refusal for a git command naming a session the hub does not have.
+const NO_SUCH_SESSION: &str = "No such session";
+/// Sessions whose last listing one connection keeps; another lets the least recent go.
+const LISTED_SESSIONS: usize = 8;
 /// The longest workspace path kept in an audit line, in characters.
 const AUDIT_PATH: usize = 200;
 /// The longest phone-chosen text (a mode or model name) kept in an audit line, in characters.
@@ -195,6 +207,13 @@ enum ConnEvent {
         job: Job,
         /// The audit line to write: device, session and what.
         audit: Option<(String, String, String)>,
+    },
+    /// A `changes` finished: the listing to keep for `session` and the frame, or the refusal.
+    Listed {
+        conn: u64,
+        req: u64,
+        session: String,
+        result: Result<git::Changes, git::Refusal>,
     },
     /// A replay found no room for too long.
     Stalled { conn: u64 },
@@ -229,6 +248,8 @@ enum Job {
     Scan,
     /// A tmux launch, and whether tmux accepted it.
     Launch { accepted: bool },
+    /// A git call (a diff or a commit); its slot went back as it ended.
+    Git,
 }
 
 /// What the hub loop has a connection's writer send, in order.
@@ -272,6 +293,21 @@ impl std::fmt::Debug for ConnEvent {
                 .field("frame", &Redacted(frame.to_string().len()))
                 .field("job", job)
                 .field("audit", &audit.as_ref().map(|(_, session, _)| session))
+                .finish(),
+            Self::Listed {
+                conn,
+                req,
+                session,
+                result,
+            } => f
+                .debug_struct("Listed")
+                .field("conn", conn)
+                .field("req", req)
+                .field("session", session)
+                .field(
+                    "result",
+                    &result.as_ref().map(|c| c.info.files.len()).map_err(|e| e.0),
+                )
                 .finish(),
             Self::Stalled { conn } => f.debug_struct("Stalled").field("conn", conn).finish(),
             Self::Closed { conn } => f.debug_struct("Closed").field("conn", conn).finish(),
@@ -458,8 +494,49 @@ struct Conn {
     device: Option<Device>,
     /// The sessions it streams, by id.
     subscriptions: HashMap<String, Subscription>,
+    /// What its last `changes` of each session listed, which is all a `diff` may name.
+    listings: Listings,
     /// Its place in the hub's room, given back as it drops.
     seat: Seat,
+}
+
+/// One connection's last listing of each session, for at most [`LISTED_SESSIONS`] sessions;
+/// each holds at most [`git::FILES_LIMIT`] paths.
+#[derive(Debug, Default)]
+struct Listings {
+    /// By session: when it was kept, and the listing.
+    by_session: HashMap<String, (u64, Listing)>,
+    /// The last stamp given.
+    stamp: u64,
+}
+
+impl Listings {
+    /// Keeps `listing` as `session`'s, in place of the last; a ninth session lets the least
+    /// recently listed go.
+    fn keep(&mut self, session: String, listing: Listing) {
+        if !self.by_session.contains_key(&session) && self.by_session.len() >= LISTED_SESSIONS {
+            let oldest = self
+                .by_session
+                .iter()
+                .min_by_key(|(_, (stamp, _))| *stamp)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                self.by_session.remove(&oldest);
+            }
+        }
+        self.stamp += 1;
+        self.by_session.insert(session, (self.stamp, listing));
+    }
+
+    /// Forgets `session`'s listing.
+    fn forget(&mut self, session: &str) {
+        self.by_session.remove(session);
+    }
+
+    /// `session`'s last listing.
+    fn get(&self, session: &str) -> Option<&Listing> {
+        self.by_session.get(session).map(|(_, listing)| listing)
+    }
 }
 
 /// A command sent to a session and not yet answered.
@@ -548,6 +625,8 @@ pub struct Hub {
     launches: Launches,
     /// Whether a `recent` scan is running; only one runs at a time (see [`Scanning`]).
     scanning: Arc<AtomicBool>,
+    /// Runs git in sessions' workspaces, two calls at a time.
+    git: Git,
     /// Where seqs are in the journals, for replays after a cursor.
     index: tail::SharedIndex,
     /// Given to each connection and replay task.
@@ -660,6 +739,7 @@ impl Hub {
             directory,
             launches: Launches::default(),
             scanning: Arc::new(AtomicBool::new(false)),
+            git: Git::new(),
             index: tail::SharedIndex::default(),
             owner,
             port,
@@ -732,6 +812,7 @@ impl Hub {
                 opened: Instant::now(),
                 device: None,
                 subscriptions: HashMap::new(),
+                listings: Listings::default(),
                 seat,
             },
         );
@@ -754,8 +835,8 @@ impl Hub {
                 audit,
             } => {
                 match job {
-                    // The scan's own guard put its flag down.
-                    Job::Scan => {}
+                    // The scan's own guard put its flag down, as git's slot went back.
+                    Job::Scan | Job::Git => {}
                     Job::Launch { accepted } => {
                         let now = Instant::now();
                         self.launches.running(self.sessions.phone_started(), now);
@@ -771,6 +852,12 @@ impl Hub {
                 }
                 self.send(conn, &frame);
             }
+            ConnEvent::Listed {
+                conn,
+                req,
+                session,
+                result,
+            } => self.on_listed(conn, req, session, result),
             ConnEvent::Stalled { conn } | ConnEvent::Closed { conn } => self.drop_conn(conn),
         }
     }
@@ -945,12 +1032,10 @@ impl Hub {
                 self.refuse(conn, req, Code::TooLarge, TOO_LONG);
                 return;
             }
-            command => {
-                let Some(parts) = bridge_command(command) else {
-                    return;
-                };
-                parts
-            }
+            command => match bridge_command(command) {
+                Ok(parts) => parts,
+                Err(command) => return self.git_command(conn, &device.name, req, *command),
+            },
         };
         self.route(conn, device, req, &session, &command, &what)
             .await;
@@ -1038,6 +1123,142 @@ impl Hub {
                 frame,
                 job: Job::Scan,
                 audit: None,
+            };
+            let _ = events.send(done).await;
+        });
+    }
+
+    /// Runs a git command: `changes`, `diff` or `commit` (any other was answered before).
+    fn git_command(&mut self, conn: u64, device: &str, req: u64, command: PhoneCommand) {
+        match command {
+            PhoneCommand::Changes { session } => self.changes(conn, req, session),
+            PhoneCommand::Diff { session, path } => self.diff(conn, req, &session, &path),
+            PhoneCommand::Commit { session, message } => {
+                self.commit(conn, device, req, session, message);
+            }
+            _ => {}
+        }
+    }
+
+    /// Lists what session `session`'s workspace changed, in the background; the answer keeps
+    /// the listing for this connection (see [`on_listed`](Self::on_listed)).
+    fn changes(&mut self, conn: u64, req: u64, session: String) {
+        let Some(place) = self.sessions.place(&session) else {
+            return self.refuse(conn, req, Code::Unavailable, NO_SUCH_SESSION);
+        };
+        let slot = match self.git.begin() {
+            Ok(slot) => slot,
+            Err((code, reason)) => return self.refuse(conn, req, code, &reason),
+        };
+        let (git, events) = (self.git.clone(), self.events.clone());
+        tokio::spawn(async move {
+            let result = git.changes(&place.workspace).await;
+            drop(slot);
+            let done = ConnEvent::Listed {
+                conn,
+                req,
+                session,
+                result,
+            };
+            let _ = events.send(done).await;
+        });
+    }
+
+    /// A `changes` finished: the connection keeps the listing, which replaces its last one of
+    /// the session, before the phone hears it. A refusal forgets the last one.
+    fn on_listed(
+        &mut self,
+        conn: u64,
+        req: u64,
+        session: String,
+        result: Result<git::Changes, git::Refusal>,
+    ) {
+        let Some(state) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        match result {
+            Ok(changes) => {
+                state.listings.keep(session, changes.listing);
+                self.send(conn, &changes_frame(req, &changes.info));
+            }
+            Err((code, reason)) => {
+                state.listings.forget(&session);
+                self.refuse(conn, req, code, &reason);
+            }
+        }
+    }
+
+    /// One file's diff, in the background; `path` must be one this connection's last `changes`
+    /// of the session listed.
+    fn diff(&mut self, conn: u64, req: u64, session: &str, path: &str) {
+        if self.sessions.place(session).is_none() {
+            return self.refuse(conn, req, Code::Unavailable, NO_SUCH_SESSION);
+        }
+        let target = self
+            .conns
+            .get(&conn)
+            .and_then(|state| state.listings.get(session))
+            .and_then(|listing| listing.target(path));
+        let Some(target) = target else {
+            return self.refuse(conn, req, Code::Invalid, ASK_FOR_CHANGES);
+        };
+        let slot = match self.git.begin() {
+            Ok(slot) => slot,
+            Err((code, reason)) => return self.refuse(conn, req, code, &reason),
+        };
+        let (git, events) = (self.git.clone(), self.events.clone());
+        tokio::spawn(async move {
+            let frame = match git.diff(&target).await {
+                Ok(diff) => diff_frame(req, &diff),
+                Err((code, reason)) => refused(req, code, &reason),
+            };
+            drop(slot);
+            let done = ConnEvent::Answer {
+                conn,
+                frame,
+                job: Job::Git,
+                audit: None,
+            };
+            let _ = events.send(done).await;
+        });
+    }
+
+    /// Commits everything in session `session`'s workspace, in the background, while no turn
+    /// runs and no approval waits. The audit names the device and the session, never the
+    /// message: `commit`, or `commit failed` when git may have staged files and then refused.
+    fn commit(&mut self, conn: u64, device: &str, req: u64, session: String, message: String) {
+        let Some(place) = self.sessions.place(&session) else {
+            return self.refuse(conn, req, Code::Unavailable, NO_SUCH_SESSION);
+        };
+        match place.phase.as_deref() {
+            None => return self.refuse(conn, req, Code::NotConnected, NOT_CONNECTED),
+            Some("idle" | "stopped") if place.approvals == 0 => {}
+            Some(_) => return self.refuse(conn, req, Code::TurnOpen, TURN_FIRST),
+        }
+        let slot = match self.git.begin() {
+            Ok(slot) => slot,
+            Err((code, reason)) => return self.refuse(conn, req, code, &reason),
+        };
+        let (git, events, device) = (self.git.clone(), self.events.clone(), device.to_owned());
+        tokio::spawn(async move {
+            let result = git.commit(&place.workspace, &message).await;
+            drop(slot);
+            let (frame, what) = match result {
+                Ok(hash) if hash.is_empty() => (ack(req, "Committed"), Some("commit")),
+                Ok(hash) => (ack(req, &format!("Committed {hash}")), Some("commit")),
+                Err((code, reason)) => {
+                    let staged = matches!(code, Code::NotAllowed | Code::Timeout);
+                    (
+                        refused(req, code, &reason),
+                        staged.then_some("commit failed"),
+                    )
+                }
+            };
+            let done = ConnEvent::Answer {
+                conn,
+                frame,
+                job: Job::Git,
+                audit: what.map(|what| (device, session, what.to_owned())),
             };
             let _ = events.send(done).await;
         });
@@ -1613,12 +1834,15 @@ impl Hub {
     }
 }
 
-/// The session, the command and the audit text of a phone command that a terminal UI runs.
-fn bridge_command(command: PhoneCommand) -> Option<(String, BridgeCommand, String)> {
+/// The session, the command and the audit text of a phone command that a terminal UI runs; any
+/// other command comes back.
+fn bridge_command(
+    command: PhoneCommand,
+) -> Result<(String, BridgeCommand, String), Box<PhoneCommand>> {
     match command {
-        PhoneCommand::End { session } => Some((session, BridgeCommand::End, "end".into())),
+        PhoneCommand::End { session } => Ok((session, BridgeCommand::End, "end".into())),
         PhoneCommand::Prompt { session, text } => {
-            Some((session, BridgeCommand::Prompt { text }, "prompt".to_owned()))
+            Ok((session, BridgeCommand::Prompt { text }, "prompt".to_owned()))
         }
         PhoneCommand::Answer {
             session,
@@ -1627,11 +1851,11 @@ fn bridge_command(command: PhoneCommand) -> Option<(String, BridgeCommand, Strin
         } => {
             let verdict = if allow { "allow" } else { "deny" };
             let what = format!("answer {approval} {verdict}");
-            Some((session, BridgeCommand::Answer { approval, allow }, what))
+            Ok((session, BridgeCommand::Answer { approval, allow }, what))
         }
-        PhoneCommand::Cancel { session } => Some((session, BridgeCommand::Cancel, "cancel".into())),
+        PhoneCommand::Cancel { session } => Ok((session, BridgeCommand::Cancel, "cancel".into())),
         PhoneCommand::Steer { session, text } => {
-            Some((session, BridgeCommand::Steer { text }, "steer".into()))
+            Ok((session, BridgeCommand::Steer { text }, "steer".into()))
         }
         PhoneCommand::SetMode {
             session,
@@ -1639,17 +1863,17 @@ fn bridge_command(command: PhoneCommand) -> Option<(String, BridgeCommand, Strin
             confirm,
         } => {
             let what = format!("set_mode {}", clip(&mode));
-            Some((session, BridgeCommand::SetMode { mode, confirm }, what))
+            Ok((session, BridgeCommand::SetMode { mode, confirm }, what))
         }
         PhoneCommand::SetModel { session, selection } => {
             let what = format!("set_model {}", clip(&selection));
-            Some((session, BridgeCommand::SetModel { selection }, what))
+            Ok((session, BridgeCommand::SetModel { selection }, what))
         }
         PhoneCommand::Command { session, name } => {
             let what = format!("command {}", name.as_str());
-            Some((session, BridgeCommand::Command { name }, what))
+            Ok((session, BridgeCommand::Command { name }, what))
         }
-        _ => None,
+        other => Err(Box::new(other)),
     }
 }
 
@@ -2440,6 +2664,23 @@ mod tests {
             assert!(alive.ping());
             alive.pong();
         }
+    }
+
+    #[test]
+    fn a_connection_keeps_the_last_listing_of_eight_sessions() {
+        let mut listings = Listings::default();
+        for n in 0..LISTED_SESSIONS {
+            listings.keep(format!("s{n}"), Listing::default());
+        }
+        // Listing s0 again makes it the most recent, so s1 goes first.
+        listings.keep("s0".into(), Listing::default());
+        listings.keep("s8".into(), Listing::default());
+        assert_eq!(listings.by_session.len(), LISTED_SESSIONS);
+        assert!(listings.get("s0").is_some());
+        assert!(listings.get("s1").is_none());
+        assert!(listings.get("s8").is_some());
+        listings.forget("s8");
+        assert!(listings.get("s8").is_none());
     }
 
     #[test]

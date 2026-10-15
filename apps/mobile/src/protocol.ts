@@ -19,6 +19,9 @@ export type ToolPhase = "running" | "done" | "failed";
 /** A desk command a phone may run: a closed set, none of which takes an argument. */
 export type CommandName = "new" | "session" | "help" | "export";
 
+/** How a file changed: modified, added, deleted, renamed, untracked or unmerged. */
+export type FileStatus = "M" | "A" | "D" | "R" | "?" | "U";
+
 /** Why a command was refused, for a client to act on; `reason` is the words to show. */
 export type RefusalCode = "unpaired" | "revoked" | "rate_limited" | "not_allowed" | "turn_open" | "not_connected" | "invalid" | "unavailable" | "busy" | "too_large" | "timeout";
 
@@ -183,6 +186,15 @@ export interface RecentInfo {
   started: number;
 }
 
+/** One changed file against HEAD: its path from the repository's top (git's bytes, read as UTF-8), lines added and deleted (0 for a binary file), and how it changed. */
+export interface FileChange {
+  path: string;
+  add: number;
+  del: number;
+  binary: boolean;
+  status: FileStatus;
+}
+
 /** A known device connected. */
 export interface WelcomeFrame {
   v: 1;
@@ -246,6 +258,30 @@ export interface RecentFrame {
   type: "recent";
   req: number;
   items: RecentInfo[];
+}
+
+/** What the session's workspace changed against HEAD, answering the `changes` command `req`: the branch (none when detached), its upstream and how far ahead and behind it is, at most 500 files, and `more` counting the rest. */
+export interface ChangesFrame {
+  v: 1;
+  type: "changes";
+  req: number;
+  branch?: string | null;
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+  files: FileChange[];
+  more: number;
+}
+
+/** One file's diff against HEAD, answering the `diff` command `req`; `clipped` when the text was cut at 64 KiB or 2,000 lines, `binary` for a binary file. */
+export interface DiffFrame {
+  v: 1;
+  type: "diff";
+  req: number;
+  path: string;
+  text: string;
+  clipped: boolean;
+  binary: boolean;
 }
 
 /** A command succeeded. */
@@ -388,6 +424,32 @@ export interface RecentCommand {
   workspace?: string | null;
 }
 
+/** List what the session's workspace changed against HEAD. */
+export interface ChangesCommand {
+  v: 1;
+  type: "changes";
+  req: number;
+  session: string;
+}
+
+/** One file's diff; `path` must be one the last `changes` answer on this connection listed for the session. */
+export interface DiffCommand {
+  v: 1;
+  type: "diff";
+  req: number;
+  session: string;
+  path: string;
+}
+
+/** Stage everything and commit it with `message` (1 to 2,000 characters); the repository's hooks run. Refused while a turn runs or an approval waits. */
+export interface CommitCommand {
+  v: 1;
+  type: "commit";
+  req: number;
+  session: string;
+  message: string;
+}
+
 /** Start or resume a terminal UI in tmux. */
 export interface StartCommand {
   v: 1;
@@ -521,6 +583,8 @@ export type ToPhone =
   | StateFrame
   | CatalogFrame
   | RecentFrame
+  | ChangesFrame
+  | DiffFrame
   | AckFrame
   | RefusedFrame;
 
@@ -539,6 +603,9 @@ export type FromPhone =
   | SetModelCommand
   | RunCommand
   | RecentCommand
+  | ChangesCommand
+  | DiffCommand
+  | CommitCommand
   | StartCommand
   | EndCommand;
 

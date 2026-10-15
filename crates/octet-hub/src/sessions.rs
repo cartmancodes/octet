@@ -435,6 +435,17 @@ impl Live {
     }
 }
 
+/// Where a session runs and where its turn is, for git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Place {
+    /// The workspace its registration names.
+    pub(crate) workspace: PathBuf,
+    /// The phase its bridge last said; none while it has no link, or before it said one.
+    pub(crate) phase: Option<String>,
+    /// The approvals waiting.
+    pub(crate) approvals: usize,
+}
+
 /// Every session the hub can reach.
 #[derive(Debug)]
 pub(crate) struct Sessions {
@@ -676,6 +687,22 @@ impl Sessions {
         live.lose_link();
         self.push_changed();
         Err(failed)
+    }
+
+    /// Where session `id` runs, from its registration, and where its turn is, from what its
+    /// bridge last said; none for a session the hub does not have.
+    pub(crate) fn place(&self, id: &str) -> Option<Place> {
+        let live = self.find(id)?;
+        let state = live.state.as_ref();
+        Some(Place {
+            workspace: live.registration.workspace.clone(),
+            phase: state
+                .and_then(|s| s.get("phase")?.as_str())
+                .map(str::to_owned),
+            approvals: state
+                .and_then(|s| s.get("approvals")?.as_array())
+                .map_or(0, Vec::len),
+        })
     }
 
     /// Whether session `id` is there and its bridge linked.

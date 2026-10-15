@@ -11,6 +11,17 @@ pub const MAX_MESSAGE: usize = 96 * 1024;
 /// The most bytes one hub → bridge line may take: a phone's largest message, re-wrapped with the
 /// device's name, fits with room.
 pub const MAX_BRIDGE_LINE: usize = MAX_MESSAGE + 1024;
+/// The longest path a `diff` may name, in characters.
+pub const PATH_LIMIT: usize = 4096;
+/// The longest commit message, in characters.
+pub const COMMIT_MESSAGE_LIMIT: usize = 2000;
+/// The refusal for a commit message that is empty, all space, over [`COMMIT_MESSAGE_LIMIT`]
+/// characters or holds a NUL.
+pub const NO_COMMIT_MESSAGE: &str = "Write a commit message";
+/// The refusal for a `diff` path over [`PATH_LIMIT`] characters.
+pub const PATH_TOO_LONG: &str = "The path is over 4,096 characters";
+/// The refusal for a `diff` path that is empty or holds a NUL.
+const NOT_A_PATH: &str = "Not a path";
 /// What a client must type to confirm `full-access`.
 pub const FULL_ACCESS_CONFIRM: &str = "full access";
 
@@ -189,6 +200,11 @@ pub static CHOICES: &[Choices] = &[
         name: "CommandName",
         values: &["new", "session", "help", "export"],
         doc: "A desk command a phone may run: a closed set, none of which takes an argument.",
+    },
+    Choices {
+        name: "FileStatus",
+        values: &["M", "A", "D", "R", "?", "U"],
+        doc: "How a file changed: modified, added, deleted, renamed, untracked or unmerged.",
     },
     Choices {
         name: "RefusalCode",
@@ -434,6 +450,18 @@ pub static OBJECTS: &[Shape] = &[
         ],
         doc: "One resumable session; `started` is Unix seconds.",
     },
+    Shape {
+        name: "FileChange",
+        fields: &[
+            req("path", Str),
+            req("add", U64),
+            req("del", U64),
+            req("binary", Bool),
+            req("status", Choice("FileStatus")),
+        ],
+        doc: "One changed file against HEAD: its path from the repository's top (git's bytes, \
+              read as UTF-8), lines added and deleted (0 for a binary file), and how it changed.",
+    },
 ];
 
 /// Every message type on every link.
@@ -496,6 +524,35 @@ pub static MESSAGES: &[Message] = &[
         ToPhone,
         &[req("req", U64), req("items", ObjectList("RecentInfo"))],
         "Recent sessions that can be resumed, answering the `recent` command `req`.",
+    ),
+    message(
+        "changes",
+        ToPhone,
+        &[
+            req("req", U64),
+            opt("branch", Str),
+            opt("upstream", Str),
+            req("ahead", U64),
+            req("behind", U64),
+            req("files", ObjectList("FileChange")),
+            req("more", U64),
+        ],
+        "What the session's workspace changed against HEAD, answering the `changes` command \
+         `req`: the branch (none when detached), its upstream and how far ahead and behind it \
+         is, at most 500 files, and `more` counting the rest.",
+    ),
+    message(
+        "diff",
+        ToPhone,
+        &[
+            req("req", U64),
+            req("path", Str),
+            req("text", Str),
+            req("clipped", Bool),
+            req("binary", Bool),
+        ],
+        "One file's diff against HEAD, answering the `diff` command `req`; `clipped` when the \
+         text was cut at 64 KiB or 2,000 lines, `binary` for a binary file.",
     ),
     message(
         "ack",
@@ -608,6 +665,26 @@ pub static MESSAGES: &[Message] = &[
         FromPhone,
         &[opt("workspace", Str)],
         "List recent sessions, optionally of one workspace.",
+    ),
+    message(
+        "changes",
+        FromPhone,
+        &[req("session", Str)],
+        "List what the session's workspace changed against HEAD.",
+    ),
+    message(
+        "diff",
+        FromPhone,
+        &[req("session", Str), req("path", Str)],
+        "One file's diff; `path` must be one the last `changes` answer on this connection \
+         listed for the session.",
+    ),
+    message(
+        "commit",
+        FromPhone,
+        &[req("session", Str), req("message", Str)],
+        "Stage everything and commit it with `message` (1 to 2,000 characters); the \
+         repository's hooks run. Refused while a turn runs or an approval waits.",
     ),
     message(
         "start",
@@ -840,6 +917,97 @@ impl CommandName {
     }
 }
 
+/// How a file changed, as a `FileChange` says it. The spellings are [`CHOICES`]' `FileStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileStatus {
+    /// Modified (or its type changed).
+    Modified,
+    /// Added to the index.
+    Added,
+    /// Deleted.
+    Deleted,
+    /// Renamed or copied.
+    Renamed,
+    /// Not tracked yet.
+    Untracked,
+    /// Unmerged: a conflict.
+    Unmerged,
+}
+
+impl FileStatus {
+    /// Every status, in [`CHOICES`]' order.
+    pub const ALL: [FileStatus; 6] = [
+        FileStatus::Modified,
+        FileStatus::Added,
+        FileStatus::Deleted,
+        FileStatus::Renamed,
+        FileStatus::Untracked,
+        FileStatus::Unmerged,
+    ];
+
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileStatus::Modified => "M",
+            FileStatus::Added => "A",
+            FileStatus::Deleted => "D",
+            FileStatus::Renamed => "R",
+            FileStatus::Untracked => "?",
+            FileStatus::Unmerged => "U",
+        }
+    }
+
+    /// The status spelled `text`, if there is one.
+    pub fn parse(text: &str) -> Option<FileStatus> {
+        FileStatus::ALL.into_iter().find(|s| s.as_str() == text)
+    }
+}
+
+/// One changed file of a [`ChangesInfo`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    /// Its path from the repository's top.
+    pub path: String,
+    /// Lines added.
+    pub add: u64,
+    /// Lines deleted.
+    pub del: u64,
+    /// Whether git sees it as binary.
+    pub binary: bool,
+    /// How it changed.
+    pub status: FileStatus,
+}
+
+/// What a workspace changed, for the `changes` frame.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangesInfo {
+    /// The branch; none when HEAD is detached.
+    pub branch: Option<String>,
+    /// The branch's upstream, if it has one.
+    pub upstream: Option<String>,
+    /// Commits ahead of the upstream.
+    pub ahead: u64,
+    /// Commits behind it.
+    pub behind: u64,
+    /// The files listed.
+    pub files: Vec<FileChange>,
+    /// The changed files left out.
+    pub more: u64,
+}
+
+/// One file's diff, for the `diff` frame.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiffInfo {
+    /// The path, as the `changes` frame listed it.
+    pub path: String,
+    /// The diff text.
+    pub text: String,
+    /// Whether the text was cut short.
+    pub clipped: bool,
+    /// Whether the file is binary.
+    pub binary: bool,
+}
+
 /// What a device is pushed, by kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PushKinds {
@@ -955,6 +1123,25 @@ pub enum PhoneCommand {
     Recent {
         /// Only this workspace's.
         workspace: Option<String>,
+    },
+    /// List what the session's workspace changed.
+    Changes {
+        /// The session id.
+        session: String,
+    },
+    /// One listed file's diff.
+    Diff {
+        /// The session id.
+        session: String,
+        /// The path, as the last `changes` listed it.
+        path: String,
+    },
+    /// Commit everything.
+    Commit {
+        /// The session id.
+        session: String,
+        /// The commit message.
+        message: String,
     },
     /// Start a terminal UI in tmux.
     Start {
@@ -1235,6 +1422,32 @@ fn command_name(map: &Map<String, Value>) -> Result<CommandName, String> {
         .ok_or_else(|| "name must be new, session, help or export".into())
 }
 
+/// The `path` of a `diff`: 1 to [`PATH_LIMIT`] characters with no NUL. A refusal never echoes
+/// the text.
+fn diff_path(map: &Map<String, Value>) -> Result<String, String> {
+    let path = text(map, "path");
+    if path.chars().count() > PATH_LIMIT {
+        return Err(PATH_TOO_LONG.into());
+    }
+    if path.is_empty() || path.contains('\0') {
+        return Err(NOT_A_PATH.into());
+    }
+    Ok(path)
+}
+
+/// The `message` of a `commit`: 1 to [`COMMIT_MESSAGE_LIMIT`] characters, not all space, with no
+/// NUL (git would cut the message there). A refusal never echoes the text.
+fn commit_message(map: &Map<String, Value>) -> Result<String, String> {
+    let message = text(map, "message");
+    if message.trim().is_empty()
+        || message.contains('\0')
+        || message.chars().count() > COMMIT_MESSAGE_LIMIT
+    {
+        return Err(NO_COMMIT_MESSAGE.into());
+    }
+    Ok(message)
+}
+
 /// Parses one phone message: `(req, command)`, or the reason it was refused.
 ///
 /// # Errors
@@ -1306,6 +1519,17 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
         },
         "recent" => PhoneCommand::Recent {
             workspace: maybe(m, "workspace"),
+        },
+        "changes" => PhoneCommand::Changes {
+            session: text(m, "session"),
+        },
+        "diff" => PhoneCommand::Diff {
+            session: text(m, "session"),
+            path: diff_path(m)?,
+        },
+        "commit" => PhoneCommand::Commit {
+            session: text(m, "session"),
+            message: commit_message(m)?,
         },
         "start" => PhoneCommand::Start {
             engine: text(m, "engine"),
@@ -1439,6 +1663,40 @@ pub fn catalog_frame(session: &str, catalog: &Value) -> Value {
 /// The `recent` frame answering the command `req`: each row is a `RecentInfo`.
 pub fn recent_frame(req: u64, items: &[Value]) -> Value {
     frame("recent", json!({ "req": req, "items": items }))
+}
+/// The `changes` frame answering the command `req`.
+pub fn changes_frame(req: u64, info: &ChangesInfo) -> Value {
+    let files: Vec<Value> = info
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": file.path, "add": file.add, "del": file.del, "binary": file.binary,
+                "status": file.status.as_str(),
+            })
+        })
+        .collect();
+    let mut fields = json!({
+        "req": req, "ahead": info.ahead, "behind": info.behind, "files": files,
+        "more": info.more,
+    });
+    if let Some(branch) = &info.branch {
+        fields["branch"] = json!(branch);
+    }
+    if let Some(upstream) = &info.upstream {
+        fields["upstream"] = json!(upstream);
+    }
+    frame("changes", fields)
+}
+/// The `diff` frame answering the command `req`.
+pub fn diff_frame(req: u64, info: &DiffInfo) -> Value {
+    frame(
+        "diff",
+        json!({
+            "req": req, "path": info.path, "text": info.text, "clipped": info.clipped,
+            "binary": info.binary,
+        }),
+    )
 }
 /// The `ack` frame (hub → phone, or bridge → hub) for the command `req`.
 pub fn ack(req: u64, message: &str) -> Value {
@@ -1635,6 +1893,9 @@ mod tests {
             r#"{"v":1,"req":13,"type":"end","session":"12-34"}"#,
             r#"{"v":1,"req":14,"type":"unsubscribe","session":"12-34"}"#,
             r#"{"v":1,"req":15,"type":"command","session":"12-34","name":"new"}"#,
+            r#"{"v":1,"req":16,"type":"changes","session":"12-34"}"#,
+            r#"{"v":1,"req":17,"type":"diff","session":"12-34","path":"src/a b.rs"}"#,
+            r#"{"v":1,"req":18,"type":"commit","session":"12-34","message":"Fix it\n\nWhy"}"#,
         ];
         for (n, case) in cases.iter().enumerate() {
             let (req, _) = parse_phone(case).unwrap_or_else(|e| panic!("{case}: {e}"));
@@ -1817,7 +2078,29 @@ mod tests {
         });
         let recent = json!({"engine": "codex", "workspace": "/w", "session": "s", "title": "t", "started": 5});
         let data = json!({"text": "hi"});
+        let changes = ChangesInfo {
+            branch: Some("main".into()),
+            upstream: None,
+            ahead: 1,
+            behind: 0,
+            files: vec![FileChange {
+                path: "src/a.rs".into(),
+                add: 3,
+                del: 1,
+                binary: false,
+                status: FileStatus::Modified,
+            }],
+            more: 2,
+        };
+        let diff = DiffInfo {
+            path: "src/a.rs".into(),
+            text: "@@ -1 +1 @@\n-a\n+b\n".into(),
+            clipped: false,
+            binary: false,
+        };
         for (frame, direction) in [
+            (changes_frame(5, &changes), Direction::ToPhone),
+            (diff_frame(6, &diff), Direction::ToPhone),
             (welcome("Gemini 10"), Direction::ToPhone),
             (paired("tok", "Gemini 10"), Direction::ToPhone),
             (sessions_frame(&[session]), Direction::ToPhone),
@@ -2427,6 +2710,136 @@ mod tests {
             .unwrap();
         let unknown = unknown.split('}').next().unwrap();
         assert!(unknown.contains("type: string;") && unknown.contains("data: unknown;"));
+    }
+
+    #[test]
+    fn git_commands_carry_their_fields() {
+        let (_, changes) =
+            parse_phone(r#"{"v":1,"req":1,"type":"changes","session":"s"}"#).unwrap();
+        assert_eq!(
+            changes,
+            PhoneCommand::Changes {
+                session: "s".into()
+            }
+        );
+        let (_, diff) =
+            parse_phone(r#"{"v":1,"req":1,"type":"diff","session":"s","path":"-rf \"x\"\n"}"#)
+                .unwrap();
+        assert_eq!(
+            diff,
+            PhoneCommand::Diff {
+                session: "s".into(),
+                path: "-rf \"x\"\n".into()
+            }
+        );
+        let (_, commit) =
+            parse_phone(r#"{"v":1,"req":1,"type":"commit","session":"s","message":"One line"}"#)
+                .unwrap();
+        assert_eq!(
+            commit,
+            PhoneCommand::Commit {
+                session: "s".into(),
+                message: "One line".into()
+            }
+        );
+        let longest = json!({"v": 1, "req": 1, "type": "diff", "session": "s",
+            "path": "é".repeat(PATH_LIMIT)});
+        assert!(parse_phone(&longest.to_string()).is_ok());
+        let longest = json!({"v": 1, "req": 1, "type": "commit", "session": "s",
+            "message": "é".repeat(COMMIT_MESSAGE_LIMIT)});
+        assert!(parse_phone(&longest.to_string()).is_ok());
+    }
+
+    #[test]
+    fn git_commands_refuse_extra_fields_a_nul_and_a_long_path() {
+        let refusals = [
+            (
+                json!({"v": 1, "req": 1, "type": "changes", "session": "s", "ref": "HEAD~3"}),
+                "Unexpected field ref",
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "diff", "session": "s", "path": "a",
+                    "args": ["--output=/tmp/x"]}),
+                "Unexpected field args",
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "commit", "session": "s", "message": "m",
+                    "amend": true}),
+                "Unexpected field amend",
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "diff", "session": "s",
+                    "path": "a".repeat(PATH_LIMIT + 1)}),
+                PATH_TOO_LONG,
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "diff", "session": "s", "path": "a\u{0}b"}),
+                "path",
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "diff", "session": "s", "path": ""}),
+                "path",
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "commit", "session": "s",
+                    "message": "fine\u{0}--amend"}),
+                NO_COMMIT_MESSAGE,
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "commit", "session": "s", "message": ""}),
+                NO_COMMIT_MESSAGE,
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "commit", "session": "s", "message": " \n\t"}),
+                NO_COMMIT_MESSAGE,
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "commit", "session": "s",
+                    "message": "m".repeat(COMMIT_MESSAGE_LIMIT + 1)}),
+                NO_COMMIT_MESSAGE,
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "commit", "session": "s"}),
+                "Missing message",
+            ),
+            (
+                json!({"v": 1, "req": 1, "type": "diff", "path": "a"}),
+                "Missing session",
+            ),
+        ];
+        for (command, wanted) in refusals {
+            let error = parse_phone(&command.to_string()).unwrap_err();
+            assert!(error.contains(wanted), "{command}: {error}");
+            // A refusal never echoes the message or the path back.
+            assert!(!error.contains("--amend") && error.len() < 120, "{error}");
+        }
+    }
+
+    #[test]
+    fn the_typescript_types_changes_and_diffs() {
+        let ts = typescript();
+        for wanted in [
+            "export type FileStatus = \"M\" | \"A\" | \"D\" | \"R\" | \"?\" | \"U\";",
+            "export interface FileChange {",
+            "  status: FileStatus;",
+            "export interface ChangesFrame {",
+            "  files: FileChange[];",
+            "  branch?: string | null;",
+            "export interface DiffFrame {",
+            "  clipped: boolean;",
+            "export interface ChangesCommand {",
+            "export interface DiffCommand {",
+            "export interface CommitCommand {",
+        ] {
+            assert!(ts.contains(wanted), "no {wanted:?}");
+        }
+        for status in FileStatus::ALL {
+            assert_eq!(FileStatus::parse(status.as_str()), Some(status));
+        }
+        let spelled: Vec<&str> = FileStatus::ALL.iter().map(|s| s.as_str()).collect();
+        let set = CHOICES.iter().find(|c| c.name == "FileStatus").unwrap();
+        assert_eq!(set.values, spelled);
+        assert_eq!(FileStatus::parse("X"), None);
     }
 
     #[test]

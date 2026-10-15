@@ -13,7 +13,7 @@ use std::{
     future::Future,
     io::Write as _,
     os::unix::fs::PermissionsExt as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Mutex,
@@ -177,6 +177,23 @@ impl Env {
         seqs: std::ops::Range<u64>,
         from_phone: bool,
     ) -> Bridge {
+        self.bridge_with(pid, seqs, from_phone, "/work".into())
+            .await
+    }
+
+    /// A fake bridge for `pid` registered as running in `workspace`.
+    async fn bridge_in(&self, pid: u32, workspace: &Path) -> Bridge {
+        self.bridge_with(pid, 0..1, false, workspace.to_owned())
+            .await
+    }
+
+    async fn bridge_with(
+        &self,
+        pid: u32,
+        seqs: std::ops::Range<u64>,
+        from_phone: bool,
+        workspace: PathBuf,
+    ) -> Bridge {
         self.journal(JOURNAL, seqs);
         let registration = Registration {
             id: format!("{pid}-1790000000"),
@@ -184,7 +201,7 @@ impl Env {
             started: 1_790_000_000,
             socket: self.run.join(format!("{pid}.sock")),
             engine: "claude".into(),
-            workspace: "/work".into(),
+            workspace,
             model: "opus".into(),
             mode: "ask".into(),
             vendor_session: String::new(),
@@ -1881,4 +1898,249 @@ async fn no_replayed_event_follows_the_unsubscribe_ack() {
         assert_eq!(recv(&mut phone).await["seq"], seq);
     }
     assert_eq!(recv(&mut phone).await, ack(5, "Subscribed"));
+}
+
+/// Runs git in `dir` as the person at the desk would.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A git repository at `dir` with one commit of `tracked.txt`; its own config names who
+/// commits, so the hub's git needs nothing from the machine.
+fn git_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("repo directory");
+    git_in(dir, &["init", "-q"]);
+    for (key, value) in [
+        ("user.name", "Test"),
+        ("user.email", "test@example.com"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git_in(dir, &["config", key, value]);
+    }
+    std::fs::write(dir.join("tracked.txt"), "one\n").expect("write");
+    git_in(dir, &["add", "-A"]);
+    git_in(dir, &["commit", "-q", "-m", "First"]);
+}
+
+/// The bridge's state: `phase`, with `approvals` waiting.
+fn turn_state(phase: &str, approvals: u64) -> Value {
+    let approvals: Vec<Value> = (1..=approvals)
+        .map(|id| {
+            json!({"id": id, "summary": {"action": "Run a shell command", "files": [],
+            "scope": "This request only, once"}})
+        })
+        .collect();
+    json!({"phase": phase, "queue": [], "queued": 0, "mode": "ask", "approvals": approvals})
+}
+
+/// Waits until the hub lists session `id` in `phase` with `approvals` waiting.
+async fn listed_as(phone: &mut Phone, id: &str, phase: &str, approvals: u64) {
+    timeout(WAIT, async {
+        loop {
+            let frame = recv_kind(phone, "sessions").await;
+            let rows = frame["sessions"].as_array().cloned().unwrap_or_default();
+            if rows.iter().any(|row| {
+                row["id"] == id && row["phase"] == phase && row["approvals"] == approvals
+            }) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the session is listed in that phase");
+}
+
+#[tokio::test]
+async fn changes_and_diffs_work_on_the_sessions_workspace() {
+    let mut env = Env::new();
+    let workspace = env.root.join("ws");
+    git_repo(&workspace);
+    std::fs::write(workspace.join("tracked.txt"), "one\ntwo\n").expect("write");
+    std::fs::write(workspace.join("new.txt"), "fresh\n").expect("write");
+    let bridge = env.bridge_in(5050, &workspace).await;
+    env.start().await;
+    let (_read, _write) = bridge.accept().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let changes = |req: u64| json!({"v": 1, "req": req, "type": "changes", "session": bridge.id});
+    let diff = |req: u64, path: &str| json!({"v": 1, "req": req, "type": "diff", "session": bridge.id, "path": path});
+
+    // A diff before any listing is refused.
+    send(&mut phone, diff(1, "tracked.txt")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(1, Code::Invalid, "Ask for the changes first")
+    );
+
+    send(&mut phone, changes(2)).await;
+    let listed = recv_kind(&mut phone, "changes").await;
+    assert_eq!(listed["req"], 2, "{listed}");
+    assert_eq!(listed["more"], 0);
+    let files = listed["files"].as_array().expect("files");
+    let tracked = files.iter().find(|f| f["path"] == "tracked.txt");
+    assert_eq!(
+        tracked,
+        Some(
+            &json!({"path": "tracked.txt", "add": 1, "del": 0, "binary": false,
+            "status": "M"})
+        )
+    );
+    let fresh = files.iter().find(|f| f["path"] == "new.txt");
+    assert_eq!(fresh.map(|f| f["status"].clone()), Some(json!("?")));
+
+    send(&mut phone, diff(3, "tracked.txt")).await;
+    let shown = recv_kind(&mut phone, "diff").await;
+    assert_eq!(shown["req"], 3);
+    assert_eq!(shown["path"], "tracked.txt");
+    assert_eq!(shown["clipped"], false);
+    assert_eq!(shown["binary"], false);
+    assert!(
+        shown["text"].as_str().is_some_and(|t| t.contains("+two\n")),
+        "{shown}"
+    );
+
+    // A path the listing did not have is refused, and works after a fresh listing.
+    std::fs::write(workspace.join("later.txt"), "later\n").expect("write");
+    for path in ["later.txt", "../outside", "/etc/passwd", "--output=x"] {
+        send(&mut phone, diff(4, path)).await;
+        assert_eq!(
+            recv_kind(&mut phone, "refused").await,
+            refused(4, Code::Invalid, "Ask for the changes first"),
+            "{path}"
+        );
+    }
+    send(&mut phone, changes(5)).await;
+    recv_kind(&mut phone, "changes").await;
+    send(&mut phone, diff(6, "later.txt")).await;
+    let shown = recv_kind(&mut phone, "diff").await;
+    assert!(
+        shown["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("+later\n")),
+        "{shown}"
+    );
+
+    // Another connection has a listing of its own.
+    let token = env.pair("Other phone").await;
+    let (mut other, _) = hello(env.port, &token).await;
+    send(&mut other, diff(7, "later.txt")).await;
+    assert_eq!(
+        recv_kind(&mut other, "refused").await,
+        refused(7, Code::Invalid, "Ask for the changes first")
+    );
+}
+
+#[tokio::test]
+async fn a_commit_waits_for_the_turn_and_is_audited_without_its_message() {
+    let mut env = Env::new();
+    let workspace = env.root.join("ws");
+    git_repo(&workspace);
+    std::fs::write(workspace.join("tracked.txt"), "one\ntwo\n").expect("write");
+    let bridge = env.bridge_in(5052, &workspace).await;
+    env.start().await;
+    let (_read, mut write) = bridge.accept().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let commit = |req: u64, message: &str| json!({"v": 1, "req": req, "type": "commit", "session": bridge.id, "message": message});
+
+    // No commit while the session's turn is unknown, running, or waiting on an approval.
+    send(&mut phone, commit(8, "Too early")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(8, Code::NotConnected, "The session is not connected")
+    );
+    bridge_write(&mut write, bridge_state_frame(&turn_state("running", 0))).await;
+    listed_as(&mut phone, &bridge.id, "running", 0).await;
+    send(&mut phone, commit(9, "During a turn")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(9, Code::TurnOpen, "Finish or cancel the current turn first")
+    );
+    bridge_write(&mut write, bridge_state_frame(&turn_state("idle", 1))).await;
+    listed_as(&mut phone, &bridge.id, "idle", 1).await;
+    send(&mut phone, commit(10, "With an approval waiting")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(
+            10,
+            Code::TurnOpen,
+            "Finish or cancel the current turn first"
+        )
+    );
+    bridge_write(&mut write, bridge_state_frame(&turn_state("idle", 0))).await;
+    listed_as(&mut phone, &bridge.id, "idle", 0).await;
+    send(&mut phone, commit(11, "")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(11, Code::Invalid, "Write a commit message")
+    );
+
+    send(&mut phone, commit(12, "Secret plans for the phone")).await;
+    let done = recv_kind(&mut phone, "ack").await;
+    let hash = git_in(&workspace, &["rev-parse", "--short", "HEAD"]);
+    assert_eq!(done, ack(12, &format!("Committed {}", hash.trim())));
+    assert_eq!(
+        git_in(&workspace, &["log", "-1", "--format=%s"]).trim(),
+        "Secret plans for the phone"
+    );
+    send(&mut phone, commit(13, "Again")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(13, Code::Invalid, "Nothing to commit")
+    );
+
+    // The audit names the device and the session, never the message.
+    let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
+    let commits: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .filter(|line: &Value| line["what"] == "commit")
+        .collect();
+    assert_eq!(commits.len(), 1, "{audit}");
+    assert_eq!(commits[0]["device"], "Test phone");
+    assert_eq!(commits[0]["session"], bridge.id);
+    assert!(!audit.contains("Secret plans"), "{audit}");
+}
+
+#[tokio::test]
+async fn git_on_a_folder_that_is_not_a_repository_is_refused_and_the_hub_goes_on() {
+    let mut env = Env::new();
+    let workspace = env.root.join("plain");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let bridge = env.bridge_in(5051, &workspace).await;
+    env.start().await;
+    let (_read, _write) = bridge.accept().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 1, "type": "changes", "session": bridge.id}),
+    )
+    .await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(1, Code::Unavailable, "This folder isn't a git repository")
+    );
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 2, "type": "changes", "session": "9-9"}),
+    )
+    .await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(2, Code::Unavailable, "No such session")
+    );
+    send(&mut phone, json!({"v": 1, "req": 3, "type": "ping"})).await;
+    assert_eq!(recv_kind(&mut phone, "ack").await, ack(3, "pong"));
 }
