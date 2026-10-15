@@ -1,5 +1,5 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
-import { usePathname, useRouter } from "expo-router";
+import { useNavigationContainerRef, usePathname, useRouter } from "expo-router";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useState, type ReactNode } from "react";
 import { AccessibilityInfo, Animated, BackHandler, PanResponder, Pressable, StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -7,6 +7,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { closeDrawer, openDrawer, useDrawerEnabled, useDrawerOpen, useEdgeBottom } from "../drawer";
 import { useHubClient } from "../hub";
 import { drawerList, drawerSub, macName, type DrawerRow } from "../inbox";
+import { isSessionPath, openSession } from "../navigation";
 import { useHub, useSessions } from "../store";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
 
@@ -132,7 +133,6 @@ function sameRow(a: RowProps, b: RowProps): boolean {
 }
 
 /** Whether `pathname` is the Conversation of session `id` (expo-router may percent-encode the id). */
-const isSessionPath = (pathname: string, id: string): boolean => pathname === `/session/${id}` || pathname === `/session/${encodeURIComponent(id)}`;
 
 const keyOf = (row: DrawerRow): string => row.id;
 const readClock = (): number => Date.now();
@@ -148,6 +148,7 @@ export function Drawer() {
   const s = theme === light ? LIGHT : DARK;
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const nav = useNavigationContainerRef();
   const pathname = usePathname();
   const client = useHubClient();
   const sessions = useSessions();
@@ -246,13 +247,10 @@ export function Drawer() {
   const goSession = useCallback(
     (id: string) => {
       closeDrawer();
-      const target = { pathname: "/session/[id]", params: { id } } as const;
-      if (isSessionPath(pathname, id)) return;
-      // From one conversation to another: replace it, so back still returns to where it came from.
-      if (pathname.startsWith("/session/")) router.replace(target);
-      else router.push(target);
+      // One copy of each conversation: back to it when it is in the stack, in place of another.
+      openSession(router, nav.getRootState(), pathname, id);
     },
-    [pathname, router],
+    [pathname, router, nav],
   );
 
   const renderItem = useCallback<ListRenderItem<DrawerRow>>(

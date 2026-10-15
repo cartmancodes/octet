@@ -178,6 +178,7 @@ export default function Session() {
           offline={offline}
           approval={approvals.length > 0}
           phase={phase}
+          focused={focused}
           onCovered={setSheetOpen}
         />
         <HubBanner state={hub} announce={focused} />

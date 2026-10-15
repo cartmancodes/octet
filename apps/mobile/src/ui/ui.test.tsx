@@ -1,10 +1,10 @@
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
-import { StyleSheet, Text } from "react-native";
+import { AccessibilityInfo, Platform, StyleSheet, Text } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { dark, light, radius, type } from "../theme";
 import { hideToast, showToast, TOAST_MS, toastStore } from "../toast";
-import { BAR_HEIGHT, Button, Card, Chip, Label, Segmented, ToastHost as BareToastHost } from "./index";
+import { Button, Card, Chip, Label, Segmented, ToastHost as BareToastHost } from "./index";
 
 const METRICS = { frame: { x: 0, y: 0, width: 390, height: 844 }, insets: { top: 47, left: 0, right: 0, bottom: 34 } };
 /** The host as the app has it: inside the safe area. */
@@ -23,6 +23,7 @@ beforeEach(() => {
 afterEach(() => {
   hideToast();
   jest.useRealTimers();
+  jest.restoreAllMocks();
 });
 
 describe("Card", () => {
@@ -188,11 +189,75 @@ describe("Toast", () => {
     expect(screen.queryByText("octet needs approval")).toBeNull();
   });
 
-  it("sits above a screen's bottom button and the home indicator", async () => {
+  it("sits at the top, under the header: the safe area's top plus 58", async () => {
     await render(<ToastHost />);
     await act(async () => showToast("hello"));
     const wrap = style(screen.getByTestId("toast-wrap"));
-    expect(Number(wrap.bottom)).toBeGreaterThanOrEqual(METRICS.insets.bottom + BAR_HEIGHT);
+    expect(wrap.top).toBe(METRICS.insets.top + 58);
+    expect(wrap.bottom).toBeUndefined();
+  });
+
+  describe("for a screen reader", () => {
+    const os = Platform.OS;
+    afterEach(() => {
+      Platform.OS = os;
+    });
+
+    it("on iOS, announces each toast's words", async () => {
+      Platform.OS = "ios";
+      const announce = jest.spyOn(AccessibilityInfo, "announceForAccessibility").mockImplementation(() => undefined);
+      announce.mockClear();
+      await render(<ToastHost />);
+      await act(async () => showToast("Write a prompt first."));
+      expect(announce).toHaveBeenCalledWith("Write a prompt first.");
+      await act(async () => showToast("Write a prompt first."));
+      expect(announce).toHaveBeenCalledTimes(2);
+    });
+
+    it("on Android, leaves it to the live region and announces nothing", async () => {
+      Platform.OS = "android";
+      const announce = jest.spyOn(AccessibilityInfo, "announceForAccessibility").mockImplementation(() => undefined);
+      announce.mockClear();
+      await render(<ToastHost />);
+      await act(async () => showToast("hello"));
+      expect(announce).not.toHaveBeenCalled();
+      expect(screen.getByTestId("toast").props.accessibilityLiveRegion).toBe("polite");
+    });
+
+    it("holds the toast while a screen reader runs, until it is dismissed", async () => {
+      jest.spyOn(AccessibilityInfo, "isScreenReaderEnabled").mockResolvedValue(true);
+      await render(<ToastHost />);
+      await act(async () => {});
+      await act(async () => showToast("octet needs approval"));
+      await act(async () => void jest.advanceTimersByTime(60_000));
+      expect(screen.getByText("octet needs approval")).toBeTruthy();
+      await act(async () => screen.getByTestId("toast").props.onAccessibilityEscape());
+      expect(screen.queryByText("octet needs approval")).toBeNull();
+      await act(async () => showToast("again"));
+      const text = screen.getByText("again");
+      expect(text.props.accessibilityActions).toEqual([{ name: "dismiss", label: "Dismiss" }]);
+      await act(async () => text.props.onAccessibilityAction({ nativeEvent: { actionName: "dismiss" } }));
+      expect(screen.queryByText("again")).toBeNull();
+    });
+
+    it("goes 3.4 s after the screen reader stops", async () => {
+      let changed: (on: boolean) => void = () => {};
+      jest.spyOn(AccessibilityInfo, "isScreenReaderEnabled").mockResolvedValue(true);
+      jest.spyOn(AccessibilityInfo, "addEventListener").mockImplementation(((name: string, handler: (on: boolean) => void) => {
+        if (name === "screenReaderChanged") changed = handler;
+        return { remove: jest.fn() };
+      }) as never);
+      await render(<ToastHost />);
+      await act(async () => {});
+      await act(async () => showToast("hello"));
+      await act(async () => void jest.advanceTimersByTime(10_000));
+      expect(screen.getByText("hello")).toBeTruthy();
+      await act(async () => changed(false));
+      await act(async () => void jest.advanceTimersByTime(3_399));
+      expect(screen.getByText("hello")).toBeTruthy();
+      await act(async () => void jest.advanceTimersByTime(1));
+      expect(screen.queryByText("hello")).toBeNull();
+    });
   });
 
   it("is a polite live region and draws the text as text", async () => {

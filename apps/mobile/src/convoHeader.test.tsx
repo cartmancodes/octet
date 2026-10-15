@@ -71,6 +71,7 @@ interface Opts {
   phase?: Phase;
   offline?: boolean;
   approval?: boolean;
+  focused?: boolean;
   onCovered?: (covered: boolean) => void;
 }
 const header = (r: Rig, o: Opts = {}) => (
@@ -81,6 +82,7 @@ const header = (r: Rig, o: Opts = {}) => (
     live={o.live ?? true}
     offline={o.offline ?? false}
     approval={o.approval ?? false}
+    focused={o.focused ?? true}
     phase={o.phase}
     onCovered={o.onCovered ?? noop}
   />
@@ -384,6 +386,19 @@ describe("the ▾ menu", () => {
     await view.rerender(header(rig(), { live: false }));
     await act(async () => void requestMenu(SESSION));
     expect(screen.queryByTestId("menu")).toBeNull();
+  });
+
+  it("opens for /model only on the screen in front: a copy behind another screen ignores it", async () => {
+    await hear(CATALOG);
+    const view = await render(header(rig(), { focused: false }));
+    let ran = true;
+    await act(async () => void (ran = requestMenu(SESSION)));
+    expect(ran).toBe(false);
+    expect(screen.queryByTestId("menu")).toBeNull();
+    await view.rerender(header(rig(), { focused: true }));
+    await act(async () => void (ran = requestMenu(SESSION)));
+    expect(ran).toBe(true);
+    expect(screen.getByTestId("menu")).toBeTruthy();
   });
 
   it("lists the session engine's models with ✓ on the current one, and other engines' after", async () => {

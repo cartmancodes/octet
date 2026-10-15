@@ -1,6 +1,7 @@
-import { usePathname, useRouter } from "expo-router";
+import { useNavigationContainerRef, usePathname, useRouter } from "expo-router";
 import { memo, useEffect, useRef } from "react";
 
+import { openSession } from "../navigation";
 import type { SessionInfo } from "../protocol";
 import { sessionName } from "../sessions";
 import { useListed, useSessions } from "../store";
@@ -67,6 +68,7 @@ function onScreen(pathname: string): string | null {
  */
 export const ApprovalToasts = memo(function ApprovalToasts() {
   const router = useRouter();
+  const nav = useNavigationContainerRef();
   const pathname = usePathname();
   const sessions = useSessions();
   const listed = useListed();
@@ -92,12 +94,9 @@ export const ApprovalToasts = memo(function ApprovalToasts() {
     const fresh = news[0];
     if (!fresh || here.current === "/" || onScreen(here.current) === fresh.id) return;
     const id = fresh.id;
-    showToast(
-      `${sessionName(fresh.workspace)}${APPROVAL_TOAST}`,
-      () => router.push({ pathname: "/session/[id]", params: { id } }),
-      VIEW,
-    );
-  }, [sessions, listed, router]);
+    // View opens it as the drawer does: back to it when it is in the stack already.
+    showToast(`${sessionName(fresh.workspace)}${APPROVAL_TOAST}`, () => openSession(router, nav.getRootState(), here.current, id), VIEW);
+  }, [sessions, listed, router, nav]);
 
   return null;
 });

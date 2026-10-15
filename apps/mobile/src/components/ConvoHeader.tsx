@@ -67,6 +67,9 @@ interface ConvoHeaderProps {
   approval: boolean;
   /** Where the session's connection is: End is offered when it is idle. */
   phase?: Phase;
+  /** The screen is in front: only then does the prompt line's `/model` open its menu, so a copy
+   * of the conversation behind another screen never does. */
+  focused: boolean;
   /** Told when the menu or the info sheet opens and closes: what is under them must not be
    * answered meanwhile. Must be stable. */
   onCovered: (covered: boolean) => void;
@@ -79,7 +82,7 @@ interface ConvoHeaderProps {
  * draws it again; Aa changes the size without reading it, so the header does not draw again for
  * that either.
  */
-export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live, offline, approval, phase, onCovered }: ConvoHeaderProps) {
+export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live, offline, approval, phase, focused, onCovered }: ConvoHeaderProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const head = useSessionHead(session);
@@ -107,21 +110,21 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
     setToInfo(false);
     setMenu((open) => !open);
   }, [live]);
-  // The prompt line's /model opens the menu (a session that takes no commands has none: the
-  // check above closes it again). Not over Session info: iOS shows one Modal at a time.
+  // The prompt line's /model opens the menu, on the screen in front only (a session that takes
+  // no commands has none: the check above closes it again). Not over Session info: iOS shows one
+  // Modal at a time.
   const infoUp = useRef(info);
   useLayoutEffect(() => {
     infoUp.current = info;
   });
-  useEffect(
-    () =>
-      onMenuRequest(session, () => {
-        if (infoUp.current) return;
-        setToInfo(false);
-        setMenu(true);
-      }),
-    [session],
-  );
+  useEffect(() => {
+    if (!focused) return;
+    return onMenuRequest(session, () => {
+      if (infoUp.current) return;
+      setToInfo(false);
+      setMenu(true);
+    });
+  }, [session, focused]);
   const closeMenu = useCallback(() => setMenu(false), []);
   const menuToInfo = useCallback(() => {
     setMenu(false);

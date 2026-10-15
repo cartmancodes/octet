@@ -249,6 +249,19 @@ describe("notifications", () => {
     expect(view.getPathname()).toBe(`/session/${SESSION}`);
   });
 
+  it("a tap for a session already in the stack goes back to it: no second copy", async () => {
+    const { sockets, view } = await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    connected({ sockets });
+    await act(async () => router.push(`/session/${SESSION}`));
+    await act(async () => router.push("/settings"));
+    await act(async () => listener()?.(tap({ session: SESSION })));
+    expect(view.getPathname()).toBe(`/session/${SESSION}`);
+    await act(async () => router.back());
+    expect(view.getPathname()).toBe("/");
+    expect(router.canGoBack()).toBe(false);
+  });
+
   it("a tap while unpaired goes to Pair", async () => {
     const { view } = await launch();
     await screen.findByText("Scan the code from /remote-control pair");

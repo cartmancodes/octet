@@ -1,4 +1,4 @@
-// The one toast the app shows at a time: a short line at the bottom, with at most one action. A
+// The one toast the app shows at a time: a short line at the top, with at most one action. A
 // zustand store without React in it, so anything can show one; the host in app/_layout.tsx draws
 // it (src/ui/Toast.tsx).
 import { createStore, useStore } from "zustand";
@@ -24,15 +24,36 @@ export const toastStore = createStore<ToastState>()(() => ({ toast: null }));
 
 let seq = 0;
 let timer: ReturnType<typeof setTimeout> | null = null;
+/** A screen reader runs: the toast stays until it is dismissed or replaced, since the user may be
+ * reading it (React Native says nothing of where a screen reader's focus is). */
+let held = false;
 
 const clear = () => {
   if (timer !== null) clearTimeout(timer);
   timer = null;
 };
 
-/** Shows `text` in place of any toast up, for `TOAST_MS`. */
-export function showToast(text: string, action?: () => void, label?: string): void {
+/** Takes the toast that is up down `TOAST_MS` from now, unless toasts are held. */
+function schedule(): void {
   clear();
+  const toast = toastStore.getState().toast;
+  if (!toast || held) return;
+  const mine = toast.seq;
+  timer = setTimeout(() => {
+    timer = null;
+    if (toastStore.getState().toast?.seq === mine) toastStore.setState({ toast: null });
+  }, TOAST_MS);
+}
+
+/** While `on`, a toast does not go by itself; once off, the one up goes `TOAST_MS` later. */
+export function holdToasts(on: boolean): void {
+  if (held === on) return;
+  held = on;
+  schedule();
+}
+
+/** Shows `text` in place of any toast up, for `TOAST_MS` (or, held, until it is dismissed). */
+export function showToast(text: string, action?: () => void, label?: string): void {
   seq += 1;
   const toast: ToastInfo = { text, seq };
   if (action && label) {
@@ -40,11 +61,7 @@ export function showToast(text: string, action?: () => void, label?: string): vo
     toast.label = label;
   }
   toastStore.setState({ toast });
-  const mine = seq;
-  timer = setTimeout(() => {
-    timer = null;
-    if (toastStore.getState().toast?.seq === mine) toastStore.setState({ toast: null });
-  }, TOAST_MS);
+  schedule();
 }
 
 /** Takes the toast down. */

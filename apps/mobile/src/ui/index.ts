@@ -4,4 +4,4 @@ export { Card } from "./Card";
 export { Chip } from "./Chip";
 export { Label } from "./Label";
 export { Segmented, type SegmentedOption } from "./Segmented";
-export { BAR_GAP, BAR_HEIGHT, ToastHost, toastBottom } from "./Toast";
+export { BAR_GAP, BAR_HEIGHT, TOAST_TOP, ToastHost } from "./Toast";

@@ -325,6 +325,18 @@ describe("the drawer", () => {
       expect(rig.view.getPathname()).toBe("/");
     });
 
+    it("a tap on a session already in the stack goes back to it: no second copy", async () => {
+      const rig = await open([info("a"), info("b")]);
+      await act(async () => router.push("/session/a"));
+      await act(async () => router.push("/settings"));
+      await openFromStore();
+      await fireEvent.press(inDrawer().getByRole("button", { name: /^a/ }));
+      expect(rig.view.getPathname()).toBe("/session/a");
+      await act(async () => router.back());
+      expect(rig.view.getPathname()).toBe("/");
+      expect(router.canGoBack()).toBe(false);
+    });
+
     it("Settings navigates and closes the drawer", async () => {
       const rig = await open([info("a")]);
       await openFromMenu();

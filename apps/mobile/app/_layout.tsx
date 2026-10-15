@@ -1,4 +1,4 @@
-import { Stack, usePathname, useRouter } from "expo-router";
+import { Stack, useNavigationContainerRef, usePathname, useRouter } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import * as SystemUI from "expo-system-ui";
@@ -9,6 +9,7 @@ import { ApprovalToasts } from "../src/components/ApprovalToasts";
 import { Drawer, DrawerHost } from "../src/components/Drawer";
 import { closeDrawer, drawerScreen, setDrawerEnabled } from "../src/drawer";
 import { useHubController, useHubSnapshot } from "../src/hub";
+import { openSession } from "../src/navigation";
 import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
 import { useTheme } from "../src/theme";
 import { ToastHost } from "../src/ui";
@@ -31,6 +32,7 @@ export default function RootLayout() {
   const theme = useTheme();
   const hub = useHubController();
   const router = useRouter();
+  const nav = useNavigationContainerRef();
   const { status, offer } = useHubSnapshot();
   const pathname = usePathname();
 
@@ -60,12 +62,13 @@ export default function RootLayout() {
     return () => subscription.remove();
   }, [hub]);
 
-  // A tap opens the session it names; unpaired, the phone can only pair; a tap that names no
-  // valid session lands on Sessions. (The Session screen already handles a session that is gone.)
+  // A tap opens the session it names, as the drawer does (back to it when it is in the stack);
+  // unpaired, the phone can only pair; a tap that names no valid session lands on the Inbox. (The
+  // Session screen already handles a session that is gone.)
   const open = (session: string | null) => {
     if (status === "unpaired") router.replace("/pair");
     else if (session === null) router.replace("/");
-    else router.push({ pathname: "/session/[id]", params: { id: session } });
+    else openSession(router, nav.getRootState(), pathname, session);
   };
   // The latest of these, for the listener below, which is set up once.
   const route = useRef({ status, offer, open });
