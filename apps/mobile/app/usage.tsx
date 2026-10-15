@@ -1,4 +1,4 @@
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { memo, useCallback, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -6,6 +6,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { FreshConfirm } from "../src/components/CommandSheet";
 import { useDeskCommand } from "../src/components/deskCommand";
 import { useSend } from "../src/components/send";
+import { useHubClient } from "../src/hub";
+import { field, FIELD_CHARS } from "../src/model/text";
 import { engineModel, shortId } from "../src/session";
 import { sessionName } from "../src/sessions";
 import type { SessionInfo } from "../src/protocol";
@@ -19,12 +21,17 @@ import {
   useSessionUsage,
   useTurns,
   useUsageRows,
+  octetStore,
+  unwatch,
+  watch,
 } from "../src/store";
 import { radius, spacing, type, useTheme } from "../src/theme";
 import { Button, Card } from "../src/ui";
 
 /** Said for USAGE, and for Today, when no session has reported any. */
 export const NO_USAGE = "No usage reported yet";
+/** Said for WORKSPACE when the session is not in the list and the route did not say. */
+export const NOT_LISTED = "Not listed";
 /** Said for JOURNAL before the hub has listed one. */
 export const NO_JOURNAL = "None yet";
 
@@ -48,10 +55,31 @@ export default function Usage() {
   const theme = useTheme();
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const params = useLocalSearchParams<{ id?: string | string[] }>();
+  const params = useLocalSearchParams<{ id?: string | string[]; workspace?: string | string[] }>();
   const id = typeof params.id === "string" ? params.id : "";
+  const routed = typeof params.workspace === "string" ? field(params.workspace, FIELD_CHARS) : "";
   const info = useSessionInfo(id);
   const head = useSessionHead(id);
+  const client = useHubClient();
+
+  // The session streams while this screen is in front, as it does for the Conversation under it:
+  // USAGE and TURNS are live. An ended session has nothing more to stream. The two screens hold
+  // the one subscription together (`watch` counts them).
+  useFocusEffect(
+    useCallback(() => {
+      if (!client || id === "") return;
+      if (octetStore.getState().bySession.get(id)?.ended) return;
+      if (octetStore.getState().sessions.every((x) => x.id !== id)) return; // not in the list: the hub would refuse
+      watch(octetStore, client, id);
+      return () => unwatch(client, id);
+    }, [client, id]),
+  );
+
+  // The workspace outlives the session's place in the list; the route (from the Conversation) gives
+  // it when the row is already gone.
+  const [lastWorkspace, setLastWorkspace] = useState(head.workspace);
+  if (head.workspace !== undefined && head.workspace !== lastWorkspace) setLastWorkspace(head.workspace);
+  const workspace = lastWorkspace ?? (routed === "" ? undefined : routed);
   const catalog = useCatalog(id);
   const status = useSessionStatus(id);
   const usage = useSessionUsage(id);
@@ -78,7 +106,11 @@ export default function Usage() {
     run("new", back);
   }, [run, back]);
 
-  const today = useMemo(() => byActivity(rows), [rows]);
+  // This session's line is the view's latest usage, which is newer than its row's.
+  const today = useMemo(() => {
+    const list = info && usage !== null && !rows.some((r) => r.id === info.id) ? [...rows, info] : rows;
+    return byActivity(list).map((row) => ({ row, usage: row.id === id ? (usage ?? row.usage ?? "") : (row.usage ?? "") }));
+  }, [rows, info, usage, id]);
   const s = useMemo(
     () =>
       StyleSheet.create({
@@ -90,7 +122,7 @@ export default function Usage() {
         spacer: { width: 44 },
         body: { gap: spacing.xl, paddingHorizontal: 20, paddingVertical: spacing.lg },
         row: { flexDirection: "row", gap: spacing.sm },
-        label: { ...type.body, width: 80, color: theme.muted },
+        label: { ...type.body, width: 96, color: theme.muted },
         value: { ...type.body, flex: 1, color: theme.fg },
         line: { ...type.body, color: theme.fg },
         lineUsage: { ...type.body, color: theme.muted },
@@ -130,7 +162,7 @@ export default function Usage() {
           </Text>
           {known ? (
             <Text numberOfLines={1} style={s.sub}>
-              {`${sessionName(head.workspace)} · ${shortId(id)}`}
+              {`${sessionName(workspace)} · ${shortId(id)}`}
             </Text>
           ) : null}
         </View>
@@ -138,8 +170,22 @@ export default function Usage() {
       </View>
       {known ? (
         <>
+          {/* A deliberate exception to "lists are FlashList": the page is a few cards, and Today holds at
+              most 200 rows (the store's cap on listed sessions), each a short memoised line. */}
           <ScrollView contentContainerStyle={s.body}>
             <Card title="This session" testID="this-session">
+              <View style={s.row}>
+                <Text style={s.label}>SESSION</Text>
+                <Text selectable style={s.value}>
+                  {id}
+                </Text>
+              </View>
+              <View style={s.row}>
+                <Text style={s.label}>WORKSPACE</Text>
+                <Text selectable style={s.value}>
+                  {workspace ?? NOT_LISTED}
+                </Text>
+              </View>
               <View style={s.row}>
                 <Text style={s.label}>ENGINE</Text>
                 <Text style={s.value}>{engineModel(catalog, head)}</Text>
@@ -159,8 +205,8 @@ export default function Usage() {
             </Card>
             <Card title="Today" testID="today">
               {today.length === 0 ? <Text style={s.lineUsage}>{NO_USAGE}</Text> : null}
-              {today.map((row) => (
-                <UsageLine key={row.id} name={sessionName(row.workspace)} usage={row.usage ?? ""} nameStyle={s.line} usageStyle={s.lineUsage} />
+              {today.map(({ row, usage: line }) => (
+                <UsageLine key={row.id} name={sessionName(row.workspace)} usage={line} nameStyle={s.line} usageStyle={s.lineUsage} />
               ))}
             </Card>
           </ScrollView>

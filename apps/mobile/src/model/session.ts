@@ -101,7 +101,9 @@ export type Op =
   | { op: "state"; state: StateInfo }
   | { op: "catalog"; catalog: CatalogInfo }
   | { op: "failed"; reason: string | null }
-  | { op: "ended"; ended: boolean };
+  | { op: "ended"; ended: boolean }
+  /** A note the phone adds to the transcript itself, after what is there (a fresh start). */
+  | { op: "note"; text: string };
 
 /** Approvals waiting, at most. */
 export const MAX_APPROVALS = 32;
@@ -294,6 +296,9 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         break;
       case "ended":
         v.ended = op.ended;
+        break;
+      case "note":
+        own().addLocalNote(op.text);
         break;
       case "failed":
         v.failed = op.reason;

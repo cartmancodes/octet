@@ -57,6 +57,10 @@ export interface OctetState {
   reset(): void;
   /** The hub refused to stream `session` for good. */
   subscribeFailed(session: string, reason: string): void;
+  /** Adds a note of the phone's own after the session's transcript (once: the same note straight
+   * after itself adds nothing). False, and nothing made, for a session the store holds no view
+   * of: a view made here would stop a later `watch` from starting fresh. */
+  addNote(session: string, text: string): boolean;
   /** Lets go of a live session's transcript and approvals, keeping what other screens read of it
    * (its catalog and last state). False for a session with no view, or one that ended. */
   evict(session: string): boolean;
@@ -279,6 +283,14 @@ export function createOctetStore(): OctetStore {
       return true;
     },
 
+    addNote(session, text) {
+      const old = get().bySession.get(session);
+      if (!old) return false;
+      const next = reduceView(old, [{ op: "note", text: field(text, FIELD) }]);
+      if (next !== old) set((s) => ({ bySession: new Map(s.bySession).set(session, next) }));
+      return true;
+    },
+
     subscribeFailed(session, reason) {
       const old = get().bySession.get(session) ?? EMPTY_VIEW;
       const next = reduceView(old, [{ op: "failed", reason: field(reason, FIELD) }]);
@@ -395,6 +407,14 @@ const shown = (client: HubClient): Set<string> => {
   return set;
 };
 
+/** How many screens watch each session, per client. */
+const watchers = new WeakMap<HubClient, Map<string, number>>();
+const holdsOf = (client: HubClient): Map<string, number> => {
+  let map = watchers.get(client);
+  if (!map) watchers.set(client, (map = new Map()));
+  return map;
+};
+
 /** Live sessions whose transcripts the phone keeps, the ones seen last: each holds up to 1,000
  * entries and 4 MiB, and nothing else bounds the total. */
 export const MAX_VIEWS = 4;
@@ -445,6 +465,8 @@ function keepRecent(store: OctetStore, client: HubClient): void {
  * transcript to resume. Asking again changes nothing. Seeing it makes it the newest of the
  * `MAX_VIEWS` whose transcripts are kept. */
 export function watch(store: OctetStore, client: HubClient, session: string): void {
+  const holds = holdsOf(client);
+  holds.set(session, (holds.get(session) ?? 0) + 1);
   const fresh = !store.getState().bySession.has(session) && !requested(client).has(session);
   requested(client).add(session);
   shown(client).add(session);
@@ -457,6 +479,15 @@ export function watch(store: OctetStore, client: HubClient, session: string): vo
 
 /** Stops streaming `session`; the store keeps what it holds, and a later `watch` resumes. */
 export function unwatch(client: HubClient, session: string): void {
+  // Screens that stream one session (a Conversation, and the Usage over it) hold it together: it
+  // stops when the last of them lets go, whichever order they blur in.
+  const holds = holdsOf(client);
+  const left = (holds.get(session) ?? 0) - 1;
+  if (left > 0) {
+    holds.set(session, left);
+    return;
+  }
+  holds.delete(session);
   requested(client).delete(session);
   shown(client).delete(session);
   client.unsubscribe(session);

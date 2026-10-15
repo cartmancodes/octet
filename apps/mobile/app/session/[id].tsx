@@ -71,14 +71,18 @@ export default function Session() {
   const insets = useSafeAreaInsets();
   const setTaskOpen = octetStore.getState().setTaskOpen;
 
+  // Usage is opening over this screen: an ended session's view is not let go of meanwhile (Usage
+  // shows what it left), and ⋯ pushes once however fast it is tapped.
+  const toUsage = useRef(false);
   useFocusEffect(
     useCallback(() => {
+      toUsage.current = false; // in front again
       if (!client || id === "") return;
       // An ended session's view is what it left behind: there is nothing more to stream.
       if (!octetStore.getState().bySession.get(id)?.ended) watch(octetStore, client, id);
       return () => {
         unwatch(client, id);
-        releaseSession(octetStore, client, id);
+        if (!toUsage.current) releaseSession(octetStore, client, id);
       };
     }, [client, id]),
   );
@@ -122,8 +126,10 @@ export default function Session() {
 
   // ⋯: this session's Usage, once (a second tap while it opens would stack a second copy).
   const usage = useCallback(() => {
-    if (focused) router.push({ pathname: "/usage", params: { id } });
-  }, [focused, router, id]);
+    if (!focused || toUsage.current) return;
+    toUsage.current = true;
+    router.push({ pathname: "/usage", params: { id, workspace: workspace ?? "" } });
+  }, [focused, router, id, workspace]);
 
   // Not listed, and nothing to show: never heard of (once the list came), or refused with no
   // transcript (a deep link to an id the Mac does not have).

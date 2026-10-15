@@ -786,6 +786,30 @@ describe("with a client", () => {
     off();
   });
 
+  // Usage opens over the Conversation: both screens watch the one session.
+  it("two screens watching one session: the first to leave does not unsubscribe it", () => {
+    const { sockets, client, off } = rig();
+    watch(store, client, "a");
+    watch(store, client, "a"); // Usage over the Conversation
+    unwatch(client, "a");
+    expect(sockets.last.commandsOf("unsubscribe")).toHaveLength(0);
+    unwatch(client, "a");
+    expect(sockets.last.commandsOf("unsubscribe")).toHaveLength(1);
+    off();
+  });
+
+  it("the count never goes below none: extra unwatches do not cancel a later watch", () => {
+    const { sockets, client, off } = rig();
+    watch(store, client, "a");
+    unwatch(client, "a");
+    unwatch(client, "a"); // one too many
+    watch(store, client, "a");
+    watch(store, client, "a");
+    unwatch(client, "a"); // one screen is still there
+    expect(sockets.last.commandsOf("unsubscribe")).toHaveLength(1);
+    off();
+  });
+
   it("stops listening when disconnected", () => {
     const { off, sockets, clock } = rig();
     off();
@@ -964,5 +988,40 @@ describe("what the Usage screen reads", () => {
     const before = rows.result.current;
     await apply(sessions(info("a", { usage: "5h 12%" }), info("b", { phase: "running" }), info("c", { usage: "" }), info("d", { usage: "week 3%" })));
     expect(rows.result.current).toBe(before);
+  });
+});
+
+describe("a fresh start marked in the transcript", () => {
+  const apply = (...frames: ToPhone[]) => act(async () => void store.getState().applyBatch(frames));
+  const NOTE = "Fresh conversation — the earlier one is above.";
+  const lines = (id: string) => view(id).transcript.entries.map((e) => [e.kind, "text" in e ? e.text : ""]);
+
+  it("addNote puts the divider after the old conversation once, and new-journal events land below it", async () => {
+    await apply(sessions(info("a")), subscribed("a", "start"), user("a", "old"), text("a", "old reply"));
+    expect(store.getState().addNote("a", NOTE)).toBe(true);
+    expect(store.getState().addNote("a", NOTE)).toBe(true); // a repeated ack: nothing more
+    await apply(
+      { v: 1, type: "event", session: "a", journal: "j2", seq: 1, event: { type: "user", data: "new" } },
+      { v: 1, type: "event", session: "a", journal: "j2", seq: 2, event: { type: "text", data: "new reply" } },
+    );
+    expect(lines("a")).toEqual([
+      ["user", "old"],
+      ["reply", "old reply"],
+      ["note", NOTE],
+      ["user", "new"],
+      ["reply", "new reply"],
+    ]);
+  });
+
+  it("is not made for a session the store holds no view of: a later watch must still start fresh", () => {
+    expect(store.getState().addNote("zz", NOTE)).toBe(false);
+    expect(store.getState().bySession.has("zz")).toBe(false);
+  });
+
+  it("changes nothing for the other sessions' views", async () => {
+    await apply(sessions(info("a"), info("b")), subscribed("a", "start"), user("a", "x"), subscribed("b", "start"), user("b", "y"));
+    const b = view("b");
+    store.getState().addNote("a", NOTE);
+    expect(view("b")).toBe(b);
   });
 });

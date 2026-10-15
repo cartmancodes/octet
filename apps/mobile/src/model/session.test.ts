@@ -1,5 +1,6 @@
 import type { ApprovalSummary, CatalogInfo, KnownJournalEvent, StateInfo } from "../protocol";
 import { EMPTY_VIEW, reduceView, type Op, type SessionView } from "./session";
+import { entrySize } from "./transcript";
 
 const ev = (event: KnownJournalEvent): Op => ({ op: "event", ev: event });
 const summary = (action: string, extra: Partial<ApprovalSummary> = {}): ApprovalSummary => ({
@@ -203,6 +204,44 @@ describe("turns", () => {
   it("are counted in the reducer: they outlast the entries the view drops", () => {
     const many = Array.from({ length: 2_500 }, () => [ev({ type: "user", data: "q" }), finished]).flat();
     expect(view(many).turns).toBe(2_500);
+  });
+});
+
+describe("a local note", () => {
+  const note = (text = "Fresh conversation — the earlier one is above."): Op => ({ op: "note", text });
+
+  it("is a NOTE entry after the conversation, and what comes next goes below it", () => {
+    const old = view([ev({ type: "user", data: "old" }), ev({ type: "text", data: "old reply" }), ev({ type: "finished", data: "completed" })]);
+    const after = view([note(), ev({ type: "user", data: "new" }), ev({ type: "text", data: "new reply" })], old);
+    expect(after.transcript.entries.map((e) => [e.kind, "text" in e ? e.text : ""])).toEqual([
+      ["user", "old"],
+      ["reply", "old reply"],
+      ["note", "Fresh conversation — the earlier one is above."],
+      ["user", "new"],
+      ["reply", "new reply"],
+    ]);
+  });
+
+  it("is not added twice in a row: the same note straight after itself changes nothing", () => {
+    const once = view([ev({ type: "user", data: "old" }), note()]);
+    expect(view([note()], once)).toBe(once);
+    expect(view([note(), note()]).transcript.entries).toHaveLength(1);
+    // After something new it is a new divider.
+    const later = view([ev({ type: "user", data: "new" }), note()], once);
+    expect(later.transcript.entries.filter((e) => e.kind === "note")).toHaveLength(2);
+  });
+
+  it("stays inside the transcript bounds", () => {
+    const many = view(Array.from({ length: 1_000 }, (_, i) => ev({ type: "user", data: `q${i}` })));
+    const after = view([note()], many);
+    expect(after.transcript.entries).toHaveLength(1_000);
+    expect(after.transcript.entries[999]).toMatchObject({ kind: "note" });
+    expect(after.transcript.bytes).toBe(after.transcript.entries.reduce((n, e) => n + entrySize(e), 0));
+  });
+
+  it("is cleaned like any hub text", () => {
+    const v = view([{ op: "note", text: "a\u001b[31mb\u0007" }]);
+    expect(v.transcript.entries[0]).toMatchObject({ kind: "note", text: "ab" });
   });
 });
 

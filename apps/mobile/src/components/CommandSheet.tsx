@@ -53,7 +53,7 @@ export const CommandSheet = memo(function CommandSheet({ title, text, onClose }:
       <View style={s.root}>
         <View style={s.scrim} />
         <Pressable testID="command-sheet-scrim" accessible={false} onPress={onClose} style={StyleSheet.absoluteFill} />
-        <View style={s.sheet}>
+        <View testID="command-sheet-body" accessibilityViewIsModal style={s.sheet}>
           <View style={s.head}>
             <Text accessibilityRole="header" style={s.heading}>
               {title}
@@ -89,8 +89,10 @@ export const FreshConfirm = memo(function FreshConfirm({ offline, onStart, onCan
       <View style={s.root}>
         <View style={s.scrim} />
         <Pressable testID="fresh-confirm-scrim" accessible={false} onPress={onCancel} style={StyleSheet.absoluteFill} />
-        <View style={s.sheet}>
-          <Text style={s.question}>{FRESH_QUESTION}</Text>
+        <View testID="fresh-confirm-sheet" accessibilityViewIsModal style={s.sheet}>
+          <Text accessibilityRole="header" style={s.question}>
+            {FRESH_QUESTION}
+          </Text>
           <View style={s.buttons}>
             <Button label="Cancel" onPress={onCancel} />
             <Button label="Start fresh" variant="accent" onPress={onStart} disabled={offline} />

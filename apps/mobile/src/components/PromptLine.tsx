@@ -3,7 +3,7 @@ import { Pressable, StyleSheet, Text, TextInput, View, type NativeSyntheticEvent
 
 import { requestMenu } from "../convoMenu";
 import { lightTap } from "../haptics";
-import type { Engine, Mode, Phase } from "../protocol";
+import type { CommandName, Engine, Mode, Phase } from "../protocol";
 import { shortId } from "../session";
 import { octetStore, useDraft, useSent } from "../store";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
@@ -36,6 +36,14 @@ export const PROMPT_LINES = 4;
 /** The field's room above and below its text: one line of it is 44 pt tall. */
 export const PROMPT_PAD = 12;
 export const PROMPT_MAX_HEIGHT = PROMPT_LINES * type.body.lineHeight + 2 * PROMPT_PAD;
+
+/** The hub's `command` name of each slash row that runs a desk handler (/new, which asks first,
+ * goes through `startFresh`). */
+const DESK_COMMAND = {
+  "/session": "session",
+  "/export": "export",
+  "/help": "help",
+} as const satisfies Readonly<Partial<Record<SlashCommand["cmd"], CommandName>>>;
 
 /** The modes ⇧tab and /mode cycle through. Full access is never among them: it has its own
  * guarded flow in the ▾ menu. */
@@ -297,9 +305,12 @@ export const PromptLine = memo(function PromptLine({
         case "/new":
           setAsking(true); // nothing goes until the user says Start fresh
           return;
-        default: {
+        case "/session":
+        case "/export":
+        case "/help": {
           const ran = shown.current;
-          runDesk(cmd.slice(1) as "session" | "export" | "help", () => setText((current) => (current === ran ? "" : current)));
+          runDesk(DESK_COMMAND[cmd], () => setText((current) => (current === ran ? "" : current)));
+          return;
         }
       }
     },

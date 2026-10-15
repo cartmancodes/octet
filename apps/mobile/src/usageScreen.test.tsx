@@ -31,6 +31,13 @@ const ev = (event: JournalEvent, session = SESSION, journal = "a-2.jsonl") => ({
 async function feed(_rig: Rig, ...frames: object[]) {
   await act(async () => void octetStore.getState().applyBatch(frames.map((f) => ({ v: 1, ...f })) as BatchItem[]));
 }
+/** Frames over the socket, as the Mac sends them: the client must be subscribed to deliver them. */
+async function socketFeed({ sockets, clock }: Rig, ...frames: object[]) {
+  await act(async () => {
+    for (const frame of frames) sockets.last.receive(frame);
+    clock.advance(50);
+  });
+}
 const subscribed = (journals: string[] = ["a-1.jsonl", "a-2.jsonl"], session = SESSION) => ({ type: "subscribed", session, from: "start", journals });
 
 const A = (extra: Partial<SessionInfo> = {}) => info("a1b2c3d4", { workspace: "/Users/me/Projects/octet", last_activity: 1_000, ...extra });
@@ -99,7 +106,7 @@ describe("This session", () => {
     expect(screen.getByText("This session")).toBeTruthy();
     for (const label of ["ENGINE", "USAGE", "TURNS", "JOURNAL"]) expect(screen.getByText(label)).toBeTruthy();
     expect(screen.getByText("claude")).toBeTruthy();
-    expect(screen.getByText("5h 20% · week 4%")).toBeTruthy();
+    expect(within(screen.getByTestId("this-session")).getByText("5h 20% · week 4%")).toBeTruthy();
     expect(screen.queryByText("5h 12% · week 3%")).toBeNull();
     expect(screen.getByText("2")).toBeTruthy();
     expect(screen.getByText("a-2.jsonl")).toBeTruthy();
@@ -140,13 +147,92 @@ describe("This session", () => {
   it("draws hub text as plain text only", async () => {
     const rig = await open([A()]);
     await feed(rig, subscribed(["<b>x</b>.jsonl"]), ev({ type: "usage", data: "\u001b[31m5h\u001b[0m <i>12%</i> [a](http://evil.example)\u0007" }, SESSION, "<b>x</b>.jsonl"));
-    expect(screen.getByText("5h <i>12%</i> [a](http://evil.example)")).toBeTruthy();
+    expect(within(screen.getByTestId("this-session")).getByText("5h <i>12%</i> [a](http://evil.example)")).toBeTruthy();
+    expect(within(screen.getByTestId("today")).getByText("octet 5h <i>12%</i> [a](http://evil.example)")).toBeTruthy();
     expect(screen.getByText("<b>x</b>.jsonl")).toBeTruthy();
     expect(screen.queryByRole("link")).toBeNull();
   });
 });
 
+describe("This session: who", () => {
+  it("shows the full session id (selectable) and the workspace", async () => {
+    await open([A({ workspace: "/Users/me/Projects/octet" })]);
+    const card = within(screen.getByTestId("this-session"));
+    for (const label of ["SESSION", "WORKSPACE"]) expect(card.getByText(label)).toBeTruthy();
+    const id = card.getByText(SESSION);
+    expect(id.props.selectable).toBe(true);
+    expect(card.getByText("/Users/me/Projects/octet").props.selectable).toBe(true);
+  });
+
+  it("a session that is not in the list shows its id and says the rest is unknown", async () => {
+    await open([info("other")]);
+    const card = within(screen.getByTestId("this-session"));
+    expect(card.getByText(SESSION)).toBeTruthy();
+    expect(card.getByText("Not listed")).toBeTruthy();
+    expect(screen.getByText("Session · a1b2c3")).toBeTruthy();
+    for (const name of ["Export journal /export", "Fresh context /new"]) {
+      expect(screen.getByRole("button", { name }).props.accessibilityState?.disabled).toBe(true);
+    }
+  });
+
+  it("an ended session keeps the workspace it had, from the list or from the route", async () => {
+    const rig = await open([A({ workspace: "/Users/me/Projects/octet" })]);
+    await hear(rig, [info("other")]);
+    expect(within(screen.getByTestId("this-session")).getByText("/Users/me/Projects/octet")).toBeTruthy();
+    expect(screen.getByText("octet · a1b2c3")).toBeTruthy();
+  });
+
+  it("takes the workspace from the route when the row is already gone, as plain text", async () => {
+    seq = 0;
+    await launch("/", { usage: Usage }, [info("other")]);
+    await act(async () => router.push({ pathname: "/usage", params: { id: SESSION, workspace: "/w/<b>octet</b>\u001b[2J" } }));
+    await flush();
+    expect(within(screen.getByTestId("this-session")).getByText("/w/<b>octet</b>")).toBeTruthy();
+  });
+});
+
+describe("live", () => {
+  it("watches the session while it is in front: subscribe on focus, unsubscribe on blur", async () => {
+    const rig = await open();
+    expect(rig.sockets.last.commandsOf("subscribe")).toEqual([expect.objectContaining({ session: SESSION })]);
+    expect(rig.sockets.last.commandsOf("unsubscribe")).toEqual([]);
+    await press("Back");
+    expect(rig.sockets.last.commandsOf("unsubscribe")).toEqual([expect.objectContaining({ session: SESSION })]);
+  });
+
+  it("USAGE and TURNS follow the frames the Mac sends while it is open", async () => {
+    const rig = await open();
+    const frame = (event: JournalEvent) => ({ type: "event", session: SESSION, journal: "a-1.jsonl", seq: ++seq, event });
+    await socketFeed(rig,
+      { type: "subscribed", session: SESSION, from: "start", journals: ["a-1.jsonl"] },
+      frame({ type: "usage", data: "5h 12%" }),
+      frame({ type: "finished", data: "completed" }),
+    );
+    const card = within(screen.getByTestId("this-session"));
+    expect(card.getByText("5h 12%")).toBeTruthy();
+    expect(card.getByText("1")).toBeTruthy();
+    await socketFeed(rig, frame({ type: "usage", data: "5h 15%" }), frame({ type: "finished", data: "completed" }));
+    expect(card.getByText("5h 15%")).toBeTruthy();
+    expect(card.getByText("2")).toBeTruthy();
+    expect(card.getByText("a-1.jsonl")).toBeTruthy();
+  });
+
+  it("does not subscribe a session the list no longer holds", async () => {
+    const rig = await open([info("other")]);
+    expect(rig.sockets.last.commandsOf("subscribe")).toEqual([]);
+  });
+});
+
 describe("Today", () => {
+  it("uses the view's usage for this session, and lists it though its row reports none", async () => {
+    const rig = await open([A({ usage: "old row usage", last_activity: 500 }), info("other", { workspace: "/w/other", usage: "5h 1%", last_activity: 100 })]);
+    await feed(rig, subscribed(), ev({ type: "usage", data: "fresh view usage" }));
+    const lines = within(screen.getByTestId("today")).getAllByTestId("today-line").map(textOf);
+    expect(lines).toEqual(["octet fresh view usage", "other 5h 1%"]);
+    await hear(rig, [A({ usage: null, last_activity: 500 }), info("other", { workspace: "/w/other", usage: "5h 1%", last_activity: 100 })]);
+    expect(within(screen.getByTestId("today")).getAllByTestId("today-line").map(textOf)).toEqual(["octet fresh view usage", "other 5h 1%"]);
+  });
+
   it("lists each session's usage line by most recent activity, '<name> <usage>'", async () => {
     await open([
       info("old", { workspace: "/w/old", usage: "5h 1%", last_activity: 100 }),

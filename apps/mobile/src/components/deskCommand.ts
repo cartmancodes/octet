@@ -4,6 +4,7 @@ import { useCallback, useState } from "react";
 
 import type { CommandName } from "../protocol";
 import { field } from "../model/text";
+import { octetStore } from "../store";
 import { showToast } from "../toast";
 import { useAction, type Action, type Send } from "./send";
 
@@ -19,6 +20,11 @@ export function ackText(ack: unknown): string {
   const message = typeof ack === "object" && ack !== null ? (ack as { message?: unknown }).message : undefined;
   return field(message, ACK_CHARS).trimEnd();
 }
+
+/** The divider /new leaves in the transcript. The session keeps its id and the hub replays its
+ * journals from the first, so the earlier conversation stays on screen: this marks where the new
+ * one begins, and the new journal's records land below it. */
+export const FRESH_NOTE = "Fresh conversation — the earlier one is above.";
 
 /** What /session and /help open: a title and the ack's text. */
 export interface SheetInfo {
@@ -41,7 +47,17 @@ export interface DeskCommand {
 
 /** The desk's commands for `session`, one at a time. */
 export function useDeskCommand(session: string, send: Send): DeskCommand {
-  const action = useAction(send);
+  // The fresh-start divider is the Mac's doing as soon as it acks, whether or not this screen is
+  // still there to see it.
+  const marking = useCallback<Send>(
+    (body) =>
+      send(body).then((ack) => {
+        if (body.type === "command" && body.name === "new") octetStore.getState().addNote(session, FRESH_NOTE);
+        return ack;
+      }),
+    [send, session],
+  );
+  const action = useAction(marking);
   const { run: sendBody } = action;
   const [sheet, setSheet] = useState<SheetInfo | null>(null);
   const run = useCallback(

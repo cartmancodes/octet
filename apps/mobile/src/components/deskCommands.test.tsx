@@ -12,6 +12,7 @@ import { octetStore } from "../store";
 import { toastStore, hideToast } from "../toast";
 import { approval, controls, disabled, flush, input, rig, settle } from "./controlsRig";
 import { FRESH_QUESTION } from "./CommandSheet";
+import { FRESH_NOTE } from "./deskCommand";
 
 const row = (cmd: string) => screen.getByRole("button", { name: new RegExp(`^${cmd}, `) });
 const submit = () => fireEvent(input(), "submitEditing");
@@ -92,6 +93,58 @@ describe("/new", () => {
     expect(screen.getByText("A turn is running; wait or cancel it first")).toBeTruthy();
     expect(input().props.value).toBe("/new");
     expect(button("Try again")).toBeNull();
+  });
+});
+
+describe("/new marks the fresh start", () => {
+  const hold = () =>
+    octetStore.getState().applyBatch([
+      { v: 1, type: "subscribed", session: "s", from: "start", journals: ["j1"] },
+      { v: 1, type: "event", session: "s", journal: "j1", seq: 1, event: { type: "user", data: "old question" } },
+    ]);
+  const notes = () => (octetStore.getState().bySession.get("s")?.transcript.entries ?? []).filter((e) => e.kind === "note");
+
+  it("adds one divider to the session's transcript on the ack, and new events land below it", async () => {
+    expect(FRESH_NOTE).toBe("Fresh conversation — the earlier one is above.");
+    hold();
+    const r = rig();
+    await render(controls(r.send));
+    await type("/new");
+    await fireEvent.press(row("/new"));
+    await fireEvent.press(button("Start fresh") as never);
+    expect(notes()).toHaveLength(0); // nothing until the Mac took it
+    r.waiting[0]?.resolve({ message: "Starting a fresh conversation" });
+    await flush();
+    expect(notes()).toEqual([expect.objectContaining({ text: FRESH_NOTE })]);
+    octetStore.getState().applyBatch([{ v: 1, type: "event", session: "s", journal: "j2", seq: 1, event: { type: "user", data: "new question" } }]);
+    const kinds = (octetStore.getState().bySession.get("s")?.transcript.entries ?? []).map((e) => ("text" in e ? e.text : ""));
+    expect(kinds).toEqual(["old question", FRESH_NOTE, "new question"]);
+  });
+
+  it("a refused /new, and the other commands, add none", async () => {
+    hold();
+    const r = rig();
+    await render(controls(r.send));
+    await type("/new");
+    await fireEvent.press(row("/new"));
+    await fireEvent.press(button("Start fresh") as never);
+    r.waiting[0]?.reject(new Refusal("turn_open", "A turn is running"));
+    await flush();
+    await type("/export");
+    await submit();
+    r.waiting[1]?.resolve({ message: "Exported" });
+    await flush();
+    expect(notes()).toHaveLength(0);
+  });
+});
+
+describe("the /new ask for a screen reader", () => {
+  it("has its question as a header, and the sheet is modal", async () => {
+    await render(controls(rig().send));
+    await type("/new");
+    await fireEvent.press(row("/new"));
+    expect(screen.getByRole("header", { name: FRESH_QUESTION })).toBeTruthy();
+    expect(within(screen.getByTestId("fresh-confirm")).getByTestId("fresh-confirm-sheet").props.accessibilityViewIsModal).toBe(true);
   });
 });
 

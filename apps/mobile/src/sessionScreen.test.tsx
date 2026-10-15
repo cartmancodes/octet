@@ -411,6 +411,54 @@ describe("the Session screen", () => {
       expect(rig.view.getPathname()).toBe("/session/a");
     });
 
+    it("⋯ pressed twice in one frame opens Usage once", async () => {
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      const more = screen.getByRole("button", { name: "Usage" });
+      await act(async () => {
+        fireEvent.press(more);
+        fireEvent.press(more);
+      });
+      expect(rig.view.getPathname()).toBe("/usage");
+      await fireEvent.press(screen.getByRole("button", { name: "Back" }));
+      expect(rig.view.getPathname()).toBe("/session/a");
+    });
+
+    it("⋯ passes the workspace on, and the conversation keeps streaming under Usage", async () => {
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), ev({ type: "usage", data: "5h 1%" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Usage" }));
+      expect(rig.view.getSearchParams()).toMatchObject({ id: "a", workspace: "/Users/me/Projects/a" });
+      // The Conversation let go as it left the front and Usage asks for the session: the Mac acks
+      // the unsubscribe, and the subscribe that was waiting for it goes out and resumes.
+      const handOver = async () => {
+        const unsubscribes = rig.sockets.last.commandsOf("unsubscribe");
+        await feed(rig, { type: "ack", req: unsubscribes[unsubscribes.length - 1]?.req, message: "ok" });
+        await feed(rig, { type: "subscribed", session: "a", from: "cursor", journals: ["j1"] });
+      };
+      await handOver();
+      expect(rig.sockets.last.commandsOf("subscribe")).toHaveLength(2);
+      await feed(rig, ev({ type: "usage", data: "5h 2%" }), ev({ type: "finished", data: "completed" }));
+      expect(within(screen.getByTestId("this-session")).getByText("5h 2%")).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Back" }));
+      await handOver();
+      expect(rig.sockets.last.commandsOf("subscribe")).toHaveLength(3);
+      await feed(rig, ev({ type: "user", data: "still live" }));
+      expect(screen.getByText("still live")).toBeTruthy();
+    });
+
+    it("an ended session keeps what it left while Usage is open over it", async () => {
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), ev({ type: "usage", data: "5h 9%" }));
+      await feed(rig, { type: "sessions", sessions: [info("b")] });
+      await fireEvent.press(screen.getByRole("button", { name: "Usage" }));
+      expect(within(screen.getByTestId("this-session")).getByText("5h 9%")).toBeTruthy();
+      expect(octetStore.getState().bySession.has("a")).toBe(true);
+      expect(within(screen.getByTestId("this-session")).getByText("a")).toBeTruthy();
+    });
+
     it("says Octet's version and Mac, the mode · engine / model, and the phase · workspace", async () => {
       const rig = await launch([info("a", { phase: "idle", workspace: "/Users/me/Projects/a" })]);
       await open(rig, "a");
