@@ -25,7 +25,8 @@
 //! finished turn's reply ended on a question. When the hub first sees a session they are seeded
 //! from at most the last [`SEED_BYTES`] of its newest journal (errors aside: those were before the
 //! hub looked). A journal the session moved on from keeps every fact while it is drained before
-//! the newest starts; what it gets later, read beside the newest, only counts errors. A change to
+//! the newest starts; what it gets later, read beside the newest, only counts errors. Moving on
+//! to a fresh journal drops the question, which was the old journal's. A change to
 //! them is a [`SessionUpdate::Changed`] after the records' events.
 use crate::{
     push::Snapshot,
@@ -218,7 +219,8 @@ struct Facts {
     /// The last [`REPLY_CHARS`] characters of the reply text since the last `user` record.
     reply: String,
     /// The last finished turn completed and its reply, trimmed, ended on `?`; cleared by the next
-    /// `user` record. A heuristic: the reply may ask in other words, or quote a question.
+    /// `user` record, or when the session moves on to a fresh journal. A heuristic: the reply
+    /// may ask in other words, or quote a question.
     question: bool,
 }
 
@@ -905,8 +907,9 @@ fn emit(
 /// Moves `live`'s tail to the newest of `journals`. What the old journal has left is emitted
 /// first, then every journal between whole (every earlier one when it had no tail or its journal
 /// left the list), and the tail starts the newest from its first byte. Each journal it moves on
-/// from without a `stopped` record is kept in `previous`, to be read for a while longer. Whether
-/// what it emitted changed the session's facts.
+/// from without a `stopped` record is kept in `previous`, to be read for a while longer. Once they
+/// are drained the question and the reply so far are dropped: a fresh journal (`/new`, or a
+/// `/reconnect`) has asked nothing yet. Whether the session's facts changed.
 async fn follow(
     live: &mut Live,
     journals: &[PathBuf],
@@ -940,6 +943,8 @@ async fn follow(
             live.previous.push(Previous { tail, until });
         }
     }
+    live.facts.reply.clear();
+    changed |= std::mem::replace(&mut live.facts.question, false);
     live.tail = Some(Tail::new(newest.clone()));
     changed
 }
@@ -1939,6 +1944,55 @@ mod tests {
         env.write(new, 1, "finished", &json!("completed"));
         assert_eq!(event(&next(&mut sessions).await), (new, 1));
         assert!(sessions.list()[0].get("question").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_journal_drops_the_old_question() {
+        let (old, new) = ("session-1-1.jsonl", "session-2-1.jsonl");
+        let env = Env::new();
+        env.write(old, 0, "user", &json!("Fix it"));
+        let one = env.registration(4096, &[old]);
+        let _bridge = Env::listen(&one);
+        one.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        env.write(old, 1, "text", &json!("Fixed. Shall I"));
+        until_events(&mut sessions, 1).await;
+        env.write(old, 2, "text", &json!(" push?"));
+        env.write(old, 3, "finished", &json!("completed"));
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(sessions.list()[0]["question"], true);
+        // `/new`: the old journal's last words are drained, then the question is gone.
+        env.write(old, 4, "notice", &json!("bye"));
+        env.write(new, 0, "notice", &json!("fresh"));
+        env.registration(4096, &[old, new])
+            .write(&env.run)
+            .await
+            .unwrap();
+        sessions.refresh().await;
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(event(&got[0]), (old, 4));
+        assert!(sessions.list()[0].get("question").is_none());
+        // Nor does the old reply's tail reach the fresh journal's first turn.
+        env.write(new, 1, "text", &json!("Done"));
+        env.write(new, 2, "finished", &json!("completed"));
+        until_events(&mut sessions, 3).await;
+        assert!(sessions.list()[0].get("question").is_none());
+        assert!(sessions.live[0].facts.reply.ends_with("Done"));
+        assert!(!sessions.live[0].facts.reply.contains("Shall"));
+    }
+
+    /// Waits for `count` events.
+    async fn until_events(sessions: &mut Sessions, count: usize) {
+        let mut seen = 0;
+        while seen < count {
+            if matches!(next(sessions).await, SessionUpdate::Event { .. }) {
+                seen += 1;
+            }
+        }
     }
 
     #[tokio::test]
