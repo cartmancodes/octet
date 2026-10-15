@@ -73,16 +73,19 @@ interface ConvoHeaderProps {
   /** Told when the menu or the info sheet opens and closes: what is under them must not be
    * answered meanwhile. Must be stable. */
   onCovered: (covered: boolean) => void;
+  /** ⋯ was pressed: open the Usage screen. Must be stable. */
+  onUsage: () => void;
 }
 
 /**
  * The Conversation's header: ☰ (the drawer), the session's name ▾ with "model · mode" under it
- * (the model and mode menu), Aa (the transcript's text size) and ⋯ (Session info). It reads only
+ * (the model and mode menu, which also opens Session info), Aa (the transcript's text size) and ⋯
+ * (the Usage screen). It reads only
  * the session's listed name, engine, model and mode and its catalog, so streamed output never
  * draws it again; Aa changes the size without reading it, so the header does not draw again for
  * that either.
  */
-export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live, offline, approval, phase, focused, onCovered }: ConvoHeaderProps) {
+export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live, offline, approval, phase, focused, onCovered, onUsage }: ConvoHeaderProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const head = useSessionHead(session);
@@ -134,7 +137,6 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
     setToInfo(false);
     setInfo(true);
   }, []);
-  const showInfo = useCallback(() => setInfo(true), []);
 
   // End, in Session info, for an idle session; asked first. A new phase is a new situation: a
   // half-made End means nothing now, and an End the Mac took waits for the session to leave.
@@ -189,7 +191,7 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
         <Pressable accessibilityRole="button" accessibilityLabel="Text size" onPress={cycleSize} style={s.glyph}>
           <Text style={s.aa}>Aa</Text>
         </Pressable>
-        <Pressable accessibilityRole="button" accessibilityLabel="Session info" onPress={showInfo} style={s.glyph}>
+        <Pressable accessibilityRole="button" accessibilityLabel="Usage" onPress={onUsage} style={s.glyph}>
           <Text style={s.more}>⋯</Text>
         </Pressable>
       </View>

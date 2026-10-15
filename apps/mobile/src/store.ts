@@ -463,6 +463,7 @@ export function unwatch(client: HubClient, session: string): void {
 }
 
 const NO_APPROVALS: PendingApproval[] = [];
+const NO_JOURNALS: readonly string[] = [];
 
 export interface SessionStatus {
   /** The store holds a view of it. */
@@ -544,6 +545,16 @@ export function bindHooks(store: OctetStore) {
     useHub: (): HubState => useStore(store, (s) => s.hub),
     /** How the session's last turn ended, for its mascot; null before one ends and while one runs. */
     useSessionTurn: (id: string): TurnEnd | null => useStore(store, (s) => s.bySession.get(id)?.turn ?? null),
+    /** The turns a session has finished: the `finished` records counted by its view's reducer. */
+    useTurns: (id: string): number => useStore(store, (s) => s.bySession.get(id)?.turns ?? 0),
+    /** The latest usage text of a session: the journal's, else its row's; null when neither says. */
+    useSessionUsage: (id: string): string | null =>
+      useStore(store, (s) => s.bySession.get(id)?.usage || s.sessions.find((x) => x.id === id)?.usage || null),
+    /** The journals the hub listed for a session, newest last; the same array until they change. */
+    useJournals: (id: string): readonly string[] => useStore(store, (s) => s.bySession.get(id)?.journals ?? NO_JOURNALS),
+    /** The listed sessions that report usage, in list order; each row the same object until it
+     * changes. */
+    useUsageRows: (): SessionInfo[] => useStore(store, useShallow((s) => s.sessions.filter((x) => !!x.usage))),
   };
 }
 
@@ -567,4 +578,8 @@ export const {
   useCatalogs,
   useHub,
   useSessionTurn,
+  useTurns,
+  useSessionUsage,
+  useJournals,
+  useUsageRows,
 } = bindHooks(octetStore);

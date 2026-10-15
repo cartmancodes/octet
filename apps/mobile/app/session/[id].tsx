@@ -120,6 +120,11 @@ export default function Session() {
     else router.replace("/");
   }, [router]);
 
+  // ⋯: this session's Usage, once (a second tap while it opens would stack a second copy).
+  const usage = useCallback(() => {
+    if (focused) router.push({ pathname: "/usage", params: { id } });
+  }, [focused, router, id]);
+
   // Not listed, and nothing to show: never heard of (once the list came), or refused with no
   // transcript (a deep link to an id the Mac does not have).
   const gone = info === undefined && ((listed && !status.known) || (status.failed !== null && entries.length === 0));
@@ -180,6 +185,7 @@ export default function Session() {
           phase={phase}
           focused={focused}
           onCovered={setSheetOpen}
+          onUsage={usage}
         />
         <HubBanner state={hub} announce={focused} />
         {gone ? (

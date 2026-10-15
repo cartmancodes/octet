@@ -76,6 +76,7 @@ async function launch(opts: { paired?: boolean } = {}) {
     recent: () => null,
     new: () => null,
     settings: () => null,
+    usage: () => <Text>Usage x</Text>,
   });
   await view;
   return { hub, sockets, clock, view };
@@ -95,6 +96,23 @@ describe("the app shell", () => {
     expect(sockets.all).toHaveLength(0);
   });
 
+  it("a link to Usage before pairing lands on Pair, not Usage", async () => {
+    const sockets = new Sockets();
+    const hub = new HubController({ factory: sockets.factory, store: createOctetStore(), platform: "ios" });
+    const Layout = () => (
+      <HubContext.Provider value={hub}>
+        <RootLayout />
+      </HubContext.Provider>
+    );
+    const view = renderRouter(
+      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => null, recent: () => null, new: () => null, settings: () => null, usage: () => <Text>Usage x</Text> },
+      { initialUrl: "/usage?id=x" },
+    );
+    await view;
+    expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
+    expect(screen.queryByText("Usage x")).toBeNull();
+  });
+
   it("a link to a session before pairing lands on Pair, not the session", async () => {
     const sockets = new Sockets();
     const hub = new HubController({ factory: sockets.factory, store: createOctetStore(), platform: "ios" });
@@ -104,7 +122,7 @@ describe("the app shell", () => {
       </HubContext.Provider>
     );
     const view = renderRouter(
-      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text>, recent: () => null, new: () => null, settings: () => null },
+      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text>, recent: () => null, new: () => null, settings: () => null, usage: () => <Text>Usage x</Text> },
       { initialUrl: "/session/x" },
     );
     await view;

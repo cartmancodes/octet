@@ -4,8 +4,11 @@ import { Pressable, StyleSheet, Text, TextInput, View, type NativeSyntheticEvent
 import { requestMenu } from "../convoMenu";
 import { lightTap } from "../haptics";
 import type { Engine, Mode, Phase } from "../protocol";
+import { shortId } from "../session";
 import { octetStore, useDraft, useSent } from "../store";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
+import { CommandSheet, FreshConfirm } from "./CommandSheet";
+import { useDeskCommand } from "./deskCommand";
 import { KeyBar } from "./KeyBar";
 import type { Permission } from "./PermissionCard";
 import { PROMPT_LIMIT, SLASH_NOTE, TOO_LONG, isSlash, useAction, useAlive, utf8Bytes, type Send } from "./send";
@@ -115,6 +118,9 @@ interface PromptLineProps {
   question?: boolean;
   /** The safe area under the key bar. */
   bottom: number;
+  /** Told when a sheet this line opened (a command's text, the /new ask) goes up and down: an
+   * approval under it must not be answered meanwhile. Must be stable. */
+  onCovered?: (covered: boolean) => void;
 }
 
 /**
@@ -125,7 +131,9 @@ interface PromptLineProps {
  * prompt once the deny is acked — only for the approval that was at the front when the user sent,
  * and only if no other approval is at the front by then. The text clears only when the Mac acks it, so a refusal or a lost
  * connection never costs the user their words. One command goes at a time; offline, none does.
- * A slash command other than the phone's own (/model, /mode) is the desk's, and is not sent.
+ * The phone's own slash commands are /model and /mode, and the desk's four safe ones (/new,
+ * /session, /export, /help) through the hub's `command` request; any other is the desk's alone,
+ * and is not sent.
  */
 export const PromptLine = memo(function PromptLine({
   session,
@@ -139,6 +147,7 @@ export const PromptLine = memo(function PromptLine({
   offline,
   question = false,
   bottom,
+  onCovered,
 }: PromptLineProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
@@ -149,6 +158,16 @@ export const PromptLine = memo(function PromptLine({
   const control = useAction(send);
   const { run: runPrompt, fail: failPrompt } = prompt;
   const { run: runControl } = control;
+  // The desk's commands (/new, /session, /export, /help): one at a time, like the others.
+  const desk = useDeskCommand(session, send);
+  const { run: runDesk, fail: failDesk, closeSheet } = desk;
+  // The ask before /new is up.
+  const [asking, setAsking] = useState(false);
+  const covering = asking || desk.sheet !== null;
+  useEffect(() => {
+    onCovered?.(covering);
+    return () => onCovered?.(false);
+  }, [covering, onCovered]);
   // A deny ahead of a prompt is out: the prompt waits for its ack.
   const [denying, setDenying] = useState(false);
   const denyOut = useRef(false);
@@ -198,17 +217,18 @@ export const PromptLine = memo(function PromptLine({
   const steers = running && engine === "codex";
   const matches = slashMatches(text);
   const target = matches[0] ?? null;
-  const desk = target === null && isSlash(text);
-  const busy = prompt.busy || control.busy || denying || answering;
+  const deskNote = target === null && isSlash(text);
+  const busy = prompt.busy || control.busy || desk.busy || denying || answering;
   const blank = text.trim() === "";
-  const canSend = !offline && !busy && !blank && !desk;
+  const canSend = !offline && !busy && !blank && !deskNote;
 
   const onChange = useCallback(
     (next: string) => {
       setText(next);
       failPrompt(null);
+      failDesk(null);
     },
-    [failPrompt],
+    [failPrompt, failDesk],
   );
 
   const sendText = useCallback(
@@ -259,15 +279,39 @@ export const PromptLine = memo(function PromptLine({
 
   // The slash menu's commands wait while an approval does (the keys are its) and while a command
   // is out; the words clear only when the command ran.
-  const slashOff = offline || busy || front !== null;
+  const slashOff = offline || busy || front !== null || asking;
+  // The desk's commands clear the words when the Mac acks, if they are still what was run: a
+  // refusal keeps them, with its words, and words typed meanwhile are the user's.
+  const shown = useRef(text);
+  useLayoutEffect(() => {
+    shown.current = text;
+  });
   const runSlash = useCallback(
     (cmd: SlashCommand["cmd"]) => {
       if (down.current || slashOff) return;
-      const ran = cmd === "/model" ? requestMenu(session) : cycle();
-      if (ran) setText("");
+      switch (cmd) {
+        case "/model":
+        case "/mode":
+          if (cmd === "/model" ? requestMenu(session) : cycle()) setText("");
+          return;
+        case "/new":
+          setAsking(true); // nothing goes until the user says Start fresh
+          return;
+        default: {
+          const ran = shown.current;
+          runDesk(cmd.slice(1) as "session" | "export" | "help", () => setText((current) => (current === ran ? "" : current)));
+        }
+      }
     },
-    [slashOff, session, cycle],
+    [slashOff, session, cycle, runDesk],
   );
+  const cancelFresh = useCallback(() => setAsking(false), []);
+  const startFresh = useCallback(() => {
+    setAsking(false);
+    if (down.current) return;
+    const ran = shown.current;
+    runDesk("new", () => setText((current) => (current === ran ? "" : current)));
+  }, [runDesk]);
 
   const submit = useCallback(() => {
     if (down.current || busy || blank) return;
@@ -343,16 +387,16 @@ export const PromptLine = memo(function PromptLine({
   const allow = useCallback(() => void allowFront(), [allowFront]);
   const deny = useCallback(() => void denyFront(), [denyFront]);
 
-  const values = useMemo(() => ({ "/model": model ?? "", "/mode": currentMode }), [model, currentMode]);
+  const values = useMemo(() => ({ "/model": model ?? "", "/mode": currentMode, "/session": shortId(session) }), [model, currentMode, session]);
   const sendLabel = target ? `Run ${target.cmd}` : steers ? "Steer" : running ? "Queue" : "Send";
-  const failed = prompt.failed ?? control.failed;
+  const failed = prompt.failed ?? control.failed ?? desk.failed;
   const looks = LINES.get(s) ?? lineLooks(s);
   return (
     <View>
       <SlashMenu matches={matches} values={values} disabled={slashOff} onRun={runSlash} />
-      {desk || failed || tooEarly ? (
+      {deskNote || failed || tooEarly ? (
         <View style={s.notes}>
-          {desk ? <Text style={s.note}>{SLASH_NOTE}</Text> : null}
+          {deskNote ? <Text style={s.note}>{SLASH_NOTE}</Text> : null}
           {tooEarly ? (
             <Text accessibilityLiveRegion="polite" style={s.note}>
               {JUST_APPEARED}
@@ -395,6 +439,8 @@ export const PromptLine = memo(function PromptLine({
           style={s.input}
         />
       </View>
+      {asking ? <FreshConfirm offline={offline} onStart={startFresh} onCancel={cancelFresh} /> : null}
+      {desk.sheet ? <CommandSheet title={desk.sheet.title} text={desk.sheet.text} onClose={closeSheet} /> : null}
       <KeyBar
         approval={front !== null}
         offline={offline}

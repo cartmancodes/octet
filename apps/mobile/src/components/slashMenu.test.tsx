@@ -27,16 +27,25 @@ afterEach(() => {
 });
 
 describe("the slash menu", () => {
-  it("offers /model and /mode in Phase A", () => {
+  it("offers /model, /mode and the desk's four safe commands", () => {
     expect(SLASH_COMMANDS.map((c) => [c.cmd, c.desc])).toEqual([
       ["/model", "Switch model"],
       ["/mode", "Permissions"],
+      ["/new", "Fresh context"],
+      ["/session", "Session info"],
+      ["/export", "Save journal"],
+      ["/help", "List commands"],
     ]);
   });
 
   it("matches a `/` word with no space, by prefix, an exact match first", () => {
     const cmds = (text: string) => slashMatches(text).map((c) => c.cmd);
-    expect(cmds("/")).toEqual(["/model", "/mode"]);
+    expect(cmds("/")).toEqual(["/model", "/mode", "/new", "/session", "/export", "/help"]);
+    expect(cmds("/s")).toEqual(["/session"]);
+    expect(cmds("/e")).toEqual(["/export"]);
+    expect(cmds("/h")).toEqual(["/help"]);
+    expect(cmds("/n")).toEqual(["/new"]);
+    expect(cmds("/new")).toEqual(["/new"]);
     expect(cmds("/mo")).toEqual(["/model", "/mode"]);
     expect(cmds("/mode")).toEqual(["/mode", "/model"]);
     expect(cmds("/model")).toEqual(["/model"]);

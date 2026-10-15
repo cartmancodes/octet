@@ -11,10 +11,10 @@ import type { Send } from "./send";
 /** A `send` the test settles by hand, in the order the commands went. */
 export function rig() {
   const sent: RequestBody[] = [];
-  const waiting: { resolve: () => void; reject: (e: unknown) => void }[] = [];
+  const waiting: { resolve: (ack?: unknown) => void; reject: (e: unknown) => void }[] = [];
   const send = jest.fn((body: RequestBody) => {
     sent.push(body);
-    return new Promise<unknown>((resolve, reject) => waiting.push({ resolve: () => resolve({}), reject }));
+    return new Promise<unknown>((resolve, reject) => waiting.push({ resolve: (ack: unknown = {}) => resolve(ack), reject }));
   });
   return { sent, send, waiting };
 }

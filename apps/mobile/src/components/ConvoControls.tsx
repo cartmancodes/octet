@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useState } from "react";
 import { View, type LayoutChangeEvent } from "react-native";
 
 import type { PendingApproval } from "../model/session";
@@ -50,7 +50,9 @@ export const ConvoControls = memo(function ConvoControls({
   bottom,
   onPromptLayout,
 }: ConvoControlsProps) {
-  const permission = usePermission(session, approvals, { send, offline, covered });
+  // A sheet the prompt line opened (a command's text, the /new ask) covers the approval too.
+  const [sheetUp, setSheetUp] = useState(false);
+  const permission = usePermission(session, approvals, { send, offline, covered: covered || sheetUp });
   return (
     <>
       <PermissionCard permission={permission} />
@@ -66,6 +68,7 @@ export const ConvoControls = memo(function ConvoControls({
           send={send}
           offline={offline}
           bottom={bottom}
+          onCovered={setSheetUp}
         />
       </View>
     </>

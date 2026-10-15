@@ -919,3 +919,50 @@ describe("the texts sent from this phone, for ↑", () => {
     expect(store.getState().sent.size).toBe(0);
   });
 });
+
+describe("what the Usage screen reads", () => {
+  const apply = (...frames: ToPhone[]) => act(async () => void store.getState().applyBatch(frames));
+
+  it("useTurns counts the finished records and starts over at a replay from the start", async () => {
+    const hooks = bindHooks(store);
+    const turns = await renderHook(() => hooks.useTurns("a"));
+    expect(turns.result.current).toBe(0);
+    await apply(sessions(info("a")), subscribed("a", "start"), ev("a", { type: "finished", data: "completed" }), ev("a", { type: "finished", data: "failed" }));
+    expect(turns.result.current).toBe(2);
+    await apply(subscribed("a", "start"), ev("a", { type: "finished", data: "completed" }));
+    expect(turns.result.current).toBe(1);
+  });
+
+  it("useSessionUsage is the view's latest text, else the row's, else null", async () => {
+    const hooks = bindHooks(store);
+    const usage = await renderHook(() => hooks.useSessionUsage("a"));
+    expect(usage.result.current).toBeNull();
+    await apply(sessions(info("a", { usage: "row usage" })));
+    expect(usage.result.current).toBe("row usage");
+    await apply(subscribed("a", "start"), ev("a", { type: "usage", data: "view usage" }));
+    expect(usage.result.current).toBe("view usage");
+    await apply(sessions(info("a", { usage: null })), ev("a", { type: "usage", data: "" }));
+    expect(usage.result.current).toBeNull();
+  });
+
+  it("useJournals lists the journals, newest last, and is the same array until they change", async () => {
+    const hooks = bindHooks(store);
+    const journals = await renderHook(() => hooks.useJournals("a"));
+    expect(journals.result.current).toEqual([]);
+    await apply(sessions(info("a")), { v: 1, type: "subscribed", session: "a", from: "start", journals: ["old.jsonl", "j1"] });
+    expect(journals.result.current).toEqual(["old.jsonl", "j1"]);
+    const same = journals.result.current;
+    await apply(text("a", "hi"));
+    expect(journals.result.current).toBe(same);
+  });
+
+  it("useUsageRows is the listed sessions that report usage", async () => {
+    const hooks = bindHooks(store);
+    const rows = await renderHook(() => hooks.useUsageRows());
+    await apply(sessions(info("a", { usage: "5h 12%" }), info("b"), info("c", { usage: "" }), info("d", { usage: "week 3%" })));
+    expect(rows.result.current.map((r) => r.id)).toEqual(["a", "d"]);
+    const before = rows.result.current;
+    await apply(sessions(info("a", { usage: "5h 12%" }), info("b", { phase: "running" }), info("c", { usage: "" }), info("d", { usage: "week 3%" })));
+    expect(rows.result.current).toBe(before);
+  });
+});

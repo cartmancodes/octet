@@ -68,6 +68,7 @@ async function hear(catalog: CatalogInfo | null, extra: Partial<SessionInfo> = {
 const flush = () => act(async () => void (await new Promise((resolve) => setTimeout(resolve, 0))));
 
 interface Opts {
+  onUsage?: () => void;
   live?: boolean;
   phase?: Phase;
   offline?: boolean;
@@ -86,6 +87,7 @@ const header = (r: Rig, o: Opts = {}) => (
     focused={o.focused ?? true}
     phase={o.phase}
     onCovered={o.onCovered ?? noop}
+    onUsage={o.onUsage ?? noop}
   />
 );
 const noop = () => undefined;
@@ -99,6 +101,12 @@ const title = () => screen.getByRole("button", { name: /^octet, / });
 const openMenu = async () => {
   await fireEvent.press(title());
   await flush();
+};
+/** Session info, by way of the ▾ menu, once the menu's Modal has gone. */
+const openInfo = async () => {
+  await openMenu();
+  await press("Session info, a1b2c3");
+  await act(async () => void (await new Promise((resolve) => setTimeout(resolve, MENU_DISMISS_MS + 50))));
 };
 const color = (node: { props: { style?: unknown } }): unknown =>
   (StyleSheet.flatten(node.props.style as never) as { color?: unknown } | undefined)?.color;
@@ -119,16 +127,18 @@ afterEach(() => {
 });
 
 describe("the conversation header", () => {
-  it("shows ☰, the session's name ▾ with model · mode under it, Aa and ⋯", async () => {
+  it("shows ☰, the session's name ▾ with model · mode under it, Aa and ⋯ (Usage)", async () => {
     await hear(CATALOG);
     await render(header(rig()));
     expect(screen.getByText("octet")).toBeTruthy();
     expect(screen.getByText("▾")).toBeTruthy();
     expect(screen.getByText("Sonnet · ask")).toBeTruthy();
     expect(title().props.accessibilityLabel).toBe("octet, Sonnet · ask");
-    for (const name of ["Menu", "Text size", "Session info"]) expect(button(name)).toBeTruthy();
+    for (const name of ["Menu", "Text size", "Usage"]) expect(button(name)).toBeTruthy();
+    // Session info is in the ▾ menu now, not behind ⋯.
+    expect(button("Session info")).toBeNull();
     // Each is at least 44 × 44.
-    for (const name of ["Menu", "Text size", "Session info"]) {
+    for (const name of ["Menu", "Text size", "Usage"]) {
       const style = StyleSheet.flatten(screen.getByRole("button", { name }).props.style);
       expect(style.minHeight ?? style.height).toBeGreaterThanOrEqual(44);
       expect(style.minWidth ?? style.width).toBeGreaterThanOrEqual(44);
@@ -227,12 +237,26 @@ describe("the conversation header", () => {
     });
   });
 
-  describe("⋯ Session info", () => {
+  describe("⋯ Usage", () => {
+    it("opens the Usage screen through onUsage, and nothing else", async () => {
+      await hear(CATALOG);
+      const onUsage = jest.fn();
+      const covered = jest.fn();
+      await render(header(rig(), { onUsage, onCovered: covered }));
+      expect(onUsage).not.toHaveBeenCalled();
+      await press("Usage");
+      expect(onUsage).toHaveBeenCalledTimes(1);
+      expect(screen.queryByTestId("info")).toBeNull();
+      expect(screen.queryByTestId("menu")).toBeNull();
+    });
+  });
+
+  describe("Session info, from the ▾ menu", () => {
     it("shows engine / model, the mode, the workspace and the session id, and closes", async () => {
       await hear(CATALOG);
       const covered = jest.fn();
       await render(header(rig(), { onCovered: covered }));
-      await press("Session info");
+      await openInfo();
       const sheet = within(screen.getByTestId("info"));
       expect(sheet.getByText("Session info")).toBeTruthy();
       expect(sheet.getByText("claude / Sonnet")).toBeTruthy();
@@ -260,8 +284,7 @@ describe("the conversation header", () => {
   });
 
   // Moved from the old session controls: End lives in Session info now.
-  describe("End, in ⋯ Session info", () => {
-    const openInfo = () => press("Session info");
+  describe("End, in Session info", () => {
     const disabledNow = (name: string) => screen.getByRole("button", { name }).props.accessibilityState?.disabled === true;
 
     it("shows End only when idle, and asks first", async () => {
@@ -290,8 +313,11 @@ describe("the conversation header", () => {
     it("is not offered for a session that takes no commands", async () => {
       await hear(CATALOG);
       await render(header(rig(), { phase: "idle", live: false }));
-      await openInfo();
+      // No ▾ menu, so no way to Session info (and ⋯ is Usage).
+      expect(title().props.accessibilityState?.disabled).toBe(true);
+      await press("Usage");
       expect(button("End session")).toBeNull();
+      expect(screen.queryByTestId("info")).toBeNull();
     });
 
     it("shows the refusal of an end, in fg, and the confirmation goes", async () => {

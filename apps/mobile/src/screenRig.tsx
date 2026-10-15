@@ -70,6 +70,7 @@ export async function mount(url: string, routes: Record<string, ComponentType>) 
         return <Text testID="opened">{useLocalSearchParams<{ id: string }>().id}</Text>;
       },
       recent: () => null,
+      usage: () => null,
       new: () => null,
       settings: () => null,
       ...routes,

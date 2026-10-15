@@ -10,9 +10,11 @@ import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
 import Sessions from "../app/index";
 import Session from "../app/session/[id]";
+import Usage from "../app/usage";
 import { FakeClock, Sockets } from "./client/fakes";
 import { HubContext, HubController, TOKEN_KEY } from "./hub";
 import { DRAWER_MS } from "./components/Drawer";
+import { MENU_DISMISS_MS } from "./components/ModelModeMenu";
 import { closeDrawer, openDrawer } from "./drawer";
 import { saveSettings } from "./persist";
 import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol";
@@ -77,7 +79,7 @@ async function launch(list: SessionInfo[], at?: string) {
     </HubContext.Provider>
   );
   const view = renderRouter(
-    { _layout: Layout, index: Sessions, pair: Pair, "session/[id]": Session, recent: () => null, new: () => null, settings: () => null },
+    { _layout: Layout, index: Sessions, pair: Pair, "session/[id]": Session, recent: () => null, new: () => null, settings: () => null, usage: Usage },
     at ? { initialUrl: at } : undefined,
   );
   await view;
@@ -108,6 +110,13 @@ const stateFrame = (state: Partial<StateInfo>, session = "a") => ({
   session,
   state: { phase: "running", queue: [], queued: 0, mode: "ask", approvals: [], ...state },
 });
+
+/** Session info of session "a", by way of the ▾ menu and once its Modal has gone. */
+async function openInfo() {
+  await fireEvent.press(screen.getByRole("button", { name: /^a, / }));
+  await fireEvent.press(screen.getByRole("button", { name: "Session info, a" }));
+  await act(async () => void jest.advanceTimersByTime(MENU_DISMISS_MS + 50));
+}
 
 /** Taps the card of `id` on the Inbox, on whichever tab it is, and waits for its screen. */
 async function open(rig: Rig, id: string) {
@@ -386,9 +395,20 @@ describe("the Session screen", () => {
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }), catalogFrame("auto"));
       expect(screen.getByRole("button", { name: "a, Opus · auto" })).toBeTruthy();
       expect(screen.getByRole("button", { name: "Text size" })).toBeTruthy();
-      expect(screen.getByRole("button", { name: "Session info" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Usage" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Session info" })).toBeNull();
       await fireEvent.press(screen.getByRole("button", { name: "Menu" }));
       expect(screen.getByRole("button", { name: "Close menu" })).toBeTruthy();
+    });
+
+    it("⋯ opens Usage for this session, and back returns to the conversation", async () => {
+      const rig = await launch([info("a", { usage: "5h 12%" })]);
+      await open(rig, "a");
+      await fireEvent.press(screen.getByRole("button", { name: "Usage" }));
+      expect(rig.view.getPathname()).toBe("/usage");
+      expect(screen.getByText("a · a")).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Back" }));
+      expect(rig.view.getPathname()).toBe("/session/a");
     });
 
     it("says Octet's version and Mac, the mode · engine / model, and the phase · workspace", async () => {
@@ -624,7 +644,7 @@ describe("the Session screen", () => {
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
       expect(screen.getByLabelText("Message")).toBeTruthy();
       expect(screen.getByRole("button", { name: "Cancel (esc)" }).props.accessibilityState?.disabled).toBe(true);
-      await fireEvent.press(screen.getByRole("button", { name: "Session info" }));
+      await openInfo();
       expect(screen.getByRole("button", { name: "End session" })).toBeTruthy();
       await fireEvent.press(screen.getByRole("button", { name: "Close" }));
       await feed(rig, stateFrame({ phase: "running", queued: 2 }));
@@ -638,7 +658,7 @@ describe("the Session screen", () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
-      await fireEvent.press(screen.getByRole("button", { name: "Session info" }));
+      await openInfo();
       await fireEvent.press(screen.getByRole("button", { name: "End session" }));
       expect(rig.sockets.last.commandsOf("end")).toEqual([]);
       await fireEvent.press(screen.getByRole("button", { name: "Yes, end it" }));
@@ -722,7 +742,8 @@ describe("the Session screen", () => {
       expect(screen.queryByRole("button", { name: "Allow (y)" })).toBeNull();
       expect(screen.queryByText("Run tests")).toBeNull();
       expect(screen.queryByRole("button", { name: "Allow" })).toBeNull();
-      await fireEvent.press(screen.getByRole("button", { name: "Session info" }));
+      // An ended session takes no commands: no ▾ menu, so no End; ⋯ is still Usage.
+      expect(screen.getByRole("button", { name: "Usage" })).toBeTruthy();
       expect(screen.queryByRole("button", { name: "End session" })).toBeNull();
     });
 

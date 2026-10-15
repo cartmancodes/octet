@@ -64,6 +64,9 @@ export interface SessionView {
   epoch: number;
   /** How the last turn ended; null before one ends and while the next runs. */
   turn: TurnEnd | null;
+  /** The `finished` records seen since the last replay from the start: the turns taken. Counted
+   * here, not from the entries, which the view bounds and drops from the top. */
+  turns: number;
 }
 
 export const EMPTY_VIEW: SessionView = {
@@ -83,6 +86,7 @@ export const EMPTY_VIEW: SessionView = {
   held: null,
   epoch: 0,
   turn: null,
+  turns: 0,
 };
 
 /** One change to a session's view, in the order the hub sent it. */
@@ -270,6 +274,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         draft = new TranscriptDraft(EMPTY_TRANSCRIPT);
         v.epoch += 1;
         v.turn = null;
+        v.turns = 0; // the replay brings every finished record again
         // What the latest state frame listed is still waiting; the replay fills it in or closes it.
         if (!alike(v.approvals, v.stated)) v.approvals = v.stated;
         if (v.closed.length > 0) v.closed = [];
@@ -351,6 +356,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
             own().apply(ev);
             break;
           case "finished":
+            v.turns += 1;
             v.turn = ev.data === "completed" ? "finished" : ev.data === "interrupted" ? "stopped" : "failed";
             own().apply(ev);
             break;
@@ -383,6 +389,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.replaying === view.replaying &&
     v.held === view.held &&
     v.epoch === view.epoch &&
-    v.turn === view.turn;
+    v.turn === view.turn &&
+    v.turns === view.turns;
   return same ? view : v;
 }

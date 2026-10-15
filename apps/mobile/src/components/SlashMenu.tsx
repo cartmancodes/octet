@@ -5,15 +5,20 @@ import { dark, light, radius, spacing, type, useTheme, type Theme } from "../the
 
 /** A command the phone runs itself, from the prompt line. */
 export interface SlashCommand {
-  cmd: "/model" | "/mode";
+  cmd: "/model" | "/mode" | "/new" | "/session" | "/export" | "/help";
   desc: string;
 }
 
-/** Phase A's: `/model` opens the ▾ menu, `/mode` moves to the next mode (as ⇧tab). Any other `/`
- * text is the desk's (`isSlash`), and is not sent. */
+/** `/model` opens the ▾ menu, `/mode` moves to the next mode (as ⇧tab), and `/new`, `/session`,
+ * `/export` and `/help` are the desk's own handlers, run through the hub's `command` request. Any
+ * other `/` text is the desk's alone (`isSlash`), and is not sent. */
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { cmd: "/model", desc: "Switch model" },
   { cmd: "/mode", desc: "Permissions" },
+  { cmd: "/new", desc: "Fresh context" },
+  { cmd: "/session", desc: "Session info" },
+  { cmd: "/export", desc: "Save journal" },
+  { cmd: "/help", desc: "List commands" },
 ];
 
 const NONE: readonly SlashCommand[] = [];
@@ -77,8 +82,8 @@ const rowStyle = (s: Styles, top: boolean, off: boolean) => {
 interface SlashMenuProps {
   /** `slashMatches` of the prompt's text; the first is marked ▸. */
   matches: readonly SlashCommand[];
-  /** Each command's current value: the model's name, the mode. */
-  values: Readonly<Record<SlashCommand["cmd"], string>>;
+  /** Each command's current value, where it has one: the model's name, the mode. */
+  values: Readonly<Partial<Record<SlashCommand["cmd"], string>>>;
   /** The Mac can't be reached: the rows do nothing. */
   disabled: boolean;
   /** Runs a command. Must be stable. */
@@ -93,7 +98,7 @@ export const SlashMenu = memo(function SlashMenu({ matches, values, disabled, on
   return (
     <View testID="slash-menu" style={s.menu}>
       {matches.map((c, i) => (
-        <SlashRow key={c.cmd} command={c} top={i === 0} value={values[c.cmd]} disabled={disabled} s={s} onRun={onRun} />
+        <SlashRow key={c.cmd} command={c} top={i === 0} value={values[c.cmd] ?? ""} disabled={disabled} s={s} onRun={onRun} />
       ))}
     </View>
   );

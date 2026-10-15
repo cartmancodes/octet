@@ -179,6 +179,33 @@ describe("the other records", () => {
   });
 });
 
+describe("turns", () => {
+  const finished = ev({ type: "finished", data: "completed" });
+
+  it("count the finished records, whatever else they ended with", () => {
+    const v = view([finished, ev({ type: "finished", data: "interrupted" }), ev({ type: "finished", data: "failed" })]);
+    expect(v.turns).toBe(3);
+    expect(view([finished], v).turns).toBe(4);
+  });
+
+  it("are not counted from other records, and the view keeps its identity", () => {
+    const v = view([finished]);
+    expect(view([ev({ type: "text", data: "x" }), ev({ type: "started", data: null } as never)], v).turns).toBe(1);
+    expect(view([], v)).toBe(v);
+  });
+
+  it("start over at a replay from the start, which brings them all again", () => {
+    const old = view([finished, finished, finished]);
+    const after = view([{ op: "reset" }, finished], old);
+    expect(after.turns).toBe(1);
+  });
+
+  it("are counted in the reducer: they outlast the entries the view drops", () => {
+    const many = Array.from({ length: 2_500 }, () => [ev({ type: "user", data: "q" }), finished]).flat();
+    expect(view(many).turns).toBe(2_500);
+  });
+});
+
 describe("a_reset_replaces_the_transcript", () => {
   it("drops the transcript and the approvals the replay will bring back", () => {
     const old = view([ev({ type: "user", data: "old" }), ev({ type: "text", data: "old reply" }), approval(1)]);

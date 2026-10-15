@@ -124,7 +124,7 @@ describe("the prompt line", () => {
   it("sends text that only starts like a path, and refuses a slash command even after spaces", async () => {
     const r = rig();
     await render(controls(r.send));
-    await fireEvent.changeText(input(), "  /help");
+    await fireEvent.changeText(input(), "  /compact");
     expect(screen.getByText("Slash commands run on the desk")).toBeTruthy();
     expect(disabled(sendKey())).toBe(true);
     await fireEvent.changeText(input(), "/model x");
