@@ -132,6 +132,12 @@ describe("Button", () => {
     expect([dark.accent, light.accent]).toContain(style(screen.getByRole("button", { name: "Allow once" })).borderColor);
     expect([dark.accent, light.accent]).toContain(style(screen.getByText("Allow once")).color);
   });
+
+  it("a link button has accent text and no outline", async () => {
+    await render(<Button label="Enter code instead" variant="link" onPress={jest.fn()} />);
+    expect(style(screen.getByRole("button", { name: "Enter code instead" })).borderColor).toBe("transparent");
+    expect([dark.accent, light.accent]).toContain(style(screen.getByText("Enter code instead")).color);
+  });
 });
 
 describe("Chip", () => {

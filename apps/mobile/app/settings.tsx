@@ -1,25 +1,39 @@
 import Constants from "expo-constants";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Alert, Pressable, StyleSheet, Switch, Text, View } from "react-native";
+import { memo } from "react";
+import { Alert, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { confirmBiometric } from "../src/auth";
 import { hubHost } from "../src/client/link";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
+import { openDrawer } from "../src/drawer";
 import { useHubController, useHubSnapshot } from "../src/hub";
+import { macName } from "../src/inbox";
 import { NO_PROJECT_ID, projectId } from "../src/notifications";
 import { NOT_SAVED, loadSettings, saveSettings, type Settings as Saved } from "../src/persist";
-import { radius, spacing, type, useTheme } from "../src/theme";
+import { useHub } from "../src/store";
+import { spacing, type, useTheme } from "../src/theme";
+import { Button, Card } from "../src/ui";
 
 const TURN_OFF_REASON = "Turn off Face ID for allowing";
 export const UNPAIR_TITLE = "Unpair this phone?";
 export const UNPAIR_BODY =
   "You'll need a new pairing code from the Mac. Notifications to this phone stop. The Mac keeps listing this phone until you run `octet hub revoke <name>` there.";
 
-/** This phone's settings: where it is paired, whether Allow asks for Face ID, and Unpair. */
+/** The footer's words, after the app's name and version. */
+const FOOTER = "talks to your Macs directly over your tailnet; nothing passes through a relay.";
+/** Said under "A turn finishes", which has no setting of its own until the hub tells turns apart. */
+export const TURN_NOTE = "Coming with the next hub update";
+
+/** This phone's settings: the Mac it is paired with (and Unpair), what to notify it about, and
+ * whether Allow asks for Face ID. */
 export default function Settings() {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const hub = useHubController();
+  const online = useHub() === "ready";
   const alive = useAlive();
   const [saved, setSaved] = useState<Saved | null>(null);
   const [error, setError] = useState(false);
@@ -94,6 +108,8 @@ export default function Settings() {
     [changePush],
   );
 
+  const openMenu = useCallback(() => openDrawer(), []);
+
   const unpair = useCallback(() => {
     Alert.alert(UNPAIR_TITLE, UNPAIR_BODY, [
       { text: "Cancel", style: "cancel" },
@@ -104,96 +120,122 @@ export default function Settings() {
   if (saved === null) return <View style={[styles.screen, { backgroundColor: theme.bg }]} />;
   const version = Constants.expoConfig?.version;
   const hasProject = projectId() !== null;
+  const pushOn = hasProject && saved.notifications;
   const pushWords =
     working === "on" ? "Turning on…" : working === "off" ? "Turning off…" : (pushError ?? (hasProject ? pushNotice : NO_PROJECT_ID));
+  const mac = macName(saved.hubUrl);
   return (
-    <View style={[styles.screen, { backgroundColor: theme.bg }]}>
-      <DevBuildBanner />
-      <View style={[styles.card, { backgroundColor: theme.panel, borderColor: theme.edge }]}>
-        <Line label="Mac" value={saved.hubUrl === null ? "Not paired" : hubHost(saved.hubUrl)} />
-        <Line label="This phone" value={saved.deviceName ?? hub.initialName()} />
-      </View>
-      <View style={[styles.card, { backgroundColor: theme.panel, borderColor: theme.edge }]}>
-        <View style={styles.switchRow}>
-          <Text style={[type.body, styles.grow, { color: theme.fg }]}>Face ID to allow</Text>
-          <Switch
-            accessibilityRole="switch"
-            accessibilityLabel="Face ID to allow"
-            value={saved.faceId}
-            onValueChange={flip}
-            hitSlop={HIT}
-            trackColor={{ false: theme.edge, true: theme.accent }}
-          />
-        </View>
-        <Text style={[type.caption, { color: theme.muted }]}>
-          {"Allowing an agent's request asks for Face ID. Full access always asks."}
+    <View style={[styles.screen, { backgroundColor: theme.bg, paddingTop: insets.top }]}>
+      <View style={styles.header}>
+        <Button label="☰" accessibilityLabel="Menu" variant="bare" onPress={openMenu} />
+        <Text accessibilityRole="header" style={[type.body, styles.title, { color: theme.fg }]}>
+          Settings
         </Text>
-        {error ? (
-          <View accessibilityLiveRegion="polite">
-            <Text style={[type.caption, { color: theme.fg }]}>{NOT_SAVED}</Text>
-          </View>
-        ) : null}
+        <View style={styles.spacer} />
       </View>
-      <View style={[styles.card, { backgroundColor: theme.panel, borderColor: theme.edge }]}>
-        <View style={styles.switchRow}>
-          <Text style={[type.body, styles.grow, { color: theme.fg }]}>Notifications</Text>
-          <Switch
-            accessibilityRole="switch"
-            accessibilityLabel="Notifications"
-            value={hasProject && saved.notifications}
+      <DevBuildBanner inset />
+      <ScrollView contentContainerStyle={[styles.content, { paddingBottom: Math.max(insets.bottom, spacing.lg) }]}>
+        <Card title="Machines">
+          <View style={styles.row}>
+            <Text numberOfLines={1} style={[type.body, styles.grow, { color: online ? theme.fg : theme.muted }]}>
+              <Text style={{ color: online ? theme.accent : theme.muted }}>{online ? "●" : "○"}</Text>
+              {` ${mac}`}
+            </Text>
+            <Text style={[type.body, { color: theme.muted }]}>{online ? "online" : "offline"}</Text>
+          </View>
+          <Text style={[type.label, { color: theme.muted }]}>{saved.hubUrl === null ? "Not paired" : hubHost(saved.hubUrl)}</Text>
+          <View style={[styles.row, styles.rule, { borderTopColor: theme.edge }]}>
+            <Text style={[type.body, { color: theme.muted }]}>This phone</Text>
+            <Text numberOfLines={1} style={[type.body, styles.grow, styles.right, { color: theme.fg }]}>
+              {saved.deviceName ?? hub.initialName()}
+            </Text>
+          </View>
+          <View style={styles.action}>
+            <Button label="Unpair" onPress={unpair} />
+          </View>
+        </Card>
+
+        <Card title="Notify me when">
+          <SwitchRow
+            label="An action needs approval"
+            value={pushOn}
             disabled={!hasProject || working !== null}
             onValueChange={flipPush}
-            hitSlop={HIT}
-            trackColor={{ false: theme.edge, true: theme.accent }}
           />
-        </View>
-        <Text style={[type.caption, { color: theme.muted }]}>
-          Get a notification when an agent needs your approval or finishes a turn, while the app is closed.
-        </Text>
-        {pushWords !== null ? (
-          <View accessibilityLiveRegion="polite">
-            <Text style={[type.caption, { color: theme.fg }]}>{pushWords}</Text>
-          </View>
-        ) : null}
-      </View>
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel="Unpair"
-        onPress={unpair}
-        style={[styles.button, { borderColor: theme.accent }]}
-      >
-        <Text style={[type.body, { color: theme.accent }]}>Unpair</Text>
-      </Pressable>
-      {version ? <Text style={[type.caption, styles.version, { color: theme.muted }]}>{`Version ${version}`}</Text> : null}
+          <SwitchRow label="A turn finishes" value={pushOn} disabled note={TURN_NOTE} first={false} />
+          {pushWords !== null ? (
+            <View accessibilityLiveRegion="polite" style={styles.words}>
+              <Text style={[type.caption, { color: theme.fg }]}>{pushWords}</Text>
+            </View>
+          ) : null}
+        </Card>
+
+        <Card title="Face ID to allow">
+          <SwitchRow label="Ask before allowing" accessibilityLabel="Face ID to allow" value={saved.faceId} onValueChange={flip} />
+          <Text style={[type.caption, styles.words, { color: theme.muted }]}>
+            {"Allowing an agent's request asks for Face ID. Full access always asks."}
+          </Text>
+          {error ? (
+            <View accessibilityLiveRegion="polite" style={styles.words}>
+              <Text style={[type.caption, { color: theme.fg }]}>{NOT_SAVED}</Text>
+            </View>
+          ) : null}
+        </Card>
+
+        <Text style={[type.caption, { color: theme.muted }]}>{version ? `Octet v${version} · ${FOOTER}` : `Octet · ${FOOTER}`}</Text>
+      </ScrollView>
     </View>
   );
 }
 
-function Line({ label, value }: { label: string; value: string }) {
+interface SwitchRowProps {
+  label: string;
+  /** What a screen reader says for the switch; the label when not given. */
+  accessibilityLabel?: string;
+  value: boolean;
+  disabled?: boolean;
+  /** A muted line under the label. */
+  note?: string;
+  /** Not the first row of its card: a rule above it. */
+  first?: boolean;
+  onValueChange?: (on: boolean) => void;
+}
+
+/** One row of switches: the label (and its note) on the left, the switch on the right. */
+const SwitchRow = memo(function SwitchRow({ label, accessibilityLabel, value, disabled = false, note, first = true, onValueChange }: SwitchRowProps) {
   const theme = useTheme();
   return (
-    <View style={styles.line}>
-      <Text style={[type.caption, { color: theme.muted }]}>{label}</Text>
-      <Text style={[type.body, { color: theme.fg }]}>{value}</Text>
+    <View style={[styles.switchRow, first ? null : [styles.rule, { borderTopColor: theme.edge }]]}>
+      <View style={styles.grow}>
+        <Text style={[type.body, { color: disabled ? theme.muted : theme.fg }]}>{label}</Text>
+        {note ? <Text style={[type.label, { color: theme.muted }]}>{note}</Text> : null}
+      </View>
+      <Switch
+        accessibilityRole="switch"
+        accessibilityLabel={accessibilityLabel ?? label}
+        value={value}
+        disabled={disabled}
+        onValueChange={onValueChange}
+        hitSlop={HIT}
+        trackColor={{ false: theme.edge, true: theme.accent }}
+      />
     </View>
   );
-}
+});
 
 const HIT = { top: 8, bottom: 8, left: 8, right: 8 } as const;
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, padding: spacing.lg, gap: spacing.lg },
-  card: { padding: spacing.lg, gap: spacing.md, borderRadius: radius.md, borderWidth: StyleSheet.hairlineWidth },
-  line: { gap: 2 },
-  switchRow: { flexDirection: "row", alignItems: "center", gap: spacing.md, minHeight: 44 },
+  screen: { flex: 1 },
+  header: { flexDirection: "row", alignItems: "center", gap: spacing.xs, paddingHorizontal: spacing.sm, paddingBottom: spacing.md },
+  title: { flex: 1, textAlign: "center", fontWeight: "700" },
+  spacer: { width: 44 },
+  content: { paddingHorizontal: 20, paddingTop: spacing.lg, gap: spacing.xl },
+  row: { minHeight: 44, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: spacing.md },
+  rule: { borderTopWidth: 1 },
+  right: { textAlign: "right" },
+  action: { alignItems: "flex-start", paddingVertical: spacing.sm },
+  switchRow: { minHeight: 52, flexDirection: "row", alignItems: "center", gap: spacing.md },
   grow: { flex: 1 },
-  button: {
-    minHeight: 44,
-    minWidth: 44,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: radius.md,
-    borderWidth: 1,
-  },
-  version: { textAlign: "center" },
+  words: { paddingBottom: spacing.sm },
 });

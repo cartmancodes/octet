@@ -5,6 +5,7 @@ import * as SystemUI from "expo-system-ui";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { AppState, View } from "react-native";
 
+import { ApprovalToasts } from "../src/components/ApprovalToasts";
 import { Drawer, DrawerHost } from "../src/components/Drawer";
 import { closeDrawer, drawerScreen, setDrawerEnabled } from "../src/drawer";
 import { useHubController, useHubSnapshot } from "../src/hub";
@@ -119,7 +120,7 @@ export default function RootLayout() {
             <Stack.Screen name="session/[id]" options={{ title: "Session", headerShown: false, ...OWN_EDGE }} />
             <Stack.Screen name="new" options={{ title: "New session", headerShown: false }} />
             <Stack.Screen name="recent" options={{ title: "Resume a session" }} />
-            <Stack.Screen name="settings" options={{ title: "Settings", ...OWN_EDGE }} />
+            <Stack.Screen name="settings" options={{ title: "Settings", headerShown: false, ...OWN_EDGE }} />
           </Stack.Protected>
           <Stack.Protected guard={!paired || offer}>
             <Stack.Screen name="pair" options={{ title: "Pair", headerShown: false }} />
@@ -127,6 +128,7 @@ export default function RootLayout() {
         </Stack>
       </DrawerHost>
       <ToastHost />
+      {paired && !offer ? <ApprovalToasts /> : null}
       {paired && !offer ? <Drawer /> : null}
     </>
   );

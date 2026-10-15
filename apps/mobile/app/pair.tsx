@@ -1,24 +1,34 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { hubHost, pairLinkProblem, parsePairLink } from "../src/client/link";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { NOT_A_LINK, useHubController, useHubSnapshot } from "../src/hub";
+import { macName } from "../src/inbox";
 import { Mascot } from "../src/mascot/Mascot";
+import { loadSettings } from "../src/persist";
 import { radius, spacing, type, useTheme } from "../src/theme";
+import { showToast } from "../src/toast";
+import { Button } from "../src/ui";
 
 const QR_ONLY = { barcodeTypes: ["qr" as const] };
 /** The Mac refuses a name over 64 characters. */
 const NAME_CHARS = 64;
+/** The scan frame, and its corner brackets, in points. */
+const FRAME = 240;
+const CORNER = 36;
+const CORNER_LINE = 3;
 
-/** Pairing: scan the QR code the Mac shows, or paste its link. The hub's refusals and every
+/** Pairing: scan the QR code the Mac shows, or enter its link. The hub's refusals and every
  * failure are shown as plain text. */
 export default function Pair() {
   const theme = useTheme();
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const hub = useHubController();
   const { notice, offer } = useHubSnapshot();
   const [permission, requestPermission] = useCameraPermissions();
@@ -26,6 +36,10 @@ export default function Pair() {
   const [name, setName] = useState(() => hub.initialName());
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // "Enter code instead" was pressed, or a scan or paste filled the link: the paste and name fields show.
+  const [entering, setEntering] = useState(false);
+  // The Mac this phone was paired with before, when it pairs again.
+  const [before, setBefore] = useState<string | null>(null);
   const attempting = useRef(false);
   const lastScan = useRef<string | null>(null);
 
@@ -34,6 +48,14 @@ export default function Pair() {
     // Asked once, when the screen shows and the permission is still undetermined.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permission?.status]);
+
+  useEffect(() => {
+    let live = true;
+    void loadSettings().then((s) => live && setBefore(s.hubUrl === null ? null : macName(s.hubUrl)));
+    return () => {
+      live = false;
+    };
+  }, []);
 
   const parsed = useMemo(() => parsePairLink(link), [link]);
   const pasted = link.trim() !== "";
@@ -47,6 +69,7 @@ export default function Pair() {
     try {
       const result = await hub.pair(link, name);
       if (result.ok) {
+        showToast(`Paired with ${macName(parsed.url)}`);
         // With a notifications step to show, Pair stays up until the user answers it.
         if (!hub.snapshot().offer) router.replace("/");
         return;
@@ -76,12 +99,14 @@ export default function Pair() {
       return;
     }
     setError(null);
+    setEntering(true);
     setLink(data);
   }, []);
 
   const onLink = useCallback((text: string) => {
     lastScan.current = null;
     setError(null);
+    setEntering(true);
     setLink(text);
   }, []);
 
@@ -91,99 +116,122 @@ export default function Pair() {
     setLink("");
   }, []);
 
+  const onEnter = useCallback(() => setEntering(true), []);
+
   if (offer) return <NotificationsStep />;
 
   const cameraOn = permission?.granted === true;
   const cameraOff = permission !== null && !permission.granted && !permission.canAskAgain;
+  // The fields show once asked for (or once a scan or a paste filled the link), and stay; with no camera they are all there is.
+  const fields = entering || cameraOff;
   const field = [styles.field, { color: theme.fg, backgroundColor: theme.panel, borderColor: theme.edge }];
+  const corner = { borderColor: theme.accent };
 
   return (
-    <KeyboardAvoidingView style={{ flex: 1, backgroundColor: theme.bg }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
-      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-        <DevBuildBanner />
-        <Mascot pose="idle" size={118} />
-        <Text accessibilityRole="header" style={[type.display, { color: theme.fg }]}>
-          Pair with your Mac
-        </Text>
-        <Text style={[type.body, { color: theme.muted }]}>
-          On your Mac, run /remote-control pair, then scan the code or paste its link.
+    <KeyboardAvoidingView style={{ flex: 1, backgroundColor: theme.panel }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <ScrollView
+        contentContainerStyle={[styles.content, { paddingTop: insets.top }]}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+      >
+        <DevBuildBanner inset />
+        <Text accessibilityRole="header" style={[type.body, styles.heading, { color: theme.fg }]}>
+          {"Scan the code from "}
+          <Text style={styles.bold}>octet pair</Text>
         </Text>
 
-        {notice !== null && (
-          <Text accessibilityRole="alert" style={[type.body, { color: theme.amber }]}>
-            {notice}
-          </Text>
-        )}
-
-        {cameraOn && (
-          <View style={[styles.camera, { borderColor: theme.edge }]}>
-            <CameraView
-              style={StyleSheet.absoluteFill}
-              facing="back"
-              barcodeScannerSettings={QR_ONLY}
-              onBarcodeScanned={busy ? undefined : onScan}
-              accessibilityLabel="Camera for the pairing code"
-            />
+        <View style={styles.scan}>
+          <View testID="scan-frame" style={styles.frame}>
+            {cameraOn && (
+              <CameraView
+                style={StyleSheet.absoluteFill}
+                facing="back"
+                barcodeScannerSettings={QR_ONLY}
+                onBarcodeScanned={busy ? undefined : onScan}
+                accessibilityLabel="Camera for the pairing code"
+              />
+            )}
+            {cameraOff && (
+              <Text style={[type.body, styles.off, { color: theme.muted }]}>Camera access is off — paste the link instead</Text>
+            )}
+            <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+              <View testID="scan-corner-tl" style={[styles.corner, styles.tl, corner]} />
+              <View testID="scan-corner-tr" style={[styles.corner, styles.tr, corner]} />
+              <View testID="scan-corner-bl" style={[styles.corner, styles.bl, corner]} />
+              <View testID="scan-corner-br" style={[styles.corner, styles.br, corner]} />
+            </View>
           </View>
-        )}
-        {cameraOff && (
-          <Text style={[type.body, { color: theme.muted }]}>Camera access is off — paste the link instead</Text>
-        )}
+        </View>
 
-        <Text style={[type.caption, { color: theme.muted }]}>Paste link</Text>
-        <TextInput
-          style={field}
-          value={link}
-          onChangeText={onLink}
-          placeholder="https://…#pair=…"
-          placeholderTextColor={theme.muted}
-          autoCapitalize="none"
-          autoCorrect={false}
-          spellCheck={false}
-          keyboardType="url"
-          accessibilityLabel="Pairing link"
-        />
-
-        <Text style={[type.caption, { color: theme.muted }]}>Device name</Text>
-        <TextInput
-          style={field}
-          value={name}
-          onChangeText={setName}
-          maxLength={NAME_CHARS}
-          autoCorrect={false}
-          accessibilityLabel="Device name"
-        />
-
-        {parsed !== null && (
-          <Text style={[type.title, { color: theme.fg }]}>{`Pair with ${hubHost(parsed.url)}?`}</Text>
-        )}
-
-        {shownError !== null && (
-          <Text accessibilityRole="alert" style={[type.body, { color: theme.accent }]}>
-            {shownError}
-          </Text>
-        )}
-
-        <Pressable
-          onPress={onPair}
-          disabled={busy || parsed === null}
-          accessibilityRole="button"
-          accessibilityLabel="Pair"
-          accessibilityState={{ disabled: busy || parsed === null, busy }}
-          style={[styles.button, { backgroundColor: theme.accent, opacity: busy || parsed === null ? 0.5 : 1 }]}
+        <View
+          style={[
+            styles.sheet,
+            { backgroundColor: theme.bg, borderColor: theme.edge, paddingBottom: Math.max(insets.bottom, spacing.lg) + spacing.lg },
+          ]}
         >
-          <Text style={[type.body, { color: theme.bg, fontWeight: "600" }]}>{busy ? "Pairing…" : "Pair"}</Text>
-        </Pressable>
-        {pasted && !busy && (
-          <Pressable
-            onPress={onCancel}
-            accessibilityRole="button"
-            accessibilityLabel="Cancel"
-            style={[styles.button, { borderColor: theme.edge, borderWidth: 1 }]}
-          >
-            <Text style={[type.body, { color: theme.fg }]}>Cancel</Text>
-          </Pressable>
-        )}
+          <Text style={[type.label, { color: theme.muted }]}>PAIRED</Text>
+          <View style={styles.mac}>
+            <Text style={[type.body, { color: before === null ? theme.muted : theme.fg }]}>{before === null ? "No Mac yet" : `○ ${before}`}</Text>
+          </View>
+
+          {notice !== null && (
+            <Text accessibilityRole="alert" style={[type.body, { color: theme.amber }]}>
+              {notice}
+            </Text>
+          )}
+
+          {fields ? (
+            <>
+              <Text style={[type.label, { color: theme.muted }]}>Paste link</Text>
+              <TextInput
+                style={field}
+                value={link}
+                onChangeText={onLink}
+                placeholder="https://…#pair=…"
+                placeholderTextColor={theme.muted}
+                autoCapitalize="none"
+                autoCorrect={false}
+                spellCheck={false}
+                keyboardType="url"
+                accessibilityLabel="Pairing link"
+              />
+
+              <Text style={[type.label, { color: theme.muted }]}>Device name</Text>
+              <TextInput
+                style={field}
+                value={name}
+                onChangeText={setName}
+                maxLength={NAME_CHARS}
+                autoCorrect={false}
+                accessibilityLabel="Device name"
+              />
+
+              {parsed !== null && <Text style={[type.title, { color: theme.fg }]}>{`Pair with ${hubHost(parsed.url)}?`}</Text>}
+            </>
+          ) : null}
+
+          {shownError !== null && (
+            <Text accessibilityRole="alert" style={[type.body, { color: theme.amber }]}>
+              {shownError}
+            </Text>
+          )}
+
+          {fields ? (
+            <>
+              <Button
+                label={busy ? "Pairing…" : "Pair"}
+                accessibilityLabel="Pair"
+                variant="primary"
+                onPress={onPair}
+                disabled={busy || parsed === null}
+                busy={busy}
+              />
+              {pasted && !busy && <Button label="Cancel" onPress={onCancel} />}
+            </>
+          ) : (
+            <Button label="Enter code instead" variant="link" onPress={onEnter} style={styles.enter} />
+          )}
+        </View>
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -223,7 +271,7 @@ function NotificationsStep() {
   const onTurnOn = useCallback(() => void turnOn(), [turnOn]);
 
   return (
-    <View style={[styles.content, { flex: 1, backgroundColor: theme.bg }]}>
+    <View style={[styles.step, { flex: 1, backgroundColor: theme.bg }]}>
       <Mascot pose="idle" size={118} />
       <Text accessibilityRole="header" style={[type.display, { color: theme.fg }]}>
         Paired
@@ -232,37 +280,45 @@ function NotificationsStep() {
         Get a notification when an agent needs your approval or finishes a turn, while the app is closed.
       </Text>
       {error !== null && (
-        <Text accessibilityRole="alert" style={[type.body, { color: theme.accent }]}>
+        <Text accessibilityRole="alert" style={[type.body, { color: theme.amber }]}>
           {error}
         </Text>
       )}
-      <Pressable
+      <Button
+        label={busy ? "Turning on…" : "Turn on notifications"}
+        accessibilityLabel="Turn on notifications"
+        variant="primary"
         onPress={onTurnOn}
         disabled={busy}
-        accessibilityRole="button"
-        accessibilityLabel="Turn on notifications"
-        accessibilityState={{ disabled: busy, busy }}
-        style={[styles.button, { backgroundColor: theme.accent, opacity: busy ? 0.5 : 1 }]}
-      >
-        <Text style={[type.body, { color: theme.bg, fontWeight: "600" }]}>
-          {busy ? "Turning on…" : "Turn on notifications"}
-        </Text>
-      </Pressable>
-      <Pressable
-        onPress={leave}
-        accessibilityRole="button"
-        accessibilityLabel="Not now"
-        style={[styles.button, { borderColor: theme.edge, borderWidth: 1 }]}
-      >
-        <Text style={[type.body, { color: theme.fg }]}>Not now</Text>
-      </Pressable>
+        busy={busy}
+      />
+      <Button label="Not now" onPress={leave} />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  content: { padding: spacing.lg, gap: spacing.md, paddingTop: spacing.xxl },
-  camera: { height: 280, borderRadius: radius.lg, borderWidth: 1, overflow: "hidden" },
-  field: { minHeight: 44, borderWidth: 1, borderRadius: radius.md, paddingHorizontal: spacing.md, fontSize: 16 },
-  button: { minHeight: 48, borderRadius: radius.md, alignItems: "center", justifyContent: "center" },
+  content: { flexGrow: 1 },
+  heading: { paddingHorizontal: spacing.xl, paddingVertical: spacing.sm },
+  bold: { fontWeight: "700" },
+  scan: { flex: 1, minHeight: FRAME + 2 * spacing.xl, alignItems: "center", justifyContent: "center" },
+  frame: { width: FRAME, height: FRAME, borderRadius: radius.card, overflow: "hidden", alignItems: "center", justifyContent: "center" },
+  off: { textAlign: "center", paddingHorizontal: spacing.xl },
+  corner: { position: "absolute", width: CORNER, height: CORNER },
+  tl: { left: 0, top: 0, borderLeftWidth: CORNER_LINE, borderTopWidth: CORNER_LINE, borderTopLeftRadius: radius.card },
+  tr: { right: 0, top: 0, borderRightWidth: CORNER_LINE, borderTopWidth: CORNER_LINE, borderTopRightRadius: radius.card },
+  bl: { left: 0, bottom: 0, borderLeftWidth: CORNER_LINE, borderBottomWidth: CORNER_LINE, borderBottomLeftRadius: radius.card },
+  br: { right: 0, bottom: 0, borderRightWidth: CORNER_LINE, borderBottomWidth: CORNER_LINE, borderBottomRightRadius: radius.card },
+  sheet: {
+    borderTopWidth: 1,
+    borderTopLeftRadius: radius.card,
+    borderTopRightRadius: radius.card,
+    paddingHorizontal: spacing.xl,
+    paddingTop: spacing.lg,
+    gap: spacing.sm,
+  },
+  mac: { minHeight: 44, justifyContent: "center" },
+  enter: { alignSelf: "flex-start", paddingHorizontal: 0 },
+  field: { minHeight: 44, borderWidth: 1, borderRadius: radius.card, paddingHorizontal: spacing.md, fontSize: 16 },
+  step: { padding: spacing.lg, gap: spacing.md, paddingTop: spacing.xxl },
 });

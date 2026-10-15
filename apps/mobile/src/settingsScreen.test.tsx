@@ -7,6 +7,7 @@ import * as SecureStore from "expo-secure-store";
 import { Alert, type AlertButton } from "react-native";
 
 import Settings from "../app/settings";
+import { drawerStore, closeDrawer } from "./drawer";
 import { TOKEN_KEY } from "./hub";
 import { loadSettings, saveSettings } from "./persist";
 import { info, launch, pairedStorage } from "./screenRig";
@@ -31,7 +32,10 @@ beforeEach(async () => {
   auth.authenticateAsync.mockResolvedValue({ success: true });
   auth.authenticateAsync.mockClear();
 });
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => {
+  closeDrawer();
+  jest.restoreAllMocks();
+});
 
 const flush = () => act(async () => void jest.advanceTimersByTime(60));
 
@@ -55,16 +59,68 @@ describe("Settings", () => {
     expect(screen.getByText("Shubh's iPhone")).toBeTruthy();
   });
 
-  it("shows the app version from the app's config", async () => {
+  it("ends with the footer, naming the app version from the app's config", async () => {
     await open();
-    expect(screen.getByText("Version 4.5.6")).toBeTruthy();
+    expect(
+      screen.getByText("Octet v4.5.6 · talks to your Macs directly over your tailnet; nothing passes through a relay."),
+    ).toBeTruthy();
   });
 
-  it("shows no version line when the config has none", async () => {
+  it("leaves the version out of the footer when the config has none", async () => {
     mockConfig = null;
     await open();
-    expect(screen.queryByText(/^Version/)).toBeNull();
+    expect(screen.queryByText(/ v\d/)).toBeNull();
+    expect(screen.getByText("Octet · talks to your Macs directly over your tailnet; nothing passes through a relay.")).toBeTruthy();
     mockConfig = { version: "4.5.6" };
+  });
+
+  describe("the new look", () => {
+    it("has a header with ☰ and Settings, and ☰ opens the drawer", async () => {
+      await open();
+      expect(screen.getByText("Settings")).toBeTruthy();
+      expect(drawerStore.getState().open).toBe(false);
+      await fireEvent.press(screen.getByRole("button", { name: "Menu" }));
+      expect(drawerStore.getState().open).toBe(true);
+    });
+
+    it("has three notched cards: Machines, Notify me when, and Face ID to allow", async () => {
+      await open();
+      expect(screen.getByText("Machines")).toBeTruthy();
+      expect(screen.getByText("Notify me when")).toBeTruthy();
+      // The title of the Face ID card, and (separately) the switch that is named for it.
+      expect(screen.getAllByText("Face ID to allow").length).toBeGreaterThanOrEqual(1);
+      expect(screen.getByRole("switch", { name: "Face ID to allow" })).toBeTruthy();
+    });
+
+    it("lists the Mac with ● online while connected, and ○ offline when not, with Unpair", async () => {
+      const rig = await open();
+      expect(screen.getByText("● mac")).toBeTruthy();
+      expect(screen.getByText("online")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Unpair" })).toBeTruthy();
+      await act(async () => {
+        rig.sockets.last.drop();
+      });
+      expect(screen.getByText("○ mac")).toBeTruthy();
+      expect(screen.getByText("offline")).toBeTruthy();
+    });
+
+    it("has 'An action needs approval' and a disabled 'A turn finishes' with its note, and no error switch", async () => {
+      await open();
+      expect(screen.getByRole("switch", { name: "An action needs approval" })).toBeTruthy();
+      const turn = screen.getByRole("switch", { name: "A turn finishes" });
+      expect(turn.props.disabled).toBe(true);
+      expect(screen.getByText("Coming with the next hub update")).toBeTruthy();
+      expect(screen.queryByText("A session hits an error")).toBeNull();
+    });
+
+    it("'A turn finishes' shows the same value as the approval switch", async () => {
+      mockConfig = { extra: { eas: { projectId: "11111111-2222-3333-4444-555555555555" } } };
+      await saveSettings({ notifications: true });
+      await open();
+      expect(screen.getByRole("switch", { name: "A turn finishes" }).props.value).toBe(true);
+      expect(screen.getByRole("switch", { name: "An action needs approval" }).props.value).toBe(true);
+      mockConfig = { version: "4.5.6" };
+    });
   });
 
   it("has Face ID to allow on by default", async () => {
@@ -176,7 +232,7 @@ describe("Settings", () => {
       expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
       expect((await loadSettings()).hubUrl).toBeNull();
       expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
-      expect(await screen.findByText("Pair with your Mac")).toBeTruthy();
+      expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
       expect(rig.view.getPathname()).toBe("/pair");
       expect(screen.queryByText("This phone was unpaired on the Mac")).toBeNull();
     });
@@ -200,7 +256,7 @@ describe("Settings", () => {
   describe("Notifications", () => {
     const PROJECT = "11111111-2222-3333-4444-555555555555";
     const NO_ID = "Notifications need this app's EAS project id. See the README.";
-    const switchOf = () => screen.getByRole("switch", { name: "Notifications" });
+    const switchOf = () => screen.getByRole("switch", { name: "An action needs approval" });
     const registered = (rig: Awaited<ReturnType<typeof open>>) => rig.sockets.last.commandsOf("register_push");
     const reply = async (rig: Awaited<ReturnType<typeof open>>, frame: object) => {
       await act(async () => {

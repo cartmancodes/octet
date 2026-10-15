@@ -115,15 +115,41 @@ run:android`. The same rule applies: never pair that build with your everyday Ma
 
 1. On the Mac, start the hub and publish it (see [the guide](../../docs/remote-control.md#phone-app-hub)).
 2. In an Octet session on the Mac, type `/remote-control pair`. It shows a QR code and a link.
-3. Open the app. Until it is paired it shows **Pair with your Mac**. Scan the code with the
-   camera, or paste the link into **Paste link**. Once the link is valid the app says `Pair with
-   <the hub's address>?` and the **Pair** button turns on (it is dimmed until then). Give the phone a
-   name under **Device name** (the Mac lists it in `octet hub devices`) and tap **Pair**. The code
-   works once and expires after 10 minutes.
+3. Open the app. Until it is paired it shows **Scan the code from octet pair**: point the camera at
+   the code, inside the four corner brackets. Or tap **Enter code instead** and paste the link into
+   **Paste link** (with the camera off, those fields show at once). Once the link is valid the app
+   says `Pair with <the hub's address>?` and the **Pair** button turns on (it is dimmed until then).
+   Give the phone a name under **Device name** (the Mac lists it in `octet hub devices`) and tap
+   **Pair**. A toast says `Paired with <the Mac>`. The code works once and expires after 10 minutes.
 
 The app keeps the device token in the iOS Keychain / Android Keystore (`expo-secure-store`), never
-in plain storage. **Settings** shows where you are paired, turns the Face ID check on allowing an
-approval on or off (full access always asks), and unpairs.
+in plain storage.
+
+## Screens
+
+Every screen is drawn in the terminal's look: one monospace face, the TUI's colours, 1 px bordered
+cards with their titles notched into the border, and touch targets of at least 44 pt. ☰ opens the
+side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Settings.
+
+- **Pair.** A panel with the camera in four accent corner brackets and a bottom sheet: `PAIRED`
+  (the Mac this phone was paired with, when it pairs again) and **Enter code instead**, which
+  shows the paste and name fields. A scanned code only fills the field; you confirm the Mac it
+  names and tap **Pair**. After pairing, one offer to turn on notifications.
+- **Inbox.** The live sessions in three tabs (Needs you, Running, Done). An approval is answered
+  right on its card; **Allow all N once** answers the ones still open and fully shown.
+- **New session / Resume.** Tap the chips for the Mac, folder, engine and model, and mode, write
+  the prompt and start; or resume a recent session.
+- **Conversation.** The transcript, the model and mode menu, the permission card, the prompt line
+  with its slash menu, and a key bar for the terminal's keys.
+- **Settings.** Three cards. **Machines**: the Mac with ● online or ○ offline, this phone's name,
+  and **Unpair**. **Notify me when**: **An action needs approval** turns notifications on or off
+  (the switch moves only when the Mac acknowledges; a refusal or an unreachable Mac is said below
+  it); **A turn finishes** shows the same setting and is disabled until the next hub update.
+  **Face ID to allow**: turns the Face ID check on allowing an approval on or off (turning it off
+  asks for Face ID; full access always asks). The footer names the app version.
+- **Toasts.** One line at the bottom of a screen. When an approval newly arrives for a session
+  other than the one you are in (and you are not on the Inbox), `<name> needs approval` appears
+  with **View**, which opens it.
 
 ## Notifications
 
@@ -246,7 +272,7 @@ removed this phone (`octet hub revoke NAME`), so the hub no longer knows its tok
 **Allow says "Face ID isn't set up on this phone. Turn it off in Settings to allow from here."**
 Allowing an approval asks the phone's biometrics first. If Face ID or a fingerprint isn't set up on
 the phone (or none is enrolled), the app can't ask and sends nothing. Enrol one in the phone's own
-settings, or turn off **Face ID to allow** in the app's Settings (the gear on the Sessions screen).
+settings, or turn off **Face ID to allow** in the app's Settings (☰, then Settings).
 Deny never needs it.
 
 **A session I started doesn't appear.** Phone-started sessions run in tmux on the Mac. Check
@@ -259,4 +285,4 @@ Sessions list to refresh it; after a Start the app says "NAME hasn't appeared ye
 `/remote-control pair` again for a new one.
 
 **The camera is off.** The pairing screen says "Camera access is off — paste the link instead": paste the
-link into **Paste link**.
+link into **Paste link** (the fields show at once).

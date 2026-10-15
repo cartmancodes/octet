@@ -140,6 +140,15 @@ Claude Code and Codex CLIs.
 
 ### Changed
 
+- The phone app has a new look, drawn after the terminal: an Inbox of your
+  sessions in three tabs with approvals answered on their cards, a side
+  drawer, a redrawn New session and Conversation (permission card, slash menu
+  and key bar), and Pair and Settings in notched cards. Pair is a camera in
+  four corner brackets with an "Enter code instead" sheet; Settings has
+  Machines, Notify me when and Face ID to allow. A toast says "Paired with
+  <Mac>" after pairing, and "<name> needs approval · View" when an approval
+  arrives for a session you are not in. Every approval guard stays (Allow is
+  once only; Face ID and the 400 ms arm apply on each Allow).
 - Enter in `/skills` (or Tab) puts `/name ` in the prompt instead of running
   the skill; nothing runs until it is sent. Sending another provider's skill
   switches provider first, with its arguments, and an amber hint says so.

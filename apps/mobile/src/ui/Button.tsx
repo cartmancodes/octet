@@ -11,8 +11,8 @@ interface ButtonProps {
   accessibilityLabel?: string;
   /** `accent`: accent border and text on the selected fill (Allow once); `primary`: the bold
    * accent outline of a screen's main action; `plain`: an edge outline; `bare`: no outline (a
-   * header glyph). */
-  variant?: "accent" | "primary" | "plain" | "bare";
+   * header glyph); `link`: no outline, accent text (a quiet way on, like "Enter code instead"). */
+  variant?: "accent" | "primary" | "plain" | "bare" | "link";
   disabled?: boolean;
   busy?: boolean;
   style?: StyleProp<ViewStyle>;
@@ -37,6 +37,8 @@ export const Button = memo(function Button({
         return { box: { borderColor: theme.accent, backgroundColor: theme.selected }, text: { color: theme.accent } };
       case "primary":
         return { box: { borderColor: theme.accent }, text: { color: theme.accent, fontWeight: "700" as const } };
+      case "link":
+        return { box: { borderColor: "transparent" }, text: { color: theme.accent } };
       case "bare":
         return { box: { borderColor: "transparent" }, text: { color: theme.fg } };
       default:
