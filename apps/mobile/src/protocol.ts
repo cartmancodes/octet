@@ -66,7 +66,7 @@ export interface Cursor {
   seq: number;
 }
 
-/** One live session; `last_activity` is Unix seconds, `goal` a one-liner, `now` the NOW line, `tmux` the tmux session a phone started it in, `approval` the first approval waiting (the count is `approvals`). */
+/** One live session; `last_activity` is Unix seconds, `goal` a one-liner, `now` the NOW line, `tmux` the tmux session a phone started it in, `approval` the first approval waiting (the count is `approvals`), `usage` the latest usage line, and `question` true when the last finished turn's reply ended on a `?` (a heuristic; cleared by the next prompt). */
 export interface SessionInfo {
   id: string;
   engine: Engine;
@@ -81,6 +81,15 @@ export interface SessionInfo {
   from_phone: boolean;
   tmux?: string | null;
   approval?: ApprovalInfo | null;
+  usage?: string | null;
+  question?: boolean | null;
+}
+
+/** What a device is pushed: an approval waiting, a session error, a finished turn. */
+export interface PushKinds {
+  approvals: boolean;
+  errors: boolean;
+  turns: boolean;
 }
 
 /** What an approval would do, as the dialog leads with it. */
@@ -274,12 +283,13 @@ export interface PairCommand {
   platform: string;
 }
 
-/** Set the Expo push token notifications go to (`ExponentPushToken[..]` or `ExpoPushToken[..]`), or turn them off with `null`; leaving `token` out is refused. */
+/** Set the Expo push token notifications go to (`ExponentPushToken[..]` or `ExpoPushToken[..]`), or turn them off with `null`; leaving `token` out is refused. `kinds` says what to push; left out, the hub keeps what it has (approvals and errors for a new device). */
 export interface RegisterPushCommand {
   v: 1;
   type: "register_push";
   req: number;
   token: string | null;
+  kinds?: PushKinds | null;
 }
 
 /** Ask the hub to answer, to tell a live connection from a dead one. */

@@ -1,5 +1,5 @@
 //! Devices, pairing secrets, hub config and the audit log.
-use octet_core::remote::protocol::is_push_token;
+use octet_core::remote::protocol::{PushKinds, is_push_token};
 use octet_store::{create_private, create_private_dir, sync_directory};
 use sha2::{Digest, Sha256};
 use std::{
@@ -44,6 +44,8 @@ pub struct Device {
     pub token_sha256: String,
     /// The Expo push token notifications go to, if the phone turned them on.
     pub push_token: Option<String>,
+    /// What it is pushed; the defaults until the phone says.
+    pub push_kinds: PushKinds,
 }
 
 /// Shows the device without its token hash or push token.
@@ -60,6 +62,7 @@ impl std::fmt::Debug for Device {
                 "push_token",
                 &self.push_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("push_kinds", &self.push_kinds)
             .finish()
     }
 }
@@ -203,6 +206,7 @@ impl Store {
             last_seen: seconds,
             token_sha256: sha256_hex(&token),
             push_token: None,
+            push_kinds: PushKinds::default(),
         };
         self.update(|devices| {
             if devices.iter().any(|kept| kept.name == device.name) {
@@ -277,8 +281,7 @@ impl Store {
     }
 
     /// Sets, or with `None` clears, the push token of the device whose token hash is
-    /// `token_sha256`. False if there is no such device. A token is on one device only: any other
-    /// device holding it loses it, in the same write.
+    /// `token_sha256`, keeping its kinds: [`set_push`](Self::set_push) without kinds.
     ///
     /// # Errors
     ///
@@ -287,6 +290,23 @@ impl Store {
         &mut self,
         token_sha256: &str,
         token: Option<String>,
+    ) -> io::Result<bool> {
+        self.set_push(token_sha256, token, None).await
+    }
+
+    /// Sets, or with `None` clears, the push token of the device whose token hash is
+    /// `token_sha256`, and its kinds when `kinds` says them (`None` keeps them), in one write.
+    /// False if there is no such device. A token is on one device only: any other device holding
+    /// it loses it, in the same write.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
+    pub async fn set_push(
+        &mut self,
+        token_sha256: &str,
+        token: Option<String>,
+        kinds: Option<PushKinds>,
     ) -> io::Result<bool> {
         self.update(|devices| {
             if !devices
@@ -306,6 +326,14 @@ impl Store {
                 };
                 changed |= device.push_token != wanted;
                 device.push_token = wanted;
+            }
+            if let Some(kinds) = kinds
+                && let Some(device) = devices
+                    .iter_mut()
+                    .find(|device| device.token_sha256 == token_sha256)
+            {
+                changed |= device.push_kinds != kinds;
+                device.push_kinds = kinds;
             }
             (true, changed)
         })
@@ -429,6 +457,12 @@ impl Store {
                     if let Some(push) = &device.push_token {
                         entry["push_token"] = serde_json::json!(push);
                     }
+                    let kinds = device.push_kinds;
+                    entry["push_kinds"] = serde_json::json!({
+                        "approvals": kinds.approvals,
+                        "errors": kinds.errors,
+                        "turns": kinds.turns,
+                    });
                     entry
                 })
                 .collect::<Vec<_>>();
@@ -510,6 +544,7 @@ async fn read_devices(directory: &Path) -> io::Result<(Vec<Device>, Option<Stamp
                 last_seen: entry["last_seen"].as_u64()?,
                 token_sha256: text("token_sha256")?,
                 push_token: text("push_token").filter(|token| is_push_token(token)),
+                push_kinds: push_kinds(&entry["push_kinds"]),
             })
             .filter(|device| {
                 !device.login.is_empty()
@@ -523,6 +558,18 @@ async fn read_devices(directory: &Path) -> io::Result<(Vec<Device>, Option<Stamp
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| invalid("devices.json has a malformed device"))?;
     Ok((devices, stamp))
+}
+
+/// A device's stored kinds: each one the file says as a boolean, the default for the rest (all
+/// of them in a file from before kinds).
+fn push_kinds(stored: &serde_json::Value) -> PushKinds {
+    let defaults = PushKinds::default();
+    let kind = |key: &str, default: bool| stored[key].as_bool().unwrap_or(default);
+    PushKinds {
+        approvals: kind("approvals", defaults.approvals),
+        errors: kind("errors", defaults.errors),
+        turns: kind("turns", defaults.turns),
+    }
 }
 
 /// The settings when `hub.json` names none: port 47823 and no extra workspaces.
@@ -1108,6 +1155,84 @@ mod tests {
         let store = store(&dir).await;
         assert_eq!(store.devices().len(), 1);
         assert_eq!(store.devices()[0].push_token, None);
+    }
+
+    #[tokio::test]
+    async fn kinds_default_and_persist() {
+        let dir = TempDir::new("hub-kinds");
+        let hash = "ab".repeat(32);
+        // A file from before kinds, and one whose kinds are not what this hub writes.
+        let entry = |name: &str, hash: &str, extra: &str| {
+            format!(
+                r#"{{"name":"{name}","platform":"ios","login":"{LOGIN}","created":1,"last_seen":2,"token_sha256":"{hash}"{extra}}}"#
+            )
+        };
+        let legacy = format!(
+            r#"{{"devices":[{},{},{}]}}"#,
+            entry("Old", &hash, &format!(r#","push_token":"{PUSH}""#)),
+            entry(
+                "Odd",
+                &"cd".repeat(32),
+                r#","push_kinds":{"turns":1,"errors":false}"#
+            ),
+            entry("Word", &"ef".repeat(32), r#","push_kinds":"all""#),
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("devices.json"), legacy).unwrap();
+        let mut store = store(&dir).await;
+        let kinds = |store: &Store| -> Vec<PushKinds> {
+            store.devices().iter().map(|d| d.push_kinds).collect()
+        };
+        let defaults = PushKinds {
+            approvals: true,
+            errors: true,
+            turns: false,
+        };
+        let odd = PushKinds {
+            errors: false,
+            ..defaults
+        };
+        assert_eq!(kinds(&store), [defaults, odd, defaults]);
+        // Kinds go into devices.json with the token, in the same write, and read back.
+        let all = PushKinds {
+            approvals: false,
+            errors: true,
+            turns: true,
+        };
+        assert!(
+            store
+                .set_push(&hash, Some(PUSH.to_owned()), Some(all))
+                .await
+                .unwrap()
+        );
+        let text = std::fs::read_to_string(dir.path().join("devices.json")).unwrap();
+        assert!(text.contains("\"push_kinds\""), "{text}");
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(reopened.devices()[0].push_kinds, all);
+        assert_eq!(reopened.devices()[0].push_token.as_deref(), Some(PUSH));
+        // A registration that does not say its kinds keeps them, on or off.
+        assert!(
+            store
+                .set_push(&hash, Some(PUSH.to_owned()), None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.devices()[0].push_kinds, all);
+        assert!(store.set_push_token(&hash, None).await.unwrap());
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(
+            (
+                reopened.devices()[0].push_kinds,
+                reopened.devices()[0].push_token.clone()
+            ),
+            (all, None)
+        );
+        // A newly paired device starts with the defaults.
+        paired(&mut store, "New", epoch(1_790_000_000)).await;
+        let new = store.devices().iter().find(|d| d.name == "New").unwrap();
+        assert_eq!(new.push_kinds, defaults);
+        // Debug shows the kinds, which are not secret.
+        assert!(format!("{new:?}").contains("push_kinds"));
     }
 
     #[tokio::test]

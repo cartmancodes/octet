@@ -17,6 +17,14 @@
 //! or below what it has of that event's journal. Everything the tail emits after the
 //! subscription is either in the replay or delivered live, so nothing is lost and nothing
 //! repeats.
+//!
+//! # Facts
+//!
+//! The records a session's tails read also keep its [`Facts`]: the latest usage line, how many
+//! error records came since the hub first saw it (for the error push), and whether the last
+//! finished turn's reply ended on a question. When the hub first sees a session they are seeded
+//! from at most the last [`SEED_BYTES`] of its newest journal (errors aside: those were before the
+//! hub looked). A change to them is a [`SessionUpdate::Changed`] after the records' events.
 use crate::{
     push::Snapshot,
     tail::{Tail, event_of, file_name},
@@ -28,12 +36,13 @@ use octet_core::remote::{
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
+    io::SeekFrom,
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     net::{
         UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
@@ -65,6 +74,10 @@ const GOAL_CHARS: usize = 200;
 const GISTS_BUDGET: usize = 64 * 1024;
 /// How long a journal the session has moved on from is still read for its last records.
 const FOLLOW_PREVIOUS: Duration = Duration::from_secs(10);
+/// The most of a reply kept to tell whether it ended on a question, in characters.
+const REPLY_CHARS: usize = 256;
+/// The most of the newest journal read to seed a session's facts when the hub first sees it.
+const SEED_BYTES: u64 = 256 * 1024;
 
 /// What changed in the sessions since the last call to [`Sessions::next`].
 #[derive(Debug, PartialEq)]
@@ -193,6 +206,123 @@ fn gist(approval: &Value) -> Option<Value> {
     Some(json!({"id": id, "summary": out}))
 }
 
+/// What a session's journal records have said that its row and the pusher show.
+#[derive(Debug, Default)]
+struct Facts {
+    /// The latest `usage` record's text, clipped to [`GOAL_CHARS`].
+    usage: Option<String>,
+    /// `error` records read since the hub first saw the session.
+    errors: u64,
+    /// The last [`REPLY_CHARS`] characters of the reply text since the last `user` record.
+    reply: String,
+    /// The last finished turn's reply, trimmed, ended on `?`; cleared by the next `user` record.
+    /// A heuristic: the reply may ask in other words, or quote a question.
+    question: bool,
+}
+
+impl Facts {
+    /// Takes one record of `kind` with `data`; whether the row or the pusher sees a change. A
+    /// reply's chunk costs at most [`REPLY_CHARS`] characters of work, however long it or the
+    /// reply is.
+    fn take(&mut self, kind: &str, data: &Value) -> bool {
+        match kind {
+            "usage" => {
+                let Some(text) = data.as_str() else {
+                    return false;
+                };
+                let usage: String = text.chars().take(GOAL_CHARS).collect();
+                if self.usage.as_ref() == Some(&usage) {
+                    return false;
+                }
+                self.usage = Some(usage);
+                true
+            }
+            "error" => {
+                self.errors = self.errors.saturating_add(1);
+                true
+            }
+            "text" => {
+                if let Some(chunk) = data.as_str() {
+                    self.hear(chunk);
+                }
+                false
+            }
+            "user" => {
+                self.reply.clear();
+                std::mem::replace(&mut self.question, false)
+            }
+            "finished" => {
+                let asked = self.reply.trim_end().ends_with('?');
+                asked != std::mem::replace(&mut self.question, asked)
+            }
+            _ => false,
+        }
+    }
+
+    /// Adds a chunk of the reply, keeping its last [`REPLY_CHARS`] characters.
+    fn hear(&mut self, chunk: &str) {
+        self.reply.push_str(last_chars(chunk, REPLY_CHARS));
+        // At most twice the limit here, so counting is bounded too.
+        let extra = self.reply.chars().count().saturating_sub(REPLY_CHARS);
+        if extra > 0 {
+            let cut = self
+                .reply
+                .char_indices()
+                .nth(extra)
+                .map_or(self.reply.len(), |(at, _)| at);
+            self.reply.drain(..cut);
+        }
+    }
+}
+
+/// The last `count` characters of `text` (all of it when shorter), found from its end.
+fn last_chars(text: &str, count: usize) -> &str {
+    match count.checked_sub(1) {
+        None => "",
+        Some(back) => text
+            .char_indices()
+            .rev()
+            .nth(back)
+            .map_or(text, |(at, _)| &text[at..]),
+    }
+}
+
+/// The facts the last [`SEED_BYTES`] before `end` of `journal` hold, and the bytes read. One
+/// bounded read; when it starts past the journal's beginning, what comes before its first newline
+/// is the end of an earlier line and is passed over. Errors are not counted: they were before the
+/// hub looked. A journal that cannot be read seeds nothing.
+async fn seed(journal: &Path, end: u64) -> (Facts, u64) {
+    let start = end.saturating_sub(SEED_BYTES);
+    let read = async {
+        let mut file = tokio::fs::File::open(journal).await?;
+        if !file.metadata().await?.is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        file.seek(SeekFrom::Start(start)).await?;
+        let mut bytes = Vec::new();
+        file.take(end - start).read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    };
+    let mut facts = Facts::default();
+    let Ok(bytes) = read.await else {
+        return (facts, 0);
+    };
+    let mut lines = bytes.split(|&byte| byte == b'\n');
+    if start > 0 {
+        lines.next();
+    }
+    for line in lines {
+        let Ok(record) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if let Some(kind) = record.get("type").and_then(Value::as_str) {
+            facts.take(kind, record.get("data").unwrap_or(&Value::Null));
+        }
+    }
+    facts.errors = 0;
+    (facts, bytes.len() as u64)
+}
+
 /// One session: its registration, bridge link, journal tails and what the bridge last said.
 #[derive(Debug)]
 struct Live {
@@ -204,6 +334,7 @@ struct Live {
     state: Option<Value>,
     catalog: Option<Value>,
     last_activity: Option<u64>,
+    facts: Facts,
 }
 
 impl Live {
@@ -252,6 +383,8 @@ impl Live {
             ),
             ("tmux", registration.tmux.as_ref().map(|t| json!(t))),
             ("approval", front),
+            ("usage", self.facts.usage.as_ref().map(|u| json!(u))),
+            ("question", self.facts.question.then_some(json!(true))),
         ];
         for (key, value) in optional {
             if let Some(value) = value {
@@ -355,6 +488,10 @@ impl Sessions {
                         None => None,
                     };
                     let last_activity = activity(&registration.journals).await;
+                    let facts = match &tail {
+                        Some(tail) => seed(tail.path(), tail.offset()).await.0,
+                        None => Facts::default(),
+                    };
                     self.live.push(Live {
                         registration,
                         link,
@@ -363,6 +500,7 @@ impl Sessions {
                         state: None,
                         catalog: None,
                         last_activity,
+                        facts,
                     });
                     changed = true;
                 }
@@ -373,7 +511,7 @@ impl Sessions {
                     }
                     changed |= shows_differently(&live.registration, &registration);
                     if live.registration.journals != registration.journals {
-                        follow(live, &registration.journals, &mut self.pending).await;
+                        changed |= follow(live, &registration.journals, &mut self.pending).await;
                     }
                     live.registration = registration;
                     live.last_activity = activity(&live.registration.journals).await;
@@ -427,6 +565,7 @@ impl Sessions {
                         .and_then(|s| s.get("approvals")?.as_array())
                         .map(|list| list.iter().filter_map(|a| a.get("id")?.as_u64()).collect())
                         .unwrap_or_default(),
+                    errors: live.facts.errors,
                 }
             })
             .collect()
@@ -575,9 +714,11 @@ impl Sessions {
     }
 
     /// Reads every session's journals for records written since the last pass: the journals
-    /// it moved on from first, each let go once it stops or its time is up, then the newest.
+    /// it moved on from first, each let go once it stops or its time is up, then the newest. A
+    /// change to the sessions' facts is one `Changed` after the events.
     async fn poll_tails(&mut self) {
         let now = Instant::now();
+        let mut changed = false;
         for at in 0..self.live.len() {
             let live = &mut self.live[at];
             let id = &live.registration.id;
@@ -587,10 +728,17 @@ impl Sessions {
             while index < live.previous.len() {
                 let tail = &mut live.previous[index].tail;
                 let found = match tail.read().await {
-                    Ok(records) => emit(&mut self.pending, id, &file_name(tail.path()), &records),
+                    Ok(records) => emit(
+                        &mut self.pending,
+                        &mut live.facts,
+                        id,
+                        &file_name(tail.path()),
+                        &records,
+                    ),
                     Err(_) => Emitted::default(),
                 };
                 wrote |= found.any;
+                changed |= found.changed;
                 if found.stopped {
                     live.previous.remove(index);
                 } else {
@@ -600,11 +748,22 @@ impl Sessions {
             if let Some(tail) = live.tail.as_mut()
                 && let Ok(records) = tail.read().await
             {
-                wrote |= emit(&mut self.pending, id, &file_name(tail.path()), &records).any;
+                let found = emit(
+                    &mut self.pending,
+                    &mut live.facts,
+                    id,
+                    &file_name(tail.path()),
+                    &records,
+                );
+                wrote |= found.any;
+                changed |= found.changed;
             }
             if wrote {
                 live.last_activity = activity(&live.registration.journals).await;
             }
+        }
+        if changed {
+            self.push_changed();
         }
     }
 
@@ -663,11 +822,14 @@ struct Emitted {
     any: bool,
     /// A `stopped` record: the journal's session has ended.
     stopped: bool,
+    /// A record changed the session's [`Facts`].
+    changed: bool,
 }
 
-/// Queues an event for each record `records` holds.
+/// Queues an event for each record `records` holds, and keeps `facts` up to date with them.
 fn emit(
     pending: &mut VecDeque<SessionUpdate>,
+    facts: &mut Facts,
     id: &str,
     journal: &str,
     records: &[Value],
@@ -676,6 +838,9 @@ fn emit(
     for (seq, record) in records.iter().filter_map(event_of) {
         emitted.any = true;
         emitted.stopped |= record["type"] == "stopped";
+        if let Some(kind) = record["type"].as_str() {
+            emitted.changed |= facts.take(kind, &record["data"]);
+        }
         pending.push_back(SessionUpdate::Event {
             id: id.to_owned(),
             journal: journal.to_owned(),
@@ -689,14 +854,19 @@ fn emit(
 /// Moves `live`'s tail to the newest of `journals`. What the old journal has left is emitted
 /// first, then every journal between whole (every earlier one when it had no tail or its journal
 /// left the list), and the tail starts the newest from its first byte. Each journal it moves on
-/// from without a `stopped` record is kept in `previous`, to be read for a while longer.
-async fn follow(live: &mut Live, journals: &[PathBuf], pending: &mut VecDeque<SessionUpdate>) {
+/// from without a `stopped` record is kept in `previous`, to be read for a while longer. Whether
+/// what it emitted changed the session's facts.
+async fn follow(
+    live: &mut Live,
+    journals: &[PathBuf],
+    pending: &mut VecDeque<SessionUpdate>,
+) -> bool {
     let Some(newest) = journals.last() else {
-        return;
+        return false;
     };
     let current = live.tail.as_ref().map(|t| t.path().to_owned());
     if current.as_ref() == Some(newest) {
-        return;
+        return false;
     }
     let id = live.registration.id.clone();
     let until = Instant::now() + FOLLOW_PREVIOUS;
@@ -708,26 +878,39 @@ async fn follow(live: &mut Live, journals: &[PathBuf], pending: &mut VecDeque<Se
         .map_or(0, |at| at + 1);
     let between = journals.get(start..journals.len() - 1).unwrap_or_default();
     passed.extend(between.iter().map(|path| Tail::new(path.clone())));
+    let mut changed = false;
     for mut tail in passed {
-        if !drain(&mut tail, &id, pending).await {
+        let drained = drain(&mut tail, &mut live.facts, &id, pending).await;
+        changed |= drained.changed;
+        if !drained.stopped {
             live.previous.push(Previous { tail, until });
         }
     }
     live.tail = Some(Tail::new(newest.clone()));
+    changed
 }
 
-/// Queues the events of everything `tail` has left to read; whether one was a `stopped` record.
-async fn drain(tail: &mut Tail, id: &str, pending: &mut VecDeque<SessionUpdate>) -> bool {
+/// Queues the events of everything `tail` has left to read, keeping `facts` up to date; whether
+/// one was a `stopped` record, and whether the facts changed.
+async fn drain(
+    tail: &mut Tail,
+    facts: &mut Facts,
+    id: &str,
+    pending: &mut VecDeque<SessionUpdate>,
+) -> Emitted {
     let journal = file_name(tail.path());
-    let mut stopped = false;
+    let mut drained = Emitted::default();
     loop {
         let before = tail.offset();
         let Ok(records) = tail.read().await else {
-            return stopped;
+            return drained;
         };
-        stopped |= emit(pending, id, &journal, &records).stopped;
+        let found = emit(pending, facts, id, &journal, &records);
+        drained.any |= found.any;
+        drained.stopped |= found.stopped;
+        drained.changed |= found.changed;
         if tail.offset() <= before {
-            return stopped;
+            return drained;
         }
     }
 }
@@ -1019,6 +1202,17 @@ mod tests {
                     json!({"format": "octet-preview-1", "seq": seq, "type": "t", "data": name});
                 writeln!(file, "{line}").unwrap();
             }
+        }
+
+        /// Appends one record of `kind` with `data` to the journal `name`, making it if need be.
+        fn write(&self, name: &str, seq: u64, kind: &str, data: &Value) {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.root.join(name))
+                .unwrap();
+            let line = json!({"format": "octet-preview-1", "seq": seq, "type": kind, "data": data});
+            writeln!(file, "{line}").unwrap();
         }
 
         /// Appends one record of `kind` to the journal `name`.
@@ -1470,7 +1664,183 @@ mod tests {
             state: Some(state),
             catalog: None,
             last_activity: None,
+            facts: Facts::default(),
         }
+    }
+
+    /// The updates up to and including the next `Changed`.
+    async fn until_changed(sessions: &mut Sessions) -> Vec<SessionUpdate> {
+        let mut got = Vec::new();
+        loop {
+            let update = next(sessions).await;
+            let changed = update == SessionUpdate::Changed;
+            got.push(update);
+            if changed {
+                return got;
+            }
+        }
+    }
+
+    #[test]
+    fn question_tail_is_bounded() {
+        let mut facts = Facts::default();
+        facts.take("user", &json!("go on"));
+        // A reply of 10,000 chunks of 2 KiB: the tail never holds more than 256 characters, and
+        // each chunk costs the same however long the reply has grown.
+        let chunk = json!(format!("{} ", "é".repeat(1023)));
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            facts.take("text", &chunk);
+            assert!(facts.reply.chars().count() <= REPLY_CHARS);
+            assert!(facts.reply.len() <= REPLY_CHARS * 4);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // One huge chunk is read from its end only.
+        facts.take(
+            "text",
+            &json!(format!("{} Shall I go on?\n", "é".repeat(1_000_000))),
+        );
+        assert!(facts.reply.chars().count() <= REPLY_CHARS);
+        assert!(facts.reply.ends_with("Shall I go on?\n"), "{}", facts.reply);
+        facts.take("finished", &json!("completed"));
+        assert!(facts.question);
+    }
+
+    #[test]
+    fn a_reply_ending_in_a_question_asks_until_the_next_user_record() {
+        let env = Env::new();
+        let mut live = live_with(&env, 4091, json!({"phase": "idle", "approvals": []}));
+        assert!(!live.facts.take("user", &json!("Fix the build")));
+        live.facts.take("text", &json!("Fixed it. Shall I"));
+        live.facts.take("text", &json!(" push too?  \n\n"));
+        // Not before the turn is over.
+        assert!(live.row().get("question").is_none());
+        assert!(live.facts.take("finished", &json!("completed")));
+        assert_eq!(live.row()["question"], true);
+        // The answer clears it.
+        assert!(live.facts.take("user", &json!("yes")));
+        assert!(live.row().get("question").is_none());
+        // A question mark that is not the reply's last word is no question.
+        live.facts
+            .take("text", &json!("Why? Because it was stale."));
+        assert!(!live.facts.take("finished", &json!("completed")));
+        assert!(live.row().get("question").is_none());
+        // Nor is a reply from before the last user record.
+        live.facts.take("text", &json!("Want more?"));
+        live.facts.take("user", &json!("next"));
+        live.facts.take("text", &json!("Done."));
+        live.facts.take("finished", &json!("completed"));
+        assert!(!live.facts.question);
+    }
+
+    #[test]
+    fn usage_is_latest_wins_and_clipped() {
+        let env = Env::new();
+        let mut live = live_with(&env, 4092, json!({"phase": "idle", "approvals": []}));
+        assert!(live.row().get("usage").is_none());
+        assert!(live.facts.take("usage", &json!("5h 10% · week 2%")));
+        assert_eq!(live.row()["usage"], "5h 10% · week 2%");
+        assert!(!live.facts.take("usage", &json!("5h 10% · week 2%")));
+        assert!(live.facts.take("usage", &json!("é".repeat(500))));
+        assert_eq!(live.row()["usage"], "é".repeat(200));
+        // A record that is not text changes nothing.
+        assert!(!live.facts.take("usage", &json!(7)));
+        assert_eq!(live.row()["usage"], "é".repeat(200));
+        // Errors are counted, for the pusher; the row does not show them.
+        assert!(live.facts.take("error", &json!("boom")));
+        assert!(live.facts.take("error", &Value::Null));
+        assert_eq!(live.facts.errors, 2);
+        assert!(live.row().get("errors").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_seed_reads_at_most_256_kib() {
+        let env = Env::new();
+        let name = "session-1-1.jsonl";
+        let path = env.root.join(name);
+        let size = || std::fs::metadata(&path).unwrap().len();
+        env.write(name, 0, "usage", &json!("old 1%"));
+        env.write(name, 1, "user", &json!("first"));
+        env.write(name, 2, "text", &json!("An old question?"));
+        env.write(name, 3, "finished", &json!("completed"));
+        // Over 256 KiB after them: what came before is not read.
+        for seq in 4..304 {
+            env.write(name, seq, "notice", &json!("n".repeat(1000)));
+        }
+        assert!(size() > SEED_BYTES + 1024);
+        let (facts, read) = seed(&path, size()).await;
+        assert!(read <= SEED_BYTES, "{read}");
+        assert_eq!((facts.usage, facts.question), (None, false));
+        // What is inside the window seeds, but its errors are from before the hub looked.
+        env.write(name, 304, "usage", &json!("new 2%"));
+        env.write(name, 305, "user", &json!("again"));
+        env.write(name, 306, "error", &json!("boom"));
+        env.write(name, 307, "text", &json!("Ready to ship?"));
+        env.write(name, 308, "finished", &json!("completed"));
+        let (facts, read) = seed(&path, size()).await;
+        assert!(read <= SEED_BYTES, "{read}");
+        assert_eq!(facts.usage.as_deref(), Some("new 2%"));
+        assert!(facts.question);
+        // A session the hub first sees gets its row from the seed.
+        let registration = env.registration(4093, &[name]);
+        let _bridge = Env::listen(&registration);
+        registration.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        let row = &sessions.list()[0];
+        assert_eq!(
+            (&row["usage"], &row["question"]),
+            (&json!("new 2%"), &json!(true))
+        );
+        assert_eq!(sessions.snapshots()[0].errors, 0);
+        // A journal too small to fill the window is read whole.
+        let small = env.root.join("session-2-1.jsonl");
+        env.write("session-2-1.jsonl", 0, "usage", &json!("tiny"));
+        let (facts, read) = seed(&small, std::fs::metadata(&small).unwrap().len()).await;
+        assert_eq!(facts.usage.as_deref(), Some("tiny"));
+        assert_eq!(read, std::fs::metadata(&small).unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn the_tail_keeps_usage_errors_and_the_question() {
+        let env = Env::new();
+        let name = "session-1-1.jsonl";
+        env.write(name, 0, "error", &json!("from before"));
+        let registration = env.registration(4094, &[name]);
+        let _bridge = Env::listen(&registration);
+        registration.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        assert_eq!(sessions.snapshots()[0].errors, 0);
+        env.write(name, 1, "user", &json!("Fix it"));
+        env.write(name, 2, "text", &json!("Fixed. Shall I push?"));
+        env.write(name, 3, "usage", &json!("5h 3%"));
+        env.write(name, 4, "error", &json!("rate limited"));
+        env.write(name, 5, "finished", &json!("completed"));
+        // The records go out as events, then the row is said to have changed.
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 6, "{got:?}");
+        assert_eq!(event(&got[4]), (name, 5));
+        let row = &sessions.list()[0];
+        assert_eq!(
+            (&row["usage"], &row["question"]),
+            (&json!("5h 3%"), &json!(true))
+        );
+        assert_eq!(sessions.snapshots()[0].errors, 1);
+        // Text alone changes nothing the row shows, so it is not a change.
+        env.write(name, 6, "text", &json!("more"));
+        assert_eq!(event(&next(&mut sessions).await), (name, 6));
+        let quiet = timeout(Duration::from_millis(300), sessions.next()).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+        env.write(name, 7, "user", &json!("yes"));
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(sessions.list()[0].get("question").is_none());
     }
 
     #[test]
@@ -1530,6 +1900,13 @@ mod tests {
         }
     }
 
+    /// A row's facts at their largest: the longest usage line, and a question.
+    fn worst_facts(live: &mut Live) {
+        live.facts.take("usage", &json!("é".repeat(5000)));
+        live.facts.take("text", &json!("?"));
+        live.facts.take("finished", &json!("completed"));
+    }
+
     #[test]
     fn sixteen_worst_case_rows_fit_one_sessions_frame() {
         let env = Env::new();
@@ -1538,7 +1915,9 @@ mod tests {
                 let state = json!({"phase": "waiting", "now": "n".repeat(300),
                     "goal": {"objective": "g".repeat(5000)},
                     "approvals": [{"id": i, "summary": worst_summary()}]});
-                live_with(&env, 4100 + i, state).row()
+                let mut live = live_with(&env, 4100 + i, state);
+                worst_facts(&mut live);
+                live.row()
             })
             .collect();
         let frame = json!({"v": 1, "type": "sessions", "sessions": rows}).to_string();
@@ -1609,6 +1988,18 @@ mod tests {
             .min()
             .unwrap();
         assert!(oldest_kept >= newest_lost);
+        // Every row's facts at their largest too: the gists give way, and the frame still fits.
+        for live in &mut sessions.live {
+            worst_facts(live);
+        }
+        let rows = sessions.list();
+        let frame = json!({"v": 1, "type": "sessions", "sessions": rows}).to_string();
+        assert!(
+            frame.len() < octet_core::remote::protocol::MAX_MESSAGE,
+            "{} bytes",
+            frame.len()
+        );
+        assert!(rows.iter().all(|row| row["question"] == true));
         // A few rows are under the budget and keep every gist.
         sessions.live.truncate(4);
         assert!(

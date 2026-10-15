@@ -80,6 +80,31 @@ describe("the sessions list", () => {
     expect(after[1]).not.toBe(before[1]);
   });
 
+  it("keeps a row's usage as clean text, and its question only when it is true", () => {
+    const raw = [
+      info("a", { usage: "5h \u001b[1m12%\u0007 · week 3%", question: true }),
+      info("b", { usage: "é".repeat(5_000) }),
+      { ...info("c"), usage: 7, question: "yes" },
+      info("d", { question: false }),
+    ] as unknown as SessionInfo[];
+    store.getState().applyBatch([sessions(...raw)]);
+    const [a, b, c, d] = store.getState().sessions;
+    expect(a).toMatchObject({ usage: "5h 12% · week 3%", question: true });
+    expect(b?.usage).toBe("é".repeat(200));
+    expect(c?.usage).toBeNull();
+    expect(c && "question" in c).toBe(false);
+    expect(d && "question" in d).toBe(false);
+    // The same usage and question keep the row; a change makes a new one.
+    const before = store.getState().sessions;
+    store.getState().applyBatch([sessions(...raw)]);
+    expect(store.getState().sessions).toBe(before);
+    store.getState().applyBatch([sessions(info("a", { usage: "5h 13% · week 3%", question: true }), ...raw.slice(1))]);
+    expect(store.getState().sessions[0]).not.toBe(before[0]);
+    expect(store.getState().sessions[1]).toBe(before[1]);
+    store.getState().applyBatch([sessions(info("a", { usage: "5h 13% · week 3%" }), ...raw.slice(1))]);
+    expect(store.getState().sessions[0]?.question).toBeUndefined();
+  });
+
   it("cleans the strings and skips entries without an id", () => {
     const junk = [info("a", { now: "Running \u001b[1mls\u0007", workspace: "/w".repeat(100_000) }), { engine: "claude" }, null, 5] as unknown as SessionInfo[];
     store.getState().applyBatch([sessions(...junk)]);

@@ -54,9 +54,9 @@ use futures_util::{SinkExt, StreamExt};
 use octet_core::PROMPT_LIMIT;
 use octet_core::remote::{
     protocol::{
-        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, ack, catalog_frame, event_frame,
-        full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of, sessions_frame,
-        state_frame, subscribed_frame, welcome,
+        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, ack, catalog_frame,
+        event_frame, full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of,
+        sessions_frame, state_frame, subscribed_frame, welcome,
     },
     run::run_dir,
 };
@@ -886,9 +886,9 @@ impl Hub {
                 return;
             }
             PhoneCommand::Ping => return self.send(conn, &ack(req, "pong")),
-            PhoneCommand::RegisterPush { token } => {
+            PhoneCommand::RegisterPush { token, kinds } => {
                 let token = token.map(|token| token.expose().to_owned());
-                return self.register_push(conn, device, req, token).await;
+                return self.register_push(conn, device, req, token, kinds).await;
             }
             PhoneCommand::Subscribe { session, after } => {
                 self.subscribe(conn, req, session, after);
@@ -956,13 +956,21 @@ impl Hub {
             .await;
     }
 
-    /// Sets, or with `None` clears, `device`'s push token, and answers `req`. Neither the token nor
-    /// the device's hash reaches the audit line.
-    async fn register_push(&mut self, conn: u64, device: &Device, req: u64, token: Option<String>) {
+    /// Sets, or with `None` clears, `device`'s push token, and its kinds when `kinds` says them
+    /// (`None` keeps what is stored), and answers `req`. Neither the token nor the device's hash
+    /// reaches the audit line.
+    async fn register_push(
+        &mut self,
+        conn: u64,
+        device: &Device,
+        req: u64,
+        token: Option<String>,
+        kinds: Option<PushKinds>,
+    ) {
         let on = token.is_some();
         match self
             .store
-            .set_push_token(&device.token_sha256, token.clone())
+            .set_push(&device.token_sha256, token.clone(), kinds)
             .await
         {
             Ok(true) => {}
@@ -988,6 +996,9 @@ impl Hub {
                 .filter(|held| held.token_sha256 == device.token_sha256)
             {
                 held.push_token.clone_from(&token);
+                if let Some(kinds) = kinds {
+                    held.push_kinds = kinds;
+                }
             }
         }
         let (message, what) = if on {
@@ -1521,19 +1532,21 @@ impl Hub {
         self.pusher.prune(now);
         let mut batch = Vec::new();
         for key in self.pusher.waiting() {
-            let token = self
+            let known = self
                 .store
                 .devices()
                 .iter()
-                .find(|device| device.token_sha256 == key)
-                .and_then(|device| device.push_token.clone());
+                .find(|device| device.token_sha256 == key);
+            let token = known.and_then(|device| device.push_token.clone());
+            let kinds = known.map(|device| device.push_kinds).unwrap_or_default();
             let connected = token.is_none()
                 || self.conns.values().any(|conn| {
                     conn.device
                         .as_ref()
                         .is_some_and(|device| device.token_sha256 == key)
                 });
-            if let (Some(due), Some(token)) = (self.pusher.due_for(&key, connected, now), token) {
+            let due = self.pusher.due_for(&key, connected, kinds, now);
+            if let (Some(due), Some(token)) = (due, token) {
                 batch.push((token, due));
             }
         }

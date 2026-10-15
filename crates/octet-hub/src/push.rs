@@ -1,14 +1,15 @@
 //! Content-free push through Expo: a phone with a push token and no open connection is told that
-//! an approval is waiting, or that a turn finished, and nothing more.
+//! an approval is waiting, that a session had an error, or that a turn finished, and nothing more.
 //!
 //! [`Pusher`] is pure: it is fed what the sessions look like ([`Snapshot`]) and the time, and says
-//! what is due. It pushes for an approval id it has not seen in a session, and for a turn that
-//! stopped running. A session's first state seeds what it has seen and pushes nothing, so a hub
-//! restart does not repeat what the phone was already told. Pushes to one device collect for
-//! [`WINDOW`] and go out as one (an approval beats a finished turn, and the push names the most
-//! recent session), at most [`CAP`] in any minute. A device that is connected when its window
-//! closes gets nothing, but the approvals it was spared are held: when its last connection drops,
-//! those still open are offered to it again.
+//! what is due. It pushes for an approval id it has not seen in a session, for a rise in a
+//! session's count of error records, and for a turn that stopped running. A session's first state
+//! seeds what it has seen and pushes nothing, so a hub restart does not repeat what the phone was
+//! already told. Pushes to one device collect for [`WINDOW`] and go out as one (an approval beats
+//! an error, which beats a finished turn, and the push names the most recent session), at most
+//! [`CAP`] in any minute, and only of the kinds the device asked for ([`PushKinds`]). A device
+//! that is connected when its window closes gets nothing, but the approvals it was spared are
+//! held: when its last connection drops, those still open are offered to it again.
 //!
 //! Two edges are accepted. When a session's journal list changes (a new vendor process) the
 //! approval ids it has seen are forgotten, so a reused id can stay hidden until the registration
@@ -17,6 +18,7 @@
 //!
 //! [`send`] posts a batch with `curl`: literal argv, the JSON body on stdin, so no token is in
 //! `ps`. The only log lines are `Push failed` and `Push refused: <code>`.
+use octet_core::remote::protocol::PushKinds;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::{
@@ -96,6 +98,8 @@ pub(crate) struct Snapshot {
     pub phase: Option<String>,
     /// The ids of the approvals open now.
     pub approvals: Vec<u64>,
+    /// Error records the session's journals had since the hub first saw it.
+    pub errors: u64,
 }
 
 /// Something worth a push.
@@ -103,6 +107,8 @@ pub(crate) struct Snapshot {
 pub(crate) enum Notice {
     /// An approval id new to the session.
     Approval { session: String, id: u64 },
+    /// A rise in the session's error count.
+    Error { session: String },
     /// A turn that stopped running.
     Turn { session: String },
 }
@@ -112,6 +118,8 @@ pub(crate) enum Notice {
 pub(crate) enum Kind {
     /// `Approval waiting`.
     Approval,
+    /// `Session error`.
+    Error,
     /// `Turn finished`.
     Turn,
 }
@@ -133,6 +141,7 @@ impl Due {
         });
         let (body, priority, channel) = match self.kind {
             Kind::Approval => ("Approval waiting", "high", "approvals"),
+            Kind::Error => ("Session error", "high", "errors"),
             Kind::Turn => ("Turn finished", "normal", "turns"),
         };
         message["body"] = json!(body);
@@ -153,12 +162,15 @@ struct Seen {
     approvals: HashSet<u64>,
     /// The approval ids open now.
     open: HashSet<u64>,
+    /// The session's error count when last looked at.
+    errors: u64,
 }
 
 /// Notices collecting for one device.
 struct Window {
     opened: Instant,
     approvals: Vec<(String, u64)>,
+    errors: Vec<String>,
     turns: Vec<String>,
 }
 
@@ -204,6 +216,7 @@ impl Pusher {
                             phase: Some(phase.clone()),
                             approvals: open.clone(),
                             open,
+                            errors: snapshot.errors,
                         },
                     );
                 }
@@ -214,6 +227,13 @@ impl Pusher {
                 seen.journals.clone_from(&snapshot.journals);
                 seen.approvals.clear();
             }
+            // Errors are counted across journals, with or without a state.
+            if snapshot.errors > seen.errors {
+                notices.push(Notice::Error {
+                    session: snapshot.id.clone(),
+                });
+            }
+            seen.errors = snapshot.errors;
             let Some(phase) = &snapshot.phase else {
                 // Without a state nothing is open; what was seen stays seen.
                 seen.open.clear();
@@ -248,16 +268,20 @@ impl Pusher {
         let window = self.windows.entry(device.to_owned()).or_insert(Window {
             opened: now,
             approvals: Vec::new(),
+            errors: Vec::new(),
             turns: Vec::new(),
         });
         for notice in notices {
             match notice {
                 Notice::Approval { session, id } => window.approvals.push((session.clone(), *id)),
+                Notice::Error { session } => window.errors.push(session.clone()),
                 Notice::Turn { session } => window.turns.push(session.clone()),
             }
         }
         let extra = window.approvals.len().saturating_sub(WINDOW_NOTICES);
         window.approvals.drain(..extra);
+        let extra = window.errors.len().saturating_sub(WINDOW_NOTICES);
+        window.errors.drain(..extra);
         let extra = window.turns.len().saturating_sub(WINDOW_NOTICES);
         window.turns.drain(..extra);
     }
@@ -315,10 +339,18 @@ impl Pusher {
     }
 
     /// The push due to `device` at `now`, if its window has been open for [`WINDOW`]; the window
-    /// then closes either way. Nothing is due to a device that `connected` (its user is looking
-    /// at it: its open approvals are held for [`disconnected`](Self::disconnected)), for an
-    /// approval already answered, or past [`CAP`] in the last minute.
-    pub(crate) fn due_for(&mut self, device: &str, connected: bool, now: Instant) -> Option<Due> {
+    /// then closes either way. Of the kinds the device wants (`kinds`), an approval still open
+    /// beats an error, which beats a finished turn. Nothing is due to a device that `connected`
+    /// (its user is looking at it: its open approvals are held for
+    /// [`disconnected`](Self::disconnected)), for an approval already answered, for a kind it
+    /// does not want, or past [`CAP`] in the last minute.
+    pub(crate) fn due_for(
+        &mut self,
+        device: &str,
+        connected: bool,
+        kinds: PushKinds,
+        now: Instant,
+    ) -> Option<Due> {
         if now.saturating_duration_since(self.windows.get(device)?.opened) < WINDOW {
             return None;
         }
@@ -342,16 +374,29 @@ impl Pusher {
             return None;
         }
         let still_open = |(session, id): &&(String, u64)| self.is_open(session, *id);
-        let due = if let Some((session, _)) = window.approvals.iter().rev().find(still_open) {
-            Due {
-                kind: Kind::Approval,
-                session: session.clone(),
-            }
-        } else {
-            Due {
-                kind: Kind::Turn,
-                session: window.turns.last()?.clone(),
-            }
+        let approval = kinds
+            .approvals
+            .then(|| window.approvals.iter().rev().find(still_open))
+            .flatten()
+            .map(|(session, _)| (Kind::Approval, session));
+        let error = || {
+            kinds
+                .errors
+                .then(|| window.errors.last())
+                .flatten()
+                .map(|session| (Kind::Error, session))
+        };
+        let turn = || {
+            kinds
+                .turns
+                .then(|| window.turns.last())
+                .flatten()
+                .map(|session| (Kind::Turn, session))
+        };
+        let (kind, session) = approval.or_else(error).or_else(turn)?;
+        let due = Due {
+            kind,
+            session: session.clone(),
         };
         let sent = self.sent.entry(device.to_owned()).or_default();
         while sent
@@ -553,12 +598,34 @@ impl Sender {
 mod tests {
     use super::*;
 
+    /// Every kind on, as the tests before kinds expect.
+    const ALL: PushKinds = PushKinds {
+        approvals: true,
+        errors: true,
+        turns: true,
+    };
+
     fn snap(id: &str, phase: Option<&str>, approvals: &[u64], journals: &[&str]) -> Snapshot {
         Snapshot {
             id: id.into(),
             journals: journals.iter().map(PathBuf::from).collect(),
             phase: phase.map(str::to_owned),
             approvals: approvals.to_vec(),
+            errors: 0,
+        }
+    }
+
+    /// Session `id`, idle with nothing open, having had `errors` error records.
+    fn erred(id: &str, errors: u64) -> Snapshot {
+        Snapshot {
+            errors,
+            ..snap(id, Some("idle"), &[], &["a"])
+        }
+    }
+
+    fn error(session: &str) -> Notice {
+        Notice::Error {
+            session: session.into(),
         }
     }
 
@@ -692,22 +759,22 @@ mod tests {
         pusher.offer("dev", &notices, base);
         assert_eq!(pusher.waiting(), ["dev"]);
         // The window is still open.
-        assert_eq!(pusher.due_for("dev", false, later(base, 1.9)), None);
+        assert_eq!(pusher.due_for("dev", false, ALL, later(base, 1.9)), None);
         // One push: the approval, with the most recent session.
         assert_eq!(
-            pusher.due_for("dev", false, later(base, 2.0)),
+            pusher.due_for("dev", false, ALL, later(base, 2.0)),
             Some(Due {
                 kind: Kind::Approval,
                 session: "s3".into()
             })
         );
         assert_eq!(pusher.waiting(), Vec::<String>::new());
-        assert_eq!(pusher.due_for("dev", false, later(base, 9.0)), None);
+        assert_eq!(pusher.due_for("dev", false, ALL, later(base, 9.0)), None);
 
         // Turns alone collapse to the most recent one.
         pusher.offer("dev", &[turn("s1"), turn("s4")], later(base, 10.0));
         assert_eq!(
-            pusher.due_for("dev", false, later(base, 12.0)),
+            pusher.due_for("dev", false, ALL, later(base, 12.0)),
             Some(Due {
                 kind: Kind::Turn,
                 session: "s4".into()
@@ -723,7 +790,7 @@ mod tests {
         pusher.offer("dev", &notices, base);
         // The user answers it at the terminal a second later.
         pusher.observe(&[snap("s1", Some("idle"), &[], &["a"])]);
-        assert_eq!(pusher.due_for("dev", false, later(base, 2.0)), None);
+        assert_eq!(pusher.due_for("dev", false, ALL, later(base, 2.0)), None);
         // A turn that finished in the same window is still worth telling.
         let mut pusher = seeded(&["s1"]);
         let notices = open(&mut pusher, "s1", 1);
@@ -731,7 +798,7 @@ mod tests {
         pusher.offer("dev", &[turn("s1")], base);
         pusher.observe(&[snap("s1", Some("idle"), &[], &["a"])]);
         assert_eq!(
-            pusher.due_for("dev", false, later(base, 2.0)),
+            pusher.due_for("dev", false, ALL, later(base, 2.0)),
             Some(Due {
                 kind: Kind::Turn,
                 session: "s1".into()
@@ -746,13 +813,13 @@ mod tests {
         let first = open(&mut pusher, "s1", 1);
         pusher.offer("dev", &first, base);
         // Looking at the app when the window closes: nothing, and nothing later either.
-        assert_eq!(pusher.due_for("dev", true, later(base, 2.0)), None);
-        assert_eq!(pusher.due_for("dev", false, later(base, 30.0)), None);
+        assert_eq!(pusher.due_for("dev", true, ALL, later(base, 2.0)), None);
+        assert_eq!(pusher.due_for("dev", false, ALL, later(base, 30.0)), None);
         // The app goes to the background; the next approval reaches it.
         let second = open(&mut pusher, "s1", 2);
         pusher.offer("dev", &second, later(base, 40.0));
         assert_eq!(
-            pusher.due_for("dev", false, later(base, 42.0)),
+            pusher.due_for("dev", false, ALL, later(base, 42.0)),
             Some(Due {
                 kind: Kind::Approval,
                 session: "s1".into()
@@ -762,8 +829,8 @@ mod tests {
         let third = open(&mut pusher, "s1", 3);
         pusher.offer("a", &third, later(base, 50.0));
         pusher.offer("b", &third, later(base, 50.0));
-        assert!(pusher.due_for("a", true, later(base, 52.0)).is_none());
-        assert!(pusher.due_for("b", false, later(base, 52.0)).is_some());
+        assert!(pusher.due_for("a", true, ALL, later(base, 52.0)).is_none());
+        assert!(pusher.due_for("b", false, ALL, later(base, 52.0)).is_some());
     }
 
     #[test]
@@ -772,13 +839,13 @@ mod tests {
         let base = Instant::now();
         let first = open(&mut pusher, "s1", 1);
         pusher.offer("dev", &first, base);
-        assert_eq!(pusher.due_for("dev", true, later(base, 2.0)), None);
+        assert_eq!(pusher.due_for("dev", true, ALL, later(base, 2.0)), None);
         // The app goes to the background: the approval still open is offered again, in a window.
         pusher.disconnected("dev", later(base, 10.0));
         assert_eq!(pusher.waiting(), ["dev"]);
-        assert_eq!(pusher.due_for("dev", false, later(base, 11.0)), None);
+        assert_eq!(pusher.due_for("dev", false, ALL, later(base, 11.0)), None);
         assert_eq!(
-            pusher.due_for("dev", false, later(base, 12.0)),
+            pusher.due_for("dev", false, ALL, later(base, 12.0)),
             Some(Due {
                 kind: Kind::Approval,
                 session: "s1".into()
@@ -792,17 +859,21 @@ mod tests {
         let second = open(&mut pusher, "s1", 5);
         assert_eq!(second, [approval("s1", 5)]);
         pusher.offer("dev", &second, later(base, 30.0));
-        assert_eq!(pusher.due_for("dev", true, later(base, 32.0)), None);
+        assert_eq!(pusher.due_for("dev", true, ALL, later(base, 32.0)), None);
         pusher.disconnected("dev", later(base, 33.0));
-        assert_eq!(pusher.due_for("dev", true, later(base, 35.0)), None);
+        assert_eq!(pusher.due_for("dev", true, ALL, later(base, 35.0)), None);
         pusher.disconnected("dev", later(base, 36.0));
-        assert!(pusher.due_for("dev", false, later(base, 38.0)).is_some());
+        assert!(
+            pusher
+                .due_for("dev", false, ALL, later(base, 38.0))
+                .is_some()
+        );
 
         // An approval answered while the phone was open is not offered at all.
         let third = open(&mut pusher, "s1", 6);
         assert_eq!(third, [approval("s1", 6)]);
         pusher.offer("dev", &third, later(base, 40.0));
-        assert_eq!(pusher.due_for("dev", true, later(base, 42.0)), None);
+        assert_eq!(pusher.due_for("dev", true, ALL, later(base, 42.0)), None);
         pusher.observe(&[snap("s1", Some("idle"), &[], &["a"])]);
         pusher.disconnected("dev", later(base, 43.0));
         assert_eq!(pusher.waiting(), Vec::<String>::new());
@@ -822,16 +893,16 @@ mod tests {
             pusher.offer("dev", &notices, later(base, at));
             assert!(
                 pusher
-                    .due_for("dev", false, later(base, at + 2.0))
+                    .due_for("dev", false, ALL, later(base, at + 2.0))
                     .is_some()
             );
         }
         let held = open(&mut pusher, "s1", 50);
         pusher.offer("dev", &held, later(base, 20.0));
-        assert_eq!(pusher.due_for("dev", true, later(base, 22.0)), None);
+        assert_eq!(pusher.due_for("dev", true, ALL, later(base, 22.0)), None);
         pusher.disconnected("dev", later(base, 23.0));
         assert_eq!(pusher.waiting(), ["dev"], "offered again");
-        assert_eq!(pusher.due_for("dev", false, later(base, 25.0)), None);
+        assert_eq!(pusher.due_for("dev", false, ALL, later(base, 25.0)), None);
     }
 
     #[test]
@@ -855,7 +926,7 @@ mod tests {
             pusher.offer("dev", &notices, later(base, at));
             // A replay of this state adds nothing.
             assert_eq!(pusher.observe(&rows), []);
-            if let Some(due) = pusher.due_for("dev", false, later(base, at + 2.0)) {
+            if let Some(due) = pusher.due_for("dev", false, ALL, later(base, at + 2.0)) {
                 all.push(due);
             }
         }
@@ -863,11 +934,169 @@ mod tests {
         // A minute after the first, the allowance comes back.
         let notices = pusher.observe(&[snap("s0", Some("idle"), &[99], &["a"])]);
         pusher.offer("dev", &notices, later(base, 60.5));
-        assert!(pusher.due_for("dev", false, later(base, 62.5)).is_some());
+        assert!(
+            pusher
+                .due_for("dev", false, ALL, later(base, 62.5))
+                .is_some()
+        );
         // Each device has its own allowance.
         let notices = pusher.observe(&[snap("s0", Some("idle"), &[99, 100], &["a"])]);
         pusher.offer("other", &notices, later(base, 63.0));
-        assert!(pusher.due_for("other", false, later(base, 65.0)).is_some());
+        assert!(
+            pusher
+                .due_for("other", false, ALL, later(base, 65.0))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_error_count_that_rises_after_seeding_is_news() {
+        let mut pusher = Pusher::default();
+        // Errors from before the pusher looked seed, like approvals.
+        assert_eq!(pusher.observe(&[erred("s1", 4)]), []);
+        assert_eq!(pusher.observe(&[erred("s1", 4)]), []);
+        assert_eq!(pusher.observe(&[erred("s1", 5)]), [error("s1")]);
+        // A rise of several between looks is one notice.
+        assert_eq!(pusher.observe(&[erred("s1", 9)]), [error("s1")]);
+        assert_eq!(pusher.observe(&[erred("s1", 9)]), []);
+        // Without a state the count still says something went wrong.
+        let lost = Snapshot {
+            phase: None,
+            ..erred("s1", 10)
+        };
+        assert_eq!(pusher.observe(&[lost]), [error("s1")]);
+        // A session first seen without a state seeds nothing, so its errors push nothing.
+        let mut pusher = Pusher::default();
+        let quiet = Snapshot {
+            phase: None,
+            ..erred("s2", 3)
+        };
+        assert_eq!(pusher.observe(&[quiet]), []);
+        assert_eq!(pusher.observe(&[erred("s2", 3)]), []);
+        assert_eq!(pusher.observe(&[erred("s2", 4)]), [error("s2")]);
+    }
+
+    #[test]
+    fn errors_push_once_per_window_and_rank_after_approvals() {
+        let mut pusher = seeded(&["s1", "s2", "s3"]);
+        let base = Instant::now();
+        // A crash loop: an error every 50 ms for a minute.
+        let mut pushed = Vec::new();
+        for n in 1..=1_200_u32 {
+            let at = later(base, 0.05 * f64::from(n));
+            let notices = pusher.observe(&[erred("s1", u64::from(n))]);
+            assert_eq!(notices, [error("s1")]);
+            pusher.offer("dev", &notices, at);
+            if let Some(due) = pusher.due_for("dev", false, ALL, at) {
+                pushed.push((n, due));
+            }
+        }
+        // One push per window, never more than the cap in the minute.
+        assert_eq!(pushed.len(), 6, "{pushed:?}");
+        assert!(
+            pushed
+                .iter()
+                .all(|(_, due)| due.kind == Kind::Error && due.session == "s1")
+        );
+        for pair in pushed.windows(2) {
+            assert!(pair[1].0 - pair[0].0 >= 40, "{pushed:?}");
+        }
+
+        // An approval still open beats an error, and an error beats a finished turn.
+        let mut pusher = seeded(&["s1", "s2", "s3"]);
+        let open = pusher.observe(&[snap("s2", Some("idle"), &[7], &["a"])]);
+        let notices = [error("s1"), open[0].clone(), turn("s3"), error("s1")];
+        pusher.offer("dev", &notices, base);
+        assert_eq!(
+            pusher.due_for("dev", false, ALL, later(base, 2.0)),
+            Some(Due {
+                kind: Kind::Approval,
+                session: "s2".into()
+            })
+        );
+        pusher.offer(
+            "dev",
+            &[turn("s3"), error("s1"), turn("s2")],
+            later(base, 3.0),
+        );
+        assert_eq!(
+            pusher.due_for("dev", false, ALL, later(base, 5.0)),
+            Some(Due {
+                kind: Kind::Error,
+                session: "s1".into()
+            })
+        );
+        // An answered approval does not hide the error behind it.
+        let notices = pusher.observe(&[snap("s2", Some("idle"), &[7, 8], &["a"])]);
+        pusher.offer("dev", &notices, later(base, 6.0));
+        pusher.offer("dev", &[error("s3")], later(base, 6.0));
+        pusher.observe(&[snap("s2", Some("idle"), &[], &["a"])]);
+        assert_eq!(
+            pusher.due_for("dev", false, ALL, later(base, 8.0)),
+            Some(Due {
+                kind: Kind::Error,
+                session: "s3".into()
+            })
+        );
+        // A device looking at the app gets no error push, and none is held for later.
+        pusher.offer("dev", &[error("s1")], later(base, 10.0));
+        assert_eq!(pusher.due_for("dev", true, ALL, later(base, 12.0)), None);
+        pusher.disconnected("dev", later(base, 13.0));
+        assert_eq!(pusher.waiting(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn kinds_filter_what_a_device_is_sent() {
+        let mut pusher = seeded(&["s1", "s2"]);
+        let base = Instant::now();
+        let defaults = PushKinds::default();
+        // Turns are off by default: a finished turn alone sends nothing, and costs no allowance.
+        pusher.offer("dev", &[turn("s1")], base);
+        assert_eq!(
+            pusher.due_for("dev", false, defaults, later(base, 2.0)),
+            None
+        );
+        assert_eq!(pusher.waiting(), Vec::<String>::new());
+        assert_eq!(pusher.remembered(), 0);
+        // With errors off, a window of an error and a turn sends the turn to a device that wants it.
+        let turns_only = PushKinds {
+            approvals: false,
+            errors: false,
+            turns: true,
+        };
+        pusher.offer("dev", &[error("s1"), turn("s2")], later(base, 3.0));
+        assert_eq!(
+            pusher.due_for("dev", false, turns_only, later(base, 5.0)),
+            Some(Due {
+                kind: Kind::Turn,
+                session: "s2".into()
+            })
+        );
+        // With approvals off, an open approval is passed over for the error.
+        let notices = open(&mut pusher, "s1", 3);
+        pusher.offer("dev", &notices, later(base, 6.0));
+        pusher.offer("dev", &[error("s2")], later(base, 6.0));
+        let no_approvals = PushKinds {
+            approvals: false,
+            ..defaults
+        };
+        assert_eq!(
+            pusher.due_for("dev", false, no_approvals, later(base, 8.0)),
+            Some(Due {
+                kind: Kind::Error,
+                session: "s2".into()
+            })
+        );
+        // Nothing wanted: nothing sent.
+        let none = PushKinds {
+            approvals: false,
+            errors: false,
+            turns: false,
+        };
+        let notices = open(&mut pusher, "s1", 4);
+        pusher.offer("dev", &notices, later(base, 10.0));
+        pusher.offer("dev", &[error("s1"), turn("s1")], later(base, 10.0));
+        assert_eq!(pusher.due_for("dev", false, none, later(base, 12.0)), None);
     }
 
     #[test]
@@ -891,6 +1120,15 @@ mod tests {
             turn.message(token),
             json!({"to": token, "title": "Octet", "body": "Turn finished",
                 "data": {"session": "123-456"}, "priority": "normal", "channelId": "turns"})
+        );
+        let error = Due {
+            kind: Kind::Error,
+            session: "123-456".into(),
+        };
+        assert_eq!(
+            error.message(token),
+            json!({"to": token, "title": "Octet", "body": "Session error",
+                "data": {"session": "123-456"}, "priority": "high", "channelId": "errors"})
         );
     }
 
@@ -991,7 +1229,11 @@ mod tests {
         let notices = open(&mut pusher, "s1", 1);
         pusher.offer("dev", &notices, base);
         assert_eq!(pusher.waiting(), ["dev"]);
-        assert!(pusher.due_for("dev", false, later(base, 2.0)).is_some());
+        assert!(
+            pusher
+                .due_for("dev", false, ALL, later(base, 2.0))
+                .is_some()
+        );
         // The window closed with its push; the minute's record is all that is left.
         assert_eq!(pusher.waiting(), Vec::<String>::new());
         assert_eq!(pusher.remembered(), 1);
@@ -1002,7 +1244,7 @@ mod tests {
         // A window that closes without a push (connected) leaves no record either.
         let notices = pusher.observe(&[snap("s1", Some("idle"), &[1, 2], &["a"])]);
         pusher.offer("dev", &notices, later(base, 70.0));
-        assert_eq!(pusher.due_for("dev", true, later(base, 72.0)), None);
+        assert_eq!(pusher.due_for("dev", true, ALL, later(base, 72.0)), None);
         assert_eq!((pusher.waiting().len(), pusher.remembered()), (0, 0));
     }
 

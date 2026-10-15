@@ -309,10 +309,23 @@ pub static OBJECTS: &[Shape] = &[
             req("from_phone", Bool),
             opt("tmux", Str),
             opt("approval", Object("ApprovalInfo")),
+            opt("usage", Str),
+            opt("question", Bool),
         ],
         doc: "One live session; `last_activity` is Unix seconds, `goal` a one-liner, `now` the \
               NOW line, `tmux` the tmux session a phone started it in, `approval` the first \
-              approval waiting (the count is `approvals`).",
+              approval waiting (the count is `approvals`), `usage` the latest usage line, and \
+              `question` true when the last finished turn's reply ended on a `?` (a heuristic; \
+              cleared by the next prompt).",
+    },
+    Shape {
+        name: "PushKinds",
+        fields: &[
+            req("approvals", Bool),
+            req("errors", Bool),
+            req("turns", Bool),
+        ],
+        doc: "What a device is pushed: an approval waiting, a session error, a finished turn.",
     },
     Shape {
         name: "ApprovalSummary",
@@ -515,9 +528,11 @@ pub static MESSAGES: &[Message] = &[
     message(
         "register_push",
         FromPhone,
-        &[req_null("token", Str)],
+        &[req_null("token", Str), opt("kinds", Object("PushKinds"))],
         "Set the Expo push token notifications go to (`ExponentPushToken[..]` or \
-         `ExpoPushToken[..]`), or turn them off with `null`; leaving `token` out is refused.",
+         `ExpoPushToken[..]`), or turn them off with `null`; leaving `token` out is refused. \
+         `kinds` says what to push; left out, the hub keeps what it has (approvals and errors \
+         for a new device).",
     ),
     message(
         "ping",
@@ -825,6 +840,28 @@ impl CommandName {
     }
 }
 
+/// What a device is pushed, by kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushKinds {
+    /// An approval waiting.
+    pub approvals: bool,
+    /// A session error.
+    pub errors: bool,
+    /// A finished turn.
+    pub turns: bool,
+}
+
+/// A device that never said: approvals and errors, not every finished turn.
+impl Default for PushKinds {
+    fn default() -> Self {
+        Self {
+            approvals: true,
+            errors: true,
+            turns: false,
+        }
+    }
+}
+
 /// A phone → hub command, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhoneCommand {
@@ -846,6 +883,8 @@ pub enum PhoneCommand {
     RegisterPush {
         /// The checked Expo push token; `None` turns notifications off.
         token: Option<Secret>,
+        /// What to push; `None` keeps what the hub has.
+        kinds: Option<PushKinds>,
     },
     /// Answer with an ack, to show the connection is alive.
     Ping,
@@ -1216,6 +1255,14 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
         },
         "register_push" => PhoneCommand::RegisterPush {
             token: push_token(m)?,
+            kinds: m
+                .get("kinds")
+                .and_then(Value::as_object)
+                .map(|k| PushKinds {
+                    approvals: flag(k, "approvals"),
+                    errors: flag(k, "errors"),
+                    turns: flag(k, "turns"),
+                }),
         },
         "ping" => PhoneCommand::Ping,
         "subscribe" => PhoneCommand::Subscribe {
@@ -2184,14 +2231,23 @@ mod tests {
             let text = format!(r#"{{"v":1,"req":4,"type":"register_push","token":"{token}"}}"#);
             let (req, command) = parse_phone(&text).unwrap_or_else(|e| panic!("{token}: {e}"));
             assert_eq!(req, 4);
-            let PhoneCommand::RegisterPush { token: Some(kept) } = command else {
+            let PhoneCommand::RegisterPush {
+                token: Some(kept), ..
+            } = command
+            else {
                 panic!("a registration of {token}")
             };
             assert_eq!(kept.expose(), token);
         }
         let (_, off) =
             parse_phone(r#"{"v":1,"req":5,"type":"register_push","token":null}"#).unwrap();
-        assert_eq!(off, PhoneCommand::RegisterPush { token: None });
+        assert_eq!(
+            off,
+            PhoneCommand::RegisterPush {
+                token: None,
+                kinds: None
+            }
+        );
         let too_long = format!("ExpoPushToken[{}]", "a".repeat(201));
         let refused = [
             r#"{"v":1,"req":6,"type":"register_push"}"#.to_owned(),
@@ -2234,6 +2290,96 @@ mod tests {
     }
 
     #[test]
+    fn register_push_takes_optional_kinds_all_three_said() {
+        let with = |kinds: &str| {
+            format!(r#"{{"v":1,"req":2,"type":"register_push","token":null,"kinds":{kinds}}}"#)
+        };
+        let (_, command) =
+            parse_phone(&with(r#"{"approvals":true,"errors":false,"turns":true}"#)).unwrap();
+        assert_eq!(
+            command,
+            PhoneCommand::RegisterPush {
+                token: None,
+                kinds: Some(PushKinds {
+                    approvals: true,
+                    errors: false,
+                    turns: true
+                }),
+            }
+        );
+        // Left out, or null: the hub keeps what it has.
+        for text in [
+            r#"{"v":1,"req":2,"type":"register_push","token":null}"#.to_owned(),
+            with("null"),
+        ] {
+            let (_, command) = parse_phone(&text).unwrap();
+            assert_eq!(
+                command,
+                PhoneCommand::RegisterPush {
+                    token: None,
+                    kinds: None
+                }
+            );
+        }
+        for kinds in [
+            r#"{"approvals":true,"errors":true}"#,
+            r#"{"approvals":true,"errors":true,"turns":1}"#,
+            r#"{"approvals":true,"errors":true,"turns":false,"sound":true}"#,
+            r#""all""#,
+            "[]",
+        ] {
+            assert!(parse_phone(&with(kinds)).is_err(), "{kinds}");
+        }
+        // New devices hear of approvals and errors, not of every finished turn.
+        assert_eq!(
+            PushKinds::default(),
+            PushKinds {
+                approvals: true,
+                errors: true,
+                turns: false
+            }
+        );
+        let ts = typescript();
+        assert!(ts.contains("  kinds?: PushKinds | null;"), "{ts}");
+        assert!(ts.contains("export interface PushKinds {"));
+    }
+
+    #[test]
+    fn a_sessions_row_may_say_its_usage_and_that_it_asked() {
+        let ts = typescript();
+        let row = ts
+            .split("export interface SessionInfo {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the interface");
+        assert!(row.contains("  usage?: string | null;"), "{row}");
+        assert!(row.contains("  question?: boolean | null;"), "{row}");
+        let frame = sessions_frame(&[json!({
+            "id": "1-2", "engine": "claude", "workspace": "/w", "mode": "ask", "phase": "idle",
+            "approvals": 0, "from_phone": false, "usage": "5h 12%", "question": true,
+        })]);
+        let message = MESSAGES.iter().find(|m| m.kind == "sessions").unwrap();
+        check_fields(
+            frame.as_object().unwrap(),
+            message.fields,
+            &["v", "type"],
+            "",
+        )
+        .unwrap_or_else(|e| panic!("{frame}: {e}"));
+        let asked = |question: Value| {
+            let mut frame = frame.clone();
+            frame["sessions"][0]["question"] = question;
+            check_fields(
+                frame.as_object().unwrap(),
+                message.fields,
+                &["v", "type"],
+                "",
+            )
+        };
+        assert!(asked(json!("yes")).is_err());
+    }
+
+    #[test]
     fn ping_parses_and_takes_no_fields() {
         let (req, command) = parse_phone(r#"{"v":1,"req":9,"type":"ping"}"#).unwrap();
         assert_eq!((req, command), (9, PhoneCommand::Ping));
@@ -2248,7 +2394,11 @@ mod tests {
         let shown = format!("{command:?}");
         assert!(!shown.contains("secretvalue"), "{shown}");
         assert!(shown.contains("redacted"), "{shown}");
-        assert!(!format!("{:?}", PhoneCommand::RegisterPush { token: None }).contains("redacted"));
+        let off = PhoneCommand::RegisterPush {
+            token: None,
+            kinds: None,
+        };
+        assert!(!format!("{off:?}").contains("redacted"));
     }
 
     #[test]

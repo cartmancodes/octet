@@ -73,6 +73,8 @@ export const MAX_SENT = 20;
 const MAX_SENT_SESSIONS = 16;
 const NO_SENT: readonly string[] = [];
 const FIELD = FIELD_CHARS;
+/** The longest usage line kept: the hub clips it to this too. */
+const USAGE_CHARS = 200;
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 
@@ -98,6 +100,9 @@ function cleanSession(raw: unknown): SessionInfo | null {
   if (typeof raw.last_activity === "number" || raw.last_activity === null) info.last_activity = raw.last_activity;
   const approval = cleanFrontApproval(raw.approval);
   if (approval) info.approval = approval;
+  if (raw.usage !== undefined) info.usage = typeof raw.usage === "string" ? field(raw.usage, USAGE_CHARS) : null;
+  // A heuristic flag: only `true` says anything, so nothing else is kept.
+  if (raw.question === true) info.question = true;
   return info;
 }
 
