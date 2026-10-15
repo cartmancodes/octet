@@ -127,6 +127,13 @@ describe("classify", () => {
       expect(item).toMatchObject({ status: "● Bash · cargo test", question: false });
     });
 
+    it("a running turn is not a question: the user (from the desk, say) already answered it", () => {
+      const { needs, running } = run([info("a", { question: true, phase: "running", now: "Thinking" })]);
+      expect(needs).toEqual([]);
+      expect(running).toEqual([expect.objectContaining({ id: "a", question: false, line: "Thinking" })]);
+      expect(drawerList([info("a", { question: true, phase: "running" })], NOW_MS)).toMatchObject({ needs: 0, running: 1 });
+    });
+
     it("only `true` is a question", () => {
       const { needs } = run([info("a", { question: false }), info("b", { question: null }), info("c")]);
       expect(needs).toEqual([]);

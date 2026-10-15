@@ -105,7 +105,7 @@ describe("/new marks the fresh start", () => {
     ]);
   const notes = () => (octetStore.getState().bySession.get("s")?.transcript.entries ?? []).filter((e) => e.kind === "note");
 
-  it("adds one divider to the session's transcript on the ack, and new events land below it", async () => {
+  it("marks the start on the ack: one divider, before the new journal's first record, below the old one's last", async () => {
     expect(FRESH_NOTE).toBe("Fresh conversation — the earlier one is above.");
     hold();
     const r = rig();
@@ -116,10 +116,31 @@ describe("/new marks the fresh start", () => {
     expect(notes()).toHaveLength(0); // nothing until the Mac took it
     r.waiting[0]?.resolve({ message: "Starting a fresh conversation" });
     await flush();
-    expect(notes()).toEqual([expect.objectContaining({ text: FRESH_NOTE })]);
+    // The old journal's last words are still to come: they go above it.
+    octetStore.getState().applyBatch([{ v: 1, type: "event", session: "s", journal: "j1", seq: 2, event: { type: "error", data: "last words" } }]);
+    expect(notes()).toHaveLength(0);
     octetStore.getState().applyBatch([{ v: 1, type: "event", session: "s", journal: "j2", seq: 1, event: { type: "user", data: "new question" } }]);
+    expect(notes()).toEqual([expect.objectContaining({ text: FRESH_NOTE })]);
     const kinds = (octetStore.getState().bySession.get("s")?.transcript.entries ?? []).map((e) => ("text" in e ? e.text : ""));
-    expect(kinds).toEqual(["old question", FRESH_NOTE, "new question"]);
+    expect(kinds).toEqual(["old question", "last words", FRESH_NOTE, "new question"]);
+  });
+
+  it("the session's question is answered by the fresh start: its row stops asking on the ack", async () => {
+    hold();
+    octetStore.getState().applyBatch([
+      { v: 1, type: "sessions", sessions: [{ id: "s", engine: "claude", workspace: "/w", mode: "ask", phase: "idle", approvals: 0, from_phone: false, question: true }] },
+    ]);
+    const asking = () => octetStore.getState().sessions[0]?.question;
+    expect(asking()).toBe(true);
+    const r = rig();
+    await render(controls(r.send));
+    await type("/new");
+    await fireEvent.press(row("/new"));
+    await fireEvent.press(button("Start fresh") as never);
+    expect(asking()).toBe(true); // nothing until the Mac took it
+    r.waiting[0]?.resolve({ message: "Starting a fresh conversation" });
+    await flush();
+    expect(asking()).toBeUndefined();
   });
 
   it("a refused /new, and the other commands, add none", async () => {
@@ -135,6 +156,8 @@ describe("/new marks the fresh start", () => {
     await submit();
     r.waiting[1]?.resolve({ message: "Exported" });
     await flush();
+    // The next journal's first record finds no fresh start to mark.
+    octetStore.getState().applyBatch([{ v: 1, type: "event", session: "s", journal: "j2", seq: 1, event: { type: "user", data: "new question" } }]);
     expect(notes()).toHaveLength(0);
   });
 });

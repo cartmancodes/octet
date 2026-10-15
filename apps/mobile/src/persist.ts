@@ -15,7 +15,8 @@ export interface Settings {
   /** Push notifications are on: the Mac has this phone's token. Off unless the user turned it on. */
   notifications: boolean;
   /** What the Mac pushes this phone while notifications are on. Missing is the Mac's own default
-   * for a new pairing: approvals and errors on, finished turns off. */
+   * for a new pairing (approvals and errors on, finished turns off), except in settings saved
+   * before kinds existed with notifications on: the Mac was pushing all three, so all three. */
   pushKinds: PushKinds;
   /** The transcript's text size in points, which `Aa` cycles. */
   textSize: TextSize;
@@ -26,6 +27,8 @@ export type TextSize = (typeof TEXT_SIZES)[number];
 
 /** What the hub sends a newly paired device, which is what an app with nothing saved shows. */
 export const DEFAULT_PUSH_KINDS: PushKinds = { approvals: true, errors: true, turns: false };
+/** What a Mac from before kinds existed pushed: everything. */
+const ALL_PUSH_KINDS: PushKinds = { approvals: true, errors: true, turns: true };
 
 export const DEFAULT_SETTINGS: Settings = {
   deviceName: null,
@@ -69,14 +72,19 @@ export async function readSettings(): Promise<{ ok: true; settings: Settings } |
   try {
     const value: unknown = JSON.parse(raw);
     if (!isObj(value)) return { ok: true, settings: DEFAULT_SETTINGS };
+    const notifications =
+      typeof value.notifications === "boolean" ? value.notifications : DEFAULT_SETTINGS.notifications;
+    // Saved before kinds existed, with notifications on: keep what the Mac was pushing, rather
+    // than turn finished turns off behind the user's back on the next register.
+    const upgraded = notifications && !("pushKinds" in value);
     return {
       ok: true,
       settings: {
         deviceName: text(value.deviceName),
         faceId: typeof value.faceId === "boolean" ? value.faceId : DEFAULT_SETTINGS.faceId,
         hubUrl: text(value.hubUrl),
-        notifications: typeof value.notifications === "boolean" ? value.notifications : DEFAULT_SETTINGS.notifications,
-        pushKinds: pushKinds(value.pushKinds),
+        notifications,
+        pushKinds: upgraded ? ALL_PUSH_KINDS : pushKinds(value.pushKinds),
         textSize: textSize(value.textSize),
       },
     };

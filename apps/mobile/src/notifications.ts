@@ -1,7 +1,7 @@
 // Push notifications: the permission, the Expo push token, the Android channels, the foreground
 // rule and what a tap names. The Mac's hub sends the pushes (title "Octet", body "Approval
-// waiting" or "Turn finished", `data.session`, a channel); this file only prepares the phone for
-// them. Registering the token with the hub is `HubController`'s job (src/hub.ts).
+// waiting", "Session error" or "Turn finished", `data.session`, and the channel "approvals",
+// "errors" or "turns"); this file only prepares the phone for them. Registering the token with the hub is `HubController`'s job (src/hub.ts).
 import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
@@ -52,6 +52,11 @@ export async function configureNotifications(): Promise<void> {
   try {
     await Notifications.setNotificationChannelAsync("approvals", {
       name: "Approvals",
+      importance: Notifications.AndroidImportance.HIGH,
+      sound: "default",
+    });
+    await Notifications.setNotificationChannelAsync("errors", {
+      name: "Session errors",
       importance: Notifications.AndroidImportance.HIGH,
       sound: "default",
     });

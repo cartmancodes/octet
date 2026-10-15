@@ -207,62 +207,93 @@ describe("turns", () => {
   });
 });
 
-describe("a local note", () => {
-  const note = (text = "Fresh conversation — the earlier one is above."): Op => ({ op: "note", text });
+describe("a fresh start's divider", () => {
+  const NOTE = "Fresh conversation — the earlier one is above.";
+  const note = (text = NOTE): Op => ({ op: "note", text });
+  const at = (journal: string, event: KnownJournalEvent): Op => ({ op: "event", ev: event, journal });
+  const lines = (v: SessionView) => v.transcript.entries.map((e) => [e.kind, "text" in e ? e.text : ""]);
+  const OLD = [
+    { op: "journals", journals: ["j1"] } as Op,
+    at("j1", { type: "user", data: "old" }),
+    at("j1", { type: "text", data: "old reply" }),
+    at("j1", { type: "finished", data: "completed" }),
+  ];
 
-  it("is a NOTE entry after the conversation, and what comes next goes below it", () => {
-    const old = view([ev({ type: "user", data: "old" }), ev({ type: "text", data: "old reply" }), ev({ type: "finished", data: "completed" })]);
-    const after = view([note(), ev({ type: "user", data: "new" }), ev({ type: "text", data: "new reply" })], old);
-    expect(after.transcript.entries.map((e) => [e.kind, "text" in e ? e.text : ""])).toEqual([
+  it("goes before the first record of a journal the session had not heard of: the old journal's last words stay above it", () => {
+    let v = view([...OLD, note()]);
+    // Nothing yet: the old journal may still be draining.
+    expect(v.transcript.entries.some((e) => e.kind === "note")).toBe(false);
+    v = view([at("j1", { type: "error", data: "late crash" }), at("j2", { type: "user", data: "new" }), at("j2", { type: "text", data: "new reply" })], v);
+    expect(lines(v)).toEqual([
       ["user", "old"],
       ["reply", "old reply"],
-      ["note", "Fresh conversation — the earlier one is above."],
+      ["error", "late crash"],
+      ["note", NOTE],
       ["user", "new"],
       ["reply", "new reply"],
     ]);
   });
 
-  it("is not added twice in a row: the same note straight after itself changes nothing", () => {
-    const once = view([ev({ type: "user", data: "old" }), note()]);
-    expect(view([note()], once)).toBe(once);
-    expect(view([note(), note()]).transcript.entries).toHaveLength(1);
-    // After something new it is a new divider.
-    const later = view([ev({ type: "user", data: "new" }), note()], once);
-    expect(later.transcript.entries.filter((e) => e.kind === "note")).toHaveLength(2);
-  });
-
-  it("stays inside the transcript bounds", () => {
-    const many = view(Array.from({ length: 1_000 }, (_, i) => ev({ type: "user", data: `q${i}` })));
-    const after = view([note()], many);
-    expect(after.transcript.entries).toHaveLength(1_000);
-    expect(after.transcript.entries[999]).toMatchObject({ kind: "note" });
-    expect(after.transcript.bytes).toBe(after.transcript.entries.reduce((n, e) => n + entrySize(e), 0));
-  });
-
-  it("waits for the replay to be over when the old conversation is still coming: it lands after it", () => {
-    const old = view([ev({ type: "user", data: "old" })]);
-    let v = view([{ op: "reset" }, note()], old); // a replay from the start began, and the note came
-    expect(v.transcript.entries).toHaveLength(0);
-    v = view([ev({ type: "user", data: "old" }), ev({ type: "text", data: "old reply" })], v);
-    expect(v.transcript.entries.map((e) => e.kind)).toEqual(["user", "reply"]);
-    v = view([{ op: "replayed" }, ev({ type: "user", data: "new" })], v);
-    expect(v.transcript.entries.map((e) => [e.kind, "text" in e ? e.text : ""])).toEqual([
+  it("a resubscribe that lists the new journal before its first record still puts it there", () => {
+    let v = view([...OLD, note(), { op: "journals", journals: ["j1", "j2"] }]);
+    v = view([at("j2", { type: "user", data: "new" })], v);
+    expect(lines(v)).toEqual([
       ["user", "old"],
       ["reply", "old reply"],
-      ["note", "Fresh conversation — the earlier one is above."],
+      ["note", NOTE],
       ["user", "new"],
     ]);
   });
 
-  it("a second note while one waits changes nothing, and a failed replay lets it through", () => {
-    const waiting = view([{ op: "reset" }, note()]);
+  it("survives a held replay: asked while a replay from the start holds the old entries, it lands at the boundary", () => {
+    const old = view(OLD);
+    let v = view([{ op: "reset" }, { op: "journals", journals: ["j1"] }, note()], old);
+    expect(v.held).not.toBeNull();
+    v = view([at("j1", { type: "user", data: "old" }), at("j1", { type: "text", data: "old reply" }), { op: "replayed" }], v);
+    expect(lines(v)).toEqual([
+      ["user", "old"],
+      ["reply", "old reply"],
+    ]);
+    v = view([at("j2", { type: "user", data: "new" })], v);
+    expect(lines(v)).toEqual([
+      ["user", "old"],
+      ["reply", "old reply"],
+      ["note", NOTE],
+      ["user", "new"],
+    ]);
+  });
+
+  it("is made again at the same boundary on each replay from the start, however the pages fall", () => {
+    let v = view([...OLD, note(), at("j2", { type: "user", data: "new" }), at("j2", { type: "text", data: "new reply" })]);
+    const placed = lines(v);
+    for (const pages of [
+      [[at("j1", { type: "user", data: "old" }), at("j1", { type: "text", data: "old reply" }), at("j1", { type: "finished", data: "completed" }), at("j2", { type: "user", data: "new" }), at("j2", { type: "text", data: "new reply" })]],
+      [[at("j1", { type: "user", data: "old" }), at("j1", { type: "text", data: "old reply" })], [at("j1", { type: "finished", data: "completed" })], [at("j2", { type: "user", data: "new" }), at("j2", { type: "text", data: "new reply" })]],
+    ]) {
+      v = view([{ op: "reset" }, { op: "journals", journals: ["j1", "j2"] }], v);
+      for (const page of pages) v = view(page, v);
+      v = view([{ op: "replayed" }], v);
+      expect(lines(v)).toEqual(placed);
+    }
+  });
+
+  it("a repeated ack while it waits changes nothing, and once placed, the same note straight after it adds none", () => {
+    const waiting = view([...OLD, note()]);
     expect(view([note()], waiting)).toBe(waiting);
-    const failed = view([{ op: "failed", reason: "x" }], waiting);
-    expect(failed.transcript.entries.map((e) => e.kind)).toEqual(["note"]);
+    const placed = view([at("j2", { type: "ready", data: "" }), note()], waiting);
+    expect(placed.transcript.entries.filter((e) => e.kind === "note")).toHaveLength(1);
+  });
+
+  it("stays inside the transcript bounds", () => {
+    const many = view([{ op: "journals", journals: ["j1"] }, ...Array.from({ length: 1_000 }, (_, i) => at("j1", { type: "user", data: `q${i}` })), note()]);
+    const after = view([at("j2", { type: "user", data: "new" })], many);
+    expect(after.transcript.entries).toHaveLength(1_000);
+    expect(after.transcript.entries[998]).toMatchObject({ kind: "note" });
+    expect(after.transcript.bytes).toBe(after.transcript.entries.reduce((n, e) => n + entrySize(e), 0));
   });
 
   it("is cleaned like any hub text", () => {
-    const v = view([{ op: "note", text: "a\u001b[31mb\u0007" }]);
+    const v = view([{ op: "journals", journals: ["j1"] }, { op: "note", text: "a\u001b[31mb\u0007" }, at("j2", { type: "user", data: "new" })]);
     expect(v.transcript.entries[0]).toMatchObject({ kind: "note", text: "ab" });
   });
 });

@@ -32,6 +32,17 @@ export type SessionState = Omit<StateInfo, "approvals">;
  * a completed turn finished, an interrupted one stopped, anything else (or an error) failed. */
 export type TurnEnd = "finished" | "failed" | "stopped";
 
+/** A fresh start (/new) the Mac took, as the journal boundary it falls on. */
+export interface FreshStart {
+  /** The divider's words. */
+  text: string;
+  /** The journals the session had when it was asked: the fresh conversation is the first one
+   * that is not among them. */
+  known: readonly string[];
+  /** That journal, once a record came from it; null before. */
+  journal: string | null;
+}
+
 export interface SessionView {
   transcript: Transcript;
   state: SessionState | null;
@@ -67,11 +78,12 @@ export interface SessionView {
   /** The `finished` records seen since the last replay from the start: the turns taken. Counted
    * here, not from the entries, which the view bounds and drops from the top. */
   turns: number;
-  /** A replay from the start began and its end (the hub's ack) has not come: the old
-   * conversation is still arriving. */
-  catchingUp: boolean;
-  /** A local note asked for meanwhile, to go after the replay's last record. */
-  pendingNote: string | null;
+  /** The last fresh start: its divider goes before the first record of its journal, and again
+   * there on each replay from the start. Null for none. */
+  fresh: FreshStart | null;
+  /** The fresh start's divider is in the transcript as it is now (since the last replay from the
+   * start). */
+  freshShown: boolean;
 }
 
 export const EMPTY_VIEW: SessionView = {
@@ -92,8 +104,8 @@ export const EMPTY_VIEW: SessionView = {
   epoch: 0,
   turn: null,
   turns: 0,
-  catchingUp: false,
-  pendingNote: null,
+  fresh: null,
+  freshShown: false,
 };
 
 /** One change to a session's view, in the order the hub sent it. */
@@ -109,7 +121,8 @@ export type Op =
   | { op: "catalog"; catalog: CatalogInfo }
   | { op: "failed"; reason: string | null }
   | { op: "ended"; ended: boolean }
-  /** A note the phone adds to the transcript itself, after what is there (a fresh start). */
+  /** The Mac took a fresh start: its divider goes in the transcript before the first record of
+   * the next journal. */
   | { op: "note"; text: string };
 
 /** Approvals waiting, at most. */
@@ -266,13 +279,17 @@ function approve(approvals: PendingApproval[], data: unknown): PendingApproval[]
   return approvals.length >= MAX_APPROVALS ? approvals : [...approvals, made];
 }
 
-/** The replay is over (or will not be): a note that waited for it goes in now. */
-function endCatchUp(v: SessionView, own: () => TranscriptDraft): void {
-  v.catchingUp = false;
-  if (v.pendingNote !== null) {
-    own().addLocalNote(v.pendingNote);
-    v.pendingNote = null;
-  }
+/** Before a record from `journal`: the fresh start's divider goes in when this is the first
+ * record of its journal (the first journal the session did not have when it was asked). */
+function freshBefore(v: SessionView, journal: string, own: () => TranscriptDraft): void {
+  const fresh = v.fresh;
+  if (fresh === null || v.freshShown) return;
+  if (fresh.journal === null) {
+    if (fresh.known.includes(journal)) return;
+    v.fresh = { ...fresh, journal };
+  } else if (fresh.journal !== journal) return;
+  own().addLocalNote(fresh.text);
+  v.freshShown = true;
 }
 
 /**
@@ -297,7 +314,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         v.epoch += 1;
         v.turn = null;
         v.turns = 0; // the replay brings every finished record again
-        v.catchingUp = true;
+        v.freshShown = false; // the replay brings its journal's first record again
         // What the latest state frame listed is still waiting; the replay fills it in or closes it.
         if (!alike(v.approvals, v.stated)) v.approvals = v.stated;
         if (v.closed.length > 0) v.closed = [];
@@ -314,19 +331,20 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
           v.replaying = false;
           v.held = null;
         }
-        endCatchUp(v, own);
         break;
       case "ended":
         v.ended = op.ended;
         break;
       case "note":
-        // The old conversation is still replaying: the note goes after its last record.
-        if (v.catchingUp) v.pendingNote = op.text;
-        else own().addLocalNote(op.text);
+        // Not at the end of what is there: the old journal may still have records to come (its
+        // last words, or the rest of a replay). The divider waits for the new journal's first.
+        // A repeated ack, while the same start waits for its journal, is the same start.
+        if (v.fresh !== null && v.fresh.journal === null && v.fresh.text === op.text) break;
+        v.fresh = { text: op.text, known: v.journals, journal: null };
+        v.freshShown = false;
         break;
       case "failed":
         v.failed = op.reason;
-        if (op.reason !== null) endCatchUp(v, own); // the replay will not finish
         break;
       case "state": {
         const state = cleanState(op.state, v.approvals, v.closed);
@@ -345,6 +363,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         const ev = op.ev;
         if (op.journal !== undefined) {
           const journal = str(op.journal, SHORT_CHARS);
+          freshBefore(v, journal, own);
           if (!v.journals.includes(journal)) setJournals(v, [...v.journals, journal]); // one the hub did not list yet
         }
         if (v.replaying) {
@@ -421,7 +440,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.epoch === view.epoch &&
     v.turn === view.turn &&
     v.turns === view.turns &&
-    v.catchingUp === view.catchingUp &&
-    v.pendingNote === view.pendingNote;
+    v.fresh === view.fresh &&
+    v.freshShown === view.freshShown;
   return same ? view : v;
 }

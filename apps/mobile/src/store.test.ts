@@ -101,6 +101,23 @@ describe("a question answered from the phone", () => {
     expect(store.getState().sessions[0]?.question).toBe(true);
   });
 
+  it("forgets the mark when the link to the Mac is ready again: the fresh list is the truth", () => {
+    store.getState().setHub("ready");
+    store.getState().applyBatch([sessions(question("a"))]);
+    store.getState().markAnswered("a");
+    store.getState().setHub("connecting");
+    // Still marked while the link is down.
+    expect(store.getState().answered.has("a")).toBe(true);
+    store.getState().setHub("ready");
+    expect(store.getState().answered.size).toBe(0);
+    store.getState().applyBatch([sessions(question("a"))]);
+    expect(store.getState().sessions[0]?.question).toBe(true);
+    // A ready that was ready already forgets nothing.
+    store.getState().markAnswered("a");
+    store.getState().setHub("ready");
+    expect(store.getState().answered.has("a")).toBe(true);
+  });
+
   it("forgets the mark when the session leaves the list, and on reset", () => {
     store.getState().applyBatch([sessions(question("a"))]);
     store.getState().markAnswered("a");
@@ -1120,6 +1137,30 @@ describe("a fresh start marked in the transcript", () => {
       ["note", NOTE],
       ["user", "new question"],
     ]);
+  });
+
+  it("is made again at the new journal's first record on a replay from the start, and after the transcript was let go", async () => {
+    const j2 = (seq: number, data: string): ToPhone => ({ v: 1, type: "event", session: "a", journal: "j2", seq, event: { type: "user", data } });
+    const replay = (): ToPhone[] => [
+      { v: 1, type: "subscribed", session: "a", from: "start", journals: ["j1", "j2"] },
+      user("a", "old"),
+      j2(1, "new"),
+      { v: 1, type: "replayed", session: "a" } as never,
+    ];
+    await apply(sessions(info("a")), subscribed("a", "start"), user("a", "old"), { v: 1, type: "replayed", session: "a" } as never);
+    store.getState().addNote("a", NOTE);
+    await apply(j2(1, "new"));
+    const placed = [
+      ["user", "old"],
+      ["note", NOTE],
+      ["user", "new"],
+    ];
+    expect(lines("a")).toEqual(placed);
+    await apply(...replay());
+    expect(lines("a")).toEqual(placed);
+    expect(store.getState().evict("a")).toBe(true);
+    await apply(...replay());
+    expect(lines("a")).toEqual(placed);
   });
 
   it("is not made for a session the store holds no view of: a later watch must still start fresh", () => {

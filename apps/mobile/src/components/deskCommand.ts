@@ -47,12 +47,17 @@ export interface DeskCommand {
 
 /** The desk's commands for `session`, one at a time. */
 export function useDeskCommand(session: string, send: Send): DeskCommand {
-  // The fresh-start divider is the Mac's doing as soon as it acks, whether or not this screen is
-  // still there to see it.
+  // The fresh start is the Mac's doing as soon as it acks, whether or not this screen is still
+  // there to see it: the divider goes in, and a question the old conversation ended on is no
+  // longer asked.
   const marking = useCallback<Send>(
     (body) =>
       send(body).then((ack) => {
-        if (body.type === "command" && body.name === "new") octetStore.getState().addNote(session, FRESH_NOTE);
+        if (body.type === "command" && body.name === "new") {
+          const store = octetStore.getState();
+          store.addNote(session, FRESH_NOTE);
+          store.markAnswered(session);
+        }
         return ack;
       }),
     [send, session],

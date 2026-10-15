@@ -144,7 +144,8 @@ export function classify(
     const base = { id: s.id, name: sessionName(s.workspace), ago: shortAgo(s.last_activity, now) };
     if (s.approvals > 0) {
       out.needs.push(needsItem(s, fronts.get(s.id) ?? null, base));
-    } else if (s.question === true) {
+    } else if (s.question === true && s.phase !== "running") {
+      // A running turn has moved past the question, whatever the row still says.
       out.needs.push({
         ...base,
         status: "● question",

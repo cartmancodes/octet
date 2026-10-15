@@ -124,7 +124,7 @@ describe("while the app is in the foreground", () => {
 describe("Android channels", () => {
   const android = () => jest.replaceProperty(Platform, "OS", "android");
 
-  it("creates approvals (high, with sound) and turns (default) at start-up", async () => {
+  it("creates approvals and errors (high, with sound) and turns (default) at start-up", async () => {
     const replaced = android();
     try {
       await configureNotifications();
@@ -136,7 +136,14 @@ describe("Android channels", () => {
       importance: 6,
       sound: "default",
     });
+    expect(n.setNotificationChannelAsync).toHaveBeenCalledWith("errors", {
+      name: "Session errors",
+      importance: 6,
+      sound: "default",
+    });
     expect(n.setNotificationChannelAsync).toHaveBeenCalledWith("turns", { name: "Finished turns", importance: 5 });
+    // Every channel the hub's pushes name, and no other.
+    expect(n.setNotificationChannelAsync.mock.calls.map(([id]) => id).sort()).toEqual(["approvals", "errors", "turns"]);
   });
 
   it("creates no channel on iOS", async () => {

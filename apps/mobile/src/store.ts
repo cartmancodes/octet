@@ -55,7 +55,8 @@ export interface OctetState {
   remember(session: string, text: string): void;
   /** Sessions whose question the user answered from this phone, whose rows the Mac may not have
    * caught up with: such a row's `question` is not kept. A session leaves this when a row of
-   * it comes without a question (the Mac caught up), when it leaves the list, and on reset. */
+   * it comes without a question (the Mac caught up), when it leaves the list, when the link to
+   * the Mac is ready again, and on reset. */
   answered: ReadonlySet<string>;
   /** The user sent something to `session`: its row stops asking, at once. Nothing for a session
    * that is not asking now (a question that comes later must show). */
@@ -67,9 +68,10 @@ export interface OctetState {
   reset(): void;
   /** The hub refused to stream `session` for good. */
   subscribeFailed(session: string, reason: string): void;
-  /** Adds a note of the phone's own after the session's transcript (once: the same note straight
-   * after itself adds nothing). False, and nothing made, for a session the store holds no view
-   * of: a view made here would stop a later `watch` from starting fresh. */
+  /** Marks a fresh start the Mac took: its divider goes before the first record of the
+   * session's next journal, and again there on a replay from the start. False, and nothing made,
+   * for a session the store holds no view of: a view made here would stop a later `watch` from
+   * starting fresh. */
   addNote(session: string, text: string): boolean;
   /** Lets go of a live session's transcript and approvals, keeping what other screens read of it
    * (its catalog and last state). False for a session with no view, or one that ended. */
@@ -330,13 +332,18 @@ export function createOctetStore(): OctetStore {
     },
 
     setHub(hub) {
-      if (get().hub !== hub) set({ hub });
+      const was = get().hub;
+      if (was === hub) return;
+      // A link ready again brings a fresh list, which is the truth: an answer the Mac never heard
+      // (the link went down first) must not hide its question.
+      set(hub === "ready" ? { hub, answered: NO_ANSWERED } : { hub });
     },
 
     evict(session) {
       const v = get().bySession.get(session);
       if (!v || v.ended) return false;
-      const kept: SessionView = { ...EMPTY_VIEW, state: v.state, catalog: v.catalog, mode: v.mode, model: v.model, usage: v.usage, epoch: v.epoch + 1 };
+      // A fresh start's divider is made again from its journal when the transcript comes back.
+      const kept: SessionView = { ...EMPTY_VIEW, state: v.state, catalog: v.catalog, mode: v.mode, model: v.model, usage: v.usage, epoch: v.epoch + 1, fresh: v.fresh };
       set((st) => ({ bySession: new Map(st.bySession).set(session, kept) }));
       return true;
     },

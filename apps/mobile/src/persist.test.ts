@@ -86,6 +86,28 @@ describe("settings", () => {
     }
   });
 
+  it("an app upgraded from before push kinds keeps what the Mac was pushing it: all three while notifications are on", async () => {
+    const before = { deviceName: "Old", faceId: true, hubUrl: "wss://mac.tail1234.ts.net/", textSize: 13 };
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...before, notifications: true }));
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: true, turns: true });
+    // A save writes them down, so they stay what they were.
+    await saveSettings({ textSize: 14 });
+    expect(JSON.parse((await AsyncStorage.getItem(SETTINGS_KEY)) ?? "null").pushKinds).toEqual({
+      approvals: true,
+      errors: true,
+      turns: true,
+    });
+    // Notifications off: nothing was being pushed, so the kinds are a new pairing's.
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...before, notifications: false }));
+    expect((await loadSettings()).pushKinds).toEqual(DEFAULT_PUSH_KINDS);
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(before));
+    expect((await loadSettings()).pushKinds).toEqual(DEFAULT_PUSH_KINDS);
+    // Kinds that were saved are kept, notifications on or not.
+    const kinds = { approvals: true, errors: false, turns: false };
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...before, notifications: true, pushKinds: kinds }));
+    expect((await loadSettings()).pushKinds).toEqual(kinds);
+  });
+
   it("the transcript text size is 13 by default, 12, 13 or 14 when saved, and 13 for anything else", async () => {
     expect((await loadSettings()).textSize).toBe(13);
     for (const size of [12, 14, 13] as const) {

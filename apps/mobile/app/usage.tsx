@@ -65,8 +65,10 @@ export default function Usage() {
   const client = useHubClient();
 
   // The session streams while this screen is in front, as it does for the Conversation under it:
-  // USAGE and TURNS are live. An ended session has nothing more to stream. The two screens hold
-  // the one subscription together (`watch` counts them).
+  // USAGE and TURNS are live. An ended session has nothing more to stream. Navigation blurs the
+  // Conversation before this screen focuses, so opening it is one unsubscribe and one resubscribe
+  // (a cursor resume, not a replay); `watch` counts holds so that the other order would not drop
+  // the stream either.
   useFocusEffect(
     useCallback(() => {
       if (!client || id === "") return;
