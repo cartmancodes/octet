@@ -125,6 +125,7 @@ export default function RootLayout() {
             <Stack.Screen name="recent" options={{ title: "Resume a session" }} />
             <Stack.Screen name="settings" options={{ title: "Settings", headerShown: false, ...OWN_EDGE }} />
             <Stack.Screen name="usage" options={{ title: "Usage", headerShown: false }} />
+            <Stack.Screen name="changes" options={{ title: "Changes", headerShown: false }} />
           </Stack.Protected>
           <Stack.Protected guard={!paired || offer}>
             <Stack.Screen name="pair" options={{ title: "Pair", headerShown: false }} />

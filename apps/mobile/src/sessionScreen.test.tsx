@@ -79,7 +79,7 @@ async function launch(list: SessionInfo[], at?: string) {
     </HubContext.Provider>
   );
   const view = renderRouter(
-    { _layout: Layout, index: Sessions, pair: Pair, "session/[id]": Session, recent: () => null, new: () => null, settings: () => null, usage: Usage },
+    { _layout: Layout, index: Sessions, pair: Pair, "session/[id]": Session, recent: () => null, new: () => null, settings: () => null, usage: Usage, changes: () => null },
     at ? { initialUrl: at } : undefined,
   );
   await view;

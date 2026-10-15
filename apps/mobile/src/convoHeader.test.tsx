@@ -88,6 +88,7 @@ const header = (r: Rig, o: Opts = {}) => (
     phase={o.phase}
     onCovered={o.onCovered ?? noop}
     onUsage={o.onUsage ?? noop}
+    onChanges={noop}
   />
 );
 const noop = () => undefined;

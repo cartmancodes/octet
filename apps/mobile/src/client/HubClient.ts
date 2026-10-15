@@ -1,6 +1,8 @@
 import type {
   AckFrame,
+  ChangesFrame,
   Cursor,
+  DiffFrame,
   FromPhone,
   RecentFrame,
   RefusalCode,
@@ -9,6 +11,7 @@ import type {
 } from "../protocol";
 import { PROTOCOL_VERSION } from "../protocol";
 import { SHORT_CHARS, field } from "../model/text";
+import { cleanChanges, cleanDiff } from "./answers";
 import { Backoff } from "./backoff";
 import { Cursors } from "./cursors";
 import { parseFrame } from "./frames";
@@ -35,8 +38,9 @@ export interface ReplayedMark {
 /** What a batch carries: the hub's frames, in order, and the client's replayed marks among them. */
 export type BatchItem = ToPhone | ReplayedMark;
 
-/** What answers a request: `ack`, or `recent` for the `recent` command. */
-export type Ack = AckFrame | RecentFrame;
+/** What answers a request: `ack`, or the frame of the same name for `recent`, `changes` and
+ * `diff` (the last two cleaned, answers.ts). */
+export type Ack = AckFrame | RecentFrame | ChangesFrame | DiffFrame;
 
 /**
  * A command that was not done. `code` is the hub's, or one of two the phone makes up:
@@ -303,12 +307,13 @@ export class HubClient {
     this.connect();
   }
 
-  /** Sends a command and resolves with its `ack` (or `recent`) frame. Rejects with a
-   * `Refusal`: the hub's code and words, `lost` after 45 s, or `unsent` when not ready. The hub
-   * answers a command it gave up on (30 s, swept every second) with its own `timeout`, so the
-   * phone waits longer than that. A request with no answer in 45 s on a link that has also been
-   * silent for 10 s takes the link for dead: the socket is closed and the client reconnects with
-   * its backoff, resuming every session from its cursor. A link that is still talking is kept. */
+  /** Sends a command and resolves with its `ack` (or `recent`, `changes` or `diff`) frame.
+   * Rejects with a `Refusal`: the hub's code and words, `lost` after 45 s, or `unsent` when not
+   * ready. The hub answers a command it gave up on (30 s, swept every second) with its own
+   * `timeout`, so the phone waits longer than that. A request with no answer in 45 s on a link
+   * that has also been silent for 10 s takes the link for dead: the socket is closed and the
+   * client reconnects with its backoff, resuming every session from its cursor. A link that is
+   * still talking is kept. */
   request(cmd: RequestBody): Promise<Ack> {
     const socket = this.socket;
     if (this.stateValue !== "ready" || !socket) {
@@ -562,6 +567,17 @@ export class HubClient {
         } else {
           this.settled(frame.req); // else a late answer to a request that timed out: dropped
         }
+        return;
+      }
+      case "changes":
+      case "diff": {
+        // Only ever an answer to a request: a late one (it timed out) is dropped.
+        if (this.pinged(frame.req)) return;
+        const entry = this.pending.get(frame.req);
+        if (!entry) return;
+        this.pending.delete(frame.req);
+        entry.cancel();
+        entry.resolve(frame.type === "changes" ? cleanChanges(frame) : cleanDiff(frame));
         return;
       }
       case "refused":

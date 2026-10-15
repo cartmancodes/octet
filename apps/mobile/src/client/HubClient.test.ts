@@ -215,6 +215,112 @@ describe("requests", () => {
     await expect(pending).resolves.toMatchObject({ type: "recent", items: [] });
   });
 
+  it("a changes frame answers its request, its strings cleaned and its numbers whole", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "changes", session: "s" });
+    const req = r.sockets.last.commandsOf("changes")[0]?.req;
+    expect(r.sockets.last.commandsOf("changes")[0]).toEqual({ v: 1, type: "changes", req, session: "s" });
+    r.sockets.last.receive({
+      type: "changes",
+      req,
+      branch: "feat\u001b[31m/x‮",
+      upstream: "origin/\u0007feat",
+      ahead: 2.7,
+      behind: -3,
+      more: "9",
+      files: [
+        { path: "src/\u001b]8;;https://evil.test\u0007a.ts\u001b]8;;\u0007", add: 3, del: 1, binary: false, status: "M" },
+        { path: "b‏c.png", add: -1, del: Number.MAX_VALUE, binary: true, status: "A" },
+        { path: "weird", add: 1, del: 0, binary: "yes", status: "Z" },
+        { path: 7, add: 1, del: 0, binary: false, status: "M" },
+        "not a file",
+      ],
+    });
+    await expect(pending).resolves.toEqual({
+      v: 1,
+      type: "changes",
+      req,
+      branch: "feat/x",
+      upstream: "origin/feat",
+      ahead: 2,
+      behind: 0,
+      more: 0,
+      files: [
+        { path: "src/a.ts", add: 3, del: 1, binary: false, status: "M" },
+        { path: "bc.png", add: 0, del: Number.MAX_SAFE_INTEGER, binary: true, status: "A" },
+        { path: "weird", add: 1, del: 0, binary: false, status: "?" },
+      ],
+    });
+  });
+
+  it("a changes frame with no branch says so", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "changes", session: "s" });
+    const req = r.sockets.last.commandsOf("changes")[0]?.req;
+    r.sockets.last.receive({ type: "changes", req, ahead: 0, behind: 0, files: [], more: 0 });
+    await expect(pending).resolves.toMatchObject({ type: "changes", branch: null, upstream: null, files: [] });
+  });
+
+  it("a diff frame answers its request, its text cleaned with its newlines kept", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "diff", session: "s", path: "src/a.ts" });
+    const req = r.sockets.last.commandsOf("diff")[0]?.req;
+    expect(r.sockets.last.commandsOf("diff")[0]).toEqual({ v: 1, type: "diff", req, session: "s", path: "src/a.ts" });
+    r.sockets.last.receive({
+      type: "diff",
+      req,
+      path: "src/\u001b[2Ja.ts",
+      text: "@@ -1 +1 @@\r\n-old\u001b]0;title\u0007\n+new‮\tx\n",
+      clipped: true,
+      binary: 1,
+    });
+    await expect(pending).resolves.toEqual({
+      v: 1,
+      type: "diff",
+      req,
+      path: "src/a.ts",
+      text: "@@ -1 +1 @@\n-old\n+new    x\n",
+      clipped: true,
+      binary: false,
+    });
+  });
+
+  it("a changes or diff frame of the wrong shape is not an answer", async () => {
+    const r = rig();
+    ready(r);
+    let outcome: unknown = "pending";
+    void r.client.request({ type: "changes", session: "s" }).then((x) => (outcome = x));
+    const req = r.sockets.last.commandsOf("changes")[0]?.req;
+    r.sockets.last.receive({ type: "changes", req, files: "none" });
+    r.sockets.last.receive({ type: "diff", req, path: "a", text: 5 });
+    await Promise.resolve();
+    expect(outcome).toBe("pending");
+    r.sockets.last.receive({ type: "changes", req, ahead: 0, behind: 0, files: [], more: 0 });
+    await Promise.resolve();
+    expect(outcome).toMatchObject({ type: "changes" });
+  });
+
+  it("a late changes or diff answer is dropped, not delivered", async () => {
+    const r = rig();
+    ready(r);
+    const changes = r.client.request({ type: "changes", session: "s" }).catch((e: unknown) => e);
+    const diff = r.client.request({ type: "diff", session: "s", path: "a" }).catch((e: unknown) => e);
+    chatter(r, REQUEST_TIMEOUT_MS);
+    await expect(changes).resolves.toMatchObject({ code: "lost" });
+    await expect(diff).resolves.toMatchObject({ code: "lost" });
+    const changesReq = r.sockets.last.commandsOf("changes")[0]?.req;
+    const diffReq = r.sockets.last.commandsOf("diff")[0]?.req;
+    r.sockets.last.receive({ type: "changes", req: changesReq, ahead: 0, behind: 0, files: [], more: 0 });
+    r.sockets.last.receive({ type: "diff", req: diffReq, path: "a", text: "", clipped: false, binary: false });
+    // An answer to nothing asked is dropped too.
+    r.sockets.last.receive({ type: "changes", req: 9_999, ahead: 0, behind: 0, files: [], more: 0 });
+    flush(r);
+    expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
+  });
+
   it("a refusal without a code is invalid", async () => {
     const r = rig();
     ready(r);

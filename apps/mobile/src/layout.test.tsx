@@ -77,6 +77,7 @@ async function launch(opts: { paired?: boolean } = {}) {
     new: () => null,
     settings: () => null,
     usage: () => <Text>Usage x</Text>,
+    changes: () => null,
   });
   await view;
   return { hub, sockets, clock, view };
@@ -105,7 +106,7 @@ describe("the app shell", () => {
       </HubContext.Provider>
     );
     const view = renderRouter(
-      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => null, recent: () => null, new: () => null, settings: () => null, usage: () => <Text>Usage x</Text> },
+      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => null, recent: () => null, new: () => null, settings: () => null, usage: () => <Text>Usage x</Text>, changes: () => null },
       { initialUrl: "/usage?id=x" },
     );
     await view;
@@ -122,7 +123,7 @@ describe("the app shell", () => {
       </HubContext.Provider>
     );
     const view = renderRouter(
-      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text>, recent: () => null, new: () => null, settings: () => null, usage: () => <Text>Usage x</Text> },
+      { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text>, recent: () => null, new: () => null, settings: () => null, usage: () => <Text>Usage x</Text>, changes: () => null },
       { initialUrl: "/session/x" },
     );
     await view;

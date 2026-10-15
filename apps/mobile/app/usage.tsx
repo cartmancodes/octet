@@ -1,5 +1,5 @@
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -48,9 +48,9 @@ function byActivity(rows: readonly SessionInfo[]): SessionInfo[] {
 
 /**
  * Usage, opened from ⋯ in a conversation (`/usage?id=<session>`): this session's engine, latest
- * usage line, turns and newest journal; every session's usage line for today; and Export journal
- * and Fresh context, which are the desk's /export and /new. It shows what the phone holds of the
- * session (the conversation, behind it, is not streaming meanwhile). There is no context bar:
+ * usage line, turns and newest journal; Changes ›; every session's usage line for today; and
+ * Export journal and Fresh context, which are the desk's /export and /new. It shows what the
+ * phone holds of the session (the conversation, behind it, is not streaming meanwhile). There is no context bar:
  * the desk reports no context size. Everything the hub sent is drawn as plain text.
  */
 export default function Usage() {
@@ -68,9 +68,11 @@ export default function Usage() {
   // USAGE and TURNS are live. An ended session has nothing more to stream. Navigation blurs the
   // Conversation before this screen focuses, so opening it is one unsubscribe and one resubscribe
   // (a cursor resume, not a replay); `watch` counts holds so that the other order would not drop
-  // the stream either.
+  // the stream either. Changes opens once however fast its row is tapped; back in front, again.
+  const toChanges = useRef(false);
   useFocusEffect(
     useCallback(() => {
+      toChanges.current = false;
       if (!client || id === "") return;
       if (octetStore.getState().bySession.get(id)?.ended) return;
       if (octetStore.getState().sessions.every((x) => x.id !== id)) return; // not in the list: the hub would refuse
@@ -101,6 +103,11 @@ export default function Usage() {
     if (router.canGoBack()) router.back();
     else router.replace("/");
   }, [router]);
+  const openChanges = useCallback(() => {
+    if (toChanges.current) return;
+    toChanges.current = true;
+    router.push({ pathname: "/changes", params: { id } });
+  }, [router, id]);
   const exportJournal = useCallback(() => void run("export"), [run]);
   const askFresh = useCallback(() => setAsking(true), []);
   const cancelFresh = useCallback(() => setAsking(false), []);
@@ -207,6 +214,9 @@ export default function Usage() {
                 <Text style={s.value}>{journal ?? NO_JOURNAL}</Text>
               </View>
             </Card>
+            <Pressable accessibilityRole="button" accessibilityLabel="Changes" onPress={openChanges} style={s.action}>
+              <Text style={s.actionName}>Changes ›</Text>
+            </Pressable>
             <Card title="Today" testID="today">
               {today.length === 0 ? <Text style={s.lineUsage}>{NO_USAGE}</Text> : null}
               {today.map(({ row, usage: line }) => (

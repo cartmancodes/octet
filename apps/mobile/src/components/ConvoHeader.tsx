@@ -75,6 +75,8 @@ interface ConvoHeaderProps {
   onCovered: (covered: boolean) => void;
   /** ⋯ was pressed: open the Usage screen. Must be stable. */
   onUsage: () => void;
+  /** Session info's "Changes ›" was pressed: open the Changes screen. Must be stable. */
+  onChanges: () => void;
 }
 
 /**
@@ -85,7 +87,19 @@ interface ConvoHeaderProps {
  * draws it again; Aa changes the size without reading it, so the header does not draw again for
  * that either.
  */
-export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live, offline, approval, phase, focused, onCovered, onUsage }: ConvoHeaderProps) {
+export const ConvoHeader = memo(function ConvoHeader({
+  session,
+  send,
+  top,
+  live,
+  offline,
+  approval,
+  phase,
+  focused,
+  onCovered,
+  onUsage,
+  onChanges,
+}: ConvoHeaderProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const head = useSessionHead(session);
@@ -158,6 +172,10 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
     if (!offline) setEnding(true);
   }, [offline]);
   const keep = useCallback(() => setEnding(false), []);
+  const toChanges = useCallback(() => {
+    hideInfo();
+    onChanges();
+  }, [hideInfo, onChanges]);
   const end = useCallback(() => {
     if (offline) return;
     setEnding(false);
@@ -226,6 +244,9 @@ export const ConvoHeader = memo(function ConvoHeader({ session, send, top, live,
               <Field label="Mode" value={headMode(catalog, head)} />
               <Field label="Workspace" value={workspace ?? ""} />
               <Field label="Session" value={session} />
+              <View style={s.endRow}>
+                <Button label="Changes ›" accessibilityLabel="Changes" onPress={toChanges} />
+              </View>
               {canEnd ? (
                 <View style={s.end}>
                   {ending ? (

@@ -71,18 +71,18 @@ export default function Session() {
   const insets = useSafeAreaInsets();
   const setTaskOpen = octetStore.getState().setTaskOpen;
 
-  // Usage is opening over this screen: an ended session's view is not let go of meanwhile (Usage
-  // shows what it left), and ⋯ pushes once however fast it is tapped.
-  const toUsage = useRef(false);
+  // Usage or Changes is opening over this screen: an ended session's view is not let go of
+  // meanwhile (they show what it left), and each way there pushes once however fast it is tapped.
+  const toOwn = useRef(false);
   useFocusEffect(
     useCallback(() => {
-      toUsage.current = false; // in front again
+      toOwn.current = false; // in front again
       if (!client || id === "") return;
       // An ended session's view is what it left behind: there is nothing more to stream.
       if (!octetStore.getState().bySession.get(id)?.ended) watch(octetStore, client, id);
       return () => {
         unwatch(client, id);
-        if (!toUsage.current) releaseSession(octetStore, client, id);
+        if (!toOwn.current) releaseSession(octetStore, client, id);
       };
     }, [client, id]),
   );
@@ -110,9 +110,23 @@ export default function Session() {
       return next;
     });
   }, []);
+  // A file-edit tool entry's "view ›": Changes, with that file open. It reads the focus from a
+  // ref, so that a change of focus does not draw every row again.
+  const inFront = useRef(focused);
+  useEffect(() => {
+    inFront.current = focused;
+  }, [focused]);
+  const viewChanges = useCallback(
+    (file: string) => {
+      if (!inFront.current || toOwn.current) return;
+      toOwn.current = true;
+      router.push({ pathname: "/changes", params: { id, file } });
+    },
+    [router, id],
+  );
   const renderItem = useCallback<ListRenderItem<Entry>>(
-    ({ item }) => <TranscriptRow entry={item} open={open.has(item.key)} onToggle={toggle} size={size} />,
-    [open, toggle, size],
+    ({ item }) => <TranscriptRow entry={item} open={open.has(item.key)} onToggle={toggle} size={size} onView={viewChanges} />,
+    [open, toggle, size, viewChanges],
   );
   const extra = useMemo(() => ({ open, size }), [open, size]);
 
@@ -126,10 +140,16 @@ export default function Session() {
 
   // ⋯: this session's Usage, once (a second tap while it opens would stack a second copy).
   const usage = useCallback(() => {
-    if (!focused || toUsage.current) return;
-    toUsage.current = true;
+    if (!focused || toOwn.current) return;
+    toOwn.current = true;
     router.push({ pathname: "/usage", params: { id, workspace: workspace ?? "" } });
   }, [focused, router, id, workspace]);
+  // Session info's "Changes ›".
+  const changes = useCallback(() => {
+    if (!focused || toOwn.current) return;
+    toOwn.current = true;
+    router.push({ pathname: "/changes", params: { id } });
+  }, [focused, router, id]);
 
   // Not listed, and nothing to show: never heard of (once the list came), or refused with no
   // transcript (a deep link to an id the Mac does not have).
@@ -192,6 +212,7 @@ export default function Session() {
           focused={focused}
           onCovered={setSheetOpen}
           onUsage={usage}
+          onChanges={changes}
         />
         <HubBanner state={hub} announce={focused} />
         {gone ? (

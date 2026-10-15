@@ -72,6 +72,11 @@ export function parseFrame(text: string): ToPhone | null {
         return isStr(value.session) && isObj(value.catalog);
       case "recent":
         return isUint(value.req) && Array.isArray(value.items);
+      // Their strings and numbers are cleaned before the request resolves (answers.ts).
+      case "changes":
+        return isUint(value.req) && Array.isArray(value.files);
+      case "diff":
+        return isUint(value.req) && isStr(value.path) && isStr(value.text);
       case "ack":
         return isUint(value.req) && isStr(value.message);
       case "refused":

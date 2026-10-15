@@ -71,6 +71,7 @@ export async function mount(url: string, routes: Record<string, ComponentType>) 
       },
       recent: () => null,
       usage: () => null,
+      changes: () => null,
       new: () => null,
       settings: () => null,
       ...routes,

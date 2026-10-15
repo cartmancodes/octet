@@ -17,6 +17,8 @@ interface TranscriptRowProps {
   onToggle: (key: string) => void;
   /** The transcript's text size (`Aa`); 13 when not given. */
   size?: TextSize;
+  /** A file-edit tool entry's "view ›" (ToolRun). Must be stable. */
+  onView?: (file: string) => void;
 }
 
 function makeStyles(theme: Theme, size: TextSize) {
@@ -42,7 +44,7 @@ const stylesFor = sizedStyles(makeStyles);
  * entry, which the store replaces only when it changes: while a reply streams, only its row draws
  * again. A new text size draws every row again.
  */
-export const TranscriptRow = memo(function TranscriptRow({ entry, open, onToggle, size = DEFAULT_SETTINGS.textSize }: TranscriptRowProps) {
+export const TranscriptRow = memo(function TranscriptRow({ entry, open, onToggle, size = DEFAULT_SETTINGS.textSize, onView }: TranscriptRowProps) {
   const theme = useTheme();
   const s = stylesFor(theme, size);
   const role = rowRole(entry);
@@ -50,7 +52,7 @@ export const TranscriptRow = memo(function TranscriptRow({ entry, open, onToggle
     <View style={s.row}>
       <Text style={s[role.tone]}>{role.label}</Text>
       {entry.kind === "tools" ? (
-        <ToolRun entry={entry} open={open} onToggle={onToggle} size={size} />
+        <ToolRun entry={entry} open={open} onToggle={onToggle} size={size} onView={onView} />
       ) : entry.kind === "reply" ? (
         <Markdown text={entry.text} streaming={!entry.done} size={size} />
       ) : (
