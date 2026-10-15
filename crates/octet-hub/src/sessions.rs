@@ -24,7 +24,9 @@
 //! error records came since the hub first saw it (for the error push), and whether the last
 //! finished turn's reply ended on a question. When the hub first sees a session they are seeded
 //! from at most the last [`SEED_BYTES`] of its newest journal (errors aside: those were before the
-//! hub looked). A change to them is a [`SessionUpdate::Changed`] after the records' events.
+//! hub looked). A journal the session moved on from keeps every fact while it is drained before
+//! the newest starts; what it gets later, read beside the newest, only counts errors. A change to
+//! them is a [`SessionUpdate::Changed`] after the records' events.
 use crate::{
     push::Snapshot,
     tail::{Tail, event_of, file_name},
@@ -42,7 +44,7 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{
         UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
@@ -215,8 +217,8 @@ struct Facts {
     errors: u64,
     /// The last [`REPLY_CHARS`] characters of the reply text since the last `user` record.
     reply: String,
-    /// The last finished turn's reply, trimmed, ended on `?`; cleared by the next `user` record.
-    /// A heuristic: the reply may ask in other words, or quote a question.
+    /// The last finished turn completed and its reply, trimmed, ended on `?`; cleared by the next
+    /// `user` record. A heuristic: the reply may ask in other words, or quote a question.
     question: bool,
 }
 
@@ -252,11 +254,20 @@ impl Facts {
                 std::mem::replace(&mut self.question, false)
             }
             "finished" => {
-                let asked = self.reply.trim_end().ends_with('?');
+                // Only a turn that completed asked: an interrupted or failed one was cut short.
+                let asked =
+                    data.as_str() == Some("completed") && self.reply.trim_end().ends_with('?');
                 asked != std::mem::replace(&mut self.question, asked)
             }
             _ => false,
         }
+    }
+
+    /// Takes one record of `kind` from a journal the session moved on from, read after the
+    /// newest began ([`Heard::Late`]): only an error counts, since the usage, reply and question
+    /// are the newest journal's now. Whether the pusher sees a change.
+    fn take_late(&mut self, kind: &str) -> bool {
+        kind == "error" && self.take(kind, &Value::Null)
     }
 
     /// Adds a chunk of the reply, keeping its last [`REPLY_CHARS`] characters.
@@ -287,31 +298,58 @@ fn last_chars(text: &str, count: usize) -> &str {
     }
 }
 
+/// The record kinds a seed parses, as a journal line spells them; any other line is passed over
+/// without being parsed.
+const SEEDED: [&[u8]; 5] = [
+    br#""type":"usage""#,
+    br#""type":"error""#,
+    br#""type":"text""#,
+    br#""type":"user""#,
+    br#""type":"finished""#,
+];
+
 /// The facts the last [`SEED_BYTES`] before `end` of `journal` hold, and the bytes read. One
-/// bounded read; when it starts past the journal's beginning, what comes before its first newline
-/// is the end of an earlier line and is passed over. Errors are not counted: they were before the
-/// hub looked. A journal that cannot be read seeds nothing.
+/// bounded read, of the window and the byte before it: when the window starts past the
+/// journal's beginning, everything through the first newline read is the end of an earlier line
+/// and is passed over, so a line that starts the window exactly is kept whole. The read and the
+/// parse run off the async threads. Errors are not counted: they were before the hub looked. A
+/// journal that cannot be read seeds nothing.
 async fn seed(journal: &Path, end: u64) -> (Facts, u64) {
+    let journal = journal.to_owned();
+    tokio::task::spawn_blocking(move || seed_now(&journal, end))
+        .await
+        .unwrap_or_default()
+}
+
+/// [`seed`], blocking.
+fn seed_now(journal: &Path, end: u64) -> (Facts, u64) {
+    use std::io::{Read, Seek};
     let start = end.saturating_sub(SEED_BYTES);
-    let read = async {
-        let mut file = tokio::fs::File::open(journal).await?;
-        if !file.metadata().await?.is_file() {
+    let from = start.saturating_sub(1);
+    let read = || {
+        let mut file = std::fs::File::open(journal)?;
+        if !file.metadata()?.is_file() {
             return Err(std::io::Error::other("not a regular file"));
         }
-        file.seek(SeekFrom::Start(start)).await?;
+        file.seek(SeekFrom::Start(from))?;
         let mut bytes = Vec::new();
-        file.take(end - start).read_to_end(&mut bytes).await?;
-        Ok(bytes)
+        file.take(end - from).read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
     };
     let mut facts = Facts::default();
-    let Ok(bytes) = read.await else {
+    let Ok(bytes) = read() else {
         return (facts, 0);
     };
     let mut lines = bytes.split(|&byte| byte == b'\n');
     if start > 0 {
         lines.next();
     }
-    for line in lines {
+    let seeded = |line: &[u8]| {
+        SEEDED
+            .iter()
+            .any(|kind| line.windows(kind.len()).any(|at| at == *kind))
+    };
+    for line in lines.filter(|line| seeded(line)) {
         let Ok(record) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
@@ -730,7 +768,7 @@ impl Sessions {
                 let found = match tail.read().await {
                     Ok(records) => emit(
                         &mut self.pending,
-                        &mut live.facts,
+                        (&mut live.facts, Heard::Late),
                         id,
                         &file_name(tail.path()),
                         &records,
@@ -750,7 +788,7 @@ impl Sessions {
             {
                 let found = emit(
                     &mut self.pending,
-                    &mut live.facts,
+                    (&mut live.facts, Heard::Whole),
                     id,
                     &file_name(tail.path()),
                     &records,
@@ -826,10 +864,20 @@ struct Emitted {
     changed: bool,
 }
 
-/// Queues an event for each record `records` holds, and keeps `facts` up to date with them.
+/// How the records a tail reads reach the session's [`Facts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heard {
+    /// In the session's order: the newest journal, or one drained before the newest starts.
+    Whole,
+    /// From a journal the session moved on from, read after the newest began: errors only.
+    Late,
+}
+
+/// Queues an event for each record `records` holds, and keeps `facts` up to date with them as
+/// `heard` says.
 fn emit(
     pending: &mut VecDeque<SessionUpdate>,
-    facts: &mut Facts,
+    (facts, heard): (&mut Facts, Heard),
     id: &str,
     journal: &str,
     records: &[Value],
@@ -839,7 +887,10 @@ fn emit(
         emitted.any = true;
         emitted.stopped |= record["type"] == "stopped";
         if let Some(kind) = record["type"].as_str() {
-            emitted.changed |= facts.take(kind, &record["data"]);
+            emitted.changed |= match heard {
+                Heard::Whole => facts.take(kind, &record["data"]),
+                Heard::Late => facts.take_late(kind),
+            };
         }
         pending.push_back(SessionUpdate::Event {
             id: id.to_owned(),
@@ -880,6 +931,9 @@ async fn follow(
     passed.extend(between.iter().map(|path| Tail::new(path.clone())));
     let mut changed = false;
     for mut tail in passed {
+        // What these journals have left comes before the newest's first record, in the
+        // session's own order, so it is the session's history and keeps every fact. Only what
+        // they get later, read beside the newest (`previous`), is late and counts errors alone.
         let drained = drain(&mut tail, &mut live.facts, &id, pending).await;
         changed |= drained.changed;
         if !drained.stopped {
@@ -905,7 +959,7 @@ async fn drain(
         let Ok(records) = tail.read().await else {
             return drained;
         };
-        let found = emit(pending, facts, id, &journal, &records);
+        let found = emit(pending, (facts, Heard::Whole), id, &journal, &records);
         drained.any |= found.any;
         drained.stopped |= found.stopped;
         drained.changed |= found.changed;
@@ -1738,6 +1792,24 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_that_did_not_complete_asks_nothing() {
+        let mut facts = Facts::default();
+        for outcome in ["interrupted", "failed", "something new"] {
+            facts.take("user", &json!("go"));
+            facts.take("text", &json!("Shall I go on?"));
+            assert!(!facts.take("finished", &json!(outcome)), "{outcome}");
+            assert!(!facts.question, "{outcome}");
+        }
+        assert!(!facts.take("finished", &Value::Null));
+        assert!(facts.take("finished", &json!("completed")));
+        assert!(facts.question);
+        // A turn that ends otherwise after one that asked: the question is no longer open.
+        facts.take("text", &json!(" Or not?"));
+        assert!(facts.take("finished", &json!("interrupted")));
+        assert!(!facts.question);
+    }
+
+    #[test]
     fn usage_is_latest_wins_and_clipped() {
         let env = Env::new();
         let mut live = live_with(&env, 4092, json!({"phase": "idle", "approvals": []}));
@@ -1773,7 +1845,8 @@ mod tests {
         }
         assert!(size() > SEED_BYTES + 1024);
         let (facts, read) = seed(&path, size()).await;
-        assert!(read <= SEED_BYTES, "{read}");
+        // The window, and the byte before it that says whether its first line is whole.
+        assert!(read <= SEED_BYTES + 1, "{read}");
         assert_eq!((facts.usage, facts.question), (None, false));
         // What is inside the window seeds, but its errors are from before the hub looked.
         env.write(name, 304, "usage", &json!("new 2%"));
@@ -1782,7 +1855,7 @@ mod tests {
         env.write(name, 307, "text", &json!("Ready to ship?"));
         env.write(name, 308, "finished", &json!("completed"));
         let (facts, read) = seed(&path, size()).await;
-        assert!(read <= SEED_BYTES, "{read}");
+        assert!(read <= SEED_BYTES + 1, "{read}");
         assert_eq!(facts.usage.as_deref(), Some("new 2%"));
         assert!(facts.question);
         // A session the hub first sees gets its row from the seed.
@@ -1803,6 +1876,69 @@ mod tests {
         let (facts, read) = seed(&small, std::fs::metadata(&small).unwrap().len()).await;
         assert_eq!(facts.usage.as_deref(), Some("tiny"));
         assert_eq!(read, std::fs::metadata(&small).unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn the_seed_keeps_a_line_that_starts_its_window() {
+        let env = Env::new();
+        let line = |seq: u64, kind: &str, data: &Value| {
+            let record =
+                json!({"format": "octet-preview-1", "seq": seq, "type": kind, "data": data});
+            u64::try_from(record.to_string().len()).unwrap() + 1
+        };
+        // The usage line starts exactly where the window does, then one byte before it.
+        for (name, before) in [("session-1-1.jsonl", 0), ("session-2-1.jsonl", 1)] {
+            env.write(name, 0, "notice", &json!("before"));
+            let usage = json!("5h 4%");
+            env.write(name, 1, "usage", &usage);
+            let pad =
+                SEED_BYTES - line(1, "usage", &usage) - line(2, "notice", &json!("")) + before;
+            let pad = "n".repeat(usize::try_from(pad).unwrap());
+            env.write(name, 2, "notice", &json!(pad));
+            let path = env.root.join(name);
+            let size = std::fs::metadata(&path).unwrap().len();
+            let (facts, read) = seed(&path, size).await;
+            // The window and the byte before it, which says whether its first line is whole.
+            assert_eq!(read, SEED_BYTES + 1, "{name}");
+            let kept = (before == 0).then_some("5h 4%");
+            assert_eq!(facts.usage.as_deref(), kept, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn late_records_of_the_previous_journal_only_count_errors() {
+        let (old, new) = ("session-1-1.jsonl", "session-2-1.jsonl");
+        let env = Env::new();
+        env.write(old, 0, "usage", &json!("5h 1%"));
+        let one = env.registration(4095, &[old]);
+        let _bridge = Env::listen(&one);
+        one.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        env.write(new, 0, "user", &json!("next"));
+        env.registration(4095, &[old, new])
+            .write(&env.run)
+            .await
+            .unwrap();
+        sessions.refresh().await;
+        assert_eq!(event(&next(&mut sessions).await), (new, 0));
+        // The old vendor process's last words: still sent, but only the error is a fact.
+        env.write(old, 1, "usage", &json!("late 9%"));
+        env.write(old, 2, "text", &json!("Late question?"));
+        env.write(old, 3, "finished", &json!("completed"));
+        env.write(old, 4, "error", &json!("late crash"));
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 5, "{got:?}");
+        assert_eq!(event(&got[3]), (old, 4));
+        let row = &sessions.list()[0];
+        assert_eq!(row["usage"], "5h 1%");
+        assert!(row.get("question").is_none(), "{row}");
+        assert_eq!(sessions.snapshots()[0].errors, 1);
+        // The late text did not reach the newest journal's reply either.
+        env.write(new, 1, "finished", &json!("completed"));
+        assert_eq!(event(&next(&mut sessions).await), (new, 1));
+        assert!(sessions.list()[0].get("question").is_none());
     }
 
     #[tokio::test]

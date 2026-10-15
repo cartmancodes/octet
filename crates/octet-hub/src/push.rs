@@ -11,10 +11,12 @@
 //! that is connected when its window closes gets nothing, but the approvals it was spared are
 //! held: when its last connection drops, those still open are offered to it again.
 //!
-//! Two edges are accepted. When a session's journal list changes (a new vendor process) the
+//! Three edges are accepted. When a session's journal list changes (a new vendor process) the
 //! approval ids it has seen are forgotten, so a reused id can stay hidden until the registration
 //! refresh shows the new list, and an approval still open in the old state can be pushed once more.
-//! A session that disappears mid-turn pushes nothing: it is forgotten with its phase.
+//! A session that disappears mid-turn pushes nothing: it is forgotten with its phase. Errors that
+//! arrive before a session's first bridge state are absorbed into the pusher's seed, and push
+//! nothing.
 //!
 //! [`send`] posts a batch with `curl`: literal argv, the JSON body on stdin, so no token is in
 //! `ps`. The only log lines are `Push failed` and `Push refused: <code>`.

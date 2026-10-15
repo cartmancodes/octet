@@ -44,7 +44,8 @@ pub struct Device {
     pub token_sha256: String,
     /// The Expo push token notifications go to, if the phone turned them on.
     pub push_token: Option<String>,
-    /// What it is pushed; the defaults until the phone says.
+    /// What it is pushed: the defaults for a new pairing, every kind for one from before kinds,
+    /// until the phone says.
     pub push_kinds: PushKinds,
 }
 
@@ -560,15 +561,15 @@ async fn read_devices(directory: &Path) -> io::Result<(Vec<Device>, Option<Stamp
     Ok((devices, stamp))
 }
 
-/// A device's stored kinds: each one the file says as a boolean, the default for the rest (all
-/// of them in a file from before kinds).
+/// A device's stored kinds: each one the file says as a boolean, and on for the rest. A device
+/// stored without kinds (or with kinds that are not an object) paired before there were kinds,
+/// when it was told of every one, so it still is; [`PushKinds::default`] is for new pairings.
 fn push_kinds(stored: &serde_json::Value) -> PushKinds {
-    let defaults = PushKinds::default();
-    let kind = |key: &str, default: bool| stored[key].as_bool().unwrap_or(default);
+    let kind = |key: &str| stored[key].as_bool().unwrap_or(true);
     PushKinds {
-        approvals: kind("approvals", defaults.approvals),
-        errors: kind("errors", defaults.errors),
-        turns: kind("turns", defaults.turns),
+        approvals: kind("approvals"),
+        errors: kind("errors"),
+        turns: kind("turns"),
     }
 }
 
@@ -1161,7 +1162,9 @@ mod tests {
     async fn kinds_default_and_persist() {
         let dir = TempDir::new("hub-kinds");
         let hash = "ab".repeat(32);
-        // A file from before kinds, and one whose kinds are not what this hub writes.
+        // A file from before kinds, one whose kinds are not what this hub writes, and one whose
+        // kinds are not an object. A device that paired before kinds was told of every kind, and
+        // still is: the defaults are for new pairings only.
         let entry = |name: &str, hash: &str, extra: &str| {
             format!(
                 r#"{{"name":"{name}","platform":"ios","login":"{LOGIN}","created":1,"last_seen":2,"token_sha256":"{hash}"{extra}}}"#
@@ -1188,11 +1191,16 @@ mod tests {
             errors: true,
             turns: false,
         };
+        let every = PushKinds {
+            approvals: true,
+            errors: true,
+            turns: true,
+        };
         let odd = PushKinds {
             errors: false,
-            ..defaults
+            ..every
         };
-        assert_eq!(kinds(&store), [defaults, odd, defaults]);
+        assert_eq!(kinds(&store), [every, odd, every]);
         // Kinds go into devices.json with the token, in the same write, and read back.
         let all = PushKinds {
             approvals: false,
