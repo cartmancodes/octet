@@ -27,6 +27,11 @@ private func linkPart(_ text: String) -> String {
   text.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
 }
 
+/// A host as the app keys the App Group by it: lowercased, without a trailing dot.
+private func hostKey(_ host: String) -> String {
+  (host.hasSuffix(".") ? String(host.dropLast()) : host).lowercased()
+}
+
 private func clip(_ text: String, _ limit: Int) -> String? {
   let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
   return trimmed.isEmpty ? nil : String(trimmed.prefix(limit))
@@ -39,7 +44,7 @@ private struct Shown {
 
   init(_ state: OctetActivity.ContentState) {
     self.state = state
-    self.entry = Shown.entry(forKey: state.mac + "/" + state.session)
+    self.entry = Shown.entry(forKey: hostKey(state.mac) + "/" + state.session)
   }
 
   /// Reads only this session's entry, so another malformed entry hides nothing here.
@@ -134,16 +139,19 @@ private struct Particulars: View {
   let shown: Shown
 
   var body: some View {
+    // Both are the user's work: iOS may redact them on a locked phone, as the user sets it.
     if let name = shown.name {
       Text(name)
         .font(.subheadline)
         .lineLimit(1)
+        .privacySensitive()
     }
     if let command = shown.command {
       Text(command)
         .font(.caption.monospaced())
         .foregroundStyle(.secondary)
         .lineLimit(2)
+        .privacySensitive()
     }
   }
 }
@@ -170,6 +178,7 @@ private struct Actions: View {
         Button(intent: deny) {
           Text("Deny")
             .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(Rectangle())
         }
         .tint(.red)
         .accessibilityLabel("Deny this approval")

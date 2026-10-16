@@ -87,6 +87,10 @@ export interface HubClientOptions {
   /** A session's cursor moved (or, null, was cleared): the store saves it. Called after the
    * frames up to that cursor were handed to the batch listeners, at most once per session per batch. */
   onCursor?: (session: string, cursor: Cursor | null) => void;
+  /** A connection the app makes from the background (to hand a Live Activity token over, or to
+   * send a Deny): its hello says `background: true`, so the hub doesn't take it for the app in
+   * front. Any other client sends no such field. */
+  background?: boolean;
 }
 
 /** A `rate_limited` or `timeout` refusal of a subscribe is retried this many times, this far apart. */
@@ -154,6 +158,7 @@ export class HubClient {
   private readonly now: () => number;
   private readonly schedule: (fn: () => void, ms: number) => () => void;
   private readonly onCursor?: (session: string, cursor: Cursor | null) => void;
+  private readonly background: boolean;
   private readonly backoff: Backoff;
   private readonly cursors: Cursors;
 
@@ -203,6 +208,7 @@ export class HubClient {
   constructor(opts: HubClientOptions) {
     this.url = opts.url;
     this.tokenValue = opts.token;
+    this.background = opts.background === true;
     this.factory = opts.factory;
     this.now = opts.now ?? Date.now;
     this.schedule = opts.schedule ?? defaultSchedule;
@@ -427,7 +433,13 @@ export class HubClient {
       if (this.socket !== socket || this.tokenValue === null) return;
       this.setState("authenticating");
       socket.send(
-        JSON.stringify({ v: PROTOCOL_VERSION, type: "hello", req: this.nextReq++, token: this.tokenValue }),
+        JSON.stringify({
+          v: PROTOCOL_VERSION,
+          type: "hello",
+          req: this.nextReq++,
+          token: this.tokenValue,
+          ...(this.background ? { background: true } : {}),
+        }),
       );
     };
     socket.onmessage = (text) => {

@@ -18,8 +18,8 @@ import { MacLink, UNREACHABLE, type LinkHost, type MacInfo, type PushResult } fr
 export { NOT_A_LINK };
 /** How long an approve link waits for its Mac's list before it gives up (and the Inbox stays). */
 export const APPROVE_WAIT_MS = 8_000;
-/** How long a hand-over connection (`Fleet.handOver`) stays open, at most: well inside the time iOS
- * gives an app woken in the background. */
+/** How long a background connection (`Fleet.sendInBackground`) stays open, at most: well inside
+ * the time iOS gives an app woken in the background. */
 export const HAND_OVER_MS = 10_000;
 /** The Mac revoked this phone: only that pairing goes. */
 export const unpairedNotice = (macName: string): string => `This phone was unpaired on ${macName}`;
@@ -105,7 +105,7 @@ export class Fleet {
   private starting: Promise<void> | null = null;
   /** Unpairs whose storage writes are not done: pairing waits for them. */
   private unpairing = 0;
-  /** The hand-overs under way (`handOver`), by Mac: each one's stop. */
+  /** The background sends under way (`sendInBackground`), by Mac: each one's stop. */
   private readonly handing = new Map<string, Set<() => void>>();
   /** Push registrations wait their turn, so that each Mac ends with the last one asked for. */
   private pushQueue: Promise<unknown> = Promise.resolve();
@@ -399,7 +399,7 @@ export class Fleet {
     try {
       const last = ids.length === this.pairings.length;
       const going = this.all.filter((l) => ids.includes(l.id));
-      // A hand-over still on its way could land a register_activity after the goodbye's
+      // A background send still on its way could land a register_activity after the goodbye's
       // clear_activity: it stops first.
       for (const id of ids) this.stopHandOvers(id);
       for (const link of going) {
@@ -629,19 +629,26 @@ export class Fleet {
   }
 
   /**
-   * Sends `body` to each of Macs `macs` over a connection of its own, made for it alone: hello,
-   * `body`, then closed, once the Mac answers or after `HAND_OVER_MS`. It subscribes to nothing, so
-   * the hub does not count it as the phone being back, and it feeds nothing to the store. For the
-   * app in the background (its links are closed), such as handing the hub a Live Activity's new
-   * token. Resolves to the Macs that acked.
+   * Sends `body` to each of Macs `macs` over a connection of its own, made for it alone: a hello
+   * that says `background: true`, `body`, then closed, once the Mac answers or after
+   * `HAND_OVER_MS`. The hub doesn't count it as the app in front, it subscribes to nothing and it
+   * feeds nothing to the store. For the app in the background (its links are closed): handing the
+   * hub a Live Activity's new token, or a Deny tapped on the Island. Resolves to the Macs that
+   * acked. Unpairing a Mac stops any send to it that is under way.
    */
-  async handOver(macs: readonly string[], body: RequestBody): Promise<string[]> {
+  async sendInBackground(macs: readonly string[], body: RequestBody): Promise<string[]> {
     const targets = this.all.filter((link) => macs.includes(link.id) && link.client.token !== null);
     const results = await Promise.all(
       targets.map(
         (link) =>
           new Promise<string | null>((resolve) => {
-            const client = new HubClient({ ...this.clientOptions, url: link.pairing.hubUrl, token: link.client.token, factory: this.factory });
+            const client = new HubClient({
+              ...this.clientOptions,
+              url: link.pairing.hubUrl,
+              token: link.client.token,
+              factory: this.factory,
+              background: true,
+            });
             let done = false;
             let asked = false;
             let cancel = () => {};
@@ -677,7 +684,7 @@ export class Fleet {
     return results.filter((mac): mac is string => mac !== null);
   }
 
-  /** Stops every hand-over to Mac `mac` that is under way (it resolves as not acked). */
+  /** Stops every background send to Mac `mac` that is under way (it resolves as not acked). */
   private stopHandOvers(mac: string): void {
     for (const stop of [...(this.handing.get(mac) ?? [])]) stop();
   }

@@ -70,6 +70,10 @@ describe("the App Group key", () => {
     expect(entryKey("mac.tail1234.ts.net", "6101-1790000000")).toBe("mac.tail1234.ts.net/6101-1790000000");
   });
 
+  it("lowercases the host and drops a trailing dot, as the widget does, so a host's case loses nothing", () => {
+    expect(entryKey("Mac.Tail1234.TS.net.", "6101-1790000000")).toBe("mac.tail1234.ts.net/6101-1790000000");
+  });
+
   it("is a slash and the session when the hub published no host", () => {
     expect(entryKey("", "6101-1790000000")).toBe("/6101-1790000000");
   });

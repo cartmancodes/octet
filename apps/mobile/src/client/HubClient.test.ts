@@ -14,7 +14,7 @@ interface Rig {
   cursors: [string, Cursor | null][];
 }
 
-function rig(opts: { token?: string | null; cursors?: Record<string, Cursor>; random?: () => number } = {}): Rig {
+function rig(opts: { token?: string | null; cursors?: Record<string, Cursor>; random?: () => number; background?: boolean } = {}): Rig {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const cursors: [string, Cursor | null][] = [];
@@ -27,6 +27,7 @@ function rig(opts: { token?: string | null; cursors?: Record<string, Cursor>; ra
     random: opts.random ?? (() => 1),
     cursors: opts.cursors,
     onCursor: (session, cursor) => cursors.push([session, cursor]),
+    ...(opts.background === undefined ? {} : { background: opts.background }),
   });
   const states: HubState[] = [];
   const batches: BatchItem[][] = [];
@@ -1397,5 +1398,25 @@ describe("batching", () => {
     ready(r);
     flush(r);
     expect(seen).toEqual([]);
+  });
+});
+
+describe("a background connection", () => {
+  it("says so in its hello, and is otherwise the same client", () => {
+    const r = rig({ background: true });
+    r.client.start();
+    r.sockets.last.open();
+    expect(r.sockets.last.commands()).toEqual([{ v: 1, type: "hello", req: expect.any(Number), token: TOKEN, background: true }]);
+    r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    expect(r.client.state).toBe("ready");
+  });
+
+  it("a client that is not one sends no background field at all", () => {
+    for (const background of [undefined, false]) {
+      const r = rig(background === undefined ? {} : { background });
+      r.client.start();
+      r.sockets.last.open();
+      expect(r.sockets.last.commandsOf("hello")[0]).not.toHaveProperty("background");
+    }
   });
 });

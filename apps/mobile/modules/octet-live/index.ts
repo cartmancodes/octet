@@ -58,9 +58,11 @@ export const ACTIVITY_ATTRIBUTES_TYPE = "OctetActivity";
 /** The App Group the app and the widget share. */
 export const APP_GROUP = "group.dev.octet.mobile";
 
-/** The App Group key for a session, as the widget sees it: `<mac>/<raw session>`. */
+/** The App Group key for a session, as the widget sees it: `<mac>/<raw session>`, the host
+ * lowercased and without a trailing dot (the widget looks it up the same way), so a host that
+ * differs only in case still finds its entry. */
 export function entryKey(mac: string, session: string): string {
-  return `${mac}/${session}`;
+  return `${mac.replace(/\.$/, "").toLowerCase()}/${session}`;
 }
 
 const nothing: Subscription = { remove: () => undefined };

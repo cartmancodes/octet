@@ -31,6 +31,9 @@ export interface Settings {
   /** The Live Activity (the Dynamic Island and the Lock Screen) is on, where the phone has it. On
    * unless the user turned it off. */
   liveActivity: boolean;
+  /** The Mac that drives the Live Activity while the phone is away (one Mac at a time: the one of
+   * the lead session when the app was last in front); null for none chosen yet. */
+  liveActivityMac: string | null;
 }
 
 export const TEXT_SIZES = [12, 13, 14] as const;
@@ -51,6 +54,7 @@ export const DEFAULT_SETTINGS: Settings = {
   pushKinds: DEFAULT_PUSH_KINDS,
   textSize: 13,
   liveActivity: true,
+  liveActivityMac: null,
 };
 export const SETTINGS_KEY = "octet.settings.v1";
 /** What to tell the user when a settings write failed. */
@@ -128,6 +132,7 @@ export async function readSettings(): Promise<{ ok: true; settings: Settings } |
         pushKinds: upgraded ? ALL_PUSH_KINDS : pushKinds(value.pushKinds),
         textSize: textSize(value.textSize),
         liveActivity: typeof value.liveActivity === "boolean" ? value.liveActivity : DEFAULT_SETTINGS.liveActivity,
+        liveActivityMac: typeof value.liveActivityMac === "string" && MAC_ID.test(value.liveActivityMac) ? value.liveActivityMac : null,
       },
     };
   } catch {
@@ -175,6 +180,7 @@ async function write(change: (saved: Settings) => Partial<Settings>): Promise<bo
         pushKinds: next.pushKinds,
         textSize: next.textSize,
         liveActivity: next.liveActivity,
+        liveActivityMac: next.liveActivityMac,
       }),
     );
     return true;

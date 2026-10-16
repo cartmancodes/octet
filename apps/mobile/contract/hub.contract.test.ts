@@ -713,11 +713,15 @@ run("the app's hub client against the real octet hub", () => {
       "activity registered",
     );
 
-    // The app, woken in the background with that activity's token, hands it over as Fleet.handOver
-    // does: a connection of its own that says hello, registers, and closes. (This client's hello
-    // has no `background: true`, so the hub counts it as the app in front while it is open, and
-    // sends nothing until it closes.)
-    const handOver = new HubClient({ url: `ws://127.0.0.1:${port}/`, token: client?.token ?? null, factory: nodeSocketFactory(OWNER, sockets) });
+    // The app, woken in the background with that activity's token, hands it over as
+    // Fleet.sendInBackground does: a connection of its own whose hello says `background: true` (so
+    // the hub doesn't count it as the app in front), which registers, and closes.
+    const handOver = new HubClient({
+      url: `ws://127.0.0.1:${port}/`,
+      token: client?.token ?? null,
+      factory: nodeSocketFactory(OWNER, sockets),
+      background: true,
+    });
     handOver.start();
     await until("the hand-over connection", () => handOver.state === "ready");
     const both = activityRegistration({ token: ACTIVITY_TOKEN, start: START_TOKEN });
@@ -742,9 +746,14 @@ run("the app's hub client against the real octet hub", () => {
       [`/3/device/${ACTIVITY_TOKEN}`, "update"],
     ]);
 
-    // The phone turns the Live Activity off (here on a register-only connection, so the streaming
+    // The phone turns the Live Activity off (here on a background connection, so the streaming
     // client's return below can't race it): the hub forgets the tokens and acks.
-    const off = new HubClient({ url: `ws://127.0.0.1:${port}/`, token: client?.token ?? null, factory: nodeSocketFactory(OWNER, sockets) });
+    const off = new HubClient({
+      url: `ws://127.0.0.1:${port}/`,
+      token: client?.token ?? null,
+      factory: nodeSocketFactory(OWNER, sockets),
+      background: true,
+    });
     off.start();
     await until("the clearing connection", () => off.state === "ready");
     expect(await off.request({ type: "clear_activity" })).toMatchObject({ type: "ack" });

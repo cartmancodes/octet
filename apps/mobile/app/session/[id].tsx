@@ -85,7 +85,9 @@ export default function Session() {
   useFocusEffect(
     useCallback(() => {
       toOwn.current = false; // in front again
-      if (!client || id === "") return;
+      // Only with the Mac's link as it is now: a client this effect read before the Mac was paired
+      // again would leave a hold on the new link that its cleanup never gives back.
+      if (!client || id === "" || macId === null || links.client(macId) !== client) return;
       // An ended session's view is what it left behind: there is nothing more to stream.
       if (!octetStore.getState().bySession.get(id)?.ended) watch(octetStore, links, id);
       return () => {

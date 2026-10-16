@@ -1996,6 +1996,71 @@ mod tests {
         );
     }
 
+    /// The scenario fixture the app's model test also runs (`tests/data/activity-scenarios.json`)
+    /// is the cases of `the_lead_and_since_follow_the_rulings`, run through this driver.
+    #[test]
+    fn the_scenarios_fixture_is_the_rulings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/activity-scenarios.json");
+        let fixture: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("the scenarios"))
+                .expect("JSON");
+        let mut checked = 0;
+        for scenario in fixture["scenarios"].as_array().expect("scenarios") {
+            let name = scenario["name"].as_str().expect("a name");
+            let sessions: Vec<&str> = scenario["sessions"]
+                .as_array()
+                .expect("sessions")
+                .iter()
+                .map(|id| id.as_str().expect("a session id"))
+                .collect();
+            let mut rig = Rig::new(&sessions);
+            for step in scenario["steps"].as_array().expect("steps") {
+                let at = step["at"].as_f64().expect("at");
+                if let Some(rows) = step["rows"].as_array() {
+                    let rows: Vec<Snapshot> = rows
+                        .iter()
+                        .map(|row| {
+                            let approvals: Vec<u64> = row["approvals"]
+                                .as_array()
+                                .expect("approvals")
+                                .iter()
+                                .map(|id| id.as_u64().expect("an approval id"))
+                                .collect();
+                            snap(
+                                row["id"].as_str().expect("an id"),
+                                row["phase"].as_str(),
+                                &approvals,
+                            )
+                        })
+                        .collect();
+                    rig.observe(at, &rows);
+                }
+                let expect = &step["expect"];
+                if expect.is_null() {
+                    continue;
+                }
+                let now = rig.driver.content(rig.at(at));
+                if let Some(kind) = expect["kind"].as_str() {
+                    assert_eq!(now.kind.label(), kind, "{name} at {at}");
+                }
+                if let Some(session) = expect["session"].as_str() {
+                    assert_eq!(now.session, session, "{name} at {at}");
+                }
+                if let Some(since) = expect["since"].as_f64() {
+                    assert_eq!(now.since, rig.at(since), "{name} at {at}");
+                }
+                if let Some(approvals) = expect["approvals"].as_u64() {
+                    let approvals = usize::try_from(approvals).expect("a count");
+                    assert_eq!(now.approvals, approvals, "{name} at {at}");
+                }
+                checked += 1;
+            }
+        }
+        // Every check of the rulings test, and no fewer.
+        assert_eq!(checked, 7);
+    }
+
     /// The fixture the app's test reads: one payload of each event.
     fn fixture() -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

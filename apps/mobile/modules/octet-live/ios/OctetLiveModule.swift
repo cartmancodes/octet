@@ -57,13 +57,16 @@ private func hex(_ data: Data) -> String {
 /// The app runs on iOS 16.4, but the activity needs 17.2 (push-to-start tokens). `OctetActivity` is
 /// marked `@available(iOS 17.2, *)`, so every ActivityKit call here sits behind `#available`; below
 /// 17.2 isSupported() is false and every function resolves without doing anything.
-// @unchecked Sendable: its only mutable state, `tasks` and `hearingDenies`, is behind `lock`.
+// @unchecked Sendable: its only mutable state, `tasks`, `hearingDenies` and `newestId`, is behind
+// `lock`.
 public final class OctetLiveModule: Module, @unchecked Sendable {
-  /// Guards `tasks` and `hearingDenies`.
+  /// Guards `tasks`, `hearingDenies` and `newestId`.
   private let lock = NSLock()
   /// Each watching task by key, with an id so a finished task forgets only itself.
   private var tasks: [String: (id: UUID, task: Task<Void, Never>)] = [:]
   private var hearingDenies = false
+  /// The id of the activity that appeared last: the one kept when another appears.
+  private var newestId: String?
   /// Drains run one at a time, so a key is emitted once before it is removed.
   private let denyQueue = DispatchQueue(label: "dev.octet.mobile.deny")
 
@@ -85,8 +88,9 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
       if let running = liveActivities().first {
         await running.update(state.content)
       } else {
-        _ = try Activity<OctetActivity>.request(
+        let started = try Activity<OctetActivity>.request(
           attributes: OctetActivity(), content: state.content, pushType: .token)
+        self.keepOnly(started)
       }
     }
 
@@ -144,6 +148,7 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
         Task { [weak self] in
           for await activity in Activity<OctetActivity>.activityUpdates {
             if Task.isCancelled { break }
+            self?.keepOnly(activity)
             self?.watch(activity)
           }
           self?.forget(key, id)
@@ -202,6 +207,30 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
         self?.forget(key, id)
       }
     }
+  }
+
+  /// A new activity (one the hub started by push, or one the app started) is the one to keep: every
+  /// other live one is ended at once, so they never stack on the Lock Screen. Which one is newest is
+  /// decided under the lock, and checked again before each end, so an earlier arrival's ends stop
+  /// once a later one has appeared. Needs no keychain, so it works with the phone locked.
+  @available(iOS 17.2, *)
+  private func keepOnly(_ newest: Activity<OctetActivity>) {
+    let id = newest.id
+    lock.lock()
+    newestId = newest.id
+    lock.unlock()
+    Task { [weak self] in
+      for activity in liveActivities() where activity.id != id {
+        guard self?.isNewest(id) == true else { return }
+        await activity.end(nil, dismissalPolicy: .immediate)
+      }
+    }
+  }
+
+  private func isNewest(_ id: String) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return newestId == id
   }
 
   /// Starts the task for `key` unless one runs already. `make` gets the key and the task's id; the

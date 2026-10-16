@@ -206,6 +206,26 @@ describe("what the native side keeps, and how", () => {
     expect(block(moduleSwift, /private func drainDenies\(\)/)).toMatch(/denyMaxAge/);
   });
 
+  it("prunes expired and malformed denies before it counts toward the 16, so old taps can't block a new one", () => {
+    const perform = block(denySwift, /func perform\(\)/);
+    const prune = perform.indexOf("removeObject(forKey:");
+    expect(prune).toBeGreaterThan(-1);
+    expect(perform).toMatch(/10 \* 60/);
+    expect(prune).toBeLessThan(perform.indexOf(">= 16"));
+  });
+
+  it("ends the older activities when a new one appears, keeping the newest, deciding under the lock", () => {
+    const updates = block(moduleSwift, /for await activity in Activity<OctetActivity>\.activityUpdates/);
+    expect(updates).toMatch(/self\?\.keepOnly\(activity\)/);
+    // An activity the app starts is the newest too.
+    expect(block(moduleSwift, /AsyncFunction\("start"\)/)).toMatch(/keepOnly\(/);
+    const keep = block(moduleSwift, /private func keepOnly\(_ newest: Activity<OctetActivity>\)/);
+    expect(keep).toMatch(/lock\.lock\(\)/);
+    expect(keep).toMatch(/newestId = newest\.id/);
+    expect(keep).toMatch(/\.end\(nil, dismissalPolicy: \.immediate\)/);
+    expect(keep).toMatch(/!= newest\.id|!== newest\.id|\.id != /);
+  });
+
   it("drains on one serial queue, so no key is emitted twice", () => {
     expect(moduleSwift).toMatch(/private let denyQueue = DispatchQueue\(label: "dev\.octet\.mobile\.deny"\)/);
     // drainDenies runs only from the queue.
@@ -254,6 +274,22 @@ describe("the widget's buttons and links", () => {
     );
     // The link is built in that one place.
     expect([...widgetSwift.matchAll(/octet:\/\/approve/g)].length).toBe(1);
+  });
+
+  it("looks an entry up by the host lowercased, without a trailing dot, as the app writes it", () => {
+    expect(widgetSwift).toMatch(/Shown\.entry\(forKey: hostKey\(state\.mac\) \+ "\/" \+ state\.session\)/);
+    const key = block(widgetSwift, /private func hostKey\(_ host: String\) -> String/);
+    expect(key).toMatch(/lowercased\(\)/);
+    expect(key).toMatch(/hasSuffix\("\."\)/);
+  });
+
+  it("marks the session's name and command privacy-sensitive, so iOS can redact them on a locked phone", () => {
+    const particulars = block(widgetSwift, /private struct Particulars: View/);
+    expect([...particulars.matchAll(/\.privacySensitive\(\)/g)].length).toBe(2);
+  });
+
+  it("gives the whole Deny label its tap area", () => {
+    expect(block(block(widgetSwift, /private struct Actions: View/), /Button\(intent: deny\)/)).toMatch(/\.contentShape\(Rectangle\(\)\)/);
   });
 
   it("gives Allow and Deny a hit area at least 44 points tall", () => {

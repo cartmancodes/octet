@@ -4,13 +4,14 @@
 // own fallback is tested in modules/octet-live.
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as SecureStore from "expo-secure-store";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 import type { ActivityState, WidgetEntry } from "../modules/octet-live";
 import {
   COMMAND_CHARS,
   DRIVE_GAP_MS,
   ENTRIES_BYTES,
-  HAND_OVER_MS,
   ENTRIES_LIMIT,
   IDLE_END_MS,
   LiveActivity,
@@ -21,7 +22,7 @@ import {
 } from "./activity";
 import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
 import { FakeLive } from "./liveRig";
-import { Fleet, tokenKeyOf } from "./hub";
+import { Fleet, HAND_OVER_MS, tokenKeyOf } from "./hub";
 import { keyOf } from "./macs";
 import { loadSettings, saveSettings } from "./persist";
 import type { SessionInfo } from "./protocol";
@@ -131,29 +132,37 @@ describe("what the activity shows: the hub's rules (activity.rs the_lead_and_sin
   });
   const idle = (key: string) => snap(key, "idle");
 
-  it("leads with the oldest approval, then the newest running turn, then the last to finish", () => {
-    const model = new ActivityModel();
-    model.observe([idle("s1"), idle("s2"), idle("s3")], at(0));
-    // The one with the oldest waiting approval leads; the count is every session's.
-    model.observe([snap("s1", "idle", [1]), idle("s2"), idle("s3")], at(1));
-    model.observe([snap("s1", "idle", [1]), snap("s2", "running", [5, 6]), idle("s3")], at(2));
-    expect(model.content(at(2))).toEqual({ kind: "approval", key: "s1", since: at(1), approvals: 3 });
-    // s1's approval is answered and another comes: s2's are older now.
-    model.observe([snap("s1", "idle", [2]), snap("s2", "running", [5, 6]), idle("s3")], at(3));
-    expect(model.content(at(3))).toMatchObject({ key: "s2", since: at(2) });
-    // No approvals: the most recently started running session leads, since its turn began.
-    model.observe([idle("s1"), snap("s2", "running"), snap("s3", "running")], at(4));
-    expect(model.content(at(4))).toEqual({ kind: "running", key: "s3", since: at(4), approvals: 0 });
-    model.observe([idle("s1"), snap("s2", "running"), idle("s3")], at(5));
-    // s2 has been running since its approvals were answered.
-    expect(model.content(at(5))).toMatchObject({ key: "s2", since: at(4) });
-    // All idle: the last that finished leads, since it finished.
-    model.observe([idle("s1"), idle("s2"), idle("s3")], at(7));
-    expect(model.content(at(7))).toMatchObject({ kind: "done", key: "s2", since: at(7) });
-    // A session that loses its state runs no more and has nothing open.
-    model.observe([snap("s1", "running", [9]), idle("s2"), idle("s3")], at(8));
-    model.observe([idle("s1"), idle("s2"), idle("s3")], at(9));
-    expect(model.content(at(9))).toMatchObject({ kind: "done", key: "s1", approvals: 0 });
+  // The hub's own scenarios, from the fixture its test the_scenarios_fixture_is_the_rulings holds
+  // to its rules: one file, so the two can't drift.
+  type Step = {
+    at: number;
+    rows?: { id: string; phase: string | null; approvals: number[] }[];
+    expect?: { kind?: string; session?: string; since?: number; approvals?: number };
+  };
+  const fixture = JSON.parse(
+    readFileSync(path.resolve(__dirname, "..", "..", "..", "crates", "octet-hub", "tests", "data", "activity-scenarios.json"), "utf8"),
+  ) as { scenarios: { name: string; sessions: string[]; steps: Step[] }[] };
+
+  it("runs the hub's scenarios, from the shared fixture", () => {
+    let checked = 0;
+    for (const scenario of fixture.scenarios) {
+      const model = new ActivityModel();
+      model.observe(scenario.sessions.map(idle), at(0));
+      for (const step of scenario.steps) {
+        // A session without state is idle with nothing open on the phone's list.
+        if (step.rows) model.observe(step.rows.map((r) => (r.phase === null ? idle(r.id) : snap(r.id, r.phase, r.approvals))), at(step.at));
+        if (!step.expect) continue;
+        const now = model.content(at(step.at));
+        const { kind, session, since, approvals } = step.expect;
+        const where = `${scenario.name} at ${step.at}`;
+        if (kind !== undefined) expect([where, now.kind]).toEqual([where, kind]);
+        if (session !== undefined) expect([where, now.key]).toEqual([where, session]);
+        if (since !== undefined) expect([where, now.since]).toEqual([where, at(since)]);
+        if (approvals !== undefined) expect([where, now.approvals]).toEqual([where, approvals]);
+        checked += 1;
+      }
+    }
+    expect(checked).toBe(7);
   });
 
   it("sessions that never ran lead nothing: no session, since every session went idle", () => {
@@ -238,43 +247,82 @@ describe("the controller", () => {
   });
 });
 
-describe("registration", () => {
-  it("registers the tokens with every Mac, once each however often the same token comes", async () => {
+describe("registration: one Mac drives the Island", () => {
+  it("only the owner (the first paired Mac, with no lead yet) is given the tokens, once each; every other Mac is told to forget them", async () => {
     const r = await rig();
     r.api.pushToStartToken("ab12");
     r.api.pushToStartToken("ab12"); // ActivityKit may say the first one twice
     await settle();
-    for (const host of [STUDIO_HOST, MINI_HOST]) {
-      expect(r.socketOf(host).commandsOf("register_activity")).toEqual([
-        expect.not.objectContaining({ token: expect.anything() }),
-      ]);
-      expect(r.socketOf(host).commandsOf("register_activity")[0]).toMatchObject({ start_token: "ab12" });
-      await r.ack(host, "register_activity");
-    }
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([expect.not.objectContaining({ token: expect.anything() })]);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")[0]).toMatchObject({ start_token: "ab12" });
+    expect(r.socketOf(STUDIO_HOST).commandsOf("clear_activity")).toEqual([]);
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toEqual([]);
+    expect(r.socketOf(MINI_HOST).commandsOf("clear_activity")).toHaveLength(1);
+    await r.ack(STUDIO_HOST, "register_activity");
+    await r.ack(MINI_HOST, "clear_activity");
     r.api.pushToStartToken("ab12");
-    await settle();
     // An activity's token joins it; each registration states both.
     r.api.pushToken("cd34");
     await settle();
-    for (const host of [STUDIO_HOST, MINI_HOST]) {
-      expect(r.socketOf(host).commandsOf("register_activity").map(({ token, start_token }) => ({ token, start_token }))).toEqual([
-        { token: undefined, start_token: "ab12" },
-        { token: "cd34", start_token: "ab12" },
-      ]);
-    }
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity").map(({ token, start_token }) => ({ token, start_token }))).toEqual([
+      { token: undefined, start_token: "ab12" },
+      { token: "cd34", start_token: "ab12" },
+    ]);
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toEqual([]);
+    expect(r.socketOf(MINI_HOST).commandsOf("clear_activity")).toHaveLength(1);
   });
 
-  it("a token that changes while a Mac is out of reach goes to it on its next connection", async () => {
+  it("a lead on another Mac moves the tokens there, and the old owner forgets them", async () => {
     const r = await rig();
-    r.socketOf(MINI_HOST).drop();
+    r.api.pushToStartToken("ab12");
+    r.api.pushToken("cd34", "a");
+    await settle();
+    await r.ack(STUDIO_HOST, "register_activity");
+    await r.ack(MINI_HOST, "clear_activity");
+    await r.list(MINI_HOST, [info(B, { phase: "running" })]);
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toEqual([expect.objectContaining({ token: "cd34", start_token: "ab12" })]);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("clear_activity")).toHaveLength(1);
+    expect((await loadSettings()).liveActivityMac).toBe(MINI);
+    await r.ack(MINI_HOST, "register_activity");
+    // And back: an approval on studio leads.
+    await r.list(STUDIO_HOST, [info(A, { approvals: 1, approval: approval(2) })]);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity").at(-1)).toMatchObject({ token: "cd34", start_token: "ab12" });
+    expect(r.socketOf(MINI_HOST).commandsOf("clear_activity")).toHaveLength(2);
+  });
+
+  it("the owner doesn't change in the background", async () => {
+    const r = await rig();
+    r.api.pushToStartToken("ab12");
+    await settle();
+    r.live.setForeground(false);
+    await r.list(MINI_HOST, [info(B, { phase: "running" })]);
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toEqual([]);
+    expect((await loadSettings()).liveActivityMac).not.toBe(MINI);
+    r.live.setForeground(true);
+    await settle();
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toHaveLength(1);
+  });
+
+  it("the owner is kept across launches, until a lead says otherwise", async () => {
+    await saveSettings({ liveActivityMac: MINI });
+    const r = await rig();
+    r.api.pushToStartToken("ab12");
+    await settle();
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toHaveLength(1);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([]);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("clear_activity")).toHaveLength(1);
+  });
+
+  it("a token that changes while the owner is out of reach goes to it on its next connection", async () => {
+    const r = await rig();
+    r.socketOf(STUDIO_HOST).drop();
     await settle();
     r.api.pushToStartToken("ab12");
     await settle();
-    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(1);
     expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toHaveLength(0);
     await r.advance(60_000); // the link tries again
-    await r.ready(MINI_HOST);
-    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toEqual([expect.objectContaining({ start_token: "ab12" })]);
+    await r.ready(STUDIO_HOST);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([expect.objectContaining({ start_token: "ab12" })]);
   });
 
   it("an ended activity's token is taken back: only the push-to-start token is left", async () => {
@@ -399,6 +447,7 @@ describe("Deny from the Island", () => {
     const api = new FakeLive(clock.now);
     const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
     live.start();
+    live.setForeground(true); // the app is opened
     api.deny({ mac: STUDIO_HOST, session: A, approval: "6" }); // a tap made while the app was closed
     fleet.setForeground(true);
     await fleet.init();
@@ -409,6 +458,51 @@ describe("Deny from the Island", () => {
     await settle();
     expect(socket.commandsOf("answer")).toEqual([expect.objectContaining({ session: A, approval: 6, allow: false })]);
     live.stop();
+  });
+
+  it("a Deny in the background goes at once, over a background connection to its Mac: hello background, the answer, closed", async () => {
+    const r = await rig();
+    r.fleet.setForeground(false);
+    r.live.setForeground(false);
+    await settle();
+    const before = r.sockets.all.length;
+    r.api.deny({ mac: MINI_HOST, session: A, approval: "5" });
+    r.api.deny({ mac: MINI_HOST, session: A, approval: "5" }); // once
+    await settle();
+    const opened = r.sockets.all.slice(before);
+    expect(opened.map((s) => s.url)).toEqual([urlOf(MINI_HOST)]);
+    const [mini] = opened;
+    mini?.open();
+    mini?.receive({ type: "welcome", device: "iPhone" });
+    await settle();
+    expect(mini?.commands().map((c) => c.type)).toEqual(["hello", "answer"]);
+    expect(mini?.commandsOf("hello")[0]).toMatchObject({ background: true });
+    expect(mini?.commandsOf("answer")[0]).toMatchObject({ session: A, approval: 5, allow: false });
+    mini?.receive({ type: "ack", req: mini.commandsOf("answer")[0]?.req, message: "answered" });
+    await settle();
+    expect(mini?.closed).toBe(true);
+    // Answered: nothing is held for the foreground.
+    r.fleet.setForeground(true);
+    r.live.setForeground(true);
+    await settle();
+    await r.ready(MINI_HOST);
+    expect(r.socketOf(MINI_HOST).commandsOf("answer")).toEqual([]);
+  });
+
+  it("a background Deny the Mac doesn't answer within 10 s is held, and sent over the link back in the foreground", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    r.fleet.setForeground(false);
+    r.live.setForeground(false);
+    await settle();
+    r.api.deny({ mac: STUDIO_HOST, session: A, approval: "5" });
+    await settle();
+    await r.advance(HAND_OVER_MS);
+    expect(r.sockets.all.at(-1)?.closed).toBe(true);
+    r.fleet.setForeground(true);
+    r.live.setForeground(true);
+    await settle();
+    await r.ready(STUDIO_HOST);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("answer")).toEqual([expect.objectContaining({ session: A, approval: 5, allow: false })]);
   });
 
   it("a Deny while the Mac is out of reach goes on its next connection", async () => {
@@ -435,25 +529,28 @@ describe("the switch", () => {
     const r = await rig();
     r.api.pushToStartToken("ab12");
     await r.list(STUDIO_HOST, [info(A, { phase: "running", approvals: 1, approval: approval(1) })]);
-    for (const host of [STUDIO_HOST, MINI_HOST]) await r.ack(host, "register_activity");
+    await r.ack(STUDIO_HOST, "register_activity");
+    await r.ack(MINI_HOST, "clear_activity");
     expect(await r.live.setEnabled(false)).toBe(true);
     await settle();
     expect((await loadSettings()).liveActivity).toBe(false);
     expect(r.api.of("end")).toHaveLength(1);
     expect(r.api.of("setEntries").at(-1)?.arg).toEqual({});
-    for (const host of [STUDIO_HOST, MINI_HOST]) expect(r.socketOf(host).commandsOf("clear_activity")).toHaveLength(1);
+    // Every Mac is told again, the owner and the others.
+    expect(r.socketOf(STUDIO_HOST).commandsOf("clear_activity")).toHaveLength(1);
+    expect(r.socketOf(MINI_HOST).commandsOf("clear_activity")).toHaveLength(2);
     const before = r.api.calls.length;
-    r.api.pushToken("ef56");
+    r.api.pushToken("ef56"); // an activity that lands while it is off is ended, not adopted
     await r.list(STUDIO_HOST, [info(A, { phase: "running", approvals: 2, approval: approval(1) })]);
     await r.advance(5 * DRIVE_GAP_MS);
-    expect(r.api.calls.length).toBe(before);
-    for (const host of [STUDIO_HOST, MINI_HOST]) expect(r.socketOf(host).commandsOf("register_activity")).toHaveLength(1);
+    expect(r.api.calls.slice(before).map((c) => c.what)).toEqual(["end"]);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(1);
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toHaveLength(0);
 
     expect(await r.live.setEnabled(true)).toBe(true);
     await settle();
-    for (const host of [STUDIO_HOST, MINI_HOST]) {
-      expect(r.socketOf(host).commandsOf("register_activity").at(-1)).toMatchObject({ token: "ef56", start_token: "ab12" });
-    }
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity").at(-1)).toMatchObject({ token: "ef56", start_token: "ab12" });
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toHaveLength(0);
     await r.advance(DRIVE_GAP_MS);
     expect(r.api.of("start").length + r.api.of("update").length).toBeGreaterThan(0);
   });
@@ -472,6 +569,31 @@ describe("the switch", () => {
     finish();
     await settle();
     expect(r.api.of("end")).toHaveLength(2);
+  });
+
+  it("an activity the hub started that lands after the switch went off is ended", async () => {
+    await saveSettings({ liveActivity: false });
+    const r = await rig({ macs: [STUDIO_HOST] });
+    r.api.pushToken("cd34", "hub-started");
+    await settle();
+    expect(r.api.of("end")).toHaveLength(1);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([]);
+  });
+
+  it("one that lands before the setting is read, with the switch off, is ended once it is read", async () => {
+    await saveSettings({ liveActivity: false });
+    const sockets = new Sockets();
+    const clock = new FakeClock();
+    const store = createOctetStore();
+    const fleet = new Fleet({ factory: sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
+    const api = new FakeLive(clock.now);
+    const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
+    live.start();
+    api.pushToken("cd34", "hub-started");
+    expect(api.of("end")).toHaveLength(0);
+    await settle();
+    expect(api.of("end")).toHaveLength(1);
+    live.stop();
   });
 
   it("off from the start: nothing is shown or registered", async () => {
@@ -573,46 +695,60 @@ describe("the hand-over in the background", () => {
     await settle();
   };
 
-  it("an activity token that comes in the background is registered over a connection that only says hello, and closes", async () => {
+  it("an activity token that comes in the background goes to the owner alone, over a background connection that only registers, and closes", async () => {
     const r = await rig();
     r.api.pushToStartToken("ab12");
     await settle();
-    for (const host of [STUDIO_HOST, MINI_HOST]) await r.ack(host, "register_activity");
+    await r.ack(STUDIO_HOST, "register_activity");
     await background(r);
     const before = r.sockets.all.length;
     r.api.pushToken("cd34", "hub-started");
     r.api.pushToken("cd34", "hub-started"); // said twice: one hand-over
     await settle();
     const opened = r.sockets.all.slice(before);
-    expect(opened.map((s) => s.url).sort()).toEqual([urlOf(MINI_HOST), urlOf(STUDIO_HOST)]);
-    for (const socket of opened) {
-      socket.open();
-      socket.receive({ type: "welcome", device: "iPhone" });
-    }
+    expect(opened.map((s) => s.url)).toEqual([urlOf(STUDIO_HOST)]);
+    const [studio] = opened;
+    studio?.open();
+    studio?.receive({ type: "welcome", device: "iPhone" });
     await settle();
-    for (const socket of opened) {
-      expect(socket.commands().map((c) => c.type)).toEqual(["hello", "register_activity"]);
-      expect(socket.commandsOf("register_activity")[0]).toMatchObject({ token: "cd34", start_token: "ab12" });
-    }
-    const [studio, mini] = [opened.find((s) => s.url === urlOf(STUDIO_HOST)), opened.find((s) => s.url === urlOf(MINI_HOST))];
+    expect(studio?.commands().map((c) => c.type)).toEqual(["hello", "register_activity"]);
+    // The hub isn't to take it for the app in front.
+    expect(studio?.commandsOf("hello")[0]).toMatchObject({ background: true });
+    expect(studio?.commandsOf("register_activity")[0]).toMatchObject({ token: "cd34", start_token: "ab12" });
     studio?.receive({ type: "ack", req: studio.commandsOf("register_activity")[0]?.req, message: "Activity registered" });
     await settle();
     expect(studio?.closed).toBe(true);
-    expect(mini?.closed).toBe(false);
-    await r.advance(HAND_OVER_MS); // mini never answers: closed at the end of the window
-    expect(mini?.closed).toBe(true);
     expect(r.clock.pending).toBe(0);
 
-    // Back in the foreground: studio has it already; mini is told on its link.
+    // Back in the foreground: studio has it already; mini is the other Mac and gets none.
     r.fleet.setForeground(true);
     r.live.setForeground(true);
     await settle();
     for (const host of [STUDIO_HOST, MINI_HOST]) await r.ready(host);
     expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([]);
-    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toEqual([expect.objectContaining({ token: "cd34" })]);
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toEqual([]);
   });
 
-  it("a cold launch in the background for the token: handed over once the settings and pairings are read, once per Mac", async () => {
+  it("a hand-over the owner never answers is closed at the end of the window, and told over the link back in the foreground", async () => {
+    const r = await rig();
+    await background(r);
+    const before = r.sockets.all.length;
+    r.api.pushToken("cd34", "a");
+    await settle();
+    const [studio] = r.sockets.all.slice(before);
+    studio?.open();
+    studio?.receive({ type: "welcome", device: "iPhone" });
+    await settle();
+    await r.advance(HAND_OVER_MS);
+    expect(studio?.closed).toBe(true);
+    r.fleet.setForeground(true);
+    r.live.setForeground(true);
+    await settle();
+    await r.ready(STUDIO_HOST);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([expect.objectContaining({ token: "cd34" })]);
+  });
+
+  it("a cold launch in the background for the token: handed over to the owner once the settings and pairings are read, once", async () => {
     for (const id of [STUDIO, MINI]) await SecureStore.setItemAsync(tokenKeyOf(id), TOKEN);
     await saveSettings({
       deviceName: "iPhone",
@@ -636,7 +772,8 @@ describe("the hand-over in the background", () => {
     expect(sockets.all).toEqual([]);
     await fleet.init();
     await settle();
-    expect(sockets.all.map((s) => s.url).sort()).toEqual([urlOf(MINI_HOST), urlOf(STUDIO_HOST)]);
+    // To the owner alone: the first paired Mac, with none saved.
+    expect(sockets.all.map((s) => s.url)).toEqual([urlOf(STUDIO_HOST)]);
     for (const socket of sockets.all) {
       socket.open();
       socket.receive({ type: "welcome", device: "iPhone" });
@@ -651,7 +788,7 @@ describe("the hand-over in the background", () => {
     // Anything else the Fleet says meanwhile hands nothing over again.
     await fleet.rename(STUDIO, "Studio");
     await settle();
-    expect(sockets.all).toHaveLength(2);
+    expect(sockets.all).toHaveLength(1);
     live.stop();
   });
 
@@ -674,11 +811,9 @@ describe("the hand-over in the background", () => {
     r.api.pushToken("cd34", "a");
     await settle();
     const studio = r.sockets.all.slice(before).find((s) => s.url === urlOf(STUDIO_HOST));
-    const mini = r.sockets.all.slice(before).find((s) => s.url === urlOf(MINI_HOST));
     await r.fleet.unpair(STUDIO);
     await settle();
     expect(studio?.closed).toBe(true);
-    expect(mini?.closed).toBe(false); // the other Mac's goes on
     studio?.open();
     studio?.receive({ type: "welcome", device: "iPhone" });
     await settle();
@@ -707,18 +842,21 @@ describe("Live Activities turned off or on in the phone's settings", () => {
     const r = await rig();
     r.api.pushToStartToken("ab12");
     await r.list(STUDIO_HOST, [info(A, { approvals: 1, approval: approval(1) })]);
-    for (const host of [STUDIO_HOST, MINI_HOST]) await r.ack(host, "register_activity");
+    await r.ack(STUDIO_HOST, "register_activity");
+    await r.ack(MINI_HOST, "clear_activity");
     r.live.setForeground(false);
     r.api.supported = false;
     r.live.setForeground(true);
     await settle();
     expect(r.live.supported).toBe(false);
-    for (const host of [STUDIO_HOST, MINI_HOST]) expect(r.socketOf(host).commandsOf("clear_activity")).toHaveLength(1);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("clear_activity")).toHaveLength(1);
+    expect(r.socketOf(MINI_HOST).commandsOf("clear_activity")).toHaveLength(2);
     expect(r.api.of("setEntries").at(-1)?.arg).toEqual({});
     r.api.pushToken("cd34", "x");
     await r.list(STUDIO_HOST, [info(A, { phase: "running", approvals: 2, approval: approval(1) })]);
     await r.advance(5 * DRIVE_GAP_MS);
-    for (const host of [STUDIO_HOST, MINI_HOST]) expect(r.socketOf(host).commandsOf("register_activity")).toHaveLength(1);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(1);
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toHaveLength(0);
     expect(r.api.shown().filter((c) => (c.arg as ActivityState).approvals === 2)).toEqual([]);
 
     r.live.setForeground(false);
@@ -726,9 +864,8 @@ describe("Live Activities turned off or on in the phone's settings", () => {
     r.live.setForeground(true);
     await settle();
     expect(r.live.supported).toBe(true);
-    for (const host of [STUDIO_HOST, MINI_HOST]) {
-      expect(r.socketOf(host).commandsOf("register_activity").at(-1)).toMatchObject({ token: "cd34", start_token: "ab12" });
-    }
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity").at(-1)).toMatchObject({ token: "cd34", start_token: "ab12" });
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toHaveLength(0);
     expect(Object.keys((r.api.of("setEntries").at(-1)?.arg ?? {}) as object)).toEqual([`${STUDIO_HOST}/${A}`]);
   });
 

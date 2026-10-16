@@ -31,8 +31,17 @@ struct DenyIntent: LiveActivityIntent {
     guard !session.isEmpty, !approval.isEmpty,
       let defaults = UserDefaults(suiteName: "group.dev.octet.mobile")
     else { return .result() }
-    // At most 16 wait for the app; past that, this tap is dropped (the app drains them, and drops
-    // any older than 10 minutes, whenever it listens).
+    // Expired (older than 10 minutes, which the app would drop) and malformed waiting denies go
+    // first, so old taps never fill the 16 and block this one.
+    let now = Date().timeIntervalSince1970
+    for key in defaults.dictionaryRepresentation().keys where key.hasPrefix("deny.") {
+      let at = defaults.dictionary(forKey: key)?["at"] as? Double
+      if at.map({ abs(now - $0) > 10 * 60 }) ?? true {
+        defaults.removeObject(forKey: key)
+      }
+    }
+    // At most 16 wait for the app; past that, this tap is dropped (the app drains them whenever it
+    // listens).
     let waiting = defaults.dictionaryRepresentation().keys.filter { $0.hasPrefix("deny.") }
     if waiting.count >= 16 { return .result() }
     // A key of its own: nothing else writes it, so no other Deny can overwrite or drop this one.

@@ -1,20 +1,21 @@
 // The Live Activity while the app runs (the Dynamic Island and the Lock Screen, iOS 17.2 and later):
-// the app shows what every Mac's sessions are doing, gives each Mac the ActivityKit tokens so its
-// hub can start and update the activity while the phone is away, keeps the widget's App Group
-// entries (names and commands, which never leave the phone), and answers the Island's Deny. The
-// Island's Allow is a link (src/navigation.ts), opened by the shell behind Face ID and the arm.
-// Where Live Activities are not supported (Android, Expo Go, jest) it does nothing at all.
+// the app shows what every Mac's sessions are doing, gives one Mac (the one that drives the Island
+// while the phone is away) the ActivityKit tokens so its hub can start and update the activity,
+// keeps the widget's App Group entries (names and commands, which never leave the phone), and
+// hands the Island's Deny to src/activityDeny.ts. The Island's Allow is a link
+// (src/navigation.ts), opened by the shell behind Face ID and the arm. Where Live Activities are not
+// supported (Android, Expo Go, jest) it does nothing at all.
 import { createContext, useContext } from "react";
 
 import * as octetLive from "../modules/octet-live";
 import type { ActivityState, DenyEvent, Subscription, TokenEvent, WidgetEntry } from "../modules/octet-live";
+import { IslandDenies, type DenyFleet } from "./activityDeny";
 import { ActivityModel, IDLE_END_MS, activityRegistration, rowsOf, widgetEntries, type ActivityTokens } from "./activityModel";
-import { Refusal, type HubClient, type RequestBody } from "./client/HubClient";
-import { hostKey, macOfKey, splitKey, type Links } from "./macs";
-import { parseApprovalId } from "./navigation";
+import type { HubClient, RequestBody } from "./client/HubClient";
+import { MAC_ID, macOfKey, splitKey } from "./macs";
 import { loadSettings, saveSettings } from "./persist";
-import { sendTo, sendVia } from "./sendVia";
-import { hasEnded, type OctetState, type OctetStore } from "./store";
+import { sendTo } from "./sendVia";
+import type { OctetState, OctetStore } from "./store";
 
 export {
   ActivityModel,
@@ -30,15 +31,11 @@ export {
   type ActivityTokens,
   type Lead,
 } from "./activityModel";
-export { HAND_OVER_MS } from "./fleet/fleet";
 
 /** The least time between two changes the app makes to the activity. */
 export const DRIVE_GAP_MS = 1_000;
-/** Denies remembered, so the same one is answered once. */
-const DENIES_SEEN = 64;
-/** Denies kept for a Mac out of reach, at most, and for how long: the native side drops older. */
-const DENIES_HELD = 16;
-const DENY_MAX_AGE_MS = 10 * 60_000;
+/** What a Mac is told when it is not the one that drives the Island (or the switch is off). */
+const CLEAR: RequestBody = { type: "clear_activity" };
 
 /** The native module, as the controller uses it (modules/octet-live); a test gives a fake. */
 export interface LiveApi {
@@ -65,15 +62,10 @@ export const nativeLive: LiveApi = {
 };
 
 /** What the controller needs of the Fleet (src/hub.ts). */
-export interface ActivityFleet {
-  /** `status` is "loading" until the saved pairings are read. */
+export interface ActivityFleet extends DenyFleet {
+  /** `status` is "loading" until the saved pairings are read; `macs` are the pairings, in order. */
   snapshot(): { status: string; macs: readonly { id: string; host: string }[] };
   subscribe(fn: () => void): () => void;
-  readonly links: Links;
-  keyFor(host: string | null, raw: string): string | null;
-  /** Sends `body` to Macs `macs` over register-only connections of their own (the app in the
-   * background); resolves to the Macs that acked. */
-  handOver(macs: readonly string[], body: RequestBody): Promise<string[]>;
 }
 
 export interface LiveActivityOptions {
@@ -85,30 +77,28 @@ export interface LiveActivityOptions {
   schedule?: (fn: () => void, ms: number) => () => void;
 }
 
-/** A Deny waiting for its Mac to be reached. */
-interface HeldDeny {
-  key: string;
-  approval: number;
-  at: number;
-}
-
 const stateKey = (s: ActivityState): string => `${s.kind}\n${s.session}\n${s.mac}\n${s.since}\n${s.approvals}`;
 
 /**
  * Drives the Live Activity from the store while the app is in the foreground, at most once per
  * `DRIVE_GAP_MS`: starts it while something waits or runs, updates it as that changes, and ends it
- * `IDLE_END_MS` after every session went idle. Registers the phone's ActivityKit tokens with every
- * Mac, each time they change, over a link that is up (a Mac out of reach is told on its next
- * connection). Writes the App Group's entries whenever the waiting approvals change, and shows the
- * activity again after each write so the widget reads them anew. Answers each Deny once, to the Mac
- * its host names. Turned off, it ends the activity, tells every Mac to forget the tokens and
- * empties the entries.
+ * `IDLE_END_MS` after every session went idle. Writes the App Group's entries whenever the waiting
+ * approvals change, and shows the activity again after each write so the widget reads them anew.
+ * Turned off, it ends the activity, tells every Mac to forget the tokens and empties the entries.
+ *
+ * One Mac drives the Island while the phone is away: the owner, the Mac of the current lead session
+ * (else the one saved from before, else the first paired). Only it is given the phone's ActivityKit
+ * tokens, each time they change, over a link that is up (out of reach, on its next connection);
+ * every other Mac is told `clear_activity`, so no two hubs fight over one activity. The owner
+ * changes only while the app is in front, and is saved, so a launch in the background hands over
+ * to the same Mac. The other Macs still push notifications.
  *
  * One activity, two drivers: an activity that is already there (the hub started it while the phone
  * was away) is adopted as soon as ActivityKit hands over its token, and driven from then on, done
- * or not. A token that comes while the app is in the background is handed to each Mac over a
- * register-only connection (`Fleet.handOver`), so the hub can update that activity. One the user
- * dismissed is not started again until what it would show changes. Whether the phone has Live
+ * or not; one that lands while the switch is off is ended. A token that comes while the app is in
+ * the background is handed to the owner over a background connection (`Fleet.sendInBackground`),
+ * so its hub can update that activity. One the user dismissed is not started again until what it
+ * would show changes. Whether the phone has Live
  * Activities (`isSupported()`, which the user can change in the phone's settings) is asked again at
  * each foreground: gone, every Mac forgets the tokens and the entries empty, as with the switch off.
  */
@@ -146,14 +136,13 @@ export class LiveActivity {
   private force = false;
 
   private tokens: ActivityTokens = { token: null, start: null };
-  /** What each link's Mac took, and what is on its way to it. By client: a Mac paired again is a
-   * new device to its hub. */
+  /** The Mac that drives the Island while the phone is away; null with none paired. */
+  private owner: string | null = null;
+  /** What each link's Mac took (a registration, or `clear_activity`), and what is on its way to it.
+   * By client: a Mac paired again is a new device to its hub. Reset when the switch goes off, so
+   * every Mac is told again; and each launch tells each Mac that isn't the owner once. */
   private told = new WeakMap<HubClient, string>();
   private telling = new WeakMap<HubClient, string>();
-  /** Links whose Mac took `clear_activity` since the switch was last turned off. With it off, each
-   * other link's Mac is told on its next connection: one that missed the turn-off, in this run or
-   * an earlier one, would go on starting activities the user turned off. */
-  private cleared = new WeakSet<HubClient>();
   /** What each link's Mac was last handed over in the background, answered or not: a hand-over is
    * tried once per Mac for a body, so nothing in the background tries it again and again. */
   private handedOver = new WeakMap<HubClient, string>();
@@ -162,11 +151,9 @@ export class LiveActivity {
   private entries: string | null = null;
   private macs: readonly { id: string; host: string }[] = [];
 
-  private readonly denied: string[] = [];
-  private held: HeldDeny[] = [];
-  /** Denies that came before the pairings were read (the native side hands over the taps made
-   * while the app was closed as soon as it is listened to): resolved once they are. */
-  private early: DenyEvent[] = [];
+  private readonly denies: IslandDenies;
+  /** Settings' switch, following `supported`. */
+  private readonly listeners = new Set<() => void>();
 
   constructor({ api = nativeLive, fleet, store, now = Date.now, schedule }: LiveActivityOptions) {
     this.api = api;
@@ -180,7 +167,14 @@ export class LiveActivity {
         return () => clearTimeout(id);
       });
     this.supportedNow = api.isSupported();
+    this.denies = new IslandDenies({ fleet, store, now: this.now, inFront: () => this.foreground });
   }
+
+  /** For Settings: told when `supported` changes. */
+  subscribe = (fn: () => void): (() => void) => {
+    this.listeners.add(fn);
+    return () => void this.listeners.delete(fn);
+  };
 
   /** Whether the phone has Live Activities, as last asked (at the start and each foreground). */
   get supported(): boolean {
@@ -225,8 +219,14 @@ export class LiveActivity {
     void loadSettings().then((s) => {
       if (this.stopped || this.on !== null) return;
       this.on = s.liveActivity;
+      if (s.liveActivityMac !== null && this.owner === null) this.owner = s.liveActivityMac;
+      this.chooseOwner();
       this.syncAll();
-      if (!this.on) return;
+      if (!this.on) {
+        // One that landed before the setting was read, with the switch off: ended.
+        if (this.activities.size > 0) this.endUnwanted();
+        return;
+      }
       this.writeEntries();
       this.drive(true);
       // Launched in the background for a token (iOS woke a closed app): it came before the setting.
@@ -252,6 +252,7 @@ export class LiveActivity {
     }
     const supported = this.api.isSupported();
     if (supported !== this.supportedNow && !this.stopped) this.supportChanged(supported);
+    this.chooseOwner();
     this.drive(true);
   }
 
@@ -259,13 +260,13 @@ export class LiveActivity {
    * is told to forget the tokens, then the App Group empties. Back: registered again. */
   private supportChanged(supported: boolean): void {
     this.supportedNow = supported;
+    for (const fn of [...this.listeners]) fn();
     if (!this.attached) {
       if (supported) this.attach();
       return;
     }
     this.told = new WeakMap();
     this.telling = new WeakMap();
-    this.cleared = new WeakSet();
     this.handedOver = new WeakMap();
     this.entries = null;
     if (!supported) {
@@ -296,7 +297,6 @@ export class LiveActivity {
       await this.api.setEntries({}).catch(() => undefined);
       this.told = new WeakMap();
       this.telling = new WeakMap();
-      this.cleared = new WeakSet();
       this.handedOver = new WeakMap();
       this.syncAll();
       return true;
@@ -321,6 +321,25 @@ export class LiveActivity {
   }
 
   private hostOf = (mac: string): string | null => this.macs.find((m) => m.id === mac)?.host ?? null;
+
+  /** Picks the Mac that drives the Island: while the app is in front, the lead session's Mac;
+   * otherwise (or with no lead) the owner it had, while that one is still paired; else the first
+   * paired. A change is saved, and moves the tokens there (the old owner is told to forget them). */
+  private chooseOwner(): void {
+    // Not before the saved owner and the pairings are both read: either alone would pick wrongly.
+    if (!this.attached || this.stopped || this.on === null || this.fleet.snapshot().status === "loading") return;
+    const paired = this.macs.map((m) => m.id);
+    let next = this.owner !== null && paired.includes(this.owner) ? this.owner : (paired[0] ?? null);
+    if (this.foreground) {
+      const lead = this.model.content(this.now()).key;
+      const mac = lead === "" ? null : macOfKey(lead);
+      if (mac !== null && paired.includes(mac)) next = mac;
+    }
+    if (next === this.owner) return;
+    this.owner = next;
+    if (next === null || MAC_ID.test(next)) void saveSettings({ liveActivityMac: next });
+    this.syncAll();
+  }
 
   /** The content state now: the lead's raw id and its Mac's host, as the hub sends them. */
   private stateNow(): ActivityState {
@@ -421,6 +440,7 @@ export class LiveActivity {
   private storeChanged(state: OctetState, prev: OctetState): void {
     if (state.sessions !== prev.sessions) {
       this.model.observe(rowsOf(state.sessions), this.now());
+      if (this.foreground) this.chooseOwner();
       this.writeEntries();
       this.drive();
     }
@@ -428,25 +448,27 @@ export class LiveActivity {
       for (const [mac, hub] of state.hubs) {
         if (hub !== "ready" || prev.hubs.get(mac) === "ready") continue;
         this.sync(mac);
-        this.flushDenies(mac);
+        this.denies.ready(mac);
       }
     }
   }
 
   private fleetChanged(): void {
     const snapshot = this.fleet.snapshot();
-    if (snapshot.status !== "loading" && this.early.length > 0) {
-      const early = this.early;
-      this.early = [];
-      for (const event of early) this.deny(event);
+    this.denies.fleetChanged();
+    const macs = snapshot.macs;
+    if (macs !== this.macs) {
+      this.macs = macs;
+      this.chooseOwner();
+      this.writeEntries();
+      this.drive();
     }
     // Launched in the background for a token: it came before the pairings were read.
     if (snapshot.status !== "loading" && !this.foreground) this.handOver();
-    const macs = snapshot.macs;
-    if (macs === this.macs) return;
-    this.macs = macs;
-    this.writeEntries();
-    this.drive();
+  }
+
+  private deny(event: DenyEvent): void {
+    this.denies.deny(event);
   }
 
   // The App Group
@@ -492,9 +514,14 @@ export class LiveActivity {
     } else {
       this.activities.delete(activity);
       this.activities.set(activity, token);
-      this.live = true;
-      this.dismissed = false;
-      this.drive(true);
+      if (this.wanted() === false) {
+        // It landed with the switch off (or Live Activities gone): ended, not adopted.
+        this.endUnwanted();
+      } else {
+        this.live = true;
+        this.dismissed = false;
+        this.drive(true);
+      }
     }
     const newest = [...this.activities.values()].at(-1) ?? null;
     if (newest === this.tokens.token) return;
@@ -503,19 +530,25 @@ export class LiveActivity {
     if (newest !== null && !this.foreground) this.handOver();
   }
 
-  /** In the background every link is closed: the new token goes to each Mac that lacks it over a
-   * register-only connection, so the hub can update the activity while the phone is away. Tried
-   * when the token comes, and again once the setting and the pairings are read (a closed app that
-   * iOS launched in the background for it), at most once per Mac for the same body. This needs iOS
-   * to give the app time in the background for the token, and the phone unlocked (a Mac's device
-   * token is in the keychain, readable only then: a locked phone's pairings have no link); without
-   * either the Mac gets the token on the next foreground. */
+  /** An activity that is not wanted (it landed with the switch off): every one is ended. */
+  private endUnwanted(): void {
+    this.live = false;
+    void this.api.end().catch(() => undefined);
+  }
+
+  /** In the background every link is closed: the new token goes to the owner, if it lacks it, over
+   * a background connection (`Fleet.sendInBackground`), so its hub can update the activity while
+   * the phone is away. Tried when the token comes, and again once the setting and the pairings are
+   * read (a closed app that iOS launched in the background for it), at most once for the same
+   * body. This needs iOS to give the app time in the background for the token, and the phone
+   * unlocked (a Mac's device token is in the keychain, readable only then: a locked phone's
+   * pairings have no link); without either the owner gets the token on the next foreground. */
   private handOver(): void {
     if (this.wanted() !== true || this.stopped || this.tokens.token === null) return;
     const body = activityRegistration(this.tokens);
     if (body === null) return;
     const said = JSON.stringify(body);
-    const macs = this.fleet.links.macs().filter((mac) => {
+    const macs = (this.owner === null ? [] : [this.owner]).filter((mac) => {
       const client = this.fleet.links.client(mac);
       return client !== null && this.told.get(client) !== said && this.telling.get(client) !== said && this.handedOver.get(client) !== said;
     });
@@ -526,7 +559,7 @@ export class LiveActivity {
       this.telling.set(client, said);
       this.handedOver.set(client, said);
     }
-    void this.fleet.handOver(macs, body).then((acked) => {
+    void this.fleet.sendInBackground(macs, body).then((acked) => {
       for (const mac of macs) {
         const client = this.fleet.links.client(mac);
         if (!client || this.telling.get(client) !== said) continue;
@@ -541,22 +574,16 @@ export class LiveActivity {
     for (const mac of this.fleet.links.macs()) this.sync(mac);
   }
 
-  /** Tells Mac `mac` the tokens (or, switched off, to forget them), over a link that is up, unless
-   * it has them already or they are on their way. */
+  /** Tells Mac `mac` what it is to hold, over a link that is up, unless it has it already or it is
+   * on its way: the tokens, for the owner while the Live Activity is wanted; `clear_activity` for
+   * every other Mac, and for every Mac while it is off. A refusal or a dropped link is tried again
+   * on the next change or connection. */
   private sync(mac: string): void {
     const client = this.fleet.links.client(mac);
     if (!client || client.state !== "ready" || this.stopped || !this.attached) return;
     const wanted = this.wanted();
     if (wanted === null) return; // the setting is not read yet
-    if (!wanted) {
-      if (this.cleared.has(client)) return;
-      this.cleared.add(client);
-      sendTo(this.fleet.links, mac, { type: "clear_activity" }).catch(() => {
-        this.cleared.delete(client); // told on its next connection
-      });
-      return;
-    }
-    const body = activityRegistration(this.tokens);
+    const body = wanted && mac === this.owner ? activityRegistration(this.tokens) : CLEAR;
     if (body === null) return;
     const said = JSON.stringify(body);
     if (this.told.get(client) === said || this.telling.get(client) === said) return;
@@ -566,61 +593,11 @@ export class LiveActivity {
         () => {
           if (this.telling.get(client) === said) this.told.set(client, said);
         },
-        () => undefined, // a refusal or a dropped link: tried on the next change or connection
+        () => undefined,
       )
       .finally(() => {
         if (this.telling.get(client) === said) this.telling.delete(client);
       });
-  }
-
-  // Deny
-
-  private deny(event: DenyEvent): void {
-    if (this.fleet.snapshot().status === "loading") {
-      this.early = [...this.early, event].slice(-DENIES_HELD);
-      return;
-    }
-    const approval = parseApprovalId(event.approval);
-    if (approval === null) return;
-    const mark = `${hostKey(event.mac)}\n${event.session}\n${approval}`;
-    if (this.denied.includes(mark)) return;
-    this.denied.push(mark);
-    if (this.denied.length > DENIES_SEEN) this.denied.shift();
-    const key = this.fleet.keyFor(event.mac === "" ? null : event.mac, event.session);
-    if (key !== null) this.sendDeny({ key, approval, at: this.now() });
-  }
-
-  /** Denies `held.approval` of session `held.key` on its Mac, or keeps it for the Mac's next
-   * connection. Not sent for a session its Mac has listed as over, or as waiting on nothing. */
-  private sendDeny(held: HeldDeny): void {
-    const mac = macOfKey(held.key);
-    if (mac === null) return;
-    const state = this.store.getState();
-    if (state.listed.has(mac)) {
-      if (hasEnded(state, held.key)) return;
-      const row = state.sessions.find((s) => s.id === held.key);
-      if (row && row.approvals === 0) return;
-    }
-    const client = this.fleet.links.client(mac);
-    if (client?.state !== "ready") {
-      this.hold(held);
-      return;
-    }
-    sendVia(this.fleet.links, held.key, { type: "answer", session: held.key, approval: held.approval, allow: false }).catch((error: unknown) => {
-      if (error instanceof Refusal && error.code === "unsent") this.hold(held);
-    });
-  }
-
-  private hold(held: HeldDeny): void {
-    this.held = [...this.held.filter((h) => !(h.key === held.key && h.approval === held.approval)), held].slice(-DENIES_HELD);
-  }
-
-  private flushDenies(mac: string): void {
-    const now = this.now();
-    const mine = this.held.filter((h) => macOfKey(h.key) === mac);
-    if (mine.length === 0) return;
-    this.held = this.held.filter((h) => macOfKey(h.key) !== mac);
-    for (const held of mine) if (now - held.at <= DENY_MAX_AGE_MS) this.sendDeny(held);
   }
 }
 

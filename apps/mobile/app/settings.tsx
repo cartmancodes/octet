@@ -1,6 +1,6 @@
 import Constants from "expo-constants";
 import { useRouter } from "expo-router";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -47,6 +47,9 @@ export default function Settings() {
   const [working, setWorking] = useState<"on" | "off" | null>(null);
   // The Live Activity's switch: only where the phone has Live Activities.
   const live = useLiveActivity();
+  // Whether the phone has Live Activities: asked again at each foreground, so the switch comes and
+  // goes with the phone's own setting while this screen is open.
+  const supported = useSyncExternalStore(live?.subscribe ?? noSubscribe, () => live?.supported ?? false);
   const [liveError, setLiveError] = useState(false);
   const flipping = useRef(false);
 
@@ -198,7 +201,7 @@ export default function Settings() {
           ) : null}
         </Card>
 
-        {live?.supported ? (
+        {supported ? (
           <Card title="Live Activity">
             <SwitchRow label="Show sessions in the Dynamic Island" accessibilityLabel="Live Activity" value={saved.liveActivity} onValueChange={onLive} />
             <Text style={[type.caption, styles.words, { color: theme.muted }]}>
@@ -349,6 +352,7 @@ const SwitchRow = memo(function SwitchRow({ label, accessibilityLabel, value, di
 });
 
 const HIT = { top: 8, bottom: 8, left: 8, right: 8 } as const;
+const noSubscribe = (): (() => void) => () => undefined;
 
 const styles = StyleSheet.create({
   screen: { flex: 1 },

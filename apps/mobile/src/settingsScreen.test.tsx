@@ -4,7 +4,7 @@ import * as LocalAuthentication from "expo-local-authentication";
 import * as Notifications from "expo-notifications";
 import { router } from "expo-router";
 import * as SecureStore from "expo-secure-store";
-import { Alert, type AlertButton } from "react-native";
+import { Alert, AppState, type AlertButton } from "react-native";
 
 import Settings from "../app/settings";
 import { drawerStore, closeDrawer } from "./drawer";
@@ -524,6 +524,27 @@ describe("Settings › Live Activity", () => {
     expect(island()?.props.value).toBe(true);
     const slop = island()?.props.hitSlop as { top: number; bottom: number };
     expect(31 + slop.top + slop.bottom).toBeGreaterThanOrEqual(44);
+  });
+
+  it("follows the phone's own setting: it goes when Live Activities are turned off for Octet, and comes back", async () => {
+    let changeAppState: (state: string) => void = () => {};
+    jest.spyOn(AppState, "addEventListener").mockImplementation((_type, listener) => {
+      changeAppState = listener as (state: string) => void;
+      return { remove: jest.fn() };
+    });
+    const api = new FakeLive();
+    await openWith(api);
+    expect(island()).not.toBeNull();
+    await act(async () => changeAppState("background"));
+    api.supported = false;
+    await act(async () => changeAppState("active"));
+    await flush();
+    expect(island()).toBeNull();
+    await act(async () => changeAppState("background"));
+    api.supported = true;
+    await act(async () => changeAppState("active"));
+    await flush();
+    expect(island()).not.toBeNull();
   });
 
   it("off ends the activity, tells the Mac to forget the tokens and empties the widget's entries; on registers again", async () => {

@@ -140,7 +140,9 @@ export default function Changes() {
   // The session streams while this screen is in front, as it does for Usage: Checks is live.
   useFocusEffect(
     useCallback(() => {
-      if (!client || id === "") return;
+      // Only with the Mac's link as it is now (see the Conversation's): no hold on a link this
+      // effect's cleanup would not give back.
+      if (!client || id === "" || macId === null || links.client(macId) !== client) return;
       if (octetStore.getState().bySession.get(id)?.ended) return;
       if (octetStore.getState().sessions.every((x) => x.id !== id)) return; // not in the list: the hub would refuse
       watch(octetStore, links, id);

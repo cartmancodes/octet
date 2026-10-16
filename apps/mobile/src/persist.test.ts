@@ -18,6 +18,7 @@ describe("settings", () => {
       pushKinds: { approvals: true, errors: true, turns: false },
       textSize: 13,
       liveActivity: true,
+      liveActivityMac: null,
     });
   });
 
@@ -34,6 +35,7 @@ describe("settings", () => {
       pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
       liveActivity: true,
+      liveActivityMac: null,
     });
   });
 
@@ -69,6 +71,16 @@ describe("settings", () => {
     expect((await loadSettings()).liveActivity).toBe(true);
   });
 
+  it("the Mac that drives the Live Activity is none by default, round-trips, and only a Mac id is kept", async () => {
+    expect((await loadSettings()).liveActivityMac).toBeNull();
+    await saveSettings({ liveActivityMac: "m0000000a" });
+    expect((await loadSettings()).liveActivityMac).toBe("m0000000a");
+    for (const junk of ["../x", 5, "M0000000A"]) {
+      await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ liveActivityMac: junk }));
+      expect((await loadSettings()).liveActivityMac).toBeNull();
+    }
+  });
+
   it("notifications are off by default, round-trip, and an old record without the field still loads", async () => {
     await AsyncStorage.setItem(
       SETTINGS_KEY,
@@ -84,6 +96,7 @@ describe("settings", () => {
       pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
       liveActivity: true,
+      liveActivityMac: null,
     });
     await saveSettings({ notifications: true });
     expect((await loadSettings()).notifications).toBe(true);
@@ -168,13 +181,14 @@ describe("settings", () => {
       pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
       liveActivity: true,
+      liveActivityMac: null,
     });
   });
 
   it("never hold a token", async () => {
     await saveSettings({ hubUrl: "wss://x/" });
     const raw = (await AsyncStorage.getItem(SETTINGS_KEY)) ?? "";
-    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "forget", "hubUrl", "liveActivity", "notifications", "pairings", "pushKinds", "textSize"]);
+    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "forget", "hubUrl", "liveActivity", "liveActivityMac", "notifications", "pairings", "pushKinds", "textSize"]);
   });
 });
 

@@ -3,7 +3,8 @@
 // waiting", "Session error" or "Turn finished", `data.session`, `data.mac` (the host it is
 // published at) when it knows it, and the channel "approvals", "errors" or "turns"); this file
 // only prepares the phone for them. Registering the token with each Mac's hub is the Fleet's job
-// (`MacLink`, src/hub.ts), and so is finding the Mac a tap is for (`Fleet.tapKey`).
+// (`MacLink`, src/fleet/macLink.ts), and finding the Mac a tap is for is the Fleet's
+// (`Fleet.tapKey`, src/fleet/fleet.ts).
 import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
