@@ -1,4 +1,5 @@
 //! Devices, pairing secrets, hub config and the audit log.
+use crate::apns::ApnsConfig;
 use octet_core::remote::protocol::{PushKinds, is_activity_token, is_push_token};
 use octet_store::{create_private, create_private_dir, sync_directory};
 use sha2::{Digest, Sha256};
@@ -123,6 +124,9 @@ pub struct HubConfig {
     pub port: u16,
     /// The workspaces a phone may start sessions in.
     pub workspaces: Vec<PathBuf>,
+    /// APNs for the Live Activity, when `hub.json` names a well-formed `apns` block; off
+    /// otherwise.
+    pub apns: Option<ApnsConfig>,
 }
 
 /// A file's mtime and size.
@@ -737,12 +741,13 @@ fn activity(stored: &serde_json::Value) -> Option<ActivityTokens> {
     .or_none()
 }
 
-/// The settings when `hub.json` names none: port 47823 and no extra workspaces.
+/// The settings when `hub.json` names none: port 47823, no extra workspaces and no APNs.
 impl Default for HubConfig {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
             workspaces: Vec::new(),
+            apns: None,
         }
     }
 }
@@ -774,6 +779,12 @@ async fn read_config(directory: &Path) -> io::Result<HubConfig> {
             })
             .ok_or_else(|| invalid("hub.json workspaces must be a list of paths"))?;
     }
+    // A malformed `apns` block turns APNs off, with one line naming the field; the hub still
+    // starts.
+    config.apns = ApnsConfig::from_hub_json(&value["apns"]).unwrap_or_else(|line| {
+        eprintln!("{line}");
+        None
+    });
     Ok(config)
 }
 
@@ -1850,7 +1861,8 @@ mod tests {
             store.config(),
             &HubConfig {
                 port: 47823,
-                workspaces: Vec::new()
+                workspaces: Vec::new(),
+                apns: None
             }
         );
         std::fs::write(
@@ -1866,6 +1878,42 @@ mod tests {
         );
         std::fs::write(dir.path().join("hub.json"), r#"{"port":70000}"#).unwrap();
         assert!(Store::open(dir.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn hub_json_names_apns_and_a_malformed_block_only_turns_it_off() {
+        let dir = TempDir::new("hub-apns");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let write = |apns: &str| {
+            std::fs::write(
+                dir.path().join("hub.json"),
+                format!(r#"{{"port":50001,"apns":{apns}}}"#),
+            )
+            .unwrap();
+        };
+        write(
+            r#"{"team_id":"TEAM123456","key_id":"KEY1234567",
+                "key_path":"/keys/AuthKey.p8","sandbox":false}"#,
+        );
+        let store = Store::open(dir.path()).await.unwrap();
+        assert_eq!(
+            store.config().apns,
+            Some(ApnsConfig {
+                team_id: "TEAM123456".into(),
+                key_id: "KEY1234567".into(),
+                key_path: PathBuf::from("/keys/AuthKey.p8"),
+                sandbox: false,
+            })
+        );
+        // Malformed: APNs is off and the rest of hub.json still holds.
+        write(r#"{"team_id":"team","key_id":"KEY1234567","key_path":"/k","sandbox":true}"#);
+        let store = Store::open(dir.path()).await.unwrap();
+        assert_eq!(store.config().apns, None);
+        assert_eq!(store.config().port, 50001);
+        write(r#""on""#);
+        assert_eq!(Store::open(dir.path()).await.unwrap().config().apns, None);
+        write("null");
+        assert_eq!(Store::open(dir.path()).await.unwrap().config().apns, None);
     }
 
     #[tokio::test]

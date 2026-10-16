@@ -17,6 +17,10 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+# One crate, not the whole tree: `subtle` (constant-time helpers that every
+# RustCrypto curve crate needs, here through p256 for the hub's APNs JWT) is
+# BSD-3-Clause only.
+exceptions = [{ allow = ["BSD-3-Clause"], crate = "subtle" }]
 
 [licenses.private]
 # The workspace's own crates are not published (publish = false).
