@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react-native";
 
 import { FakeClock, Sockets } from "./client/fakes";
 import { HubClient } from "./client/HubClient";
-import type { CatalogInfo, JournalEvent, SessionInfo, StateInfo, ToPhone } from "./protocol";
+import { MAX_SESSION_ROWS, type CatalogInfo, type JournalEvent, type SessionInfo, type StateInfo, type ToPhone } from "./protocol";
 import { entrySize } from "./model/transcript";
 import type { BatchItem } from "./client/HubClient";
 import { linksOf, type Links } from "./macs";
@@ -204,6 +204,127 @@ describe("the sessions list", () => {
     expect(rest).toEqual([]);
     expect(only?.now).toBe("Running ls");
     expect((only?.workspace ?? "").length).toBeLessThan(10_000);
+  });
+
+  it(`keeps at most MAX_SESSION_ROWS (${MAX_SESSION_ROWS}) rows, the protocol's own bound`, () => {
+    applyM([sessions(...Array.from({ length: MAX_SESSION_ROWS + 30 }, (_, i) => info(`s${i}`)))]);
+    expect(store.getState().sessions).toHaveLength(MAX_SESSION_ROWS);
+    expect(store.getState().sessions.at(-1)?.id).toBe(k(`s${MAX_SESSION_ROWS - 1}`));
+  });
+});
+
+describe("several sessions frames of a Mac in one batch", () => {
+  /** A row whose fields count how often they are read. */
+  const counted = (id: string, reads: { n: number }, extra: Partial<SessionInfo> = {}): SessionInfo => {
+    const row = info(id, extra) as unknown as Record<string, unknown>;
+    for (const key of ["engine", "workspace", "mode", "phase", "goal", "now", "usage"]) {
+      const value = row[key];
+      Object.defineProperty(row, key, {
+        enumerable: true,
+        get: () => {
+          reads.n += 1;
+          return value;
+        },
+      });
+    }
+    return row as unknown as SessionInfo;
+  };
+
+  it("reconciles only the last: the rows of the frames before it are never cleaned", () => {
+    const early = { n: 0 };
+    const last = { n: 0 };
+    // Keyed already, as the feed hands them over (a spread would read every field).
+    const frames = (n: number, reads: { n: number }) => sessions(...Array.from({ length: 50 }, (_, i) => counted(k(`s${i}`), reads, { now: `step ${n}` })));
+    store.getState().applyBatch(M, [frames(1, early), frames(2, early), stateFrame(k("s0")), frames(3, last)]);
+    expect(early.n).toBe(0);
+    expect(last.n).toBeGreaterThan(0);
+    expect(store.getState().sessions).toHaveLength(50);
+    expect(store.getState().sessions[0]?.now).toBe("step 3");
+    // The state frame between them still landed.
+    expect(view("s0").state?.phase).toBe("idle");
+  });
+
+  it("a session listed only in an earlier frame of the batch neither starts nor ends anything", () => {
+    applyM([sessions(info("a"))]);
+    const ended = applyM([sessions(info("a"), info("b")), sessions(info("a"))]);
+    expect(ended).toEqual([]);
+    expect(store.getState().sessions.map((s) => s.id)).toEqual([k("a")]);
+  });
+
+  it("an answered question still shows again when an earlier frame of the batch caught the Mac up", () => {
+    const question = (extra: Partial<SessionInfo> = {}) => info("a", { question: true, ...extra });
+    applyM([sessions(question())]);
+    store.getState().markAnswered(k("a"));
+    // Caught up (no question), then a new question, in one batch: the new one must show.
+    applyM([sessions(info("a", { last_activity: 6 })), sessions(question({ last_activity: 9 }))]);
+    expect(store.getState().sessions[0]?.question).toBe(true);
+    // And one that left the list in an earlier frame of the batch is forgotten too.
+    store.getState().markAnswered(k("a"));
+    applyM([sessions(info("b")), sessions(question({ last_activity: 12 }), info("b"))]);
+    expect(store.getState().sessions[0]?.question).toBe(true);
+    // A batch that never catches up keeps the mark.
+    store.getState().markAnswered(k("a"));
+    applyM([sessions(question({ last_activity: 13 })), sessions(question({ last_activity: 14 }))]);
+    expect(store.getState().sessions[0]?.question).toBeUndefined();
+  });
+
+  it("each Mac's last frame counts, and one Mac's frames never touch another's rows", () => {
+    const other = "m00000002";
+    store.getState().applyBatches([
+      { mac: M, frames: keyed([sessions(info("a", { now: "1" })), sessions(info("a", { now: "2" }))]) },
+      { mac: other, frames: [sessions({ ...info("b"), id: `${other}/b` }), sessions({ ...info("b", { now: "x" }), id: `${other}/b` })] },
+    ]);
+    expect(store.getState().sessions.map((s) => [s.id, s.now])).toEqual([
+      [k("a"), "2"],
+      [`${other}/b`, "x"],
+    ]);
+  });
+});
+
+describe("a row the hub shortened to fit the frame", () => {
+  const summary = { action: "Run Bash", command: "cargo test", files: [], scope: "this call" };
+  const waiting = (extra: Partial<SessionInfo> = {}) => info("a", { approvals: 1, approval: { id: 4, summary }, ...extra });
+
+  it("keeps the approval's gist it knew while the count says an approval still waits", () => {
+    applyM([sessions(waiting())]);
+    const before = store.getState().sessions;
+    // Under pressure the hub drops the gist and keeps the count: not sent is not cleared.
+    applyM([sessions(info("a", { approvals: 1 }))]);
+    expect(store.getState().sessions[0]?.approval).toEqual({ id: 4, summary });
+    expect(store.getState().sessions).toBe(before);
+    // One more behind it: the front is the same one.
+    applyM([sessions(info("a", { approvals: 2, last_activity: 3 }))]);
+    expect(store.getState().sessions[0]?.approval).toEqual({ id: 4, summary });
+    expect(store.getState().sessions[0]?.last_activity).toBe(3);
+  });
+
+  it("drops it when the count says none waits, or fell (the front was likely answered)", () => {
+    applyM([sessions(waiting())]);
+    applyM([sessions(info("a"))]);
+    expect(store.getState().sessions[0]?.approval).toBeUndefined();
+    applyM([sessions(waiting({ approvals: 2 }))]);
+    applyM([sessions(info("a", { approvals: 1 }))]);
+    expect(store.getState().sessions[0]?.approval).toBeUndefined();
+  });
+
+  it("takes a gist that is sent, and drops one sent malformed: only an absent field is not sent", () => {
+    applyM([sessions(waiting())]);
+    applyM([sessions(waiting({ approval: { id: 5, summary } }))]);
+    expect(store.getState().sessions[0]?.approval?.id).toBe(5);
+    applyM([sessions(info("a", { approvals: 1, approval: null }))]);
+    expect(store.getState().sessions[0]?.approval).toBeUndefined();
+    // Nothing known before: nothing to keep.
+    applyM([sessions(info("b", { approvals: 1 }))]);
+    expect(store.getState().sessions[0]?.approval).toBeUndefined();
+  });
+
+  it("shows a usage, NOW or goal line the hub left out as not there: the Mac sends no null for a cleared one", () => {
+    applyM([sessions(info("a", { usage: "5h 12%", now: "Running ls", goal: "ship it" }))]);
+    applyM([sessions(info("a"))]);
+    const [a] = store.getState().sessions;
+    expect(a?.usage).toBeUndefined();
+    expect(a?.now).toBeUndefined();
+    expect(a?.goal).toBeUndefined();
   });
 });
 

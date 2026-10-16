@@ -1,5 +1,5 @@
 // A Mac's listed sessions: each row cleaned and keyed by its Mac, and reconciled with the last list.
-import type { ApprovalInfo, SessionInfo } from "../protocol";
+import { MAX_SESSION_ROWS, type ApprovalInfo, type SessionInfo } from "../protocol";
 import { splitKey } from "../macs";
 import { ENGINES, MODES, PHASES, count, member } from "../model/enums";
 import { cleanFrontApproval } from "../model/session";
@@ -9,8 +9,6 @@ import { FIELD_CHARS, field } from "../model/text";
  * which goes only on the wire, and `mac` the phone's id for the Mac that listed it. */
 export type ListedSession = SessionInfo & { mac: string; raw: string };
 
-/** Sessions listed, at most, per Mac. */
-const MAX_SESSIONS = 200;
 export const FIELD = FIELD_CHARS;
 /** The longest usage line kept: the hub clips it to this too. */
 const USAGE_CHARS = 200;
@@ -66,36 +64,75 @@ const sameSession = (a: ListedSession, b: ListedSession): boolean => {
   return sameApproval(a.approval, b.approval);
 };
 
+/** `answered` once kept to what is still asking: other Macs' marks, and those of this Mac that
+ * `asking` (a session listed still asking) holds. The same set when nothing left it. */
+function settle(mac: string, answered: ReadonlySet<string>, asking: (id: string) => boolean): ReadonlySet<string> {
+  const prefix = `${mac}/`;
+  let kept: Set<string> | null = null;
+  for (const id of answered) {
+    if (!id.startsWith(prefix) || asking(id)) continue;
+    kept ??= new Set(answered);
+    kept.delete(id);
+  }
+  return kept ?? answered;
+}
+
+/** `answered` after a sessions frame of Mac `mac` that a later one in the same batch replaces: its
+ * rows are not cleaned or kept, only read for the marks of this Mac, which leave the set as
+ * `reconcile` would let them go (the row no longer asks, or is not listed), so that a question
+ * after the Mac caught up still shows. O(rows) only while one of this Mac's marks is out. */
+export function answeredAfter(mac: string, raw: unknown[], answered: ReadonlySet<string>): ReadonlySet<string> {
+  const prefix = `${mac}/`;
+  if (![...answered].some((id) => id.startsWith(prefix))) return answered;
+  const asking = new Set<string>();
+  for (const item of raw.slice(0, MAX_SESSION_ROWS)) {
+    if (isObj(item) && typeof item.id === "string" && item.question === true) asking.add(field(item.id, FIELD));
+  }
+  return settle(mac, answered, (id) => asking.has(id));
+}
+
+/** The front approval `old` showed, for its row `info` that came without one. Under pressure the hub
+ * leaves a row's `approval` out and keeps its count (`SessionsFrame`, protocol.ts): what is not sent
+ * is not cleared. The count decides: none waiting, no front; fewer than before, the front was likely
+ * answered, so none is kept. */
+function keptFront(old: ListedSession | undefined, info: SessionInfo, raw: Record<string, unknown>): ApprovalInfo | undefined {
+  if (raw.approval !== undefined || !old?.approval || info.approvals <= 0 || info.approvals < old.approvals) return undefined;
+  return old.approval;
+}
+
 /** Mac `mac`'s listed sessions, reusing the previous object of each session that did not change,
- * and the previous array when none did. A session in `answered` that still says question is
- * shown as not asking, and stays in the set; one of this Mac whose row no longer asks (the Mac
- * caught up), or that is not listed, leaves it. Other Macs' marks are kept. */
+ * and the previous array when none did. A row's field the hub left out is not sent, which for most
+ * fields is the same as none (a Mac sends no null for a NOW line or goal that went), but a front
+ * approval's gist it knew is kept while the count says it still waits (`keptFront`). A session in
+ * `answered` that still says question is shown as not asking, and stays in the set; one of this Mac
+ * whose row no longer asks (the Mac caught up), or that is not listed, leaves it. Other Macs' marks
+ * are kept. At most `MAX_SESSION_ROWS`, the hub's own bound. */
 export function reconcile(
   mac: string,
   prev: ListedSession[],
   raw: unknown[],
   answered: ReadonlySet<string>,
 ): { sessions: ListedSession[]; answered: ReadonlySet<string> } {
-  const prefix = `${mac}/`;
   const before = new Map(prev.map((s) => [s.id, s]));
   const next: ListedSession[] = [];
   const seen = new Set<string>();
-  const kept = new Set<string>();
-  for (const id of answered) if (!id.startsWith(prefix)) kept.add(id);
-  for (const item of raw.slice(0, MAX_SESSIONS)) {
+  const asking = new Set<string>();
+  for (const item of raw.slice(0, MAX_SESSION_ROWS)) {
     const info = cleanRow(mac, item);
     if (!info || seen.has(info.id)) continue;
     seen.add(info.id);
     if (info.question && answered.has(info.id)) {
       delete info.question;
-      kept.add(info.id);
+      asking.add(info.id);
     }
     const old = before.get(info.id);
+    const front = keptFront(old, info, item as Record<string, unknown>);
+    if (front) info.approval = front;
     next.push(old && sameSession(old, info) ? old : info);
   }
   return {
     sessions: next.length === prev.length && next.every((s, i) => s === prev[i]) ? prev : next,
-    answered: kept.size === answered.size && [...kept].every((id) => answered.has(id)) ? answered : kept,
+    answered: settle(mac, answered, (id) => asking.has(id)),
   };
 }
 

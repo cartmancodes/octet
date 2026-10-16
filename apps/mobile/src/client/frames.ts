@@ -1,6 +1,8 @@
 import { PROTOCOL_VERSION, type ToPhone } from "../protocol";
 
-/** The largest frame taken, in bytes of UTF-8. The hub bounds what it sends well below this. */
+/** The largest frame taken, in bytes of UTF-8; a larger one parses to null. The hub keeps its
+ * `sessions`, `changes` and `diff` frames within `MAX_MESSAGE` (96 KiB, protocol.ts), well under
+ * this. */
 export const MAX_FRAME_BYTES = 256 * 1024;
 
 type Obj = Record<string, unknown>;

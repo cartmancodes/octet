@@ -9,7 +9,7 @@ import { clearParsed } from "../markdown/blocks";
 import { hideToastOf } from "../toast";
 import { field } from "../model/text";
 import { isKnownEvent } from "../protocol";
-import { FIELD, isObj, merged, reconcile, type ListedSession } from "./rows";
+import { FIELD, answeredAfter, isObj, merged, reconcile, type ListedSession } from "./rows";
 
 export interface OctetState {
   /** The live sessions of every Mac, each Mac's as it listed them last, Mac after Mac. */
@@ -29,8 +29,8 @@ export interface OctetState {
   /** The Macs whose sessions frame came since the store began or was reset: until a Mac's comes,
    * its having no rows means "not told yet", not "none". */
   listed: ReadonlySet<string>;
-  /** Applies one Mac's frames, their sessions already keyed by it, in order, in one commit.
-   * Returns the sessions that just ended (they were listed before and are not now): their views
+  /** Applies one Mac's frames, their sessions already keyed by it, in order, in one commit. Each
+   * sessions frame is the Mac's whole list, so only the last in the batch is reconciled. Returns the sessions that just ended (they were listed before and are not now): their views
    * stay, marked `ended`, until the caller releases them. A frame naming another Mac's session
    * is left out, and so is a listed row of another Mac's: a frame of one Mac never makes or
    * changes another's keys. */
@@ -291,11 +291,19 @@ export function createOctetStore(): OctetStore {
           if (list) list.push(op);
           else ops.set(session, [op]);
         };
-        for (const frame of ownFrames(mac, frames)) {
+        const own = ownFrames(mac, frames);
+        // Each list is the whole of the Mac's sessions, so only the batch's last one is reconciled;
+        // one before it only lets go of the answered marks it would have.
+        let lastList = -1;
+        own.forEach((frame, i) => {
+          if (frame.type === "sessions" && Array.isArray(frame.sessions)) lastList = i;
+        });
+        for (const [i, frame] of own.entries()) {
           switch (frame.type) {
             case "sessions":
               if (Array.isArray(frame.sessions)) {
-                ({ sessions: rows, answered } = reconcile(mac, rows, frame.sessions, answered));
+                if (i === lastList) ({ sessions: rows, answered } = reconcile(mac, rows, frame.sessions, answered));
+                else answered = answeredAfter(mac, frame.sessions, answered);
                 heard = true;
               }
               break;

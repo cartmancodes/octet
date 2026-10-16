@@ -1,5 +1,6 @@
-import type { Cursor } from "../protocol";
+import { MAX_MESSAGE, MAX_SESSION_ROWS, type Cursor } from "../protocol";
 import { FakeClock, Sockets } from "./fakes";
+import { MAX_FRAME_BYTES, utf8Length } from "./frames";
 import { HubClient, PING_INTERVAL_MS, PING_TIMEOUT_MS, REQUEST_TIMEOUT_MS, Refusal, type BatchItem, type HubState } from "./HubClient";
 
 const URL = "wss://mac.tail1234.ts.net/";
@@ -1309,6 +1310,34 @@ describe("hostile input", () => {
     flush(r);
     expect(delivered(r).map((f) => f.type)).toEqual(["sessions", "event"]);
     expect(r.client.garbageFrames).toBe(garbage.length);
+  });
+
+  it("takes whole the largest sessions frame the hub sends: MAX_SESSION_ROWS rows of 3-byte text, within MAX_MESSAGE", () => {
+    // The hub's bound (crates/octet-hub/src/sessions.rs `frame`) sits well under the phone's.
+    expect(MAX_MESSAGE).toBeLessThan(MAX_FRAME_BYTES);
+    const r = rig();
+    ready(r);
+    const row = (i: number, goal: string) => ({
+      id: `${100 + i}-1790000000`,
+      engine: "claude",
+      workspace: `/w/${i}`,
+      mode: "ask",
+      phase: "idle",
+      approvals: 0,
+      from_phone: false,
+      goal,
+    });
+    const frame = (goal: string) => JSON.stringify({ v: 1, type: "sessions", sessions: Array.from({ length: MAX_SESSION_ROWS }, (_, i) => row(i, goal)) });
+    // As much CJK as a goal can take while the frame still fits the hub's bound.
+    let chars = 0;
+    while (utf8Length(frame("目".repeat(chars + 1))) <= MAX_MESSAGE) chars += 1;
+    const text = frame("目".repeat(chars));
+    expect(utf8Length(text)).toBeGreaterThan(MAX_MESSAGE - 3 * MAX_SESSION_ROWS);
+    r.sockets.last.receive(text);
+    flush(r);
+    const sessions = delivered(r).filter((f) => f.type === "sessions").at(-1);
+    expect(sessions?.type === "sessions" ? sessions.sessions.length : -1).toBe(MAX_SESSION_ROWS);
+    expect(r.client.garbageFrames).toBe(0);
   });
 
   it("a frame of exactly 256 KB is accepted", () => {
