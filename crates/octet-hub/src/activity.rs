@@ -8,15 +8,20 @@
 //!   session runs, else `done`. The session that leads is the one with the oldest waiting
 //!   approval, else the most recently started running one, else the last that finished; `since`
 //!   is when that session's own kind began, and `approvals` counts every approval waiting.
+//! - **Connected** means here that a connection of the device streams a session: it sent at least
+//!   one `subscribe`, which only the app in the foreground does. A bare `hello`, or a background
+//!   wake that only sends `register_activity` (handing over a hub-started activity's token), is
+//!   not connected: the activity goes on, and its updates go to the token that wake registered.
 //! - **Start**, to the device's `start_token`: on news (an approval new to its session, or a turn
-//!   that starts) while the device has no connection and no activity the hub knows of. News seen
-//!   while it is connected is spent, so leaving the app starts nothing by itself. A session's
-//!   first state only seeds, so a hub restart starts nothing either.
+//!   that starts) while the device is not connected and has no activity the hub knows of. News
+//!   seen while it is connected is spent, so leaving the app starts nothing by itself. A
+//!   session's first state only seeds, so a hub restart starts nothing either.
 //! - **Update**, to the device's activity `token`: when the kind or the approval count changes,
 //!   at most once per [`UPDATE_GAP`]. Without an activity token the hub cannot update; it only
 //!   starts and ends.
 //! - **End**, to the activity token, with `dismissal-date`: [`IDLE_END`] after every session went
-//!   idle, or when the device connects, after which the app drives the activity itself.
+//!   idle, or when a connection of the device starts streaming, after which the app drives the
+//!   activity itself.
 //!
 //! Every send also takes one from the device's allowance in the [`Limiter`] the pushes use, so the
 //! two together stay within its cap. One the allowance has no room for waits for the next look;
@@ -148,8 +153,9 @@ impl Due {
     }
 
     /// The APNs payload at `now` (whose wall-clock time is `wall`), naming `mac` (the host the hub
-    /// is published at, or nothing): the event, the content state and the attributes, with an
-    /// alert for a start and a `dismissal-date` for an end. Nothing else.
+    /// is published at, or nothing): the event and the content state; a start adds the
+    /// attributes and an alert ("Approval waiting" for an approval, else "Session running"), and
+    /// an end a `dismissal-date`. Nothing else.
     pub(crate) fn payload(&self, mac: Option<&str>, now: Instant, wall: SystemTime) -> Value {
         let timestamp = wall.duration_since(UNIX_EPOCH).map_or(0, |at| at.as_secs());
         let age = now.saturating_duration_since(self.content.since).as_secs();
@@ -163,12 +169,20 @@ impl Due {
                 "since": timestamp.saturating_sub(age),
                 "approvals": self.content.approvals,
             },
-            "attributes-type": "OctetActivity",
-            "attributes": {},
         });
         match self.event {
-            // ActivityKit wants an alert to start an activity by push.
-            Event::Start => aps["alert"] = json!({"title": "Octet", "body": "Session running"}),
+            Event::Start => {
+                // ActivityKit makes the activity from the attributes, and wants an alert to start
+                // one by push.
+                let body = if self.content.kind == Kind::Approval {
+                    "Approval waiting"
+                } else {
+                    "Session running"
+                };
+                aps["attributes-type"] = json!("OctetActivity");
+                aps["attributes"] = json!({});
+                aps["alert"] = json!({"title": "Octet", "body": body});
+            }
             Event::End => aps["dismissal-date"] = json!(timestamp),
             Event::Update => {}
         }
@@ -373,8 +387,19 @@ impl Driver {
         }
     }
 
-    /// `device` connected: the activity the hub started for it, if any, is to end, and the news
-    /// so far is spent. From now on the app drives it.
+    /// `device` said hello: from now on it is judged on news from now, even if the hub has not
+    /// looked at it yet when that news comes. Nothing else changes: a hello is not a connection
+    /// that streams (see [`connected`](Self::connected)).
+    pub(crate) fn hello(&mut self, device: &str) {
+        let news = self.news;
+        self.phones
+            .entry(device.to_owned())
+            .or_insert_with(|| Phone::new(news));
+    }
+
+    /// A connection of `device` started streaming a session (the app is in the foreground): the
+    /// activity the hub started for it, if any, is to end, and the news so far is spent. From now
+    /// on the app drives it.
     pub(crate) fn connected(&mut self, device: &str) {
         let news = self.news;
         let phone = self
@@ -554,6 +579,11 @@ impl Activity {
         self.driver.observe(snapshots, now);
     }
 
+    /// See [`Driver::hello`].
+    pub(crate) fn hello(&mut self, device: &str) {
+        self.driver.hello(device);
+    }
+
     /// See [`Driver::connected`].
     pub(crate) fn connected(&mut self, device: &str) {
         self.driver.connected(device);
@@ -570,8 +600,8 @@ impl Activity {
     }
 
     /// Sends, in the background, what is due at `now` (wall-clock `wall`) to each of `devices`
-    /// with activity tokens, naming `mac`; `connected` says which devices have a phone connected,
-    /// and `cap` is the allowance the pushes share.
+    /// with activity tokens, naming `mac`; `connected` says which devices have a connection that
+    /// streams a session, and `cap` is the allowance the pushes share.
     pub(crate) fn flush(
         &mut self,
         devices: &[Device],
@@ -1026,6 +1056,29 @@ mod tests {
     }
 
     #[test]
+    fn a_hello_marks_where_news_starts_and_ends_nothing() {
+        let mut rig = Rig::new(&["s1"]);
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
+        // A background wake says hello: the activity goes on, and the next change updates it.
+        rig.driver.hello("dev");
+        rig.observe(4.0, &[snap("s1", Some("idle"), &[1, 2])]);
+        assert_eq!(rig.away(4.0).map(|due| due.event), Some(Event::Update));
+        // A device that says hello and then has news before the hub first looks at it is
+        // judged on that news.
+        let now = rig.at(5.0);
+        rig.driver.hello("new");
+        rig.observe(5.0, &[snap("s1", Some("idle"), &[1, 2, 3])]);
+        let held = rig.tokens.clone();
+        assert_eq!(
+            rig.driver
+                .due_for("new", Some(&held), false, &mut rig.cap, now)
+                .map(|due| due.event),
+            Some(Event::Start)
+        );
+    }
+
+    #[test]
     fn a_lost_activity_is_started_again_by_the_next_news() {
         let mut rig = Rig::new(&["s1"]);
         rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
@@ -1165,6 +1218,25 @@ mod tests {
             fixture["end"]
         );
         assert_eq!(fixture.as_object().map(serde_json::Map::len), Some(3));
+        // A start for a turn says so; one for an approval says that instead.
+        let running = due(Event::Start, Kind::Running, 0).payload(Some(MAC), now, wall);
+        assert_eq!(
+            running["aps"]["alert"],
+            json!({"title": "Octet", "body": "Session running"})
+        );
+        assert_eq!(
+            fixture["start"]["aps"]["alert"],
+            json!({"title": "Octet", "body": "Approval waiting"})
+        );
+        // Only a start carries the attributes: ActivityKit reads them to make the activity.
+        for event in ["update", "end"] {
+            let aps = fixture[event]["aps"].as_object().expect("aps");
+            assert!(!aps.contains_key("attributes-type"), "{event}");
+            assert!(
+                !aps.contains_key("attributes") && !aps.contains_key("alert"),
+                "{event}"
+            );
+        }
         // Unpublished, `mac` is empty; with no session leading, so is `session`.
         let mut lone = due(Event::Update, Kind::Done, 0);
         lone.content.session.clear();
@@ -1184,9 +1256,9 @@ mod tests {
         rig.driver.connected("dev");
         let end = rig.due(4.0, true).expect("an end");
         for (due, extra) in [
-            (start, Some("alert")),
-            (update, None),
-            (end, Some("dismissal-date")),
+            (start, &["alert", "attributes", "attributes-type"][..]),
+            (update, &[][..]),
+            (end, &["dismissal-date"][..]),
         ] {
             let payload = due.payload(Some(MAC), rig.at(4.0), wall);
             let text = payload.to_string();
@@ -1200,13 +1272,7 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             keys.sort_unstable();
-            let mut want = vec![
-                "attributes",
-                "attributes-type",
-                "content-state",
-                "event",
-                "timestamp",
-            ];
+            let mut want = vec!["content-state", "event", "timestamp"];
             want.extend(extra);
             want.sort_unstable();
             assert_eq!(keys, want);

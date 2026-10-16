@@ -369,6 +369,16 @@ async fn register(phone: &mut Phone, token: Option<&str>, start_token: Option<&s
     assert_eq!(recv_kind(phone, "ack").await, ack(3, "Activity registered"));
 }
 
+/// Streams `session`, as the app does in the foreground.
+async fn subscribe(phone: &mut Phone, session: &str) {
+    send(
+        phone,
+        json!({"v": 1, "req": 4, "type": "subscribe", "session": session}),
+    )
+    .await;
+    recv_kind(phone, "subscribed").await;
+}
+
 /// Closes the phone's socket, as the app does in the background, and gives the hub a moment.
 async fn background(mut phone: Phone) {
     let _ = timeout(WAIT, phone.close(None)).await;
@@ -386,7 +396,15 @@ fn assert_state(request: &Request, event: &str, kind: &str, session: &str, appro
     assert_eq!(state["mac"], MAC, "{request:?}");
     assert_eq!(state["approvals"], approvals, "{request:?}");
     assert!(state["since"].as_u64().is_some(), "{request:?}");
-    assert_eq!(aps["attributes-type"], "OctetActivity");
+    // Only a start carries the attributes.
+    if event == "start" {
+        assert_eq!(aps["attributes-type"], "OctetActivity", "{request:?}");
+        assert_eq!(aps["attributes"], json!({}), "{request:?}");
+    } else {
+        let aps = aps.as_object().expect("aps");
+        assert!(!aps.contains_key("attributes-type"), "{request:?}");
+        assert!(!aps.contains_key("attributes"), "{request:?}");
+    }
     let priority = if event == "start" || kind == "approval" {
         "apns-priority: 10"
     } else {
@@ -448,17 +466,21 @@ fn the_live_activity_follows_the_sessions_while_the_phone_is_away() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// An approval while the phone is away starts the activity; a second updates it; the phone
-/// coming back ends it, and the hub then leaves it alone.
+/// An approval while the app streams a session is the app's to show. Once it is in the
+/// background, a second approval starts the activity. A background wake that only registers the
+/// new activity's token ends nothing, and the next change goes to that token. The app streaming a
+/// session again ends the activity, and the hub then leaves it alone.
 async fn start_update_and_end(fake: &Fake, root: PathBuf) {
     const TOKEN: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
     const START: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+    const WOKEN: &str = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
     let env = Env::start(root, 6201).await;
     let mut link = env.link().await;
     let device = env.pair("Story A phone").await;
     let mut phone = env.hello(&device).await;
     register(&mut phone, Some(TOKEN), Some(START)).await;
-    // While connected, an approval is the app's to show.
+    subscribe(&mut phone, &env.id).await;
+    // While the app streams a session, an approval is the app's to show.
     link.state("idle", &[]).await;
     link.state("idle", &[1]).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -469,20 +491,38 @@ async fn start_update_and_end(fake: &Fake, root: PathBuf) {
     assert_state(&start, "start", "approval", &env.id, 2);
     assert_eq!(
         start.body["aps"]["alert"],
-        json!({"title": "Octet", "body": "Session running"})
+        json!({"title": "Octet", "body": "Approval waiting"})
     );
-    // Answered, and a turn runs: an update, to the activity's own token.
+    // The app wakes in the background to hand over the new activity's token: a hello and a
+    // registration, no stream. That ends nothing.
+    let mut wake = env.hello(&device).await;
+    register(&mut wake, Some(WOKEN), Some(START)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(fake.to(TOKEN).is_empty() && fake.to(WOKEN).is_empty());
+    // Answered, and a turn runs: an update, to the token the wake handed over, while the wake's
+    // connection is still open.
     link.state("running", &[]).await;
-    let update = fake.wait_for(TOKEN, 0).await;
+    let update = fake.wait_for(WOKEN, 0).await;
     assert_state(&update, "update", "running", &env.id, 0);
-    // The phone is back: the activity ends, and the app drives it from here.
-    let phone = env.hello(&device).await;
-    let end = fake.wait_for(TOKEN, 1).await;
+    background(wake).await;
+    // The app is back and streams a session: the activity ends, and the app drives it from here.
+    let mut phone = env.hello(&device).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(fake.to(WOKEN).len(), 1, "a bare hello ends nothing");
+    subscribe(&mut phone, &env.id).await;
+    let end = fake.wait_for(WOKEN, 1).await;
     assert_state(&end, "end", "running", &env.id, 0);
     assert!(end.body["aps"]["dismissal-date"].as_u64().is_some());
     link.state("idle", &[3]).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_eq!((fake.to(START).len(), fake.to(TOKEN).len()), (1, 2));
+    assert_eq!(
+        (
+            fake.to(START).len(),
+            fake.to(TOKEN).len(),
+            fake.to(WOKEN).len()
+        ),
+        (1, 0, 2)
+    );
     drop(phone);
 }
 

@@ -14,7 +14,7 @@
       "attributes": {},
       "alert": {
         "title": "Octet",
-        "body": "Session running"
+        "body": "Approval waiting"
       }
     }
   },
@@ -28,9 +28,7 @@
         "mac": "mac.tail1234.ts.net",
         "since": 1790000059,
         "approvals": 0
-      },
-      "attributes-type": "OctetActivity",
-      "attributes": {}
+      }
     }
   },
   "end": {
@@ -44,8 +42,6 @@
         "since": 1790000059,
         "approvals": 0
       },
-      "attributes-type": "OctetActivity",
-      "attributes": {},
       "dismissal-date": 1790000101
     }
   }

@@ -501,6 +501,9 @@ struct Conn {
     device: Option<Device>,
     /// The sessions it streams, by id.
     subscriptions: HashMap<String, Subscription>,
+    /// Whether it ever sent `subscribe`: only the app in the foreground does, so only such a
+    /// connection takes the Live Activity over from the hub.
+    streamed: bool,
     /// What its last `changes` of each session listed, which is all a `diff` may name.
     listings: Listings,
     /// Its place in the hub's room, given back as it drops.
@@ -797,6 +800,7 @@ impl Hub {
                 opened: Instant::now(),
                 device: None,
                 subscriptions: HashMap::new(),
+                streamed: false,
                 listings: Listings::default(),
                 seat,
             },
@@ -889,9 +893,9 @@ impl Hub {
                     return;
                 };
                 let name = device.name.clone();
-                // The phone drives its Live Activity while it is here: the hub's ends.
+                // Judged on news from now; a hello alone ends no Live Activity.
                 if let Some(activity) = self.activity.as_mut() {
-                    activity.connected(&device.token_sha256);
+                    activity.hello(&device.token_sha256);
                 }
                 // Out of the waiting room before the phone hears it is in.
                 if let Some(state) = self.conns.get_mut(&conn) {
@@ -971,6 +975,7 @@ impl Hub {
                 return self.activity(conn, device, req, command).await;
             }
             PhoneCommand::Subscribe { session, after } => {
+                self.streaming(conn, device);
                 self.subscribe(conn, req, session, after);
                 return;
             }
@@ -1579,6 +1584,21 @@ impl Hub {
         }
     }
 
+    /// `conn`, of `device`, sent a `subscribe`: the app is in the foreground. The first time, the
+    /// Live Activity the hub started for the device ends, and the app drives it from now on. A
+    /// connection that only says hello or registers tokens (a background wake) never gets here.
+    fn streaming(&mut self, conn: u64, device: &Device) {
+        let Some(state) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        if std::mem::replace(&mut state.streamed, true) {
+            return;
+        }
+        if let Some(activity) = self.activity.as_mut() {
+            activity.connected(&device.token_sha256);
+        }
+    }
+
     /// Every second: refuses what timed out, and sends the pushes and Live Activity sends due.
     fn tick(&mut self) {
         self.sweep();
@@ -1709,8 +1729,9 @@ impl Hub {
     }
 
     /// Sends what each device's Live Activity is due, in the background: a start or an update to
-    /// a device with no phone connected, an end to one whose phone came back or whose sessions
-    /// have all been idle long enough. Each send takes from the allowance pushes use.
+    /// a device with no connection streaming a session, an end to one whose app came back to the
+    /// foreground or whose sessions have all been idle long enough. Each send takes from the
+    /// allowance pushes use.
     fn flush_activity(&mut self) {
         let Some(activity) = self.activity.as_mut() else {
             return;
@@ -1719,9 +1740,11 @@ impl Hub {
         let conns = &self.conns;
         let connected = |key: &str| {
             conns.values().any(|conn| {
-                conn.device
-                    .as_ref()
-                    .is_some_and(|device| device.token_sha256 == key)
+                conn.streamed
+                    && conn
+                        .device
+                        .as_ref()
+                        .is_some_and(|device| device.token_sha256 == key)
             })
         };
         activity.flush(
