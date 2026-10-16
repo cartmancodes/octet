@@ -11,6 +11,10 @@ export type Tone = "amber" | "accent" | "muted";
 export interface InboxItem {
   /** The session's id. */
   id: string;
+  /** The Mac it runs on (the phone's id for it), when its row says. */
+  mac?: string;
+  /** The Mac's name, drawn muted on the card: only with several Macs paired. */
+  macName?: string;
   /** Its workspace folder. */
   name: string;
   /** How long since it last did anything: "now", "2m", "3h", "2d", "1w"; empty when unknown. */
@@ -82,11 +86,21 @@ export function shortAgo(seconds: number | null | undefined, nowMs: number): str
   return `${Math.floor(gone / WEEK)}w`;
 }
 
-/** Newest activity first; the id breaks a tie so the order never jumps. */
-const newestFirst = (a: SessionInfo, b: SessionInfo): number =>
-  (b.last_activity ?? 0) - (a.last_activity ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+/** A listed row, and the Mac it came from when the store says. */
+export type MacSession = SessionInfo & { mac?: string };
 
-function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Pick<InboxItem, "id" | "name" | "ago">): InboxItem {
+const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Newest activity first; a tie goes by the Mac's name (`nameOf`), then by id, so the order never
+ * jumps. */
+const newestFirst =
+  (nameOf: (s: MacSession) => string) =>
+  (a: MacSession, b: MacSession): number =>
+    (b.last_activity ?? 0) - (a.last_activity ?? 0) || byText(nameOf(a), nameOf(b)) || byText(a.id, b.id);
+
+type Base = Pick<InboxItem, "id" | "mac" | "macName" | "name" | "ago">;
+
+function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Base): InboxItem {
   if (!approval) {
     return {
       ...base,
@@ -122,17 +136,21 @@ function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Pick<Inb
 /**
  * The Inbox's three lists, each newest first. `fronts` is the approval each session's card
  * answers (the screen gives each row's own); a session waiting with none there can only be opened.
- * `mac` names the Mac on a quiet card; `now` is the clock in milliseconds. O(n log n) in the
- * sessions.
+ * `mac` names the Mac on a quiet card; `now` is the clock in milliseconds. `names`, the paired
+ * Macs' names by id, is given only when there are several: each card then carries its own Mac's
+ * name (a quiet card says it in place of `mac`), and a tie in time goes by that name. O(n log n)
+ * in the sessions.
  */
 export function classify(
-  sessions: readonly SessionInfo[],
+  sessions: readonly MacSession[],
   fronts: ReadonlyMap<string, ApprovalInfo | null>,
-  { mac, now }: { mac: string; now: number },
+  { mac, now, names }: { mac: string; now: number; names?: ReadonlyMap<string, string> },
 ): Inbox {
   const out: Inbox = { needs: [], running: [], done: [] };
-  for (const s of [...sessions].sort(newestFirst)) {
-    const base = { id: s.id, name: sessionName(s.workspace), ago: shortAgo(s.last_activity, now) };
+  const nameOf = (s: MacSession): string => (names && s.mac !== undefined ? (names.get(s.mac) ?? "") : "");
+  for (const s of [...sessions].sort(newestFirst(nameOf))) {
+    const macName = names ? nameOf(s) : undefined;
+    const base: Base = { id: s.id, mac: s.mac, macName, name: sessionName(s.workspace), ago: shortAgo(s.last_activity, now) };
     if (s.approvals > 0) {
       out.needs.push(needsItem(s, fronts.get(s.id) ?? null, base));
     } else if (s.question === true && s.phase !== "running") {
@@ -163,7 +181,7 @@ export function classify(
     } else {
       out.done.push({
         ...base,
-        status: `${mac} · ${s.engine}`,
+        status: `${macName ?? mac} · ${s.engine}`,
         statusTone: "muted",
         line: s.goal ? s.goal : phaseWords(s.phase).toLowerCase(),
         files: NO_FILES,
@@ -183,6 +201,7 @@ export function classify(
 export function cardLabel(item: InboxItem): string {
   return [
     item.name,
+    item.macName ?? "",
     item.ago,
     clipLabel(item.status),
     ...item.files.map((file) => clipLabel(file)),
@@ -197,6 +216,8 @@ export function cardLabel(item: InboxItem): string {
 export function sameItem(a: InboxItem, b: InboxItem): boolean {
   return (
     a.id === b.id &&
+    a.mac === b.mac &&
+    a.macName === b.macName &&
     a.name === b.name &&
     a.ago === b.ago &&
     a.status === b.status &&
@@ -212,16 +233,32 @@ export function sameItem(a: InboxItem, b: InboxItem): boolean {
 
 /** One row of the drawer's session list. */
 export interface DrawerRow {
+  kind: "row";
   id: string;
+  /** The Mac it runs on, when its row says. */
+  mac?: string;
   name: string;
   /** "approve", "question", a phase word ("thinking"), "done", or how long ago; empty when none is known. */
   status: string;
   tone: Tone;
 }
 
+/** A Mac's header in the drawer, over its sessions: with several Macs only. */
+export interface DrawerGroup {
+  kind: "mac";
+  /** `mac:<id>`: a list key no session's has. */
+  id: string;
+  mac: string;
+}
+
+export type DrawerItem = DrawerRow | DrawerGroup;
+
 /** The drawer's session list, with the counts under its title. */
 export interface DrawerList {
   rows: DrawerRow[];
+  /** What the list draws: the rows, or, with several Macs, each Mac's header (every paired Mac,
+   * in pairing order) with its rows under it. */
+  items: DrawerItem[];
   /** Sessions that need you: an approval waiting, or a turn that ended on a question. */
   needs: number;
   /** Sessions with a turn running and nothing waiting. */
@@ -233,15 +270,16 @@ export interface DrawerList {
  * first). A session waiting on an approval says "approve"; one that ended on a question says
  * "question"; one running says what it is doing in a
  * word; one that finished well says "done"; any other says how long ago it last did anything.
- * `now` is the clock in milliseconds.
+ * `now` is the clock in milliseconds. `names`, the paired Macs' names by id, is given only when
+ * there are several: the rows are then grouped by Mac, in the Inbox's order within each.
  */
-export function drawerList(sessions: readonly SessionInfo[], now: number): DrawerList {
+export function drawerList(sessions: readonly MacSession[], now: number, names?: ReadonlyMap<string, string>): DrawerList {
   const byId = new Map(sessions.map((s) => [s.id, s]));
-  const { needs, running, done } = classify(sessions, new Map(), { mac: "", now });
+  const { needs, running, done } = classify(sessions, new Map(), { mac: "", now, names });
   const rows: DrawerRow[] = [];
   for (const item of [...needs, ...running, ...done]) {
     const s = byId.get(item.id);
-    const base = { id: item.id, name: item.name };
+    const base = { kind: "row" as const, id: item.id, mac: item.mac, name: item.name };
     if (item.question) {
       rows.push({ ...base, status: "question", tone: "amber" });
     } else if (item.statusTone === "amber") {
@@ -254,8 +292,28 @@ export function drawerList(sessions: readonly SessionInfo[], now: number): Drawe
       rows.push({ ...base, status: item.ago, tone: "muted" });
     }
   }
-  return { rows, needs: needs.length, running: running.length };
+  return { rows, items: names ? grouped(rows, names) : rows, needs: needs.length, running: running.length };
 }
+
+/** Each Mac of `names` (in its order) as a header with its rows under it, in their order. */
+function grouped(rows: readonly DrawerRow[], names: ReadonlyMap<string, string>): DrawerItem[] {
+  const byMac = new Map<string, DrawerRow[]>();
+  for (const row of rows) {
+    const mac = row.mac ?? "";
+    const list = byMac.get(mac);
+    if (list) list.push(row);
+    else byMac.set(mac, [row]);
+  }
+  const items: DrawerItem[] = [];
+  for (const mac of names.keys()) {
+    items.push({ kind: "mac", id: `mac:${mac}`, mac });
+    for (const row of byMac.get(mac) ?? []) items.push(row);
+  }
+  return items;
+}
+
+/** What a screen reader says for a drawer row: its name, and its status when it has one. */
+export const drawerRowLabel = (row: DrawerRow): string => (row.status === "" ? row.name : `${row.name}, ${row.status}`);
 
 /** The line under "Octet" in the drawer: "2 need you · 3 running", or just "3 running". */
 export const drawerSub = (needs: number, running: number): string =>

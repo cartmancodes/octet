@@ -8,6 +8,8 @@ import { radius, spacing, type, useTheme } from "../theme";
 
 interface RecentRowProps {
   item: RecentInfo;
+  /** The Mac it is on, drawn (and said) only with several Macs; empty otherwise. */
+  macName?: string;
   /** The clock the list was loaded at, in ms: it moves only with a load, so rows stay put. */
   now: number;
   /** A start is out or a launched session is awaited. */
@@ -18,7 +20,7 @@ interface RecentRowProps {
 
 /** One resumable session: engine, title (else "Untitled"), workspace folder, how long ago, and
  * Resume. Every string is the Mac's and drawn as text. */
-export const RecentRow = memo(function RecentRow({ item, now, disabled, onResume }: RecentRowProps) {
+export const RecentRow = memo(function RecentRow({ item, macName = "", now, disabled, onResume }: RecentRowProps) {
   const theme = useTheme();
   const folder = sessionName(item.workspace);
   const title = item.title.trim() === "" ? "Untitled" : item.title;
@@ -28,6 +30,7 @@ export const RecentRow = memo(function RecentRow({ item, now, disabled, onResume
     <View style={[styles.row, { backgroundColor: theme.panel, borderColor: theme.edge }]}>
       <View style={styles.text}>
         <Text style={[type.caption, { color: theme.muted }]}>{engineName(item.engine)}</Text>
+        {macName === "" ? null : <Text style={[type.caption, { color: theme.muted }]}>{macName}</Text>}
         <Text numberOfLines={2} style={[type.body, { color: theme.fg }]}>
           {title}
         </Text>
@@ -38,7 +41,7 @@ export const RecentRow = memo(function RecentRow({ item, now, disabled, onResume
       </View>
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel={`Resume ${clipLabel(title)}, ${clipLabel(folder)}`}
+        accessibilityLabel={macName === "" ? `Resume ${clipLabel(title)}, ${clipLabel(folder)}` : `Resume ${clipLabel(title)}, ${clipLabel(folder)}, on ${macName}`}
         accessibilityState={disabled ? OFF : ON}
         disabled={disabled}
         onPress={resume}

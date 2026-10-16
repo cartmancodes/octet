@@ -76,6 +76,30 @@ export function useSend(key?: string): Send {
   return useCallback<Send>((body) => sendVia(links, key, body), [links, key]);
 }
 
+/**
+ * `sendVia` for Mac `mac`, chosen by the user (New session's chip, a Recent row): a body that
+ * names no session (`start`, `recent`) goes to that Mac, and one that names a session goes to
+ * the session's Mac, which must be `mac`. Refused as `unsent`: a session of another Mac, or a Mac
+ * with no connection. With no `mac`, `sendVia` with no key.
+ */
+export function sendTo(links: Links, mac: string | undefined, body: RequestBody): Promise<Ack> {
+  if (mac === undefined) return sendVia(links, undefined, body);
+  if ("session" in body) {
+    if (splitKey(body.session)?.mac !== mac) return Promise.reject(new Refusal("unsent", UNREACHABLE));
+    return sendVia(links, body.session, body);
+  }
+  const client = links.client(mac);
+  if (client === null) return Promise.reject(new Refusal("unsent", UNREACHABLE));
+  return client.request(body);
+}
+
+/** A `Send` to Mac `mac` (see `sendTo`); with none, `useSend()`. Stable while the links and the
+ * Mac are. */
+export function useSendTo(mac: string | undefined): Send {
+  const links = useLinks();
+  return useCallback<Send>((body) => sendTo(links, mac, body), [links, mac]);
+}
+
 const isLow = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
 
 /** The length of `text` once UTF-8 encoded. */

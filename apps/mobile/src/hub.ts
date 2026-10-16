@@ -3,7 +3,7 @@
 // where the pairings come from, how pairing and unpairing keep them, and what the app's lifecycle
 // does to every link. No JSX here; `app/_layout.tsx` provides the Fleet to screens.
 import * as SecureStore from "expo-secure-store";
-import { createContext, useContext, useSyncExternalStore } from "react";
+import { createContext, useContext, useMemo, useSyncExternalStore } from "react";
 import { Platform } from "react-native";
 
 import { HubClient, Refusal, type HubClientOptions, type HubState, type SocketFactory } from "./client/HubClient";
@@ -852,6 +852,12 @@ export class Fleet {
     return saved ? { ok: true } : { ok: false, message: NOT_SAVED };
   }
 
+  /** The user dismissed the notice the Inbox shows (a Mac that unpaired this phone, an unpair
+   * that did not finish) while some Mac is still paired. */
+  dismissNotice(): void {
+    if (this.current.notice !== null) this.emit({ notice: null });
+  }
+
   /** The user answered the notifications step (or skipped it): Pair gives way to Sessions. */
   finishOffer(): void {
     if (this.current.offer) this.emit({ offer: false });
@@ -979,6 +985,24 @@ export const useMacs = (): MacInfo[] => useFleetPart((s) => s.macs);
 export const useNotice = (): string | null => useFleetPart((s) => s.notice);
 /** Each Mac's push notice; the same array until one changes. */
 export const useNotices = (): string[] => useFleetPart((s) => s.notices);
+
+/** One paired Mac; the same object until that Mac changes (another Mac's change does not render
+ * it again). Null for a Mac not paired. */
+export const useMac = (id: string): MacInfo | null => useFleetPart((s) => s.macs.find((m) => m.id === id) ?? null);
+
+/** The paired Macs' names by id, in pairing order: the same map until a Mac is paired, unpaired
+ * or renamed (a link's state changing does not make a new one). */
+export function useMacNames(): ReadonlyMap<string, string> {
+  const key = useFleetPart((s) => s.macs.map((m) => `${m.id}\t${m.macName}`).join("\n"));
+  return useMemo(() => {
+    const names = new Map<string, string>();
+    for (const line of key === "" ? [] : key.split("\n")) {
+      const at = line.indexOf("\t");
+      names.set(line.slice(0, at), line.slice(at + 1));
+    }
+    return names;
+  }, [key]);
+}
 
 /** @deprecated One-Mac code only; `useFleet` is the same snapshot. */
 export const useHubSnapshot = useFleet;

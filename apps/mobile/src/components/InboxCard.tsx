@@ -9,7 +9,7 @@ import type { Send } from "./send";
 
 interface InboxCardProps {
   item: InboxItem;
-  /** The Mac can't be reached: the card is greyed and does nothing. */
+  /** The card's Mac can't be reached: the card is greyed and does nothing. */
   offline: boolean;
   /** The drawer is over the card: it answers nothing, and arms again once the drawer is gone. */
   covered: boolean;
@@ -34,6 +34,7 @@ function makeStyles(theme: Theme) {
     head: { flexDirection: "row", justifyContent: "space-between", gap: spacing.sm },
     name: { ...type.body, color: theme.fg, fontWeight: "700", flexShrink: 1 },
     ago: { ...type.body, color: theme.muted },
+    side: { flexDirection: "row", gap: spacing.sm, flexShrink: 0 },
     amber: { ...type.body, color: theme.amber },
     accent: { ...type.body, color: theme.accent },
     muted: { ...type.body, color: theme.muted },
@@ -78,7 +79,17 @@ export const InboxCard = memo(function InboxCard({ item, offline, covered, send,
           <Text numberOfLines={1} style={s.name}>
             {item.name}
           </Text>
-          <Text style={s.ago}>{item.ago}</Text>
+          {/* With several Macs, the card names its own, muted, before how long ago. */}
+          {item.macName ? (
+            <View style={s.side}>
+              <Text numberOfLines={1} style={s.ago}>
+                {item.macName}
+              </Text>
+              <Text style={s.ago}>{item.ago}</Text>
+            </View>
+          ) : (
+            <Text style={s.ago}>{item.ago}</Text>
+          )}
         </View>
         {/* An approval's command shows whole (its gist is at most 200 characters): what Allow runs
             is never cut off by the edge of the screen. */}

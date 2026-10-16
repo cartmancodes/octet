@@ -9,8 +9,7 @@ import { HubBanner } from "../src/components/HubBanner";
 import { NewChips } from "../src/components/NewChips";
 import { failure, isSlash, PROMPT_LIMIT, SLASH_NOTE, TOO_LONG, utf8Bytes } from "../src/components/send";
 import { lightTap } from "../src/haptics";
-import { useHubClient } from "../src/hub";
-import { macName } from "../src/inbox";
+import { useMacs } from "../src/hub";
 import type { Engine, Mode } from "../src/protocol";
 import { modelsFor } from "../src/recent";
 import { sessionName } from "../src/sessions";
@@ -48,10 +47,17 @@ export default function NewSession() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const focused = useIsFocused();
-  const hub = useHub();
-  const client = useHubClient();
-  const catalogs = useCatalogs();
-  const { choices: workspaces, loaded: foldersLoaded } = useWorkspaceChoices();
+  // Where the session starts: the Mac chosen on the chip, while it is online; else the first
+  // online Mac; else the first paired. With one Mac, that one.
+  const macs = useMacs();
+  const [chosen, setChosen] = useState<string | null>(null);
+  const online = useMemo(() => macs.filter((m) => m.state === "ready"), [macs]);
+  const target = online.find((m) => m.id === chosen) ?? online[0] ?? macs[0];
+  const targetId = target?.id;
+  const targetName = target?.macName ?? "Mac";
+  const hub = useHub(targetId ?? "");
+  const catalogs = useCatalogs(targetId);
+  const { choices: workspaces, loaded: foldersLoaded } = useWorkspaceChoices(targetId);
   const [text, setText] = useState("");
   const [engine, setEngine] = useState<Engine>("claude");
   const [folder, setFolder] = useState<string | null>(null);
@@ -70,7 +76,7 @@ export default function NewSession() {
     },
     [router],
   );
-  const { send, start, failed, fail, locked, notice } = useStartSession(listed);
+  const { send, start, failed, fail, locked, notice } = useStartSession(listed, targetId);
   useEffect(() => {
     sendPrompt.current = (id, prompt) => {
       send({ type: "prompt", session: id, text: prompt }).catch((error: unknown) => {
@@ -93,7 +99,7 @@ export default function NewSession() {
 
   const full = useFullAccessArm({
     reason: BIOMETRIC_REASON,
-    key: JSON.stringify(["new", engine, workspace, selection, "full-access"]),
+    key: JSON.stringify(["new", targetId, engine, workspace, selection, "full-access"]),
     failed,
     fail,
   });
@@ -152,7 +158,17 @@ export default function NewSession() {
     fail(null);
   }, [disarm, fail]);
 
-  const onMac = useCallback(() => showToast(`Sessions start on ${macName(client?.url)}.`), [client]);
+  // With several Macs online, a tap moves to the next online one; otherwise it says where
+  // sessions start.
+  const onMac = useCallback(() => {
+    if (online.length < 2) {
+      showToast(`Sessions start on ${targetName}.`);
+      return;
+    }
+    disarm();
+    const at = online.findIndex((m) => m.id === targetId);
+    setChosen(online[(at + 1) % online.length]?.id ?? null);
+  }, [online, targetId, targetName, disarm]);
   const onFolder = useCallback(() => {
     if (workspaces.length === 0) {
       showToast(foldersLoaded ? NO_WORKSPACE : LOADING_FOLDERS);
@@ -186,7 +202,7 @@ export default function NewSession() {
   const resume = useCallback(() => router.replace("/recent"), [router]);
 
   const engineModel = `${engine} / ${model?.name ?? "default"}`;
-  const online = hub === "ready";
+  const reachable = hub === "ready";
   const startOff = locked;
   const hasText = text.trim() !== "";
   const startColor = hasText && !startOff ? theme.accent : theme.muted;
@@ -238,8 +254,8 @@ export default function NewSession() {
       ) : null}
       {armed ? <FullAccessConfirm busy={locked} onTurnOn={turnOn} onCancel={cancelFull} /> : null}
       <NewChips
-        mac={macName(client?.url)}
-        online={online}
+        mac={targetName}
+        online={reachable}
         folder={workspace === null ? "" : sessionName(workspace)}
         loading={workspace === null && !foldersLoaded}
         engineModel={engineModel}

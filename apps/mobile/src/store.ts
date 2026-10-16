@@ -4,6 +4,7 @@
 // screen re-renders only for what it shows. The batches of every Mac's client go through one
 // coalescer (src/coalesce.ts) and are applied in one `set`, and every part that a batch did not
 // change keeps its identity.
+import { useMemo } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { createStore, useStore, type StoreApi } from "zustand";
 
@@ -842,6 +843,13 @@ const viewEntries = (v: SessionView | undefined): Entry[] => {
  * when something opens, which a stream must not draw again. */
 export const entriesNow = (store: OctetStore, id: string): Entry[] => viewEntries(store.getState().bySession.get(id));
 
+/** The ready Macs of `hubs`, as one string (a Mac id holds no space). */
+function readyKey(hubs: ReadonlyMap<string, HubState>): string {
+  let key = "";
+  for (const [mac, hub] of hubs) if (hub === "ready") key = key === "" ? mac : `${key} ${mac}`;
+  return key;
+}
+
 /** Hooks over `store`: each selects the smallest part a screen needs. */
 export function bindHooks(store: OctetStore) {
   return {
@@ -898,13 +906,15 @@ export function bindHooks(store: OctetStore) {
     /** The modes and models a session offers, with the current ones marked; null until the Mac
      * sends them. The same object until it changes. */
     useCatalog: (id: string): CatalogInfo | null => useStore(store, (s) => s.bySession.get(id)?.catalog ?? null),
-    /** The catalogs of the live sessions that have sent one; each the same object until it changes. */
-    useCatalogs: (): CatalogInfo[] =>
+    /** The catalogs of the live sessions that have sent one (of Mac `mac` only, when given); each
+     * the same object until it changes. */
+    useCatalogs: (mac?: string): CatalogInfo[] =>
       useStore(
         store,
         useShallow((s) => {
           const catalogs: CatalogInfo[] = [];
-          for (const { id } of s.sessions) {
+          for (const { id, mac: of } of s.sessions) {
+            if (mac !== undefined && of !== mac) continue;
             const catalog = s.bySession.get(id)?.catalog;
             if (catalog) catalogs.push(catalog);
           }
@@ -913,6 +923,11 @@ export function bindHooks(store: OctetStore) {
       ),
     /** The link to `mac`; with none, the best link of every Mac's (`bestHub`). */
     useHub: (mac?: string): HubState => useStore(store, (s) => (mac === undefined ? bestHub(s) : (s.hubs.get(mac) ?? "offline"))),
+    /** The Macs whose link is ready; the same set until one comes or goes. */
+    useReadyMacs: (): ReadonlySet<string> => {
+      const key = useStore(store, (s) => readyKey(s.hubs));
+      return useMemo(() => new Set(key === "" ? [] : key.split(" ")), [key]);
+    },
     /** How the session's last turn ended, for its mascot; null before one ends and while one runs. */
     useSessionTurn: (id: string): TurnEnd | null => useStore(store, (s) => s.bySession.get(id)?.turn ?? null),
     /** The turns a session has finished: the `finished` records counted by its view's reducer. */
@@ -949,6 +964,7 @@ export const {
   useCatalog,
   useCatalogs,
   useHub,
+  useReadyMacs,
   useSessionTurn,
   useTurns,
   useSessionUsage,

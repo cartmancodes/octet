@@ -1,7 +1,7 @@
 // The Macs this phone is paired with, as the rest of the app names them. Every session is keyed
 // `"<mac>/<session>"`: `<mac>` is the phone's own id for the pairing (never holding a `/`), and
 // `<session>` the hub's raw id, which appears only on the wire. Pure: no React, no storage.
-import type { HubClient } from "./client/HubClient";
+import type { HubClient, HubState } from "./client/HubClient";
 import { field } from "./model/text";
 
 /** Pairings kept, at most: one link each, all open in the foreground. */
@@ -122,3 +122,14 @@ export function cleanMacName(raw: unknown): string | null {
   const name = field(field(raw, MAC_NAME_CHARS * 4).replace(/\s+/g, " ").trim(), MAC_NAME_CHARS).trim();
   return name === "" ? null : name;
 }
+
+/** What a Mac's group header says after its name: nothing when ready; "asleep" once its first
+ * attempt is over and it is not ready (a dropped link, a Mac asleep or away); "connecting…"
+ * before that. */
+export function macStatus(state: HubState, tried: boolean): "asleep" | "connecting…" | null {
+  if (state === "ready") return null;
+  return tried ? "asleep" : "connecting…";
+}
+
+/** The Inbox's header line with several Macs: "2 Macs · 1 online". */
+export const fleetLine = (paired: number, online: number): string => `${paired} Macs · ${online} online`;

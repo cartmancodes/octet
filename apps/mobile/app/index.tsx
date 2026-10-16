@@ -11,12 +11,14 @@ import { InboxCard } from "../src/components/InboxCard";
 import { failure, useAlive, useSend } from "../src/components/send";
 import { openDrawer, useDrawerOpen } from "../src/drawer";
 import { successTap } from "../src/haptics";
-import { useHubClient } from "../src/hub";
-import { classify, macName, type InboxItem } from "../src/inbox";
+import type { HubState } from "../src/client/HubClient";
+import { useLinks, useMacNames, useMacs } from "../src/hub";
+import { classify, type InboxItem } from "../src/inbox";
+import { fleetLine, macOfKey } from "../src/macs";
 import { Mascot } from "../src/mascot/Mascot";
 import { openSession } from "../src/navigation";
 import type { ApprovalInfo } from "../src/protocol";
-import { octetStore, useHub, useListed, useSessions } from "../src/store";
+import { octetStore, useListed, useReadyMacs, useSessions } from "../src/store";
 import { spacing, type, useTheme } from "../src/theme";
 import { BAR_GAP, BAR_HEIGHT, Button, Segmented } from "../src/ui";
 
@@ -40,6 +42,7 @@ const EMPTY: Record<Tab, { pose: "success" | "sleeping"; text: string; offline: 
 };
 
 const keyOf = (item: InboxItem): string => item.id;
+const NO_PULL: ReadonlyMap<string, "live" | "connect"> = new Map();
 const readClock = (): number => Date.now();
 
 /** Whether `id` is still `session`'s front approval, as the store has it this instant. */
@@ -64,9 +67,14 @@ export default function Inbox() {
     here.current = pathname;
   });
   const insets = useSafeAreaInsets();
-  const client = useHubClient();
+  const links = useLinks();
+  const macs = useMacs();
+  // The paired Macs' names: with several, each card names its Mac and the header counts them.
+  const names = useMacNames();
+  const several = names.size > 1;
+  // Offline is per Mac: a card is greyed, and answers nothing, while its own Mac is not ready.
+  const ready = useReadyMacs();
   const sessions = useSessions();
-  const hub = useHub();
   const listed = useListed();
   const focused = useIsFocused();
   // The drawer is over the cards, or another screen is: they answer nothing then, and arm again
@@ -75,12 +83,17 @@ export default function Inbox() {
   const covered = drawerOpen || !focused;
   const send = useSend();
   const alive = useAlive();
-  const reachable = hub === "ready";
+  // Some Mac can be reached (with one Mac: that one).
+  const reachable = ready.size > 0;
   const offline = !reachable;
-  const mac = macName(client?.url);
+  const mac = macs[0]?.macName ?? "Mac";
+  const online = macs.reduce((n, m) => (ready.has(m.id) ? n + 1 : n), 0);
+  // What the banner over the list says: with several Macs, only when none can be reached.
+  const bannerState: HubState = reachable ? "ready" : macs.some((m) => m.state === "connecting" || m.state === "authenticating") ? "connecting" : "offline";
   const [tab, setTab] = useState<Tab>("needs");
-  // "live": pulled on a live link; "connect": pulled while the Mac could not be reached.
-  const [pull, setPull] = useState<"live" | "connect" | null>(null);
+  // The Macs a pull waits for: "live", pulled on a live link (until its next list); "connect",
+  // pulled while that Mac could not be reached (until it can). Empty when no pull is out.
+  const [pull, setPull] = useState(NO_PULL);
 
   // The clock the cards count "ago" from, moved on by a timer rather than read during render.
   const [now, setNow] = useState(readClock);
@@ -90,8 +103,8 @@ export default function Inbox() {
   }, []);
   const inbox = useMemo(() => {
     const fronts = new Map(sessions.map((s) => [s.id, s.approval ?? null]));
-    return classify(sessions, fronts, { mac, now });
-  }, [sessions, mac, now]);
+    return classify(sessions, fronts, several ? { mac, now, names } : { mac, now });
+  }, [sessions, mac, now, several, names]);
 
   // The answers out and given from this screen, shared by the cards and Allow all. What it has
   // given is read as a store, so Allow all's count drops the moment a card's answer is taken.
@@ -104,13 +117,16 @@ export default function Inbox() {
   );
   useEffect(() => ledger.keep(listedKeys), [ledger, listedKeys]);
   // What Allow all may answer: whole requests (a shortened one is reviewed in its session) not
-  // already answered from a card.
+  // already answered from a card. With several Macs, only those of a Mac that can be reached (with
+  // one, Allow all stays, unarmed, while it can't).
   const answerable = useMemo(
     () =>
       inbox.needs.flatMap((i) =>
-        i.approval && !i.shortened && !given.has(approvalKey(i.id, i.approval)) ? [{ session: i.id, approval: i.approval }] : [],
+        i.approval && !i.shortened && (!several || ready.has(i.mac ?? "")) && !given.has(approvalKey(i.id, i.approval))
+          ? [{ session: i.id, approval: i.approval }]
+          : [],
       ),
-    [inbox.needs, given],
+    [inbox.needs, given, ready, several],
   );
   const keys = useMemo(() => answerable.map((a) => approvalKey(a.session, a.approval)), [answerable]);
   const batchKey = keys.join("\n");
@@ -119,17 +135,19 @@ export default function Inbox() {
   const showAll = tab === "needs" && answerable.length >= ALL_FROM;
   const allArmed = useArm(batchKey, reachable && showAll && !covered);
 
-  // What is drawn, and whether the link is down or the drawer is over the cards, for an Allow all
-  // awaiting Face ID: layout effects, so a change is seen in the commit that makes it. `drops` moves
-  // on with each render while the Mac can't be reached: a link that dropped and came back during
-  // Face ID answers nothing.
+  // What is drawn, which Macs can be reached, and whether every link is down or the drawer is over
+  // the cards, for an Allow all awaiting Face ID: layout effects, so a change is seen in the commit
+  // that makes it. A Mac's count in `drops` moves on with each render while it can't be reached: a
+  // link that dropped and came back during Face ID answers nothing.
   const shown = useRef<ReadonlySet<string>>(new Set());
   const down = useRef(offline);
-  const drops = useRef(0);
+  const readyNow = useRef(ready);
+  const drops = useRef(new Map<string, number>());
   useLayoutEffect(() => {
     shown.current = new Set(showAll ? keys : []);
     down.current = offline || covered;
-    if (offline) drops.current += 1;
+    readyNow.current = ready;
+    for (const id of names.keys()) if (!ready.has(id)) drops.current.set(id, (drops.current.get(id) ?? 0) + 1);
   });
 
   const [batchBusy, setBatchBusy] = useState(false);
@@ -141,7 +159,7 @@ export default function Inbox() {
     if (batchOut.current || !allArmed || down.current) return;
     batchOut.current = true;
     const batch = batchKey;
-    const since = drops.current;
+    const since = new Map(drops.current);
     setBatchBusy(true);
     setBatchError(null);
     let taken = 0;
@@ -151,7 +169,9 @@ export default function Inbox() {
         // one, and not answered from its card; and the link never dropped meanwhile. A request
         // that closed or arrived since is left alone.
         const key = approvalKey(session, approval);
-        if (!alive() || down.current || drops.current !== since || !shown.current.has(key)) return;
+        const at = macOfKey(session) ?? "";
+        const dropped = !readyNow.current.has(at) || (drops.current.get(at) ?? 0) !== (since.get(at) ?? 0);
+        if (!alive() || down.current || dropped || !shown.current.has(key)) return;
         const front = frontNow(session);
         if (!front || approvalKey(session, front) !== key) return;
         if (!ledger.claim(key)) return;
@@ -194,40 +214,84 @@ export default function Inbox() {
   const openNew = useCallback(() => router.push("/new"), [router]);
   const openMenu = useCallback(() => openDrawer(), []);
 
+  // Each card is greyed by its own Mac: one Mac's link changing draws only that Mac's cards again.
   const renderItem = useCallback<ListRenderItem<InboxItem>>(
-    ({ item }) => <InboxCard item={item} offline={offline} covered={covered} send={send} ledger={ledger} isFront={isFront} onOpen={open} onReply={reply} />,
-    [offline, covered, send, ledger, open, reply],
+    ({ item }) => (
+      <InboxCard
+        item={item}
+        offline={!ready.has(item.mac ?? "")}
+        covered={covered}
+        send={send}
+        ledger={ledger}
+        isFront={isFront}
+        onOpen={open}
+        onReply={reply}
+      />
+    ),
+    [ready, covered, send, ledger, open, reply],
   );
+  const extraData = useMemo(() => ({ ready, covered }), [ready, covered]);
 
   // On a live link the sessions are pushed as they change, so a pull keeps the link (no offline
-  // flash) and only waits briefly for the next list. Otherwise it tries the Mac now, skipping
-  // what is left of the backoff.
+  // flash) and only waits briefly for that Mac's next list. A Mac that can't be reached is tried
+  // now, skipping what is left of its backoff. Every paired Mac at once.
+  // Moves on with each pull: a round's timers and listeners are its own.
+  const [pulled, setPulled] = useState(0);
   const refresh = useCallback(() => {
-    if (!client) return;
-    if (client.state === "ready") {
-      setPull("live");
-      return;
+    const next = new Map<string, "live" | "connect">();
+    for (const id of links.macs()) {
+      const client = links.client(id);
+      if (!client) continue;
+      if (client.state === "ready") next.set(id, "live");
+      else {
+        client.retry();
+        next.set(id, "connect");
+      }
     }
-    client.retry();
-    setPull("connect");
-  }, [client]);
+    if (next.size === 0) return;
+    setPull(next);
+    setPulled((n) => n + 1);
+  }, [links]);
+  const pulling = pull.size > 0;
   useEffect(() => {
-    if (pull === null) return;
-    const timer = setTimeout(() => setPull(null), pull === "live" ? LIVE_PULL_MS : REFRESH_MAX_MS);
-    const off =
-      pull === "live" && client
-        ? client.onBatch((frames) => {
-            if (frames.some((f) => f.type === "sessions")) setPull(null);
-          })
-        : null;
+    if (pulled === 0 || !pulling) return;
+    // The Macs this round waits for, as it began.
+    const waits = pull;
+    const settle = (keep: (id: string, kind: "live" | "connect") => boolean) =>
+      setPull((p) => {
+        const next = new Map([...p].filter(([id, kind]) => keep(id, kind)));
+        return next.size === p.size ? p : next.size === 0 ? NO_PULL : next;
+      });
+    const timers = [
+      setTimeout(() => settle((_, kind) => kind !== "live"), LIVE_PULL_MS),
+      setTimeout(() => settle((_, kind) => kind !== "connect"), REFRESH_MAX_MS),
+    ];
+    const offs = [...waits].flatMap(([id, kind]) => {
+      const client = kind === "live" ? links.client(id) : null;
+      return client
+        ? [
+            client.onBatch((frames) => {
+              if (frames.some((f) => f.type === "sessions")) settle((other) => other !== id);
+            }),
+          ]
+        : [];
+    });
     return () => {
-      clearTimeout(timer);
-      off?.();
+      for (const timer of timers) clearTimeout(timer);
+      for (const off of offs) off();
     };
-  }, [pull, client]);
-  // The Mac answered: the pull is over, so a later drop does not bring the spinner back.
-  if (pull === "connect" && reachable) setPull(null);
-  const refreshing = pull === "live" || (pull === "connect" && !reachable);
+    // A round's timers and listeners live until it is over or another begins, not with each Mac
+    // that answers.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pulled, pulling, links]);
+  // A Mac that was tried answered: it is done, so a later drop does not bring the spinner back.
+  if ([...pull].some(([id, kind]) => kind === "connect" && ready.has(id))) {
+    setPull((p) => {
+      const next = new Map([...p].filter(([id, kind]) => kind !== "connect" || !ready.has(id)));
+      return next.size === 0 ? NO_PULL : next;
+    });
+  }
+  const refreshing = pulling;
 
   const tabs = useMemo(
     () => [
@@ -263,20 +327,20 @@ export default function Inbox() {
           <Text style={[type.body, styles.bold, { color: theme.fg }]}>Inbox</Text>
           <Text style={[type.label, { color: theme.muted }]}>
             <Text style={{ color: reachable ? theme.accent : theme.muted }}>●</Text>
-            {` ${mac} · ${reachable ? "online" : "offline"}`}
+            {several ? ` ${fleetLine(names.size, online)}` : ` ${mac} · ${reachable ? "online" : "offline"}`}
           </Text>
         </View>
         <Button label="+" accessibilityLabel="New session" variant="bare" onPress={openNew} />
       </View>
       <DevBuildBanner inset />
-      <HubBanner state={hub} announce={focused} />
+      <HubBanner state={bannerState} announce={focused} several={several} notices />
       <View style={styles.tabs}>
         <Segmented options={tabs} value={tab} onChange={setTab} />
       </View>
       <FlashList
         testID="inbox-list"
         data={inbox[tab]}
-        extraData={Number(offline) * 2 + Number(covered)}
+        extraData={extraData}
         renderItem={renderItem}
         keyExtractor={keyOf}
         ItemSeparatorComponent={Gap}

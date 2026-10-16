@@ -5,8 +5,9 @@ import { AccessibilityInfo, Animated, BackHandler, PanResponder, Pressable, Styl
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { closeDrawer, openDrawer, useDrawerEnabled, useDrawerOpen, useEdgeBottom } from "../drawer";
-import { useHubClient } from "../hub";
-import { drawerList, drawerSub, macName, type DrawerRow } from "../inbox";
+import { useMac, useMacNames } from "../hub";
+import { drawerList, drawerRowLabel, drawerSub, type DrawerItem, type DrawerRow } from "../inbox";
+import { macStatus } from "../macs";
 import { isSessionPath, openSession } from "../navigation";
 import { useHub, useSessions } from "../store";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
@@ -65,6 +66,8 @@ function makeStyles(theme: Theme) {
     badge: { minWidth: 24, height: 24, paddingHorizontal: 6, alignItems: "center", justifyContent: "center", borderRadius: 12, backgroundColor: theme.amber },
     badgeText: { ...type.label, color: INK, fontWeight: "700" },
     group: { ...type.label, color: theme.muted, paddingHorizontal: 20, paddingBottom: 4 },
+    macHead: { ...type.label, color: theme.muted, paddingHorizontal: 20, paddingTop: spacing.md, paddingBottom: 4 },
+    grey: { opacity: 0.5 },
     list: { flex: 1, minHeight: 0 },
     listContent: { paddingTop: 20, paddingBottom: 20 },
     foot: { borderTopWidth: 1, borderTopColor: theme.edge, paddingTop: spacing.sm },
@@ -83,28 +86,34 @@ interface RowProps {
   selected: boolean;
   /** The Mac can be reached: its sessions are in the foreground colour. */
   online: boolean;
+  /** With several Macs: a row of a Mac that can't be reached is greyed, and opens nothing. */
+  grouped?: boolean;
   /** Must be stable. */
   onOpen: (id: string) => void;
 }
 
 const SELECTED = { selected: true } as const;
 const NOT_SELECTED = { selected: false } as const;
+const SELECTED_OFF = { selected: true, disabled: true } as const;
+const OFF = { selected: false, disabled: true } as const;
 
 /** One session in the drawer: its name, and a word for where it stands. Both are the Mac's and
  * drawn as text. */
-const SessionRow = memo(function SessionRow({ row, selected, online, onOpen }: RowProps) {
+const SessionRow = memo(function SessionRow({ row, selected, online, grouped = false, onOpen }: RowProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const open = useCallback(() => onOpen(row.id), [onOpen, row.id]);
   const nameColor = selected ? s.accent : online ? s.fg : s.muted;
+  const off = grouped && !online;
   return (
     <Pressable
       testID={`drawer-row-${row.id}`}
       accessibilityRole="button"
-      accessibilityLabel={row.status === "" ? row.name : `${row.name}, ${row.status}`}
-      accessibilityState={selected ? SELECTED : NOT_SELECTED}
+      accessibilityLabel={drawerRowLabel(row)}
+      accessibilityState={off ? (selected ? SELECTED_OFF : OFF) : selected ? SELECTED : NOT_SELECTED}
+      disabled={off}
       onPress={open}
-      style={rowStyle(theme, selected)}
+      style={off ? [rowStyle(theme, selected), s.grey] : rowStyle(theme, selected)}
     >
       <Text numberOfLines={1} style={[s.name, nameColor]}>
         {row.name}
@@ -120,21 +129,53 @@ const ROWS = {
 };
 const rowStyle = (theme: Theme, selected: boolean) => ROWS[theme === light ? "light" : "dark"][selected ? "on" : "off"];
 
+/** Two rows that draw the same: the list hands each a fresh row object. */
+const sameData = (a: DrawerRow, b: DrawerRow): boolean =>
+  a.id === b.id && a.name === b.name && a.status === b.status && a.tone === b.tone && a.mac === b.mac;
+
 function sameRow(a: RowProps, b: RowProps): boolean {
   return (
-    a.row.id === b.row.id &&
-    a.row.name === b.row.name &&
-    a.row.status === b.row.status &&
-    a.row.tone === b.row.tone &&
+    sameData(a.row, b.row) &&
     a.selected === b.selected &&
     a.online === b.online &&
+    a.grouped === b.grouped &&
     a.onOpen === b.onOpen
   );
 }
 
+type MacRowProps = Omit<RowProps, "online" | "grouped">;
+
+/** A row under its Mac's header: it reads its own Mac's link, so that one Mac's link changing
+ * draws only that Mac's rows again. */
+const MacRow = memo(
+  function MacRow({ row, selected, onOpen }: MacRowProps) {
+    const online = useHub(row.mac ?? "") === "ready";
+    return <SessionRow row={row} selected={selected} online={online} grouped onOpen={onOpen} />;
+  },
+  (a: MacRowProps, b: MacRowProps) => sameData(a.row, b.row) && a.selected === b.selected && a.onOpen === b.onOpen,
+);
+
+/** A Mac's header over its sessions: its name, and "asleep" or "connecting…" while it is not
+ * ready. It reads only its own Mac. */
+const MacHeader = memo(function MacHeader({ mac }: { mac: string }) {
+  const theme = useTheme();
+  const s = theme === light ? LIGHT : DARK;
+  const info = useMac(mac);
+  if (!info) return null;
+  const word = macStatus(info.state, info.tried);
+  const online = word === null;
+  return (
+    <Text testID={`drawer-mac-${mac}`} accessibilityRole="header" style={s.macHead}>
+      <Text style={online ? s.accent : s.muted}>{online ? "●" : "○"}</Text>
+      {word === null ? ` ${info.macName}` : ` ${info.macName} · ${word}`}
+    </Text>
+  );
+});
+
 /** Whether `pathname` is the Conversation of session `id` (expo-router may percent-encode the id). */
 
-const keyOf = (row: DrawerRow): string => row.id;
+const keyOf = (item: DrawerItem): string => item.id;
+const typeOf = (item: DrawerItem): string => item.kind;
 const readClock = (): number => Date.now();
 
 /**
@@ -150,12 +191,16 @@ export function Drawer() {
   const router = useRouter();
   const nav = useNavigationContainerRef();
   const pathname = usePathname();
-  const client = useHubClient();
   const sessions = useSessions();
-  const hub = useHub();
+  // The paired Macs' names: with several, the sessions are grouped under a header per Mac, and
+  // each header and row reads its own Mac's link. With one, the drawer reads it (as it always has).
+  const names = useMacNames();
+  const several = names.size > 1;
+  const only = several ? "" : (names.keys().next().value ?? "");
+  const hub = useHub(only);
   const open = useDrawerOpen();
-  const online = hub === "ready";
-  const mac = macName(client?.url);
+  const online = !several && hub === "ready";
+  const mac = names.get(only) ?? "Mac";
 
   // Stays mounted while it slides out.
   const [mounted, setMounted] = useState(open);
@@ -229,8 +274,11 @@ export function Drawer() {
     const timer = setInterval(() => setClock(readClock()), AGO_TICK_MS);
     return () => clearInterval(timer);
   }, [open]);
-  const list = useMemo(() => (mounted ? drawerList(sessions, clock) : null), [mounted, sessions, clock]);
-  const rows = list?.rows ?? NONE;
+  const list = useMemo(
+    () => (mounted ? drawerList(sessions, clock, several ? names : undefined) : null),
+    [mounted, sessions, clock, several, names],
+  );
+  const items = list?.items ?? NONE;
 
   const goInbox = useCallback(() => {
     closeDrawer();
@@ -253,16 +301,16 @@ export function Drawer() {
     [pathname, router, nav],
   );
 
-  const renderItem = useCallback<ListRenderItem<DrawerRow>>(
-    ({ item }) => (
-      <SessionRow
-        row={item}
-        selected={isSessionPath(pathname, item.id)}
-        online={online}
-        onOpen={goSession}
-      />
-    ),
-    [pathname, online, goSession],
+  const renderItem = useCallback<ListRenderItem<DrawerItem>>(
+    ({ item }) =>
+      item.kind === "mac" ? (
+        <MacHeader mac={item.mac} />
+      ) : several ? (
+        <MacRow row={item} selected={isSessionPath(pathname, item.id)} onOpen={goSession} />
+      ) : (
+        <SessionRow row={item} selected={isSessionPath(pathname, item.id)} online={online} onOpen={goSession} />
+      ),
+    [pathname, online, several, goSession],
   );
 
   const place = useMemo(
@@ -273,13 +321,15 @@ export function Drawer() {
   const fade = useMemo(() => ({ opacity: progress.interpolate({ inputRange: [0, 1], outputRange: [0, SCRIM] }) }), [progress]);
 
   const header = useMemo(
-    () => (
-      <Text style={s.group}>
-        <Text style={online ? s.accent : s.muted}>{online ? "●" : "○"}</Text>
-        {` ${mac} · ${online ? "online" : "offline"}`}
-      </Text>
-    ),
-    [s, online, mac],
+    () =>
+      // With several Macs each has its own header in the list.
+      several ? null : (
+        <Text style={s.group}>
+          <Text style={online ? s.accent : s.muted}>{online ? "●" : "○"}</Text>
+          {` ${mac} · ${online ? "online" : "offline"}`}
+        </Text>
+      ),
+    [s, online, mac, several],
   );
 
   if (!mounted || !list) return null;
@@ -316,10 +366,11 @@ export function Drawer() {
         </Pressable>
         <View style={s.list}>
           <FlashList
-            data={rows}
+            data={items}
             extraData={pathname}
             renderItem={renderItem}
             keyExtractor={keyOf}
+            getItemType={typeOf}
             ListHeaderComponent={header}
             contentContainerStyle={s.listContent}
           />
@@ -340,7 +391,7 @@ export function Drawer() {
   );
 }
 
-const NONE: DrawerRow[] = [];
+const NONE: DrawerItem[] = [];
 const SCRIM_BOX = { backgroundColor: INK } as const;
 
 /** A touch start that is in no gutter. */
