@@ -1,10 +1,16 @@
 // Push notifications: the permission, the Expo push token, the Android channels, the foreground
 // rule and what a tap names. The Mac's hub sends the pushes (title "Octet", body "Approval
-// waiting", "Session error" or "Turn finished", `data.session`, and the channel "approvals",
-// "errors" or "turns"); this file only prepares the phone for them. Registering the token with each Mac's hub is the Fleet's job (`MacLink`, src/hub.ts).
+// waiting", "Session error" or "Turn finished", `data.session`, `data.mac` (the host it is
+// published at) when it knows it, and the channel "approvals", "errors" or "turns"); this file
+// only prepares the phone for them. Registering the token with each Mac's hub is the Fleet's job
+// (`MacLink`, src/hub.ts), and so is finding the Mac a tap is for (`Fleet.tapKey`).
 import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
+
+import type { Tap } from "./macs";
+
+export type { Tap };
 
 export const NO_PROJECT_ID = "Notifications need this app's EAS project id. See the README.";
 export const DENIED = "Notifications are off for Octet in the phone's settings.";
@@ -34,6 +40,26 @@ export function sessionFromData(data: unknown): string | null {
   return typeof session === "string" && session.length <= SESSION_ID_CHARS && SESSION_ID.test(session)
     ? session
     : null;
+}
+
+/** The longest DNS name, and the longest label of one. */
+const HOST_CHARS = 253;
+const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+/** The host a notification names as its Mac (`data.mac`), or null for data that is not a DNS
+ * name: 253 characters at most, each label 1 to 63 letters, digits and hyphens, never starting or
+ * ending with a hyphen. */
+function hostFromData(data: unknown): string | null {
+  if (typeof data !== "object" || data === null) return null;
+  const mac = (data as { mac?: unknown }).mac;
+  if (typeof mac !== "string" || mac.length > HOST_CHARS) return null;
+  return mac.split(".").every((label) => HOST_LABEL.test(label)) ? mac : null;
+}
+
+/** What a notification's data names: the session, and the host of the Mac that sent it. Each is
+ * null when the data names none that is valid. */
+export function tapFromData(data: unknown): Tap {
+  return { host: hostFromData(data), session: sessionFromData(data) };
 }
 
 /** Start-up, once: nothing shows while the app is open (the screen is already live), and on
@@ -144,11 +170,11 @@ export function onTokenChange(fn: () => void): () => void {
 
 /**
  * Taps on notifications: a tap while the app runs (the listener) and the tap that launched it
- * (the last response). `fn` gets the session the tap names, or null when the data names none that
- * is valid. A tap is handed over once, however many ways it is reported, and the native side is
- * told it was taken, so that no later mount of the shell opens it again. Returns the stop.
+ * (the last response). `fn` gets what the tap names (`tapFromData`). A tap is handed over once,
+ * however many ways it is reported, and the native side is told it was taken, so that no later
+ * mount of the shell opens it again. Returns the stop.
  */
-export function watchTaps(fn: (session: string | null) => void): () => void {
+export function watchTaps(fn: (tap: Tap) => void): () => void {
   let live = true;
   let last: string | null = null;
   const take = (response: Notifications.NotificationResponse | null): void => {
@@ -156,7 +182,7 @@ export function watchTaps(fn: (session: string | null) => void): () => void {
     const id = response.notification.request.identifier;
     if (id === last) return;
     last = id;
-    fn(sessionFromData(response.notification.request.content.data));
+    fn(tapFromData(response.notification.request.content.data));
     try {
       Notifications.clearLastNotificationResponse();
     } catch {

@@ -1,4 +1,4 @@
-import { MAC_ID, cleanMacName, keyOf, linksOf, macNameOf, macOfHost, newMacId, rawOf, splitKey } from "./macs";
+import { MAC_ID, cleanMacName, keyOf, linksOf, machineWords, macNameOf, macOfHost, newMacId, rawOf, splitKey, tapKey } from "./macs";
 
 describe("session keys", () => {
   it("round-trip a Mac and a raw id", () => {
@@ -37,6 +37,49 @@ describe("macOfHost", () => {
     expect(macOfHost(pairings, "")).toBeNull();
     expect(macOfHost(pairings, "studio")).toBeNull();
     expect(macOfHost([{ id: "m1", hubUrl: "not a url" }], "not a url")).toBeNull();
+  });
+});
+
+describe("tap_routes_by_mac", () => {
+  const studio = { id: "m00000001", hubUrl: "wss://studio.tail1.ts.net/" };
+  const mini = { id: "m00000002", hubUrl: "wss://mini.tail1.ts.net/" };
+  const live = () => false;
+
+  it("a known host opens that Mac's session, whatever the case or a trailing dot", () => {
+    expect(tapKey({ host: "mini.tail1.ts.net", session: "1-2" }, [studio, mini], live)).toBe("m00000002/1-2");
+    expect(tapKey({ host: "Studio.Tail1.ts.net.", session: "1-2" }, [studio, mini], live)).toBe("m00000001/1-2");
+  });
+
+  it("a known host whose session has ended opens the Inbox", () => {
+    const ended = (key: string) => key === "m00000002/1-2";
+    expect(tapKey({ host: "mini.tail1.ts.net", session: "1-2" }, [studio, mini], ended)).toBeNull();
+    expect(tapKey({ host: "studio.tail1.ts.net", session: "1-2" }, [studio, mini], ended)).toBe("m00000001/1-2");
+  });
+
+  it("an unknown host opens the Inbox, even with one Mac", () => {
+    expect(tapKey({ host: "air.tail1.ts.net", session: "1-2" }, [studio, mini], live)).toBeNull();
+    expect(tapKey({ host: "air.tail1.ts.net", session: "1-2" }, [studio], live)).toBeNull();
+  });
+
+  it("no host with two Macs opens the Inbox; with one Mac, that Mac", () => {
+    expect(tapKey({ host: null, session: "1-2" }, [studio, mini], live)).toBeNull();
+    expect(tapKey({ host: null, session: "1-2" }, [mini], live)).toBe("m00000002/1-2");
+  });
+
+  it("no session, or no Mac paired, opens the Inbox", () => {
+    expect(tapKey({ host: "mini.tail1.ts.net", session: null }, [studio, mini], live)).toBeNull();
+    expect(tapKey({ host: null, session: "1-2" }, [], live)).toBeNull();
+  });
+});
+
+describe("machineWords", () => {
+  it("online when ready; offline for a pairing with no link; else asleep once tried, connecting… before", () => {
+    expect(machineWords("ready", true)).toBe("online");
+    expect(machineWords("offline", false)).toBe("offline");
+    expect(machineWords("offline", true)).toBe("asleep");
+    expect(machineWords("connecting", true)).toBe("asleep");
+    expect(machineWords("connecting", false)).toBe("connecting…");
+    expect(machineWords("authenticating", false)).toBe("connecting…");
   });
 });
 

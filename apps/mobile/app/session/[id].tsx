@@ -12,6 +12,7 @@ import { useSend } from "../../src/components/send";
 import { TaskStrip } from "../../src/components/TaskStrip";
 import { TranscriptHeader } from "../../src/components/TranscriptHeader";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
+import { useInboxWhenUnpaired } from "../../src/components/unpair";
 import { clearEdgeBottom, setEdgeBottom, useDrawerOpen } from "../../src/drawer";
 import { useLinks } from "../../src/hub";
 import { macName } from "../../src/inbox";
@@ -61,6 +62,8 @@ export default function Session() {
   const macId = macOfKey(id);
   const links = useLinks();
   const client = macId === null ? null : links.client(macId);
+  // Its Mac unpaired: back to the Inbox.
+  useInboxWhenUnpaired(id);
   const focused = useIsFocused();
   const info = useSessionInfo(id);
   const entries = useEntries(id);

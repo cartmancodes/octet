@@ -93,16 +93,18 @@ describe("Settings", () => {
       expect(screen.getByRole("switch", { name: "Face ID to allow" })).toBeTruthy();
     });
 
-    it("lists the Mac with ● online while connected, and ○ offline when not, with Unpair", async () => {
+    it("lists the Mac with ● online while connected, and ○ asleep when not, with Rename and Unpair", async () => {
       const rig = await open();
       expect(screen.getByText("● mac")).toBeTruthy();
       expect(screen.getByText("online")).toBeTruthy();
-      expect(screen.getByRole("button", { name: "Unpair" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Rename mac" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Unpair mac" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Pair another machine" })).toBeTruthy();
       await act(async () => {
         rig.sockets.last.drop();
       });
       expect(screen.getByText("○ mac")).toBeTruthy();
-      expect(screen.getByText("offline")).toBeTruthy();
+      expect(screen.getByText("asleep")).toBeTruthy();
     });
 
     it("has three notification switches: approval, a turn finishing and a session error, none with the old note", async () => {
@@ -201,12 +203,10 @@ describe("Settings", () => {
     it("asks first, in these words, with a destructive Unpair", async () => {
       const alert = confirm();
       await open();
-      await fireEvent.press(screen.getByRole("button", { name: "Unpair" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Unpair mac" }));
       expect(alert).toHaveBeenCalledTimes(1);
-      expect(alert.mock.calls[0]?.[0]).toBe("Unpair this phone?");
-      expect(alert.mock.calls[0]?.[1]).toBe(
-        "You'll need a new pairing code from the Mac. Notifications to this phone stop. The Mac keeps listing this phone until you run `octet hub revoke <name>` there.",
-      );
+      expect(alert.mock.calls[0]?.[0]).toBe("Unpair mac?");
+      expect(alert.mock.calls[0]?.[1]).toBe("Its sessions leave this phone.");
       expect(buttons(alert).map((b) => [b.text, b.style])).toEqual([
         ["Cancel", "cancel"],
         ["Unpair", "destructive"],
@@ -217,7 +217,7 @@ describe("Settings", () => {
     it("Cancel changes nothing", async () => {
       const alert = confirm();
       const rig = await open();
-      await fireEvent.press(screen.getByRole("button", { name: "Unpair" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Unpair mac" }));
       await act(async () => buttons(alert)[0]?.onPress?.());
       expect(await SecureStore.getItemAsync(tokenKeyOf(M))).not.toBeNull();
       expect(rig.hub.snapshot().status).toBe("paired");
@@ -227,7 +227,7 @@ describe("Settings", () => {
     it("Unpair clears the token, the hub address and the cursors, and shows Pair", async () => {
       const alert = confirm();
       const rig = await open();
-      await fireEvent.press(screen.getByRole("button", { name: "Unpair" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Unpair mac" }));
       await act(async () => {
         buttons(alert)[1]?.onPress?.();
       });
@@ -252,7 +252,7 @@ describe("Settings", () => {
   it("sizes its controls for a thumb", async () => {
     await open();
     const style = (el: { props: { style?: unknown } }) => (Array.isArray(el.props.style) ? el.props.style : [el.props.style]).flat();
-    const unpair = screen.getByRole("button", { name: "Unpair" });
+    const unpair = screen.getByRole("button", { name: "Unpair mac" });
     expect(Math.max(...style(unpair).map((s: { minHeight?: number } | undefined) => s?.minHeight ?? 0))).toBeGreaterThanOrEqual(44);
   });
 

@@ -12,6 +12,8 @@
 //   one stays on its PATH behind the stand-in directory. Nothing here reaches Expo.
 // - the WebSocket factory sets `Tailscale-User-Login`, which `tailscale serve` adds in real life.
 //   The app itself never sends that header.
+// The last part runs two hubs at once, as two Macs, each with its own run dir, port, journal dir,
+// stand-in `tailscale` (its own host) and fake bridge, and the phone's store fed by both.
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import http from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, appendFileSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
@@ -22,7 +24,10 @@ import path from "node:path";
 import WebSocket from "ws";
 
 import { type BatchItem, HubClient } from "../src/client/HubClient";
+import { sendVia } from "../src/sendVia";
+import { keyOf, linksOf } from "../src/macs";
 import type { EventFrame, ToPhone } from "../src/protocol";
+import { connectStore, createOctetStore, entriesNow, watch } from "../src/store";
 import { nodeSocketFactory } from "./nodeSocket";
 
 const BINARY = path.resolve(__dirname, "../../../target/debug/octet");
@@ -489,7 +494,8 @@ run("the app's hub client against the real octet hub", () => {
         to: PUSH_TOKEN,
         title: "Octet",
         body: "Approval waiting",
-        data: { session: sessionId },
+        // The host the hub is published at (the stand-in's), which the phone paired with.
+        data: { session: sessionId, mac: "mac.test.ts.net" },
         sound: "default",
         priority: "high",
         channelId: "approvals",
@@ -543,7 +549,8 @@ run("the app's hub client against the real octet hub", () => {
         to: PUSH_TOKEN,
         title: "Octet",
         body: "Session error",
-        data: { session: sessionId },
+        // The host the hub is published at (the stand-in's), which the phone paired with.
+        data: { session: sessionId, mac: "mac.test.ts.net" },
         priority: "high",
         channelId: "errors",
       },
@@ -573,5 +580,202 @@ run("the app's hub client against the real octet hub", () => {
     expect(code).toBe(0);
     await until("the client to be unpaired", () => client?.state === "unpaired", 10_000);
     expect(client?.token).toBeNull();
+  });
+});
+
+/** One more real hub, as one Mac of several: its own temp root (journal dir and run dir), port,
+ * stand-in `tailscale` publishing it at `host`, and fake bridge with session `sessionId`. */
+interface MacHub {
+  host: string;
+  root: string;
+  binDir: string;
+  port: number;
+  sessionId: string;
+  bridge: FakeBridge;
+  child: ChildProcess;
+  log: () => string;
+  /** Appends a record to the session's journal; returns its seq. */
+  journal: (type: string, data: unknown) => number;
+  control: (request: Obj) => Promise<Obj>;
+}
+
+/** Starts `octet hub` on a fresh port and temp root, published (to the stand-in) at `host`, with
+ * a fake bridge whose one session is `${pid}-1790000000`: two of these list the same raw id. */
+async function startMacHub(host: string): Promise<MacHub> {
+  const root = mkdtempSync(path.join(tmpdir(), "omd"));
+  const binDir = mkdtempSync(path.join(tmpdir(), "omb"));
+  const runDir = path.join(root, "run");
+  const sock = path.join(runDir, "hub.sock");
+  if (sock.length > 100) throw new Error(`the temp path is too long for a Unix socket: ${sock}`);
+  mkdirSync(runDir, { recursive: true });
+  const port = await freePort();
+  const serveStatus = JSON.stringify({
+    TCP: { "443": { HTTPS: true } },
+    Web: { [`${host}:443`]: { Handlers: { "/": { Proxy: `http://127.0.0.1:${port}` } } } },
+  });
+  const script = path.join(binDir, "tailscale");
+  writeFileSync(
+    script,
+    `#!/bin/sh\nif [ "$1 $2 $3" = "serve status --json" ]; then printf '%s' '${serveStatus}'; else exit 1; fi\n`,
+  );
+  chmodSync(script, 0o755);
+  let seq = 0;
+  const journal = (type: string, data: unknown): number => {
+    appendFileSync(path.join(root, JOURNAL), `${JSON.stringify({ format: "octet-preview-1", seq, type, data })}\n`);
+    return seq++;
+  };
+  journal("text", `hello from ${host}`);
+  const pid = process.pid;
+  const sessionId = `${pid}-1790000000`;
+  const bridge = new FakeBridge(path.join(runDir, `${pid}.sock`), (line) => ({ v: 1, type: "ack", req: line.req, message: "answered" }));
+  await bridge.listen();
+  writeFileSync(
+    path.join(runDir, `${pid}.json`),
+    JSON.stringify({
+      id: sessionId,
+      pid,
+      started: 1_790_000_000,
+      socket: bridge.socketPath,
+      engine: "claude",
+      workspace: path.join(root, "ws"),
+      model: "opus",
+      mode: "ask",
+      vendor_session: "",
+      journals: [path.join(root, JOURNAL)],
+      from_phone: false,
+    }),
+  );
+  const child = spawn(BINARY, ["hub", "--journal-dir", root, "--port", String(port), "--owner", OWNER], {
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}`, NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  process.once("exit", () => child.kill("SIGKILL"));
+  let out = "";
+  child.stdout?.on("data", (d: Buffer) => (out += d.toString()));
+  child.stderr?.on("data", (d: Buffer) => (out += d.toString()));
+  const end = Date.now() + 8000;
+  for (;;) {
+    const published = await control(sock, { type: "status" }).then(
+      (status) => status.published === true,
+      () => false,
+    );
+    if (published) break;
+    if (Date.now() > end) throw new Error(`timed out waiting for the hub at ${host}\n${out}`);
+    await sleep(50);
+  }
+  return { host, root, binDir, port, sessionId, bridge, child, log: () => out, journal, control: (request) => control(sock, request) };
+}
+
+async function stopMacHub(mac: MacHub | null): Promise<void> {
+  if (!mac) return;
+  mac.bridge.close();
+  if (mac.child.exitCode === null) {
+    const exited = new Promise<void>((resolve) => mac.child.once("exit", () => resolve()));
+    mac.child.kill("SIGTERM");
+    const giveUp = setTimeout(() => mac.child.kill("SIGKILL"), 3000);
+    await exited;
+    clearTimeout(giveUp);
+  }
+  rmSync(mac.root, { recursive: true, force: true });
+  rmSync(mac.binDir, { recursive: true, force: true });
+}
+
+run("two Macs: the phone's store fed by two real hubs", () => {
+  /** The phone's ids for the two pairings. */
+  const STUDIO = "m0000000a";
+  const MINI = "m0000000b";
+  let studio: MacHub | null = null;
+  let mini: MacHub | null = null;
+  const sockets: WebSocket[] = [];
+  const store = createOctetStore();
+  const clients = new Map<string, HubClient>();
+  const links = linksOf(clients);
+  const feeds = new Map<string, () => void>();
+
+  /** Pairs with `mac`'s hub as the app does, and feeds the store from it as Mac `id`. */
+  async function pairWith(id: string, mac: MacHub): Promise<HubClient> {
+    const secret = await mac.control({ type: "pair_secret" });
+    expect(secret.url).toBe(`https://${mac.host}`);
+    const factory = nodeSocketFactory(OWNER, sockets);
+    const url = `ws://127.0.0.1:${mac.port}/`;
+    const paired = await new HubClient({ url, token: null, factory }).pair(String(secret.secret), PHONE, "ios");
+    const client = new HubClient({ url, token: paired.token, factory });
+    clients.set(id, client);
+    feeds.set(id, connectStore(store, client, { mac: id, links }));
+    client.start();
+    return client;
+  }
+  /** Every text the store holds for `key`'s transcript, as one string. */
+  const transcript = (key: string): string => JSON.stringify(entriesNow(store, key));
+
+  beforeAll(async () => {
+    [studio, mini] = await Promise.all([startMacHub("studio.test.ts.net"), startMacHub("mini.test.ts.net")]);
+  });
+
+  afterAll(async () => {
+    for (const client of clients.values()) client.stop();
+    for (const off of feeds.values()) off();
+    for (const ws of sockets) ws.terminate();
+    await Promise.all([stopMacHub(studio), stopMacHub(mini)]);
+  });
+
+  // In order, on purpose: each step builds on the one before.
+  it("lists both Macs' sessions, the same raw id keyed apart", async () => {
+    if (!studio || !mini) throw new Error("no hubs");
+    expect(studio.sessionId).toBe(mini.sessionId);
+    const a = await pairWith(STUDIO, studio);
+    const b = await pairWith(MINI, mini);
+    await until("both links ready", () => a.state === "ready" && b.state === "ready");
+    await until("both Macs listed", () => store.getState().listed.size === 2);
+    const raw = studio.sessionId;
+    expect(store.getState().sessions.map((s) => [s.id, s.mac, s.raw])).toEqual([
+      [keyOf(STUDIO, raw), STUDIO, raw],
+      [keyOf(MINI, raw), MINI, raw],
+    ]);
+  });
+
+  it("an answer for mini's session reaches mini's bridge only", async () => {
+    if (!studio || !mini) throw new Error("no hubs");
+    const key = keyOf(MINI, mini.sessionId);
+    const ack = await sendVia(links, key, { type: "answer", session: key, approval: 7, allow: true });
+    expect(ack).toMatchObject({ type: "ack", message: "answered" });
+    expect(mini.bridge.lines.filter((l) => l.type === "answer")).toEqual([
+      expect.objectContaining({ type: "answer", by: PHONE, approval: 7, allow: true }),
+    ]);
+    expect(studio.bridge.lines.filter((l) => l.type === "answer")).toEqual([]);
+  });
+
+  it("unpairing studio leaves mini streaming", async () => {
+    if (!studio || !mini) throw new Error("no hubs");
+    const studioKey = keyOf(STUDIO, studio.sessionId);
+    const miniKey = keyOf(MINI, mini.sessionId);
+    watch(store, links, studioKey);
+    watch(store, links, miniKey);
+    await until("both replays", () => transcript(studioKey).includes("hello from studio") && transcript(miniKey).includes("hello from mini"));
+
+    // The phone unpairs studio as the Fleet does: its link stops, its feed ends, the store forgets it.
+    clients.get(STUDIO)?.stop();
+    feeds.get(STUDIO)?.();
+    feeds.delete(STUDIO);
+    clients.delete(STUDIO);
+    store.getState().reset(STUDIO);
+    expect(store.getState().sessions.map((s) => s.id)).toEqual([miniKey]);
+    expect(store.getState().bySession.has(studioKey)).toBe(false);
+
+    studio.journal("text", "studio after the unpair");
+    mini.journal("text", "mini after the unpair");
+    await until("mini's live event", () => transcript(miniKey).includes("mini after the unpair"));
+    expect(clients.get(MINI)?.state).toBe("ready");
+    await sleep(300); // anything of studio's would arrive by now
+    expect(store.getState().bySession.has(studioKey)).toBe(false);
+    expect(store.getState().sessions.every((s) => s.mac === MINI)).toBe(true);
+    // mini still takes commands.
+    const ack = await sendVia(links, miniKey, { type: "answer", session: miniKey, approval: 8, allow: false });
+    expect(ack).toMatchObject({ type: "ack", message: "answered" });
+    // studio is not reached at all: a key of studio's is refused on the phone, never sent.
+    await expect(sendVia(links, studioKey, { type: "answer", session: studioKey, approval: 9, allow: true })).rejects.toMatchObject({
+      code: "unsent",
+    });
+    expect(studio.bridge.lines.filter((l) => l.type === "answer")).toEqual([]);
   });
 });

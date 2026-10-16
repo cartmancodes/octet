@@ -443,7 +443,11 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
 
 - **What is sent.** Exactly this and nothing else: the title `Octet`, the body
   `Approval waiting`, `Session error` or `Turn finished`, and `data` holding
-  the hub's opaque session id so a tap opens that session, plus the fixed delivery fields
+  the hub's opaque session id so a tap opens that session and, while the hub
+  is published, `mac`: the host name of its published address (for example
+  `studio.tail1234.ts.net`, lowercased; left out when it isn't a plain DNS
+  name), which the phone already holds from pairing and uses to tell which
+  Mac a tap is for. The title and body never name it. Then the fixed delivery fields
   Expo needs (`to`, which is the phone's push token, and `sound`, `priority`
   and `channelId`, which are constants: `approvals`, `errors` or `turns`). No
   prompt, command, file name, workspace, model, error or reply text ever goes in
@@ -530,6 +534,44 @@ mistake there never blocks a revoke. A relative `--journal-dir` is resolved
 to an absolute path when Octet starts. The hub, the sessions at your desk and
 the sessions a phone starts then use the same directory, whatever directory
 each one runs in.
+
+### More than one Mac
+
+The app pairs with up to 4 Macs, each running its own hub. Pair the first as
+above; for each next one, open **Settings › Machines › + Pair another
+machine** and scan that Mac's `/remote-control pair` code. Pairing a Mac the
+phone already has (the same host) replaces its pairing and keeps its name. A
+5th is refused (`Unpair a Mac first (4 at most)`), and the button is off at 4
+(`4 Macs is the most`).
+
+- **All of them at once.** The app keeps one connection per Mac while it is
+  open, and closes them all in the background. The Inbox and the drawer show
+  every Mac's sessions together, each card named by its Mac; a Mac that can't
+  be reached shows "asleep" and only its sessions grey out. Every command goes
+  to the Mac that owns its session, so two Macs whose sessions have the same id
+  never mix.
+- **Settings › Machines** lists each Mac with its host and its own state
+  (`online`, `connecting…`, `asleep`, or `offline` for a pairing whose
+  credentials the phone can't read right now). **Rename** gives it a name of
+  1 to 40 characters, for this phone only. **Unpair** asks "Unpair NAME? Its
+  sessions leave this phone." and drops only that Mac: its sessions, drafts
+  and approvals leave the phone, and a screen showing one of them goes back to
+  the Inbox. The other Macs are untouched.
+- **Notifications** are one choice for every Mac. Each push names its Mac's
+  published host (`mac`, above), and a tap opens that Mac's session. A tap
+  goes to the Inbox when the push names a host none of your pairings has, when
+  it names none and several Macs are paired, or when that session has ended.
+  A hub that isn't published sends no `mac`; with one Mac paired the tap still
+  opens its session.
+- **Unpairing a Mac that can't be reached.** Unpairing tells that Mac
+  "notifications off" when it can. A Mac that is asleep or away when you
+  unpair it doesn't hear that, and since the phone's push token is the same
+  for all your Macs, the phone can't make the token stop working without
+  stopping every Mac's pushes. That Mac keeps pushing until you run
+  `octet hub revoke "NAME"` on it (`octet hub devices` lists the names). The
+  app ignores those pushes' sessions (their host matches no pairing, so a tap
+  only opens the Inbox), but they still show. Unpairing the last Mac also
+  turns the phone's push registration off when that Mac doesn't answer.
 
 ### Keep a session off the phone
 

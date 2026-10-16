@@ -113,6 +113,7 @@ export const MACS = [
   { id: "m00000001", host: "studio" },
   { id: "m00000002", host: "mini" },
   { id: "m00000003", host: "air" },
+  { id: "m00000004", host: "pro" },
 ] as const;
 
 /** The hub address of the Mac whose host label is `host`. */

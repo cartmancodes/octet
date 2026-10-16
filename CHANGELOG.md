@@ -11,6 +11,23 @@ Claude Code and Codex CLIs.
 
 ### Added
 
+- The phone app pairs with up to 4 Macs. Each pairing keeps its token in its
+  own keychain entry, the one pairing of an earlier version moves over on
+  first launch, and every Mac stays connected while the app is open. The
+  Inbox and the drawer show every Mac's sessions together, each named by its
+  Mac ("2 Macs · 1 online"), a Mac that can't be reached greys only its own
+  sessions, and every command goes to the Mac that owns its session, even when
+  two Macs report the same session id. **Settings › Machines** lists each Mac
+  with its host and state, renames it (1 to 40 characters) and unpairs it
+  alone ("Unpair <name>? Its sessions leave this phone."; a screen showing
+  its session goes back to the Inbox), and **+ Pair another machine** adds
+  one, up to 4. A push now names its Mac in `data.mac`, the host of the hub's
+  published address (lowercased, and only when it is a plain DNS name; never
+  in the title or body), and a tap opens that Mac's session, or the Inbox for
+  a host no pairing has, no host with several Macs, or a session that ended.
+  A Mac unpaired while it can't be reached keeps pushing until `octet hub
+  revoke <device>` on it, as the phone's push token is shared with the other
+  Macs. The contract test runs two real hubs at once.
 - Changes and commits on the phone. A session's Changes screen lists what its
   workspace changed since the last commit (at most 500 files), opens a listed
   file's diff (at most 64 KiB or 2,000 lines), and shows the last test run and

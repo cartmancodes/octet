@@ -24,6 +24,7 @@ import { CommitSheet, PrSheet } from "../src/components/CommitSheet";
 import { DiffLineRow, DiffNote, FileRow, SIDE } from "../src/components/FileRow";
 import { HubBanner } from "../src/components/HubBanner";
 import { failure, useAlive, useSend, type Failure } from "../src/components/send";
+import { useInboxWhenUnpaired } from "../src/components/unpair";
 import { useLinks } from "../src/hub";
 import { macOfKey } from "../src/macs";
 import { FIELD_CHARS, field } from "../src/model/text";
@@ -124,6 +125,8 @@ export default function Changes() {
   const macId = macOfKey(id);
   const links = useLinks();
   const client = macId === null ? null : links.client(macId);
+  // Its Mac unpaired: back to the Inbox.
+  useInboxWhenUnpaired(id);
   // No id, or one that is not a key, names no session on any Mac: nothing is asked of a Mac,
   // and the screen has no link of its own to show (it never borrows another Mac's).
   const known = macId !== null;

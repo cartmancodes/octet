@@ -51,7 +51,11 @@ test needs `git` on the `PATH`. It builds nothing:
 run `scripts/rust-env.sh cargo build -p octet` first. Without that binary it skips. It never
 touches Tailscale: the hub is given a stand-in `tailscale` on its `PATH`, and the test's socket
 adds the `Tailscale-User-Login` header that `tailscale serve` adds in real life. The app never
-sends that header. The hub posts push with `curl`, so `curl` must be on the `PATH`. CI runs this
+sends that header. The hub posts push with `curl`, so `curl` must be on the `PATH`. Its pushes name
+the stand-in's host as `mac`. A second part runs two hubs at once, as two Macs (each with its own
+temp directory, port, stand-in `tailscale` and fake session, the same session id on both), feeds
+one store from both clients and checks that both are listed apart, that an answer reaches only its
+own Mac's session, and that the other Mac keeps streaming after one is unpaired. CI runs this
 test in its own `contract` job.
 
 ## Building the app for a phone
@@ -130,6 +134,24 @@ run:android`. The same rule applies: never pair that build with your everyday Ma
 The app keeps the device token in the iOS Keychain / Android Keystore (`expo-secure-store`), never
 in plain storage.
 
+### More than one Mac
+
+The app pairs with up to 4 Macs. To add one, open **Settings › Machines › + Pair another machine**
+(off at 4: `4 Macs is the most`) and scan that Mac's code. Every Mac stays connected while the app is
+open; the Inbox and the drawer show all their sessions, each named by its Mac, and a Mac that can't
+be reached shows "asleep" and greys only its own sessions. In **Machines**, **Rename** gives a Mac a
+name of 1 to 40 characters on this phone, and **Unpair** asks `Unpair <name>? Its sessions leave
+this phone.` and drops only that Mac (a screen showing one of its sessions goes back to the Inbox).
+
+A push names the Mac it came from (`data.mac`, the hub's published host), and a tap opens that
+Mac's session. A host none of your pairings has, no host with several Macs paired, or a session that
+has ended opens the Inbox. A Mac you unpair while it can't be reached doesn't hear "notifications
+off": it keeps pushing until you run `octet hub revoke <device>` on it, because the phone's push
+token is shared with your other Macs (a tap on one finds no pairing for its host and opens the
+Inbox). A pairing whose token the
+phone can't read shows `offline` in Machines, and on Pair (with Unpair) when it is the only kind
+left, so it can always be cleared.
+
 ## Screens
 
 Every screen is drawn in the terminal's look: one monospace face, the TUI's colours, 1 px bordered
@@ -137,8 +159,9 @@ cards with their titles notched into the border, and touch targets of at least 4
 side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Settings.
 
 - **Pair.** A panel with the camera in four accent corner brackets and a bottom sheet: `PAIRED`
-  (the Mac this phone was paired with, when it pairs again) and **Enter code instead**, which
-  shows the paste and name fields. A scanned code only fills the field; you confirm the Mac it
+  (the Macs this phone is paired with, each with **Unpair** while none can be reached) and
+  **Enter code instead**, which shows the paste and name fields. Opened from **+ Pair another
+  machine**, it reads **Pair another machine**, with Cancel. A scanned code only fills the field; you confirm the Mac it
   names and tap **Pair**. After pairing, one offer to turn on notifications.
 - **Inbox.** The live sessions in three tabs (Needs you, Running, Done). An approval is answered
   right on its card; **Allow all N once** answers the ones still open and fully shown.
@@ -161,8 +184,9 @@ side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Se
     can't be reached or an approval waits.
   - **Open PR on the desk** shows `gh pr create` to run at the Mac, and sends nothing. The phone
     can't push, open a pull request or commit only some files.
-- **Settings.** Three cards. **Machines**: the Mac with ● online or ○ offline, this phone's name,
-  and **Unpair**. **Notify me when**: three switches, **An action needs approval**, **A turn
+- **Settings.** Three cards. **Machines**: each Mac with ● or ○, its own state (`online`,
+  `connecting…`, `asleep` or `offline`), its host, **Rename** and **Unpair**; this phone's name; and
+  **+ Pair another machine**. **Notify me when**: three switches, **An action needs approval**, **A turn
   finishes** and **A session hits an error**, one per kind of push. A switch moves only when the
   Mac acknowledges (a refusal or an unreachable Mac is said below them). Turning one on while
   notifications are off asks the phone's permission and turns on approvals and errors with it;
@@ -250,6 +274,10 @@ workspace. Tick each one on each phone.
 - [ ] Return to the app after a long background: it reconnects at once, without a pull to refresh.
 - [ ] All three switches off in Settings: no more pushes. Revoke the phone on the Mac
       (`octet hub revoke`): the app says it is unpaired.
+- [ ] Pair a second Mac from **+ Pair another machine**: both Macs' sessions show in the Inbox,
+      each named. A push from each Mac, tapped, opens that Mac's session.
+- [ ] Rename a Mac; unpair it while its conversation is open: the app goes back to the Inbox and
+      the other Mac keeps working.
 
 ## Performance notes
 

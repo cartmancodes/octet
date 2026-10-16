@@ -6,7 +6,7 @@ import type { CatalogInfo, JournalEvent, SessionInfo, StateInfo, ToPhone } from 
 import { entrySize } from "./model/transcript";
 import type { BatchItem } from "./client/HubClient";
 import { linksOf, type Links } from "./macs";
-import { MAX_VIEWS, bestHub, bindHooks, connectStore, createOctetStore, releaseSession, unwatch, watch, type OctetStore } from "./store";
+import { MAX_VIEWS, bestHub, bindHooks, connectStore, createOctetStore, hasEnded, releaseSession, unwatch, watch, type OctetStore } from "./store";
 import { M, k, keyed } from "./testKeys";
 
 const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
@@ -430,6 +430,32 @@ describe("listed", () => {
       applyM([sessions(info("a"))]);
     });
     expect(listed.result.current).toBe(true);
+  });
+});
+
+describe("hasEnded", () => {
+  it("is false before the Mac has listed: not told yet is not ended", () => {
+    expect(hasEnded(store.getState(), k("a"))).toBe(false);
+  });
+
+  it("is false for a listed session, true for one its Mac's list does not hold", () => {
+    applyM([sessions(info("a"))]);
+    expect(hasEnded(store.getState(), k("a"))).toBe(false);
+    expect(hasEnded(store.getState(), k("b"))).toBe(true);
+    // Another Mac's list says nothing of this one's.
+    expect(hasEnded(store.getState(), "m00000009/b")).toBe(false);
+  });
+
+  it("is true for a session whose view is kept as ended", () => {
+    applyM([sessions(info("a")), subscribed("a", "start")]);
+    applyM([sessions()]);
+    expect(store.getState().bySession.get(k("a"))?.ended).toBe(true);
+    expect(hasEnded(store.getState(), k("a"))).toBe(true);
+  });
+
+  it("is false for a string that is no key", () => {
+    applyM([sessions()]);
+    expect(hasEnded(store.getState(), "a")).toBe(false);
   });
 });
 

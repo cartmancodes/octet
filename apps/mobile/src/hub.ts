@@ -12,10 +12,10 @@ import { webSocketFactory } from "./client/socket";
 import { isDevBuild } from "./build";
 import { DEFAULT_PUSH_KINDS, NOT_SAVED, loadSettings, readSettings, updateSettings, type Settings } from "./persist";
 import { createCoalescer, type Coalescer } from "./coalesce";
-import { MAX_MACS, TOO_MANY_MACS, cleanMacName, hostOf, macNameOf, macOfHost, newMacId, type Links, type Pairing } from "./macs";
+import { MAX_MACS, TOO_MANY_MACS, cleanMacName, hostOf, macNameOf, macOfHost, newMacId, tapKey, type Links, type Pairing, type Tap } from "./macs";
 import { DENIED, askForToken, currentToken, dropPushRegistration, onTokenChange, projectId } from "./notifications";
 import type { PushKinds } from "./protocol";
-import { connectStore, octetStore, type OctetStore } from "./store";
+import { connectStore, hasEnded, octetStore, type OctetStore } from "./store";
 
 /** The keychain item that held the device token while the phone had one pairing. A development
  * build keeps its own, so that it never inherits (and so can never leak) the pairing a release
@@ -852,6 +852,14 @@ export class Fleet {
     return saved ? { ok: true } : { ok: false, message: NOT_SAVED };
   }
 
+  /** The key a push tap opens (see `tapKey`): the session on the pairing whose host the tap
+   * names, or, with no host, on the only pairing; null for the Inbox, and for a session that Mac
+   * has ended. A pairing with no link counts: its session's screen says it can't be reached. */
+  tapKey(tap: Tap): string | null {
+    const state = this.store.getState();
+    return tapKey(tap, this.pairings, (key) => hasEnded(state, key));
+  }
+
   /** The user dismissed the notice the Inbox shows (a Mac that unpaired this phone, an unpair
    * that did not finish) while some Mac is still paired. */
   dismissNotice(): void {
@@ -989,6 +997,10 @@ export const useNotices = (): string[] => useFleetPart((s) => s.notices);
 /** One paired Mac; the same object until that Mac changes (another Mac's change does not render
  * it again). Null for a Mac not paired. */
 export const useMac = (id: string): MacInfo | null => useFleetPart((s) => s.macs.find((m) => m.id === id) ?? null);
+
+/** Whether Mac `mac` is paired (with a link or not); false for null. Renders again only when
+ * that changes. */
+export const useIsPaired = (mac: string | null): boolean => useFleetPart((s) => mac !== null && s.macs.some((m) => m.id === mac));
 
 /** The paired Macs' names by id, in pairing order: the same map until a Mac is paired, unpaired
  * or renamed (a link's state changing does not make a new one). */

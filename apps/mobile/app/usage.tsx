@@ -6,6 +6,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { FreshConfirm } from "../src/components/CommandSheet";
 import { useDeskCommand } from "../src/components/deskCommand";
 import { useSend } from "../src/components/send";
+import { useInboxWhenUnpaired } from "../src/components/unpair";
 import { useLinks } from "../src/hub";
 import { macOfKey, rawOf } from "../src/macs";
 import { field } from "../src/model/text";
@@ -67,6 +68,8 @@ export default function Usage() {
   const macId = macOfKey(id);
   const links = useLinks();
   const client = macId === null ? null : links.client(macId);
+  // Its Mac unpaired: back to the Inbox.
+  useInboxWhenUnpaired(id);
 
   // The session streams while this screen is in front, as it does for the Conversation under it:
   // USAGE and TURNS are live. An ended session has nothing more to stream. Navigation blurs the

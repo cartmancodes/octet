@@ -84,6 +84,27 @@ export function macOfHost(pairings: readonly Pick<Pairing, "id" | "hubUrl">[], h
   return null;
 }
 
+/** What a push tap names: the host of the Mac that sent it (its `mac`; null when it named none
+ * that is a host name) and the hub's raw session id (null when it named none that is valid). */
+export interface Tap {
+  host: string | null;
+  session: string | null;
+}
+
+/**
+ * The key a push tap opens, or null for the Inbox. The Mac is the pairing whose hub host is the
+ * tap's host (without case or a trailing dot); with no host, the only pairing, if there is just
+ * one. A host no pairing has, no host with several pairings, no session, or a session `ended`
+ * says is over: the Inbox.
+ */
+export function tapKey(tap: Tap, pairings: readonly Pick<Pairing, "id" | "hubUrl">[], ended: (key: string) => boolean): string | null {
+  if (tap.session === null) return null;
+  const mac = tap.host !== null ? macOfHost(pairings, tap.host) : pairings.length === 1 ? (pairings[0]?.id ?? null) : null;
+  if (mac === null) return null;
+  const key = keyOf(mac, tap.session);
+  return ended(key) ? null : key;
+}
+
 const SOME_MAC = "Mac";
 const LABEL_MAX = 63;
 
@@ -129,6 +150,15 @@ export function cleanMacName(raw: unknown): string | null {
 export function macStatus(state: HubState, tried: boolean): "asleep" | "connecting…" | null {
   if (state === "ready") return null;
   return tried ? "asleep" : "connecting…";
+}
+
+/** What Settings › Machines says of a Mac: "online" when ready; "offline" for a pairing with no
+ * link (never tried, and not trying: its token could not be read, or is on its way); else its
+ * `macStatus`, "asleep" or "connecting…". */
+export function machineWords(state: HubState, tried: boolean): "online" | "offline" | "asleep" | "connecting…" {
+  if (state === "ready") return "online";
+  if (state === "offline" && !tried) return "offline";
+  return macStatus(state, tried) ?? "online";
 }
 
 /** The Inbox's header line with several Macs: "2 Macs · 1 online". */

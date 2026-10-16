@@ -8,10 +8,9 @@ import { AppState, View } from "react-native";
 import { ApprovalToasts } from "../src/components/ApprovalToasts";
 import { Drawer, DrawerHost } from "../src/components/Drawer";
 import { closeDrawer, drawerScreen, setDrawerEnabled } from "../src/drawer";
-import { useFleetStatus, useHubController, useLinks, useOffer } from "../src/hub";
-import { keyOf } from "../src/macs";
+import { useFleetStatus, useHubController, useOffer } from "../src/hub";
 import { openSession } from "../src/navigation";
-import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
+import { clearDelivered, configureNotifications, watchTaps, type Tap } from "../src/notifications";
 import { useTheme } from "../src/theme";
 import { ToastHost } from "../src/ui";
 
@@ -38,7 +37,6 @@ export default function RootLayout() {
   // Two primitives, not the snapshot: a link's state changing does not render the shell.
   const status = useFleetStatus();
   const offer = useOffer();
-  const links = useLinks();
   const pathname = usePathname();
 
   // The drawer belongs to the Inbox, a Conversation and Settings of a paired phone: anywhere else
@@ -67,36 +65,39 @@ export default function RootLayout() {
     return () => subscription.remove();
   }, [hub]);
 
-  // A tap opens the session it names, as the drawer does (back to it when it is in the stack);
-  // unpaired, the phone can only pair; a tap that names no valid session lands on the Inbox. (The
-  // Session screen already handles a session that is gone.) A push names the hub's raw id: it is
-  // the only Mac's; with no one Mac to own it, the tap lands on the Inbox.
-  const open = (session: string | null) => {
-    const macs = links.macs();
-    const only = macs.length === 1 ? macs[0] : undefined;
-    if (status === "unpaired") router.replace("/pair");
-    else if (session === null || only === undefined) router.replace("/");
-    else openSession(router, nav.getRootState(), pathname, keyOf(only, session));
+  // A tap opens the session it names on the Mac it names (`Fleet.tapKey`: the pairing of the
+  // push's host, or the only one when it names none), as the drawer does (back to it when it is in
+  // the stack); unpaired, the phone can only pair. A tap for no valid session, a host no pairing
+  // has, no host with several Macs, or a session that Mac has ended lands on the Inbox, and
+  // nothing is sent. (The Session screen handles a session found gone once its Mac lists.)
+  const open = (tap: Tap) => {
+    if (status === "unpaired") {
+      router.replace("/pair");
+      return;
+    }
+    const key = hub.tapKey(tap);
+    if (key === null) router.replace("/");
+    else openSession(router, nav.getRootState(), pathname, key);
   };
   // The latest of these, for the listener below, which is set up once.
   const route = useRef({ status, offer, open });
-  const waiting = useRef<{ session: string | null } | null>(null);
+  const waiting = useRef<Tap | null>(null);
   useEffect(() => {
     route.current = { status, offer, open };
     if (status === "loading" || offer || waiting.current === null) return;
-    // A tap that arrived before the saved pairing was read, or during the notifications step.
-    const { session } = waiting.current;
+    // A tap that arrived before the saved pairings were read, or during the notifications step.
+    const tap = waiting.current;
     waiting.current = null;
-    open(session);
+    open(tap);
   });
 
   // Nothing shows while the app is open; Android gets its channels. Then taps on notifications,
   // the one that launched the app included.
   useEffect(() => {
     void configureNotifications();
-    return watchTaps((session) => {
-      if (route.current.status === "loading" || route.current.offer) waiting.current = { session };
-      else route.current.open(session);
+    return watchTaps((tap) => {
+      if (route.current.status === "loading" || route.current.offer) waiting.current = tap;
+      else route.current.open(tap);
     });
   }, []);
 

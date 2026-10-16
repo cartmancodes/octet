@@ -850,6 +850,16 @@ function readyKey(hubs: ReadonlyMap<string, HubState>): string {
   return key;
 }
 
+/** Whether session `key` is over, as far as the phone knows: its view is kept as ended, or its
+ * Mac has listed its sessions and `key` is not one of them. False before the Mac has listed (not
+ * told yet is not over) and for a string that is no key. */
+export function hasEnded(state: Pick<OctetState, "bySession" | "listed" | "slices">, key: string): boolean {
+  if (state.bySession.get(key)?.ended) return true;
+  const mac = macOfKey(key);
+  if (mac === null || !state.listed.has(mac)) return false;
+  return !(state.slices.get(mac) ?? []).some((s) => s.id === key);
+}
+
 /** Hooks over `store`: each selects the smallest part a screen needs. */
 export function bindHooks(store: OctetStore) {
   return {

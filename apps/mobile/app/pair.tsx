@@ -1,13 +1,14 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { hubHost, pairLinkProblem, parsePairLink } from "../src/client/link";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
-import { NOT_A_LINK, useFleetStatus, useHubController, useMacs, useNotice, useOffer } from "../src/hub";
+import { confirmUnpair } from "../src/components/unpair";
+import { NOT_A_LINK, useFleetStatus, useHubController, useMacs, useNotice, useOffer, type MacInfo, type Fleet } from "../src/hub";
 import { macName } from "../src/inbox";
 import { Mascot } from "../src/mascot/Mascot";
 import { radius, spacing, type, useTheme } from "../src/theme";
@@ -24,7 +25,9 @@ const CORNER_LINE = 3;
 
 /** Pairing: scan the QR code the Mac shows, or enter its link. The hub's refusals and every
  * failure are shown as plain text. Opened with `?add=1` on a paired phone, it pairs another
- * machine: the Macs paired already stay, and Cancel goes back. */
+ * machine: the Macs paired already stay, and Cancel goes back. With no Mac linked, a pairing that
+ * is still saved (its token could not be read) is listed with Unpair, so the phone can be
+ * cleared. */
 export default function Pair() {
   const theme = useTheme();
   const router = useRouter();
@@ -185,13 +188,7 @@ export default function Pair() {
               <Text style={[type.body, { color: theme.muted }]}>No Mac yet</Text>
             </View>
           ) : (
-            macs.map((m) => (
-              <View key={m.id} style={styles.mac}>
-                <Text numberOfLines={1} style={[type.body, { color: m.state === "ready" ? theme.fg : theme.muted }]}>
-                  {`${m.state === "ready" ? "●" : "○"} ${m.macName}`}
-                </Text>
-              </View>
-            ))
+            macs.map((m) => <PairedRow key={m.id} mac={m} hub={hub} unpairable={status === "unpaired"} />)
           )}
 
           {notice !== null && (
@@ -256,6 +253,27 @@ export default function Pair() {
     </KeyboardAvoidingView>
   );
 }
+
+interface PairedRowProps {
+  mac: MacInfo;
+  hub: Fleet;
+  /** No Mac is linked: the row offers Unpair. */
+  unpairable: boolean;
+}
+
+/** One paired Mac under PAIRED: its name, and, while no Mac is linked, Unpair (asked first). */
+const PairedRow = memo(function PairedRow({ mac, hub, unpairable }: PairedRowProps) {
+  const theme = useTheme();
+  const unpair = useCallback(() => confirmUnpair(mac.macName, () => void hub.unpair(mac.id)), [hub, mac.id, mac.macName]);
+  return (
+    <View style={[styles.mac, styles.macRow]}>
+      <Text numberOfLines={1} style={[type.body, styles.grow, { color: mac.state === "ready" ? theme.fg : theme.muted }]}>
+        {`${mac.state === "ready" ? "●" : "○"} ${mac.macName}`}
+      </Text>
+      {unpairable ? <Button label="Unpair" accessibilityLabel={`Unpair ${mac.macName}`} onPress={unpair} /> : null}
+    </View>
+  );
+});
 
 /** After a pairing, once: get a notification when an agent needs approval or finishes a turn.
  * Skippable; Settings has the same switch. */
@@ -341,6 +359,7 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   mac: { minHeight: 44, justifyContent: "center" },
+  macRow: { flexDirection: "row", alignItems: "center", gap: spacing.md },
   enter: { alignSelf: "flex-start", paddingHorizontal: 0 },
   field: { minHeight: 44, borderWidth: 1, borderRadius: radius.card, paddingHorizontal: spacing.md, fontSize: 16 },
   step: { padding: spacing.lg, gap: spacing.md, paddingTop: spacing.xxl },

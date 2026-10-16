@@ -9,7 +9,9 @@ import {
   currentToken,
   projectId,
   sessionFromData,
+  tapFromData,
   watchTaps,
+  type Tap,
 } from "./notifications";
 
 let mockExtra: { eas?: { projectId?: string } } | undefined;
@@ -190,13 +192,61 @@ describe("what a tap names", () => {
   });
 });
 
+describe("what a tap names of its Mac", () => {
+  it("is the session and the host the push names as its mac", () => {
+    expect(tapFromData({ session: "4821-1790000000", mac: "studio.tail1.ts.net" })).toEqual({
+      host: "studio.tail1.ts.net",
+      session: "4821-1790000000",
+    });
+  });
+
+  it("is no host from a hub that does not name one", () => {
+    expect(tapFromData({ session: "4821-1790000000" })).toEqual({ host: null, session: "4821-1790000000" });
+  });
+
+  it("keeps the host of a tap whose session is not valid: it still names the Mac", () => {
+    expect(tapFromData({ session: "../x", mac: "studio.tail1.ts.net" })).toEqual({ host: "studio.tail1.ts.net", session: null });
+    expect(tapFromData(undefined)).toEqual({ host: null, session: null });
+  });
+
+  it("allows a name of any case, 253 characters at most", () => {
+    const label = "a".repeat(63);
+    const longest = `${label}.${label}.${label}.${"b".repeat(61)}`;
+    expect(longest).toHaveLength(253);
+    expect(tapFromData({ session: "1-2", mac: longest }).host).toBe(longest);
+    expect(tapFromData({ session: "1-2", mac: "Studio.Tail1.TS.net" }).host).toBe("Studio.Tail1.TS.net");
+  });
+
+  it.each([
+    ["a number", 7],
+    ["an object", { host: "studio" }],
+    ["an empty string", ""],
+    ["a URL", "wss://studio.tail1.ts.net/"],
+    ["a port", "studio.tail1.ts.net:443"],
+    ["a path", "studio/../x"],
+    ["user info", "me@studio.ts.net"],
+    ["a space", "stu dio.ts.net"],
+    ["a newline", "studio.ts.net\n"],
+    ["a leading hyphen", "-studio.ts.net"],
+    ["a trailing hyphen", "studio-.ts.net"],
+    ["an empty label", "studio..ts.net"],
+    ["a trailing dot, which the hub never sends", "studio.ts.net."],
+    ["a label over 63", `${"a".repeat(64)}.ts.net`],
+    ["over 253 characters", `${"a.".repeat(127)}a`],
+    ["a bidi control", "studio\u202e.ts.net"],
+  ])("is no host for %s", (_name, mac) => {
+    expect(tapFromData({ session: "1-2", mac })).toEqual({ host: null, session: "1-2" });
+  });
+});
+
 describe("watching taps", () => {
   const response = (data: unknown, id = "n1") => ({ notification: { request: { identifier: id, content: { data } } } });
 
   it("hands over a cold start's tap once, and a warm one from the listener", () => {
     n.getLastNotificationResponse.mockReturnValueOnce(response({ session: "1-2" }) as never);
     const heard: (string | null)[] = [];
-    const stop = watchTaps((s) => heard.push(s));
+    const push = (tap: Tap) => heard.push(tap.session);
+    const stop = watchTaps(push);
     expect(heard).toEqual(["1-2"]);
     const listener = n.addNotificationResponseReceivedListener.mock.calls[0]?.[0];
     listener?.(response({ session: "3-4" }, "n2") as never);
@@ -206,6 +256,14 @@ describe("watching taps", () => {
     stop();
   });
 
+  it("hands over the Mac's host with the session", () => {
+    const taps: Tap[] = [];
+    watchTaps((tap) => taps.push(tap));
+    const listener = n.addNotificationResponseReceivedListener.mock.calls[0]?.[0];
+    listener?.(response({ session: "3-4", mac: "mini.tail1.ts.net" }, "n9") as never);
+    expect(taps).toEqual([{ host: "mini.tail1.ts.net", session: "3-4" }]);
+  });
+
   it("clears the last response once it is taken, so that no later start sees it again", () => {
     let last: unknown = response({ session: "1-2" });
     n.getLastNotificationResponse.mockImplementation(() => last as never);
@@ -213,8 +271,9 @@ describe("watching taps", () => {
       last = null;
     });
     const heard: (string | null)[] = [];
-    watchTaps((s) => heard.push(s))();
-    watchTaps((s) => heard.push(s))();
+    const push = (tap: Tap) => heard.push(tap.session);
+    watchTaps(push)();
+    watchTaps(push)();
     expect(heard).toEqual(["1-2"]);
     expect(n.clearLastNotificationResponse).toHaveBeenCalledTimes(1);
   });
@@ -222,7 +281,8 @@ describe("watching taps", () => {
   it("does not repeat the cold start's tap when the listener reports it too", () => {
     n.getLastNotificationResponse.mockReturnValueOnce(response({ session: "1-2" }) as never);
     const heard: (string | null)[] = [];
-    watchTaps((s) => heard.push(s));
+    const push = (tap: Tap) => heard.push(tap.session);
+    watchTaps(push);
     const listener = n.addNotificationResponseReceivedListener.mock.calls[0]?.[0];
     listener?.(response({ session: "1-2" }) as never);
     expect(heard).toEqual(["1-2"]);
@@ -233,7 +293,8 @@ describe("watching taps", () => {
       throw new Error("unavailable");
     });
     const heard: (string | null)[] = [];
-    expect(() => watchTaps((s) => heard.push(s))).not.toThrow();
+    const push = (tap: Tap) => heard.push(tap.session);
+    expect(() => watchTaps(push)).not.toThrow();
     expect(heard).toEqual([]);
   });
 
@@ -241,7 +302,8 @@ describe("watching taps", () => {
     const remove = jest.fn();
     n.addNotificationResponseReceivedListener.mockReturnValueOnce({ remove } as never);
     const heard: (string | null)[] = [];
-    watchTaps((s) => heard.push(s))();
+    const push = (tap: Tap) => heard.push(tap.session);
+    watchTaps(push)();
     expect(remove).toHaveBeenCalled();
   });
 });
