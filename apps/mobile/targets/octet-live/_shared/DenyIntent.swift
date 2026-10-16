@@ -31,10 +31,15 @@ struct DenyIntent: LiveActivityIntent {
     guard !session.isEmpty, !approval.isEmpty,
       let defaults = UserDefaults(suiteName: "group.dev.octet.mobile")
     else { return .result() }
+    // At most 16 wait for the app; past that, this tap is dropped (the app drains them, and drops
+    // any older than 10 minutes, whenever it listens).
+    let waiting = defaults.dictionaryRepresentation().keys.filter { $0.hasPrefix("deny.") }
+    if waiting.count >= 16 { return .result() }
     // A key of its own: nothing else writes it, so no other Deny can overwrite or drop this one.
-    defaults.set(
-      ["mac": mac, "session": session, "approval": approval],
-      forKey: "deny." + UUID().uuidString)
+    let deny: [String: Any] = [
+      "mac": mac, "session": session, "approval": approval, "at": Date().timeIntervalSince1970,
+    ]
+    defaults.set(deny, forKey: "deny." + UUID().uuidString)
     CFNotificationCenterPostNotification(
       CFNotificationCenterGetDarwinNotifyCenter(),
       CFNotificationName("dev.octet.mobile.deny" as CFString), nil, nil, true)

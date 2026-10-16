@@ -27,6 +27,19 @@ function contentStateFields(swift: string): Record<string, string> {
   return fields;
 }
 
+/** The brace-balanced body that follows the first match of `start` (a declaration or a call). */
+function block(swift: string, start: RegExp): string {
+  const at = start.exec(swift);
+  if (!at) return "";
+  const open = swift.indexOf("{", at.index + at[0].length - 1);
+  let depth = 0;
+  for (let i = open; i < swift.length; i++) {
+    if (swift[i] === "{") depth++;
+    else if (swift[i] === "}" && --depth === 0) return swift.slice(open, i + 1);
+  }
+  return "";
+}
+
 describe("the ActivityAttributes type", () => {
   it("is named exactly as the hub's attributes-type, with no attributes of its own", () => {
     expect(moduleAttributes).toMatch(new RegExp(`struct ${ACTIVITY_ATTRIBUTES_TYPE}\\s*:\\s*ActivityAttributes\\b`));
@@ -151,5 +164,96 @@ describe("the App Group contract", () => {
     expect(denySwift).toContain("UUID().uuidString");
     expect(moduleSwift).toMatch(/hasPrefix\(denyPrefix\)/);
     expect(moduleSwift).toMatch(/removeObject\(forKey: key\)/);
+  });
+});
+
+describe("what the native side keeps, and how", () => {
+  it("refuses entries over 64 KiB, or that aren't an object of at most 64 objects of strings", () => {
+    expect(moduleSwift).toMatch(/private let entriesByteLimit = 64 \* 1024\b/);
+    expect(moduleSwift).toMatch(/private let entriesLimit = 64\b/);
+    const setEntries = block(moduleSwift, /AsyncFunction\("setEntries"\)/);
+    expect(setEntries).toMatch(/json\.utf8\.count <= entriesByteLimit/);
+    expect(setEntries).toMatch(/as\? \[String: Any\]/);
+    expect(setEntries).toMatch(/\.count <= entriesLimit/);
+    expect(setEntries).toMatch(/is String/);
+    expect(setEntries).toMatch(/throw InvalidEntriesException\(\)/);
+    expect(moduleSwift).toMatch(/final class InvalidEntriesException\s*:\s*Exception\b/);
+  });
+
+  it("has the widget skip an oversized store and read only its own entry, so one bad entry hides no other", () => {
+    expect(widgetSwift).toMatch(/private let entriesByteLimit = 64 \* 1024\b/);
+    const entry = block(widgetSwift, /static func entry\(forKey key: String\) -> Entry\?/);
+    expect(entry).toMatch(/json\.utf8\.count <= entriesByteLimit/);
+    expect(entry).toMatch(/\[key\] as\? \[String: Any\]/);
+    expect(widgetSwift).not.toMatch(/decode\(\[String: Entry\]/);
+  });
+
+  it("starts and updates only an activity that is active or stale, never one that ended", () => {
+    const live = block(moduleSwift, /func liveActivities\(\)/);
+    expect(live).toMatch(/\.activityState == \.active \|\| \$0\.activityState == \.stale/);
+    expect(block(moduleSwift, /AsyncFunction\("start"\)/)).toMatch(/liveActivities\(\)\.first/);
+    expect(block(moduleSwift, /AsyncFunction\("update"\)/)).toMatch(/in liveActivities\(\)/);
+    expect(moduleSwift).not.toMatch(/\.activities\.first/);
+  });
+
+  it("keeps at most 16 waiting denies, each stamped, and drops any older than 10 minutes", () => {
+    const perform = block(denySwift, /func perform\(\)/);
+    expect(perform).toMatch(/hasPrefix\("deny\."\)/);
+    expect(perform).toMatch(/>= 16/);
+    expect(perform).toMatch(/"at": Date\(\)\.timeIntervalSince1970/);
+    expect(perform.indexOf(">= 16")).toBeLessThan(perform.indexOf("defaults.set("));
+    expect(moduleSwift).toMatch(/private let denyMaxAge: TimeInterval = 10 \* 60\b/);
+    expect(block(moduleSwift, /private func drainDenies\(\)/)).toMatch(/denyMaxAge/);
+  });
+
+  it("drains on one serial queue, so no key is emitted twice", () => {
+    expect(moduleSwift).toMatch(/private let denyQueue = DispatchQueue\(label: "dev\.octet\.mobile\.deny"\)/);
+    // drainDenies runs only from the queue.
+    const calls = [...moduleSwift.matchAll(/drainDenies\(\)/g)].length;
+    const queued = [...moduleSwift.matchAll(/denyQueue\.async \{ \[weak self\] in self\?\.drainDenies\(\) \}/g)].length;
+    expect(queued).toBe(1);
+    expect(calls).toBe(2); // the declaration and the one queued call
+    expect(moduleSwift).toMatch(/scheduleDrain\(\)/);
+  });
+
+  it("adds and removes the Darwin observer while holding the lock", () => {
+    const hear = block(moduleSwift, /private func hearDenies\(_ on: Bool\)/);
+    expect(hear).toMatch(/lock\.lock\(\)\s*\n\s*defer \{ lock\.unlock\(\) \}/);
+    expect(hear).toContain("CFNotificationCenterAddObserver");
+    expect(hear).toContain("CFNotificationCenterRemoveObserver");
+    expect(hear).not.toContain("lock.unlock()\n");
+  });
+
+  it("watches only a live activity, stops on cancel, and forgets each task when its loop ends", () => {
+    const watch = block(moduleSwift, /private func watch\(_ activity: Activity<OctetActivity>\)/);
+    expect(watch).toMatch(/guard activity\.activityState == \.active \|\| activity\.activityState == \.stale else \{\s*sendEvent\("pushToken", \["token": nil\]\)/);
+    for (const loop of moduleSwift.matchAll(/for await [^\n]*\{\n([^\n]*)/g)) {
+      expect(loop[1]).toMatch(/if Task\.isCancelled \{ break \}/);
+    }
+    expect([...moduleSwift.matchAll(/for await /g)].length).toBe(4);
+    expect([...moduleSwift.matchAll(/self\?\.forget\(key, id\)/g)].length).toBe(4);
+  });
+});
+
+describe("the widget's buttons and links", () => {
+  it("percent-encodes every part of the Allow link with the RFC 3986 unreserved set", () => {
+    expect(widgetSwift).toContain(
+      'CharacterSet(\n  charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")',
+    );
+    expect(block(widgetSwift, /private func linkPart\(_ text: String\) -> String/)).toContain(
+      "addingPercentEncoding(withAllowedCharacters: unreserved)",
+    );
+    expect(widgetSwift).toMatch(
+      /"octet:\/\/approve\/"\s*\+ \[state\.mac, state\.session, approval\]\.map\(linkPart\)\.joined\(separator: "\/"\)/,
+    );
+    // The link is built in that one place.
+    expect([...widgetSwift.matchAll(/octet:\/\/approve/g)].length).toBe(1);
+  });
+
+  it("gives Allow and Deny a hit area at least 44 points tall", () => {
+    const actions = block(widgetSwift, /private struct Actions: View/);
+    expect([...actions.matchAll(/minHeight: 44\b/g)].length).toBe(2);
+    expect(block(actions, /Button\(intent: deny\)/)).toMatch(/minHeight: 44\b/);
+    expect(block(actions, /Link\(destination: shown\.allowURL\)/)).toMatch(/minHeight: 44\b/);
   });
 });

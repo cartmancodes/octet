@@ -22,6 +22,7 @@ import {
   type ActivityState,
   type DenyEvent,
 } from "./index";
+import native from "./src/OctetLiveModule";
 
 const state: ActivityState = {
   kind: "approval",
@@ -32,6 +33,10 @@ const state: ActivityState = {
 };
 
 describe("the wrapper without a native module", () => {
+  it("finds no native module here, so these tests exercise the fallback", () => {
+    expect(native).toBeNull();
+  });
+
   it("is not supported", () => {
     expect(isSupported()).toBe(false);
   });

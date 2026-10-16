@@ -9,9 +9,11 @@ import WidgetKit
 // modules/octet-live/ios/OctetLiveModule.swift.
 private let appGroup = "group.dev.octet.mobile"
 private let entriesKey = "entries"
+/// The module refuses anything larger; a store past this is not read at all.
+private let entriesByteLimit = 64 * 1024
 
 /// One session's waiting approval, as the app wrote it.
-private struct Entry: Decodable {
+private struct Entry {
   let name: String
   let command: String
   let approval: String?
@@ -40,12 +42,16 @@ private struct Shown {
     self.entry = Shown.entry(forKey: state.mac + "/" + state.session)
   }
 
+  /// Reads only this session's entry, so another malformed entry hides nothing here.
   static func entry(forKey key: String) -> Entry? {
     guard let json = UserDefaults(suiteName: appGroup)?.string(forKey: entriesKey),
-      let data = json.data(using: .utf8),
-      let entries = try? JSONDecoder().decode([String: Entry].self, from: data)
+      json.utf8.count <= entriesByteLimit,
+      let entries = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
+      let entry = entries[key] as? [String: Any],
+      let name = entry["name"] as? String,
+      let command = entry["command"] as? String
     else { return nil }
-    return entries[key]
+    return Entry(name: name, command: command, approval: entry["approval"] as? String)
   }
 
   var isApproval: Bool { state.kind == "approval" }
@@ -163,7 +169,7 @@ private struct Actions: View {
       if let deny = shown.deny {
         Button(intent: deny) {
           Text("Deny")
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, minHeight: 44)
         }
         .tint(.red)
         .accessibilityLabel("Deny this approval")
@@ -171,7 +177,7 @@ private struct Actions: View {
       Link(destination: shown.allowURL) {
         Text(shown.deny == nil ? "Open Octet" : "Allow")
           .font(.body.weight(.semibold))
-          .frame(maxWidth: .infinity, minHeight: 32)
+          .frame(maxWidth: .infinity, minHeight: 44)
           .background(Capsule().fill(Color.green.opacity(0.35)))
       }
       .accessibilityLabel(shown.deny == nil ? "Open the Inbox" : "Allow, in Octet")
