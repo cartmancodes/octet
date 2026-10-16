@@ -46,11 +46,14 @@ export interface OctetState {
   listed: ReadonlySet<string>;
   /** Applies one Mac's frames, their sessions already keyed by it, in order, in one commit.
    * Returns the sessions that just ended (they were listed before and are not now): their views
-   * stay, marked `ended`, until the caller releases them. Throws, applying nothing, when a frame
-   * names a key of another Mac. */
+   * stay, marked `ended`, until the caller releases them. A frame naming another Mac's session
+   * is left out, and so is a listed row of another Mac's: a frame of one Mac never makes or
+   * changes another's keys. */
   applyBatch(mac: string, frames: readonly BatchItem[]): string[];
-  /** `applyBatch` for several Macs at once, in one commit; the ended sessions of each, in order. */
-  applyBatches(batches: readonly Batch[]): string[][];
+  /** `applyBatch` for several Macs at once, in one commit; the ended sessions of each, in order.
+   * A batch that cannot be applied (a fault in the store) is reported and left out whole, and
+   * is null here; the others still apply. */
+  applyBatches(batches: readonly Batch[]): (string[] | null)[];
   /** Drops the view of an ended session, or of a failed one the hub does not list. False for
    * any other. */
   release(session: string): boolean;
@@ -202,21 +205,32 @@ const merged = (slices: ReadonlyMap<string, ListedSession[]>): ListedSession[] =
   return all;
 };
 
-/** Throws unless every key the frames would make or change is one of Mac `mac`'s. */
-function assertOwn(mac: string, frames: readonly BatchItem[]): void {
+/** Says so, in development, when a frame of one Mac names another's session: a fault upstream,
+ * since `connectStore` keys every frame by its own Mac. */
+function stray(mac: string, what: string): void {
+  if (typeof __DEV__ !== "undefined" && __DEV__) console.warn(`octet: a frame of ${mac} names ${what}, which is not its own; it was left out`);
+}
+
+/** Mac `mac`'s frames without those that name another Mac's session; the same array when none
+ * does. A sessions frame's rows of another Mac are left out by `cleanRow`. */
+function ownFrames(mac: string, frames: readonly BatchItem[]): readonly BatchItem[] {
   const prefix = `${mac}/`;
-  for (const frame of frames) {
+  let kept: BatchItem[] | null = null;
+  frames.forEach((frame, i) => {
     if (frame.type === "sessions") {
-      if (!Array.isArray(frame.sessions)) continue;
-      for (const row of frame.sessions as unknown[]) {
-        if (isObj(row) && typeof row.id === "string" && row.id !== "" && !row.id.startsWith(prefix)) {
-          throw new Error(`a sessions frame of ${mac} lists another Mac's session`);
+      if (Array.isArray(frame.sessions)) {
+        for (const row of frame.sessions as unknown[]) {
+          if (isObj(row) && typeof row.id === "string" && row.id !== "" && !row.id.startsWith(prefix)) stray(mac, `the row ${row.id}`);
         }
       }
     } else if ("session" in frame && !(typeof frame.session === "string" && frame.session.startsWith(prefix))) {
-      throw new Error(`a frame of ${mac} names another Mac's session`);
+      stray(mac, `the session ${String(frame.session)}`);
+      kept ??= frames.slice(0, i);
+      return;
     }
-  }
+    kept?.push(frame);
+  });
+  return kept ?? frames;
 }
 
 /** Whether `key` is one of Mac `mac`'s. */
@@ -359,15 +373,16 @@ export function createOctetStore(): OctetStore {
     },
 
     applyBatches(batches) {
-      // Nothing is applied unless every frame keeps to its own Mac's keys.
-      for (const { mac, frames } of batches) assertOwn(mac, frames);
       const st = get();
       let slices = st.slices;
       let answered = st.answered;
       let listed = st.listed;
       let views: Map<string, SessionView> | null = null;
-      const ended: string[][] = [];
-      for (const { mac, frames } of batches) {
+      const ended: (string[] | null)[] = [];
+
+      /** One Mac's batch over what the batches before it made. Its views go into `changed`, which
+       * the caller merges only if the whole batch went through. */
+      const step = (mac: string, frames: readonly BatchItem[], changed: Map<string, SessionView>): string[] => {
         const before = slices.get(mac) ?? NO_ROWS;
         let rows = before;
         let heard = false;
@@ -377,7 +392,7 @@ export function createOctetStore(): OctetStore {
           if (list) list.push(op);
           else ops.set(session, [op]);
         };
-        for (const frame of frames) {
+        for (const frame of ownFrames(mac, frames)) {
           switch (frame.type) {
             case "sessions":
               if (Array.isArray(frame.sessions)) {
@@ -429,12 +444,30 @@ export function createOctetStore(): OctetStore {
           }
         }
         for (const [session, list] of ops) {
-          const old = (views ?? st.bySession).get(session);
+          const old = known.get(session);
           const next = reduceView(old ?? EMPTY_VIEW, list);
           if (next === old || (old === undefined && next === EMPTY_VIEW)) continue;
-          (views ??= new Map(st.bySession)).set(session, next);
+          changed.set(session, next);
         }
-        ended.push(gone);
+        return gone;
+      };
+
+      for (const { mac, frames } of batches) {
+        const saved = { slices, answered, listed };
+        const changed = new Map<string, SessionView>();
+        try {
+          ended.push(step(mac, frames, changed));
+        } catch (error) {
+          // A fault in the store, not the Mac: this batch costs only itself.
+          ({ slices, answered, listed } = saved);
+          console.error(`octet: a batch of ${mac} could not be applied; it was left out`, error);
+          ended.push(null);
+          continue;
+        }
+        if (changed.size > 0) {
+          views ??= new Map(st.bySession);
+          for (const [session, view] of changed) views.set(session, view);
+        }
       }
       if (views === null && slices === st.slices && listed === st.listed && answered === st.answered) return ended;
       set({
@@ -632,7 +665,7 @@ export function connectStore(store: OctetStore, client: HubClient, options: Conn
     offBatch();
     offState();
     offFailed();
-    coalescer.drop(mac);
+    coalescer.drop(mac, sink); // a newer feed of the same Mac keeps what it has waiting
     for (const session of [...timers.keys()]) cancel(session);
     if (feedsOf(store).get(mac) === client) feedsOf(store).delete(mac);
   };

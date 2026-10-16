@@ -124,7 +124,10 @@ export default function Changes() {
   const macId = macOfKey(id);
   const links = useLinks();
   const client = macId === null ? null : links.client(macId);
-  const hub = useHub(macId ?? undefined);
+  // No id, or one that is not a key, names no session on any Mac: nothing is asked of a Mac,
+  // and the screen has no link of its own to show (it never borrows another Mac's).
+  const known = macId !== null;
+  const hub = useHub(macId ?? "");
   const focused = useIsFocused();
   const head = useSessionHead(id);
   const send = useSend(id);
@@ -319,8 +322,8 @@ export default function Changes() {
       return;
     }
     // eslint-disable-next-line react-hooks/set-state-in-effect -- one extra render on a reconnect, to clear a stale failure now
-    if (id !== "") load(false);
-  }, [hub, id, load, forgetQueue]);
+    if (known) load(false);
+  }, [hub, known, load, forgetQueue]);
   const pull = useCallback(() => load(true), [load]);
   const retry = useCallback(() => load(false), [load]);
 
@@ -485,6 +488,24 @@ export default function Changes() {
       ) : null,
     [listing.state, listing.failed, offline, s],
   );
+
+  if (!known) {
+    // No session on any Mac: only the way back, and no link to speak of.
+    return (
+      <View style={[s.screen, { paddingTop: insets.top }]}>
+        <View style={s.bar}>
+          <Button label="‹" accessibilityLabel="Back" variant="bare" onPress={back} />
+          <View style={s.title}>
+            <Text accessibilityRole="header" style={s.heading}>
+              Changes
+            </Text>
+          </View>
+          <View style={s.spacer} />
+        </View>
+        <Text style={s.empty}>No session</Text>
+      </View>
+    );
+  }
 
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>

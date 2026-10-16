@@ -66,6 +66,8 @@ export default function Session() {
   const entries = useEntries(id);
   const state = useSessionState(id);
   const status = useSessionStatus(id);
+  // A route id that is not a key names no session on any Mac: the screen shows it gone, and has
+  // no link of its own to show (it never borrows another Mac's).
   const listed = useListed(macId ?? "");
   const hub = useHub(macId ?? "");
   const taskOpen = useTaskOpen();
@@ -157,7 +159,8 @@ export default function Session() {
 
   // Not listed, and nothing to show: never heard of (once the list came), or refused with no
   // transcript (a deep link to an id the Mac does not have).
-  const gone = info === undefined && ((listed && !status.known) || (status.failed !== null && entries.length === 0));
+  const gone =
+    macId === null || (info === undefined && ((listed && !status.known) || (status.failed !== null && entries.length === 0)));
   const now = nowLine(state, info);
 
   // Commands go to the session's Mac; with no link to it (not paired yet) they are unsent.
@@ -218,7 +221,7 @@ export default function Session() {
           onUsage={usage}
           onChanges={changes}
         />
-        <HubBanner state={hub} announce={focused} />
+        {macId !== null ? <HubBanner state={hub} announce={focused} /> : null}
         {gone ? (
           <View style={styles.gone}>
             <Text style={[type.body, styles.center, { color: theme.muted }]}>

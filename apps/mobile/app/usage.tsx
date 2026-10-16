@@ -96,7 +96,8 @@ export default function Usage() {
   const turns = useTurns(id);
   const journals = useJournals(id);
   const rows = useUsageRows();
-  const hub = useHub(macId ?? undefined);
+  // A route id that is not a key names no session: no link of its own, and never another Mac's.
+  const hub = useHub(macId ?? "");
 
   const send = useSend(id);
   const desk = useDeskCommand(id, send);
@@ -161,7 +162,8 @@ export default function Usage() {
     [theme],
   );
 
-  const known = id !== "";
+  // No id, or one that is not a key: no session on any Mac.
+  const known = macId !== null;
   // The Mac must be reachable, and the session listed and taking commands.
   const live = info !== undefined && !status.ended && status.failed === null;
   const off = hub !== "ready" || !live || busy || asking;

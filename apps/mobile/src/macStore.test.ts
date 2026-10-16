@@ -4,6 +4,7 @@ import { FakeClock, Sockets } from "./client/fakes";
 import { HubClient, Refusal } from "./client/HubClient";
 import { sendVia } from "./components/send";
 import type { Links } from "./macs";
+import * as model from "./model/session";
 import type { SessionInfo } from "./protocol";
 import { MAX_VIEWS, bestHub, connectStore, createOctetStore, releaseSession, unwatch, watch, type OctetStore } from "./store";
 
@@ -24,6 +25,7 @@ let store: OctetStore;
 beforeEach(() => {
   store = createOctetStore();
 });
+afterEach(() => jest.restoreAllMocks());
 
 function macs(...ids: string[]) {
   const clock = new FakeClock();
@@ -163,11 +165,69 @@ describe("a Mac's sessions frame", () => {
     expect(store.getState().bySession.get("m2/a")?.ended).toBe(false);
   });
 
-  it("can touch only keys of its own Mac", () => {
-    const before = store.getState();
-    expect(() => store.getState().applyBatch("m1", [{ v: 1, type: "event", session: "m2/a", journal: "j1", seq: 1, event: { type: "user", data: "x" } }])).toThrow();
-    expect(() => store.getState().applyBatch("m1", [{ v: 1, type: "sessions", sessions: [info("a")] }])).toThrow();
-    expect(store.getState()).toBe(before);
+  it("a stray frame costs only itself: the valid frames of both Macs apply, the foreign one is dropped", () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    const ev = (session: string, seq: number, data: string) => ({ v: 1, type: "event", session, journal: "j1", seq, event: { type: "user", data } }) as const;
+    const ended = store.getState().applyBatches([
+      { mac: "m1", frames: [{ v: 1, type: "sessions", sessions: [info("m1/a")] }, ev("m1/a", 1, "from m1")] },
+      // m2's batch holds a frame keyed for m1, and one of its own.
+      { mac: "m2", frames: [ev("m1/a", 2, "stray"), { v: 1, type: "sessions", sessions: [info("m2/b"), info("m1/z")] }, ev("m2/b", 1, "from m2")] },
+    ]);
+    expect(ended).toEqual([[], []]);
+    const s = store.getState();
+    expect(s.bySession.get("m1/a")?.transcript.entries).toMatchObject([{ text: "from m1" }]);
+    expect(s.bySession.get("m2/b")?.transcript.entries).toMatchObject([{ text: "from m2" }]);
+    // m2's list keeps only its own row: m1's rows are m1's to list.
+    expect(s.sessions.map((x) => x.id)).toEqual(["m1/a", "m2/b"]);
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it("a batch the store cannot apply costs only its own Mac, and says so", () => {
+    const error = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const real = model.reduceView;
+    jest.spyOn(model, "reduceView").mockImplementation((view, ops) => {
+      if (ops.some((op) => op.op === "event" && (op.ev as { data?: unknown }).data === "boom")) throw new Error("boom");
+      return real(view, ops);
+    });
+    const ev = (session: string, data: string) => ({ v: 1, type: "event", session, journal: "j1", seq: 1, event: { type: "user", data } }) as const;
+    const ended = store.getState().applyBatches([
+      { mac: "m1", frames: [{ v: 1, type: "sessions", sessions: [info("m1/a")] }, ev("m1/a", "boom")] },
+      { mac: "m2", frames: [{ v: 1, type: "sessions", sessions: [info("m2/b")] }, ev("m2/b", "fine")] },
+    ]);
+    expect(ended).toEqual([null, []]);
+    const s = store.getState();
+    // Nothing of m1's batch is in: not its list, not its listed flag.
+    expect(s.sessions.map((x) => x.id)).toEqual(["m2/b"]);
+    expect(s.listed.has("m1")).toBe(false);
+    expect(s.bySession.get("m2/b")?.transcript.entries).toMatchObject([{ text: "fine" }]);
+    expect(error).toHaveBeenCalled();
+  });
+});
+
+describe("a new client for the same Mac", () => {
+  it("keeps its first list when the old client's feed is torn down after it connected", () => {
+    const clock = new FakeClock();
+    const connect = () => {
+      const sockets = new Sockets();
+      const client = new HubClient({ url: "wss://m1.tail1.ts.net/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
+      const off = connectStore(store, client, { mac: "m1", now: clock.now, schedule: clock.schedule });
+      client.start();
+      sockets.last.open();
+      sockets.last.receive({ type: "welcome", device: "iPhone" });
+      return { socket: sockets.last, off };
+    };
+    const old = connect();
+    old.socket.receive({ type: "sessions", sessions: [info("a")] });
+    clock.advance(0); // the old feed's list commits, now
+    expect(store.getState().sessions.map((x) => x.id)).toEqual(["m1/a"]);
+    // The new client connects and lists within 50 ms of that commit: its batch waits.
+    const fresh = connect();
+    fresh.socket.receive({ type: "sessions", sessions: [info("b")] });
+    clock.advance(1);
+    old.off();
+    clock.advance(100);
+    expect(store.getState().sessions.map((x) => x.id)).toEqual(["m1/b"]);
+    fresh.off();
   });
 });
 

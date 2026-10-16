@@ -21,10 +21,12 @@ export interface Sink {
 }
 
 export interface Coalescer {
-  /** Hands over a Mac's batch. */
+  /** Hands over a batch of `mac`'s from the feed `sink` stands for: a feed's batches wait
+   * together, and apart from another feed's for the same Mac. */
   push(mac: string, frames: readonly BatchItem[], sink?: Sink): void;
-  /** Forgets what `mac` has waiting (its feed stopped). */
-  drop(mac: string): void;
+  /** Forgets what `mac` has waiting from the feed `sink` (that feed stopped); with no `sink`,
+   * from pushes that named none. A newer feed of the same Mac keeps its batches. */
+  drop(mac: string, sink?: Sink): void;
 }
 
 export interface CoalescerOptions {
@@ -39,16 +41,33 @@ const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
 };
 
 interface Waiting {
+  mac: string;
   frames: BatchItem[];
   sink: Sink | undefined;
 }
 
-/** A coalescer over `commit`, which applies the batches in one store commit and returns, for
- * each, the sessions that ended. */
-export function createCoalescer(commit: (batches: Batch[]) => string[][], options: CoalescerOptions = {}): Coalescer {
+/** Runs `fn`, reporting what it throws: one feed's fault stops no other's. */
+function guarded(what: string, fn: () => void): void {
+  try {
+    fn();
+  } catch (error) {
+    console.error(`octet: ${what} failed`, error);
+  }
+}
+
+/**
+ * A coalescer over `commit`, which applies the batches in one store commit and returns, for
+ * each, the sessions that ended, or null for a batch it could not apply. Every sink's `before`
+ * runs before the commit, and the `after` of each batch that applied runs after it; a sink that
+ * throws is reported and stops no other. A commit that throws is reported too, and runs no
+ * `after`: the store applies in one `set`, so it is consistent either way, and no feed acts on
+ * an outcome it was not told.
+ */
+export function createCoalescer(commit: (batches: Batch[]) => (string[] | null)[], options: CoalescerOptions = {}): Coalescer {
   const now = options.now ?? Date.now;
   const schedule = options.schedule ?? defaultSchedule;
-  const waiting = new Map<string, Waiting>();
+  /** By feed (its sink), or by Mac for pushes that name none; in the order they first came. */
+  const waiting = new Map<Sink | string, Waiting>();
   let last = -Infinity;
   let cancel: (() => void) | null = null;
 
@@ -56,34 +75,37 @@ export function createCoalescer(commit: (batches: Batch[]) => string[][], option
     cancel?.();
     cancel = null;
     if (waiting.size === 0) return;
-    const list = [...waiting];
+    const list = [...waiting.values()];
     waiting.clear();
     last = now();
-    for (const [, w] of list) w.sink?.before?.(w.frames);
-    let ended: string[][];
+    for (const w of list) guarded(`the feed of ${w.mac} before its commit`, () => w.sink?.before?.(w.frames));
+    let ended: (string[] | null)[];
     try {
-      ended = commit(list.map(([mac, w]) => ({ mac, frames: w.frames })));
-    } catch {
-      // A batch the store would not take (a key of another Mac): nothing of it was applied.
+      ended = commit(list.map((w) => ({ mac: w.mac, frames: w.frames })));
+    } catch (error) {
+      console.error("octet: a store commit failed", error);
       return;
     }
-    list.forEach(([, w], i) => w.sink?.after?.(ended[i] ?? []));
+    list.forEach((w, i) => {
+      const gone = ended[i];
+      if (gone != null) guarded(`the feed of ${w.mac} after its commit`, () => w.sink?.after?.(gone));
+    });
   };
 
   return {
     push(mac, frames, sink) {
-      const w = waiting.get(mac);
-      if (w) {
-        for (const f of frames) w.frames.push(f);
-        w.sink = sink ?? w.sink;
-      } else waiting.set(mac, { frames: frames.slice(), sink });
+      const tag = sink ?? mac;
+      const w = waiting.get(tag);
+      if (w) for (const f of frames) w.frames.push(f);
+      else waiting.set(tag, { mac, frames: frames.slice(), sink });
       if (cancel) return;
       const wait = last + COALESCE_MS - now();
       if (wait <= 0) run();
       else cancel = schedule(run, wait);
     },
-    drop(mac) {
-      waiting.delete(mac);
+    drop(mac, sink) {
+      const tag = sink ?? mac;
+      if (waiting.get(tag)?.mac === mac) waiting.delete(tag);
       if (waiting.size === 0 && cancel) {
         cancel();
         cancel = null;

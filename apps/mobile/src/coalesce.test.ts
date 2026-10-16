@@ -60,8 +60,9 @@ describe("the coalescer", () => {
     clock.advance(50);
     expect(commits).toBeLessThanOrEqual(5);
     // Nothing was lost: every batch of both Macs is in.
-    expect(store.getState().bySession.get("m1/a")?.transcript.entries[0]).toMatchObject({ text: expect.stringContaining("20") });
-    expect(store.getState().bySession.get("m2/a")?.transcript.entries[0]).toMatchObject({ text: expect.stringContaining("20") });
+    const all = Array.from({ length: 20 }, (_, i) => `${i + 1} `).join("");
+    expect(store.getState().bySession.get("m1/a")?.transcript.entries).toMatchObject([{ text: all }]);
+    expect(store.getState().bySession.get("m2/a")?.transcript.entries).toMatchObject([{ text: all }]);
   });
 
   it("calls each Mac's sink around its commit, with the sessions that ended", () => {
@@ -78,6 +79,50 @@ describe("the coalescer", () => {
     c.push("m1", [list("m1", "b")], { before: () => seen.push("before"), after: (ended) => seen.push(`after ${ended.join(",")}`) });
     clock.advance(50);
     expect(seen).toEqual(["before", "after m1/a"]);
+  });
+
+  it("a throwing sink stops no other: every Mac's after runs, and the error is reported", () => {
+    const clock = new FakeClock();
+    const error = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const commits: Batch[][] = [];
+    const c = createCoalescer((list) => (commits.push(list), list.map(() => [])), { now: clock.now, schedule: clock.schedule });
+    c.push("m0", [text("m0/a", 1)]); // a commit, so the next two wait for one together
+    const seen: string[] = [];
+    const bad = { before: () => void seen.push("before m1"), after: () => { seen.push("after m1"); throw new Error("m1's sink"); } };
+    const throwsFirst = { before: () => { throw new Error("m2's before"); }, after: () => void seen.push("after m2") };
+    c.push("m1", [text("m1/a", 1)], bad);
+    c.push("m2", [text("m2/a", 1)], throwsFirst);
+    c.push("m3", [text("m3/a", 1)], { after: () => void seen.push("after m3") });
+    clock.advance(50);
+    expect(commits[1]?.map((b) => b.mac)).toEqual(["m1", "m2", "m3"]);
+    expect(seen).toEqual(["before m1", "after m1", "after m2", "after m3"]);
+    expect(error).toHaveBeenCalledTimes(2);
+    error.mockRestore();
+  });
+
+  it("skips the after of a batch the store did not apply, and runs the others'", () => {
+    const clock = new FakeClock();
+    const seen: string[] = [];
+    const c = createCoalescer((list) => list.map((b) => (b.mac === "m1" ? null : [`${b.mac}/gone`])), { now: clock.now, schedule: clock.schedule });
+    c.push("m0", [text("m0/a", 1)]);
+    c.push("m1", [text("m1/a", 1)], { after: () => void seen.push("m1") });
+    c.push("m2", [text("m2/a", 1)], { after: (ended) => void seen.push(`m2 ${ended.join(",")}`) });
+    clock.advance(50);
+    expect(seen).toEqual(["m2 m2/gone"]);
+  });
+
+  it("drops only the pending batch of the feed let go, not a newer feed's for the same Mac", () => {
+    const clock = new FakeClock();
+    const commits: Batch[][] = [];
+    const c = createCoalescer((list) => (commits.push(list), list.map(() => [])), { now: clock.now, schedule: clock.schedule });
+    const oldFeed = {};
+    const newFeed = {};
+    c.push("m1", [text("m1/a", 1)], oldFeed);
+    c.push("m1", [text("m1/a", 2)], oldFeed);
+    c.push("m1", [text("m1/b", 1)], newFeed);
+    c.drop("m1", oldFeed);
+    clock.advance(50);
+    expect(commits[1]?.map((b) => b.frames.map((f) => (f as { session: string }).session))).toEqual([["m1/b"]]);
   });
 
   it("drops what a Mac had pending when it is let go, and leaves no timer when nothing is", () => {
