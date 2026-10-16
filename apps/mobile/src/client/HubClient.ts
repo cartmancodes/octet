@@ -109,6 +109,8 @@ interface Pending {
   resolve: (ack: Ack) => void;
   reject: (error: Refusal) => void;
   cancel: () => void;
+  /** The most characters of a refusal's words kept. */
+  words: number;
 }
 
 const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
@@ -116,8 +118,12 @@ const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
   return () => clearTimeout(id);
 };
 
-/** A refusal's words, as the user will read them: the hub's, cleaned and clipped. */
-const refusalOf = (frame: RefusedFrame): Refusal => new Refusal(frame.code ?? "invalid", field(frame.reason, SHORT_CHARS));
+/** The most characters kept of a commit's refusal: git's own words, which the hub clips to the
+ * last 2,000 (`GIT_WORDS`, crates/octet-hub/src/git.rs), where a hook puts its summary. */
+export const COMMIT_WORDS_CHARS = 2_000;
+
+/** A refusal's words, as the user will read them: the hub's, cleaned and clipped to `limit`. */
+const refusalOf = (frame: RefusedFrame, limit = SHORT_CHARS): Refusal => new Refusal(frame.code ?? "invalid", field(frame.reason, limit));
 
 const isUnpaired = (code: RefusalCode | null | undefined): boolean =>
   code === "unpaired" || code === "revoked";
@@ -327,7 +333,8 @@ export class HubClient {
         // looks open, and is silent. Its late answers die with it. One that spoke lately is alive.
         if (this.socket === socket && this.now() - this.lastHeard >= QUIET_MS) this.lost();
       }, REQUEST_TIMEOUT_MS);
-      this.pending.set(req, { resolve, reject, cancel });
+      const words = cmd.type === "commit" ? COMMIT_WORDS_CHARS : SHORT_CHARS;
+      this.pending.set(req, { resolve, reject, cancel, words });
       try {
         socket.send(JSON.stringify({ ...cmd, v: PROTOCOL_VERSION, req }));
       } catch {
@@ -610,7 +617,7 @@ export class HubClient {
     if (entry) {
       this.pending.delete(frame.req);
       entry.cancel();
-      entry.reject(refusalOf(frame));
+      entry.reject(refusalOf(frame, entry.words));
     } else if (session !== undefined) {
       this.subscribeReqs.delete(frame.req);
       this.live.delete(session);

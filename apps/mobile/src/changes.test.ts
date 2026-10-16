@@ -9,12 +9,14 @@ import {
   barCells,
   branchLines,
   changeSummary,
+  commitScope,
   committedText,
   diffLines,
   editedFile,
   firstPrompt,
   lastChecks,
   matchFile,
+  rowKey,
   splitPath,
 } from "./changes";
 import type { Entry, ToolCall } from "./model/transcript";
@@ -281,5 +283,46 @@ describe("committedText", () => {
     expect(committedText(ack("Committed"), "main")).toBe("Committed on main");
     expect(committedText(ack("Committed \u001b[2Jzz"), null)).toBe("Committed");
     expect(committedText(ack(undefined), "main")).toBe("Committed on main");
+  });
+});
+
+describe("commitScope", () => {
+  const untracked = (path: string) => file(path, 1, 0, { status: "?" });
+
+  it("counts the listed files, saying how many are new (untracked) when any are", () => {
+    expect(commitScope([file("a", 1, 0), file("b", 2, 1, { status: "A" })], 0)).toBe("Commits 2 files");
+    expect(commitScope([file("a", 1, 0)], 0)).toBe("Commits 1 file");
+    expect(commitScope([file("a", 1, 0), untracked("b"), untracked("c")], 0)).toBe("Commits 3 files, including 2 new");
+    expect(commitScope([untracked("b")], 0)).toBe("Commits 1 file, including 1 new");
+  });
+
+  it("is about the count when the Mac had more than it listed", () => {
+    expect(commitScope([file("a", 1, 0)], 4)).toBe("Commits about 5 files");
+    expect(commitScope([untracked("a"), file("b", 1, 0)], 498)).toBe("Commits about 500 files, including 1 new");
+    expect(commitScope([], 3)).toBe("Commits about 3 files");
+  });
+
+  it("is nothing with nothing listed", () => {
+    expect(commitScope([], 0)).toBeNull();
+  });
+});
+
+describe("rowKey", () => {
+  it("never makes one key of two rows, whatever a path holds", () => {
+    const rows: [string, ...(string | number)[]][] = [
+      ["a"],
+      ["a", 0],
+      ["a\n0"],
+      ["a", "loading"],
+      ["a\nloading"],
+      ["a\u0000", 0],
+      ["a", "\u00000"],
+      ["a\",0"],
+      ["a", '",0'],
+      ["a", "0"],
+    ];
+    const keys = rows.map(([raw, ...part]) => rowKey(raw, ...part));
+    expect(new Set(keys).size).toBe(rows.length);
+    expect(rowKey("a", 3)).toBe(rowKey("a", 3));
   });
 });

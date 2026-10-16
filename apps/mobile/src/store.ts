@@ -578,6 +578,17 @@ export interface SessionStatus {
 }
 
 /** Hooks over `store`: each selects the smallest part a screen needs. */
+/** A view's transcript entries as `useEntries` gives them: during a replay from the start that
+ * has brought nothing yet, the entries shown before it. */
+const viewEntries = (v: SessionView | undefined): Entry[] => {
+  const view = v ?? EMPTY_VIEW;
+  return view.replaying && view.held ? view.held : view.transcript.entries;
+};
+
+/** A session's transcript entries now, as `useEntries` gives them, read once: for a value taken
+ * when something opens, which a stream must not draw again. */
+export const entriesNow = (store: OctetStore, id: string): Entry[] => viewEntries(store.getState().bySession.get(id));
+
 export function bindHooks(store: OctetStore) {
   return {
     /** Everything the phone knows of a session; the same object until it changes. */
@@ -597,11 +608,7 @@ export function bindHooks(store: OctetStore) {
       ),
     /** A session's transcript entries: new only when an entry was added or changed. During a
      * replay from the start that has brought nothing yet, the entries shown before it. */
-    useEntries: (id: string): Entry[] =>
-      useStore(store, (s) => {
-        const v = s.bySession.get(id) ?? EMPTY_VIEW;
-        return v.replaying && v.held ? v.held : v.transcript.entries;
-      }),
+    useEntries: (id: string): Entry[] => useStore(store, (s) => viewEntries(s.bySession.get(id))),
     /** The terminal UI's state of a session (goal, NOW, queue); the same object until it changes. */
     useSessionState: (id: string): SessionState | null => useStore(store, (s) => s.bySession.get(id)?.state ?? null),
     /** Whether the phone holds a view of the session, and whether it ended or failed. */

@@ -238,14 +238,14 @@ describe("the files", () => {
     const rig = await open();
     await answer(rig);
     await tap("src/app.ts");
-    await refuse(rig, "diff", "Git is busy; try again", "busy");
-    const words = screen.getByText("Git is busy; try again");
+    await refuse(rig, "diff", "fatal: bad object HEAD", "unavailable");
+    const words = screen.getByText("fatal: bad object HEAD");
     expect(tones("fg")).toContain(look(words).color);
     await tap("src/app.ts");
     await tap("src/app.ts");
     expect(requests(rig, "diff")).toHaveLength(2);
     await answerDiff(rig, DIFF);
-    expect(screen.queryByText("Git is busy; try again")).toBeNull();
+    expect(screen.queryByText("fatal: bad object HEAD")).toBeNull();
     expect(screen.getAllByTestId("diff-line")).toHaveLength(4);
   });
 
@@ -374,15 +374,34 @@ describe("a reload that is not a pull", () => {
     await flush();
   }
 
-  it("keeps a diff whose file is as it was", async () => {
+  it("asks again for an open diff whose file looks as it was, showing the kept one meanwhile", async () => {
     const rig = await open();
     await answer(rig);
     await tap("src/app.ts");
     await answerDiff(rig, DIFF);
     await reconnect(rig);
     await answer(rig);
-    expect(rig.sockets.all.flatMap((x) => x.commandsOf("diff"))).toHaveLength(1);
+    // The same counts can hide a new edit: the open file's diff is asked for again.
+    expect(requests(rig, "diff")).toEqual([expect.objectContaining({ path: "src/app.ts" })]);
     expect(screen.getAllByTestId("diff-line")).toHaveLength(4);
+    expect(screen.queryByText(LOADING_DIFF)).toBeNull();
+    await answerDiff(rig, DIFF.replace("const b = 3;", "const b = 4;"));
+    expect(screen.getByText("const b = 4;")).toBeTruthy();
+    expect(screen.queryByText("const b = 3;")).toBeNull();
+  });
+
+  it("forgets a closed file's diff, so opening it again asks for a fresh one", async () => {
+    const rig = await open();
+    await answer(rig);
+    await tap("src/app.ts");
+    await answerDiff(rig, DIFF);
+    await tap("src/app.ts");
+    await reconnect(rig);
+    await answer(rig);
+    expect(requests(rig, "diff")).toHaveLength(0);
+    await tap("src/app.ts");
+    expect(requests(rig, "diff")).toEqual([expect.objectContaining({ path: "src/app.ts" })]);
+    expect(screen.getByText(LOADING_DIFF)).toBeTruthy();
   });
 
   it.each([
@@ -443,6 +462,113 @@ describe("pull to refresh", () => {
     // An answer to the older request after all is not drawn over the newer one.
     await answer(rig, [file("old.ts")], {}, first);
     expect(screen.queryByText("old.ts")).toBeNull();
+  });
+});
+
+describe("two diffs at a time", () => {
+  const FIVE = ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"].map((p) => file(p));
+  /** The diffs sent and not yet answered. */
+  const out = (rig: Rig, answered: Set<number>) => requests(rig, "diff").filter((d) => !answered.has(Number(d.req)));
+  /** The Mac answers the diff request `sent`. */
+  async function answerOne(rig: Rig, sent: Record<string, unknown>, answered: Set<number>) {
+    answered.add(Number(sent.req));
+    await act(async () => {
+      rig.sockets.last.receive({ type: "diff", req: Number(sent.req), path: sent.path, text: `@@ -1 +1 @@\n+${String(sent.path)}\n`, clipped: false, binary: false });
+    });
+    await flush();
+  }
+  /** Answers every diff as it is asked for, oldest first, checking that never more than two are out. */
+  async function answerAll(rig: Rig, answered: Set<number>) {
+    for (let next = out(rig, answered)[0]; next !== undefined; next = out(rig, answered)[0]) {
+      expect(out(rig, answered).length).toBeLessThanOrEqual(2);
+      await answerOne(rig, next, answered);
+    }
+  }
+  async function openFive(rig: Rig, answered: Set<number>) {
+    await answer(rig, FIVE);
+    for (const f of FIVE) await tap(f.path);
+    await answerAll(rig, answered);
+    expect(screen.getAllByTestId("diff-line")).toHaveLength(10); // a hunk and a line each
+  }
+
+  it("asks for at most two at once, in the order the files were opened", async () => {
+    const rig = await open();
+    await answer(rig, FIVE);
+    for (const f of FIVE) await tap(f.path);
+    expect(requests(rig, "diff").map((d) => d.path)).toEqual(["a.ts", "b.ts"]);
+    const answered = new Set<number>();
+    await answerAll(rig, answered);
+    expect(requests(rig, "diff").map((d) => d.path)).toEqual(["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"]);
+  });
+
+  it("a pull with five files open keeps at most two diffs in flight", async () => {
+    const rig = await open();
+    const answered = new Set<number>();
+    await openFive(rig, answered);
+    await pull();
+    await answer(rig, FIVE);
+    expect(out(rig, answered).map((d) => d.path)).toEqual(["a.ts", "b.ts"]);
+    await answerAll(rig, answered);
+    expect(requests(rig, "diff").slice(5).map((d) => d.path)).toEqual(["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"]);
+    expect(screen.queryByText(LOADING_DIFF)).toBeNull();
+    expect(screen.queryByText("Git is busy; try again")).toBeNull();
+  });
+
+  it("a pull clears the queue: the new listing's diffs go in order, none from before", async () => {
+    const rig = await open();
+    const answered = new Set<number>();
+    await openFive(rig, answered);
+    await pull();
+    await answer(rig, FIVE);
+    const before = out(rig, answered);
+    expect(before.map((d) => d.path)).toEqual(["a.ts", "b.ts"]);
+    await pull();
+    await answer(rig, FIVE);
+    // The two from before the pull are still out on the Mac: nothing more goes until they end.
+    expect(out(rig, answered)).toHaveLength(2);
+    for (const sent of before) await answerOne(rig, sent, answered);
+    expect(out(rig, answered).map((d) => d.path)).toEqual(["a.ts", "b.ts"]);
+    await answerAll(rig, answered);
+    expect(requests(rig, "diff").slice(7).map((d) => d.path)).toEqual(["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"]);
+  });
+
+  it("asks again for a diff the Mac was too busy for, at most three times, then shows its words", async () => {
+    const rig = await open();
+    await answer(rig);
+    await tap("src/app.ts");
+    for (let tries = 1; tries <= 3; tries++) {
+      await refuse(rig, "diff", "Git is busy; try again", "busy");
+      expect(screen.queryByText("Git is busy; try again")).toBeNull();
+      expect(screen.getByText(LOADING_DIFF)).toBeTruthy();
+      await act(async () => void jest.advanceTimersByTime(1_000));
+      expect(requests(rig, "diff")).toHaveLength(tries + 1);
+    }
+    await refuse(rig, "diff", "Git is busy; try again", "busy");
+    await act(async () => void jest.advanceTimersByTime(5_000));
+    expect(requests(rig, "diff")).toHaveLength(4);
+    expect(screen.getByText("Git is busy; try again")).toBeTruthy();
+  });
+
+  it("a busy diff asked again comes in", async () => {
+    const rig = await open();
+    await answer(rig);
+    await tap("src/app.ts");
+    await refuse(rig, "diff", "Git is busy; try again", "busy");
+    await act(async () => void jest.advanceTimersByTime(1_000));
+    expect(requests(rig, "diff")).toHaveLength(2);
+    await answerDiff(rig, DIFF);
+    expect(screen.getAllByTestId("diff-line")).toHaveLength(4);
+  });
+});
+
+describe("the list's keys", () => {
+  it("keep a file whose path looks like another's diff line apart from that line", async () => {
+    const rig = await open();
+    await answer(rig, [file("a"), file("a\n0"), file("a\nloading")]);
+    await tap("a");
+    await answerDiff(rig, "@@ -1 +1 @@\n+x\n");
+    expect(screen.getAllByTestId("diff-line")).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: /^a/ })).toHaveLength(3);
   });
 });
 

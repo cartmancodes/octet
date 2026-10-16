@@ -2,13 +2,15 @@
 // session's first prompt, Face ID always, one at a time, a refusal kept in the sheet) and the PR
 // sheet, which only says what to run at the Mac and sends nothing.
 import { measureParentSize } from "@shopify/flash-list/dist/recyclerview/utils/measureLayout";
-import { act, fireEvent, screen, within } from "@testing-library/react-native";
+import { act, fireEvent, render, screen, within } from "@testing-library/react-native";
 import * as LocalAuthentication from "expo-local-authentication";
 import { router } from "expo-router";
+import { Profiler } from "react";
 import { StyleSheet } from "react-native";
 
 import Changes from "../app/changes";
 import { REQUEST_TIMEOUT_MS, type BatchItem } from "./client/HubClient";
+import { CommitSheet } from "./components/CommitSheet";
 import { LOST } from "./components/send";
 import { saveSettings } from "./persist";
 import type { FileChange, JournalEvent, SessionInfo } from "./protocol";
@@ -35,7 +37,7 @@ const tones = (role: keyof Theme) => [dark[role], light[role]];
 type Look = { color?: unknown; backgroundColor?: unknown; borderColor?: unknown; fontWeight?: unknown; fontFamily?: unknown; minHeight?: number; minWidth?: number };
 const look = (node: { props: { style?: unknown } }) => StyleSheet.flatten(node.props.style as never) as Look;
 
-const file = (path: string, add = 3, del = 1): FileChange => ({ path, add, del, binary: false, status: "M" });
+const file = (path: string, add = 3, del = 1, status: FileChange["status"] = "M"): FileChange => ({ path, add, del, binary: false, status });
 const FILES = [file("src/app.ts"), file("README.md", 20, 0)];
 
 async function open(list: SessionInfo[] = [A()]) {
@@ -230,6 +232,49 @@ describe("the commit sheet", () => {
     expect(sheet().getByText("pre-commit: lint failed in src/app.ts")).toBeTruthy();
     expect(sheet().queryByText("Finish or cancel the current turn first")).toBeNull();
     expect(field().props.value).toBe("Fix it");
+  });
+
+  it("keeps a hook's last words, up to 2,000 characters, where the summary is", async () => {
+    const rig = await open();
+    await openSheet(rig);
+    await fireEvent.changeText(field(), "Fix it");
+    await press(confirm());
+    // The hub sends the end of what git said, marked as cut at its start.
+    const words = `…${"lint: src/file.ts ok\n".repeat(90)}lint: 3 errors in src/app.ts`;
+    expect(words.length).toBeLessThanOrEqual(2_000);
+    expect(words.length).toBeGreaterThan(1_000);
+    await refuse(rig, words, "not_allowed");
+    expect(sheet().getByText(words)).toBeTruthy();
+  });
+
+  it("says what it commits, from the last listing: the files, and how many are new", async () => {
+    const rig = await open();
+    await answer(rig, { files: [file("src/app.ts"), file("new.ts", 1, 0, "?"), file("notes.md", 2, 0, "?")] });
+    await press(commitButton());
+    expect(sheet().getByText("Commits 3 files, including 2 new")).toBeTruthy();
+    await press(sheet().getByRole("button", { name: "Cancel" }));
+    await act(async () => screen.getByTestId("changes-list").props.refreshControl.props.onRefresh());
+    await answer(rig, { files: FILES, more: 7 });
+    await press(commitButton());
+    expect(sheet().getByText("Commits about 9 files")).toBeTruthy();
+  });
+
+  it("draws nothing again while the session streams", async () => {
+    await feed(user("Fix the login bug"));
+    let commits = 0;
+    const none = () => undefined;
+    await render(
+      <Profiler id="sheet" onRender={() => void (commits += 1)}>
+        <CommitSheet session={SESSION} scope={null} blocked={false} onCommitted={none} onLost={none} onClose={none} />
+      </Profiler>,
+    );
+    expect(screen.getByLabelText("Commit message").props.value).toBe("Fix the login bug");
+    commits = 0;
+    for (let n = 0; n < 5; n++) {
+      await act(async () => void octetStore.getState().applyBatch([{ v: 1, ...ev({ type: "text", data: ` word ${n}` }) }] as BatchItem[]));
+    }
+    expect(octetStore.getState().bySession.get(SESSION)?.transcript.entries.length).toBeGreaterThan(1);
+    expect(commits).toBe(0);
   });
 
   it("sends one commit for a double tap, and none while one is out", async () => {

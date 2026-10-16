@@ -6,7 +6,7 @@ import { KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, Tex
 
 import { confirmBiometric } from "../auth";
 import { COMMIT_CHARS, COMMIT_REASON, PR_COMMAND, PR_INTRO, firstPrompt } from "../changes";
-import { useEntries } from "../store";
+import { entriesNow, octetStore } from "../store";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
 import { Button } from "../ui";
 import { Refusal } from "../client/HubClient";
@@ -62,6 +62,9 @@ const KEYBOARD = Platform.OS === "ios" ? "padding" : undefined;
 
 interface CommitSheetProps {
   session: string;
+  /** What the commit takes, from the screen's last listing ("Commits 3 files, including 1 new"),
+   * or null with none in. */
+  scope: string | null;
   /** The Mac can't be reached, or an approval waits: Commit is off, and a commit whose Face ID
    * check ends meanwhile is not sent. */
   blocked: boolean;
@@ -78,15 +81,16 @@ interface CommitSheetProps {
 /**
  * The commit message, prefilled with the session's first prompt as one line, and Commit: Face ID
  * every time, whatever the Face ID to allow setting (a commit changes the repository), then one
- * `commit`. One at a time: a second tap while Face ID is up or the commit is out does nothing, and
+ * `commit`, of everything in the workspace, untracked files too, as the line under the heading
+ * says. One at a time: a second tap while Face ID is up or the commit is out does nothing, and
  * the sheet stays until the commit's answer is in, so it is seen and no second sheet can send
  * another. A refusal is shown in the hub's words, and the message stays.
  */
-export const CommitSheet = memo(function CommitSheet({ session, blocked, onCommitted, onLost, onClose }: CommitSheetProps) {
+export const CommitSheet = memo(function CommitSheet({ session, scope, blocked, onCommitted, onLost, onClose }: CommitSheetProps) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
-  const entries = useEntries(session);
-  const [message, setMessage] = useState(() => firstPrompt(entries));
+  // Read once, as the sheet opens: the session's stream never draws the sheet again.
+  const [message, setMessage] = useState(() => firstPrompt(entriesNow(octetStore, session)));
   const send = useSend();
   const alive = useAlive();
   // "checking": the Face ID prompt is up. "sending": the commit is out, waiting for its ack.
@@ -144,6 +148,7 @@ export const CommitSheet = memo(function CommitSheet({ session, blocked, onCommi
           <Text accessibilityRole="header" style={s.heading}>
             Commit
           </Text>
+          {scope !== null ? <Text style={s.text}>{scope}</Text> : null}
           <TextInput
             accessibilityLabel="Commit message"
             multiline

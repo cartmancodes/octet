@@ -206,6 +206,21 @@ describe("requests", () => {
     expect(pairRefusal.message.length).toBe(512);
   });
 
+  it("a commit's refusal keeps up to 2,000 characters: a hook's words, as the hub clipped them", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "commit", session: "s", message: "Fix it" });
+    const words = `…${"x".repeat(1_990)}FAILED`;
+    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("commit")[0]?.req, code: "not_allowed", reason: words + "!".repeat(5_000) });
+    const refusal = (await pending.catch((e: unknown) => e)) as Refusal;
+    expect(refusal.message.length).toBe(2_000);
+    expect(refusal.message.startsWith(`…${"x".repeat(1_990)}FAI`)).toBe(true);
+    // Any other command's refusal is still a short one.
+    const other = r.client.request({ type: "diff", session: "s", path: "a" });
+    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("diff")[0]?.req, code: "unavailable", reason: words });
+    expect(((await other.catch((e: unknown) => e)) as Refusal).message.length).toBe(512);
+  });
+
   it("a recent frame answers its request", async () => {
     const r = rig();
     ready(r);

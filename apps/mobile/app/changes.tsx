@@ -1,6 +1,6 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
 import { useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -10,10 +10,12 @@ import {
   NO_TESTS,
   branchLines,
   changeSummary,
+  commitScope,
   committedText,
   diffLines,
   lastChecks,
   matchFile,
+  rowKey,
   type DiffLine,
 } from "../src/changes";
 import type { ChangesAnswer, ListedFile } from "../src/client/answers";
@@ -41,25 +43,40 @@ export const LOADING = "Loading changes…";
 export const LOADING_DIFF = "Loading the diff…";
 export const NO_CHANGES = "Nothing changed since the last commit";
 const WRONG: Failure = { text: "Something went wrong. Try again.", retry: true };
+/** Diffs out at once, at most: the hub runs two git calls at a time and refuses a third as busy. */
+export const DIFFS_AT_ONCE = 2;
+/** A diff the Mac was too busy for is asked for again at most this many times, after this pause. */
+export const BUSY_RETRIES = 3;
+export const BUSY_RETRY_MS = 500;
 
 /** What a diff was of: the listed file's lines and status when it was asked for. */
 type Stamp = Pick<FileChange, "add" | "del" | "status">;
 const sameStamp = (a: Stamp, b: Stamp | undefined): boolean =>
   b !== undefined && a.add === b.add && a.del === b.del && a.status === b.status;
 
-/** A file's diff, by its raw path, kept for the screen's life: a pull forgets them all, and any
- * other reload the ones of files that changed since. `truncated`: lines past what is drawn. */
+/** A file's diff, by its raw path. A pull forgets them all; any other reload forgets those of
+ * closed files and of files whose lines or status changed, and asks again for every open file's,
+ * showing the one kept meanwhile (the same counts can hide a new edit). `truncated`: lines past
+ * what is drawn. */
 type Diff =
   | { state: "loading" }
   | { state: "ready"; of: Stamp; lines: DiffLine[]; clipped: boolean; truncated: boolean; binary: boolean }
   | { state: "failed"; text: string };
 
 /** One row of the list: a file, a line of an open file's diff, or a note under an open file.
- * Keys are the raw path's: two raw paths can clean to the same text. */
+ * Keys are `rowKey`s of the raw path: two raw paths can clean to the same text. */
 type Item =
   | { kind: "file"; key: string; file: ListedFile; open: boolean }
   | { kind: "line"; key: string; line: DiffLine }
   | { kind: "note"; key: string; text: string; words: boolean };
+
+/** A diff waiting for its turn: the raw path, how often the Mac was too busy for it, and the
+ * listing (`loadId`) it was asked under. */
+interface Ask {
+  raw: string;
+  tries: number;
+  under: number;
+}
 
 interface Listing {
   /** `loading` until the first answer; `norepo` when the workspace is not in a repository. */
@@ -86,8 +103,10 @@ const isDiff = (x: unknown): x is DiffFrame => typeof x === "object" && x !== nu
  *
  * The hub lets a phone ask for a diff only of a path its last `changes` answer on this connection
  * listed, exactly as listed, so the screen asks for the listing whenever the connection is (again)
- * ready, asks for diffs only once it is in, and asks by the raw path the client kept. Everything
- * the hub sent is drawn cleaned, as plain text; the raw path never is.
+ * ready, asks for diffs only once it is in, and asks by the raw path the client kept. Diffs are
+ * asked for at most two at a time, in order, as the hub runs only two git calls at once; one the
+ * hub was too busy for anyway is asked for again, at most three times. Everything the hub sent is
+ * drawn cleaned, as plain text; the raw path never is.
  *
  * Under the list, Commit opens the commit sheet (Face ID every time, then `commit` of everything
  * in the workspace; off while the Mac can't be reached or an approval waits), and "Open PR on the
@@ -157,41 +176,94 @@ export default function Changes() {
   /** The newest listing's branch, for the commit toast; null when HEAD is detached. */
   const branchNow = useRef<string | null>(null);
 
-  /** Asks for the diff of the listed file whose raw path is `raw`, by that path. */
-  const askDiff = useCallback(
-    (raw: string) => {
-      const under = loadId.current;
+  /** Diffs waiting for room, oldest first; how many are out; and the pauses before a busy one
+   * is asked for again. Any load clears the queue and the pauses: it asks again for what it needs. */
+  const queue = useRef<Ask[]>([]);
+  const inFlight = useRef(0);
+  const pauses = useRef(new Set<ReturnType<typeof setTimeout>>());
+  const pump = useRef<() => void>(() => undefined);
+  const forgetQueue = useCallback(() => {
+    queue.current = [];
+    for (const pause of pauses.current) clearTimeout(pause);
+    pauses.current.clear();
+  }, []);
+  useEffect(() => forgetQueue, [forgetQueue]);
+
+  /** Sends one diff request, by the raw path. An answer to a request from before the newest load
+   * is dropped. Busy is asked again after a pause, up to `BUSY_RETRIES` times, then shown. */
+  const sendDiff = useCallback(
+    (ask: Ask) => {
+      const { raw, under } = ask;
       const of = listed.current.get(raw);
       if (of === undefined) return;
       const stamp: Stamp = { add: of.add, del: of.del, status: of.status };
-      setDiff(raw, { state: "loading" });
+      inFlight.current += 1;
+      const settle = (then: () => void) => {
+        inFlight.current -= 1;
+        if (alive() && loadId.current === under) then();
+        pump.current();
+      };
       send({ type: "diff", session: id, path: raw }).then(
-        (frame) => {
-          if (!alive() || loadId.current !== under) return;
-          if (!isDiff(frame)) {
-            setDiff(raw, { state: "failed", text: WRONG.text });
-            return;
-          }
-          const { lines, truncated } = diffLines(frame.text);
-          setDiff(raw, { state: "ready", of: stamp, lines, clipped: frame.clipped, truncated, binary: frame.binary });
-        },
-        (error: unknown) => {
-          if (!alive() || loadId.current !== under) return;
-          setDiff(raw, { state: "failed", text: failure(error).text });
-        },
+        (frame) =>
+          settle(() => {
+            if (!isDiff(frame)) {
+              setDiff(raw, { state: "failed", text: WRONG.text });
+              return;
+            }
+            const { lines, truncated } = diffLines(frame.text);
+            setDiff(raw, { state: "ready", of: stamp, lines, clipped: frame.clipped, truncated, binary: frame.binary });
+          }),
+        (error: unknown) =>
+          settle(() => {
+            if (error instanceof Refusal && error.code === "busy" && ask.tries < BUSY_RETRIES) {
+              const pause = setTimeout(() => {
+                pauses.current.delete(pause);
+                if (!alive() || loadId.current !== under) return;
+                queue.current.unshift({ ...ask, tries: ask.tries + 1 });
+                pump.current();
+              }, BUSY_RETRY_MS);
+              pauses.current.add(pause);
+              return;
+            }
+            setDiff(raw, { state: "failed", text: failure(error).text });
+          }),
       );
     },
     [send, id, alive, setDiff],
   );
+  // Sends what waits while there is room; one asked under an older listing is dropped.
+  useLayoutEffect(() => {
+    pump.current = () => {
+      while (inFlight.current < DIFFS_AT_ONCE) {
+        const next = queue.current.shift();
+        if (next === undefined) return;
+        if (next.under === loadId.current) sendDiff(next);
+      }
+    };
+  }, [sendDiff]);
+
+  /** Asks for the diff of the listed file whose raw path is `raw`, by that path, once there is
+   * room. A diff kept of it stays drawn until the new one is in. */
+  const askDiff = useCallback(
+    (raw: string) => {
+      const under = loadId.current;
+      if (!listed.current.has(raw) || queue.current.some((a) => a.raw === raw && a.under === under)) return;
+      if (diffsRef.current.get(raw)?.state !== "ready") setDiff(raw, { state: "loading" });
+      queue.current.push({ raw, tries: 0, under });
+      pump.current();
+    },
+    [setDiff],
+  );
 
   // Asks the Mac for the listing. Reading is safe to repeat, so a failure offers Try again. A
-  // pull forgets every diff; any reload forgets the ones not in, which are asked for again (the
-  // open ones) once the listing is.
+  // pull forgets every diff; any other reload keeps only the open files' that are in, to show
+  // until they are asked for again. Every open file's is asked for again once the listing is in.
   const load = useCallback(
     (pull: boolean) => {
       const mine = ++loadId.current;
       fresh.current = false;
-      keepDiffs((d) => !pull && d.state === "ready");
+      forgetQueue();
+      keepDiffs((d, raw) => !pull && d.state === "ready" && expandedRef.current.has(raw));
       setListing((l) => ({ ...l, pulling: pull && l.state === "ready", failed: null }));
       send({ type: "changes", session: id }).then(
         (frame) => {
@@ -215,7 +287,7 @@ export default function Changes() {
           fresh.current = true;
           setExpanded(open);
           setListing({ state: "ready", frame, pulling: false, failed: null });
-          for (const raw of open) if (diffsRef.current.get(raw)?.state !== "ready") askDiff(raw);
+          for (const raw of open) askDiff(raw);
         },
         (error: unknown) => {
           if (!alive() || loadId.current !== mine) return;
@@ -227,7 +299,7 @@ export default function Changes() {
         },
       );
     },
-    [send, id, alive, file, askDiff, keepDiffs, setExpanded],
+    [send, id, alive, file, askDiff, keepDiffs, setExpanded, forgetQueue],
   );
   // On open, and again whenever the connection comes back: the hub forgot the listing with the
   // old connection, and the workspace may have changed meanwhile.
@@ -295,18 +367,19 @@ export default function Changes() {
   const items = useMemo(() => {
     const out: Item[] = [];
     for (const f of files) {
-      const key = f.raw;
-      const open = expanded.has(f.raw);
-      out.push({ kind: "file", key, file: f, open });
+      const raw = f.raw;
+      const open = expanded.has(raw);
+      out.push({ kind: "file", key: rowKey(raw), file: f, open });
       if (!open) continue;
-      const diff = diffs.get(f.raw);
-      if (diff === undefined && stuck) out.push({ kind: "note", key: `${key}\nask`, text: ASK_AGAIN, words: false });
-      else if (diff === undefined || diff.state === "loading") out.push({ kind: "note", key: `${key}\nloading`, text: LOADING_DIFF, words: false });
-      else if (diff.state === "failed") out.push({ kind: "note", key: `${key}\nfailed`, text: diff.text, words: true });
-      else if (diff.binary) out.push({ kind: "note", key: `${key}\nbinary`, text: BINARY_NOTE, words: false });
+      const diff = diffs.get(raw);
+      const note = (what: string, text: string, words = false) => out.push({ kind: "note", key: rowKey(raw, what), text, words });
+      if (diff === undefined && stuck) note("ask", ASK_AGAIN);
+      else if (diff === undefined || diff.state === "loading") note("loading", LOADING_DIFF);
+      else if (diff.state === "failed") note("failed", diff.text, true);
+      else if (diff.binary) note("binary", BINARY_NOTE);
       else {
-        diff.lines.forEach((line, n) => out.push({ kind: "line", key: `${key}\n${n}`, line }));
-        if (diff.clipped || diff.truncated) out.push({ kind: "note", key: `${key}\nclipped`, text: CLIPPED_NOTE, words: false });
+        diff.lines.forEach((line, n) => out.push({ kind: "line", key: rowKey(raw, n), line }));
+        if (diff.clipped || diff.truncated) note("clipped", CLIPPED_NOTE);
       }
     }
     return out;
@@ -378,6 +451,7 @@ export default function Changes() {
   );
 
   const branch = listing.frame ? branchLines(listing.frame, files.length + more) : null;
+  const scope = useMemo(() => (listing.frame ? commitScope(files, more) : null), [listing.frame, files, more]);
   const branchName = branch?.name ?? null;
   const branchDetail = branch?.detail ?? "";
   const footer = useMemo(
@@ -459,7 +533,7 @@ export default function Changes() {
           </Pressable>
         </View>
       </View>
-      {sheet === "commit" ? <CommitSheet session={id} blocked={offline || waiting} onCommitted={committed} onLost={relist} onClose={closeSheet} /> : null}
+      {sheet === "commit" ? <CommitSheet session={id} scope={scope} blocked={offline || waiting} onCommitted={committed} onLost={relist} onClose={closeSheet} /> : null}
       {sheet === "pr" ? <PrSheet onClose={closeSheet} /> : null}
     </View>
   );

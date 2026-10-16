@@ -29,6 +29,23 @@ export function changeSummary(files: readonly FileChange[], more: number): strin
   return `${n === 1 ? "1 file" : `${n} files`} · +${add} −${del}`;
 }
 
+/** What the commit sheet says a commit takes, from the last listing: "Commits N files", with
+ * ", including M new" when M of them are untracked (`add -A` takes those too), and "about N" when
+ * the Mac had more than it listed. Null with nothing listed. */
+export function commitScope(files: readonly FileChange[], more: number): string | null {
+  const n = files.length + more;
+  if (n === 0) return null;
+  const fresh = files.filter((f) => f.status === "?").length;
+  const count = `${more > 0 ? "about " : ""}${n === 1 ? "1 file" : `${n} files`}`;
+  return fresh > 0 ? `Commits ${count}, including ${fresh} new` : `Commits ${count}`;
+}
+
+/** A row's key in the Changes list: a file's raw path and what the row is of it, JSON-encoded, so
+ * that no path, whatever it holds, makes one key of two rows. */
+export function rowKey(raw: string, ...part: (string | number)[]): string {
+  return JSON.stringify([raw, ...part]);
+}
+
 /** What a status letter means, for a screen reader. */
 export const STATUS_WORDS: Record<FileStatus, string> = {
   M: "modified",

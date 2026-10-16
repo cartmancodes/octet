@@ -559,14 +559,18 @@ What the phone can do with git, and nothing more:
 
 - **Read** the list of changed files (at most 500, then "N more files on the
   Mac") and the diff of a listed file (at most 64 KiB or 2,000 lines; the
-  rest stays on the Mac).
+  rest stays on the Mac). The screen asks for at most two diffs at a time,
+  as the hub runs two git calls at once, and asks again, up to three times,
+  for one the Mac was too busy for.
 - **Commit everything** in the workspace with a message you write (at most
   2,000 characters). The message starts as the session's first prompt, on one
   line of at most 72 characters. **Commit** asks for Face ID every time,
   whatever the **Face ID to allow** setting says. The Mac runs `git add -A`
   and `git commit -F -` with the message on standard input, limited to the
-  workspace's own files. A toast names the new commit's short hash and the
-  branch.
+  workspace's own files, untracked ones too: the sheet says how many files
+  that is from the last listing ("Commits 3 files, including 1 new", or
+  "about" when the Mac had more than it listed). A toast names the new
+  commit's short hash and the branch.
 
 The phone can't push, open a pull request, amend, choose which files to
 commit, or run any other git command. **Open PR on the desk** only shows
