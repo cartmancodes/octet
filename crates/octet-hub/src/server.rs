@@ -55,9 +55,9 @@ use futures_util::{SinkExt, StreamExt};
 use octet_core::PROMPT_LIMIT;
 use octet_core::remote::{
     protocol::{
-        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, ack, catalog_frame,
-        event_frame, full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of,
-        sessions_frame, state_frame, subscribed_frame, welcome,
+        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, Secret, ack,
+        catalog_frame, event_frame, full_access_confirmed, paired, parse_phone, recent_frame,
+        refused, req_of, sessions_frame, state_frame, subscribed_frame, welcome,
     },
     run::run_dir,
 };
@@ -174,6 +174,8 @@ const JOB_TIMED_OUT: &str = "That took too long; try again";
 const PUSH_NOT_SAVED: &str = "Could not save the notification setting; try again";
 /// Refuses a Live Activity registration the store could not save.
 const ACTIVITY_NOT_SAVED: &str = "Could not save the Live Activity; try again";
+/// Refuses a `clear_activity` the store could not write.
+const ACTIVITY_NOT_CLEARED: &str = "Could not update the Live Activity; try again";
 /// Reports of dead push tokens waiting for the hub loop.
 const PUSH_QUEUE: usize = 16;
 /// How long a scan or a start may take in all.
@@ -1072,28 +1074,39 @@ impl Hub {
     /// then answers `req`. Neither a token nor the device's hash reaches the audit line or a log.
     async fn activity(&mut self, conn: u64, device: &Device, req: u64, command: PhoneCommand) {
         let hash = &device.token_sha256;
-        let (saved, message, what) =
+        let exposed = |token: Option<Secret>| token.map(|token| token.expose().to_owned());
+        let (saved, message, what, failed) =
             if let PhoneCommand::RegisterActivity { token, start_token } = command {
                 let activity = ActivityTokens {
-                    token: token.expose().to_owned(),
-                    start_token: start_token.map(|token| token.expose().to_owned()),
+                    token: exposed(token),
+                    start_token: exposed(start_token),
                 };
                 let saved = self.store.set_activity(hash, activity).await;
-                (saved, "Activity registered", "activity registered")
+                (
+                    saved,
+                    "Activity registered",
+                    "activity registered",
+                    ACTIVITY_NOT_SAVED,
+                )
             } else {
                 let saved = self.store.drop_activity(hash).await;
-                (saved, "Activity cleared", "activity cleared")
+                (
+                    saved,
+                    "Activity cleared",
+                    "activity cleared",
+                    ACTIVITY_NOT_CLEARED,
+                )
             };
         match saved {
             Ok(true) => {}
             Ok(false) => {
-                self.refuse(conn, req, Code::Unavailable, ACTIVITY_NOT_SAVED);
+                self.refuse(conn, req, Code::Unavailable, failed);
                 return;
             }
             Err(error) => {
                 // The error names a kind, never a token or the device's hash.
                 eprintln!("Couldn't save a phone's Live Activity: {}", error.kind());
-                self.refuse(conn, req, Code::Unavailable, ACTIVITY_NOT_SAVED);
+                self.refuse(conn, req, Code::Unavailable, failed);
                 return;
             }
         }

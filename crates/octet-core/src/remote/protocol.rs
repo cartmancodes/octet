@@ -594,11 +594,12 @@ pub static MESSAGES: &[Message] = &[
     message(
         "register_activity",
         FromPhone,
-        &[req("token", Str), opt("start_token", Str)],
-        "Set the ActivityKit tokens the hub's Live Activity pushes go to: `token`, the running \
-         activity's push token, and `start_token`, the push-to-start token, each 1 to 200 \
-         lowercase hex digits. Each registration replaces both: one without `start_token` \
-         clears the start token the hub had.",
+        &[opt("token", Str), opt("start_token", Str)],
+        "Say the ActivityKit tokens the phone has now, for the hub's Live Activity pushes: \
+         `token`, the running activity's push token, and `start_token`, the push-to-start \
+         token, each 1 to 200 lowercase hex digits. Either may be left out, as the phone has \
+         none, but not both. Each registration replaces both: a token left out is one the hub \
+         no longer has.",
     ),
     message(
         "clear_activity",
@@ -1070,11 +1071,11 @@ pub enum PhoneCommand {
         /// What to push; `None` keeps what the hub has.
         kinds: Option<PushKinds>,
     },
-    /// Set the `ActivityKit` tokens Live Activity pushes go to, replacing both.
+    /// Say the `ActivityKit` tokens the phone has now, replacing both; at least one is there.
     RegisterActivity {
-        /// The checked push token of the running activity.
-        token: Secret,
-        /// The checked push-to-start token; `None` clears the one the hub had.
+        /// The checked push token of the running activity; `None` when none runs.
+        token: Option<Secret>,
+        /// The checked push-to-start token; `None` when the phone has none.
         start_token: Option<Secret>,
     },
     /// Forget the `ActivityKit` tokens the hub had for this device.
@@ -1435,7 +1436,7 @@ pub fn is_activity_token(token: &str) -> bool {
 }
 
 /// The `ActivityKit` token `key` of a `register_activity`, checked; `None` when it is left out or
-/// null (the schema has already refused a missing `token`). A refusal never echoes the text.
+/// null. A refusal never echoes the text.
 fn activity_token(map: &Map<String, Value>, key: &str) -> Result<Option<Secret>, String> {
     match map.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -1522,9 +1523,12 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
                     turns: flag(k, "turns"),
                 }),
         },
-        "register_activity" => PhoneCommand::RegisterActivity {
-            token: activity_token(m, "token")?.ok_or("Missing token")?,
-            start_token: activity_token(m, "start_token")?,
+        "register_activity" => match (
+            activity_token(m, "token")?,
+            activity_token(m, "start_token")?,
+        ) {
+            (None, None) => return Err("register_activity needs token or start_token".into()),
+            (token, start_token) => PhoneCommand::RegisterActivity { token, start_token },
         },
         "clear_activity" => PhoneCommand::ClearActivity,
         "ping" => PhoneCommand::Ping,
@@ -2737,21 +2741,37 @@ mod tests {
     #[test]
     fn register_activity_takes_lowercase_hex_tokens_and_refuses_anything_else() {
         let long = "a".repeat(200);
-        let accepted = [
+        // Either token may be left out (or null), as long as one is there.
+        let accepted: [(String, Option<&str>, Option<&str>); 7] = [
             (
                 r#""token":"0123456789abcdef""#.to_owned(),
-                "0123456789abcdef",
+                Some("0123456789abcdef"),
                 None,
             ),
             (
                 r#""token":"ab","start_token":"cd""#.to_owned(),
-                "ab",
+                Some("ab"),
                 Some("cd"),
             ),
-            (r#""token":"7","start_token":null"#.to_owned(), "7", None),
+            (
+                r#""token":"7","start_token":null"#.to_owned(),
+                Some("7"),
+                None,
+            ),
+            (r#""start_token":"cd""#.to_owned(), None, Some("cd")),
+            (
+                r#""token":null,"start_token":"cd""#.to_owned(),
+                None,
+                Some("cd"),
+            ),
+            (
+                r#""token":"ab","start_token":"ab""#.to_owned(),
+                Some("ab"),
+                Some("ab"),
+            ),
             (
                 format!(r#""token":"{long}","start_token":"{long}""#),
-                long.as_str(),
+                Some(long.as_str()),
                 Some(long.as_str()),
             ),
         ];
@@ -2766,14 +2786,15 @@ mod tests {
             else {
                 panic!("a registration of {text}")
             };
-            assert_eq!(kept.expose(), *token);
+            assert_eq!(kept.as_ref().map(Secret::expose), *token);
             assert_eq!(kept_start.as_ref().map(Secret::expose), *start);
         }
         let too_long = "a".repeat(201);
         let refused = [
             String::new(),
-            r#","start_token":"abc""#.to_owned(),
             r#","token":null"#.to_owned(),
+            r#","start_token":null"#.to_owned(),
+            r#","token":null,"start_token":null"#.to_owned(),
             r#","token":"""#.to_owned(),
             r#","token":"ABC""#.to_owned(),
             r#","token":"abC""#.to_owned(),
@@ -2783,13 +2804,16 @@ mod tests {
             r#","token":"0xabc""#.to_owned(),
             r#","token":7"#.to_owned(),
             format!(r#","token":"{too_long}""#),
+            r#","start_token":"""#.to_owned(),
+            r#","start_token":"ABC""#.to_owned(),
+            r#","start_token":"xyz""#.to_owned(),
+            r#","start_token":7"#.to_owned(),
+            format!(r#","start_token":"{too_long}""#),
             r#","token":"abc","start_token":"""#.to_owned(),
             r#","token":"abc","start_token":"ABC""#.to_owned(),
-            r#","token":"abc","start_token":"xyz""#.to_owned(),
-            r#","token":"abc","start_token":7"#.to_owned(),
-            format!(r#","token":"abc","start_token":"{too_long}""#),
+            r#","token":"ABC","start_token":"abc""#.to_owned(),
             r#","token":"abc","extra":1"#.to_owned(),
-            r#","token":"abc","kinds":null"#.to_owned(),
+            r#","start_token":"abc","kinds":null"#.to_owned(),
         ];
         for fields in &refused {
             let text = format!(r#"{{"v":1,"req":6,"type":"register_activity"{fields}}}"#);
@@ -2837,7 +2861,7 @@ mod tests {
     }
 
     #[test]
-    fn register_activity_has_a_required_token_and_an_optional_start_token_in_the_typescript() {
+    fn register_activity_has_two_optional_tokens_in_the_typescript() {
         let ts = typescript();
         let interface = ts
             .split("export interface RegisterActivityCommand {")
@@ -2848,7 +2872,10 @@ mod tests {
             interface.contains("  type: \"register_activity\";"),
             "{interface}"
         );
-        assert!(interface.contains("  token: string;"), "{interface}");
+        assert!(
+            interface.contains("  token?: string | null;"),
+            "{interface}"
+        );
         assert!(
             interface.contains("  start_token?: string | null;"),
             "{interface}"

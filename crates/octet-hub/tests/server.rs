@@ -1264,8 +1264,11 @@ async fn push_commands_before_hello_are_refused_as_unpaired() {
 const ACTIVITY: &str = "5ec7e7aaaa0123456789abcdef";
 const START: &str = "5ec7e7bbbb0123456789abcdef";
 
-fn register_activity(req: u64, token: &str, start_token: Option<&str>) -> Value {
-    let mut message = json!({"v": 1, "req": req, "type": "register_activity", "token": token});
+fn register_activity(req: u64, token: Option<&str>, start_token: Option<&str>) -> Value {
+    let mut message = json!({"v": 1, "req": req, "type": "register_activity"});
+    if let Some(token) = token {
+        message["token"] = json!(token);
+    }
     if let Some(start_token) = start_token {
         message["start_token"] = json!(start_token);
     }
@@ -1273,7 +1276,7 @@ fn register_activity(req: u64, token: &str, start_token: Option<&str>) -> Value 
 }
 
 /// Each device's stored activity tokens, by name, as a fresh store reads them.
-async fn stored_activity(env: &Env) -> Vec<(String, Option<(String, Option<String>)>)> {
+async fn stored_activity(env: &Env) -> Vec<(String, Option<(Option<String>, Option<String>)>)> {
     Store::open(&env.root)
         .await
         .expect("the store")
@@ -1297,7 +1300,11 @@ async fn register_activity_is_stored_acked_audited_and_dropped_on_revoke() {
     let (mut phone, _) = env.phone("Test phone").await;
     let (_other, _) = env.phone("Other phone").await;
 
-    send(&mut phone, register_activity(7, ACTIVITY, Some(START))).await;
+    send(
+        &mut phone,
+        register_activity(7, Some(ACTIVITY), Some(START)),
+    )
+    .await;
     assert_eq!(
         recv_kind(&mut phone, "ack").await,
         ack(7, "Activity registered")
@@ -1307,7 +1314,7 @@ async fn register_activity_is_stored_acked_audited_and_dropped_on_revoke() {
         [
             (
                 "Test phone".to_owned(),
-                Some((ACTIVITY.to_owned(), Some(START.to_owned())))
+                Some((Some(ACTIVITY.to_owned()), Some(START.to_owned())))
             ),
             ("Other phone".to_owned(), None),
         ]
@@ -1315,17 +1322,34 @@ async fn register_activity_is_stored_acked_audited_and_dropped_on_revoke() {
 
     // A later registration replaces both; leaving out the start token clears it.
     let newer = "0123456789abcdef5ec7e7cccc";
-    send(&mut phone, register_activity(8, newer, None)).await;
+    send(&mut phone, register_activity(8, Some(newer), None)).await;
     assert_eq!(
         recv_kind(&mut phone, "ack").await,
         ack(8, "Activity registered")
     );
     assert_eq!(
         stored_activity(&env).await[0],
-        ("Test phone".to_owned(), Some((newer.to_owned(), None)))
+        (
+            "Test phone".to_owned(),
+            Some((Some(newer.to_owned()), None))
+        )
     );
     let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
     assert!(!text.contains(ACTIVITY) && !text.contains(START), "{text}");
+
+    // With no activity running, the phone has only a push-to-start token, and says so.
+    send(&mut phone, register_activity(9, None, Some(START))).await;
+    assert_eq!(
+        recv_kind(&mut phone, "ack").await,
+        ack(9, "Activity registered")
+    );
+    assert_eq!(
+        stored_activity(&env).await[0],
+        (
+            "Test phone".to_owned(),
+            Some((None, Some(START.to_owned())))
+        )
+    );
 
     // The audit names the device and the action, never a token.
     let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
@@ -1337,7 +1361,7 @@ async fn register_activity_is_stored_acked_audited_and_dropped_on_revoke() {
         .iter()
         .filter(|l| l["what"] == "activity registered")
         .collect();
-    assert_eq!(registered.len(), 2, "{audit}");
+    assert_eq!(registered.len(), 3, "{audit}");
     assert!(
         registered
             .iter()
@@ -1354,7 +1378,7 @@ async fn register_activity_is_stored_acked_audited_and_dropped_on_revoke() {
     assert!(cli.revoke("Test phone").await);
     let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
     assert!(
-        !text.contains(newer) && !text.contains("\"activity\""),
+        !text.contains(START) && !text.contains("\"activity\""),
         "{text}"
     );
     assert_eq!(
@@ -1369,15 +1393,16 @@ async fn bad_activity_tokens_are_refused_as_invalid_and_the_connection_goes_on()
     env.start().await;
     let (mut phone, _) = env.phone("Test phone").await;
     let too_long = "a".repeat(201);
-    let mut extra = register_activity(7, ACTIVITY, None);
+    let mut extra = register_activity(7, Some(ACTIVITY), None);
     extra["extra"] = json!(1);
     for command in [
-        register_activity(1, "ABCDEF", None),
-        register_activity(2, "not-hex", None),
-        register_activity(3, "", None),
-        register_activity(4, &too_long, None),
-        register_activity(5, ACTIVITY, Some("ABCDEF")),
-        json!({"v": 1, "req": 6, "type": "register_activity", "start_token": START}),
+        register_activity(1, Some("ABCDEF"), None),
+        register_activity(2, Some("not-hex"), None),
+        register_activity(3, Some(""), None),
+        register_activity(4, Some(&too_long), None),
+        register_activity(5, Some(ACTIVITY), Some("ABCDEF")),
+        json!({"v": 1, "req": 6, "type": "register_activity"}),
+        register_activity(8, None, Some("NOT-HEX")),
         extra,
     ] {
         let req = command["req"].as_u64();
@@ -1393,7 +1418,7 @@ async fn bad_activity_tokens_are_refused_as_invalid_and_the_connection_goes_on()
             "the refusal repeats a token: {refusal}"
         );
     }
-    send(&mut phone, json!({"v": 1, "req": 8, "type": "ping"})).await;
+    send(&mut phone, json!({"v": 1, "req": 9, "type": "ping"})).await;
     assert_eq!(recv_kind(&mut phone, "ack").await["message"], "pong");
     let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
     assert!(!text.contains("\"activity\""), "{text}");
@@ -1410,9 +1435,13 @@ async fn clear_activity_removes_the_tokens_and_is_acked_and_audited() {
     let (mut phone, _) = env.phone("Test phone").await;
     let (mut other, _) = env.phone("Other phone").await;
     let theirs = "0123456789abcdef5ec7e7dddd";
-    send(&mut phone, register_activity(1, ACTIVITY, Some(START))).await;
+    send(
+        &mut phone,
+        register_activity(1, Some(ACTIVITY), Some(START)),
+    )
+    .await;
     recv_kind(&mut phone, "ack").await;
-    send(&mut other, register_activity(1, theirs, None)).await;
+    send(&mut other, register_activity(1, Some(theirs), None)).await;
     recv_kind(&mut other, "ack").await;
 
     send(&mut phone, clear_activity(2)).await;
@@ -1424,7 +1453,10 @@ async fn clear_activity_removes_the_tokens_and_is_acked_and_audited() {
         stored_activity(&env).await,
         [
             ("Test phone".to_owned(), None),
-            ("Other phone".to_owned(), Some((theirs.to_owned(), None))),
+            (
+                "Other phone".to_owned(),
+                Some((Some(theirs.to_owned()), None))
+            ),
         ]
     );
     let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
@@ -1468,14 +1500,61 @@ async fn clear_activity_removes_the_tokens_and_is_acked_and_audited() {
 }
 
 #[tokio::test]
+async fn a_failed_activity_write_is_refused_in_words_that_fit() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(
+        &mut phone,
+        register_activity(1, Some(ACTIVITY), Some(START)),
+    )
+    .await;
+    recv_kind(&mut phone, "ack").await;
+    std::fs::set_permissions(&env.root, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    // Root (a container) writes into a read-only directory, so there is nothing to test.
+    if std::fs::write(env.root.join("probe"), b"x").is_ok() {
+        std::fs::set_permissions(&env.root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        return;
+    }
+    send(&mut phone, clear_activity(2)).await;
+    let cleared = recv_kind(&mut phone, "refused").await;
+    send(&mut phone, register_activity(3, Some(START), None)).await;
+    let registered = recv_kind(&mut phone, "refused").await;
+    std::fs::set_permissions(&env.root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(
+        cleared,
+        refused(
+            2,
+            Code::Unavailable,
+            "Could not update the Live Activity; try again"
+        )
+    );
+    assert_eq!(
+        registered,
+        refused(
+            3,
+            Code::Unavailable,
+            "Could not save the Live Activity; try again"
+        )
+    );
+    assert_eq!(
+        stored_activity(&env).await[0],
+        (
+            "Test phone".to_owned(),
+            Some((Some(ACTIVITY.to_owned()), Some(START.to_owned())))
+        )
+    );
+}
+
+#[tokio::test]
 async fn activity_tokens_follow_the_newest_phone_to_register_them() {
     let mut env = Env::new();
     env.start().await;
     let (mut old, _) = env.phone("Old pairing").await;
     let (mut new, _) = env.phone("New pairing").await;
-    send(&mut old, register_activity(1, ACTIVITY, Some(START))).await;
+    send(&mut old, register_activity(1, Some(ACTIVITY), Some(START))).await;
     recv_kind(&mut old, "ack").await;
-    send(&mut new, register_activity(1, ACTIVITY, Some(START))).await;
+    send(&mut new, register_activity(1, Some(ACTIVITY), Some(START))).await;
     recv_kind(&mut new, "ack").await;
     assert_eq!(
         stored_activity(&env).await,
@@ -1483,7 +1562,7 @@ async fn activity_tokens_follow_the_newest_phone_to_register_them() {
             ("Old pairing".to_owned(), None),
             (
                 "New pairing".to_owned(),
-                Some((ACTIVITY.to_owned(), Some(START.to_owned())))
+                Some((Some(ACTIVITY.to_owned()), Some(START.to_owned())))
             ),
         ]
     );
@@ -1494,7 +1573,7 @@ async fn activity_commands_before_hello_are_refused_as_unpaired() {
     let mut env = Env::new();
     env.start().await;
     for command in [
-        register_activity(44, ACTIVITY, Some(START)),
+        register_activity(44, Some(ACTIVITY), Some(START)),
         clear_activity(45),
     ] {
         let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
@@ -1522,7 +1601,7 @@ async fn register_activity_spends_the_rate_limit_like_any_command() {
     }
     send(
         &mut spender,
-        register_activity(1_000, ACTIVITY, Some(START)),
+        register_activity(1_000, Some(ACTIVITY), Some(START)),
     )
     .await;
     let frame = loop {
@@ -1544,7 +1623,11 @@ async fn clear_activity_spends_the_rate_limit_like_any_command() {
     let mut env = Env::new();
     env.start().await;
     let (mut spender, _) = env.phone("Spender").await;
-    send(&mut spender, register_activity(1, ACTIVITY, Some(START))).await;
+    send(
+        &mut spender,
+        register_activity(1, Some(ACTIVITY), Some(START)),
+    )
+    .await;
     recv_kind(&mut spender, "ack").await;
     // A few past the burst, so a refill while they are sent still leaves none.
     for req in 2..=BURST as u64 + 4 {

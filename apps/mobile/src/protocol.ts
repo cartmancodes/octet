@@ -328,12 +328,12 @@ export interface RegisterPushCommand {
   kinds?: PushKinds | null;
 }
 
-/** Set the ActivityKit tokens the hub's Live Activity pushes go to: `token`, the running activity's push token, and `start_token`, the push-to-start token, each 1 to 200 lowercase hex digits. Each registration replaces both: one without `start_token` clears the start token the hub had. */
+/** Say the ActivityKit tokens the phone has now, for the hub's Live Activity pushes: `token`, the running activity's push token, and `start_token`, the push-to-start token, each 1 to 200 lowercase hex digits. Either may be left out, as the phone has none, but not both. Each registration replaces both: a token left out is one the hub no longer has. */
 export interface RegisterActivityCommand {
   v: 1;
   type: "register_activity";
   req: number;
-  token: string;
+  token?: string | null;
   start_token?: string | null;
 }
 
