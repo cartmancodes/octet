@@ -19,7 +19,7 @@ use std::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -1003,6 +1003,13 @@ async fn state_and_catalog_follow_subscriptions() {
     bridge_write(&mut write, bridge_state_frame(&state("idle"))).await;
     let update = recv_kind(&mut phone, "state").await;
     assert_eq!(update["state"], state("idle"));
+    // The row follows too, within a quarter second of the last list.
+    loop {
+        let sessions = recv_kind(&mut phone, "sessions").await;
+        if sessions["sessions"][0]["phase"] == "idle" {
+            break;
+        }
+    }
     bridge_write(&mut write, bridge_catalog_frame(&catalog("auto"))).await;
     let update = recv_kind(&mut phone, "catalog").await;
     assert_eq!(update["catalog"], catalog("auto"));
@@ -1846,12 +1853,18 @@ async fn silent_connections_cannot_lock_a_phone_out() {
     let mut env = Env::new();
     env.start().await;
     let token = env.pair("Test phone").await;
-    // Eight upgraded sockets that never say hello fill the waiting room.
+    // Thirty-two upgraded sockets that never say hello fill the waiting room.
     let mut waiting = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..32 {
         waiting.push(connect(env.port, Some(OWNER)).await.expect("connects"));
     }
-    // A paired phone comes in at once and says hello: the oldest silent socket makes room.
+    // While they are all younger than 2 seconds, a newcomer is turned away, and comes back.
+    match connect(env.port, Some(OWNER)).await {
+        Err(tungstenite::Error::Http(response)) => assert_eq!(response.status(), 503),
+        other => panic!("a full room of young sockets let one in: {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    // Then a paired phone comes in at once and says hello: the oldest silent socket makes room.
     let began = std::time::Instant::now();
     // (The helper waits for `welcome`, then the session list.)
     let (_phone, sessions) = hello(env.port, &token).await;
@@ -1871,6 +1884,49 @@ async fn silent_connections_cannot_lock_a_phone_out() {
     let (_again, sessions) = hello(env.port, &token).await;
     assert_eq!(sessions["type"], "sessions");
     assert!(closes(&mut waiting[1]).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_storm_of_reconnects_cannot_push_out_a_phone_slow_to_say_hello() {
+    let mut env = Env::new();
+    env.start().await;
+    let token = env.pair("Test phone").await;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Eight loops, each upgrading a socket, waiting 50 ms and closing it, again and again.
+    let storms: Vec<_> = (0..8)
+        .map(|_| {
+            let (stop, port) = (std::sync::Arc::clone(&stop), env.port);
+            tokio::spawn(async move {
+                let mut upgrades = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(mut socket) = connect(port, Some(OWNER)).await {
+                        upgrades += 1;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        let _ = socket.close(None).await;
+                    }
+                }
+                upgrades
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A phone on a slow link: upgraded mid-storm, it takes a second to say hello.
+    let mut phone = connect(env.port, Some(OWNER)).await.expect("connects");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 2, "type": "hello", "token": token}),
+    )
+    .await;
+    let welcome = recv(&mut phone).await;
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(welcome["type"], "welcome", "{welcome}");
+    assert_eq!(recv(&mut phone).await["type"], "sessions");
+    let mut upgrades = 0;
+    for storm in storms {
+        upgrades += storm.await.expect("a storm loop");
+    }
+    assert!(upgrades >= 80, "the storm upgraded {upgrades} sockets");
 }
 
 /// A journal in `env`'s data directory for a Claude session `session` in `cwd`.
@@ -2557,4 +2613,174 @@ async fn git_on_a_folder_that_is_not_a_repository_is_refused_and_the_hub_goes_on
     );
     send(&mut phone, json!({"v": 1, "req": 3, "type": "ping"})).await;
     assert_eq!(recv_kind(&mut phone, "ack").await, ack(3, "pong"));
+}
+
+/// Raises this process's soft limit on open files to `wanted` (at most the hard limit), for a
+/// test that holds hundreds of sockets: a shell's default can be 256.
+fn raise_open_files(wanted: u64) {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limit = getrlimit(Resource::Nofile);
+    if limit.current.is_none_or(|current| current >= wanted) {
+        return;
+    }
+    let current = Some(limit.maximum.map_or(wanted, |most| most.min(wanted)));
+    let _ = setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current,
+            maximum: limit.maximum,
+        },
+    );
+}
+
+/// The `sessions` frames `phone` gets until `until`, each with when it came.
+async fn sessions_until(phone: &mut Phone, until: tokio::time::Instant) -> Vec<(Instant, Value)> {
+    let mut got = Vec::new();
+    while let Ok(frame) = tokio::time::timeout_at(until, recv(phone)).await {
+        if frame["type"] == "sessions" {
+            got.push((Instant::now(), frame));
+        }
+    }
+    got
+}
+
+/// The most `sessions` frames a phone may get in `elapsed`: four a second, and the one a hello
+/// or the first change after a quiet spell sends at once.
+fn most_lists(elapsed: Duration) -> usize {
+    usize::try_from(elapsed.as_millis().div_ceil(250)).unwrap_or(usize::MAX) + 2
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_storm_of_state_changes_sends_at_most_four_lists_a_second() {
+    raise_open_files(4096);
+    let mut env = Env::new();
+    let mut bridges = Vec::new();
+    for pid in 6000..6200 {
+        bridges.push(env.bridge(pid, 0..1).await);
+    }
+    env.start().await;
+    let mut links = Vec::new();
+    for bridge in &bridges {
+        links.push(bridge.accept().await);
+    }
+    let mut phones = Vec::new();
+    for n in 0..4 {
+        let (phone, sessions) = env.phone(&format!("Phone {n}")).await;
+        assert_eq!(sessions["sessions"].as_array().map(Vec::len), Some(200));
+        phones.push(phone);
+    }
+    // A fifth phone reads nothing while the storm lasts.
+    let (mut slow, _) = env.phone("Slow phone").await;
+    let (rounds, every) = (10, Duration::from_millis(200));
+    let storm = every * rounds;
+    let began = Instant::now();
+    let settle = tokio::time::Instant::now() + storm + Duration::from_millis(1500);
+    let readers: Vec<_> = phones
+        .into_iter()
+        .map(|mut phone| tokio::spawn(async move { sessions_until(&mut phone, settle).await }))
+        .collect();
+    // Every session changes its NOW line five times a second: 1,000 state frames a second. The
+    // first one's approval comes halfway, and stays.
+    let state = |round: u32, approval: bool| {
+        let approvals = if approval {
+            json!([{"id": 1, "summary": {"action": "Run Bash", "command": "ls", "files": [],
+                "scope": "this call"}}])
+        } else {
+            json!([])
+        };
+        json!({"phase": "running", "queue": [], "queued": 0, "mode": "ask",
+            "now": format!("Step {round}"), "approvals": approvals})
+    };
+    let mut asked = None;
+    for round in 0..rounds {
+        for (i, (_read, write)) in links.iter_mut().enumerate() {
+            let approval = i == 0 && round >= rounds / 2;
+            bridge_write(write, bridge_state_frame(&state(round, approval))).await;
+        }
+        if round == rounds / 2 {
+            asked = Some(Instant::now());
+        }
+        tokio::time::sleep(every).await;
+    }
+    let asked = asked.expect("the approval was sent");
+    let last = format!("Step {}", rounds - 1);
+    for reader in readers {
+        let got = reader.await.expect("the phone's reader");
+        let elapsed = began.elapsed();
+        assert!(
+            got.len() <= most_lists(elapsed),
+            "{} lists in {elapsed:?}",
+            got.len()
+        );
+        // The lists keep up: the approval shows within the coalescing window and some, and the
+        // last list is the storm's end.
+        let shown = got
+            .iter()
+            .find(|(_, frame)| frame["sessions"][0]["approvals"] == 1)
+            .map(|(at, _)| at.saturating_duration_since(asked))
+            .expect("the approval is listed");
+        assert!(
+            shown < Duration::from_secs(1),
+            "the approval took {shown:?}"
+        );
+        let (_, final_list) = got.last().expect("lists came");
+        let rows = final_list["sessions"].as_array().expect("rows");
+        assert_eq!(rows.len(), 200);
+        assert!(
+            rows.iter().all(|row| row["now"] == last.as_str()),
+            "stale rows"
+        );
+    }
+    // The phone that read nothing was kept, with at most one list waiting in its queue: it now
+    // gets a handful, the newest last, not one per change.
+    let mut lists = 0;
+    loop {
+        let frame = recv(&mut slow).await;
+        if frame["type"] != "sessions" {
+            continue;
+        }
+        lists += 1;
+        if frame["sessions"][199]["now"] == last.as_str() {
+            break;
+        }
+    }
+    assert!(lists <= most_lists(began.elapsed()), "{lists} lists");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_devices_write_never_stalls_the_hub() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut writer, _) = env.phone("Writer phone").await;
+    let (mut other, _) = env.phone("Other phone").await;
+    // Another process (an `octet hub revoke`, say) holds the devices file's lock.
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(env.root.join("devices.lock"))
+        .expect("the lock file");
+    lock.lock().expect("the lock");
+    send(&mut writer, register(7, Some(PUSH))).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The hub goes on meanwhile: another phone's ping is answered at once.
+    let began = Instant::now();
+    send(&mut other, json!({"v": 1, "req": 3, "type": "ping"})).await;
+    assert_eq!(recv(&mut other).await, ack(3, "pong"));
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
+    // The registration is acked only once it is saved, after the lock is let go.
+    let early = timeout(Duration::from_millis(300), recv(&mut writer)).await;
+    assert!(early.is_err(), "acked before it was saved: {early:?}");
+    drop(lock);
+    let acked = recv_kind(&mut writer, "ack").await;
+    assert_eq!(
+        (acked["req"].as_u64(), acked["message"].as_str()),
+        (Some(7), Some("Notifications on"))
+    );
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(text.contains(PUSH), "{text}");
 }

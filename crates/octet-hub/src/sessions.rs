@@ -33,12 +33,15 @@ use crate::{
     tail::{Tail, event_of, file_name},
 };
 use octet_core::remote::{
-    protocol::{BridgeCommand, Code, MAX_BRIDGE_LINE, VERSION, bridge_command_json},
+    protocol::{
+        BridgeCommand, Code, MAX_BRIDGE_LINE, MAX_MESSAGE, MAX_SESSION_ROWS, VERSION,
+        bridge_command_json, sessions_frame,
+    },
     run::Registration,
 };
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     io::SeekFrom,
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
@@ -71,16 +74,17 @@ const LINE_LIMIT: u64 = MAX_BRIDGE_LINE as u64 + 1;
 const REGISTRATION_LIMIT: u64 = 1024 * 1024;
 /// The longest `goal` and `now` in a `sessions` row, in characters.
 const GOAL_CHARS: usize = 200;
-/// The most a `sessions` frame's rows take with their approval gists, in bytes. Past it, the
-/// least recently active rows lose their gists (keeping their counts), so the frame stays well
-/// under a message however many sessions wait.
-const GISTS_BUDGET: usize = 64 * 1024;
+/// The optional row fields a `sessions` frame over [`MAX_MESSAGE`] drops, in this order: each
+/// from every row, least recently active first, before the next. The approval keeps its count.
+const SHED: [&str; 4] = ["approval", "usage", "now", "goal"];
 /// How long a journal the session has moved on from is still read for its last records.
 const FOLLOW_PREVIOUS: Duration = Duration::from_secs(10);
 /// The most of a reply kept to tell whether it ended on a question, in characters.
 const REPLY_CHARS: usize = 256;
 /// The most of the newest journal read to seed a session's facts when the hub first sees it.
 const SEED_BYTES: u64 = 256 * 1024;
+/// Seeds read at once when the hub finds many sessions (at start, say).
+const SEEDS_AT_ONCE: usize = 8;
 
 /// What changed in the sessions since the last call to [`Sessions::next`].
 #[derive(Debug, PartialEq)]
@@ -310,12 +314,8 @@ const SEEDED: [&[u8]; 5] = [
     br#""type":"finished""#,
 ];
 
-/// The facts the last [`SEED_BYTES`] before `end` of `journal` hold, and the bytes read. One
-/// bounded read, of the window and the byte before it: when the window starts past the
-/// journal's beginning, everything through the first newline read is the end of an earlier line
-/// and is passed over, so a line that starts the window exactly is kept whole. The read and the
-/// parse run off the async threads. Errors are not counted: they were before the hub looked. A
-/// journal that cannot be read seeds nothing.
+/// [`seed_now`] off the async threads.
+#[cfg(test)]
 async fn seed(journal: &Path, end: u64) -> (Facts, u64) {
     let journal = journal.to_owned();
     tokio::task::spawn_blocking(move || seed_now(&journal, end))
@@ -323,7 +323,12 @@ async fn seed(journal: &Path, end: u64) -> (Facts, u64) {
         .unwrap_or_default()
 }
 
-/// [`seed`], blocking.
+/// The facts the last [`SEED_BYTES`] before `end` of `journal` hold, and the bytes read. One
+/// bounded read, of the window and the byte before it: when the window starts past the
+/// journal's beginning, everything through the first newline read is the end of an earlier line
+/// and is passed over, so a line that starts the window exactly is kept whole. It blocks: the
+/// hub runs it off the async threads ([`Sessions::seed_all`]). Errors are not counted: they
+/// were before the hub looked. A journal that cannot be read seeds nothing.
 fn seed_now(journal: &Path, end: u64) -> (Facts, u64) {
     use std::io::{Read, Seek};
     let start = end.saturating_sub(SEED_BYTES);
@@ -456,6 +461,34 @@ pub(crate) struct Sessions {
     sender: mpsc::Sender<Inbound>,
     tick: Option<Interval>,
     links: u64,
+    /// How many seeds run at once, for tests.
+    #[cfg(test)]
+    seeding: std::sync::Arc<Gauge>,
+}
+
+/// How many of something run at once, and the most that ever did.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Gauge {
+    now: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Gauge {
+    /// One more runs until the guard drops.
+    fn hold(self: &std::sync::Arc<Self>) -> impl Drop + use<> {
+        use std::sync::atomic::Ordering::SeqCst;
+        struct Held(std::sync::Arc<Gauge>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.now.fetch_sub(1, SeqCst);
+            }
+        }
+        let now = self.now.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(now, SeqCst);
+        Held(std::sync::Arc::clone(self))
+    }
 }
 
 impl Sessions {
@@ -470,6 +503,8 @@ impl Sessions {
             sender,
             tick: None,
             links: 0,
+            #[cfg(test)]
+            seeding: std::sync::Arc::default(),
         }
     }
 
@@ -488,7 +523,16 @@ impl Sessions {
     pub(crate) async fn refresh(&mut self) {
         let home = tokio::fs::canonicalize(&self.run).await.ok();
         let mut changed = false;
-        let mut present = Vec::new();
+        let mut present = HashSet::new();
+        // Where each session the hub had before this pass is; new ones go after them.
+        let known: HashMap<String, usize> = self
+            .live
+            .iter()
+            .enumerate()
+            .map(|(at, live)| (live.registration.id.clone(), at))
+            .collect();
+        // New sessions' facts, seeded once the pass has found them all.
+        let mut unseeded = Vec::new();
         for (file, registration) in scan(&self.run).await {
             if !vetted(home.as_deref(), &file, &registration).await {
                 let _ = tokio::fs::remove_file(&file).await;
@@ -507,21 +551,14 @@ impl Sessions {
                 }
                 Journals::Missing => {
                     // Not trusted yet, but not wrong either: a session already known stays.
-                    if self
-                        .live
-                        .iter()
-                        .any(|l| l.registration.id == registration.id)
-                    {
-                        present.push(registration.id.clone());
+                    if known.contains_key(&registration.id) {
+                        present.insert(registration.id.clone());
                     }
                     continue;
                 }
             }
-            let known = self
-                .live
-                .iter()
-                .position(|l| l.registration.id == registration.id);
-            let link = if known.is_none_or(|at| self.live[at].link.is_none()) {
+            let at = known.get(&registration.id).copied();
+            let link = if at.is_none_or(|at| self.live[at].link.is_none()) {
                 let Some(link) = self.connect(&registration).await else {
                     let _ = tokio::fs::remove_file(&file).await;
                     let _ = tokio::fs::remove_file(&registration.socket).await;
@@ -531,18 +568,20 @@ impl Sessions {
             } else {
                 None
             };
-            present.push(registration.id.clone());
-            match known {
+            if !present.insert(registration.id.clone()) {
+                // Two registration files naming one session: the first stands.
+                continue;
+            }
+            match at {
                 None => {
                     let tail = match registration.journals.last() {
                         Some(newest) => Some(Tail::at_end(newest.clone()).await),
                         None => None,
                     };
                     let last_activity = activity(&registration.journals).await;
-                    let facts = match &tail {
-                        Some(tail) => seed(tail.path(), tail.offset()).await.0,
-                        None => Facts::default(),
-                    };
+                    if let Some(tail) = &tail {
+                        unseeded.push((self.live.len(), tail.path().to_owned(), tail.offset()));
+                    }
                     self.live.push(Live {
                         registration,
                         link,
@@ -551,7 +590,7 @@ impl Sessions {
                         state: None,
                         catalog: None,
                         last_activity,
-                        facts,
+                        facts: Facts::default(),
                     });
                     changed = true;
                 }
@@ -569,6 +608,7 @@ impl Sessions {
                 }
             }
         }
+        self.seed_all(unseeded).await;
         let before = self.live.len();
         self.live.retain(|l| present.contains(&l.registration.id));
         if changed || self.live.len() != before {
@@ -576,28 +616,94 @@ impl Sessions {
         }
     }
 
-    /// The `sessions` frame's rows, oldest session first. Rows over [`GISTS_BUDGET`] lose their
-    /// approval gists, least recently active first, until they fit.
-    pub(crate) fn list(&self) -> Vec<Value> {
-        let mut rows: Vec<Value> = self.live.iter().map(Live::row).collect();
-        let mut total: usize = rows.iter().map(|row| row.to_string().len() + 1).sum();
-        if total <= GISTS_BUDGET {
-            return rows;
+    /// Seeds the facts of the new sessions `unseeded` names (where each is in `live`, its newest
+    /// journal and where its tail starts), [`SEEDS_AT_ONCE`] at a time, off the async threads:
+    /// a hub that finds two hundred sessions does not read them one by one.
+    async fn seed_all(&mut self, unseeded: Vec<(usize, PathBuf, u64)>) {
+        let mut running = tokio::task::JoinSet::new();
+        let mut unseeded = unseeded.into_iter();
+        loop {
+            while running.len() < SEEDS_AT_ONCE
+                && let Some((at, journal, end)) = unseeded.next()
+            {
+                #[cfg(test)]
+                let gauge = std::sync::Arc::clone(&self.seeding);
+                running.spawn_blocking(move || {
+                    #[cfg(test)]
+                    let _held = gauge.hold();
+                    (at, seed_now(&journal, end).0)
+                });
+            }
+            let Some(seeded) = running.join_next().await else {
+                return;
+            };
+            if let Ok((at, facts)) = seeded
+                && let Some(live) = self.live.get_mut(at)
+            {
+                live.facts = facts;
+            }
         }
-        let mut order: Vec<usize> = (0..rows.len()).collect();
+    }
+
+    /// The rows of the `sessions` frame (see [`frame`](Self::frame)).
+    #[cfg(test)]
+    pub(crate) fn list(&self) -> Vec<Value> {
+        self.bounded().into_iter().map(|(row, _)| row).collect()
+    }
+
+    /// The `sessions` frame, as the text that goes to phones: at most [`MAX_SESSION_ROWS`] rows,
+    /// oldest session first, the most recently active kept; never over [`MAX_MESSAGE`], however
+    /// much the sessions hold, since past it the rows lose their optional fields as [`SHED`]
+    /// says, then the least recently active rows go, until it fits. Each row is written once.
+    pub(crate) fn frame(&self) -> String {
+        let rows: Vec<String> = self.bounded().into_iter().map(|(_, text)| text).collect();
+        frame_text(&rows)
+    }
+
+    /// [`frame`](Self::frame)'s rows, each with its text.
+    fn bounded(&self) -> Vec<(Value, String)> {
+        // Least recently active first: the order rows give way in.
+        let mut order: Vec<usize> = (0..self.live.len()).collect();
         order.sort_by_key(|&i| (self.live[i].last_activity, i));
-        for i in order {
-            if total <= GISTS_BUDGET {
+        let over = order.len().saturating_sub(MAX_SESSION_ROWS);
+        let (gone, order) = order.split_at(over);
+        let mut rows: Vec<Option<(Value, String)>> = self
+            .live
+            .iter()
+            .map(|live| {
+                let row = live.row();
+                let text = row.to_string();
+                Some((row, text))
+            })
+            .collect();
+        for &i in gone {
+            rows[i] = None;
+        }
+        let mut size = FrameSize::of(rows.iter().flatten().map(|(_, text)| text.len()));
+        for key in SHED {
+            for &i in order {
+                if size.fits() {
+                    break;
+                }
+                if let Some((row, text)) = rows[i].as_mut()
+                    && let Some(fields) = row.as_object_mut()
+                    && fields.remove(key).is_some()
+                {
+                    let shorter = row.to_string();
+                    size.replace(text.len(), shorter.len());
+                    *text = shorter;
+                }
+            }
+        }
+        for &i in order {
+            if size.fits() {
                 break;
             }
-            if let Some(gist) = rows[i]
-                .as_object_mut()
-                .and_then(|row| row.remove("approval"))
-            {
-                total = total.saturating_sub(gist.to_string().len() + r#","approval":"#.len());
+            if let Some((_, text)) = rows[i].take() {
+                size.remove(text.len());
             }
         }
-        rows
+        rows.into_iter().flatten().collect()
     }
 
     /// What each session looks like to the pusher: its journals, phase and open approval ids.
@@ -860,6 +966,76 @@ impl Sessions {
             writer,
         })
     }
+}
+
+/// The bytes of a `sessions` frame around its rows, and between them.
+#[derive(Debug, Clone, Copy)]
+struct FrameSize {
+    /// The bytes of the frame without rows.
+    bare: usize,
+    /// The rows' bytes.
+    rows: usize,
+    /// How many rows there are.
+    count: usize,
+}
+
+impl FrameSize {
+    /// The size of a frame of rows `lengths` bytes long.
+    fn of(lengths: impl Iterator<Item = usize>) -> Self {
+        let bare = frame_text(&[]).len();
+        lengths.fold(
+            Self {
+                bare,
+                rows: 0,
+                count: 0,
+            },
+            |size, len| Self {
+                rows: size.rows + len,
+                count: size.count + 1,
+                ..size
+            },
+        )
+    }
+
+    /// The whole frame's bytes: the frame without rows, the rows and a comma between each two.
+    fn bytes(self) -> usize {
+        self.bare + self.rows + self.count.saturating_sub(1)
+    }
+
+    fn fits(self) -> bool {
+        self.bytes() <= MAX_MESSAGE
+    }
+
+    /// A row of `old` bytes is now `new` bytes long.
+    fn replace(&mut self, old: usize, new: usize) {
+        self.rows = self.rows - old + new;
+    }
+
+    /// A row of `len` bytes is gone.
+    fn remove(&mut self, len: usize) {
+        self.rows -= len;
+        self.count -= 1;
+    }
+}
+
+/// The text of the `sessions` frame whose rows' texts are `rows`, as
+/// [`sessions_frame`](octet_core::remote::protocol::sessions_frame) writes it.
+fn frame_text(rows: &[String]) -> String {
+    let empty = sessions_frame(&[]).to_string();
+    let (head, tail) = empty.split_once("[]").unwrap_or((&empty, ""));
+    let mut text =
+        String::with_capacity(empty.len() + rows.iter().map(|r| r.len() + 1).sum::<usize>());
+    text.push_str(head);
+    text.push('[');
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str(row);
+    }
+    text.push(']');
+    text.push_str(tail);
+    text
 }
 
 /// Queues a `Changed`, unless one is already the last thing queued.
@@ -1916,6 +2092,33 @@ mod tests {
         assert_eq!(read, std::fs::metadata(&small).unwrap().len());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn many_new_sessions_are_seeded_a_few_at_a_time() {
+        let env = Env::new();
+        let mut bridges = Vec::new();
+        for i in 0..40u32 {
+            let name = format!("session-{}-1.jsonl", i + 1);
+            for seq in 0..200 {
+                env.write(&name, seq, "notice", &json!("n".repeat(1000)));
+            }
+            env.write(&name, 200, "usage", &json!(format!("5h {i}%")));
+            let registration = env.registration(4400 + i, &[name.as_str()]);
+            bridges.push(Env::listen(&registration));
+            registration.write(&env.run).await.unwrap();
+        }
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        let most = sessions.seeding.most.load(Ordering::SeqCst);
+        assert!(most > 1 && most <= SEEDS_AT_ONCE, "{most} at once");
+        // Each session got its own facts.
+        let rows = sessions.list();
+        assert_eq!(rows.len(), 40);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row["usage"], format!("5h {i}%"), "{row}");
+        }
+        drop(bridges);
+    }
+
     #[tokio::test]
     async fn the_seed_keeps_a_line_that_starts_its_window() {
         let env = Env::new();
@@ -2270,6 +2473,134 @@ mod tests {
                 .iter()
                 .all(|row| row.get("approval").is_some())
         );
+    }
+
+    /// `count` sessions of `state`, each with its facts at their largest, active one second
+    /// apart (the first least recently).
+    fn fleet(env: &Env, count: u32, state: &dyn Fn(u32) -> Value) -> Sessions {
+        let mut sessions = Sessions::new(env.run.clone());
+        for i in 0..count {
+            let mut live = live_with(env, 5000 + i, state(i));
+            worst_facts(&mut live);
+            live.last_activity = Some(1_790_000_000 + u64::from(i));
+            sessions.live.push(live);
+        }
+        sessions
+    }
+
+    /// The frame `sessions` sends, its rows, and a check that it is what they make.
+    fn sent(sessions: &Sessions) -> (String, Vec<Value>) {
+        let (frame, rows) = (sessions.frame(), sessions.list());
+        assert_eq!(
+            frame,
+            octet_core::remote::protocol::sessions_frame(&rows).to_string()
+        );
+        (frame, rows)
+    }
+
+    /// The least recent activity among `rows` that have `key`, and the most recent among those
+    /// that lost it.
+    fn kept_and_lost(rows: &[Value], key: &str) -> (Option<u64>, Option<u64>) {
+        let recency = |row: &Value| row["last_activity"].as_u64().unwrap();
+        let oldest_kept = rows
+            .iter()
+            .filter(|r| r.get(key).is_some())
+            .map(recency)
+            .min();
+        let newest_lost = rows
+            .iter()
+            .filter(|r| r.get(key).is_none())
+            .map(recency)
+            .max();
+        (oldest_kept, newest_lost)
+    }
+
+    #[test]
+    fn two_hundred_rows_of_two_byte_text_fit_one_message() {
+        let env = Env::new();
+        let sessions = fleet(&env, 200, &|i| {
+            json!({"phase": "waiting", "now": "é".repeat(300),
+                "goal": {"objective": "é".repeat(5000)},
+                "approvals": [{"id": i, "summary": worst_summary()}]})
+        });
+        let (frame, rows) = sent(&sessions);
+        assert!(frame.len() <= MAX_MESSAGE, "{} bytes", frame.len());
+        // Every session is still listed, with its count of approvals.
+        assert_eq!(rows.len(), 200);
+        assert!(rows.iter().all(|row| row["approvals"] == 1));
+        // The optional fields went in order: every gist, usage and NOW line, then the goals of
+        // the least recently active rows.
+        for key in ["approval", "usage", "now"] {
+            assert!(rows.iter().all(|row| row.get(key).is_none()), "{key}");
+        }
+        let (oldest_kept, newest_lost) = kept_and_lost(&rows, "goal");
+        assert!(
+            oldest_kept >= newest_lost,
+            "{oldest_kept:?} {newest_lost:?}"
+        );
+        assert!(rows[199].get("goal").is_some(), "the newest keeps its goal");
+        assert!(rows[0].get("goal").is_none(), "the oldest loses its goal");
+        assert!(rows.iter().all(|row| row["question"] == true));
+    }
+
+    #[test]
+    fn two_hundred_realistic_rows_fit_one_message_and_lose_little() {
+        let env = Env::new();
+        let goal = "Refactor the hub's sessions list so a fleet of two hundred stays fast; ";
+        let mut sessions = fleet(&env, 200, &|_| {
+            json!({"phase": "running", "now": "Running Bash cargo test -p octet-hub",
+                "goal": {"objective": goal.repeat(4)}, "approvals": []})
+        });
+        for (i, live) in sessions.live.iter_mut().enumerate() {
+            live.facts
+                .take("usage", &json!("5h 41% · week 12% · resets 18:00"));
+            live.registration.workspace = format!("/Users/someone/Projects/octet-{i}").into();
+        }
+        let (frame, rows) = sent(&sessions);
+        assert!(frame.len() <= MAX_MESSAGE, "{} bytes", frame.len());
+        assert_eq!(rows.len(), 200);
+        // Only usage lines give way, the least recently active first; goals and NOW lines stay.
+        assert!(rows.iter().all(|row| row.get("goal").is_some()));
+        assert!(rows.iter().all(|row| row.get("now").is_some()));
+        let (oldest_kept, newest_lost) = kept_and_lost(&rows, "usage");
+        assert!(
+            oldest_kept >= newest_lost,
+            "{oldest_kept:?} {newest_lost:?}"
+        );
+        assert!(rows[199].get("usage").is_some());
+    }
+
+    #[test]
+    fn past_two_hundred_or_past_a_message_the_oldest_rows_go() {
+        let env = Env::new();
+        // More sessions than a frame lists: the most recently active 200, in their order.
+        let sessions = fleet(&env, 230, &|_| json!({"phase": "idle", "approvals": []}));
+        let (frame, rows) = sent(&sessions);
+        assert!(frame.len() <= MAX_MESSAGE, "{} bytes", frame.len());
+        assert_eq!(rows.len(), MAX_SESSION_ROWS);
+        assert_eq!(rows[0]["id"], "5030-1790000000");
+        assert_eq!(rows[199]["id"], "5229-1790000000");
+        // Rows too big even bare (a very long workspace): the least recently active go too.
+        let mut sessions = fleet(&env, 200, &|_| json!({"phase": "idle", "approvals": []}));
+        for live in &mut sessions.live {
+            live.registration.workspace = format!("/{}", "w".repeat(1000)).into();
+        }
+        let (frame, rows) = sent(&sessions);
+        assert!(frame.len() <= MAX_MESSAGE, "{} bytes", frame.len());
+        assert!(rows.len() < 200 && rows.len() > 50, "{}", rows.len());
+        assert_eq!(rows.last().unwrap()["id"], "5199-1790000000");
+        let ids: Vec<u64> = rows
+            .iter()
+            .map(|row| row["last_activity"].as_u64().unwrap())
+            .collect();
+        assert!(
+            ids.windows(2).all(|w| w[0] + 1 == w[1]),
+            "the newest, in order"
+        );
+        // No sessions: an empty list.
+        let (frame, rows) = sent(&Sessions::new(env.run.clone()));
+        assert!(rows.is_empty());
+        assert!(frame.len() < 64, "{frame}");
     }
 
     #[tokio::test]

@@ -397,8 +397,8 @@ impl Pusher {
             }
             seen.phase = Some(phase.clone());
         }
-        self.seen
-            .retain(|id, _| snapshots.iter().any(|snapshot| &snapshot.id == id));
+        let present: HashSet<&str> = snapshots.iter().map(|s| s.id.as_str()).collect();
+        self.seen.retain(|id, _| present.contains(id.as_str()));
         notices
     }
 

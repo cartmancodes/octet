@@ -22,7 +22,8 @@
 //! - **Start**, to the device's `start_token`: on news (an approval new to its session, or a turn
 //!   that starts) while the phone is away and the device has no usable activity token and no
 //!   push-started activity whose token is still to come (one that never comes, as from a locked
-//!   phone, holds back other starts for up to 8 hours, `ActivityKit`'s own bound). News seen while
+//!   phone, holds back other starts for up to 8 hours, `ActivityKit`'s own bound, or until the
+//!   app comes to the front with no activity token: then none is up). News seen while
 //!   the app is in front is spent, so leaving the app starts nothing by itself. A session's first
 //!   state only seeds, so a hub restart starts nothing either. A start and an update carry a
 //!   `stale-date` 15 minutes on.
@@ -415,8 +416,8 @@ impl Driver {
                 session.since = now;
             }
         }
-        self.sessions
-            .retain(|id, _| snapshots.iter().any(|snapshot| &snapshot.id == id));
+        let present: HashSet<&str> = snapshots.iter().map(|s| s.id.as_str()).collect();
+        self.sessions.retain(|id, _| present.contains(id.as_str()));
         if news {
             self.news += 1;
         }
@@ -465,16 +466,26 @@ impl Driver {
             .or_insert_with(|| Phone::new(news));
     }
 
-    /// `device` has the app in front (a hello that is not a background one): the news so far is
-    /// spent, and nothing ends. The app takes the same activity over and drives it
-    /// while it is in front.
-    pub(crate) fn connected(&mut self, device: &str) {
+    /// `device` has the app in front (a hello that is not a background one), holding `tokens`
+    /// (those not spent by age): the news so far is spent, and nothing ends. The app takes the
+    /// same activity over and drives it while it is in front. With no live activity token, no
+    /// activity the hub push-started is up (`ActivityKit` would have handed its token to the app
+    /// in front), so the hold on starts while its token is to come is lifted.
+    pub(crate) fn connected(&mut self, device: &str, tokens: Option<&ActivityTokens>) {
         let news = self.news;
         let phone = self
             .phones
             .entry(device.to_owned())
             .or_insert_with(|| Phone::new(news));
         phone.news = news;
+        let live = tokens
+            .and_then(|tokens| tokens.token.as_deref())
+            .is_some_and(|token| !phone.is_spent(token));
+        if !live {
+            phone.live = false;
+            phone.started = None;
+            phone.told_to = None;
+        }
     }
 
     /// What APNs said to a send that did not go well, given the activity token the device holds
@@ -802,9 +813,15 @@ impl Activity {
         self.driver.cleared(device);
     }
 
-    /// See [`Driver::connected`].
-    pub(crate) fn connected(&mut self, device: &str) {
-        self.driver.connected(device);
+    /// See [`Driver::connected`]: `tokens` are the device's as stored, at `wall`.
+    pub(crate) fn connected(
+        &mut self,
+        device: &str,
+        tokens: Option<&ActivityTokens>,
+        wall: SystemTime,
+    ) {
+        let tokens = tokens.map(|held| fresh(held, wall));
+        self.driver.connected(device, tokens.as_ref());
     }
 
     /// Takes what a send came to, given the activity token the device holds now (see
@@ -1268,7 +1285,7 @@ mod tests {
         assert_eq!(rig.away(700.0).map(|due| due.event), Some(Event::Start));
 
         // The app streams a session: no end, for the app takes the same activity over.
-        rig.driver.connected("dev");
+        rig.driver.connected("dev", Some(&rig.tokens));
         assert_eq!(rig.due(701.0, true), None);
         // Idle for five minutes and more while the app is in front: still no end.
         rig.observe(710.0, &[idle("s1")]);
@@ -1341,7 +1358,7 @@ mod tests {
         assert_eq!(rig.away(3.0), None);
         rig.observe(4.0, &[idle("s1")]);
         assert_eq!(rig.away(400.0), None);
-        rig.driver.connected("dev");
+        rig.driver.connected("dev", Some(&rig.tokens));
         assert_eq!(rig.due(401.0, true), None);
         assert_eq!(rig.cap.remembered(), 0);
         let now = rig.at(402.0);
@@ -1372,6 +1389,37 @@ mod tests {
                 .map(|due| due.event),
             Some(Event::Start)
         );
+    }
+
+    #[test]
+    fn the_app_in_front_with_no_activity_lifts_the_hold_on_starts() {
+        // A push-start while the phone is locked: its token never reaches the hub.
+        let mut rig = Rig::with(&["s1"], tokens(None, Some(START)));
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
+        // That activity may still be up, so news while away starts no second.
+        rig.observe(10.0, &[snap("s1", Some("idle"), &[1, 2])]);
+        assert_eq!(rig.away(10.0), None);
+        // The user dismissed it, and opens the app while nothing runs: it comes to the front
+        // with no activity token, so no activity of the hub's is up.
+        let held = rig.tokens.clone();
+        rig.driver.connected("dev", Some(&held));
+        assert_eq!(rig.due(20.0, true), None);
+        // They leave the app: the next news starts a new activity, long before 8 hours.
+        assert_eq!(rig.away(30.0), None);
+        rig.observe(40.0, &[snap("s1", Some("idle"), &[1, 2, 3])]);
+        assert_eq!(
+            sent(rig.away(40.0)),
+            expect(Event::Start, START, Kind::Approval, "s1", 3)
+        );
+        // An app in front that holds the activity's token keeps driving that one: no start.
+        rig.tokens = tokens(Some(TOKEN), Some(START));
+        let held = rig.tokens.clone();
+        rig.driver.connected("dev", Some(&held));
+        assert_eq!(rig.due(50.0, true), None);
+        rig.cap = Limiter::default();
+        rig.observe(60.0, &[snap("s1", Some("idle"), &[1, 2, 3, 4])]);
+        assert_eq!(rig.away(60.0).map(|due| due.event), Some(Event::Update));
     }
 
     /// What APNs said to `due` for `device`, as the hub reports it, with the token it now stores.
@@ -1481,7 +1529,7 @@ mod tests {
         assert_eq!(rig.away(320.0), None);
         // The app streams a session: no end. It keeps the activity current while in front,
         // so leaving with nothing new sends nothing, and the next change goes to NEW.
-        rig.driver.connected("dev");
+        rig.driver.connected("dev", Some(&rig.tokens));
         assert_eq!(rig.due(321.0, true), None);
         rig.observe(322.0, &[snap("s1", Some("running"), &[5])]);
         assert_eq!(rig.due(323.0, true), None);
@@ -1535,7 +1583,7 @@ mod tests {
         // idle minutes count from then.
         let (mut rig, end) = idle_end();
         answer(&mut rig, &end, Outcome::Failed(500));
-        rig.driver.connected("dev");
+        rig.driver.connected("dev", Some(&rig.tokens));
         assert_eq!(rig.due(304.0, true), None);
         assert_eq!(rig.away(310.0), None);
         assert_eq!(rig.away(609.0), None);
@@ -1603,7 +1651,7 @@ mod tests {
         rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
         assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
         let spent = rig.sends(2.0);
-        rig.driver.connected("dev");
+        rig.driver.connected("dev", Some(&rig.tokens));
         for seconds in [2.0, 3.0, 10.0] {
             assert_eq!(rig.due(seconds, true), None);
         }

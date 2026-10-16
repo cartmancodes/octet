@@ -7,12 +7,16 @@ use std::{
     io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
+    sync::{Mutex, OwnedMutexGuard},
 };
 
 /// The loopback port when `hub.json` names none.
@@ -161,6 +165,67 @@ pub struct Store {
     /// The mtime and size of `devices.json` as this store last wrote or read
     /// it; the size catches a change within the clock's granularity.
     stamp: Option<Stamp>,
+    /// Taken by each write in turn, so the writes of this process (each in a task of its own,
+    /// for the hub) are made, and their results handed back, in the order they were asked for.
+    turn: Arc<Mutex<()>>,
+}
+
+/// A change to `devices.json`: what it does to the devices on disk, its result, and whether it
+/// changed them (only then is the file written).
+pub(crate) type Change<R> = Box<dyn FnOnce(&mut Vec<Device>) -> (R, bool) + Send>;
+
+/// `devices.json` as a write left it, for the store in memory to take ([`Store::adopt`]).
+pub(crate) struct Disk {
+    devices: Vec<Device>,
+    stamp: Option<Stamp>,
+}
+
+// The devices hold push and activity tokens: a count only.
+impl std::fmt::Debug for Disk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Disk")
+            .field("devices", &self.devices.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Changes `devices.json` the way [`Store`] does, from a task of its own, so the hub's loop never
+/// waits on the lock, the read, the write or the syncs.
+#[derive(Debug, Clone)]
+pub(crate) struct Writer {
+    directory: PathBuf,
+    turn: Arc<Mutex<()>>,
+}
+
+impl Writer {
+    /// Waits for this process's earlier writes, then makes `change` under the lock on
+    /// `devices.lock` (see [`Store`]'s writes): its result, and the file as it is after, unless it
+    /// failed. The guard keeps the next write waiting: hand the result on, then drop it, so
+    /// results arrive in the order of the writes.
+    pub(crate) async fn update<R>(
+        &self,
+        change: Change<R>,
+    ) -> (io::Result<(R, Disk)>, OwnedMutexGuard<()>) {
+        let turn = Arc::clone(&self.turn).lock_owned().await;
+        (locked_update(&self.directory, change).await, turn)
+    }
+}
+
+/// A pairing under way: its device token (shown once), the device to save, and the secret it
+/// spent, which goes back ([`Store::unspend`]) if the save fails.
+pub(crate) struct Pairing {
+    pub(crate) token: String,
+    pub(crate) device: Device,
+    secret: Secret,
+}
+
+// The token is the phone's credential: only the device's name shows.
+impl std::fmt::Debug for Pairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pairing")
+            .field("device", &self.device.name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Store {
@@ -196,6 +261,7 @@ impl Store {
             config: HubConfig::default(),
             secrets: Vec::new(),
             stamp,
+            turn: Arc::default(),
         })
     }
 
@@ -235,6 +301,36 @@ impl Store {
         login: &str,
         now: SystemTime,
     ) -> Result<(String, Device), &'static str> {
+        let pairing = self.begin_pair(secret, name, platform, login, now)?;
+        match self.update(pair_change(pairing.device.clone())).await {
+            Ok(Ok(())) => Ok((pairing.token, pairing.device)),
+            Ok(Err(reason)) => {
+                self.unspend(pairing);
+                Err(reason)
+            }
+            Err(_) => {
+                self.unspend(pairing);
+                Err(PAIR_NOT_SAVED)
+            }
+        }
+    }
+
+    /// [`pair`](Self::pair) up to the write: checks `secret` and the fields, and spends the
+    /// secret. The device is saved by [`pair_change`]; if that fails, [`unspend`](Self::unspend)
+    /// gives the secret back.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason to show the phone when the secret is unknown, used or older than 10
+    /// minutes, or a field is empty or too long.
+    pub(crate) fn begin_pair(
+        &mut self,
+        secret: &str,
+        name: &str,
+        platform: &str,
+        login: &str,
+        now: SystemTime,
+    ) -> Result<Pairing, &'static str> {
         let hash = sha256_hex(secret);
         let position = self
             .secrets
@@ -267,17 +363,17 @@ impl Store {
             push_kinds: PushKinds::default(),
             activity: None,
         };
-        self.update(|devices| {
-            if devices.iter().any(|kept| kept.name == device.name) {
-                return (Err("A device with that name is already paired"), false);
-            }
-            devices.push(device.clone());
-            (Ok(()), true)
+        let secret = self.secrets.swap_remove(position);
+        Ok(Pairing {
+            token,
+            device,
+            secret,
         })
-        .await
-        .map_err(|_| "Could not save the device")??;
-        self.secrets.swap_remove(position);
-        Ok((token, device))
+    }
+
+    /// A pairing whose device was not saved gives its secret back, for a retry.
+    pub(crate) fn unspend(&mut self, pairing: Pairing) {
+        self.secrets.push(pairing.secret);
     }
 
     /// The device whose token this is, if it also connects from the login it
@@ -288,6 +384,26 @@ impl Store {
         login: &str,
         now: SystemTime,
     ) -> Option<Device> {
+        let (device, seen) = self.recognise(token, login, now)?;
+        if let Some(seen) = seen {
+            // The write re-reads the file, so a device revoked elsewhere is
+            // refused here; a failed write only leaves last_seen older on disk.
+            let written = self.update(seen_change(&device.token_sha256, seen)).await;
+            if matches!(written, Ok(false)) {
+                return None;
+            }
+        }
+        Some(device)
+    }
+
+    /// [`authenticate`](Self::authenticate) in memory: the device, and the time it was seen if
+    /// `devices.json` should be told ([`seen_change`]), at most once a minute.
+    pub(crate) fn recognise(
+        &mut self,
+        token: &str,
+        login: &str,
+        now: SystemTime,
+    ) -> Option<(Device, Option<u64>)> {
         let hash = sha256_hex(token);
         // Every device is compared, so the time taken does not say which matched.
         let mut found = None;
@@ -303,38 +419,19 @@ impl Store {
         let seen = seconds(now).max(device.last_seen);
         let stale = seen >= device.last_seen.saturating_add(SEEN_WRITE_GAP);
         device.last_seen = seen;
-        let device = device.clone();
-        if stale {
-            // The write re-reads the file, so a device revoked elsewhere is
-            // refused here; a failed write only leaves last_seen older on disk.
-            let written = self
-                .update(|devices| {
-                    let Some(kept) = devices
-                        .iter_mut()
-                        .find(|kept| kept.token_sha256 == device.token_sha256)
-                    else {
-                        return (false, false);
-                    };
-                    kept.last_seen = kept.last_seen.max(seen);
-                    (true, true)
-                })
-                .await;
-            if matches!(written, Ok(false)) {
-                return None;
-            }
-        }
-        Some(device)
+        Some((device.clone(), stale.then_some(seen)))
     }
 
     /// Deletes the device called `name`; false if there is none or the file
     /// cannot be written.
     pub async fn revoke(&mut self, name: &str) -> bool {
-        self.update(|devices| {
+        let name = name.to_owned();
+        self.update(Box::new(move |devices: &mut Vec<Device>| {
             let before = devices.len();
             devices.retain(|device| device.name != name);
             let removed = devices.len() != before;
             (removed, removed)
-        })
+        }))
         .await
         .unwrap_or(false)
     }
@@ -367,36 +464,7 @@ impl Store {
         token: Option<String>,
         kinds: Option<PushKinds>,
     ) -> io::Result<bool> {
-        self.update(|devices| {
-            if !devices
-                .iter()
-                .any(|device| device.token_sha256 == token_sha256)
-            {
-                return (false, false);
-            }
-            let mut changed = false;
-            for device in devices.iter_mut() {
-                let wanted = if device.token_sha256 == token_sha256 {
-                    token.clone()
-                } else if token.is_some() && device.push_token == token {
-                    None
-                } else {
-                    continue;
-                };
-                changed |= device.push_token != wanted;
-                device.push_token = wanted;
-            }
-            if let Some(kinds) = kinds
-                && let Some(device) = devices
-                    .iter_mut()
-                    .find(|device| device.token_sha256 == token_sha256)
-            {
-                changed |= device.push_kinds != kinds;
-                device.push_kinds = kinds;
-            }
-            (true, changed)
-        })
-        .await
+        self.update(push_change(token_sha256, token, kinds)).await
     }
 
     /// Clears the push token `token` from the device holding it, in the locked write; returns
@@ -405,20 +473,9 @@ impl Store {
     /// # Errors
     ///
     /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
+    #[cfg(test)]
     pub(crate) async fn drop_push_token(&mut self, token: &str) -> io::Result<Option<String>> {
-        self.update(|devices| {
-            let mut dropped = None;
-            for device in devices
-                .iter_mut()
-                .filter(|device| device.push_token.as_deref() == Some(token))
-            {
-                device.push_token = None;
-                dropped = Some(device.name.clone());
-            }
-            let changed = dropped.is_some();
-            (dropped, changed)
-        })
-        .await
+        self.update(push_token_drop(token)).await
     }
 
     /// Sets the `ActivityKit` tokens of the device whose token hash is `token_sha256` to the ones
@@ -426,7 +483,9 @@ impl Store {
     /// has, and with neither the device has no activity. False if there is no such device. A
     /// token is on one device only, the newest to register it, as a push token is: another device
     /// holding it, in either place, loses that token alone, in the same write. A revoke removes
-    /// the device, and its tokens with it.
+    /// the device, and its tokens with it. The same activity token registered again keeps when it
+    /// was first registered, so its age is the activity's; a registration that changes nothing
+    /// else is not written.
     ///
     /// # Errors
     ///
@@ -436,29 +495,7 @@ impl Store {
         token_sha256: &str,
         activity: ActivityTokens,
     ) -> io::Result<bool> {
-        self.update(|devices| {
-            if !devices
-                .iter()
-                .any(|device| device.token_sha256 == token_sha256)
-            {
-                return (false, false);
-            }
-            let ours = |token: &str| activity.holds(token);
-            let mut changed = false;
-            for device in devices.iter_mut() {
-                let wanted = if device.token_sha256 == token_sha256 {
-                    activity.clone().or_none()
-                } else if let Some(held) = &device.activity {
-                    held.without(ours)
-                } else {
-                    continue;
-                };
-                changed |= device.activity != wanted;
-                device.activity = wanted;
-            }
-            (true, changed)
-        })
-        .await
+        self.update(activity_change(token_sha256, activity)).await
     }
 
     /// Removes every `ActivityKit` token of the device whose token hash is `token_sha256`, for a
@@ -470,17 +507,7 @@ impl Store {
     ///
     /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
     pub async fn drop_activity(&mut self, token_sha256: &str) -> io::Result<bool> {
-        self.update(|devices| {
-            let Some(device) = devices
-                .iter_mut()
-                .find(|device| device.token_sha256 == token_sha256)
-            else {
-                return (false, false);
-            };
-            let changed = device.activity.take().is_some();
-            (true, changed)
-        })
-        .await
+        self.update(activity_clear(token_sha256)).await
     }
 
     /// Clears the `ActivityKit` token `token` wherever a device holds it, as its activity token
@@ -492,22 +519,7 @@ impl Store {
     ///
     /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
     pub async fn drop_activity_token(&mut self, token: &str) -> io::Result<Option<String>> {
-        self.update(|devices| {
-            let mut dropped = None;
-            for device in devices.iter_mut() {
-                let Some(held) = &device.activity else {
-                    continue;
-                };
-                let wanted = held.without(|held| held == token);
-                if device.activity != wanted {
-                    device.activity = wanted;
-                    dropped = Some(device.name.clone());
-                }
-            }
-            let changed = dropped.is_some();
-            (dropped, changed)
-        })
-        .await
+        self.update(activity_token_drop(token)).await
     }
 
     /// The paired devices.
@@ -571,72 +583,246 @@ impl Store {
     /// result if `change` says (the second value) it changed something. The
     /// list in memory becomes what is on disk, so another process's changes
     /// are never written back over.
-    async fn update<R>(
-        &mut self,
-        change: impl FnOnce(&mut Vec<Device>) -> (R, bool),
-    ) -> io::Result<R> {
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(self.directory.join("devices.lock"))
-            .await?
-            .into_std()
-            .await;
-        // The lock is released when `lock` drops, even if this future does.
-        let lock = tokio::task::spawn_blocking(move || lock.lock().map(|()| lock))
-            .await
-            .map_err(io::Error::other)??;
-        let (mut devices, stamp) = read_devices(&self.directory).await?;
-        let (result, write) = change(&mut devices);
-        if write {
-            let devices: Vec<_> = devices
-                .iter()
-                .map(|device| {
-                    let mut entry = serde_json::json!({
-                        "name": device.name,
-                        "platform": device.platform,
-                        "login": device.login,
-                        "created": device.created,
-                        "last_seen": device.last_seen,
-                        "token_sha256": device.token_sha256,
-                    });
-                    if let Some(push) = &device.push_token {
-                        entry["push_token"] = serde_json::json!(push);
-                    }
-                    let kinds = device.push_kinds;
-                    entry["push_kinds"] = serde_json::json!({
-                        "approvals": kinds.approvals,
-                        "errors": kinds.errors,
-                        "turns": kinds.turns,
-                    });
-                    if let Some(activity) = &device.activity {
-                        entry["activity"] = serde_json::json!({});
-                        if let Some(token) = &activity.token {
-                            entry["activity"]["token"] = serde_json::json!(token);
-                        }
-                        if let Some(start) = &activity.start_token {
-                            entry["activity"]["start_token"] = serde_json::json!(start);
-                        }
-                        if let Some(registered) = activity.registered {
-                            entry["activity"]["registered"] = serde_json::json!(registered);
-                        }
-                    }
-                    entry
-                })
-                .collect::<Vec<_>>();
-            let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({ "devices": devices }))?;
-            bytes.push(b'\n');
-            write_private(&self.directory, "devices.json", &bytes).await?;
-            self.stamp = file_stamp(&self.directory.join("devices.json")).await;
-        } else {
-            self.stamp = stamp;
-        }
-        self.devices = devices;
-        drop(lock);
+    async fn update<R>(&mut self, change: Change<R>) -> io::Result<R> {
+        let (written, turn) = self.writer().update(change).await;
+        let (result, disk) = written?;
+        self.adopt(disk);
+        drop(turn);
         Ok(result)
     }
+
+    /// What makes this store's writes from a task of its own, in turn with its own.
+    pub(crate) fn writer(&self) -> Writer {
+        Writer {
+            directory: self.directory.clone(),
+            turn: Arc::clone(&self.turn),
+        }
+    }
+
+    /// Takes `devices.json` as a [`Writer`]'s write left it: the list in memory becomes what is
+    /// on disk.
+    pub(crate) fn adopt(&mut self, disk: Disk) {
+        self.devices = disk.devices;
+        self.stamp = disk.stamp;
+    }
+}
+
+/// [`Store`]'s locked read-modify-write of `devices.json` in `directory`: the result, and the
+/// file as it is after.
+async fn locked_update<R>(directory: &Path, change: Change<R>) -> io::Result<(R, Disk)> {
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(directory.join("devices.lock"))
+        .await?
+        .into_std()
+        .await;
+    // The lock is released when `lock` drops, even if this future does.
+    let lock = tokio::task::spawn_blocking(move || lock.lock().map(|()| lock))
+        .await
+        .map_err(io::Error::other)??;
+    let (mut devices, stamp) = read_devices(directory).await?;
+    let (result, write) = change(&mut devices);
+    let stamp = if write {
+        let devices: Vec<_> = devices
+            .iter()
+            .map(|device| {
+                let mut entry = serde_json::json!({
+                    "name": device.name,
+                    "platform": device.platform,
+                    "login": device.login,
+                    "created": device.created,
+                    "last_seen": device.last_seen,
+                    "token_sha256": device.token_sha256,
+                });
+                if let Some(push) = &device.push_token {
+                    entry["push_token"] = serde_json::json!(push);
+                }
+                let kinds = device.push_kinds;
+                entry["push_kinds"] = serde_json::json!({
+                    "approvals": kinds.approvals,
+                    "errors": kinds.errors,
+                    "turns": kinds.turns,
+                });
+                if let Some(activity) = &device.activity {
+                    entry["activity"] = serde_json::json!({});
+                    if let Some(token) = &activity.token {
+                        entry["activity"]["token"] = serde_json::json!(token);
+                    }
+                    if let Some(start) = &activity.start_token {
+                        entry["activity"]["start_token"] = serde_json::json!(start);
+                    }
+                    if let Some(registered) = activity.registered {
+                        entry["activity"]["registered"] = serde_json::json!(registered);
+                    }
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({ "devices": devices }))?;
+        bytes.push(b'\n');
+        write_private(directory, "devices.json", &bytes).await?;
+        file_stamp(&directory.join("devices.json")).await
+    } else {
+        stamp
+    };
+    drop(lock);
+    Ok((result, Disk { devices, stamp }))
+}
+
+/// Why a pairing was not saved, when the file could not be written.
+pub(crate) const PAIR_NOT_SAVED: &str = "Could not save the device";
+
+/// Saves the new `device` of a pairing, unless a device of its name is already paired.
+pub(crate) fn pair_change(device: Device) -> Change<Result<(), &'static str>> {
+    Box::new(move |devices| {
+        if devices.iter().any(|kept| kept.name == device.name) {
+            return (Err("A device with that name is already paired"), false);
+        }
+        devices.push(device);
+        (Ok(()), true)
+    })
+}
+
+/// Records that the device whose token hash is `token_sha256` was seen at `seen`; false if it
+/// is not paired (any more).
+pub(crate) fn seen_change(token_sha256: &str, seen: u64) -> Change<bool> {
+    let token_sha256 = token_sha256.to_owned();
+    Box::new(move |devices| {
+        let Some(kept) = devices
+            .iter_mut()
+            .find(|kept| kept.token_sha256 == token_sha256)
+        else {
+            return (false, false);
+        };
+        kept.last_seen = kept.last_seen.max(seen);
+        (true, true)
+    })
+}
+
+/// [`Store::set_push`]'s change.
+pub(crate) fn push_change(
+    token_sha256: &str,
+    token: Option<String>,
+    kinds: Option<PushKinds>,
+) -> Change<bool> {
+    let token_sha256 = token_sha256.to_owned();
+    Box::new(move |devices| {
+        if !devices
+            .iter()
+            .any(|device| device.token_sha256 == token_sha256)
+        {
+            return (false, false);
+        }
+        let mut changed = false;
+        for device in devices.iter_mut() {
+            let wanted = if device.token_sha256 == token_sha256 {
+                token.clone()
+            } else if token.is_some() && device.push_token == token {
+                None
+            } else {
+                continue;
+            };
+            changed |= device.push_token != wanted;
+            device.push_token = wanted;
+        }
+        if let Some(kinds) = kinds
+            && let Some(device) = devices
+                .iter_mut()
+                .find(|device| device.token_sha256 == token_sha256)
+        {
+            changed |= device.push_kinds != kinds;
+            device.push_kinds = kinds;
+        }
+        (true, changed)
+    })
+}
+
+/// [`Store::drop_push_token`]'s change.
+pub(crate) fn push_token_drop(token: &str) -> Change<Option<String>> {
+    let token = token.to_owned();
+    Box::new(move |devices| {
+        let mut dropped = None;
+        for device in devices
+            .iter_mut()
+            .filter(|device| device.push_token.as_deref() == Some(token.as_str()))
+        {
+            device.push_token = None;
+            dropped = Some(device.name.clone());
+        }
+        let changed = dropped.is_some();
+        (dropped, changed)
+    })
+}
+
+/// [`Store::set_activity`]'s change.
+pub(crate) fn activity_change(token_sha256: &str, activity: ActivityTokens) -> Change<bool> {
+    let token_sha256 = token_sha256.to_owned();
+    Box::new(move |devices| {
+        if !devices
+            .iter()
+            .any(|device| device.token_sha256 == token_sha256)
+        {
+            return (false, false);
+        }
+        let ours = |token: &str| activity.holds(token);
+        let mut changed = false;
+        for device in devices.iter_mut() {
+            let wanted = if device.token_sha256 == token_sha256 {
+                let mut wanted = activity.clone();
+                if let Some(held) = &device.activity
+                    && held.token == wanted.token
+                {
+                    wanted.registered = held.registered.or(wanted.registered);
+                }
+                wanted.or_none()
+            } else if let Some(held) = &device.activity {
+                held.without(ours)
+            } else {
+                continue;
+            };
+            changed |= device.activity != wanted;
+            device.activity = wanted;
+        }
+        (true, changed)
+    })
+}
+
+/// [`Store::drop_activity`]'s change.
+pub(crate) fn activity_clear(token_sha256: &str) -> Change<bool> {
+    let token_sha256 = token_sha256.to_owned();
+    Box::new(move |devices| {
+        let Some(device) = devices
+            .iter_mut()
+            .find(|device| device.token_sha256 == token_sha256)
+        else {
+            return (false, false);
+        };
+        let changed = device.activity.take().is_some();
+        (true, changed)
+    })
+}
+
+/// [`Store::drop_activity_token`]'s change.
+pub(crate) fn activity_token_drop(token: &str) -> Change<Option<String>> {
+    let token = token.to_owned();
+    Box::new(move |devices| {
+        let mut dropped = None;
+        for device in devices.iter_mut() {
+            let Some(held) = &device.activity else {
+                continue;
+            };
+            let wanted = held.without(|held| held == token);
+            if device.activity != wanted {
+                device.activity = wanted;
+                dropped = Some(device.name.clone());
+            }
+        }
+        let changed = dropped.is_some();
+        (dropped, changed)
+    })
 }
 
 /// Writes `name` in `directory` owner-only: a temp file, synced, then renamed.
@@ -1396,6 +1582,67 @@ mod tests {
             older.devices()[0].activity,
             Some(activity(Some(ACTIVITY), Some(START)))
         );
+    }
+
+    #[tokio::test]
+    async fn the_same_token_registered_again_keeps_its_first_time_and_is_not_rewritten() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = TempDir::new("hub-activityagain");
+        let mut store = store(&dir).await;
+        let token = paired(&mut store, "Gemini 11", epoch(1)).await;
+        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        let at = |registered: u64, start: &str| ActivityTokens {
+            registered: Some(registered),
+            ..activity(Some(ACTIVITY), Some(start))
+        };
+        let hash = &device.token_sha256;
+        assert!(
+            store
+                .set_activity(hash, at(1_790_000_000, START))
+                .await
+                .unwrap()
+        );
+        let file = || {
+            std::fs::metadata(dir.path().join("devices.json"))
+                .unwrap()
+                .ino()
+        };
+        let written = file();
+        // A cold launch sends the same tokens again: the activity is as old as it was, and the
+        // file is not written.
+        assert!(
+            store
+                .set_activity(hash, at(1_790_000_500, START))
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.devices()[0].activity, Some(at(1_790_000_000, START)));
+        assert_eq!(file(), written, "nothing but the time changed");
+        // A new push-to-start token with the same activity: saved, still as old.
+        let rotated = "5ec7e7cccc0123456789abcdef";
+        assert!(
+            store
+                .set_activity(hash, at(1_790_000_900, rotated))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.devices()[0].activity,
+            Some(at(1_790_000_000, rotated))
+        );
+        assert_ne!(file(), written);
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(
+            reopened.devices()[0].activity,
+            Some(at(1_790_000_000, rotated))
+        );
+        // A new activity token starts its own time.
+        let newer = ActivityTokens {
+            token: Some("5ec7e7dddd0123456789abcdef".into()),
+            ..at(1_790_001_000, rotated)
+        };
+        assert!(store.set_activity(hash, newer.clone()).await.unwrap());
+        assert_eq!(store.devices()[0].activity, Some(newer));
     }
 
     #[tokio::test]

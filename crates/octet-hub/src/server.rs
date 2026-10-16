@@ -9,16 +9,16 @@
 //! header is not exactly the owner's login, or whose `Origin` names a host that is neither the
 //! request's (`Host`, `X-Forwarded-Host`) nor that of the hub's published URL as last asked (a
 //! web page of another site; the app sends none, or the hub's own), with 403, and one the hub
-//! has no room for (64 open) with 503. A connection then starts
-//! unauthenticated and accepts only `hello` (a
-//! device token) and `pair` (a pairing secret); anything else, or a failed `hello` or `pair`,
-//! is refused and the socket closed, as is one silent for 10 seconds. At most 8 wait for
-//! their `hello` at once: a ninth lets the oldest of them go, so sockets that never speak
-//! cannot keep a phone out. After `hello` it is
-//! authenticated as that device: every frame, text or not, first
-//! checks that the device is still paired (a revoked one is told `revoked`, then closed) and takes a token
-//! from the device's bucket (60 a minute; an empty bucket refuses, it does not close). Every
-//! connection is pinged every 20 seconds, and one that misses two pongs is let go.
+//! has no room for (64 open) with 503. A connection then starts unauthenticated and accepts
+//! only `hello` (a device token) and `pair` (a pairing secret); anything else, or a failed
+//! `hello` or `pair`, is refused and the socket closed, as is one silent for 10 seconds. At most
+//! 32 wait for their `hello` at once: a newer one lets the oldest go if that one has waited 2
+//! seconds, and is turned away with 503 (to try again) if every one is younger, so neither
+//! sockets that never speak nor a storm of reconnects can push out a phone about to say hello.
+//! After `hello` it is authenticated as that device: every frame, text or not, first checks
+//! that the device is still paired (a revoked one is told `revoked`, then closed) and takes a
+//! token from the device's bucket (60 a minute; an empty bucket refuses, it does not close).
+//! Every connection is pinged every 20 seconds, and one that misses two pongs is let go.
 //! Bridge commands go to the session under a hub-wide req and the reply comes back under the
 //! phone's own; one unanswered for 30 seconds is refused for it.
 //!
@@ -42,8 +42,22 @@
 //! replay page resumes at the byte where the last stopped, and the first page after a cursor
 //! starts at the last mark at or below it of the hub's journal index (`tail::Index`),
 //! which replays build as they read, so a phone back with its cursor does not have the whole
-//! journal read again. Live frames go through a queue of
-//! 512: a phone that lets it fill is dropped.
+//! journal read again. Live frames go through a queue of 512: a phone that lets it fill is
+//! dropped.
+//!
+//! # The sessions list
+//!
+//! A `sessions` frame goes to every authenticated phone when what a row shows changes, at most
+//! four a second (a change after a quiet spell goes at once, the rest within a quarter second,
+//! as one frame), and to a phone at its `hello`. It is made once and shared by every connection,
+//! and it takes one place at most in a connection's queue: a newer one replaces one still
+//! waiting there. Its size is bounded by [`Sessions::frame`].
+//!
+//! # Writes
+//!
+//! `devices.json` is written in tasks of its own, one at a time under its lock, so the hub loop
+//! never waits on a lock another process holds or on a sync to disk; what a write was for (an
+//! ack, a pairing) is done once it is saved.
 use crate::{
     activity::{Activity, Report},
     apns::{Outcome, Signer},
@@ -52,7 +66,11 @@ use crate::{
     owner::published_url,
     push::{self, Limiter, Pusher, Sender},
     sessions::{SessionUpdate, Sessions},
-    store::{ActivityTokens, Device, SECRET_REFUSED, Store},
+    store::{
+        ActivityTokens, Change, Device, Disk, PAIR_NOT_SAVED, Pairing, SECRET_REFUSED, Store,
+        activity_change, activity_clear, activity_token_drop, pair_change, push_change,
+        push_token_drop, seen_change,
+    },
     tail::{self, file_name},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -61,7 +79,7 @@ use octet_core::remote::{
     protocol::{
         BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, Secret, ack,
         catalog_frame, event_frame, full_access_confirmed, paired, parse_phone, recent_frame,
-        refused, req_of, sessions_frame, state_frame, subscribed_frame, welcome,
+        refused, req_of, state_frame, subscribed_frame, welcome,
     },
     run::run_dir,
 };
@@ -73,8 +91,8 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -83,12 +101,12 @@ use tokio::{
     net::{TcpListener, TcpStream, UnixListener, UnixStream, unix::OwnedWriteHalf},
     sync::{mpsc, oneshot, watch},
     task::AbortHandle,
-    time::{Instant, Interval, MissedTickBehavior, interval_at, timeout},
+    time::{Instant, Interval, MissedTickBehavior, interval_at, sleep_until, timeout},
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async_with_config,
     tungstenite::{
-        Message,
+        Message, Utf8Bytes,
         handshake::server::{Callback, ErrorResponse, Request, Response},
         http::{HeaderMap, StatusCode},
         protocol::WebSocketConfig,
@@ -103,8 +121,13 @@ use git_commands::Listings;
 const WATCH_QUEUE: usize = 256;
 /// How many `octet hub watch` clients may be attached at once.
 const MAX_WATCHERS: usize = 8;
-/// Live frames waiting to be written to one phone; a phone that lets it fill is dropped.
+/// Live frames waiting to be written to one phone; a phone that lets it fill is dropped. A
+/// `sessions` frame takes one place at most: a newer one replaces it while it waits.
 const OUTBOUND_QUEUE: usize = 512;
+/// The least time between two `sessions` frames to the phones: at most four a second, whatever
+/// the sessions do. A change after a quiet spell goes out at once; one within this of the last
+/// frame waits for the rest of it, and goes with whatever else changed meanwhile.
+const RELIST_GAP: Duration = Duration::from_millis(250);
 /// Replayed frames waiting to be written to one phone; a replay waits for room.
 const REPLAY_QUEUE: usize = 64;
 /// Journal records read per replay page.
@@ -139,8 +162,12 @@ const CLOSE_WITHIN: Duration = Duration::from_secs(2);
 const REVOKED_GRACE: Duration = Duration::from_secs(1);
 /// Connections open at once; more are turned away at accept.
 const MAX_CONNECTIONS: usize = 64;
-/// Connections that may wait for their hello at once; a new one past it lets the oldest go.
-const MAX_WAITING: usize = 8;
+/// Connections that may wait for their hello at once; a new one past it lets the oldest go, if
+/// that one has waited [`WAIT_KEPT`], and is turned away (503) otherwise.
+const MAX_WAITING: usize = 32;
+/// How long a connection waiting for its hello is safe from being let go to make room: a phone
+/// on a slow link takes a moment to say hello, and a storm of reconnects must not push it out.
+const WAIT_KEPT: Duration = Duration::from_secs(2);
 /// How often a connection is pinged; one that misses two pongs is let go.
 const PING_EVERY: Duration = Duration::from_secs(20);
 /// Unanswered pings after which a connection is let go.
@@ -184,6 +211,8 @@ const ACTIVITY_NOT_CLEARED: &str = "Could not update the Live Activity; try agai
 const PUSH_QUEUE: usize = 16;
 /// Reports of Live Activity sends waiting for the hub loop.
 const ACTIVITY_QUEUE: usize = 16;
+/// `devices.json` writes done and waiting for the hub loop.
+const SAVE_QUEUE: usize = 64;
 /// Logged when a dead Live Activity token could not be dropped; it names no token or path.
 const ACTIVITY_NOT_DROPPED: &str = "Couldn't drop a Live Activity token";
 /// How long a scan or a start may take in all.
@@ -259,12 +288,101 @@ enum Job {
     Git,
 }
 
+/// A `devices.json` write made off the hub loop, in a task of its own, and what the hub does once
+/// it is made. The writes go one at a time, under the file's lock, and come back in order.
+#[derive(Debug)]
+struct Saved {
+    /// The file as the write left it, for the store in memory; none if the write failed.
+    disk: Option<Disk>,
+    then: AfterSave,
+}
+
+/// What a write was for, and how it went.
+enum AfterSave {
+    /// The time a hello was seen.
+    Seen,
+    /// A pairing on `conn`, answering `req`.
+    Paired {
+        conn: u64,
+        req: u64,
+        pairing: Pairing,
+        result: std::io::Result<Result<(), &'static str>>,
+    },
+    /// `register_push` from `device` on `conn`, answering `req`.
+    Push {
+        conn: u64,
+        req: u64,
+        device: Device,
+        token: Option<String>,
+        kinds: Option<PushKinds>,
+        result: std::io::Result<bool>,
+    },
+    /// `register_activity`, or `clear_activity` when `cleared`, from `device` on `conn`.
+    Activity {
+        conn: u64,
+        req: u64,
+        device: Device,
+        cleared: bool,
+        result: std::io::Result<bool>,
+    },
+    /// A Live Activity token let go after a send; `gone` when APNs said so (410).
+    ActivityDropped {
+        gone: bool,
+        result: std::io::Result<Option<String>>,
+    },
+    /// A push token Expo says no device has.
+    PushDropped {
+        token: String,
+        result: std::io::Result<Option<String>>,
+    },
+}
+
+// Tokens and devices stay out: which write it was, only.
+impl std::fmt::Debug for AfterSave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Seen => "Seen",
+            Self::Paired { .. } => "Paired",
+            Self::Push { .. } => "Push",
+            Self::Activity { .. } => "Activity",
+            Self::ActivityDropped { .. } => "ActivityDropped",
+            Self::PushDropped { .. } => "PushDropped",
+        })
+    }
+}
+
 /// What the hub loop has a connection's writer send, in order.
 enum Out {
     /// A frame.
     Text(String),
+    /// The `sessions` frame its [`Listing`] holds when the writer comes to it: the newest.
+    Sessions,
     /// The closing handshake, then the end.
     Close,
+}
+
+/// The `sessions` frame waiting to be written to one phone, latest wins: while one waits, a newer
+/// one takes its place rather than a place of its own in the queue. Every phone's frame is the
+/// same text, shared.
+type Listing = Arc<Mutex<Option<Utf8Bytes>>>;
+
+/// Queues `frame` as the `sessions` frame `out`'s writer sends next: in `listing`, and, unless one
+/// already waits there, as an [`Out::Sessions`] in `out`. False if `out` has no room or is gone.
+fn offer_listing(out: &mpsc::Sender<Out>, listing: &Listing, frame: &Utf8Bytes) -> bool {
+    let waiting = listing
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(frame.clone())
+        .is_some();
+    waiting || out.try_send(Out::Sessions).is_ok()
+}
+
+/// The `sessions` frame waiting in `listing`, taking it.
+fn take_listing(listing: &Listing) -> Option<Utf8Bytes> {
+    listing
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
 }
 
 // A frame can hold a device token, a pairing secret or a `paired` token, so the Debug output
@@ -328,6 +446,7 @@ impl std::fmt::Debug for Out {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Text(text) => f.debug_tuple("Text").field(&Redacted(text.len())).finish(),
+            Self::Sessions => f.write_str("Sessions"),
             Self::Close => f.write_str("Close"),
         }
     }
@@ -367,24 +486,81 @@ impl Liveness {
 
 /// The connections the hub holds. A handshake takes a [`Seat`] before it upgrades, so a socket
 /// the hub has no room for (64 open) is turned away (503) rather than upgraded and then dropped,
-/// and one that never finishes its request holds no place at all. Connections not past `hello`
-/// yet are bounded by the hub itself: past [`MAX_WAITING`], each new one lets the oldest of them
-/// go (see [`Hub::accept`]), so silent sockets can never turn a phone away.
+/// and one that never finishes its request holds no place at all. The room also keeps the
+/// connections not past `hello` yet, [`MAX_WAITING`] at most: a new one past that lets the
+/// oldest of them go if it has waited [`WAIT_KEPT`] (the hub then drops it, see
+/// [`Hub::accept`]), and is itself turned away (503) when every one is younger, so that neither
+/// silent sockets nor a storm of reconnects can push out a phone about to say hello.
 #[derive(Debug, Default)]
 struct Room {
     open: AtomicUsize,
+    /// The connections waiting for their hello.
+    waiting: Mutex<Vec<Waiter>>,
+    /// The last ticket given to a seat.
+    tickets: AtomicU64,
+}
+
+/// A connection waiting for its hello, as the [`Room`] keeps it.
+#[derive(Debug)]
+struct Waiter {
+    ticket: u64,
+    since: Instant,
+    /// Raised when the room let it go to make room for a newer one.
+    evicted: Arc<AtomicBool>,
 }
 
 impl Room {
-    /// A place for one more connection; `None` when the hub has [`MAX_CONNECTIONS`] open.
+    /// A place for one more connection, waiting for its hello; `None` when the hub has
+    /// [`MAX_CONNECTIONS`] open, or [`MAX_WAITING`] waiting none of which has waited
+    /// [`WAIT_KEPT`].
     fn seat(self: &Arc<Self>) -> Option<Seat> {
+        self.seat_at(Instant::now())
+    }
+
+    /// [`seat`](Self::seat), at `now`.
+    fn seat_at(self: &Arc<Self>, now: Instant) -> Option<Seat> {
         if self.open.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
             self.open.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
+        let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        while waiting.len() >= MAX_WAITING {
+            let oldest = waiting
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, waiter)| waiter.since)
+                .filter(|(_, waiter)| now.saturating_duration_since(waiter.since) >= WAIT_KEPT)
+                .map(|(at, _)| at);
+            let Some(oldest) = oldest else {
+                drop(waiting);
+                self.open.fetch_sub(1, Ordering::AcqRel);
+                return None;
+            };
+            waiting
+                .swap_remove(oldest)
+                .evicted
+                .store(true, Ordering::Release);
+        }
+        let ticket = self.tickets.fetch_add(1, Ordering::AcqRel) + 1;
+        let evicted = Arc::new(AtomicBool::new(false));
+        waiting.push(Waiter {
+            ticket,
+            since: now,
+            evicted: Arc::clone(&evicted),
+        });
         Some(Seat {
             room: Arc::clone(self),
+            ticket,
+            evicted,
         })
+    }
+
+    /// The seat with `ticket` waits no more.
+    fn leave_waiting(&self, ticket: u64) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|waiter| waiter.ticket != ticket);
     }
 }
 
@@ -392,10 +568,26 @@ impl Room {
 #[derive(Debug)]
 struct Seat {
     room: Arc<Room>,
+    ticket: u64,
+    /// Whether the room let it go, while it waited, to make room for a newer connection.
+    evicted: Arc<AtomicBool>,
+}
+
+impl Seat {
+    /// It said hello: it no longer waits, and is never let go to make room.
+    fn admitted(&self) {
+        self.room.leave_waiting(self.ticket);
+    }
+
+    /// Whether the room let it go to make room; the hub then drops its connection.
+    fn evicted(&self) -> bool {
+        self.evicted.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for Seat {
     fn drop(&mut self) {
+        self.room.leave_waiting(self.ticket);
         self.room.open.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -474,6 +666,8 @@ impl Drop for Subscription {
 struct Conn {
     /// Live frames for the writer.
     out: mpsc::Sender<Out>,
+    /// The `sessions` frame for the writer, latest wins.
+    listing: Listing,
     /// Given to each replay task, for the writer.
     replay: mpsc::Sender<ReplayItem>,
     /// The connection task.
@@ -490,7 +684,7 @@ struct Conn {
     /// What its last `changes` of each session listed, which is all a `diff` may name.
     listings: Listings,
     /// Its place in the hub's room, given back as it drops.
-    _seat: Seat,
+    seat: Seat,
 }
 
 /// A command sent to a session and not yet answered.
@@ -567,12 +761,16 @@ pub struct Hub {
     pending: HashMap<u64, Pending>,
     /// Each device's command allowance, by token hash.
     buckets: HashMap<String, Bucket>,
-    /// The session rows phones were last sent.
-    listed: Vec<Value>,
+    /// The `sessions` frame phones were last sent, one text shared by every connection.
+    listed: Utf8Bytes,
+    /// When a `sessions` frame asked for within [`RELIST_GAP`] of the last goes out.
+    relist_at: Option<Instant>,
+    /// When the last `sessions` frame was made.
+    relisted: Option<Instant>,
     /// Control clients running `watch`.
     watchers: Vec<mpsc::Sender<String>>,
-    /// The rows with NOW lines the watchers were last sent.
-    watched: Vec<Value>,
+    /// The `sessions` frame the watchers were last sent.
+    watched: String,
     /// The data directory: journals, the run directory and the hub's files.
     directory: PathBuf,
     /// Launches that count toward the phone-started cap beyond the registrations.
@@ -588,6 +786,8 @@ pub struct Hub {
     index: tail::SharedIndex,
     /// Given to each connection and replay task.
     events: mpsc::Sender<ConnEvent>,
+    /// Given to each `devices.json` write, which says here when it is done.
+    saves: mpsc::Sender<Saved>,
     /// What to push, and when.
     pusher: Pusher,
     /// Posts pushes in the background.
@@ -663,28 +863,18 @@ impl Hub {
         if owner.is_empty() {
             return Err("The tailnet owner's login is unknown".into());
         }
-        let store = Store::open(&directory).await.map_err(|e| {
-            format!(
-                "Couldn't open the hub's files in {}: {e}",
-                directory.display()
-            )
-        })?;
-        let run = run_dir(&directory);
-        private_dir(&run)
-            .await
-            .map_err(|e| format!("Couldn't prepare {}: {e}", run.display()))?;
-        let control_path = run.join("hub.sock");
-        let control = bind_control(&control_path).await?;
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .await
-            .map_err(|e| format!("Couldn't listen on 127.0.0.1:{port}: {e}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| format!("Couldn't read the port: {e}"))?
-            .port();
+        let Bound {
+            store,
+            run,
+            control_path,
+            control,
+            listener,
+            port,
+        } = bind(&directory, port).await?;
         let (events, mut inbox) = mpsc::channel(EVENT_QUEUE);
         let (dead_tokens, mut dead) = mpsc::channel(PUSH_QUEUE);
         let (activity_reports, mut reports) = mpsc::channel(ACTIVITY_QUEUE);
+        let (saves, mut saved) = mpsc::channel(SAVE_QUEUE);
         let activity = load_activity(&store, activity_reports).await;
         let (streams, mut accepted) = mpsc::channel(16);
         let room = Arc::new(Room::default());
@@ -714,10 +904,13 @@ impl Hub {
             conns: HashMap::new(),
             pending: HashMap::new(),
             buckets: HashMap::new(),
-            listed: Vec::new(),
+            listed: Utf8Bytes::default(),
+            relist_at: None,
+            relisted: None,
             watchers: Vec::new(),
-            watched: Vec::new(),
+            watched: String::new(),
             events,
+            saves,
             pusher: Pusher::default(),
             sender: Sender::new(push::endpoint(), dead_tokens),
             cap: Limiter::default(),
@@ -726,7 +919,7 @@ impl Hub {
             ids: 0,
         };
         hub.sessions.refresh().await;
-        hub.listed = hub.sessions.list();
+        hub.listed = hub.sessions.frame().into();
         let (mut refresh, mut reload, mut sweep) = (
             every(REFRESH_EVERY),
             every(RELOAD_EVERY),
@@ -745,10 +938,13 @@ impl Hub {
                 _ = refresh.tick() => hub.sessions.refresh().await,
                 _ = reload.tick() => hub.reload().await,
                 _ = sweep.tick() => hub.tick(),
-                Some(tokens) = dead.recv() => hub.drop_push_tokens(&tokens).await,
+                Some(tokens) = dead.recv() => hub.drop_push_tokens(&tokens),
                 Some(report) = reports.recv(), if hub.activity.is_some() => {
-                    hub.on_activity_report(&report).await;
+                    hub.on_activity_report(&report);
                 }
+                Some(done) = saved.recv() => hub.on_saved(done).await,
+                () = sleep_until(hub.relist_at.unwrap_or_else(Instant::now)),
+                    if hub.relist_at.is_some() => hub.flush_relist(Instant::now()),
             }
         }
         control_task.abort();
@@ -767,18 +963,24 @@ impl Hub {
         self.ids
     }
 
-    /// Starts the task that serves one upgraded connection, which brings its seat, and makes
-    /// room in the waiting room for it.
+    /// Starts the task that serves one upgraded connection, which brings its seat, and drops the
+    /// waiting connections the room let go to make room for it.
     fn accept(&mut self, (ws, seat): Upgraded) {
         let conn = self.next_id();
         let (out, outbox) = mpsc::channel(OUTBOUND_QUEUE);
         let (replay, replays) = mpsc::channel(REPLAY_QUEUE);
-        let task =
-            tokio::spawn(connection(ws, conn, outbox, replays, self.events.clone())).abort_handle();
+        let listing = Listing::default();
+        let writer = Writer {
+            outbox,
+            listing: Arc::clone(&listing),
+            replays,
+        };
+        let task = tokio::spawn(connection(ws, conn, writer, self.events.clone())).abort_handle();
         self.conns.insert(
             conn,
             Conn {
                 out,
+                listing,
                 replay,
                 task,
                 opened: Instant::now(),
@@ -786,25 +988,22 @@ impl Hub {
                 subscriptions: HashMap::new(),
                 background: false,
                 listings: Listings::default(),
-                _seat: seat,
+                seat,
             },
         );
-        self.make_room(conn);
+        self.let_go_evicted();
     }
 
-    /// Lets the oldest connections that have not said hello go, other than `newest`, until at
-    /// most [`MAX_WAITING`] wait: a socket that never speaks only ever pushes out another such.
-    fn make_room(&mut self, newest: u64) {
-        let mut waiting: Vec<(Instant, u64)> = self
+    /// Drops the connections the room let go, while they waited for their hello, to make room
+    /// for newer ones (see [`Room`]): only a socket that has waited [`WAIT_KEPT`] goes.
+    fn let_go_evicted(&mut self) {
+        let evicted: Vec<u64> = self
             .conns
             .iter()
-            .filter(|(id, state)| state.device.is_none() && **id != newest)
-            .map(|(&id, state)| (state.opened, id))
+            .filter(|(_, state)| state.device.is_none() && state.seat.evicted())
+            .map(|(&conn, _)| conn)
             .collect();
-        // The newest counts too.
-        let extra = (waiting.len() + 1).saturating_sub(MAX_WAITING);
-        waiting.sort_unstable();
-        for (_, conn) in waiting.into_iter().take(extra) {
+        for conn in evicted {
             self.drop_conn(conn);
         }
     }
@@ -885,32 +1084,36 @@ impl Hub {
             PhoneCommand::Hello { token, background } => {
                 // A revoke by the CLI must be seen before the token is believed.
                 self.store.reload_if_changed().await;
-                let Some(device) = self
-                    .store
-                    .authenticate(token.expose(), &self.owner, now)
-                    .await
+                let Some((device, seen)) = self.store.recognise(token.expose(), &self.owner, now)
                 else {
                     self.refuse(conn, req, Code::Unpaired, "Unknown device; pair it again");
                     self.close(conn);
                     return;
                 };
+                if let Some(seen) = seen {
+                    // Off the loop; a device revoked meanwhile is let go at the next reload.
+                    self.save(seen_change(&device.token_sha256, seen), |_| AfterSave::Seen);
+                }
                 let name = device.name.clone();
                 // Judged on news from now. Any hello but a background one is the app in front,
                 // which drives the Live Activity itself while it is; nothing ends.
                 if let Some(activity) = self.activity.as_mut() {
                     activity.hello(&device.token_sha256);
                     if !background {
-                        activity.connected(&device.token_sha256);
+                        let tokens = device.activity.as_ref();
+                        activity.connected(&device.token_sha256, tokens, now);
                     }
                 }
                 // Out of the waiting room before the phone hears it is in.
                 if let Some(state) = self.conns.get_mut(&conn) {
+                    state.seat.admitted();
                     state.device = Some(device);
                     state.background = background;
                 }
                 self.send(conn, &welcome(&name));
-                let rows = self.sessions.list();
-                self.send(conn, &sessions_frame(&rows));
+                // A fresh hello is answered at once, whenever the last list went.
+                let frame = self.sessions.frame().into();
+                self.offer_sessions(conn, &frame);
             }
             PhoneCommand::Pair {
                 secret,
@@ -918,13 +1121,17 @@ impl Hub {
                 platform,
             } => match self
                 .store
-                .pair(secret.expose(), &name, &platform, &self.owner, now)
-                .await
+                .begin_pair(secret.expose(), &name, &platform, &self.owner, now)
             {
-                Ok((token, device)) => {
-                    // Who paired, and when; never the token or the secret.
-                    self.store.audit(&device.name, "", "paired").await;
-                    self.send(conn, &paired(&token, &device.name));
+                // Answered once the device is saved (see `on_saved`).
+                Ok(pairing) => {
+                    let change = pair_change(pairing.device.clone());
+                    self.save(change, move |result| AfterSave::Paired {
+                        conn,
+                        req,
+                        pairing,
+                        result,
+                    });
                 }
                 Err(reason) => {
                     let code = if reason == SECRET_REFUSED {
@@ -975,10 +1182,10 @@ impl Hub {
             PhoneCommand::Ping => return self.send(conn, &ack(req, "pong")),
             PhoneCommand::RegisterPush { token, kinds } => {
                 let token = token.map(|token| token.expose().to_owned());
-                return self.register_push(conn, device, req, token, kinds).await;
+                return self.register_push(conn, device, req, token, kinds);
             }
             command @ (PhoneCommand::RegisterActivity { .. } | PhoneCommand::ClearActivity) => {
-                return self.activity(conn, device, req, command).await;
+                return self.activity(conn, device, req, command);
             }
             PhoneCommand::Subscribe { session, after } => {
                 self.subscribe(conn, req, session, after);
@@ -1045,22 +1252,38 @@ impl Hub {
     }
 
     /// Sets, or with `None` clears, `device`'s push token, and its kinds when `kinds` says them
-    /// (`None` keeps what is stored), and answers `req`. Neither the token nor the device's hash
-    /// reaches the audit line.
-    async fn register_push(
-        &mut self,
+    /// (`None` keeps what is stored), off the loop, and answers `req` once it is saved
+    /// ([`pushed`](Self::pushed)). Neither the token nor the device's hash reaches the audit line.
+    fn register_push(
+        &self,
         conn: u64,
         device: &Device,
         req: u64,
         token: Option<String>,
         kinds: Option<PushKinds>,
     ) {
-        let on = token.is_some();
-        match self
-            .store
-            .set_push(&device.token_sha256, token.clone(), kinds)
-            .await
-        {
+        let change = push_change(&device.token_sha256, token.clone(), kinds);
+        let device = device.clone();
+        self.save(change, move |result| AfterSave::Push {
+            conn,
+            req,
+            device,
+            token,
+            kinds,
+            result,
+        });
+    }
+
+    /// A push registration was saved, or not: the connections of the device take the token and
+    /// kinds, and the phone is answered.
+    async fn pushed(
+        &mut self,
+        (conn, req): (u64, u64),
+        device: &Device,
+        (token, kinds): (Option<String>, Option<PushKinds>),
+        result: std::io::Result<bool>,
+    ) {
+        match result {
             Ok(true) => {}
             Ok(false) => {
                 self.refuse(conn, req, Code::Unavailable, PUSH_NOT_SAVED);
@@ -1076,6 +1299,7 @@ impl Hub {
                 return;
             }
         }
+        let on = token.is_some();
         // The connections of this device carry a copy of it.
         for state in self.conns.values_mut() {
             if let Some(held) = state
@@ -1099,44 +1323,56 @@ impl Hub {
     }
 
     /// Stores `device`'s `ActivityKit` tokens for `register_activity`, replacing both it had and
-    /// taking them from any other device that held them, or removes them for `clear_activity`;
-    /// then answers `req`. Neither a token nor the device's hash reaches the audit line or a log.
-    async fn activity(&mut self, conn: u64, device: &Device, req: u64, command: PhoneCommand) {
+    /// taking them from any other device that held them, or removes them for `clear_activity`,
+    /// off the loop; `req` is answered once that is saved ([`activity_saved`](Self::activity_saved)).
+    /// Neither a token nor the device's hash reaches the audit line or a log.
+    fn activity(&self, conn: u64, device: &Device, req: u64, command: PhoneCommand) {
         let hash = &device.token_sha256;
         let exposed = |token: Option<Secret>| token.map(|token| token.expose().to_owned());
-        let (saved, message, what, failed) =
+        let (change, cleared) =
             if let PhoneCommand::RegisterActivity { token, start_token } = command {
                 let activity = ActivityTokens {
                     token: exposed(token),
                     start_token: exposed(start_token),
-                    // After 12 hours the token is spent: ActivityKit has ended that activity.
+                    // After 12 hours the token is spent: ActivityKit has ended that activity. The
+                    // same token registered again keeps its first time.
                     registered: SystemTime::now()
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .ok()
                         .map(|since| since.as_secs()),
                 };
-                let saved = self.store.set_activity(hash, activity).await;
-                (
-                    saved,
-                    "Activity registered",
-                    "activity registered",
-                    ACTIVITY_NOT_SAVED,
-                )
+                (activity_change(hash, activity), false)
             } else {
-                let saved = self.store.drop_activity(hash).await;
-                // Forgotten now, not at the next look: a register just after it starts afresh.
-                if matches!(saved, Ok(true))
-                    && let Some(activity) = self.activity.as_mut()
-                {
-                    activity.cleared(hash);
-                }
-                (
-                    saved,
-                    "Activity cleared",
-                    "activity cleared",
-                    ACTIVITY_NOT_CLEARED,
-                )
+                (activity_clear(hash), true)
             };
+        let device = device.clone();
+        self.save(change, move |result| AfterSave::Activity {
+            conn,
+            req,
+            device,
+            cleared,
+            result,
+        });
+    }
+
+    /// A Live Activity registration or clear was saved, or not: the driver forgets a cleared
+    /// device's activity, the connections take the tokens, and the phone is answered.
+    async fn activity_saved(
+        &mut self,
+        (conn, req): (u64, u64),
+        device: &Device,
+        cleared: bool,
+        saved: std::io::Result<bool>,
+    ) {
+        let (message, what, failed) = if cleared {
+            ("Activity cleared", "activity cleared", ACTIVITY_NOT_CLEARED)
+        } else {
+            (
+                "Activity registered",
+                "activity registered",
+                ACTIVITY_NOT_SAVED,
+            )
+        };
         match saved {
             Ok(true) => {}
             Ok(false) => {
@@ -1150,7 +1386,18 @@ impl Hub {
                 return;
             }
         }
-        // Connections carry a copy of their device, and tokens may have left another device.
+        // Forgotten now, not at the next look: a register just after it starts afresh.
+        if cleared && let Some(activity) = self.activity.as_mut() {
+            activity.cleared(&device.token_sha256);
+        }
+        self.copy_activity_tokens();
+        self.store.audit(&device.name, "", what).await;
+        self.send(conn, &ack(req, message));
+    }
+
+    /// Connections carry a copy of their device: each takes its activity tokens as stored, which
+    /// may have left it for another device.
+    fn copy_activity_tokens(&mut self) {
         let devices = self.store.devices();
         for held in self
             .conns
@@ -1161,8 +1408,112 @@ impl Hub {
                 held.activity.clone_from(&stored.activity);
             }
         }
-        self.store.audit(&device.name, "", what).await;
-        self.send(conn, &ack(req, message));
+    }
+
+    /// Makes `change` to `devices.json` in a task of its own, so the loop goes on meanwhile;
+    /// once it is made, `then` says what the hub does about it ([`on_saved`](Self::on_saved)).
+    fn save<R: Send + 'static>(
+        &self,
+        change: Change<R>,
+        then: impl FnOnce(std::io::Result<R>) -> AfterSave + Send + 'static,
+    ) {
+        let (writer, saves) = (self.store.writer(), self.saves.clone());
+        tokio::spawn(async move {
+            let (written, turn) = writer.update(change).await;
+            let (result, disk) = match written {
+                Ok((result, disk)) => (Ok(result), Some(disk)),
+                Err(error) => (Err(error), None),
+            };
+            let _ = saves
+                .send(Saved {
+                    disk,
+                    then: then(result),
+                })
+                .await;
+            // Only now may the next write go, so the hub hears of them in order.
+            drop(turn);
+        });
+    }
+
+    /// A write made off the loop is done: the store takes the file as it left it, and the hub
+    /// does what the write was for.
+    async fn on_saved(&mut self, Saved { disk, then }: Saved) {
+        if let Some(disk) = disk {
+            self.store.adopt(disk);
+        }
+        match then {
+            AfterSave::Seen => {}
+            AfterSave::Paired {
+                conn,
+                req,
+                pairing,
+                result,
+            } => {
+                let reason = match result {
+                    Ok(Ok(())) => {
+                        // Who paired, and when; never the token or the secret.
+                        self.store.audit(&pairing.device.name, "", "paired").await;
+                        self.send(conn, &paired(&pairing.token, &pairing.device.name));
+                        return;
+                    }
+                    Ok(Err(reason)) => reason,
+                    Err(_) => PAIR_NOT_SAVED,
+                };
+                // The phone may try again with the same code.
+                self.store.unspend(pairing);
+                self.refuse(conn, req, Code::Invalid, reason);
+                self.close(conn);
+            }
+            AfterSave::Push {
+                conn,
+                req,
+                device,
+                token,
+                kinds,
+                result,
+            } => {
+                self.pushed((conn, req), &device, (token, kinds), result)
+                    .await;
+            }
+            AfterSave::Activity {
+                conn,
+                req,
+                device,
+                cleared,
+                result,
+            } => {
+                self.activity_saved((conn, req), &device, cleared, result)
+                    .await;
+            }
+            AfterSave::ActivityDropped { gone, result } => {
+                // A token APNs said is gone is audited; one the hub ended is just let go.
+                match result {
+                    Ok(Some(name)) if gone => {
+                        self.store.audit(&name, "", "activity dropped").await;
+                    }
+                    Ok(_) => {}
+                    Err(_) => eprintln!("{ACTIVITY_NOT_DROPPED}"),
+                }
+                self.copy_activity_tokens();
+            }
+            AfterSave::PushDropped { token, result } => {
+                match result {
+                    Ok(Some(name)) => self.store.audit(&name, "", "push dropped").await,
+                    Ok(None) => {}
+                    // The only push log lines are the ruled ones: no kind, path or token.
+                    Err(_) => push::report(&[push::Outcome::Failed]),
+                }
+                for state in self.conns.values_mut() {
+                    if let Some(held) = state
+                        .device
+                        .as_mut()
+                        .filter(|held| held.push_token.as_ref() == Some(&token))
+                    {
+                        held.push_token = None;
+                    }
+                }
+            }
+        }
     }
 
     /// Lists resumable sessions in the background; the scan reads up to 400 journals, and only
@@ -1388,7 +1739,11 @@ impl Hub {
             } => self.on_journal_event(&id, &journal, seq, &record),
             SessionUpdate::State { id } => {
                 self.update_turns();
-                if let Some(state) = self.sessions.state(&id) {
+                let subscribed = self
+                    .conns
+                    .values()
+                    .any(|state| state.subscriptions.contains_key(&id));
+                if subscribed && let Some(state) = self.sessions.state(&id) {
                     let frame = state_frame(&id, state).to_string();
                     self.tell_subscribers(&id, &frame);
                 }
@@ -1496,15 +1851,36 @@ impl Hub {
         }
     }
 
-    /// Sends the `sessions` frame to every authenticated phone if the rows changed.
+    /// Asks for the `sessions` frame to go to the phones and watchers: at once when none was
+    /// made in the last [`RELIST_GAP`], otherwise once that has passed (see
+    /// [`flush_relist`](Self::flush_relist)), so a storm of state changes costs at most four
+    /// frames a second.
     fn relist(&mut self) {
-        self.relist_watchers();
-        let list = self.sessions.list();
-        if list == self.listed {
+        if self.relist_at.is_some() {
             return;
         }
-        let frame = sessions_frame(&list).to_string();
-        self.listed = list;
+        let now = Instant::now();
+        match self.relisted.map(|last| last + RELIST_GAP) {
+            Some(at) if at > now => self.relist_at = Some(at),
+            _ => self.flush_relist(now),
+        }
+    }
+
+    /// Makes the `sessions` frame once, and sends it to every authenticated phone (latest wins:
+    /// see [`Listing`]) and to the watchers, each if it differs from what they were last sent.
+    fn flush_relist(&mut self, now: Instant) {
+        self.relist_at = None;
+        self.relisted = Some(now);
+        let frame = self.sessions.frame();
+        if !self.watchers.is_empty() && frame != self.watched {
+            broadcast(&mut self.watchers, &frame);
+            self.watched.clone_from(&frame);
+        }
+        if frame == self.listed.as_str() {
+            return;
+        }
+        self.listed = frame.into();
+        let frame = self.listed.clone();
         let targets: Vec<u64> = self
             .conns
             .iter()
@@ -1512,21 +1888,19 @@ impl Hub {
             .map(|(&conn, _)| conn)
             .collect();
         for conn in targets {
-            self.push(conn, frame.clone());
+            self.offer_sessions(conn, &frame);
         }
     }
 
-    /// The `sessions` frame for watchers if the rows changed.
-    fn relist_watchers(&mut self) {
-        if self.watchers.is_empty() {
+    /// Gives `conn` `frame` as the `sessions` frame its writer sends next; a connection whose
+    /// queue is full is dropped.
+    fn offer_sessions(&mut self, conn: u64, frame: &Utf8Bytes) {
+        let Some(state) = self.conns.get(&conn) else {
             return;
+        };
+        if !offer_listing(&state.out, &state.listing, frame) {
+            self.drop_conn(conn);
         }
-        let rows = self.sessions.list();
-        if rows == self.watched {
-            return;
-        }
-        broadcast(&mut self.watchers, &sessions_frame(&rows).to_string());
-        self.watched = rows;
     }
 
     /// Attaches a watcher, or turns it away when too many are attached.
@@ -1537,10 +1911,9 @@ impl Hub {
             return;
         }
         if self.watchers.is_empty() {
-            self.watched = self.sessions.list();
+            self.watched = self.sessions.frame();
         }
-        let rows = sessions_frame(&self.watched).to_string();
-        if watcher.try_send(rows).is_ok() {
+        if watcher.try_send(self.watched.clone()).is_ok() {
             self.watchers.push(watcher);
         }
     }
@@ -1578,6 +1951,7 @@ impl Hub {
     fn sweep(&mut self) {
         let now = Instant::now();
         self.launches.running(self.sessions.phone_started(), now);
+        self.let_go_evicted();
         let silent: Vec<u64> = self
             .conns
             .iter()
@@ -1744,9 +2118,9 @@ impl Hub {
     }
 
     /// Takes what a Live Activity send came to. A token APNs says is gone (410), or one whose
-    /// activity the hub ended, is cleared, by value, from `devices.json` and from the
-    /// connections' copies of their devices.
-    async fn on_activity_report(&mut self, report: &Report) {
+    /// activity the hub ended, is cleared, by value, from `devices.json` (off the loop) and then
+    /// from the connections' copies of their devices.
+    fn on_activity_report(&mut self, report: &Report) {
         let Some(activity) = self.activity.as_mut() else {
             return;
         };
@@ -1759,45 +2133,20 @@ impl Hub {
         if !activity.reported(report, stored.as_deref()) {
             return;
         }
-        // A token APNs said is gone is audited; one the hub ended is just let go.
-        match self.store.drop_activity_token(&report.token).await {
-            Ok(Some(name)) if report.outcome == Outcome::Gone => {
-                self.store.audit(&name, "", "activity dropped").await;
-            }
-            Ok(_) => {}
-            Err(_) => eprintln!("{ACTIVITY_NOT_DROPPED}"),
-        }
-        let devices = self.store.devices();
-        for held in self
-            .conns
-            .values_mut()
-            .filter_map(|state| state.device.as_mut())
-        {
-            if let Some(stored) = devices.iter().find(|d| d.token_sha256 == held.token_sha256) {
-                held.activity.clone_from(&stored.activity);
-            }
-        }
+        let gone = report.outcome == Outcome::Gone;
+        self.save(activity_token_drop(&report.token), move |result| {
+            AfterSave::ActivityDropped { gone, result }
+        });
     }
 
-    /// Clears push tokens Expo says no device has, from `devices.json` and the connections'
-    /// copies of their devices.
-    async fn drop_push_tokens(&mut self, tokens: &[String]) {
+    /// Clears push tokens Expo says no device has, from `devices.json` (off the loop) and then
+    /// from the connections' copies of their devices.
+    fn drop_push_tokens(&self, tokens: &[String]) {
         for token in tokens {
-            match self.store.drop_push_token(token).await {
-                Ok(Some(name)) => self.store.audit(&name, "", "push dropped").await,
-                Ok(None) => {}
-                // The only push log lines are the ruled ones: no kind, path or token.
-                Err(_) => push::report(&[push::Outcome::Failed]),
-            }
-            for state in self.conns.values_mut() {
-                if let Some(held) = state
-                    .device
-                    .as_mut()
-                    .filter(|held| held.push_token.as_ref() == Some(token))
-                {
-                    held.push_token = None;
-                }
-            }
+            let token = token.clone();
+            self.save(push_token_drop(&token), move |result| {
+                AfterSave::PushDropped { token, result }
+            });
         }
     }
 
@@ -1910,6 +2259,49 @@ fn clip(text: &str) -> String {
 /// Queues `frame` for every watcher; one whose queue is full or gone is dropped, never waited for.
 fn broadcast(watchers: &mut Vec<mpsc::Sender<String>>, frame: &str) {
     watchers.retain(|watcher| watcher.try_send(frame.to_owned()).is_ok());
+}
+
+/// What the hub serves from: its files, the run directory, and both sockets, bound.
+struct Bound {
+    store: Store,
+    run: PathBuf,
+    control_path: PathBuf,
+    control: UnixListener,
+    listener: TcpListener,
+    /// The loopback port it listens on.
+    port: u16,
+}
+
+/// Opens the hub's files in `directory`, readies its run directory and binds the control
+/// socket there and `127.0.0.1:<port>` (0 for any).
+async fn bind(directory: &Path, port: u16) -> Result<Bound, String> {
+    let store = Store::open(directory).await.map_err(|e| {
+        format!(
+            "Couldn't open the hub's files in {}: {e}",
+            directory.display()
+        )
+    })?;
+    let run = run_dir(directory);
+    private_dir(&run)
+        .await
+        .map_err(|e| format!("Couldn't prepare {}: {e}", run.display()))?;
+    let control_path = run.join("hub.sock");
+    let control = bind_control(&control_path).await?;
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| format!("Couldn't listen on 127.0.0.1:{port}: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Couldn't read the port: {e}"))?
+        .port();
+    Ok(Bound {
+        store,
+        run,
+        control_path,
+        control,
+        listener,
+        port,
+    })
 }
 
 /// Makes `run` ready for the hub's socket: creates it owner-only if missing, refuses one that is
@@ -2319,15 +2711,22 @@ async fn hand_off(job: HandOff) {
     }
 }
 
+/// What one connection's writer sends: the hub's live frames, its `sessions` frame, and the
+/// replays' frames.
+struct Writer {
+    outbox: mpsc::Receiver<Out>,
+    listing: Listing,
+    replays: mpsc::Receiver<ReplayItem>,
+}
+
 /// Serves one upgraded connection: frames both ways until either side ends.
 async fn connection(
     ws: WebSocketStream<TcpStream>,
     conn: u64,
-    mut outbox: mpsc::Receiver<Out>,
-    mut replays: mpsc::Receiver<ReplayItem>,
+    mut writer: Writer,
     events: mpsc::Sender<ConnEvent>,
 ) {
-    pump(ws, conn, &mut outbox, &mut replays, &events).await;
+    pump(ws, conn, &mut writer, &events).await;
     let _ = events.send(ConnEvent::Closed { conn }).await;
 }
 
@@ -2453,10 +2852,14 @@ fn host_of(authority: &str) -> &str {
 async fn pump(
     mut ws: WebSocketStream<TcpStream>,
     conn: u64,
-    outbox: &mut mpsc::Receiver<Out>,
-    replays: &mut mpsc::Receiver<ReplayItem>,
+    writer: &mut Writer,
     events: &mpsc::Sender<ConnEvent>,
 ) {
+    let Writer {
+        outbox,
+        listing,
+        replays,
+    } = writer;
     let mut replaying = true;
     let mut alive = Liveness::default();
     let mut pings = interval_at(Instant::now() + PING_EVERY, PING_EVERY);
@@ -2489,7 +2892,7 @@ async fn pump(
                 Some(ReplayItem::Frame { frame, current }) => {
                     // A subscription since dropped or replaced has its acknowledgement out
                     // already: what it left queued would follow it.
-                    if current.load(Ordering::Acquire) && !write(&mut ws, frame).await {
+                    if current.load(Ordering::Acquire) && !write(&mut ws, frame.into()).await {
                         return;
                     }
                 }
@@ -2504,7 +2907,14 @@ async fn pump(
             },
             item = outbox.recv() => match item {
                 Some(Out::Text(frame)) => {
-                    if !write(&mut ws, frame).await {
+                    if !write(&mut ws, frame.into()).await {
+                        return;
+                    }
+                }
+                Some(Out::Sessions) => {
+                    if let Some(frame) = take_listing(listing)
+                        && !write(&mut ws, frame).await
+                    {
                         return;
                     }
                 }
@@ -2518,7 +2928,7 @@ async fn pump(
 }
 
 /// Writes one text frame; false if it failed or stalled.
-async fn write(ws: &mut WebSocketStream<TcpStream>, frame: String) -> bool {
+async fn write(ws: &mut WebSocketStream<TcpStream>, frame: Utf8Bytes) -> bool {
     timeout(WRITE_STALL, ws.send(Message::text(frame)))
         .await
         .is_ok_and(|sent| sent.is_ok())
@@ -2658,9 +3068,11 @@ mod tests {
     #[test]
     fn a_seat_is_given_back_and_only_open_connections_are_capped() {
         let room = Arc::new(Room::default());
-        // Silent connections take seats past the waiting room's size: the hub lets the oldest go
-        // as each new one comes, so they never turn a phone away.
-        let seats: Vec<Seat> = (0..MAX_CONNECTIONS).filter_map(|_| room.seat()).collect();
+        // Connections past hello take seats past the waiting room's size, up to the cap.
+        let seats: Vec<Seat> = (0..MAX_CONNECTIONS)
+            .filter_map(|_| room.seat())
+            .inspect(Seat::admitted)
+            .collect();
         assert_eq!(seats.len(), MAX_CONNECTIONS);
         assert!(room.seat().is_none(), "every connection is open");
         drop(seats);
@@ -2668,6 +3080,69 @@ mod tests {
         assert!(room.seat().is_some());
         // Ten seconds to say hello.
         assert_eq!(HELLO_WITHIN, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_waiting_socket_younger_than_two_seconds_is_never_let_go() {
+        let room = Arc::new(Room::default());
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // Thirty-two wait, one every 10 ms.
+        let waiting: Vec<Seat> = (0..MAX_WAITING as u64)
+            .map(|n| room.seat_at(at(n * 10)).expect("room to wait"))
+            .collect();
+        // A newcomer while all are younger than 2 s: turned away, and nobody is let go.
+        assert!(room.seat_at(at(1000)).is_none());
+        assert!(waiting.iter().all(|seat| !seat.evicted()));
+        assert_eq!(room.open.load(Ordering::Acquire), MAX_WAITING);
+        // Once the oldest has waited 2 s, a newcomer lets it go, and only it.
+        let newcomer = room.seat_at(at(2000)).expect("room once the oldest is old");
+        assert!(waiting[0].evicted());
+        assert!(waiting[1..].iter().all(|seat| !seat.evicted()));
+        // The next has waited only 1.99 s: the room is full again.
+        assert!(room.seat_at(at(2000)).is_none());
+        // A connection that says hello leaves the room, and is never let go after.
+        waiting[5].admitted();
+        let another = room.seat_at(at(2001)).expect("the hello made room");
+        assert!(
+            room.seat_at(at(9000)).is_some(),
+            "the 2nd oldest makes room"
+        );
+        assert!(waiting[1].evicted() && !waiting[5].evicted());
+        // One that goes away frees its place.
+        drop((newcomer, another));
+        assert!(room.seat_at(at(2002)).is_some());
+    }
+
+    #[test]
+    fn a_waiting_sessions_frame_is_replaced_not_queued() {
+        let (out, mut outbox) = mpsc::channel(4);
+        let listing = Listing::default();
+        // A thousand lists while the writer is busy: one place in the queue, the newest frame.
+        for n in 0..1000 {
+            let frame = Utf8Bytes::from(format!("list {n}"));
+            assert!(offer_listing(&out, &listing, &frame));
+        }
+        assert!(matches!(outbox.try_recv(), Ok(Out::Sessions)));
+        assert!(outbox.try_recv().is_err(), "one place, however many lists");
+        assert_eq!(take_listing(&listing).as_deref(), Some("list 999"));
+        assert_eq!(take_listing(&listing), None);
+        // Once it went, the next list takes a place again, after what was queued before it.
+        out.try_send(Out::Text("ack".into())).unwrap();
+        assert!(offer_listing(&out, &listing, &Utf8Bytes::from("list 1000")));
+        assert!(matches!(outbox.try_recv(), Ok(Out::Text(text)) if text == "ack"));
+        assert!(matches!(outbox.try_recv(), Ok(Out::Sessions)));
+        // Every phone shares the one text.
+        let shared = Utf8Bytes::from("shared".to_owned());
+        let (other, _keep) = mpsc::channel(1);
+        let theirs = Listing::default();
+        assert!(offer_listing(&other, &theirs, &shared));
+        let held = take_listing(&theirs).unwrap();
+        assert_eq!(held.as_str().as_ptr(), shared.as_str().as_ptr());
+        // A queue with no room left drops the phone, as any frame does.
+        let (full, _queue) = mpsc::channel(1);
+        full.try_send(Out::Close).unwrap();
+        assert!(!offer_listing(&full, &Listing::default(), &shared));
     }
 
     #[test]
