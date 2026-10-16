@@ -14,8 +14,7 @@ import { TranscriptHeader } from "../../src/components/TranscriptHeader";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
 import { useInboxWhenUnpaired } from "../../src/components/unpair";
 import { clearEdgeBottom, setEdgeBottom, useDrawerOpen } from "../../src/drawer";
-import { useClient, useLinks } from "../../src/hub";
-import { macName } from "../../src/inbox";
+import { useClient, useLinks, useMac } from "../../src/hub";
 import { macOfKey } from "../../src/macs";
 import type { Entry } from "../../src/model/transcript";
 import { engineModel, headEngine, headMode, headModel, nowLine, type SessionHead } from "../../src/session";
@@ -179,7 +178,8 @@ export default function Session() {
   const phase = state?.phase ?? info?.phase ?? "idle";
   // The mascot over the transcript: this session's state, by the same map as the Inbox's.
   const pose = poseOf({ approvals: approvals.length, phase, now: state?.now ?? info?.now, turn });
-  const mac = macName(client?.url);
+  // The Mac as the pairing names it (renamed in Settings, or as it was kept when paired again).
+  const mac = useMac(macId ?? "")?.macName ?? "Mac";
   const head: SessionHead = { workspace, engine: info?.engine, model: info?.model ?? undefined, mode: info?.mode };
   const mode = headMode(catalog, head);
   const line = engineModel(catalog, head);

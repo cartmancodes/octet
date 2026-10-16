@@ -270,6 +270,18 @@ describe("a Mac coming or going leaves the session in front alone", () => {
   });
 });
 
+describe("Macs by their names", () => {
+  it("the Conversation names its Mac as the pairing does, renamed or not", async () => {
+    await pairedMacs(2);
+    const rig = await launchMacs("/", ROUTES, { studio: [info("a")], mini: [info("b")] });
+    await act(async () => void rig.hub.rename(STUDIO.id, "Desk"));
+    await act(async () => router.push(`/session/${encodeURIComponent(inStudio("a"))}`));
+    await flush();
+    expect(screen.getByText(/· Desk$/)).toBeTruthy();
+    expect(screen.queryByText(/· studio$/)).toBeNull();
+  });
+});
+
 describe("the drawer groups by Mac", () => {
   it("one header per Mac, in pairing order, with its sessions under it in the Inbox's order", async () => {
     await pairedMacs(2);
@@ -397,6 +409,67 @@ describe("New session's Mac chip", () => {
     await fireEvent.press(macChip());
     await flush();
     expect(screen.getByRole("button", { name: /^Folder/ }).props.accessibilityLabel).toBe("Folder on-mini");
+  });
+});
+
+describe("New session keeps its Mac", () => {
+  const macChip = () => screen.getByRole("button", { name: /^Mac / });
+  const startButton = () => screen.getByRole("button", { name: "Start session" });
+  const starts = (rig: Rig) => rig.sockets.all.flatMap((x) => x.commandsOf("start"));
+
+  it("the Mac chosen on the chip stays when it drops: it says asleep, Start waits, and nothing goes to another Mac", async () => {
+    await pairedMacs(2);
+    const rig = await launchMacs("/", ROUTES, { studio: [info("on-studio")], mini: [info("on-mini")] });
+    await act(async () => router.push("/new"));
+    await flush();
+    await fireEvent.press(macChip());
+    await flush();
+    expect(macChip().props.accessibilityLabel).toBe("Mac mini");
+    await fireEvent.changeText(screen.getByLabelText("What should the agent do?"), "fix the build");
+    await sleep(rig, "mini");
+    await flush();
+    expect(macChip().props.accessibilityLabel).toBe("Mac mini, asleep");
+    expect(screen.getByText("mini · asleep")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Folder/ }).props.accessibilityLabel).toBe("Folder on-mini");
+    expect(disabled(startButton())).toBe(true);
+    await fireEvent.press(startButton());
+    await flush();
+    expect(starts(rig)).toEqual([]);
+    // Back: Start goes to it.
+    await act(async () => void rig.clock.advance(60_000));
+    await hearOn(rig, "mini", [info("on-mini")]);
+    await flush();
+    expect(macChip().props.accessibilityLabel).toBe("Mac mini");
+    await fireEvent.press(startButton());
+    await flush();
+    expect(socketTo(rig, "mini").commandsOf("start")).toEqual([expect.objectContaining({ workspace: "/Users/me/Projects/on-mini" })]);
+    expect(starts(rig)).toHaveLength(1);
+  });
+
+  it("so does the first online Mac it showed", async () => {
+    await pairedMacs(2);
+    const rig = await launchMacs("/", ROUTES, { studio: [info("on-studio")], mini: [info("on-mini")] });
+    await act(async () => router.push("/new"));
+    await flush();
+    expect(macChip().props.accessibilityLabel).toBe("Mac studio");
+    await sleep(rig, "studio");
+    await flush();
+    expect(macChip().props.accessibilityLabel).toBe("Mac studio, asleep");
+    expect(disabled(startButton())).toBe(true);
+  });
+
+  it("goes to another Mac only when its own is unpaired", async () => {
+    await pairedMacs(2);
+    const rig = await launchMacs("/", ROUTES, { studio: [info("on-studio")], mini: [info("on-mini")] });
+    await act(async () => router.push("/new"));
+    await flush();
+    await act(async () => {
+      socketTo(rig, "studio").receive({ type: "refused", req: 0, reason: "This device was revoked", code: "revoked" });
+      rig.clock.advance(50);
+    });
+    await flush();
+    expect(macChip().props.accessibilityLabel).toBe("Mac mini");
+    expect(disabled(startButton())).toBe(false);
   });
 });
 

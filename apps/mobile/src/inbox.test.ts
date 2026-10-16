@@ -1,4 +1,4 @@
-import { NO_GIST_LINE, cardLabel, classify, drawerList, drawerSub, inboxOf, macName, sameItem, shortAgo } from "./inbox";
+import { NO_GIST_LINE, cardLabel, classify, drawerList, drawerSub, inboxOf, sameItem, shortAgo } from "./inbox";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 
 const NOW_MS = 1_800_000_000 * 1000;
@@ -46,22 +46,6 @@ describe("inboxOf: one classify for the Inbox and the drawer", () => {
     expect(sorts).not.toHaveBeenCalled();
     expect(drawer.rows.map((r) => r.id)).toEqual([...inbox.needs, ...inbox.running, ...inbox.done].map((i) => i.id));
     expect(inboxOf(rows, { mac: "studio", now: NOW_MS, names })).toBe(inbox);
-  });
-});
-
-describe("macName", () => {
-  it("is the hub host's first label", () => {
-    expect(macName("wss://studio-mac.tail1234.ts.net/")).toBe("studio-mac");
-    expect(macName("wss://studio-mac.tail1234.ts.net:8443/hub")).toBe("studio-mac");
-    expect(macName("ws://mac/")).toBe("mac");
-  });
-
-  it("keeps an IP address whole, and is Mac when there is no address", () => {
-    expect(macName("wss://100.64.1.2:8443/")).toBe("100.64.1.2");
-    expect(macName("wss://[fd7a::1]:8443/")).toBe("[fd7a::1]");
-    expect(macName(null)).toBe("Mac");
-    expect(macName("")).toBe("Mac");
-    expect(macName("not a url")).toBe("Mac");
   });
 });
 

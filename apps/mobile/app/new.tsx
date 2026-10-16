@@ -10,11 +10,12 @@ import { NewChips } from "../src/components/NewChips";
 import { failure, isSlash, PROMPT_LIMIT, SLASH_NOTE, TOO_LONG, useSend, utf8Bytes } from "../src/components/send";
 import { lightTap } from "../src/haptics";
 import { useMacs } from "../src/hub";
+import { macStatus } from "../src/macs";
 import type { Engine, Mode } from "../src/protocol";
 import { modelsFor } from "../src/recent";
 import { sessionName } from "../src/sessions";
 import { NO_WORKSPACE, useStartSession, useWorkspaceChoices, type StartBody } from "../src/start";
-import { octetStore, useCatalogs, useHub, useReadyMacs } from "../src/store";
+import { octetStore, useCatalogs, useHub, useReadyMacs, useTried } from "../src/store";
 import { spacing, type, useTheme } from "../src/theme";
 import { showToast } from "../src/toast";
 
@@ -47,16 +48,23 @@ export default function NewSession() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const focused = useIsFocused();
-  // Where the session starts: the Mac chosen on the chip (or pinned by Start), while it is online;
-  // else the first online Mac; else the first paired. With one Mac, that one.
+  // Where the session starts: the Mac chosen on the chip (or pinned by Start, or the first online
+  // one the screen showed), for as long as it is paired. Asleep, it stays: the chip says so and
+  // Start waits for it, so a prompt never lands on a Mac (or in a folder) the user did not pick.
+  // Another Mac only while none is chosen yet, or once the chosen one is unpaired: the first
+  // online, else the first paired. With one Mac, that one.
   const macs = useMacs();
   const [chosen, setChosen] = useState<string | null>(null);
   const ready = useReadyMacs();
   const online = useMemo(() => macs.filter((m) => ready.has(m.id)), [macs, ready]);
-  const target = online.find((m) => m.id === chosen) ?? online[0] ?? macs[0];
+  const target = macs.find((m) => m.id === chosen) ?? online[0] ?? macs[0];
   const targetId = target?.id;
+  if (targetId !== undefined && targetId !== chosen && ready.has(targetId)) setChosen(targetId);
   const targetName = target?.macName ?? "Mac";
   const hub = useHub(targetId ?? "");
+  // With several Macs the chip says when its Mac is not ready (with one, the banner does).
+  const tried = useTried(targetId ?? "");
+  const macWord = macs.length > 1 ? macStatus(hub, tried) : null;
   const catalogs = useCatalogs(targetId);
   const { choices: workspaces, loaded: foldersLoaded } = useWorkspaceChoices(targetId);
   const [text, setText] = useState("");
@@ -262,6 +270,7 @@ export default function NewSession() {
       {armed ? <FullAccessConfirm busy={locked} onTurnOn={turnOn} onCancel={cancelFull} /> : null}
       <NewChips
         mac={targetName}
+        status={macWord}
         online={reachable}
         folder={workspace === null ? "" : sessionName(workspace)}
         loading={workspace === null && !foldersLoaded}

@@ -25,7 +25,8 @@ import WebSocket from "ws";
 
 import { type BatchItem, HubClient } from "../src/client/HubClient";
 import { sendVia } from "../src/sendVia";
-import { keyOf, linksOf } from "../src/macs";
+import { parsePairLink } from "../src/client/link";
+import { keyFor, keyOf, linksOf, tapKey } from "../src/macs";
 import type { EventFrame, ToPhone } from "../src/protocol";
 import { connectStore, createOctetStore, entriesNow, watch } from "../src/store";
 import { nodeSocketFactory } from "./nodeSocket";
@@ -199,6 +200,9 @@ run("the app's hub client against the real octet hub", () => {
   let pushFake: PushFake | null = null;
   let seq = 0;
   let client: HubClient | null = null;
+  /** The pairing link the Mac shows for the secret the phone paired with, as the terminal UI
+   * builds it (crates/octet-tui/src/remote.rs). */
+  let pairLink = "";
   const sockets: WebSocket[] = [];
   const batches: BatchItem[] = [];
 
@@ -341,6 +345,7 @@ run("the app's hub client against the real octet hub", () => {
     const secret = await control(path.join(root, "run", "hub.sock"), { type: "pair_secret" });
     expect(typeof secret.secret).toBe("string");
     expect(secret.url).toBe("https://mac.test.ts.net");
+    pairLink = `${String(secret.url).replace(/\/$/, "")}/#pair=${String(secret.secret)}`;
     // The hub's publish lookup went to the stand-in, and asked it only the one read-only question.
     const asked = readFileSync(standInLog, "utf8").split("\n").filter((line) => line !== "");
     expect(asked.length).toBeGreaterThan(0);
@@ -510,6 +515,17 @@ run("the app's hub client against the real octet hub", () => {
         channelId: "approvals",
       },
     ]);
+    // A tap routes by that host, through the resolver the app uses (`tapKey` on `keyFor`), to the
+    // pairing made from this hub's own pairing link: the host match is the whole of push routing.
+    const [pushed] = JSON.parse(body) as [{ data: { mac: string; session: string } }];
+    const hubUrl = parsePairLink(pairLink)?.url;
+    expect(hubUrl).toBe("wss://mac.test.ts.net/");
+    const pairings = [
+      { id: "m0000000c", hubUrl: "wss://other.test.ts.net/" },
+      { id: "m0000000d", hubUrl: hubUrl ?? "" },
+    ];
+    expect(keyFor(pairings, pushed.data.mac, pushed.data.session)).toBe(keyOf("m0000000d", sessionId));
+    expect(tapKey({ host: pushed.data.mac, session: pushed.data.session }, pairings, () => false)).toBe(keyOf("m0000000d", sessionId));
     // Nothing of the approval, the workspace, the model or the engine is in it, and it came once.
     for (const secret of ["/work", workspace, "rm -rf", "secret-dir", "private", "opus", "claude"]) {
       expect(body).not.toContain(secret);

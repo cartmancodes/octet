@@ -7,6 +7,9 @@ import { Chip, Label } from "../ui";
 interface NewChipsProps {
   /** The Mac's name. */
   mac: string;
+  /** Why the Mac can't be reached ("asleep", "connecting…"), said after its name; null when it can,
+   * and with one Mac (its banner says so). */
+  status?: string | null;
   /** The connection is up: the Mac's dot is lit. */
   online: boolean;
   /** The folder of the chosen workspace; empty when none is known. */
@@ -35,6 +38,7 @@ const FULL_ACCESS_HINT = "Long-press for full access";
  * mode (or its "full access" action, for a screen reader) starts the guarded full-access flow. */
 export const NewChips = memo(function NewChips({
   mac,
+  status = null,
   online,
   folder,
   loading,
@@ -58,7 +62,13 @@ export const NewChips = memo(function NewChips({
     <View style={styles.box}>
       <Label style={styles.label}>Tap to change</Label>
       <View style={styles.row}>
-        <Chip label={mac} dot="●" dotColor={online ? theme.accent : theme.muted} accessibilityLabel={`Mac ${mac}`} onPress={onMac} />
+        <Chip
+          label={status === null ? mac : `${mac} · ${status}`}
+          dot="●"
+          dotColor={online ? theme.accent : theme.muted}
+          accessibilityLabel={status === null ? `Mac ${mac}` : `Mac ${mac}, ${status}`}
+          onPress={onMac}
+        />
         <Chip
           label={loading ? "loading…" : folder === "" ? "no folder" : folder}
           accessibilityLabel={`Folder ${loading ? "loading…" : folder === "" ? "none" : folder}`}

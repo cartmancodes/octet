@@ -166,6 +166,17 @@ describe("the Pair screen", () => {
     expect(toastStore.getState().toast?.text).toBe("Paired with mac");
   });
 
+  it("pairing a Mac again toasts the name it kept, not its host's", async () => {
+    await SecureStore.setItemAsync(tokenKeyOf("m000000aa"), TOKEN);
+    await saveSettings({ pairings: [{ id: "m000000aa", hubUrl: "wss://mac.tail1234.ts.net/", deviceName: "iPhone", macName: "Desk" }] });
+    const rig = await open();
+    await paste(LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    accept(rig);
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
+    expect(toastStore.getState().toast?.text).toBe("Paired with Desk");
+  });
+
   it("toasts nothing when the pairing fails", async () => {
     const rig = await open();
     await paste(LINK);

@@ -140,12 +140,16 @@ describe("macNameOf", () => {
     expect(macNameOf("wss://studio.tail1.ts.net/")).toBe("studio");
     expect(macNameOf("wss://studio.tail1.ts.net/hub?x=1")).toBe("studio");
     expect(macNameOf("wss://studio-mac.tail1234.ts.net:8443/")).toBe("studio-mac");
+    expect(macNameOf("wss://studio-mac.tail1234.ts.net:8443/hub")).toBe("studio-mac");
+    expect(macNameOf("ws://mac/")).toBe("mac");
   });
 
   it("keeps an IP address whole, and is Mac with no address", () => {
     expect(macNameOf("ws://100.64.0.7:7777/")).toBe("100.64.0.7");
+    expect(macNameOf("wss://[fd7a::1]:8443/")).toBe("[fd7a::1]");
     expect(macNameOf(null)).toBe("Mac");
     expect(macNameOf("")).toBe("Mac");
+    expect(macNameOf("not a url")).toBe("Mac");
   });
 });
 

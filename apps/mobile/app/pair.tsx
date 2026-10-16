@@ -9,7 +9,7 @@ import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { confirmUnpair } from "../src/components/unpair";
 import { NOT_A_LINK, useFleetStatus, useHubController, useMacs, useNotice, useOffer, type MacInfo, type Fleet } from "../src/hub";
-import { macName } from "../src/inbox";
+import { hostOf, macNameOf } from "../src/macs";
 import { Mascot } from "../src/mascot/Mascot";
 import { useHub } from "../src/store";
 import { radius, spacing, type, useTheme } from "../src/theme";
@@ -68,7 +68,9 @@ export default function Pair() {
     try {
       const result = await hub.pair(link, name);
       if (result.ok) {
-        showToast(`Paired with ${macName(parsed.url)}`);
+        // The name the pairing has: a Mac paired again keeps the one it was given.
+        const host = hostOf(parsed.url);
+        showToast(`Paired with ${hub.snapshot().macs.find((m) => m.host === host)?.macName ?? macNameOf(parsed.url)}`);
         // With a notifications step to show, Pair stays up until the user answers it.
         if (!hub.snapshot().offer) router.replace("/");
         return;

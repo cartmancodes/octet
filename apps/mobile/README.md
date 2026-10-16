@@ -139,7 +139,9 @@ in plain storage.
 The app pairs with up to 4 Macs. To add one, open **Settings › Machines › + Pair another machine**
 (off at 4: `4 Macs is the most`) and scan that Mac's code. Every Mac stays connected while the app is
 open; the Inbox and the drawer show all their sessions, each named by its Mac, and a Mac that can't
-be reached shows "asleep" and greys only its own sessions. In **Machines**, **Rename** gives a Mac a
+be reached shows "asleep" (back in the app, "connecting…" until its first try is over) and greys
+only its own sessions. New session keeps the Mac you chose: if it drops while you type, its chip
+says so and Start waits for it. In **Machines**, **Rename** gives a Mac a
 name of 1 to 40 characters on this phone, and **Unpair** asks `Unpair <name>? Its sessions leave
 this phone.` and drops only that Mac (a screen showing one of its sessions goes back to the Inbox).
 
@@ -159,7 +161,7 @@ cards with their titles notched into the border, and touch targets of at least 4
 side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Settings.
 
 - **Pair.** A panel with the camera in four accent corner brackets and a bottom sheet: `PAIRED`
-  (the Macs this phone is paired with, each with **Unpair** while none can be reached) and
+  (the Macs this phone is paired with, each with **Unpair** while none of them has a working pairing on this phone) and
   **Enter code instead**, which shows the paste and name fields. Opened from **+ Pair another
   machine**, it reads **Pair another machine**, with Cancel. A scanned code only fills the field; you confirm the Mac it
   names and tap **Pair**. After pairing, one offer to turn on notifications.

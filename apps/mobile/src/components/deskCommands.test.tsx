@@ -3,7 +3,7 @@
 // open the ack's text in a sheet, /export toasts it. Each row is off while offline, while an
 // approval waits, and while a command is out; the words clear only when a command ran.
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { act, fireEvent, render, screen, within } from "@testing-library/react-native";
+import { fireEvent, render, screen, within } from "@testing-library/react-native";
 import { StyleSheet } from "react-native";
 
 import { Refusal } from "../client/HubClient";

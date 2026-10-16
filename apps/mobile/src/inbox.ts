@@ -1,6 +1,5 @@
 // What the Inbox derives from the hub's sessions list: which tab each session is on, in what
 // order, and the words on its card. Pure; the screen only draws it.
-import { macNameOf } from "./macs";
 import { foldCommand } from "./model/command";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { clipLabel, phaseWords, sessionName, sessionPose } from "./sessions";
@@ -64,10 +63,6 @@ const MORE_FILES = /^\+\d+ more$/;
 const NO_FILES: readonly string[] = [];
 /** What a screen reader adds for a shortened request. */
 export const SHORTENED_LABEL = "Shortened: review it in the session";
-
-/** The Mac's name: the first label of the hub's host ("studio-mac" from
- * "wss://studio-mac.tail1234.ts.net/"). An IP address is kept whole. "Mac" without an address. */
-export const macName = macNameOf;
 
 const MINUTE = 60;
 const HOUR = 3_600;
