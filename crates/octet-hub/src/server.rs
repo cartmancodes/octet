@@ -44,7 +44,7 @@
 //! 512: a phone that lets it fill is dropped.
 use crate::{
     activity::{Activity, Report},
-    apns::Signer,
+    apns::{Outcome, Signer},
     git::{self, Git},
     launch::{self, Launches, StartRequest, clip as clip_to},
     owner::published_url,
@@ -501,9 +501,9 @@ struct Conn {
     device: Option<Device>,
     /// The sessions it streams, by id.
     subscriptions: HashMap<String, Subscription>,
-    /// Whether it ever sent `subscribe`: only the app in the foreground does, so only such a
-    /// connection takes the Live Activity over from the hub.
-    streamed: bool,
+    /// Whether its hello said it is the app in the background (handing a Live Activity token
+    /// over, or sending a Deny): such a connection is never the app in front.
+    background: bool,
     /// What its last `changes` of each session listed, which is all a `diff` may name.
     listings: Listings,
     /// Its place in the hub's room, given back as it drops.
@@ -800,7 +800,7 @@ impl Hub {
                 opened: Instant::now(),
                 device: None,
                 subscriptions: HashMap::new(),
-                streamed: false,
+                background: false,
                 listings: Listings::default(),
                 seat,
             },
@@ -880,7 +880,7 @@ impl Hub {
         };
         let now = SystemTime::now();
         match command {
-            PhoneCommand::Hello { token } => {
+            PhoneCommand::Hello { token, background } => {
                 // A revoke by the CLI must be seen before the token is believed.
                 self.store.reload_if_changed().await;
                 let Some(device) = self
@@ -893,13 +893,18 @@ impl Hub {
                     return;
                 };
                 let name = device.name.clone();
-                // Judged on news from now; a hello alone ends no Live Activity.
+                // Judged on news from now. Any hello but a background one is the app in front,
+                // which drives the Live Activity itself while it is; nothing ends.
                 if let Some(activity) = self.activity.as_mut() {
                     activity.hello(&device.token_sha256);
+                    if !background {
+                        activity.connected(&device.token_sha256);
+                    }
                 }
                 // Out of the waiting room before the phone hears it is in.
                 if let Some(state) = self.conns.get_mut(&conn) {
                     state.device = Some(device);
+                    state.background = background;
                     state.seat.said_hello();
                 }
                 self.send(conn, &welcome(&name));
@@ -975,7 +980,6 @@ impl Hub {
                 return self.activity(conn, device, req, command).await;
             }
             PhoneCommand::Subscribe { session, after } => {
-                self.streaming(conn, device);
                 self.subscribe(conn, req, session, after);
                 return;
             }
@@ -1104,6 +1108,11 @@ impl Hub {
                 let activity = ActivityTokens {
                     token: exposed(token),
                     start_token: exposed(start_token),
+                    // After 12 hours the token is spent: ActivityKit has ended that activity.
+                    registered: SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .ok()
+                        .map(|since| since.as_secs()),
                 };
                 let saved = self.store.set_activity(hash, activity).await;
                 (
@@ -1590,22 +1599,6 @@ impl Hub {
         }
     }
 
-    /// `conn`, of `device`, sent a `subscribe`: the app is in the foreground. The first time, the
-    /// news so far is spent; the Live Activity goes on, and the app drives it while it is in
-    /// front. A connection that only says hello or registers tokens (a background wake) never
-    /// gets here.
-    fn streaming(&mut self, conn: u64, device: &Device) {
-        let Some(state) = self.conns.get_mut(&conn) else {
-            return;
-        };
-        if std::mem::replace(&mut state.streamed, true) {
-            return;
-        }
-        if let Some(activity) = self.activity.as_mut() {
-            activity.connected(&device.token_sha256);
-        }
-    }
-
     /// Every second: refuses what timed out, and sends the pushes and Live Activity sends due.
     fn tick(&mut self) {
         self.sweep();
@@ -1715,12 +1708,7 @@ impl Hub {
                 .find(|device| device.token_sha256 == key);
             let token = known.and_then(|device| device.push_token.clone());
             let kinds = known.map(|device| device.push_kinds).unwrap_or_default();
-            let connected = token.is_none()
-                || self.conns.values().any(|conn| {
-                    conn.device
-                        .as_ref()
-                        .is_some_and(|device| device.token_sha256 == key)
-                });
+            let connected = token.is_none() || in_front(&self.conns, &key);
             let due = self
                 .pusher
                 .due_for(&key, connected, kinds, &mut self.cap, now);
@@ -1745,26 +1733,18 @@ impl Hub {
         };
         let mac = push_mac(&self.published.borrow());
         let conns = &self.conns;
-        let connected = |key: &str| {
-            conns.values().any(|conn| {
-                conn.streamed
-                    && conn
-                        .device
-                        .as_ref()
-                        .is_some_and(|device| device.token_sha256 == key)
-            })
-        };
         activity.flush(
             self.store.devices(),
-            connected,
+            |key| in_front(conns, key),
             &mut self.cap,
             mac.as_deref(),
             (Instant::now(), SystemTime::now()),
         );
     }
 
-    /// Takes what a Live Activity send came to. A token APNs says is gone (410) is cleared, by
-    /// value, from `devices.json` and from the connections' copies of their devices.
+    /// Takes what a Live Activity send came to. A token APNs says is gone (410), or one whose
+    /// activity the hub ended, is cleared, by value, from `devices.json` and from the
+    /// connections' copies of their devices.
     async fn on_activity_report(&mut self, report: &Report) {
         let Some(activity) = self.activity.as_mut() else {
             return;
@@ -1778,9 +1758,12 @@ impl Hub {
         if !activity.reported(report, stored.as_deref()) {
             return;
         }
+        // A token APNs said is gone is audited; one the hub ended is just let go.
         match self.store.drop_activity_token(&report.token).await {
-            Ok(Some(name)) => self.store.audit(&name, "", "activity dropped").await,
-            Ok(None) => {}
+            Ok(Some(name)) if report.outcome == Outcome::Gone => {
+                self.store.audit(&name, "", "activity dropped").await;
+            }
+            Ok(_) => {}
             Err(_) => eprintln!("{ACTIVITY_NOT_DROPPED}"),
         }
         let devices = self.store.devices();
@@ -1832,12 +1815,8 @@ impl Hub {
         self.pending.retain(|_, pending| pending.conn != conn);
         if let Some(device) = &state.device {
             let key = &device.token_sha256;
-            let still_here = self.conns.values().any(|other| {
-                other
-                    .device
-                    .as_ref()
-                    .is_some_and(|held| &held.token_sha256 == key)
-            });
+            // A background connection going was never the app in front.
+            let still_here = state.background || in_front(&self.conns, key);
             // A device unpaired, or without a push token, has nowhere to be told.
             let reachable = self
                 .store
@@ -2017,6 +1996,18 @@ enum Publication {
 
 /// The hub's [`Publication`], as last asked.
 type Published = watch::Receiver<Publication>;
+
+/// Whether the device whose token hash is `key` has the app in front: a connection of it whose
+/// hello was not a background one, on any screen. The pusher and the Live Activity share it.
+fn in_front(conns: &HashMap<u64, Conn>, key: &str) -> bool {
+    conns.values().any(|conn| {
+        !conn.background
+            && conn
+                .device
+                .as_ref()
+                .is_some_and(|device| device.token_sha256 == key)
+    })
+}
 
 /// The Live Activity, when `hub.json` names APNs and its key loads (read once, off the hub's
 /// thread); `None` otherwise, and then nothing of it runs. The key is never read again: a hub

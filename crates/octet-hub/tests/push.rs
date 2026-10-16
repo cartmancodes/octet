@@ -249,6 +249,11 @@ impl Env {
     /// A phone called `name` that paired, said hello and turned on push for `token`, with the
     /// `kinds` it chose (the hub's defaults when none).
     async fn phone(&self, name: &str, token: &str, kinds: Option<Value>) -> Phone {
+        self.paired_phone(name, token, kinds).await.0
+    }
+
+    /// [`phone`](Self::phone), with the device token it said hello with.
+    async fn paired_phone(&self, name: &str, token: &str, kinds: Option<Value>) -> (Phone, String) {
         let mut phone = self.connect().await;
         let secret = self
             .control(&json!({"type": "pair_secret"}))
@@ -278,6 +283,19 @@ impl Env {
             recv_kind(&mut phone, "ack").await,
             ack(3, "Notifications on")
         );
+        (phone, device_token)
+    }
+
+    /// A background connection of the device `device`: the app handing a token over, not the
+    /// app in front.
+    async fn background_hello(&self, device: &str) -> Phone {
+        let mut phone = self.connect().await;
+        send(
+            &mut phone,
+            json!({"v": 1, "req": 2, "type": "hello", "token": device, "background": true}),
+        )
+        .await;
+        recv_kind(&mut phone, "welcome").await;
         phone
     }
 
@@ -475,6 +493,7 @@ fn push_goes_out_content_free_to_a_phone_in_the_background() {
             approval_then_turn(&fake, root.join("a"), &url, &log),
             connected_phones_are_left_alone(&fake, root.join("b")),
             a_dead_token_is_dropped(&fake, root.join("c")),
+            a_background_connection_is_not_the_app(&fake, root.join("d")),
         );
         assert_content_free(&fake);
         // No call to curl, whoever made it, had a push token in its argv.
@@ -614,4 +633,22 @@ async fn a_dead_token_is_dropped(fake: &Fake, root: PathBuf) {
     // The next approval has nowhere to go.
     link.state("idle", &[1, 2]).await;
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(4)).await, 1);
+}
+
+/// A background connection open while the phone is away (the app handing a token over) is not
+/// the app in front: the approval is pushed all the same.
+async fn a_background_connection_is_not_the_app(fake: &Fake, root: PathBuf) {
+    const TOKEN: &str = "ExpoPushToken[story-d-token]";
+    let env = Env::start(root, 6104).await;
+    let mut link = env.link().await;
+    let (phone, device) = env.paired_phone("Story D phone", TOKEN, None).await;
+    background(phone).await;
+    let wake = env.background_hello(&device).await;
+    link.state("idle", &[]).await;
+    link.state("idle", &[1]).await;
+    assert_eq!(
+        fake.wait_for(TOKEN, 0).await,
+        approval_message(TOKEN, &env.id)
+    );
+    drop(wake);
 }

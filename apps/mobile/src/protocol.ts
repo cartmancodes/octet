@@ -301,12 +301,13 @@ export interface RefusedFrame {
   code?: RefusalCode | null;
 }
 
-/** Connect with a device token. */
+/** Connect with a device token. `background: true` marks a connection the app makes from the background (to hand a Live Activity token over, or to send a Deny): it is not the app in front. Left out, the connection is the app in front. */
 export interface HelloCommand {
   v: 1;
   type: "hello";
   req: number;
   token: string;
+  background?: boolean | null;
 }
 
 /** Pair a new device with a pairing secret. */

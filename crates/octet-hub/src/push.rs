@@ -54,6 +54,9 @@ pub(crate) const WINDOW: Duration = Duration::from_secs(2);
 /// Sends one device gets in any rolling minute, at most: pushes and Live Activity sends together
 /// ([`Limiter`]).
 pub(crate) const CAP: usize = 6;
+/// Live Activity sends one device gets in any rolling minute, at most: the rest of [`CAP`] are
+/// left to its pushes.
+pub(crate) const ACTIVITY_CAP: usize = 3;
 /// The rolling minute of [`CAP`].
 const MINUTE: Duration = Duration::from_secs(60);
 /// How long one send may take in all; `curl` itself is told 10 seconds.
@@ -235,8 +238,9 @@ struct Window {
 /// in any rolling minute. The hub holds one and lends it to the pusher and the activity driver.
 #[derive(Default)]
 pub(crate) struct Limiter {
-    /// When each device was last sent to, by device key, oldest first.
-    sent: HashMap<String, VecDeque<Instant>>,
+    /// When each device was last sent to, and whether that was a Live Activity send, by device
+    /// key, oldest first.
+    sent: HashMap<String, VecDeque<(Instant, bool)>>,
 }
 
 // Device keys identify devices in `devices.json`: Debug shows a count only.
@@ -249,26 +253,40 @@ impl std::fmt::Debug for Limiter {
 }
 
 impl Limiter {
-    /// Whether `device` may be sent one more at `now`; if so, it is counted.
+    /// Whether `device` may be pushed one more at `now`: at most [`CAP`] sends of any kind in
+    /// its minute. If so, it is counted.
     pub(crate) fn allow(&mut self, device: &str, now: Instant) -> bool {
-        self.allow_keeping(device, now, 0)
+        let sent = self.recent(device, now);
+        if sent.len() >= CAP {
+            return false;
+        }
+        sent.push_back((now, false));
+        true
     }
 
-    /// Whether `device` may be sent one more at `now` and still have `keep` left in its minute
-    /// for others; if so, it is counted. [`allow`](Self::allow) keeps none.
-    pub(crate) fn allow_keeping(&mut self, device: &str, now: Instant, keep: usize) -> bool {
+    /// Whether `device` may be sent one more Live Activity send at `now`: at most
+    /// [`ACTIVITY_CAP`] of them in its minute, and only while one send of the [`CAP`] is left
+    /// after it, so the rest are the pushes'. If so, it is counted.
+    pub(crate) fn allow_activity(&mut self, device: &str, now: Instant) -> bool {
+        let sent = self.recent(device, now);
+        let activity = sent.iter().filter(|(_, activity)| *activity).count();
+        if activity >= ACTIVITY_CAP || sent.len() + 1 >= CAP {
+            return false;
+        }
+        sent.push_back((now, true));
+        true
+    }
+
+    /// `device`'s sends in the minute before `now`, older ones let go.
+    fn recent(&mut self, device: &str, now: Instant) -> &mut VecDeque<(Instant, bool)> {
         let sent = self.sent.entry(device.to_owned()).or_default();
         while sent
             .front()
-            .is_some_and(|at| now.saturating_duration_since(*at) >= MINUTE)
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= MINUTE)
         {
             sent.pop_front();
         }
-        if sent.len() + keep >= CAP {
-            return false;
-        }
-        sent.push_back(now);
-        true
+        sent
     }
 
     /// Forgets the devices whose last send is over a minute old.
@@ -276,7 +294,7 @@ impl Limiter {
         self.sent.retain(|_, sent| {
             while sent
                 .front()
-                .is_some_and(|at| now.saturating_duration_since(*at) >= MINUTE)
+                .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= MINUTE)
             {
                 sent.pop_front();
             }
@@ -289,7 +307,7 @@ impl Limiter {
     pub(crate) fn sends(&self, device: &str, now: Instant) -> usize {
         self.sent.get(device).map_or(0, |sent| {
             sent.iter()
-                .filter(|at| now.saturating_duration_since(**at) < MINUTE)
+                .filter(|(at, _)| now.saturating_duration_since(*at) < MINUTE)
                 .count()
         })
     }

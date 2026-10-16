@@ -695,6 +695,8 @@ run("the app's hub client against the real octet hub", () => {
         "attributes-type": "OctetActivity",
         attributes: {},
         alert: { title: "Octet", body: "Approval waiting" },
+        // Stale 15 minutes on, unless an update comes.
+        "stale-date": (payload.aps.timestamp as number) + 900,
       },
     });
     // Nothing of the session, its workspace, the request or the vendor.
@@ -712,7 +714,9 @@ run("the app's hub client against the real octet hub", () => {
     );
 
     // The app, woken in the background with that activity's token, hands it over as Fleet.handOver
-    // does: a connection of its own that says hello, registers, and closes, subscribing to nothing.
+    // does: a connection of its own that says hello, registers, and closes. (This client's hello
+    // has no `background: true`, so the hub counts it as the app in front while it is open, and
+    // sends nothing until it closes.)
     const handOver = new HubClient({ url: `ws://127.0.0.1:${port}/`, token: client?.token ?? null, factory: nodeSocketFactory(OWNER, sockets) });
     handOver.start();
     await until("the hand-over connection", () => handOver.state === "ready");
@@ -720,7 +724,7 @@ run("the app's hub client against the real octet hub", () => {
     if (!both) throw new Error("no registration");
     expect(await handOver.request(both)).toMatchObject({ type: "ack" });
     handOver.stop();
-    // That connection was not the phone coming back: the approval is answered on the desk, and the
+    // Once it has closed, the phone is away again: the approval is answered on the desk, and the
     // hub updates the activity it started through the token it was handed, and ends nothing.
     bridge?.send(bridgeState([]));
     const updated = await until("the update to the handed-over token", () => apnsFake?.requests.find((r) => r.path === `/3/device/${ACTIVITY_TOKEN}`), 15_000);
@@ -728,6 +732,7 @@ run("the app's hub client against the real octet hub", () => {
     expect(update.aps.event).toBe("update");
     expect(update.aps["content-state"]).toEqual({ kind: "done", session: sessionId, mac: "mac.test.ts.net", since: expect.any(Number), approvals: 0 });
     expect(update.aps).not.toHaveProperty("alert");
+    expect(update.aps["stale-date"]).toBe((update.aps.timestamp as number) + 900);
     for (const secret of ["/work", workspace, "opus", "claude", PHONE]) expect(updated.body).not.toContain(secret);
     expect(hubLog).not.toContain(ACTIVITY_TOKEN);
     await sleep(2500);

@@ -60,6 +60,9 @@ pub struct ActivityTokens {
     pub token: Option<String>,
     /// The push-to-start token, lowercase hex; none if the last registration left it out.
     pub start_token: Option<String>,
+    /// When the phone registered them, in seconds since the epoch; none for a registration
+    /// from before the hub kept the time, which is not known to be old.
+    pub registered: Option<u64>,
 }
 
 impl ActivityTokens {
@@ -79,6 +82,7 @@ impl ActivityTokens {
         Self {
             token: kept(&self.token),
             start_token: kept(&self.start_token),
+            registered: self.registered,
         }
         .or_none()
     }
@@ -93,6 +97,7 @@ impl std::fmt::Debug for ActivityTokens {
                 "start_token",
                 &self.start_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("registered", &self.registered)
             .finish()
     }
 }
@@ -614,6 +619,9 @@ impl Store {
                         if let Some(start) = &activity.start_token {
                             entry["activity"]["start_token"] = serde_json::json!(start);
                         }
+                        if let Some(registered) = activity.registered {
+                            entry["activity"]["registered"] = serde_json::json!(registered);
+                        }
                     }
                     entry
                 })
@@ -737,6 +745,7 @@ fn activity(stored: &serde_json::Value) -> Option<ActivityTokens> {
     ActivityTokens {
         token: checked("token"),
         start_token: checked("start_token"),
+        registered: stored["registered"].as_u64(),
     }
     .or_none()
 }
@@ -1340,7 +1349,53 @@ mod tests {
         ActivityTokens {
             token: token.map(str::to_owned),
             start_token: start_token.map(str::to_owned),
+            registered: None,
         }
+    }
+
+    #[tokio::test]
+    async fn activity_tokens_keep_when_they_were_registered() {
+        let dir = TempDir::new("hub-activitywhen");
+        let mut store = store(&dir).await;
+        let token = paired(&mut store, "Gemini 10", epoch(1)).await;
+        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        let when = ActivityTokens {
+            registered: Some(1_790_000_000),
+            ..activity(Some(ACTIVITY), Some(START))
+        };
+        assert!(
+            store
+                .set_activity(&device.token_sha256, when.clone())
+                .await
+                .unwrap()
+        );
+        let text = std::fs::read_to_string(dir.path().join("devices.json")).unwrap();
+        assert!(text.contains("\"registered\""), "{text}");
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(reopened.devices()[0].activity, Some(when.clone()));
+        // A 410 on one token keeps when the other was registered.
+        store.drop_activity_token(ACTIVITY).await.unwrap();
+        assert_eq!(
+            store.devices()[0].activity,
+            Some(ActivityTokens {
+                token: None,
+                ..when
+            })
+        );
+        // A file from before times were kept loads them as unknown.
+        let mut file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        file["devices"][0]["activity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("registered");
+        let old = file.to_string();
+        assert!(!old.contains("registered"), "{old}");
+        std::fs::write(dir.path().join("devices.json"), old).unwrap();
+        let older = Store::open(dir.path()).await.unwrap();
+        assert_eq!(
+            older.devices()[0].activity,
+            Some(activity(Some(ACTIVITY), Some(START)))
+        );
     }
 
     #[tokio::test]

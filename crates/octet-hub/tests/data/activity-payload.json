@@ -15,7 +15,8 @@
       "alert": {
         "title": "Octet",
         "body": "Approval waiting"
-      }
+      },
+      "stale-date": 1790001001
     }
   },
   "update": {
@@ -28,7 +29,8 @@
         "mac": "mac.tail1234.ts.net",
         "since": 1790000059,
         "approvals": 0
-      }
+      },
+      "stale-date": 1790001001
     }
   },
   "end": {

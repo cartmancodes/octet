@@ -269,12 +269,18 @@ impl Env {
 
     /// A phone that said hello with `device`.
     async fn hello(&self, device: &str) -> Phone {
+        self.hello_with(device, None).await
+    }
+
+    /// A phone that said hello with `device`, and `background` when it is given. A background
+    /// connection (a token hand-over, or a Deny) is not the app in front.
+    async fn hello_with(&self, device: &str, background: Option<bool>) -> Phone {
         let mut phone = self.connect().await;
-        send(
-            &mut phone,
-            json!({"v": 1, "req": 2, "type": "hello", "token": device}),
-        )
-        .await;
+        let mut hello = json!({"v": 1, "req": 2, "type": "hello", "token": device});
+        if let Some(background) = background {
+            hello["background"] = json!(background);
+        }
+        send(&mut phone, hello).await;
         recv_kind(&mut phone, "welcome").await;
         phone
     }
@@ -396,6 +402,13 @@ fn assert_state(request: &Request, event: &str, kind: &str, session: &str, appro
     assert_eq!(state["mac"], MAC, "{request:?}");
     assert_eq!(state["approvals"], approvals, "{request:?}");
     assert!(state["since"].as_u64().is_some(), "{request:?}");
+    // A start or an update goes stale 15 minutes on, unless another comes.
+    if event == "end" {
+        assert!(aps.get("stale-date").is_none(), "{request:?}");
+    } else {
+        let timestamp = aps["timestamp"].as_u64().expect("a timestamp");
+        assert_eq!(aps["stale-date"], timestamp + 900, "{request:?}");
+    }
     // Only a start carries the attributes.
     if event == "start" {
         assert_eq!(aps["attributes-type"], "OctetActivity", "{request:?}");
@@ -457,6 +470,7 @@ fn the_live_activity_follows_the_sessions_while_the_phone_is_away() {
             a_410_drops_the_token(&fake, root.join("b")),
             a_clear_and_a_register_start_afresh(&fake, root.join("c")),
             a_410_on_the_apps_activity_starts_one(&fake, root.join("d")),
+            presence_is_any_hello_but_a_background_one(&fake, root.join("e")),
         );
         // Nothing of the approval, the workspace, the model or the engine went out.
         let all = format!("{:?}", fake.requests.lock().expect("lock"));
@@ -492,9 +506,9 @@ async fn the_apps_activity_is_updated_and_kept(fake: &Fake, root: PathBuf) {
     link.state("idle", &[1, 2]).await;
     let update = fake.wait_for(TOKEN, 0).await;
     assert_state(&update, "update", "approval", &env.id, 2);
-    // The app wakes in the background with a new token: a hello and a registration, no
-    // stream. The new token is told the state as it stands; the next change goes there too.
-    let mut wake = env.hello(&device).await;
+    // The app wakes in the background with a new token: a background hello and a
+    // registration. The new token is told the state as it stands; the next change goes there too.
+    let mut wake = env.hello_with(&device, Some(true)).await;
     register(&mut wake, Some(WOKEN), Some(START)).await;
     let told = fake.wait_for(WOKEN, 0).await;
     assert_state(&told, "update", "approval", &env.id, 2);
@@ -562,7 +576,7 @@ async fn a_clear_and_a_register_start_afresh(fake: &Fake, root: PathBuf) {
     let first = fake.wait_for(START, 0).await;
     assert_state(&first, "start", "approval", &env.id, 1);
     // Off and on again, in one connection that streams nothing.
-    let mut wake = env.hello(&device).await;
+    let mut wake = env.hello_with(&device, Some(true)).await;
     send(
         &mut wake,
         json!({"v": 1, "req": 5, "type": "clear_activity"}),
@@ -607,4 +621,40 @@ async fn a_410_on_the_apps_activity_starts_one(fake: &Fake, root: PathBuf) {
     let start = fake.wait_for(START, 0).await;
     assert_state(&start, "start", "approval", &env.id, 2);
     assert_eq!(fake.to(TOKEN).len(), 1);
+}
+
+/// The app in front is any connection whose hello is not a background one, whether it streams a
+/// session or not (the Inbox streams nothing), and whether its hello says so or is an old one
+/// without the field. A background connection never counts as the app in front.
+async fn presence_is_any_hello_but_a_background_one(fake: &Fake, root: PathBuf) {
+    const START: &str = "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5";
+    let env = Env::start(root, 6205).await;
+    let mut link = env.link().await;
+    let device = env.pair("Story E phone").await;
+    // An old hello, and no subscribe: the app is in front, so an approval sends nothing.
+    let mut phone = env.hello(&device).await;
+    register(&mut phone, None, Some(START)).await;
+    link.state("idle", &[]).await;
+    link.state("idle", &[1]).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        fake.to(START).is_empty(),
+        "an old hello is the app in front"
+    );
+    background(phone).await;
+    // A hello that says `background: false` is in front too.
+    let phone = env.hello_with(&device, Some(false)).await;
+    link.state("idle", &[1, 2]).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        fake.to(START).is_empty(),
+        "background: false is the app in front"
+    );
+    background(phone).await;
+    // A background connection, open the whole time, is not: the next approval starts one.
+    let wake = env.hello_with(&device, Some(true)).await;
+    link.state("idle", &[1, 2, 3]).await;
+    let start = fake.wait_for(START, 0).await;
+    assert_state(&start, "start", "approval", &env.id, 3);
+    drop(wake);
 }

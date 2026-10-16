@@ -573,8 +573,10 @@ pub static MESSAGES: &[Message] = &[
     message(
         "hello",
         FromPhone,
-        &[req("token", Str)],
-        "Connect with a device token.",
+        &[req("token", Str), opt("background", Bool)],
+        "Connect with a device token. `background: true` marks a connection the app makes from \
+         the background (to hand a Live Activity token over, or to send a Deny): it is not the \
+         app in front. Left out, the connection is the app in front.",
     ),
     message(
         "pair",
@@ -1054,6 +1056,9 @@ pub enum PhoneCommand {
     Hello {
         /// The device token.
         token: Secret,
+        /// Whether this connection is the app in the background (handing a Live Activity token
+        /// over, or sending a Deny) rather than the app in front; left out, it is in front.
+        background: bool,
     },
     /// Pair a new device.
     Pair {
@@ -1506,6 +1511,7 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
     let command = match message.kind {
         "hello" => PhoneCommand::Hello {
             token: Secret(text(m, "token")),
+            background: flag(m, "background"),
         },
         "pair" => PhoneCommand::Pair {
             secret: Secret(text(m, "secret")),
@@ -2736,6 +2742,34 @@ mod tests {
             kinds: None,
         };
         assert!(!format!("{off:?}").contains("redacted"));
+    }
+
+    #[test]
+    fn hello_may_say_it_is_a_background_connection() {
+        let hello = |extra: &str| {
+            parse_phone(&format!(
+                r#"{{"v":1,"req":1,"type":"hello","token":"t"{extra}}}"#
+            ))
+        };
+        let background = |extra: &str| match hello(extra) {
+            Ok((_, PhoneCommand::Hello { background, .. })) => Ok(background),
+            other => Err(format!("{other:?}")),
+        };
+        // An old app's hello, without the field, is the app in front.
+        assert_eq!(background(""), Ok(false));
+        assert_eq!(background(r#","background":false"#), Ok(false));
+        assert_eq!(background(r#","background":true"#), Ok(true));
+        // `null` is left out, as for every optional field.
+        assert_eq!(background(r#","background":null"#), Ok(false));
+        // Only a boolean.
+        for bad in [
+            r#","background":"yes""#,
+            r#","background":1"#,
+            r#","background":[]"#,
+        ] {
+            let refused = hello(bad).expect_err(bad);
+            assert!(refused.contains("background"), "{bad}: {refused}");
+        }
     }
 
     #[test]
