@@ -55,9 +55,9 @@
 //!
 //! # Writes
 //!
-//! `devices.json` is written in tasks of its own, one at a time under its lock, so the hub loop
-//! never waits on a lock another process holds or on a sync to disk; what a write was for (an
-//! ack, a pairing) is done once it is saved.
+//! `devices.json` is written by one writer task, under its lock, in the order the writes were
+//! asked for, so the hub loop never waits on a lock another process holds or on a sync to disk;
+//! what a write was for (an ack, a pairing) is done once it is saved.
 use crate::{
     activity::{Activity, Report},
     apns::{Outcome, Signer},
@@ -288,8 +288,9 @@ enum Job {
     Git,
 }
 
-/// A `devices.json` write made off the hub loop, in a task of its own, and what the hub does once
-/// it is made. The writes go one at a time, under the file's lock, and come back in order.
+/// A `devices.json` write made off the hub loop, by the writer task, and what the hub does once
+/// it is made. The writes go one at a time, under the file's lock, in the order they were asked
+/// for, and come back in that order.
 #[derive(Debug)]
 struct Saved {
     /// The file as the write left it, for the store in memory; none if the write failed.
@@ -668,6 +669,8 @@ struct Conn {
     out: mpsc::Sender<Out>,
     /// The `sessions` frame for the writer, latest wins.
     listing: Listing,
+    /// The last `sessions` frame it was given, by a list or at its hello.
+    offered: Option<Utf8Bytes>,
     /// Given to each replay task, for the writer.
     replay: mpsc::Sender<ReplayItem>,
     /// The connection task.
@@ -761,7 +764,7 @@ pub struct Hub {
     pending: HashMap<u64, Pending>,
     /// Each device's command allowance, by token hash.
     buckets: HashMap<String, Bucket>,
-    /// The `sessions` frame phones were last sent, one text shared by every connection.
+    /// The last `sessions` frame made, one text shared by every connection given it.
     listed: Utf8Bytes,
     /// When a `sessions` frame asked for within [`RELIST_GAP`] of the last goes out.
     relist_at: Option<Instant>,
@@ -786,6 +789,8 @@ pub struct Hub {
     index: tail::SharedIndex,
     /// Given to each connection and replay task.
     events: mpsc::Sender<ConnEvent>,
+    /// Makes the `devices.json` writes, one at a time, in the order they are asked for.
+    writer: crate::store::Writer,
     /// Given to each `devices.json` write, which says here when it is done.
     saves: mpsc::Sender<Saved>,
     /// What to push, and when.
@@ -890,6 +895,7 @@ impl Hub {
             tokio::spawn(watch_published(port, publisher, recheck, published_in)).abort_handle();
         let control_task =
             tokio::spawn(serve_control(control, requests, published.clone())).abort_handle();
+        let writer = crate::store::Writer::start(directory.clone());
         let mut hub = Hub {
             store,
             sessions: Sessions::new(run),
@@ -910,6 +916,7 @@ impl Hub {
             watchers: Vec::new(),
             watched: String::new(),
             events,
+            writer,
             saves,
             pusher: Pusher::default(),
             sender: Sender::new(push::endpoint(), dead_tokens),
@@ -981,6 +988,7 @@ impl Hub {
             Conn {
                 out,
                 listing,
+                offered: None,
                 replay,
                 task,
                 opened: Instant::now(),
@@ -1410,29 +1418,14 @@ impl Hub {
         }
     }
 
-    /// Makes `change` to `devices.json` in a task of its own, so the loop goes on meanwhile;
+    /// Makes `change` to `devices.json` off the loop, after every write asked for before it;
     /// once it is made, `then` says what the hub does about it ([`on_saved`](Self::on_saved)).
     fn save<R: Send + 'static>(
         &self,
         change: Change<R>,
         then: impl FnOnce(std::io::Result<R>) -> AfterSave + Send + 'static,
     ) {
-        let (writer, saves) = (self.store.writer(), self.saves.clone());
-        tokio::spawn(async move {
-            let (written, turn) = writer.update(change).await;
-            let (result, disk) = match written {
-                Ok((result, disk)) => (Ok(result), Some(disk)),
-                Err(error) => (Err(error), None),
-            };
-            let _ = saves
-                .send(Saved {
-                    disk,
-                    then: then(result),
-                })
-                .await;
-            // Only now may the next write go, so the hub hears of them in order.
-            drop(turn);
-        });
+        queue_save(&self.writer, &self.saves, change, then);
     }
 
     /// A write made off the loop is done: the store takes the file as it left it, and the hub
@@ -1867,7 +1860,9 @@ impl Hub {
     }
 
     /// Makes the `sessions` frame once, and sends it to every authenticated phone (latest wins:
-    /// see [`Listing`]) and to the watchers, each if it differs from what they were last sent.
+    /// see [`Listing`]) and to the watchers, each if it differs from what they were last given.
+    /// Each phone is judged on its own last frame: one that said hello since the last list got a
+    /// newer frame then, and must hear even of a list that went back to the last one.
     fn flush_relist(&mut self, now: Instant) {
         self.relist_at = None;
         self.relisted = Some(now);
@@ -1876,15 +1871,20 @@ impl Hub {
             broadcast(&mut self.watchers, &frame);
             self.watched.clone_from(&frame);
         }
-        if frame == self.listed.as_str() {
-            return;
+        if frame != self.listed.as_str() {
+            self.listed = frame.into();
         }
-        self.listed = frame.into();
         let frame = self.listed.clone();
         let targets: Vec<u64> = self
             .conns
             .iter()
-            .filter(|(_, state)| state.device.is_some())
+            .filter(|(_, state)| {
+                state.device.is_some()
+                    && state
+                        .offered
+                        .as_ref()
+                        .is_none_or(|offered| offered.as_str() != frame.as_str())
+            })
             .map(|(&conn, _)| conn)
             .collect();
         for conn in targets {
@@ -1895,9 +1895,10 @@ impl Hub {
     /// Gives `conn` `frame` as the `sessions` frame its writer sends next; a connection whose
     /// queue is full is dropped.
     fn offer_sessions(&mut self, conn: u64, frame: &Utf8Bytes) {
-        let Some(state) = self.conns.get(&conn) else {
+        let Some(state) = self.conns.get_mut(&conn) else {
             return;
         };
+        state.offered = Some(frame.clone());
         if !offer_listing(&state.out, &state.listing, frame) {
             self.drop_conn(conn);
         }
@@ -2179,6 +2180,30 @@ impl Hub {
         }
         Some(state)
     }
+}
+
+/// Queues `change` with `writer`, behind every write queued before it, and tells `saves` how it
+/// went, as `then` puts it: the hub hears of the writes in the order they were asked for.
+fn queue_save<R: Send + 'static>(
+    writer: &crate::store::Writer,
+    saves: &mpsc::Sender<Saved>,
+    change: Change<R>,
+    then: impl FnOnce(std::io::Result<R>) -> AfterSave + Send + 'static,
+) {
+    let saves = saves.clone();
+    writer.queue(change, move |written| async move {
+        let (result, disk) = match written {
+            Ok((result, disk)) => (Ok(result), Some(disk)),
+            Err(error) => (Err(error), None),
+        };
+        // The next write waits until the hub has this one's result.
+        let _ = saves
+            .send(Saved {
+                disk,
+                then: then(result),
+            })
+            .await;
+    });
 }
 
 /// The session, the command and the audit text of a phone command that a terminal UI runs; any
@@ -3143,6 +3168,65 @@ mod tests {
         let (full, _queue) = mpsc::channel(1);
         full.try_send(Out::Close).unwrap();
         assert!(!offer_listing(&full, &Listing::default(), &shared));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writes_asked_for_back_to_back_land_in_that_order() {
+        let dir = octet_testkit::TempDir::new("hub-writeorder");
+        let mut store = Store::open(dir.path()).await.expect("the store");
+        let secret = store.pairing_secret(SystemTime::now());
+        let (_, device) = store
+            .pair(
+                &secret,
+                "Order phone",
+                "ios",
+                "owner@example",
+                SystemTime::now(),
+            )
+            .await
+            .expect("paired");
+        let tokens = |n: u64| ActivityTokens {
+            token: Some(format!("{n:032x}")),
+            start_token: None,
+            registered: Some(n),
+        };
+        let (saves, mut saved) = mpsc::channel(SAVE_QUEUE);
+        let writer = crate::store::Writer::start(dir.path().to_owned());
+        for round in 0..20u64 {
+            // Two registrations, with no await between them, from a task on a worker thread as
+            // the hub loop is: the second is the one that stands.
+            let (writer, saves, device) = (writer.clone(), saves.clone(), device.clone());
+            tokio::spawn(async move {
+                for n in [2 * round + 1, 2 * round + 2] {
+                    let change = activity_change(&device.token_sha256, tokens(n));
+                    let device = device.clone();
+                    queue_save(&writer, &saves, change, move |result| AfterSave::Activity {
+                        conn: n,
+                        req: n,
+                        device,
+                        cleared: false,
+                        result,
+                    });
+                }
+            })
+            .await
+            .expect("queued");
+            for want in [2 * round + 1, 2 * round + 2] {
+                let done = saved.recv().await.expect("a write is done");
+                let AfterSave::Activity { req, .. } = done.then else {
+                    panic!("not the activity write")
+                };
+                assert_eq!(req, want, "round {round}: told out of order");
+                store.adopt(done.disk.expect("saved"));
+            }
+            let reopened = Store::open(dir.path()).await.expect("the store");
+            let held = reopened.devices()[0].activity.clone().expect("tokens");
+            assert_eq!(
+                held,
+                tokens(2 * round + 2),
+                "round {round}: written out of order"
+            );
+        }
     }
 
     #[test]

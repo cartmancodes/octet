@@ -4,19 +4,18 @@ use octet_core::remote::protocol::{PushKinds, is_activity_token, is_push_token};
 use octet_store::{create_private, create_private_dir, sync_directory};
 use sha2::{Digest, Sha256};
 use std::{
+    future::Future,
     io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
-    sync::{Mutex, OwnedMutexGuard},
+    sync::mpsc,
 };
 
 /// The loopback port when `hub.json` names none.
@@ -165,9 +164,6 @@ pub struct Store {
     /// The mtime and size of `devices.json` as this store last wrote or read
     /// it; the size catches a change within the clock's granularity.
     stamp: Option<Stamp>,
-    /// Taken by each write in turn, so the writes of this process (each in a task of its own,
-    /// for the hub) are made, and their results handed back, in the order they were asked for.
-    turn: Arc<Mutex<()>>,
 }
 
 /// A change to `devices.json`: what it does to the devices on disk, its result, and whether it
@@ -189,25 +185,50 @@ impl std::fmt::Debug for Disk {
     }
 }
 
-/// Changes `devices.json` the way [`Store`] does, from a task of its own, so the hub's loop never
-/// waits on the lock, the read, the write or the syncs.
+/// A write waiting for the [`Writer`]'s task: the change, and what is done with its result.
+type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Changes `devices.json` the way [`Store`] does, in one task of its own, so the hub's loop never
+/// waits on the lock, the read, the write or the syncs. The writes queue in the order they are
+/// asked for ([`queue`](Self::queue) never waits), and each is made, and its result handed on,
+/// before the next begins.
 #[derive(Debug, Clone)]
 pub(crate) struct Writer {
     directory: PathBuf,
-    turn: Arc<Mutex<()>>,
+    jobs: mpsc::UnboundedSender<Job>,
 }
 
 impl Writer {
-    /// Waits for this process's earlier writes, then makes `change` under the lock on
-    /// `devices.lock` (see [`Store`]'s writes): its result, and the file as it is after, unless it
-    /// failed. The guard keeps the next write waiting: hand the result on, then drop it, so
-    /// results arrive in the order of the writes.
-    pub(crate) async fn update<R>(
+    /// The writer of the `devices.json` in `directory`, and its task, which runs until the last
+    /// clone of it goes and the writes queued by then are made.
+    pub(crate) fn start(directory: PathBuf) -> Self {
+        let (jobs, mut queued) = mpsc::unbounded_channel::<Job>();
+        tokio::spawn(async move {
+            while let Some(job) = queued.recv().await {
+                job.await;
+            }
+        });
+        Self { directory, jobs }
+    }
+
+    /// Queues `change`, made under the lock on `devices.lock` (see [`Store`]'s writes) after every
+    /// write queued before it; `deliver` is given its result, and the file as it is after unless
+    /// it failed, before the next write begins.
+    pub(crate) fn queue<R, D>(
         &self,
         change: Change<R>,
-    ) -> (io::Result<(R, Disk)>, OwnedMutexGuard<()>) {
-        let turn = Arc::clone(&self.turn).lock_owned().await;
-        (locked_update(&self.directory, change).await, turn)
+        deliver: impl FnOnce(io::Result<(R, Disk)>) -> D + Send + 'static,
+    ) where
+        R: Send + 'static,
+        D: Future<Output = ()> + Send + 'static,
+    {
+        let directory = self.directory.clone();
+        let job: Job = Box::pin(async move {
+            let written = locked_update(&directory, change).await;
+            deliver(written).await;
+        });
+        // The task outlives every clone of the sender, so the queue is never closed early.
+        let _ = self.jobs.send(job);
     }
 }
 
@@ -261,7 +282,6 @@ impl Store {
             config: HubConfig::default(),
             secrets: Vec::new(),
             stamp,
-            turn: Arc::default(),
         })
     }
 
@@ -584,19 +604,9 @@ impl Store {
     /// list in memory becomes what is on disk, so another process's changes
     /// are never written back over.
     async fn update<R>(&mut self, change: Change<R>) -> io::Result<R> {
-        let (written, turn) = self.writer().update(change).await;
-        let (result, disk) = written?;
+        let (result, disk) = locked_update(&self.directory, change).await?;
         self.adopt(disk);
-        drop(turn);
         Ok(result)
-    }
-
-    /// What makes this store's writes from a task of its own, in turn with its own.
-    pub(crate) fn writer(&self) -> Writer {
-        Writer {
-            directory: self.directory.clone(),
-            turn: Arc::clone(&self.turn),
-        }
     }
 
     /// Takes `devices.json` as a [`Writer`]'s write left it: the list in memory becomes what is

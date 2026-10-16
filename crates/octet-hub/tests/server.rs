@@ -2784,3 +2784,26 @@ async fn a_slow_devices_write_never_stalls_the_hub() {
     let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
     assert!(text.contains(PUSH), "{text}");
 }
+
+#[tokio::test]
+async fn a_phone_that_says_hello_mid_window_is_not_left_with_a_passing_list() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5060, 0..1).await;
+    env.start().await;
+    let (_read, mut write) = bridge.accept().await;
+    let token = env.pair("Test phone").await;
+    let state = |phase: &str| json!({"phase": phase, "queue": [], "queued": 0, "mode": "ask", "approvals": []});
+    // A quiet spell, then `running` goes out at once and opens a quarter-second window.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    bridge_write(&mut write, bridge_state_frame(&state("running"))).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Within the window the session goes idle, and a phone says hello: its list shows `idle`.
+    bridge_write(&mut write, bridge_state_frame(&state("idle"))).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let (mut phone, sessions) = hello(env.port, &token).await;
+    assert_eq!(sessions["sessions"][0]["phase"], "idle", "{sessions}");
+    // Then, still within the window, it runs again: the list the others last got. The phone,
+    // which last got `idle`, must hear of it.
+    bridge_write(&mut write, bridge_state_frame(&state("running"))).await;
+    listed_as(&mut phone, &bridge.id, "running", 0).await;
+}
