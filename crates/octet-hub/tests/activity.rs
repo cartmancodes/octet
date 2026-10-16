@@ -455,6 +455,7 @@ fn the_live_activity_follows_the_sessions_while_the_phone_is_away() {
         tokio::join!(
             start_update_and_end(&fake, root.join("a")),
             a_410_drops_the_token(&fake, root.join("b")),
+            a_clear_and_a_register_start_afresh(&fake, root.join("c")),
         );
         // Nothing of the approval, the workspace, the model or the engine went out.
         let all = format!("{:?}", fake.requests.lock().expect("lock"));
@@ -552,4 +553,36 @@ async fn a_410_drops_the_token(fake: &Fake, root: PathBuf) {
     link.state("idle", &[1, 2]).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(fake.to(START).len(), 1);
+}
+
+/// The phone turns the Live Activity off and on again in one wake, faster than the hub looks:
+/// the next approval starts a new activity, rather than updating the one the clear forgot.
+async fn a_clear_and_a_register_start_afresh(fake: &Fake, root: PathBuf) {
+    const START: &str = "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4";
+    let env = Env::start(root, 6203).await;
+    let mut link = env.link().await;
+    let device = env.pair("Story C phone").await;
+    let mut phone = env.hello(&device).await;
+    register(&mut phone, None, Some(START)).await;
+    background(phone).await;
+    link.state("idle", &[]).await;
+    link.state("idle", &[1]).await;
+    let first = fake.wait_for(START, 0).await;
+    assert_state(&first, "start", "approval", &env.id, 1);
+    // Off and on again, in one connection that streams nothing.
+    let mut wake = env.hello(&device).await;
+    send(
+        &mut wake,
+        json!({"v": 1, "req": 5, "type": "clear_activity"}),
+    )
+    .await;
+    assert_eq!(
+        recv_kind(&mut wake, "ack").await,
+        ack(5, "Activity cleared")
+    );
+    register(&mut wake, None, Some(START)).await;
+    background(wake).await;
+    link.state("idle", &[1, 2]).await;
+    let second = fake.wait_for(START, 1).await;
+    assert_state(&second, "start", "approval", &env.id, 2);
 }

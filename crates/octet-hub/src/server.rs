@@ -1114,6 +1114,12 @@ impl Hub {
                 )
             } else {
                 let saved = self.store.drop_activity(hash).await;
+                // Forgotten now, not at the next look: a register just after it starts afresh.
+                if matches!(saved, Ok(true))
+                    && let Some(activity) = self.activity.as_mut()
+                {
+                    activity.cleared(hash);
+                }
                 (
                     saved,
                     "Activity cleared",

@@ -284,6 +284,16 @@ impl Limiter {
         });
     }
 
+    /// The sends to `device` in the minute before `now`.
+    #[cfg(test)]
+    pub(crate) fn sends(&self, device: &str, now: Instant) -> usize {
+        self.sent.get(device).map_or(0, |sent| {
+            sent.iter()
+                .filter(|at| now.saturating_duration_since(**at) < MINUTE)
+                .count()
+        })
+    }
+
     /// How many devices have a send on record.
     #[cfg(test)]
     pub(crate) fn remembered(&self) -> usize {
