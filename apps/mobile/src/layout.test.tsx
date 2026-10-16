@@ -13,6 +13,7 @@ import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
 import { FakeClock, Sockets } from "./client/fakes";
 import { HubContext, HubController, TOKEN_KEY, tokenKeyOf, unpairedNotice } from "./hub";
+import { drawerScreen } from "./drawer";
 import { saveSettings } from "./persist";
 import { createOctetStore } from "./store";
 import { dark, light } from "./theme";
@@ -22,6 +23,13 @@ jest.mock("expo-camera", () => ({
   CameraView: () => null,
   useCameraPermissions: () => [{ granted: false, canAskAgain: false, status: "denied" }, jest.fn()],
 }));
+
+// The shell calls `drawerScreen` once per render while paired: counting its calls counts the
+// shell's renders.
+jest.mock("./drawer", () => {
+  const actual = jest.requireActual<typeof import("./drawer")>("./drawer");
+  return { ...actual, drawerScreen: jest.fn(actual.drawerScreen) };
+});
 
 let mockProject: string | undefined;
 jest.mock("expo-constants", () => ({
@@ -87,9 +95,11 @@ async function launch(opts: { paired?: boolean } = {}) {
 }
 
 /** Walks the connection to ready: hello, welcome. */
-function connected({ sockets }: { sockets: Sockets }): void {
-  sockets.last.open();
-  sockets.last.receive({ type: "welcome", device: "iPhone" });
+async function connected({ sockets }: { sockets: Sockets }): Promise<void> {
+  await act(async () => {
+    sockets.last.open();
+    sockets.last.receive({ type: "welcome", device: "iPhone" });
+  });
 }
 
 describe("the app shell", () => {
@@ -143,10 +153,28 @@ describe("the app shell", () => {
     expect(sockets.all).toHaveLength(1);
   });
 
+  it("a link's state changing does not render the shell again", async () => {
+    const { sockets, clock } = await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    await connected({ sockets });
+    const renders = () => jest.mocked(drawerScreen).mock.calls.length;
+    const before = renders();
+    expect(before).toBeGreaterThan(0);
+    await act(async () => {
+      sockets.last.drop(); // offline
+      clock.advance(500); // connecting again
+    });
+    await act(async () => {
+      sockets.last.open(); // authenticating
+      sockets.last.receive({ type: "welcome", device: "iPhone" }); // ready
+    });
+    expect(renders()).toBe(before);
+  });
+
   it("a paired phone can open Pair to add a Mac, and the Mac it has stays paired", async () => {
     const { sockets } = await launch({ paired: true });
     await screen.findByText("Sessions list");
-    connected({ sockets });
+    await connected({ sockets });
     await act(async () => router.push("/pair?add=1"));
     expect(await screen.findByText("Pair another machine")).toBeTruthy();
     expect(screen.getByText("● mac")).toBeTruthy();
@@ -162,14 +190,14 @@ describe("the app shell", () => {
     sockets.last.receive({ type: "paired", req: command?.req, token: TOKEN, device: "iPhone" });
     expect(await screen.findByText("Sessions list")).toBeTruthy();
     expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
-    sockets.last.open();
+    await act(async () => sockets.last.open());
     expect(sockets.last.commandsOf("hello")).toEqual([expect.objectContaining({ token: TOKEN })]);
   });
 
   it("closes the socket in the background and connects again in the foreground", async () => {
     const { sockets, clock } = await launch({ paired: true });
     await screen.findByText("Sessions list");
-    connected({ sockets });
+    await connected({ sockets });
     const first = sockets.last;
     await act(async () => changeAppState("inactive"));
     expect(first.closed).toBe(false); // a Face ID prompt must not drop the link
@@ -184,7 +212,7 @@ describe("the app shell", () => {
   it("clears the notifications it left in the tray each time the app comes to the foreground", async () => {
     const { sockets } = await launch({ paired: true });
     await screen.findByText("Sessions list");
-    connected({ sockets });
+    await connected({ sockets });
     n.dismissAllNotificationsAsync.mockClear();
     await act(async () => changeAppState("inactive"));
     await act(async () => changeAppState("background"));
@@ -202,7 +230,7 @@ describe("the app shell", () => {
   it("revoked_unpairs: the Mac revoking the phone deletes the token and shows Pair with the reason", async () => {
     const { sockets } = await launch({ paired: true });
     await screen.findByText("Sessions list");
-    connected({ sockets });
+    await connected({ sockets });
     await act(async () => {
       sockets.last.receive({ type: "refused", req: 0, reason: "This device was revoked", code: "revoked" });
     });
@@ -215,7 +243,7 @@ describe("the app shell", () => {
   it("a network drop leaves the user on Sessions with the token kept", async () => {
     const { sockets, clock } = await launch({ paired: true });
     await screen.findByText("Sessions list");
-    connected({ sockets });
+    await connected({ sockets });
     await act(async () => {
       sockets.last.drop();
       clock.advance(60_000);
@@ -276,7 +304,7 @@ describe("notifications", () => {
   it("a tap while paired opens that session", async () => {
     const { sockets, view } = await launch({ paired: true });
     await screen.findByText("Sessions list");
-    connected({ sockets });
+    await connected({ sockets });
     await act(async () => listener()?.(tap({ session: SESSION })));
     expect(view.getPathname()).toBe(`/session/${k(SESSION)}`);
   });
@@ -284,7 +312,7 @@ describe("notifications", () => {
   it("a tap for a session already in the stack goes back to it: no second copy", async () => {
     const { sockets, view } = await launch({ paired: true });
     await screen.findByText("Sessions list");
-    connected({ sockets });
+    await connected({ sockets });
     await act(async () => router.push(sessionPath(SESSION)));
     await act(async () => router.push("/settings"));
     await act(async () => listener()?.(tap({ session: SESSION })));

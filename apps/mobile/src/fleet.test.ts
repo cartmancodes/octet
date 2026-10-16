@@ -6,7 +6,7 @@ import * as SecureStore from "expo-secure-store";
 
 import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
 import { Fleet, TOKEN_KEY, tokenKeyOf, unpairedNotice, type Keychain } from "./hub";
-import { TOO_MANY_MACS, keyOf } from "./macs";
+import { MAC_ID, TOO_MANY_MACS, keyOf } from "./macs";
 import { SETTINGS_KEY, loadSettings, saveSettings } from "./persist";
 import { createOctetStore } from "./store";
 import { showToast, toastStore } from "./toast";
@@ -71,7 +71,7 @@ function stubKeychain() {
   };
 }
 
-function rig(keychain?: Keychain) {
+function rig(keychain?: Keychain, newId: (() => string) | null = ids()) {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const store = createOctetStore();
@@ -80,7 +80,7 @@ function rig(keychain?: Keychain) {
     store,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
-    newId: ids(),
+    ...(newId ? { newId } : {}),
     ...(keychain ? { keychain } : {}),
   });
   return { sockets, clock, store, fleet };
@@ -592,5 +592,177 @@ describe("the Mac unpairs this phone", () => {
     studio.receive({ type: "refused", req: 0, reason: "revoked", code: "unpaired" });
     await settle();
     expect(r.fleet.snapshot()).toMatchObject({ status: "unpaired", notice: unpairedNotice("studio"), macs: [] });
+  });
+});
+
+describe("fix round 1", () => {
+  it("with no random source at all, the move and a pairing both succeed", async () => {
+    const g = globalThis as { crypto?: unknown; expo?: { uuidv4?: () => string } };
+    const crypto = g.crypto;
+    const expo = g.expo;
+    try {
+      Object.defineProperty(globalThis, "crypto", { value: {}, configurable: true });
+      g.expo = {};
+      const k = stubKeychain();
+      k.kept.set(TOKEN_KEY, TOKEN);
+      await saveSettings({ hubUrl: urlOf("studio") });
+      const r = rig(k.keychain, null);
+      r.fleet.setForeground(true);
+      await r.fleet.init();
+      expect(r.fleet.snapshot().status).toBe("paired");
+      await pairWith(r, "laptop", "bb".repeat(32));
+      const ids = r.fleet.snapshot().macs.map((m) => m.id);
+      expect(ids).toHaveLength(2);
+      for (const id of ids) expect(id).toMatch(MAC_ID);
+      expect(new Set(ids).size).toBe(2);
+      expect(k.kept.get(tokenKeyOf(ids[1]!))).toBe("bb".repeat(32));
+    } finally {
+      Object.defineProperty(globalThis, "crypto", { value: crypto, configurable: true });
+      g.expo = expo;
+    }
+  });
+
+  it("makes the new pairing's id before the Mac spends its code", async () => {
+    let made = 0;
+    const r = rig(undefined, () => `m0000000${++made}`);
+    await r.fleet.init();
+    const pending = r.fleet.pair(linkTo("studio"), "iPhone");
+    expect(made).toBe(1); // before any answer from the Mac
+    const pairing = r.sockets.last;
+    pairing.open();
+    pairing.receive({ type: "paired", req: pairing.commandsOf("pair")[0]?.req, token: TOKEN, device: "iPhone" });
+    expect(await pending).toEqual({ ok: true });
+    expect(made).toBe(1);
+  });
+
+  it("a background stop does not count as the first attempt ending", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const pending = r.fleet.pair(linkTo("studio"), "iPhone");
+    const pairing = r.sockets.last;
+    pairing.open();
+    pairing.receive({ type: "paired", req: pairing.commandsOf("pair")[0]?.req, token: TOKEN, device: "iPhone" });
+    await pending;
+    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "connecting", tried: false });
+    r.fleet.setForeground(false);
+    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: false });
+    r.fleet.setForeground(true);
+    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "connecting", tried: false });
+    socketOf(r, "studio").drop();
+    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: true });
+  });
+
+  it("an unpair while that host pairs again never deletes the token the pairing just saved", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio", "aa".repeat(32));
+    const pending = r.fleet.pair(linkTo("studio"), "iPhone");
+    const pairing = r.sockets.last;
+    const unpaired = r.fleet.unpair("m00000001");
+    pairing.open();
+    pairing.receive({ type: "paired", req: pairing.commandsOf("pair")[0]?.req, token: "ee".repeat(32), device: "iPhone" });
+    expect(await pending).toEqual({ ok: true });
+    await unpaired;
+    await settle();
+    expect(r.fleet.snapshot().macs.map((m) => m.id)).toEqual(["m00000001"]);
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("ee".repeat(32));
+    expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001"]);
+    // The next launch is paired with the new token.
+    const again = rig();
+    again.fleet.setForeground(true);
+    await again.fleet.init();
+    expect(again.fleet.snapshot().status).toBe("paired");
+    socketOf(again, "studio").open();
+    expect(socketOf(again, "studio").commandsOf("hello")).toEqual([expect.objectContaining({ token: "ee".repeat(32) })]);
+  });
+
+  it("unpairing while turning on is waiting for that Mac ends the wait at once", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const studio = await pairWith(r, "studio");
+    studio.drop();
+    let result: unknown;
+    void r.fleet.turnOnNotifications().then((x) => (result = x));
+    await settle();
+    expect(result).toBeUndefined(); // waiting for the link to come back
+    await r.fleet.unpair("m00000001");
+    await settle();
+    expect(result).toEqual({ ok: false, message: "Can't reach your Mac" });
+    expect(r.clock.pending).toBe(0);
+  });
+
+  it("a pairing whose token cannot be read is listed, offline and not tried, and can be unpaired", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio", "aa".repeat(32));
+    await pairWith(r, "laptop", "bb".repeat(32));
+    r.fleet.setForeground(false);
+    const locked: Keychain = {
+      get: async (key) => {
+        if (key === tokenKeyOf("m00000002")) throw new Error("locked");
+        return SecureStore.getItemAsync(key);
+      },
+      set: (key, value) => SecureStore.setItemAsync(key, value),
+      delete: (key) => SecureStore.deleteItemAsync(key),
+    };
+    const again = rig(locked);
+    await again.fleet.init();
+    expect(again.fleet.snapshot().macs).toEqual([
+      expect.objectContaining({ id: "m00000001" }),
+      { id: "m00000002", macName: "laptop", host: "laptop.tail1234.ts.net", state: "offline", tried: false },
+    ]);
+    expect(again.fleet.links.macs()).toEqual(["m00000001"]);
+    await again.fleet.unpair("m00000002");
+    expect(again.fleet.snapshot().macs.map((m) => m.id)).toEqual(["m00000001"]);
+    expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001"]);
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000002"))).toBeNull();
+  });
+
+  it("a pairing still waiting for its moved token is listed, and unpairing it ends the move", async () => {
+    const k = stubKeychain();
+    k.kept.set(TOKEN_KEY, TOKEN);
+    await saveSettings({ hubUrl: urlOf("studio") });
+    // The copy into pairing 1's entry fails this launch (get old, get new, then set new).
+    const set = k.keychain.set;
+    k.keychain.set = async () => {
+      throw new Error("locked");
+    };
+    const r = rig(k.keychain);
+    await r.fleet.init();
+    expect(r.fleet.snapshot()).toMatchObject({
+      status: "unpaired",
+      macs: [{ id: "m00000001", macName: "studio", state: "offline", tried: false }],
+    });
+    k.keychain.set = set;
+    await r.fleet.unpair("m00000001");
+    expect(r.fleet.snapshot().macs).toEqual([]);
+    expect(k.kept.has(TOKEN_KEY)).toBe(false);
+    const s = await loadSettings();
+    expect([s.pairings, s.hubUrl]).toEqual([[], null]);
+    // Nothing comes back at the next launch.
+    const next = rig(k.keychain);
+    await next.fleet.init();
+    expect(next.fleet.snapshot()).toMatchObject({ status: "unpaired", macs: [] });
+  });
+
+  it("keeps the Macs list the same object when only a notice changed", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const studio = await pairWith(r, "studio");
+    const laptop = await pairWith(r, "laptop");
+    const macs = r.fleet.snapshot().macs;
+    const done = r.fleet.turnOnNotifications();
+    await settle();
+    studio.receive({ type: "ack", req: studio.commandsOf("register_push").at(-1)?.req, message: "ok" });
+    await settle();
+    laptop.receive({ type: "refused", req: laptop.commandsOf("register_push").at(-1)?.req, code: "invalid", reason: "No" });
+    await done;
+    expect(r.fleet.snapshot().notices).toEqual(["laptop: No"]);
+    expect(r.fleet.snapshot().macs).toBe(macs);
   });
 });

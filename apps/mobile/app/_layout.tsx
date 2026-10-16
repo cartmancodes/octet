@@ -8,7 +8,7 @@ import { AppState, View } from "react-native";
 import { ApprovalToasts } from "../src/components/ApprovalToasts";
 import { Drawer, DrawerHost } from "../src/components/Drawer";
 import { closeDrawer, drawerScreen, setDrawerEnabled } from "../src/drawer";
-import { useFleet, useHubController, useLinks } from "../src/hub";
+import { useFleetStatus, useHubController, useLinks, useOffer } from "../src/hub";
 import { keyOf } from "../src/macs";
 import { openSession } from "../src/navigation";
 import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
@@ -35,7 +35,9 @@ export default function RootLayout() {
   const hub = useHubController();
   const router = useRouter();
   const nav = useNavigationContainerRef();
-  const { status, offer } = useFleet();
+  // Two primitives, not the snapshot: a link's state changing does not render the shell.
+  const status = useFleetStatus();
+  const offer = useOffer();
   const links = useLinks();
   const pathname = usePathname();
 

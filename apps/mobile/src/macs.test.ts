@@ -79,7 +79,7 @@ describe("newMacId", () => {
     expect(spy).toHaveBeenCalledTimes(50);
   });
 
-  it("falls back to the native UUID where the runtime has no getRandomValues", () => {
+  it("falls back to the native UUID, then to time and Math.random, where the runtime has no getRandomValues", () => {
     const g = globalThis as { crypto?: unknown; expo?: { uuidv4?: () => string } };
     const crypto = g.crypto;
     const uuid = jest.fn(() => "9F86D081-884C-4D63-9E8B-0123456789AB");
@@ -88,8 +88,15 @@ describe("newMacId", () => {
       Object.defineProperty(globalThis, "crypto", { value: {}, configurable: true });
       g.expo = { uuidv4: uuid };
       expect(newMacId()).toBe("m9f86d081");
+      // With neither, time, a counter and Math.random still make a well-formed id, never the
+      // same one twice in a row, and never a throw.
       g.expo = {};
-      expect(() => newMacId()).toThrow();
+      const ids = Array.from({ length: 20 }, () => newMacId());
+      for (const id of ids) expect(id).toMatch(MAC_ID);
+      expect(new Set(ids).size).toBe(20);
+      jest.spyOn(Date, "now").mockReturnValue(5);
+      jest.spyOn(Math, "random").mockReturnValue(0.5);
+      expect(newMacId()).not.toBe(newMacId()); // the counter alone tells them apart
     } finally {
       Object.defineProperty(globalThis, "crypto", { value: crypto, configurable: true });
       g.expo = expo;

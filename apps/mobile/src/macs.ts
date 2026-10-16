@@ -11,19 +11,32 @@ export const TOO_MANY_MACS = "Unpair a Mac first (4 at most)";
 /** A Mac's id: `m` and 8 lowercase hex characters, made by the phone. */
 export const MAC_ID = /^m[0-9a-f]{8}$/;
 
-/** A new Mac id, from a CSPRNG: `crypto.getRandomValues` where the runtime has it (Hermes, the
- * test runtime), else the native UUID v4 that expo-modules-core installs (whose first 8 hex
- * digits are all random). Throws when there is neither: an id must never be guessable or reused. */
+/** Ids made by the last resort, so that two in the same millisecond still differ. */
+let made = 0;
+
+/** A new Mac id. From a CSPRNG where there is one: `crypto.getRandomValues` (Hermes, the test
+ * runtime), else the native UUID v4 that expo-modules-core installs (whose first 8 hex digits are
+ * all random). Failing both, from the time, a counter and `Math.random`: a pairing id is the
+ * phone's own name for a Mac, not a secret, and it only has to differ from the other three. Never
+ * throws: an id is made before the Mac spends its pairing code, and at the move of an older
+ * version's pairing. */
 export function newMacId(): string {
   const g = globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array }; expo?: { uuidv4?: () => string } };
-  if (typeof g.crypto?.getRandomValues === "function") {
-    const bytes = g.crypto.getRandomValues(new Uint8Array(4));
-    return `m${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+  try {
+    if (typeof g.crypto?.getRandomValues === "function") {
+      const bytes = g.crypto.getRandomValues(new Uint8Array(4));
+      return `m${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+    }
+    const uuid = typeof g.expo?.uuidv4 === "function" ? `m${g.expo.uuidv4().toLowerCase().slice(0, 8)}` : "";
+    if (MAC_ID.test(uuid)) return uuid;
+  } catch {
+    // A source that is there but fails is no source: the last resort below.
   }
-  const uuid = typeof g.expo?.uuidv4 === "function" ? g.expo.uuidv4().toLowerCase() : "";
-  const id = `m${uuid.slice(0, 8)}`;
-  if (!MAC_ID.test(id)) throw new Error("No random source for a Mac id");
-  return id;
+  made = (made + 1) >>> 0;
+  // The low bits of the time, the counter spread over every bit (Knuth's multiplicative hash) and
+  // 32 bits of Math.random, mixed: never the same id twice in a row.
+  const mixed = (Date.now() ^ Math.imul(made, 0x9e3779b1) ^ Math.floor(Math.random() * 0x1_0000_0000)) >>> 0;
+  return `m${mixed.toString(16).padStart(8, "0")}`;
 }
 
 /** The store's key of `raw` on Mac `mac`. */

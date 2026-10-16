@@ -404,8 +404,10 @@ describe("the notifications step after pairing", () => {
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     accept(rig);
     await screen.findByRole("button", { name: "Turn on notifications" });
-    rig.sockets.last.open();
-    rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    await act(async () => {
+      rig.sockets.last.open();
+      rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    });
     return rig;
   }
   const ack = async (rig: Awaited<ReturnType<typeof open>>, message: string) => {

@@ -7,7 +7,7 @@ import { confirmBiometric } from "../src/auth";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { openDrawer } from "../src/drawer";
-import { useFleet, useHubController } from "../src/hub";
+import { useHubController, useMacs, usePushNotice } from "../src/hub";
 import { macName } from "../src/inbox";
 import { NO_PROJECT_ID, projectId } from "../src/notifications";
 import { NOT_SAVED, loadSettings, saveSettings, type Settings as Saved } from "../src/persist";
@@ -35,7 +35,8 @@ export default function Settings() {
   const [saved, setSaved] = useState<Saved | null>(null);
   const [error, setError] = useState(false);
   const checking = useRef(false);
-  const { pushNotice, macs } = useFleet();
+  const pushNotice = usePushNotice();
+  const macs = useMacs();
   const [pushError, setPushError] = useState<string | null>(null);
   const pushing = useRef(false);
   /** The switch is being worked on: "on" or "off"; null when idle. */

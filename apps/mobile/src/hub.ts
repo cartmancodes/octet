@@ -153,6 +153,8 @@ export class MacLink {
   private attempting = false;
   private shown: MacInfo;
   private detach: (() => void) | null = null;
+  /** The `whenReady` calls waiting: each ends false at `release`. */
+  private readonly waiters = new Set<(ready: boolean) => void>();
 
   constructor(
     private readonly host: LinkHost,
@@ -204,11 +206,20 @@ export class MacLink {
     };
   }
 
-  /** Stops feeding the store and following the client; the client is left as it is. */
+  /** Stops feeding the store and following the client (the client is left as it is), and ends
+   * every `whenReady` wait, false: a push waiting for this Mac gives up at once. */
   release(): void {
     this.gone = true;
     this.detach?.();
     this.detach = null;
+    for (const done of [...this.waiters]) done(false);
+  }
+
+  /** The app goes to the background: the attempt under way, if any, did not end on its own, so
+   * the stop that follows is not the Mac failing to answer (`tried` stays as it is). */
+  stop(): void {
+    this.attempting = false;
+    this.client.stop();
   }
 
   /** Stops the client, but first, on a ready link, tells the Mac "notifications off" and keeps
@@ -242,14 +253,17 @@ export class MacLink {
   whenReady(): Promise<boolean> {
     const { client } = this;
     if (client.state === "ready") return Promise.resolve(true);
+    if (this.gone) return Promise.resolve(false);
     return new Promise<boolean>((resolve) => {
       let off = () => {};
       let cancel = () => {};
       const done = (ready: boolean) => {
+        this.waiters.delete(done);
         off();
         cancel();
         resolve(ready);
       };
+      this.waiters.add(done);
       off = client.onState((state) => {
         if (state === "ready") done(true);
         else if (state === "unpaired") done(false);
@@ -372,6 +386,14 @@ export class Fleet {
   private savedName: string | null = null;
   /** The client of a pairing in flight, which is no Mac's link until it succeeds. */
   private pairing: HubClient | null = null;
+  /** The id that pairing will keep its token under: an unpair of the same Mac meanwhile must not
+   * delete what it saves. */
+  private pairingId: string | null = null;
+  /** The pairing still waiting for an older version's token (see `migrate`); null when none. */
+  private pending: string | null = null;
+  /** What `macs` shows of each pairing with no link (its token unreadable, or still on its way),
+   * kept so that the list keeps its identity. */
+  private unlinked = new Map<string, MacInfo>();
   private starting: Promise<void> | null = null;
   /** Unpairs whose storage writes are not done: pairing waits for them. */
   private unpairing = 0;
@@ -458,6 +480,7 @@ export class Fleet {
     this.savedName = settings.deviceName;
     await this.finishForgetting(settings);
     const { pairings, pending } = await this.migrate(settings);
+    this.pending = pending;
     const tokens = await Promise.all(pairings.map((p) => this.keychain.get(tokenKeyOf(p.id)).then((t) => t, () => undefined)));
     const kept: Pairing[] = [];
     const links: MacLink[] = [];
@@ -540,7 +563,7 @@ export class Fleet {
         await updateSettings(() => ({ hubUrl: null }));
         return { pairings, pending: null };
       }
-      target = { id: this.newId(), hubUrl: legacy, deviceName: settings.deviceName ?? this.defaultName(), macName: macNameOf(legacy) };
+      target = { id: this.freshId(pairings), hubUrl: legacy, deviceName: settings.deviceName ?? this.defaultName(), macName: macNameOf(legacy) };
       const next = [...pairings, target];
       if (!(await updateSettings(() => ({ pairings: next })))) return { pairings, pending: null };
       pairings = next;
@@ -569,7 +592,7 @@ export class Fleet {
       for (const link of this.all) link.client.retry(); // a start when stopped; leaves a live or opening link alone
     } else {
       this.pairing?.stop();
-      for (const link of this.all) link.client.stop();
+      for (const link of this.all) link.stop();
     }
   }
 
@@ -585,18 +608,17 @@ export class Fleet {
     const sameId = macOfHost(this.pairings, hostOf(parsed.url) ?? "");
     if (sameId === null && this.pairings.length >= MAX_MACS) return { ok: false, message: TOO_MANY_MACS, clear: false };
     const deviceName = name.trim() === "" ? this.defaultName() : name.trim();
+    // The id is made before the Mac spends its code: nothing after the Mac's answer can fail but
+    // the saves, which say how to recover.
+    const before = this.pairings.find((p) => p.id === sameId);
+    const id = before?.id ?? this.freshId(this.pairings);
     const client = new HubClient({ ...this.clientOptions, url: parsed.url, token: null, factory: this.factory });
     this.pairing = client;
+    this.pairingId = id;
     if (this.current.notice !== null) this.emit({ notice: null });
     try {
       const { token } = await client.pair(parsed.secret, deviceName, this.platform);
-      const before = this.pairings.find((p) => p.id === sameId);
-      const pairing: Pairing = {
-        id: before?.id ?? this.newId(),
-        hubUrl: parsed.url,
-        deviceName,
-        macName: before?.macName ?? macNameOf(parsed.url),
-      };
+      const pairing: Pairing = { id, hubUrl: parsed.url, deviceName, macName: before?.macName ?? macNameOf(parsed.url) };
       const tokens = tokenStore(this.keychain, pairing.id);
       let notifications = false;
       const kept =
@@ -627,7 +649,15 @@ export class Fleet {
       return { ok: false, message: error.message, clear: error.code === "unpaired" };
     } finally {
       this.pairing = null;
+      this.pairingId = null;
     }
+  }
+
+  /** A new pairing id, not one of `taken`'s. */
+  private freshId(taken: readonly Pairing[]): string {
+    let id = this.newId();
+    for (let i = 0; i < 8 && taken.some((p) => p.id === id); i++) id = this.newId();
+    return id;
   }
 
   /** Renames Mac `mac` (cleaned: 1 to 40 characters). False for a blank name or a Mac that is
@@ -653,19 +683,21 @@ export class Fleet {
    * token.
    */
   async unpair(mac?: string): Promise<void> {
-    const going = this.all.filter((l) => mac === undefined || l.id === mac);
-    if (going.length === 0) return;
+    // A pairing with no link (its token unreadable, or still on its way) is unpaired too.
+    const ids = this.pairings.filter((p) => mac === undefined || p.id === mac).map((p) => p.id);
+    if (ids.length === 0) return;
     this.unpairing += 1;
     try {
-      const last = going.length === this.all.length;
-      for (const link of going) {
+      const last = ids.length === this.pairings.length;
+      for (const link of this.all.filter((l) => ids.includes(l.id))) {
         // Best effort, sent before the link is released and never waited on.
         link.goodbye(last);
         this.drop(link);
       }
+      const removed = this.removeStored(ids, last);
       // Before any await: a foreground event now finds no client to start.
-      this.emit(last ? { status: "unpaired", notice: null, offer: false } : { notice: null });
-      if (!(await this.removeStored(going.map((l) => l.id), last))) this.emit({ notice: UNPAIR_FAILED_NOTICE });
+      this.emit(this.all.length === 0 ? { status: "unpaired", notice: null, offer: false } : { notice: null });
+      if (!(await removed)) this.emit({ notice: UNPAIR_FAILED_NOTICE });
     } finally {
       this.unpairing -= 1;
     }
@@ -676,13 +708,14 @@ export class Fleet {
    * gets here; a dropped network never does. */
   private macUnpaired(link: MacLink): void {
     if (!this.all.includes(link)) return;
-    const last = this.all.length === 1;
+    const last = this.pairings.every((p) => p.id === link.id);
     this.drop(link);
-    this.emit(last ? { status: "unpaired", notice: unpairedNotice(link.pairing.macName), offer: false } : { notice: unpairedNotice(link.pairing.macName) });
     this.unpairing += 1;
     void this.removeStored([link.id], last).finally(() => {
       this.unpairing -= 1;
     });
+    const notice = unpairedNotice(link.pairing.macName);
+    this.emit(this.all.length === 0 ? { status: "unpaired", notice, offer: false } : { notice });
   }
 
   /** Lets go of `link`: it stops feeding the store, and the store forgets what its Mac sent. */
@@ -699,18 +732,27 @@ export class Fleet {
    * could not be done; a token left is in `forget`, for the next launch. */
   private async removeStored(ids: string[], last: boolean): Promise<boolean> {
     this.pairings = this.pairings.filter((p) => !ids.includes(p.id));
+    // The pairing still waiting for an older version's token: the move ends with it, or the next
+    // launch would make it again.
+    const moving = this.pending !== null && ids.includes(this.pending);
+    if (moving) this.pending = null;
     const settings = await updateSettings((s) => ({
       pairings: s.pairings.filter((p) => !ids.includes(p.id)),
       forget: [...new Set([...s.forget, ...ids])],
-      ...(last ? { hubUrl: null, notifications: false, pushKinds: DEFAULT_PUSH_KINDS } : {}),
+      ...(last || moving ? { hubUrl: null } : {}),
+      ...(last ? { notifications: false, pushKinds: DEFAULT_PUSH_KINDS } : {}),
     }));
+    if (moving) await this.keychain.delete(TOKEN_KEY).catch(() => undefined);
     const deleted: string[] = [];
     for (const id of ids) {
+      // The same Mac pairing again meanwhile keeps its id: its new token is not this one's to
+      // delete. (The id stays in `forget`, which the next launch drops for a saved pairing.)
+      if (id === this.pairingId || this.pairings.some((p) => p.id === id)) continue;
       const clear = () => this.keychain.delete(tokenKeyOf(id)).then(() => true, () => false);
       if ((await clear()) || (await clear())) deleted.push(id);
     }
     if (settings && deleted.length > 0) await updateSettings((s) => ({ forget: s.forget.filter((id) => !deleted.includes(id)) }));
-    return settings && deleted.length === ids.length;
+    return settings && ids.every((id) => deleted.includes(id) || this.pairings.some((p) => p.id === id) || id === this.pairingId);
   }
 
   /** Makes `client` Mac `pairing.id`'s link, feeding the store, and connects it if in the
@@ -819,7 +861,7 @@ export class Fleet {
 
   /** `message` about `link`'s Mac, with its name in front when there are several Macs. */
   private named(link: MacLink, message: string): string {
-    return this.all.length > 1 ? `${link.pairing.macName}: ${message}` : message;
+    return this.pairings.length > 1 ? `${link.pairing.macName}: ${message}` : message;
   }
 
   /** A `Links` over the links as they are at each call. */
@@ -835,19 +877,48 @@ export class Fleet {
     this.view = this.makeLinks();
   }
 
-  /** Rebuilds what is shown of the links, with `patch`, and tells every listener. */
+  /** What `macs` shows of each pairing, in order: its link's, or, with no link, offline and not
+   * tried. */
+  private describeMacs(): MacInfo[] {
+    const unlinked = new Map<string, MacInfo>();
+    const macs = this.pairings.map((p) => {
+      const link = this.all.find((l) => l.id === p.id);
+      if (link) return link.info();
+      const host = hostOf(p.hubUrl) ?? "";
+      const had = this.unlinked.get(p.id);
+      const info: MacInfo = had && had.macName === p.macName && had.host === host ? had : { id: p.id, macName: p.macName, host, state: "offline", tried: false };
+      unlinked.set(p.id, info);
+      return info;
+    });
+    this.unlinked = unlinked;
+    return macs;
+  }
+
+  /** Rebuilds what is shown of the links, with `patch`, and tells every listener. Each part
+   * keeps its identity while it is the same, so a hook that selects one part (`useMacs`,
+   * `useFleetStatus`...) renders again only when that part changed. */
   private emit(patch: Partial<Pick<FleetSnapshot, "status" | "offer" | "notice">> = {}): void {
-    const notices = this.all.flatMap((l) => (l.pushNotice === null ? [] : [this.named(l, l.pushNotice)]));
+    const before = this.current;
+    const macs = sameItems(before.macs, this.describeMacs());
+    const notices = sameItems(
+      before.notices,
+      this.all.flatMap((l) => (l.pushNotice === null ? [] : [this.named(l, l.pushNotice)])),
+    );
     this.current = {
-      ...this.current,
+      ...before,
       ...patch,
-      macs: this.all.map((l) => l.info()),
+      macs,
       client: this.all.length === 1 ? (this.all[0]?.client ?? null) : null,
       notices,
       pushNotice: notices.length > 0 ? notices.join("\n") : null,
     };
     for (const fn of [...this.listeners]) fn();
   }
+}
+
+/** `before` when `next` holds the same items in the same order, else `next`. */
+function sameItems<T>(before: T[], next: T[]): T[] {
+  return before.length === next.length && next.every((x, i) => x === before[i]) ? before : next;
 }
 
 /** `list` with `pairing` in place of the one of its id, or at the end. */
@@ -885,18 +956,40 @@ export const HubContext = createContext<Fleet>(hub);
 
 export const useHubController = (): Fleet => useContext(HubContext);
 
-/** The paired Macs, their states and notices. */
+/** The whole snapshot: a new object whenever any part changes (a link's state included). A
+ * screen that reads only some of it selects those parts with the hooks below, so that it does
+ * not render again for the rest. */
 export function useFleet(): FleetSnapshot {
   const fleet = useHubController();
   return useSyncExternalStore(fleet.subscribe, fleet.snapshot, fleet.snapshot);
 }
 
+/** One part of the snapshot. `pick` must return a part as it is (each keeps its identity while
+ * it is the same) or a primitive: the hook renders again only when that changes. */
+function useFleetPart<T>(pick: (snapshot: FleetSnapshot) => T): T {
+  const fleet = useHubController();
+  const get = () => pick(fleet.snapshot());
+  return useSyncExternalStore(fleet.subscribe, get, get);
+}
+
+export const useFleetStatus = (): HubStatus => useFleetPart((s) => s.status);
+export const useOffer = (): boolean => useFleetPart((s) => s.offer);
+/** The paired Macs; the same array until one of them changes. */
+export const useMacs = (): MacInfo[] => useFleetPart((s) => s.macs);
+export const useNotice = (): string | null => useFleetPart((s) => s.notice);
+/** Each Mac's push notice; the same array until one changes. */
+export const useNotices = (): string[] => useFleetPart((s) => s.notices);
+
 /** @deprecated One-Mac code only; `useFleet` is the same snapshot. */
 export const useHubSnapshot = useFleet;
 
+/** @deprecated One-Mac code only: `notices` as one text, or null. */
+export const usePushNotice = (): string | null => useFleetPart((s) => s.pushNotice);
+
 /** @deprecated One-Mac code only: the only Mac's connection; null before pairing, after the last
- * Mac unpaired this phone, and with several Macs. Code that holds a session key asks `useLinks`. */
-export const useHubClient = (): HubClient | null => useFleet().client;
+ * Mac unpaired this phone, and with several Macs. Code that holds a session key asks `useLinks`.
+ * Renders again only when that connection changes. */
+export const useHubClient = (): HubClient | null => useFleetPart((s) => s.client);
 
 /** The connection by Mac, for code that holds a session key. A new object when a Mac comes or
  * goes, the same one until then. */
