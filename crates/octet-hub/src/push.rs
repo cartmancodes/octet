@@ -98,18 +98,34 @@ const MAC_CHARS: usize = 253;
 /// The longest label of that name.
 const LABEL_CHARS: usize = 63;
 
+/// The longest port a published URL may name, in digits.
+const PORT_DIGITS: usize = 5;
+
 /// The `mac` of a push: the host of the hub's published URL (its scheme, port, path, query and
 /// fragment dropped), lowercased, when it is a DNS name of at most 253 characters whose labels are
-/// 1 to 63 of `a-z`, `0-9` and `-`, never starting or ending with `-`; `None` for anything else
-/// (no `://`, user info, an IP v6 literal, a trailing dot, any other character).
+/// 1 to 63 of `a-z`, `0-9` and `-`, never starting or ending with `-`; `None` for anything else.
+/// An authority holding `@` (user info) is refused whole, before any `:` is read, so neither a
+/// user name nor a password can pass for the host or the port. A port, when there is one, is 1 to
+/// 5 digits after the one `:`. Also refused: no `://`, an IP v6 literal, a trailing dot, any other
+/// character.
 pub(crate) fn mac_of(url: &str) -> Option<String> {
     let (_, rest) = url.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    if authority.contains('@') {
+        return None;
+    }
+    let host = match authority.split_once(':') {
+        None => authority,
+        Some((host, port)) => {
+            let digits =
+                (1..=PORT_DIGITS).contains(&port.len()) && port.bytes().all(|b| b.is_ascii_digit());
+            if !digits {
+                return None;
+            }
+            host
+        }
+    }
+    .to_ascii_lowercase();
     let label_ok = |label: &str| {
         (1..=LABEL_CHARS).contains(&label.len())
             && label
@@ -1210,6 +1226,8 @@ mod tests {
                 "https://mac.tail1.ts.net:8443/hub?x=1#y",
                 "mac.tail1.ts.net",
             ),
+            ("https://mac.tail1.ts.net:1", "mac.tail1.ts.net"),
+            ("https://mac.tail1.ts.net:65535/", "mac.tail1.ts.net"),
             ("https://mac-mini-2.tail1.ts.net", "mac-mini-2.tail1.ts.net"),
             ("https://100.64.0.7", "100.64.0.7"),
             ("https://localhost", "localhost"),
@@ -1241,6 +1259,17 @@ mod tests {
             "https://stu_dio.ts.net",
             "https://stu dio.ts.net",
             "https://user@studio.ts.net",
+            // User info is refused whole: its `:` must never pass for a port, nor its user for a host.
+            "https://user:pass@studio.ts.net",
+            "https://evil.com:x@studio.ts.net",
+            "https://studio.ts.net@evil.com",
+            "https://studio.ts.net:443@evil.com",
+            // A port is 1 to 5 digits, once.
+            "https://studio.ts.net:",
+            "https://studio.ts.net:notaport",
+            "https://studio.ts.net:443:1",
+            "https://studio.ts.net:123456",
+            "https://studio.ts.net:-1",
             "https://studio.ts.net%2f",
             "https://[::1]:443/",
             "https://studio.ts.net\n.evil",
