@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { RequestBody } from "./client/HubClient";
-import { sendTo, useAction, useAlive, useSendTo, type Action, type Send } from "./components/send";
+import { sendTo, sendVia, useAction, useAlive, useSendTo, type Action, type Send } from "./components/send";
 import { useLinks } from "./hub";
 import type { RecentInfo } from "./protocol";
 import { recentItems, tmuxOfAck, workspaceChoices } from "./recent";
@@ -38,7 +38,8 @@ export function launchNotice(launch: Launch | null): string | null {
 }
 
 export interface StartSession {
-  /** Sends to the hook's Mac (a body naming a session, to the session's). */
+  /** Sends a body naming a session to that session's Mac, by its key (the launched session's
+   * first prompt, whatever Mac the screen shows by then); any other body to the hook's Mac. */
   send: Send;
   /** Sends `body` (a `start`) to Mac `mac` (else the hook's) unless one is out, and forgets any
    * earlier launch if it sent. True if it sent. */
@@ -65,7 +66,10 @@ export interface StartSession {
  */
 export function useStartSession(onListed: (sessionId: string) => void, mac?: string): StartSession {
   const links = useLinks();
-  const send = useSendTo(mac);
+  const send = useCallback<Send>(
+    (body) => ("session" in body ? sendVia(links, body.session, body) : sendTo(links, mac, body)),
+    [links, mac],
+  );
   const hub = useHub(mac ?? "");
   const sessions = useSessions();
   // The Mac of the start being sent: read by the send below as `run` calls it.

@@ -94,6 +94,8 @@ async function launch(list: SessionInfo[] | null) {
     recent: () => <Text>Recent screen</Text>,
     new: () => <Text>New session screen</Text>,
     settings: () => <Text>Settings screen</Text>,
+    usage: () => null,
+    changes: () => null,
   });
   await view;
   const rig = { hub, sockets, clock, view };

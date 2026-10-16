@@ -19,6 +19,9 @@ interface Answer {
   /** Null until its first list. */
   items: RecentInfo[] | null;
   failed: Failure | null;
+  /** When its list last came, in ms: its rows count "ago" from it, so another Mac's answer
+   * moves none of them. */
+  at: number;
 }
 
 interface Loaded {
@@ -26,11 +29,9 @@ interface Loaded {
   byMac: ReadonlyMap<string, Answer>;
   /** Whether a load that follows an earlier one is out (the pull spinner). */
   pulling: boolean;
-  /** When the items last came, in ms. */
-  at: number;
 }
 
-const NOT_YET: Answer = { items: null, failed: null };
+const NOT_YET: Answer = { items: null, failed: null, at: 0 };
 const BAD_ANSWER: Failure = { text: "Something went wrong. Try again.", retry: true };
 
 /** Resume a recent session. The hub asks for a terminal UI in tmux on the Mac; when it shows in
@@ -49,20 +50,19 @@ export default function Recent() {
   const ready = useReadyMacs();
   const onlyHub = useHub(only ?? "");
   const focused = useIsFocused();
-  const [loaded, setLoaded] = useState<Loaded>({ byMac: new Map(), pulling: false, at: 0 });
+  const [loaded, setLoaded] = useState<Loaded>({ byMac: new Map(), pulling: false });
   // The newest request to each Mac: only its answer is kept. And the Macs still to answer.
   const loadIds = useRef(new Map<string, number>());
   const out = useRef(new Set<string>());
   const open = useCallback((id: string) => router.replace({ pathname: "/session/[id]", params: { id } }), [router]);
   const { start, failed, locked, notice } = useStartSession(open, only);
 
-  const answer = useCallback((mac: string, change: (a: Answer) => Answer, at?: number) => {
+  const answer = useCallback((mac: string, change: (a: Answer) => Answer) => {
     out.current.delete(mac);
     const done = out.current.size === 0;
     setLoaded((l) => ({
       byMac: new Map(l.byMac).set(mac, change(l.byMac.get(mac) ?? NOT_YET)),
       pulling: done ? false : l.pulling,
-      at: at ?? l.at,
     }));
   }, []);
 
@@ -76,7 +76,7 @@ export default function Recent() {
         (frame) => {
           if (!alive() || loadIds.current.get(mac) !== mine) return;
           const items = recentItems(frame);
-          if (items) answer(mac, () => ({ items, failed: null }), Date.now());
+          if (items) answer(mac, () => ({ items, failed: null, at: Date.now() }));
           else answer(mac, (a) => ({ ...a, failed: BAD_ANSWER }));
         },
         (error: unknown) => {
@@ -110,23 +110,29 @@ export default function Recent() {
     load(back);
   }, [ready, load]);
 
-  // A row hands back the item it was given: one of `items`, so it carries its Mac.
   const onResume = useCallback(
-    (r: RecentInfo) => start({ type: "start", engine: r.engine, workspace: r.workspace, resume: r.session }, (r as RecentItem).mac),
+    (r: RecentItem) => start({ type: "start", engine: r.engine, workspace: r.workspace, resume: r.session }, r.mac),
     [start],
   );
 
-  // The paired Macs' lists, merged; a Mac no longer paired is left out.
-  const items = useMemo(
-    () =>
-      mergeRecent(
-        [...names].flatMap(([mac, macName]) => {
-          const got = loaded.byMac.get(mac)?.items;
-          return got ? [{ mac, macName, items: got }] : [];
-        }),
-      ),
-    [names, loaded.byMac],
-  );
+  // The paired Macs' lists, merged; a Mac no longer paired is left out. A row that did not change
+  // keeps its item, so it does not draw again when another Mac answers.
+  const [merged, setMerged] = useState<{ byMac: Loaded["byMac"] | null; names: typeof names | null; items: RecentItem[] }>({
+    byMac: null,
+    names: null,
+    items: [],
+  });
+  let items = merged.items;
+  if (merged.byMac !== loaded.byMac || merged.names !== names) {
+    items = mergeRecent(
+      [...names].flatMap(([mac, macName]) => {
+        const got = loaded.byMac.get(mac)?.items;
+        return got ? [{ mac, macName, items: got }] : [];
+      }),
+      merged.items,
+    );
+    setMerged({ byMac: loaded.byMac, names, items });
+  }
   const failures = useMemo(
     () => [...names].flatMap(([mac, macName]) => {
       const f = loaded.byMac.get(mac)?.failed;
@@ -142,12 +148,12 @@ export default function Recent() {
       <RecentRow
         item={item}
         macName={several ? item.macName : ""}
-        now={loaded.at}
+        now={loaded.byMac.get(item.mac)?.at ?? 0}
         disabled={locked || !ready.has(item.mac)}
         onResume={onResume}
       />
     ),
-    [several, loaded.at, locked, ready, onResume],
+    [several, loaded.byMac, locked, ready, onResume],
   );
   const extraData = useMemo(() => ({ locked, ready }), [locked, ready]);
   const empty = useMemo(

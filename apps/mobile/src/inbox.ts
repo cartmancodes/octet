@@ -138,7 +138,7 @@ function needsItem(s: SessionInfo, approval: ApprovalInfo | null, base: Base): I
  * answers (the screen gives each row's own); a session waiting with none there can only be opened.
  * `mac` names the Mac on a quiet card; `now` is the clock in milliseconds. `names`, the paired
  * Macs' names by id, is given only when there are several: each card then carries its own Mac's
- * name (a quiet card says it in place of `mac`), and a tie in time goes by that name. O(n log n)
+ * name (and a quiet card's status is the engine alone), and a tie in time goes by that name. O(n log n)
  * in the sessions.
  */
 export function classify(
@@ -181,7 +181,8 @@ export function classify(
     } else {
       out.done.push({
         ...base,
-        status: `${macName ?? mac} · ${s.engine}`,
+        // With several Macs the card names its own Mac already: the engine alone.
+        status: macName !== undefined ? s.engine : `${mac} · ${s.engine}`,
         statusTone: "muted",
         line: s.goal ? s.goal : phaseWords(s.phase).toLowerCase(),
         files: NO_FILES,

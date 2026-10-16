@@ -16,6 +16,7 @@ import * as macWords from "./macs";
 import { keyOf } from "./macs";
 import type { ApprovalInfo, RecentInfo, SessionInfo } from "./protocol";
 import { MACS, hearOn, info, launch, launchMacs, pairedMacs, pairedStorage, socketTo, type Rig } from "./screenRig";
+import * as recentWords from "./recent";
 import { mergeRecent } from "./recent";
 import { hideToast } from "./toast";
 import { k } from "./testKeys";
@@ -83,6 +84,17 @@ describe("cards name their Mac", () => {
     expect(inCard(inStudio("a")).getByText("studio")).toBeTruthy();
     expect(inCard(inMini("b")).getByText("mini")).toBeTruthy();
     expect(inCard(inStudio("a")).getByRole("button", { name: /^a, / }).props.accessibilityLabel).toMatch(/studio/);
+  });
+
+  it("a long Mac name gives way: it shrinks to one line, and how long ago stays whole", async () => {
+    await pairedMacs(2);
+    await launchMacs("/", ROUTES, { studio: [info("a", { last_activity: 100 })], mini: [] });
+    await fireEvent.press(tab("Done"));
+    const name = inCard(inStudio("a")).getByText("studio");
+    expect(name.props.numberOfLines).toBe(1);
+    expect(style(name).flexShrink).toBe(1);
+    const ago = inCard(inStudio("a")).getByText(/^\d+w$/);
+    expect(style(ago).flexShrink).toBe(0);
   });
 
   it("orders as one list across Macs, newest first, a tie by the Mac's name, then by key", async () => {
@@ -302,6 +314,38 @@ describe("New session's Mac chip", () => {
     expect(socketTo(rig, "mini").commandsOf("start")).toEqual([]);
   });
 
+  it("keeps the Mac a start went to: another Mac connecting, or a tap, moves neither the chip nor the first prompt", async () => {
+    await pairedMacs(2);
+    // studio, first in pairing order, is still connecting: mini is the first online Mac.
+    const rig = await launchMacs("/", ROUTES, { mini: [info("on-mini")] });
+    await act(async () => router.push("/new"));
+    await flush();
+    expect(macChip().props.accessibilityLabel).toBe("Mac mini");
+    await fireEvent.changeText(screen.getByLabelText("What should the agent do?"), "fix the build");
+    await flush();
+    await fireEvent.press(screen.getByRole("button", { name: "Start session" }));
+    await flush();
+    const mini = socketTo(rig, "mini");
+    expect(mini.commandsOf("start")).toHaveLength(1);
+    await act(async () => {
+      mini.receive({ type: "ack", req: Number(mini.commandsOf("start").at(-1)?.req), message: "Starting octet-a1b2c3 in /Users/me/Projects/on-mini" });
+    });
+    await flush();
+    // studio connects: it is now the first online Mac.
+    await hearOn(rig, "studio", [info("on-studio")]);
+    await flush();
+    expect(macChip().props.accessibilityLabel).toBe("Mac mini");
+    // A tap while the launch is awaited changes nothing.
+    await fireEvent.press(macChip());
+    await flush();
+    expect(macChip().props.accessibilityLabel).toBe("Mac mini");
+    await hearOn(rig, "mini", [info("on-mini"), info("fresh", { tmux: "octet-a1b2c3", from_phone: true })]);
+    await flush();
+    expect(socketTo(rig, "mini").commandsOf("prompt")).toEqual([expect.objectContaining({ session: "fresh", text: "fix the build" })]);
+    expect(rig.sockets.all.filter((x) => x.url.includes("studio")).flatMap((x) => x.commandsOf("prompt"))).toEqual([]);
+    expect(rig.sockets.all.flatMap((x) => x.commandsOf("start"))).toHaveLength(1);
+  });
+
   it("offers only the chosen Mac's folders", async () => {
     await pairedMacs(2);
     await launchMacs("/", ROUTES, { studio: [info("on-studio")], mini: [info("on-mini")] });
@@ -371,6 +415,17 @@ describe("Recent across Macs", () => {
     expect(screen.getByText("The Mac's history is unreadable")).toBeTruthy();
     expect(textOf(screen.getByTestId(`recent-failed-${STUDIO.id}`))).toMatch(/studio/);
     expect(screen.getByRole("button", { name: "Resume m1, m1, on mini" })).toBeTruthy();
+  });
+
+  it("keeps a Mac's rows as they were when another Mac answers: only the new rows draw", async () => {
+    await pairedMacs(2);
+    const rig = await launchMacs("/", ROUTES, { studio: [], mini: [] });
+    await act(async () => router.push("/recent"));
+    await flush();
+    await answer(rig, "studio", [recent("s1", 1_000), recent("s2", 100)]);
+    const drawn = jest.spyOn(recentWords, "startedAgo");
+    await answer(rig, "mini", [recent("m1", 2_000)]);
+    expect(drawn.mock.calls.map(([started]) => started)).toEqual([2_000]);
   });
 
   it("leaves out a Mac that is asleep, and disables nothing of the others", async () => {
@@ -443,7 +498,9 @@ describe("the words", () => {
       ["m2/y", "alpha"],
       ["m1/x", "zeta"],
     ]);
-    expect(done[0]?.status).toBe("alpha · claude");
+    // The card names its Mac once: a quiet card's status is the engine alone.
+    expect(done[0]?.status).toBe("claude");
+    expect(inboxWords.cardLabel(done[0]!).match(/alpha/g)).toHaveLength(1);
   });
 
   it("mergeRecent orders newest start first, a tie by the Mac's name, then by key", () => {

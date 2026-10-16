@@ -94,10 +94,20 @@ export const recentKey = (r: RecentItem): string => `${r.mac}:${r.engine}:${r.wo
 const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 /** Every Mac's recent items as one list: newest start first, a tie by the Mac's name, then by
- * key. Each Mac's items keep the order the Mac gave them for an equal start and name only through
- * the key (the sort is total). */
-export function mergeRecent(lists: readonly { mac: string; macName: string; items: readonly RecentInfo[] }[]): RecentItem[] {
+ * key. An item that `before` (the last list) holds unchanged is that same object, so its row does
+ * not draw again. */
+export function mergeRecent(
+  lists: readonly { mac: string; macName: string; items: readonly RecentInfo[] }[],
+  before: readonly RecentItem[] = [],
+): RecentItem[] {
+  const had = new Map(before.map((r) => [recentKey(r), r]));
   const all: RecentItem[] = [];
-  for (const { mac, macName, items } of lists) for (const r of items) all.push({ ...r, mac, macName });
+  for (const { mac, macName, items } of lists) {
+    for (const r of items) {
+      const next: RecentItem = { ...r, mac, macName };
+      const old = had.get(recentKey(next));
+      all.push(old && old.title === next.title && old.started === next.started && old.macName === macName ? old : next);
+    }
+  }
   return all.sort((a, b) => (b.started || 0) - (a.started || 0) || byText(a.macName, b.macName) || byText(recentKey(a), recentKey(b)));
 }

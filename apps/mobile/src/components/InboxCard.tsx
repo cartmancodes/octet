@@ -34,7 +34,10 @@ function makeStyles(theme: Theme) {
     head: { flexDirection: "row", justifyContent: "space-between", gap: spacing.sm },
     name: { ...type.body, color: theme.fg, fontWeight: "700", flexShrink: 1 },
     ago: { ...type.body, color: theme.muted },
-    side: { flexDirection: "row", gap: spacing.sm, flexShrink: 0 },
+    // The Mac's name gives way (to one line, then cut) before the session's name; "ago" never does.
+    side: { flexDirection: "row", gap: spacing.sm, flexShrink: 1, minWidth: 0 },
+    macName: { ...type.body, color: theme.muted, flexShrink: 1 },
+    agoFixed: { ...type.body, color: theme.muted, flexShrink: 0 },
     amber: { ...type.body, color: theme.amber },
     accent: { ...type.body, color: theme.accent },
     muted: { ...type.body, color: theme.muted },
@@ -82,10 +85,10 @@ export const InboxCard = memo(function InboxCard({ item, offline, covered, send,
           {/* With several Macs, the card names its own, muted, before how long ago. */}
           {item.macName ? (
             <View style={s.side}>
-              <Text numberOfLines={1} style={s.ago}>
+              <Text numberOfLines={1} style={s.macName}>
                 {item.macName}
               </Text>
-              <Text style={s.ago}>{item.ago}</Text>
+              <Text style={s.agoFixed}>{item.ago}</Text>
             </View>
           ) : (
             <Text style={s.ago}>{item.ago}</Text>

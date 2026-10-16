@@ -7,7 +7,7 @@ import { FullAccessConfirm } from "../src/components/FullAccessConfirm";
 import { FULL_ACCESS_WORDS, useFullAccessArm } from "../src/components/fullAccess";
 import { HubBanner } from "../src/components/HubBanner";
 import { NewChips } from "../src/components/NewChips";
-import { failure, isSlash, PROMPT_LIMIT, SLASH_NOTE, TOO_LONG, utf8Bytes } from "../src/components/send";
+import { failure, isSlash, PROMPT_LIMIT, SLASH_NOTE, TOO_LONG, useSend, utf8Bytes } from "../src/components/send";
 import { lightTap } from "../src/haptics";
 import { useMacs } from "../src/hub";
 import type { Engine, Mode } from "../src/protocol";
@@ -47,8 +47,8 @@ export default function NewSession() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const focused = useIsFocused();
-  // Where the session starts: the Mac chosen on the chip, while it is online; else the first
-  // online Mac; else the first paired. With one Mac, that one.
+  // Where the session starts: the Mac chosen on the chip (or pinned by Start), while it is online;
+  // else the first online Mac; else the first paired. With one Mac, that one.
   const macs = useMacs();
   const [chosen, setChosen] = useState<string | null>(null);
   const online = useMemo(() => macs.filter((m) => m.state === "ready"), [macs]);
@@ -76,15 +76,18 @@ export default function NewSession() {
     },
     [router],
   );
-  const { send, start, failed, fail, locked, notice } = useStartSession(listed, targetId);
+  const { start, failed, fail, locked, notice } = useStartSession(listed, targetId);
+  // The first prompt goes to the launched session's own Mac, by its key: whatever the chip says
+  // by the time it is listed.
+  const sendToSession = useSend();
   useEffect(() => {
     sendPrompt.current = (id, prompt) => {
-      send({ type: "prompt", session: id, text: prompt }).catch((error: unknown) => {
+      sendToSession({ type: "prompt", session: id, text: prompt }).catch((error: unknown) => {
         octetStore.getState().setDraft(id, prompt);
         showToast(`${failure(error).text.replace(/\.$/, "")}. ${KEPT_TEXT}`);
       });
     };
-  }, [send]);
+  }, [sendToSession]);
 
   // A refused start (or a phone with no Face ID) is a toast.
   useEffect(() => {
@@ -134,11 +137,13 @@ export default function NewSession() {
         return false;
       }
       if (!start(body)) return false; // a start is already out: this press is a second tap
+      // The Mac it went to stays the target: another one connecting meanwhile moves nothing.
+      setChosen(targetId ?? null);
       pending.current = text;
       lightTap();
       return true;
     },
-    [text, bodyOf, start, foldersLoaded],
+    [text, bodyOf, start, foldersLoaded, targetId],
   );
 
   const onStart = useCallback(() => {
@@ -159,16 +164,17 @@ export default function NewSession() {
   }, [disarm, fail]);
 
   // With several Macs online, a tap moves to the next online one; otherwise it says where
-  // sessions start.
+  // sessions start. While a start is out or its session awaited, the Mac stays as it is.
   const onMac = useCallback(() => {
     if (online.length < 2) {
       showToast(`Sessions start on ${targetName}.`);
       return;
     }
+    if (locked) return;
     disarm();
     const at = online.findIndex((m) => m.id === targetId);
     setChosen(online[(at + 1) % online.length]?.id ?? null);
-  }, [online, targetId, targetName, disarm]);
+  }, [locked, online, targetId, targetName, disarm]);
   const onFolder = useCallback(() => {
     if (workspaces.length === 0) {
       showToast(foldersLoaded ? NO_WORKSPACE : LOADING_FOLDERS);

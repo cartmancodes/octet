@@ -1,13 +1,12 @@
 import { memo, useCallback } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
-import type { RecentInfo } from "../protocol";
-import { startedAgo } from "../recent";
+import { startedAgo, type RecentItem } from "../recent";
 import { clipLabel, engineName, sessionName } from "../sessions";
 import { radius, spacing, type, useTheme } from "../theme";
 
 interface RecentRowProps {
-  item: RecentInfo;
+  item: RecentItem;
   /** The Mac it is on, drawn (and said) only with several Macs; empty otherwise. */
   macName?: string;
   /** The clock the list was loaded at, in ms: it moves only with a load, so rows stay put. */
@@ -15,7 +14,7 @@ interface RecentRowProps {
   /** A start is out or a launched session is awaited. */
   disabled: boolean;
   /** Must be stable, or every row draws again with the list. */
-  onResume: (item: RecentInfo) => void;
+  onResume: (item: RecentItem) => void;
 }
 
 /** One resumable session: engine, title (else "Untitled"), workspace folder, how long ago, and
