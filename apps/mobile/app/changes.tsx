@@ -231,9 +231,12 @@ export default function Changes() {
     },
     [send, id, alive, setDiff],
   );
-  // Sends what waits while there is room; one asked under an older listing is dropped.
+  // Sends what waits while there is room, and only while the newest listing came on this
+  // connection (the hub would refuse any other, and offline nothing can go); one asked under an
+  // older listing is dropped.
   useLayoutEffect(() => {
     pump.current = () => {
+      if (!fresh.current) return;
       while (inFlight.current < DIFFS_AT_ONCE) {
         const next = queue.current.shift();
         if (next === undefined) return;
@@ -305,12 +308,15 @@ export default function Changes() {
   // old connection, and the workspace may have changed meanwhile.
   useEffect(() => {
     if (hub !== "ready") {
+      // Offline: nothing waits to go, a busy one's retry included; the next listing asks again
+      // for every open file's diff.
       fresh.current = false;
+      forgetQueue();
       return;
     }
     // eslint-disable-next-line react-hooks/set-state-in-effect -- one extra render on a reconnect, to clear a stale failure now
     if (id !== "") load(false);
-  }, [hub, id, load]);
+  }, [hub, id, load, forgetQueue]);
   const pull = useCallback(() => load(true), [load]);
   const retry = useCallback(() => load(false), [load]);
 

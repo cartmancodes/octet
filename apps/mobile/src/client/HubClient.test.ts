@@ -206,19 +206,25 @@ describe("requests", () => {
     expect(pairRefusal.message.length).toBe(512);
   });
 
-  it("a commit's refusal keeps up to 2,000 characters: a hook's words, as the hub clipped them", async () => {
+  it("a commit's refusal keeps the hub's 2,000 characters whole, emoji too: a hook's words, as the hub clipped them", async () => {
     const r = rig();
     ready(r);
+    // The hub keeps the last 2,000 characters (scalars) behind "…": 3,996 UTF-16 units here.
+    const words = `…${"🙂".repeat(1_996)}END`;
+    expect(Array.from(words)).toHaveLength(2_000);
     const pending = r.client.request({ type: "commit", session: "s", message: "Fix it" });
-    const words = `…${"x".repeat(1_990)}FAILED`;
-    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("commit")[0]?.req, code: "not_allowed", reason: words + "!".repeat(5_000) });
+    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("commit")[0]?.req, code: "not_allowed", reason: words });
     const refusal = (await pending.catch((e: unknown) => e)) as Refusal;
-    expect(refusal.message.length).toBe(2_000);
-    expect(refusal.message.startsWith(`…${"x".repeat(1_990)}FAI`)).toBe(true);
+    expect(refusal.message).toBe(words);
+    // Past what the hub sends, it is still clipped.
+    const longer = r.client.request({ type: "commit", session: "s", message: "Fix it" });
+    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("commit")[1]?.req, code: "not_allowed", reason: "x".repeat(9_000) });
+    expect(((await longer.catch((e: unknown) => e)) as Refusal).message.length).toBe(4_000);
     // Any other command's refusal is still a short one.
     const other = r.client.request({ type: "diff", session: "s", path: "a" });
     r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("diff")[0]?.req, code: "unavailable", reason: words });
-    expect(((await other.catch((e: unknown) => e)) as Refusal).message.length).toBe(512);
+    // 512 units at most, an emoji never cut in two.
+    expect(((await other.catch((e: unknown) => e)) as Refusal).message).toBe(`…${"🙂".repeat(255)}`);
   });
 
   it("a recent frame answers its request", async () => {

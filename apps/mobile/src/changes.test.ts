@@ -289,8 +289,10 @@ describe("committedText", () => {
 describe("commitScope", () => {
   const untracked = (path: string) => file(path, 1, 0, { status: "?" });
 
-  it("counts the listed files, saying how many are new (untracked) when any are", () => {
-    expect(commitScope([file("a", 1, 0), file("b", 2, 1, { status: "A" })], 0)).toBe("Commits 2 files");
+  it("counts the listed files, saying how many are new (untracked or added) when any are", () => {
+    expect(commitScope([file("a", 1, 0), file("b", 2, 1, { status: "D" }), file("c", 0, 0, { status: "R" })], 0)).toBe("Commits 3 files");
+    expect(commitScope([file("a", 1, 0), file("b", 2, 0, { status: "A" })], 0)).toBe("Commits 2 files, including 1 new");
+    expect(commitScope([file("a", 2, 0, { status: "A" }), untracked("b"), file("c", 1, 1)], 0)).toBe("Commits 3 files, including 2 new");
     expect(commitScope([file("a", 1, 0)], 0)).toBe("Commits 1 file");
     expect(commitScope([file("a", 1, 0), untracked("b"), untracked("c")], 0)).toBe("Commits 3 files, including 2 new");
     expect(commitScope([untracked("b")], 0)).toBe("Commits 1 file, including 1 new");

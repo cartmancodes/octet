@@ -549,6 +549,36 @@ describe("two diffs at a time", () => {
     expect(screen.getByText("Git is busy; try again")).toBeTruthy();
   });
 
+  it("sends nothing while offline, a busy one's retry included, and waits for a fresh listing", async () => {
+    const rig = await open();
+    await answer(rig);
+    await tap("src/app.ts");
+    await refuse(rig, "diff", "Git is busy; try again", "busy");
+    const sent = () => rig.sockets.all.flatMap((x) => x.commandsOf("diff"));
+    expect(sent()).toHaveLength(1);
+    // The link drops before the retry is due; the retry's time passes offline.
+    await act(async () => rig.sockets.last.drop());
+    await act(async () => void jest.advanceTimersByTime(5_000));
+    expect(sent()).toHaveLength(1);
+    expect(within(list()).queryByText("Can't reach your Mac")).toBeNull(); // the banner says it, not the row
+    expect(within(list()).getByText(LOADING_DIFF)).toBeTruthy();
+    // Back: the listing first, then the diff.
+    await act(async () => {
+      rig.clock.advance(60_000);
+      rig.sockets.last.open();
+      rig.sockets.last.receive({ type: "welcome", device: "iPhone" });
+      rig.clock.advance(50);
+    });
+    await flush();
+    await act(async () => void jest.advanceTimersByTime(5_000));
+    expect(sent()).toHaveLength(1);
+    expect(requests(rig, "changes")).toHaveLength(1);
+    await answer(rig);
+    expect(requests(rig, "diff")).toEqual([expect.objectContaining({ path: "src/app.ts" })]);
+    await answerDiff(rig, DIFF);
+    expect(screen.getAllByTestId("diff-line")).toHaveLength(4);
+  });
+
   it("a busy diff asked again comes in", async () => {
     const rig = await open();
     await answer(rig);

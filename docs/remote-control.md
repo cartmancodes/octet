@@ -570,8 +570,9 @@ What the phone can do with git, and nothing more:
   whatever the **Face ID to allow** setting says. The Mac runs `git add -A`
   and `git commit -F -` with the message on standard input, limited to the
   workspace's own files, untracked ones too: the sheet says how many files
-  that is from the last listing ("Commits 3 files, including 1 new", or
-  "about" when the Mac had more than it listed). A toast names the new
+  that is from the last listing ("Commits 3 files, including 1 new", where
+  new means untracked or added, or "about" when the Mac had more than it
+  listed). A toast names the new
   commit's short hash and the branch.
 
 The phone can't push, open a pull request, amend, choose which files to

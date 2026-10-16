@@ -118,9 +118,10 @@ const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
   return () => clearTimeout(id);
 };
 
-/** The most characters kept of a commit's refusal: git's own words, which the hub clips to the
- * last 2,000 (`GIT_WORDS`, crates/octet-hub/src/git.rs), where a hook puts its summary. */
-export const COMMIT_WORDS_CHARS = 2_000;
+/** The most UTF-16 units kept of a commit's refusal: git's own words, which the hub clips to the
+ * last 2,000 characters (`GIT_WORDS`, crates/octet-hub/src/git.rs, counted in Unicode scalars),
+ * where a hook puts its summary. A scalar is at most two units, so the hub's words come whole. */
+export const COMMIT_WORDS_CHARS = 4_000;
 
 /** A refusal's words, as the user will read them: the hub's, cleaned and clipped to `limit`. */
 const refusalOf = (frame: RefusedFrame, limit = SHORT_CHARS): Refusal => new Refusal(frame.code ?? "invalid", field(frame.reason, limit));

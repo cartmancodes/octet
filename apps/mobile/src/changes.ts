@@ -30,12 +30,13 @@ export function changeSummary(files: readonly FileChange[], more: number): strin
 }
 
 /** What the commit sheet says a commit takes, from the last listing: "Commits N files", with
- * ", including M new" when M of them are untracked (`add -A` takes those too), and "about N" when
- * the Mac had more than it listed. Null with nothing listed. */
+ * ", including M new" when M of them are new to the repository, untracked (`?`, which `add -A`
+ * takes too) or already added (`A`), and "about N" when the Mac had more than it listed. Null
+ * with nothing listed. */
 export function commitScope(files: readonly FileChange[], more: number): string | null {
   const n = files.length + more;
   if (n === 0) return null;
-  const fresh = files.filter((f) => f.status === "?").length;
+  const fresh = files.filter((f) => f.status === "?" || f.status === "A").length;
   const count = `${more > 0 ? "about " : ""}${n === 1 ? "1 file" : `${n} files`}`;
   return fresh > 0 ? `Commits ${count}, including ${fresh} new` : `Commits ${count}`;
 }

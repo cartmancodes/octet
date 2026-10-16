@@ -577,7 +577,6 @@ export interface SessionStatus {
   epoch: number;
 }
 
-/** Hooks over `store`: each selects the smallest part a screen needs. */
 /** A view's transcript entries as `useEntries` gives them: during a replay from the start that
  * has brought nothing yet, the entries shown before it. */
 const viewEntries = (v: SessionView | undefined): Entry[] => {
@@ -589,6 +588,7 @@ const viewEntries = (v: SessionView | undefined): Entry[] => {
  * when something opens, which a stream must not draw again. */
 export const entriesNow = (store: OctetStore, id: string): Entry[] => viewEntries(store.getState().bySession.get(id));
 
+/** Hooks over `store`: each selects the smallest part a screen needs. */
 export function bindHooks(store: OctetStore) {
   return {
     /** Everything the phone knows of a session; the same object until it changes. */
