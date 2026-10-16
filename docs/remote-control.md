@@ -558,7 +558,9 @@ commit. Open it from **view ›** beside a tool entry that edited a file, from
 What the phone can do with git, and nothing more:
 
 - **Read** the list of changed files (at most 500, then "N more files on the
-  Mac") and the diff of a listed file (at most 64 KiB or 2,000 lines; the
+  Mac"; a new file's lines are counted from its first 1 MiB, and past 8 MiB
+  of new files in all, or 10 seconds of counting, the rest show `+0 −0`) and
+  the diff of a listed file (at most 64 KiB or 2,000 lines; the
   rest stays on the Mac). The screen asks for at most two diffs at a time,
   as the hub runs two git calls at once, and asks again, up to three times,
   for one the Mac was too busy for.

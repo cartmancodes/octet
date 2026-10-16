@@ -48,7 +48,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::{OwnedSemaphorePermit, Semaphore, watch},
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 
 /// How long one git call may take, hooks included.
@@ -65,6 +65,11 @@ pub(crate) const DIFF_LINES: usize = 2000;
 const UNTRACKED_READ: u64 = 1024 * 1024;
 /// The bytes of an untracked file in which a NUL means binary.
 const BINARY_SNIFF: usize = 8 * 1024;
+/// The most bytes of untracked files one `changes` reads, in all, to count their lines; past it,
+/// the rest are listed uncounted.
+const UNTRACKED_BUDGET: u64 = 8 * 1024 * 1024;
+/// The bytes of an untracked file read at a time, past its first 8 KiB.
+const COUNT_CHUNK: usize = 64 * 1024;
 /// The most characters of git's own words a refusal carries.
 pub(crate) const GIT_WORDS: usize = 2000;
 /// The most bytes of `status` or `numstat` output read.
@@ -132,6 +137,10 @@ pub(crate) struct Git {
     list_limit: usize,
     /// The environment git's is made from; the hub's own when none.
     environment: Option<Arc<Vec<(OsString, OsString)>>>,
+    /// The most bytes of untracked files one `changes` reads to count their lines.
+    count_budget: u64,
+    /// How long one `changes` may spend counting untracked files' lines.
+    count_within: Duration,
 }
 
 /// What a commit did: its short hash or refusal, and whether `add` had run (so files may be
@@ -268,6 +277,19 @@ impl Git {
             calls: Arc::new(AtomicUsize::new(0)),
             list_limit: LIST_OUTPUT,
             environment: None,
+            count_budget: UNTRACKED_BUDGET,
+            count_within: within,
+        }
+    }
+
+    /// Git that reads at most `budget` bytes of untracked files, for at most `within`, to count
+    /// their lines.
+    #[cfg(test)]
+    fn with_counting(budget: u64, within: Duration) -> Self {
+        Self {
+            count_budget: budget,
+            count_within: within,
+            ..Self::new()
         }
     }
 
@@ -309,7 +331,10 @@ impl Git {
 
     /// What `ws` changed against HEAD: a `rev-parse` for the repository's top, one `status` and
     /// one `numstat` (with a `hash-object` for the empty tree before the first commit), and the
-    /// lines of each listed untracked file counted from at most its first 1 MiB.
+    /// lines of each listed untracked file counted from at most its first 1 MiB. Counting reads
+    /// at most 8 MiB in all and takes at most the call's time limit; files past either are
+    /// listed `+0 −0` (the protocol has no "not counted"), and the listing is never refused for
+    /// it.
     ///
     /// # Errors
     ///
@@ -347,46 +372,50 @@ impl Git {
         let mut files = Vec::new();
         let mut listed = HashMap::new();
         let mut room = FRAME_ROOM;
-        let gather = async {
-            for entry in status.entries {
-                if files.len() == FILES_LIMIT {
-                    break;
-                }
-                let path = String::from_utf8_lossy(&entry.raw).into_owned();
-                // Two names that read alike once decoded: only the first can be asked for.
-                if listed.contains_key(&path) {
-                    continue;
-                }
-                let cost = json_len(&path) + ENTRY_COST;
-                if cost > room {
-                    break;
-                }
-                room -= cost;
-                let untracked = entry.status == FileStatus::Untracked;
-                let (add, del, binary) = if untracked {
-                    count_lines(&top, &entry.raw).await
-                } else {
-                    counts.get(&entry.raw).copied().unwrap_or_default()
-                };
-                files.push(FileChange {
-                    path: path.clone(),
-                    add,
-                    del,
-                    binary,
-                    status: entry.status,
-                });
-                let file = Listed {
-                    raw: entry.raw,
-                    orig: entry.orig,
-                    untracked,
-                    binary,
-                };
-                listed.insert(path, file);
+        let mut budget = self.count_budget;
+        // Counting past `count_within` (or the budget) lists the rest uncounted: a slow disk or
+        // big untracked files never refuse the listing.
+        let deadline = tokio::time::Instant::now() + self.count_within;
+        for entry in status.entries {
+            if files.len() == FILES_LIMIT {
+                break;
             }
-        };
-        timeout(self.within, gather)
-            .await
-            .map_err(|_| refusal(Code::Timeout, GIT_TIMED_OUT))?;
+            let path = String::from_utf8_lossy(&entry.raw).into_owned();
+            // Two names that read alike once decoded: only the first can be asked for.
+            if listed.contains_key(&path) {
+                continue;
+            }
+            let cost = json_len(&path) + ENTRY_COST;
+            if cost > room {
+                break;
+            }
+            room -= cost;
+            let untracked = entry.status == FileStatus::Untracked;
+            let (add, del, binary) = if untracked {
+                let count = count_lines(&top, &entry.raw, &mut budget);
+                if tokio::time::Instant::now() < deadline {
+                    timeout_at(deadline, count).await.unwrap_or_default()
+                } else {
+                    (0, 0, false)
+                }
+            } else {
+                counts.get(&entry.raw).copied().unwrap_or_default()
+            };
+            files.push(FileChange {
+                path: path.clone(),
+                add,
+                del,
+                binary,
+                status: entry.status,
+            });
+            let file = Listed {
+                raw: entry.raw,
+                orig: entry.orig,
+                untracked,
+                binary,
+            };
+            listed.insert(path, file);
+        }
         let more = (total - files.len()) as u64 + u64::from(cut_short);
         Ok(Changes {
             info: ChangesInfo {
@@ -815,10 +844,12 @@ fn clip_text(text: &str, room: usize) -> usize {
     text.len()
 }
 
-/// Counts the lines of the untracked file `raw` under `top` from at most its first 1 MiB: a NUL
-/// in its first 8 KiB means binary. Only a regular file is read, never through a symlink, and
-/// nothing that could block (a FIFO put there since git looked) holds it up.
-async fn count_lines(top: &Path, raw: &[u8]) -> (u64, u64, bool) {
+/// Counts the lines of the untracked file `raw` under `top` from at most its first 1 MiB, and at
+/// most `budget` bytes, which it spends: a NUL in its first 8 KiB means binary, and the file is
+/// read no further. Only a regular file is read, never through a symlink, and nothing that could
+/// block (a FIFO put there since git looked) holds it up. A file it cannot or does not read is
+/// `(0, 0, false)`, as an empty one: the protocol has no "not counted".
+async fn count_lines(top: &Path, raw: &[u8], budget: &mut u64) -> (u64, u64, bool) {
     let relative = Path::new(OsStr::from_bytes(raw));
     if !relative
         .components()
@@ -838,13 +869,31 @@ async fn count_lines(top: &Path, raw: &[u8]) -> (u64, u64, bool) {
     if !file.metadata().await.is_ok_and(|meta| meta.is_file()) {
         return (0, 0, false);
     }
-    let mut bytes = Vec::new();
-    let _ = file.take(UNTRACKED_READ).read_to_end(&mut bytes).await;
-    if bytes[..bytes.len().min(BINARY_SNIFF)].contains(&0) {
-        return (0, 0, true);
+    let mut reader = file.take(UNTRACKED_READ.min(*budget));
+    let mut chunk = vec![0; COUNT_CHUNK];
+    let (mut read, mut lines, mut last) = (0, 0_u64, None);
+    loop {
+        // The first 8 KiB on their own, so a binary file is read no further.
+        let want = if read < BINARY_SNIFF {
+            BINARY_SNIFF - read
+        } else {
+            COUNT_CHUNK
+        };
+        let n = match reader.read(&mut chunk[..want]).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let piece = &chunk[..n];
+        let sniffed = read < BINARY_SNIFF;
+        read += n;
+        *budget = budget.saturating_sub(n as u64);
+        if sniffed && piece.contains(&0) {
+            return (0, 0, true);
+        }
+        lines += piece.iter().fold(0, |n: u64, &b| n + u64::from(b == b'\n'));
+        last = piece.last().copied();
     }
-    let mut lines = bytes.iter().fold(0, |n: u64, &b| n + u64::from(b == b'\n'));
-    if bytes.last().is_some_and(|&b| b != b'\n') {
+    if last.is_some_and(|b| b != b'\n') {
         lines += 1;
     }
     (lines, 0, false)
@@ -1904,6 +1953,70 @@ mod tests {
         assert_eq!(git_in(top, &["diff", "--cached", "--name-only"]), "");
         std::fs::remove_file(top.join(".git/MERGE_HEAD")).expect("unmark");
         assert!(commit_now(&git, &ws).await.is_ok());
+    }
+
+    /// The listed files' `(path, added, deleted, binary)`.
+    fn counted(changes: &Changes) -> Vec<(&str, u64, u64, bool)> {
+        changes
+            .info
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.add, f.del, f.binary))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn untracked_counts_stop_at_the_budget() {
+        let git = Git::with_counting(200, GIT_WITHIN);
+        let dir = committed("octet-git-budget");
+        let ws = dir.path();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(ws.join(name), "line\n".repeat(20)).expect("write");
+        }
+        // 100 bytes each: the first two fill the budget, and the third is listed uncounted.
+        let changes = git.changes(ws).await.expect("changes");
+        assert_eq!(
+            counted(&changes),
+            [
+                ("a.txt", 20, 0, false),
+                ("b.txt", 20, 0, false),
+                ("c.txt", 0, 0, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_untracked_file_is_read_no_further_than_its_first_8_kib() {
+        let git = Git::with_counting(64 * 1024, GIT_WITHIN);
+        let dir = committed("octet-git-binary-sniff");
+        let ws = dir.path();
+        let mut binary = vec![0_u8];
+        binary.extend(std::iter::repeat_n(b'x', 1024 * 1024));
+        std::fs::write(ws.join("a.bin"), binary).expect("write");
+        std::fs::write(ws.join("b.txt"), "one\ntwo\nthree\n").expect("write");
+        // Read to 1 MiB, the binary file would spend the whole budget before b.txt.
+        let changes = git.changes(ws).await.expect("changes");
+        assert_eq!(
+            counted(&changes),
+            [("a.bin", 0, 0, true), ("b.txt", 3, 0, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn counting_that_runs_out_of_time_lists_the_rest_uncounted() {
+        let git = Git::with_counting(UNTRACKED_BUDGET, Duration::ZERO);
+        let dir = committed("octet-git-slow-count");
+        let ws = dir.path();
+        std::fs::write(ws.join("tracked.txt"), "one\ntwo\nthree\n").expect("write");
+        std::fs::write(ws.join("loose.txt"), "a\nb\n").expect("write");
+        let changes = git.changes(ws).await.expect("changes, not a timeout");
+        assert_eq!(
+            counted(&changes),
+            [("tracked.txt", 1, 0, false), ("loose.txt", 0, 0, false)]
+        );
+        // An uncounted file still diffs.
+        let target = changes.listing.target("loose.txt").expect("listed");
+        assert!(git.diff(&target).await.expect("diff").text.contains("+b"));
     }
 
     #[tokio::test]
