@@ -68,7 +68,7 @@
           "attributes-type":"OctetActivity","attributes":{}}}
   ```
 
-  `start` adds `"alert":{"title":"Octet","body":"Session running"}`, as ActivityKit requires an alert for push-to-start; `end` adds `"dismissal-date"`.
+  `"attributes-type"` and `"attributes"` go on `start` only, as Apple documents them for push-to-start. `start` adds `"alert":{"title":"Octet","body":"Approval waiting"|"Session running"}` (by kind; ActivityKit requires an alert for push-to-start); `end` adds `"dismissal-date"`.
 - **Content-free**
   - No names, commands, workspaces or file names in the payload.
   - `session` is the hub's own raw id of the session that leads, and `mac` is the hub's published host, as in Phase D's push data. The hub never knows the phone's pairing ids, so it never sends a key.
@@ -76,7 +76,7 @@
 - **Lifecycle (hub)**
   - **Start** with `start_token` when an approval waits or a turn starts and the device has no live connection.
   - **Update** when the kind or the approval count changes, at most once per 2 s per device.
-  - **End** 5 minutes after every session is idle, or when the phone connects. From then on the app drives the activity itself.
+  - **End** 5 minutes after every session is idle, or when the phone opens a session stream (a foreground UI). From then on the app drives the activity itself. A connection that only registers tokens (a background wake for a hub-started activity) does not end it.
 - **Bounds:** these sends count against the same per-device cap of 6 per minute as the other pushes. A 410 drops the token, and any other failure is logged without the token.
 - **App**
   - **The App Group** is `group.dev.octet.mobile`. The app writes `{"<host>/<raw>": {"name", "command"}}`, keyed the way the widget sees a session (host and raw id from the content state) (each value cleaned, at most 64 entries, names ≤ 80 characters and commands ≤ 200) whenever the Inbox's approvals change, and clears it on unpair.
