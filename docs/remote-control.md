@@ -805,6 +805,9 @@ answered within those 10 seconds, or the commit fails.
   finish connecting within 5 seconds, and once 32 are connecting at once, a new
   one pushes out the oldest. A stalled one never counts against the 8 that may
   wait to say hello.
+- Connections that connect and then never say hello can't keep a phone out
+  either. Each one is closed after 10 seconds, and once 8 are waiting, a new
+  one pushes out the oldest of them, so a phone that says hello always gets in.
 - The hub won't start if `run/` in the data directory is a symlink, isn't a
   directory, or belongs to another user. It names the path. If `run/` is
   readable by others, the hub makes it `0700`.

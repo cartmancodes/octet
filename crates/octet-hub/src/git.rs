@@ -53,6 +53,9 @@ use tokio::{
 
 /// How long one git call may take, hooks included.
 pub(crate) const GIT_WITHIN: Duration = Duration::from_secs(10);
+/// How long a git call past [`GIT_WITHIN`] has to stop after SIGTERM, which lets it remove its
+/// lockfiles, before it and its hooks are killed.
+const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Git calls that may run at once.
 const SLOTS: usize = 2;
 /// The most files one `changes` lists.
@@ -559,7 +562,8 @@ impl Git {
     ) -> Result<String, Refusal> {
         self.top(ws).await?;
         if self.under_way(ws).await? {
-            return Err(refusal(Code::Busy, MERGE_FIRST));
+            // Not something to wait out: the merge needs the desk.
+            return Err(refusal(Code::NotAllowed, MERGE_FIRST));
         }
         let status = [
             READ_ONLY,
@@ -738,7 +742,9 @@ impl Git {
             }
             (status, stdout, stderr, clipped)
         };
-        // Past the time limit, or dropped before git ended, `group` kills git and its hooks.
+        // Dropped before git ended, `group` kills git and its hooks. Past the time limit, git is
+        // asked to stop first (SIGTERM, to the whole group), so it takes its lockfiles away, and
+        // is killed with the rest only if it has not stopped within `TERM_GRACE`.
         match timeout(self.within, work).await {
             Ok((Ok(status), stdout, stderr, clipped)) => Ok(Ran {
                 status,
@@ -747,7 +753,16 @@ impl Git {
                 clipped,
             }),
             Ok((Err(_), ..)) => Err(refusal(Code::Unavailable, NO_GIT)),
-            Err(_) => Err(refusal(Code::Timeout, GIT_TIMED_OUT)),
+            Err(_) => {
+                if let Some(pid) = group.0 {
+                    let _ = kill_process_group(pid, Signal::TERM);
+                    // Reaped or not, the group is killed as `group` drops, straight after: a hook
+                    // that ignored the TERM goes with it. (While a member lives the group's id
+                    // cannot be reused, and git's own pid was freed only an instant before.)
+                    let _ = timeout(TERM_GRACE, child.wait()).await;
+                }
+                Err(refusal(Code::Timeout, GIT_TIMED_OUT))
+            }
         }
     }
 }
@@ -1581,7 +1596,7 @@ mod tests {
         let commit = git.commit(ws, "Mid-merge", &watch::channel(true).1).await;
         assert_eq!(
             (commit.result, commit.added),
-            (Err((Code::Busy, MERGE_FIRST.to_owned())), false)
+            (Err((Code::NotAllowed, MERGE_FIRST.to_owned())), false)
         );
         assert_eq!(git_in(ws, &["ls-files", "--stage"]), index);
         assert_eq!(git_in(ws, &["rev-list", "--count", "HEAD"]).trim(), "2");
@@ -1592,7 +1607,7 @@ mod tests {
             std::fs::create_dir(ws.join(".git").join(marker)).expect("marker");
             assert_eq!(
                 commit_now(&git, ws).await,
-                Err((Code::Busy, MERGE_FIRST.to_owned())),
+                Err((Code::NotAllowed, MERGE_FIRST.to_owned())),
                 "{marker}"
             );
             std::fs::remove_dir(ws.join(".git").join(marker)).expect("unmark");
@@ -1607,7 +1622,7 @@ mod tests {
             std::fs::write(ws.join(".git").join(marker), head).expect("marker");
             assert_eq!(
                 commit_now(&git, ws).await,
-                Err((Code::Busy, MERGE_FIRST.to_owned())),
+                Err((Code::NotAllowed, MERGE_FIRST.to_owned())),
                 "{marker}"
             );
             std::fs::remove_file(ws.join(".git").join(marker)).expect("unmark");
@@ -1696,7 +1711,7 @@ mod tests {
         assert!(git_in(ws, &["diff", "--cached", "--name-only"]).contains("new.txt"));
 
         // A hook that hangs ends at the timeout.
-        hook(ws, "pre-commit", "sleep 30");
+        hook(ws, "pre-commit", "sleep 15");
         let quick = Git::with_timeout(Duration::from_secs(1));
         let began = Instant::now();
         assert_eq!(
@@ -1708,9 +1723,9 @@ mod tests {
             "{:?}",
             began.elapsed()
         );
-        // Git was killed holding the index lock, which stays as git left it; the desk clears
-        // it as after any git that was killed.
-        let _ = std::fs::remove_file(ws.join(".git/index.lock"));
+        // Git was asked to stop (SIGTERM) before it was killed, so it took its index lock away
+        // with it: neither the next commit nor the desk's git finds one.
+        assert!(!ws.join(".git/index.lock").exists(), "git left its lock");
 
         std::fs::remove_file(ws.join(".git/hooks/pre-commit")).expect("unhook");
         let message = "-m evil --amend\n\nThe body; $(touch pwned)\n";
@@ -1948,7 +1963,7 @@ mod tests {
         let commit = git.commit(&ws, "Mid-merge", &watch::channel(true).1).await;
         assert_eq!(
             (commit.result, commit.added),
-            (Err((Code::Busy, MERGE_FIRST.to_owned())), false)
+            (Err((Code::NotAllowed, MERGE_FIRST.to_owned())), false)
         );
         assert_eq!(git_in(top, &["diff", "--cached", "--name-only"]), "");
         std::fs::remove_file(top.join(".git/MERGE_HEAD")).expect("unmark");

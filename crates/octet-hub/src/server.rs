@@ -9,10 +9,12 @@
 //! header is not exactly the owner's login, or whose `Origin` names a host that is neither the
 //! request's (`Host`, `X-Forwarded-Host`) nor that of the hub's published URL as last asked (a
 //! web page of another site; the app sends none, or the hub's own), with 403, and one the hub
-//! has no room for (64 open, or 8 not past `hello`) with 503. A connection then starts
+//! has no room for (64 open) with 503. A connection then starts
 //! unauthenticated and accepts only `hello` (a
 //! device token) and `pair` (a pairing secret); anything else, or a failed `hello` or `pair`,
-//! is refused and the socket closed, as is one silent for 30 seconds. After `hello` it is
+//! is refused and the socket closed, as is one silent for 10 seconds. At most 8 wait for
+//! their `hello` at once: a ninth lets the oldest of them go, so sockets that never speak
+//! cannot keep a phone out. After `hello` it is
 //! authenticated as that device: every frame, text or not, first
 //! checks that the device is still paired (a revoked one is told `revoked`, then closed) and takes a token
 //! from the device's bucket (60 a minute; an empty bucket refuses, it does not close). Every
@@ -124,7 +126,7 @@ const REFRESH_EVERY: Duration = Duration::from_secs(1);
 /// How often unanswered commands are checked against their deadline.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 /// How long a connection may take to say hello (or pair) before it is closed.
-const HELLO_WITHIN: Duration = Duration::from_secs(30);
+const HELLO_WITHIN: Duration = Duration::from_secs(10);
 /// How long a connection may take from accept to a finished WebSocket upgrade.
 const HANDSHAKE_WITHIN: Duration = Duration::from_secs(5);
 /// Upgrades under way at once; a connection accepted past it lets the oldest go.
@@ -137,7 +139,7 @@ const CLOSE_WITHIN: Duration = Duration::from_secs(2);
 const REVOKED_GRACE: Duration = Duration::from_secs(1);
 /// Connections open at once; more are turned away at accept.
 const MAX_CONNECTIONS: usize = 64;
-/// Connections that have not said hello yet; more are turned away at accept.
+/// Connections that may wait for their hello at once; a new one past it lets the oldest go.
 const MAX_WAITING: usize = 8;
 /// How often a connection is pinged; one that misses two pongs is let go.
 const PING_EVERY: Duration = Duration::from_secs(20);
@@ -363,32 +365,25 @@ impl Liveness {
     }
 }
 
-/// The connections the hub holds: every open one, and those not past `hello` yet. A handshake
-/// takes a [`Seat`] before it upgrades, so a socket the hub has no room for is turned away
-/// (503) rather than upgraded and then dropped, and one that never finishes its request holds
-/// no place at all.
+/// The connections the hub holds. A handshake takes a [`Seat`] before it upgrades, so a socket
+/// the hub has no room for (64 open) is turned away (503) rather than upgraded and then dropped,
+/// and one that never finishes its request holds no place at all. Connections not past `hello`
+/// yet are bounded by the hub itself: past [`MAX_WAITING`], each new one lets the oldest of them
+/// go (see [`Hub::accept`]), so silent sockets can never turn a phone away.
 #[derive(Debug, Default)]
 struct Room {
     open: AtomicUsize,
-    waiting: AtomicUsize,
 }
 
 impl Room {
-    /// A place for one more connection, not past `hello` yet; `None` when the hub has
-    /// [`MAX_CONNECTIONS`] open or [`MAX_WAITING`] waiting.
+    /// A place for one more connection; `None` when the hub has [`MAX_CONNECTIONS`] open.
     fn seat(self: &Arc<Self>) -> Option<Seat> {
         if self.open.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
             self.open.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        if self.waiting.fetch_add(1, Ordering::AcqRel) >= MAX_WAITING {
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
-            self.open.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
         Some(Seat {
             room: Arc::clone(self),
-            waiting: true,
         })
     }
 }
@@ -397,22 +392,10 @@ impl Room {
 #[derive(Debug)]
 struct Seat {
     room: Arc<Room>,
-    /// Not past `hello` yet.
-    waiting: bool,
-}
-
-impl Seat {
-    /// The connection said hello: it no longer waits.
-    fn said_hello(&mut self) {
-        if std::mem::take(&mut self.waiting) {
-            self.room.waiting.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
 }
 
 impl Drop for Seat {
     fn drop(&mut self) {
-        self.said_hello();
         self.room.open.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -507,7 +490,7 @@ struct Conn {
     /// What its last `changes` of each session listed, which is all a `diff` may name.
     listings: Listings,
     /// Its place in the hub's room, given back as it drops.
-    seat: Seat,
+    _seat: Seat,
 }
 
 /// A command sent to a session and not yet answered.
@@ -784,7 +767,8 @@ impl Hub {
         self.ids
     }
 
-    /// Starts the task that serves one upgraded connection, which brings its seat.
+    /// Starts the task that serves one upgraded connection, which brings its seat, and makes
+    /// room in the waiting room for it.
     fn accept(&mut self, (ws, seat): Upgraded) {
         let conn = self.next_id();
         let (out, outbox) = mpsc::channel(OUTBOUND_QUEUE);
@@ -802,9 +786,27 @@ impl Hub {
                 subscriptions: HashMap::new(),
                 background: false,
                 listings: Listings::default(),
-                seat,
+                _seat: seat,
             },
         );
+        self.make_room(conn);
+    }
+
+    /// Lets the oldest connections that have not said hello go, other than `newest`, until at
+    /// most [`MAX_WAITING`] wait: a socket that never speaks only ever pushes out another such.
+    fn make_room(&mut self, newest: u64) {
+        let mut waiting: Vec<(Instant, u64)> = self
+            .conns
+            .iter()
+            .filter(|(id, state)| state.device.is_none() && **id != newest)
+            .map(|(&id, state)| (state.opened, id))
+            .collect();
+        // The newest counts too.
+        let extra = (waiting.len() + 1).saturating_sub(MAX_WAITING);
+        waiting.sort_unstable();
+        for (_, conn) in waiting.into_iter().take(extra) {
+            self.drop_conn(conn);
+        }
     }
 
     /// What a connection task reported.
@@ -905,7 +907,6 @@ impl Hub {
                 if let Some(state) = self.conns.get_mut(&conn) {
                     state.device = Some(device);
                     state.background = background;
-                    state.seat.said_hello();
                 }
                 self.send(conn, &welcome(&name));
                 let rows = self.sessions.list();
@@ -2655,18 +2656,18 @@ mod tests {
     }
 
     #[test]
-    fn a_seat_is_given_back_and_the_waiting_room_is_capped() {
+    fn a_seat_is_given_back_and_only_open_connections_are_capped() {
         let room = Arc::new(Room::default());
-        let mut seats: Vec<Seat> = (0..MAX_WAITING).filter_map(|_| room.seat()).collect();
-        assert_eq!(seats.len(), MAX_WAITING);
-        assert!(room.seat().is_none(), "the waiting room is full");
-        seats[0].said_hello();
-        let another = room.seat().expect("one said hello");
-        assert_eq!(room.open.load(Ordering::Acquire), MAX_WAITING + 1);
-        drop(another);
+        // Silent connections take seats past the waiting room's size: the hub lets the oldest go
+        // as each new one comes, so they never turn a phone away.
+        let seats: Vec<Seat> = (0..MAX_CONNECTIONS).filter_map(|_| room.seat()).collect();
+        assert_eq!(seats.len(), MAX_CONNECTIONS);
+        assert!(room.seat().is_none(), "every connection is open");
         drop(seats);
         assert_eq!(room.open.load(Ordering::Acquire), 0);
-        assert_eq!(room.waiting.load(Ordering::Acquire), 0);
+        assert!(room.seat().is_some());
+        // Ten seconds to say hello.
+        assert_eq!(HELLO_WITHIN, Duration::from_secs(10));
     }
 
     #[test]

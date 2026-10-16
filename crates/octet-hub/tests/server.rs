@@ -1842,26 +1842,35 @@ async fn a_long_replay_hands_over_to_live_without_gaps_or_repeats() {
 }
 
 #[tokio::test]
-async fn connections_that_never_say_hello_are_capped() {
+async fn silent_connections_cannot_lock_a_phone_out() {
     let mut env = Env::new();
     env.start().await;
+    let token = env.pair("Test phone").await;
+    // Eight upgraded sockets that never say hello fill the waiting room.
     let mut waiting = Vec::new();
     for _ in 0..8 {
         waiting.push(connect(env.port, Some(OWNER)).await.expect("connects"));
     }
+    // A paired phone comes in at once and says hello: the oldest silent socket makes room.
+    let began = std::time::Instant::now();
+    // (The helper waits for `welcome`, then the session list.)
+    let (_phone, sessions) = hello(env.port, &token).await;
+    assert_eq!(sessions["type"], "sessions");
     assert!(
-        connect(env.port, Some(OWNER)).await.is_err(),
-        "a ninth silent connection is turned away"
+        began.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        began.elapsed()
     );
-    // One that pairs and says hello leaves the waiting room, and another can come in.
-    let token = env.pair_on(&mut waiting[0], "Test phone").await;
-    send(
-        &mut waiting[0],
-        json!({"v": 1, "req": 2, "type": "hello", "token": token}),
-    )
-    .await;
-    assert_eq!(recv(&mut waiting[0]).await["type"], "welcome");
-    assert!(connect(env.port, Some(OWNER)).await.is_ok());
+    assert!(
+        closes(&mut waiting[0]).await,
+        "the oldest silent socket was let go"
+    );
+    // The phone left the waiting room; another silent socket fills it again, and the next
+    // phone still comes in, letting the oldest silent one go: it is never the phone that waits.
+    waiting.push(connect(env.port, Some(OWNER)).await.expect("connects"));
+    let (_again, sessions) = hello(env.port, &token).await;
+    assert_eq!(sessions["type"], "sessions");
+    assert!(closes(&mut waiting[1]).await);
 }
 
 /// A journal in `env`'s data directory for a Claude session `session` in `cwd`.

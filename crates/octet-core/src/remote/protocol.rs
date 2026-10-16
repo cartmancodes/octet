@@ -1049,6 +1049,9 @@ impl Default for PushKinds {
     }
 }
 
+/// The refusal for a `set_mode` whose mode is not one of the modes; it names none the phone sent.
+const UNKNOWN_MODE: &str = "Unknown mode; use ask, accept-edits, auto or full-access";
+
 /// A phone → hub command, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhoneCommand {
@@ -1499,6 +1502,19 @@ fn commit_message(map: &Map<String, Value>) -> Result<String, String> {
     Ok(message)
 }
 
+/// A `set_mode`, whose mode must be one the terminal UI takes: nothing else reaches a session.
+fn set_mode(m: &Map<String, Value>) -> Result<PhoneCommand, String> {
+    let mode = text(m, "mode");
+    if crate::Mode::parse(&mode).is_none() {
+        return Err(UNKNOWN_MODE.into());
+    }
+    Ok(PhoneCommand::SetMode {
+        session: text(m, "session"),
+        mode,
+        confirm: maybe(m, "confirm"),
+    })
+}
+
 /// Parses one phone message: `(req, command)`, or the reason it was refused.
 ///
 /// # Errors
@@ -1564,11 +1580,7 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
             session: text(m, "session"),
             text: text(m, "text"),
         },
-        "set_mode" => PhoneCommand::SetMode {
-            session: text(m, "session"),
-            mode: text(m, "mode"),
-            confirm: maybe(m, "confirm"),
-        },
+        "set_mode" => set_mode(m)?,
         "set_model" => PhoneCommand::SetModel {
             session: text(m, "session"),
             selection: text(m, "selection"),
@@ -2528,12 +2540,13 @@ mod tests {
     }
 
     #[test]
-    fn closed_sets_do_not_narrow_what_the_parser_takes() {
-        // The phone's TypeScript is typed; the hub still refuses an unknown mode in its own words.
-        let (_, command) =
-            parse_phone(r#"{"v":1,"req":1,"type":"set_mode","session":"s","mode":"sideways"}"#)
-                .unwrap();
-        assert!(matches!(command, PhoneCommand::SetMode { mode, .. } if mode == "sideways"));
+    fn an_unknown_mode_is_refused_at_the_hub() {
+        // The hub refuses it as `invalid`, in its own words, before any session sees it (the
+        // terminal UI would refuse it too, but only after the hub had sent it on).
+        assert_eq!(
+            parse_phone(r#"{"v":1,"req":1,"type":"set_mode","session":"s","mode":"sideways"}"#),
+            Err(UNKNOWN_MODE.to_owned())
+        );
     }
 
     #[test]
@@ -2742,6 +2755,36 @@ mod tests {
             kinds: None,
         };
         assert!(!format!("{off:?}").contains("redacted"));
+    }
+
+    #[test]
+    fn set_mode_names_one_of_the_modes() {
+        let set = |mode: &str| {
+            parse_phone(&format!(
+                r#"{{"v":1,"req":1,"type":"set_mode","session":"12-34","mode":{}}}"#,
+                json!(mode)
+            ))
+        };
+        for mode in ["ask", "accept-edits", "auto", "full-access"] {
+            assert!(set(mode).is_ok(), "{mode}");
+        }
+        // Only the labels the terminal UI takes: no vendor names, no other case, no spaces.
+        for mode in [
+            "",
+            "Ask",
+            "ASK",
+            " ask",
+            "ask ",
+            "bypassPermissions",
+            "plan",
+            "acceptEdits",
+            "full access",
+            "full_access",
+        ] {
+            let refused = set(mode).expect_err(mode);
+            assert!(refused.contains("mode"), "{mode:?}: {refused}");
+            assert!(!refused.contains("bypassPermissions"), "{refused}");
+        }
     }
 
     #[test]
