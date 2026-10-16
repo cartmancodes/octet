@@ -8,9 +8,10 @@ import { Alert, type AlertButton } from "react-native";
 
 import Settings from "../app/settings";
 import { drawerStore, closeDrawer } from "./drawer";
-import { TOKEN_KEY } from "./hub";
+import { tokenKeyOf } from "./hub";
 import { loadSettings, saveSettings } from "./persist";
 import { info, launch, pairedStorage } from "./screenRig";
+import { M } from "./testKeys";
 
 let mockConfig: { version?: string; extra?: { eas?: { projectId?: string } } } | null = { version: "4.5.6" };
 jest.mock("expo-constants", () => ({
@@ -210,7 +211,7 @@ describe("Settings", () => {
         ["Cancel", "cancel"],
         ["Unpair", "destructive"],
       ]);
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).not.toBeNull(); // nothing yet
+      expect(await SecureStore.getItemAsync(tokenKeyOf(M))).not.toBeNull(); // nothing yet
     });
 
     it("Cancel changes nothing", async () => {
@@ -218,7 +219,7 @@ describe("Settings", () => {
       const rig = await open();
       await fireEvent.press(screen.getByRole("button", { name: "Unpair" }));
       await act(async () => buttons(alert)[0]?.onPress?.());
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).not.toBeNull();
+      expect(await SecureStore.getItemAsync(tokenKeyOf(M))).not.toBeNull();
       expect(rig.hub.snapshot().status).toBe("paired");
       expect(rig.view.getPathname()).toBe("/settings");
     });
@@ -231,12 +232,12 @@ describe("Settings", () => {
         buttons(alert)[1]?.onPress?.();
       });
       await flush();
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
-      expect((await loadSettings()).hubUrl).toBeNull();
-      expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
+      expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBeNull();
+      expect((await loadSettings()).pairings).toEqual([]);
+      expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null, macs: [], notices: [] });
       expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
       expect(rig.view.getPathname()).toBe("/pair");
-      expect(screen.queryByText("This phone was unpaired on the Mac")).toBeNull();
+      expect(screen.queryByText(/unpaired on/)).toBeNull();
     });
   });
 

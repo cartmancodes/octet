@@ -1,11 +1,15 @@
-// For tests that feed the store by hand: the one Mac's keys, and frames keyed as `connectStore`
+// For tests that feed the store by hand: the one Mac's id and keys, and frames keyed as `connectStore`
 // hands them to the store. Not imported by the app.
 import type { BatchItem } from "./client/HubClient";
-import { SOLO_MAC, keyOf } from "./macs";
+import { keyOf } from "./macs";
 import type { OctetStore } from "./store";
 
-/** The one Mac the app has until pairings give real ids. */
-export const M = SOLO_MAC;
+/** The one Mac of the tests that pair one: the id its pairing is given (the rigs pass
+ * `newId: newM`, so the move of a saved one-Mac pairing gives it this id too). */
+export const M = "m00000001";
+
+/** Makes `M`, for a Fleet's `newId`. */
+export const newM = (): string => M;
 
 /** The store's key of hub id `id` on the one Mac. */
 export const k = (id: string): string => keyOf(M, id);

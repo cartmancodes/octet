@@ -1,5 +1,5 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -7,10 +7,9 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { hubHost, pairLinkProblem, parsePairLink } from "../src/client/link";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
-import { NOT_A_LINK, useHubController, useHubSnapshot } from "../src/hub";
+import { NOT_A_LINK, useFleet, useHubController } from "../src/hub";
 import { macName } from "../src/inbox";
 import { Mascot } from "../src/mascot/Mascot";
-import { loadSettings } from "../src/persist";
 import { radius, spacing, type, useTheme } from "../src/theme";
 import { showToast } from "../src/toast";
 import { Button } from "../src/ui";
@@ -24,13 +23,16 @@ const CORNER = 36;
 const CORNER_LINE = 3;
 
 /** Pairing: scan the QR code the Mac shows, or enter its link. The hub's refusals and every
- * failure are shown as plain text. */
+ * failure are shown as plain text. Opened with `?add=1` on a paired phone, it pairs another
+ * machine: the Macs paired already stay, and Cancel goes back. */
 export default function Pair() {
   const theme = useTheme();
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const hub = useHubController();
-  const { notice, offer } = useHubSnapshot();
+  const { notice, offer, macs, status } = useFleet();
+  const { add } = useLocalSearchParams<{ add?: string }>();
+  const adding = add === "1" && status === "paired";
   const [permission, requestPermission] = useCameraPermissions();
   const [link, setLink] = useState("");
   const [name, setName] = useState(() => hub.initialName());
@@ -38,8 +40,6 @@ export default function Pair() {
   const [busy, setBusy] = useState(false);
   // "Enter code instead" was pressed, or a scan or paste filled the link: the paste and name fields show.
   const [entering, setEntering] = useState(false);
-  // The Mac this phone was paired with before, when it pairs again.
-  const [before, setBefore] = useState<string | null>(null);
   const attempting = useRef(false);
   const lastScan = useRef<string | null>(null);
 
@@ -48,14 +48,6 @@ export default function Pair() {
     // Asked once, when the screen shows and the permission is still undetermined.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permission?.status]);
-
-  useEffect(() => {
-    let live = true;
-    void loadSettings().then((s) => live && setBefore(s.hubUrl === null ? null : macName(s.hubUrl)));
-    return () => {
-      live = false;
-    };
-  }, []);
 
   const parsed = useMemo(() => parsePairLink(link), [link]);
   const pasted = link.trim() !== "";
@@ -118,6 +110,11 @@ export default function Pair() {
 
   const onEnter = useCallback(() => setEntering(true), []);
 
+  const onBack = useCallback(() => {
+    if (router.canGoBack()) router.back();
+    else router.replace("/");
+  }, [router]);
+
   if (offer) return <NotificationsStep />;
 
   const cameraOn = permission?.granted === true;
@@ -135,10 +132,19 @@ export default function Pair() {
         showsVerticalScrollIndicator={false}
       >
         <DevBuildBanner inset />
-        <Text accessibilityRole="header" style={[type.body, styles.heading, { color: theme.fg }]}>
-          {"Scan the code from "}
-          <Text style={styles.bold}>/remote-control pair</Text>
-        </Text>
+        {adding ? (
+          <View style={styles.addHeader}>
+            <Text accessibilityRole="header" style={[type.body, styles.bold, styles.grow, { color: theme.fg }]}>
+              Pair another machine
+            </Text>
+            <Button label="Cancel" accessibilityLabel="Cancel adding a Mac" variant="link" onPress={onBack} />
+          </View>
+        ) : (
+          <Text accessibilityRole="header" style={[type.body, styles.heading, { color: theme.fg }]}>
+            {"Scan the code from "}
+            <Text style={styles.bold}>/remote-control pair</Text>
+          </Text>
+        )}
         <Text style={[type.label, styles.hint, { color: theme.muted }]}>On your Mac, run /remote-control pair in Octet.</Text>
 
         <View style={styles.scan}>
@@ -171,9 +177,19 @@ export default function Pair() {
           ]}
         >
           <Text style={[type.label, { color: theme.muted }]}>PAIRED</Text>
-          <View style={styles.mac}>
-            <Text style={[type.body, { color: before === null ? theme.muted : theme.fg }]}>{before === null ? "No Mac yet" : `○ ${before}`}</Text>
-          </View>
+          {macs.length === 0 ? (
+            <View style={styles.mac}>
+              <Text style={[type.body, { color: theme.muted }]}>No Mac yet</Text>
+            </View>
+          ) : (
+            macs.map((m) => (
+              <View key={m.id} style={styles.mac}>
+                <Text numberOfLines={1} style={[type.body, { color: m.state === "ready" ? theme.fg : theme.muted }]}>
+                  {`${m.state === "ready" ? "●" : "○"} ${m.macName}`}
+                </Text>
+              </View>
+            ))
+          )}
 
           {notice !== null && (
             <Text accessibilityRole="alert" style={[type.body, { color: theme.amber }]}>
@@ -303,6 +319,8 @@ const styles = StyleSheet.create({
   heading: { paddingHorizontal: spacing.xl, paddingTop: spacing.sm },
   hint: { paddingHorizontal: spacing.xl, paddingBottom: spacing.sm },
   bold: { fontWeight: "700" },
+  addHeader: { flexDirection: "row", alignItems: "center", paddingHorizontal: spacing.xl, paddingTop: spacing.sm, gap: spacing.sm },
+  grow: { flex: 1 },
   scan: { flex: 1, minHeight: FRAME + 2 * spacing.xl, alignItems: "center", justifyContent: "center" },
   frame: { width: FRAME, height: FRAME, borderRadius: radius.card, overflow: "hidden", alignItems: "center", justifyContent: "center" },
   off: { textAlign: "center", paddingHorizontal: spacing.xl },

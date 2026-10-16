@@ -5,7 +5,7 @@ import { HubClient } from "./client/HubClient";
 import type { CatalogInfo, JournalEvent, SessionInfo, StateInfo, ToPhone } from "./protocol";
 import { entrySize } from "./model/transcript";
 import type { BatchItem } from "./client/HubClient";
-import { soloLinks, type Links } from "./macs";
+import { linksOf, type Links } from "./macs";
 import { MAX_VIEWS, bestHub, bindHooks, connectStore, createOctetStore, releaseSession, unwatch, watch, type OctetStore } from "./store";
 import { M, k, keyed } from "./testKeys";
 
@@ -44,7 +44,7 @@ let store: OctetStore;
 /** Mac M's frames, applied as its feed applies them. */
 const applyM = (frames: readonly BatchItem[]): string[] => store.getState().applyBatch(M, keyed(frames));
 /** The links of the client a `rig` made. */
-let links: Links = soloLinks(null);
+let links: Links = linksOf(new Map());
 beforeEach(() => {
   seqs = new Map();
   store = createOctetStore();
@@ -649,8 +649,8 @@ describe("with a client", () => {
     const sockets = new Sockets();
     const clock = new FakeClock();
     const client = new HubClient({ url: "wss://mac/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
-    const off = connectStore(store, client, { mac: M, now: clock.now, schedule: clock.schedule });
-    links = soloLinks(client);
+    links = linksOf(new Map([[M, client]]));
+    const off = connectStore(store, client, { mac: M, links, now: clock.now, schedule: clock.schedule });
     client.start();
     sockets.last.open();
     sockets.last.receive({ type: "welcome", device: "iPhone" });

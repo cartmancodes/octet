@@ -1,6 +1,6 @@
 // The store with more than one Mac: every session keyed by its Mac, so that two Macs that report
 // the same raw id (`{pid}-{started}`) never share a row, a view or an answer.
-import { FakeClock, Sockets } from "./client/fakes";
+import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
 import { HubClient, Refusal } from "./client/HubClient";
 import { sendVia } from "./components/send";
 import type { Links } from "./macs";
@@ -27,33 +27,34 @@ beforeEach(() => {
 });
 afterEach(() => jest.restoreAllMocks());
 
+type MacRig = { sockets: Sockets; client: HubClient; off: () => void; socket: () => FakeSocket };
+
 function macs(...ids: string[]) {
   const clock = new FakeClock();
-  const rigs = new Map(
-    ids.map((mac) => {
-      const sockets = new Sockets();
-      const client = new HubClient({
-        url: `wss://${mac}.tail1.ts.net/`,
-        token: "t",
-        factory: sockets.factory,
-        now: clock.now,
-        schedule: clock.schedule,
-        random: () => 1,
-      });
-      const off = connectStore(store, client, { mac, now: clock.now, schedule: clock.schedule });
-      client.start();
-      sockets.last.open();
-      sockets.last.receive({ type: "welcome", device: "iPhone" });
-      return [mac, { sockets, client, off, socket: () => sockets.last }] as const;
-    }),
-  );
+  const rigs = new Map<string, MacRig>();
+  const links: Links = { client: (mac) => rigs.get(mac)?.client ?? null, macs: () => [...rigs.keys()] };
+  for (const mac of ids) {
+    const sockets = new Sockets();
+    const client = new HubClient({
+      url: `wss://${mac}.tail1.ts.net/`,
+      token: "t",
+      factory: sockets.factory,
+      now: clock.now,
+      schedule: clock.schedule,
+      random: () => 1,
+    });
+    const off = connectStore(store, client, { mac, links, now: clock.now, schedule: clock.schedule });
+    client.start();
+    sockets.last.open();
+    sockets.last.receive({ type: "welcome", device: "iPhone" });
+    rigs.set(mac, { sockets, client, off, socket: () => sockets.last });
+  }
   clock.advance(50);
   const rig = (mac: string) => {
     const r = rigs.get(mac);
     if (!r) throw new Error(mac);
     return r;
   };
-  const links: Links = { client: (mac) => rigs.get(mac)?.client ?? null, macs: () => [...rigs.keys()] };
   /** One Mac's frames, as its socket brings them. */
   const hear = (mac: string, ...frames: object[]) => {
     for (const f of frames) rig(mac).socket().receive(f);
@@ -210,7 +211,7 @@ describe("a new client for the same Mac", () => {
     const connect = () => {
       const sockets = new Sockets();
       const client = new HubClient({ url: "wss://m1.tail1.ts.net/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
-      const off = connectStore(store, client, { mac: "m1", now: clock.now, schedule: clock.schedule });
+      const off = connectStore(store, client, { mac: "m1", links: { client: () => client, macs: () => ["m1"] }, now: clock.now, schedule: clock.schedule });
       client.start();
       sockets.last.open();
       sockets.last.receive({ type: "welcome", device: "iPhone" });
@@ -265,6 +266,27 @@ describe("the view budget", () => {
     visit("m2", "e");
     expect(holding()).toEqual(["m1/b", "m1/c", "m1/d", "m2/e"]);
     expect(forget1).toHaveBeenCalledWith("a");
+  });
+
+  it("finds each key's client through the links alone: a Mac with no feed of its own is still asked", () => {
+    const clock = new FakeClock();
+    const sockets = new Sockets();
+    const client = new HubClient({ url: "wss://m3.tail1.ts.net/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
+    const links: Links = { client: (mac) => (mac === "m3" ? client : null), macs: () => ["m3"] };
+    const forget = jest.spyOn(client, "forget");
+    const ids = ["a", "b", "c", "d", "e"];
+    store.getState().applyBatch("m3", [{ v: 1, type: "sessions", sessions: ids.map((id) => info(`m3/${id}`)) }]);
+    for (const id of ids) {
+      watch(store, links, `m3/${id}`);
+      store.getState().applyBatch("m3", [
+        { v: 1, type: "subscribed", session: `m3/${id}`, from: "start", journals: ["j1"] },
+        { v: 1, ...user(`m3/${id}`, 1, `hi ${id}`) } as never,
+      ]);
+      unwatch(links, `m3/${id}`);
+    }
+    // The fifth view let the oldest go, and its Mac's client (found only through `links`) forgot it.
+    expect(store.getState().bySession.get("m3/a")?.transcript.entries ?? []).toEqual([]);
+    expect(forget).toHaveBeenCalledWith("a");
   });
 
   it("an unwatch and a release reach the owning Mac with the raw id", () => {

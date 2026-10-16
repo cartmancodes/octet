@@ -2,10 +2,29 @@
 // `"<mac>/<session>"`: `<mac>` is the phone's own id for the pairing (never holding a `/`), and
 // `<session>` the hub's raw id, which appears only on the wire. Pure: no React, no storage.
 import type { HubClient } from "./client/HubClient";
+import { field } from "./model/text";
 
-/** The one Mac's id until pairings give each its own (Phase D, Task 2). Nothing persisted is
- * keyed by it. */
-export const SOLO_MAC = "m0";
+/** Pairings kept, at most: one link each, all open in the foreground. */
+export const MAX_MACS = 4;
+/** Why a 5th pairing is refused, before any network call. */
+export const TOO_MANY_MACS = "Unpair a Mac first (4 at most)";
+/** A Mac's id: `m` and 8 lowercase hex characters, made by the phone. */
+export const MAC_ID = /^m[0-9a-f]{8}$/;
+
+/** A new Mac id, from a CSPRNG: `crypto.getRandomValues` where the runtime has it (Hermes, the
+ * test runtime), else the native UUID v4 that expo-modules-core installs (whose first 8 hex
+ * digits are all random). Throws when there is neither: an id must never be guessable or reused. */
+export function newMacId(): string {
+  const g = globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array }; expo?: { uuidv4?: () => string } };
+  if (typeof g.crypto?.getRandomValues === "function") {
+    const bytes = g.crypto.getRandomValues(new Uint8Array(4));
+    return `m${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+  }
+  const uuid = typeof g.expo?.uuidv4 === "function" ? g.expo.uuidv4().toLowerCase() : "";
+  const id = `m${uuid.slice(0, 8)}`;
+  if (!MAC_ID.test(id)) throw new Error("No random source for a Mac id");
+  return id;
+}
 
 /** The store's key of `raw` on Mac `mac`. */
 export const keyOf = (mac: string, raw: string): string => `${mac}/${raw}`;
@@ -35,11 +54,12 @@ export interface Pairing {
 const HOST = /^[a-z][a-z0-9+.-]*:\/\/(\[[^\]/]*\]|[^/:?#[\]]+)/i;
 
 /** The host of a hub address, as written ("[::1]" keeps its brackets); null when it has none. */
-function hostOf(url: string | null | undefined): string | null {
+export function hostOf(url: string | null | undefined): string | null {
   return HOST.exec(url ?? "")?.[1] ?? null;
 }
 
-const sameHost = (a: string, b: string): boolean => a.replace(/\.$/, "").toLowerCase() === b.replace(/\.$/, "").toLowerCase();
+/** Whether two hosts are the same, without case or a trailing dot. */
+export const sameHost = (a: string, b: string): boolean => a.replace(/\.$/, "").toLowerCase() === b.replace(/\.$/, "").toLowerCase();
 
 /** The pairing whose hub host is `host`, compared without case; null when none is. */
 export function macOfHost(pairings: readonly Pick<Pairing, "id" | "hubUrl">[], host: string): string | null {
@@ -72,10 +92,20 @@ export interface Links {
   macs(): string[];
 }
 
-/** The links of a phone with at most one Mac, `SOLO_MAC`. */
-export function soloLinks(client: HubClient | null): Links {
+/** The links of the clients in `clients`, by Mac id, in its order. */
+export function linksOf(clients: ReadonlyMap<string, HubClient>): Links {
   return {
-    client: (mac) => (client !== null && mac === SOLO_MAC ? client : null),
-    macs: () => (client !== null ? [SOLO_MAC] : []),
+    client: (mac) => clients.get(mac) ?? null,
+    macs: () => [...clients.keys()],
   };
+}
+
+/** The longest name a Mac is given. */
+export const MAC_NAME_CHARS = 40;
+
+/** A Mac's name as the user gave it, cleaned: control and bidi characters dropped, each run of
+ * spaces one space, at most `MAC_NAME_CHARS`; null when nothing is left. */
+export function cleanMacName(raw: unknown): string | null {
+  const name = field(field(raw, MAC_NAME_CHARS * 4).replace(/\s+/g, " ").trim(), MAC_NAME_CHARS).trim();
+  return name === "" ? null : name;
 }

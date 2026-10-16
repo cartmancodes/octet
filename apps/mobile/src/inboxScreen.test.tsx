@@ -18,7 +18,7 @@ import * as navigation from "./navigation";
 import { saveSettings } from "./persist";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { bestHub, octetStore } from "./store";
-import { k } from "./testKeys";
+import { k, newM } from "./testKeys";
 import { hideToast } from "./toast";
 import { dark, light } from "./theme";
 
@@ -77,6 +77,7 @@ async function launch(list: SessionInfo[] | null) {
     store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
+    newId: newM,
   });
   const Layout = () => (
     <HubContext.Provider value={hub}>

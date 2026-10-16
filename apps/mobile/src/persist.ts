@@ -1,8 +1,9 @@
-// The only things the phone keeps on disk: non-secret settings. The device token is in
-// expo-secure-store (wired in the pairing task); cursors are in memory and transcripts are never
-// saved, so a cold start subscribes fresh.
+// The only things the phone keeps on disk: non-secret settings. Each pairing's device token is in
+// expo-secure-store (src/hub.ts); cursors are in memory and transcripts are never saved, so a cold
+// start subscribes fresh.
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
+import { MAC_ID, MAX_MACS, cleanMacName, macNameOf, type Pairing } from "./macs";
 import type { PushKinds } from "./protocol";
 
 export interface Settings {
@@ -10,11 +11,18 @@ export interface Settings {
   deviceName: string | null;
   /** Allow asks for Face ID or the fingerprint. On unless the user turned it off. */
   faceId: boolean;
-  /** The hub's address, wss://...; null until paired. */
+  /** The hub address of the one pairing settings held before there could be several: read only
+   * to move it into `pairings` (src/hub.ts), then saved as null. */
   hubUrl: string | null;
-  /** Push notifications are on: the Mac has this phone's token. Off unless the user turned it on. */
+  /** The Macs this phone is paired with, in the order paired: at most `MAX_MACS`, each id once. */
+  pairings: Pairing[];
+  /** Ids of pairings that went whose keychain entries could not be deleted yet: the next launch
+   * deletes them. */
+  forget: string[];
+  /** Push notifications are on: every Mac has this phone's token. One choice for every Mac. Off
+   * unless the user turned it on. */
   notifications: boolean;
-  /** What the Mac pushes this phone while notifications are on. Missing is the Mac's own default
+  /** What every Mac pushes this phone while notifications are on. Missing is the Mac's own default
    * for a new pairing (approvals and errors on, finished turns off), except in settings saved
    * before kinds existed with notifications on: the Mac was pushing all three, so all three. */
   pushKinds: PushKinds;
@@ -34,6 +42,8 @@ export const DEFAULT_SETTINGS: Settings = {
   deviceName: null,
   faceId: true,
   hubUrl: null,
+  pairings: [],
+  forget: [],
   notifications: false,
   pushKinds: DEFAULT_PUSH_KINDS,
   textSize: 13,
@@ -55,6 +65,31 @@ function pushKinds(x: unknown): PushKinds {
     return typeof v === "boolean" ? v : DEFAULT_PUSH_KINDS[k];
   };
   return { approvals: kind("approvals"), errors: kind("errors"), turns: kind("turns") };
+}
+/** The saved pairings that are whole: an id of the phone's making, an address and a device name;
+ * a missing or blank Mac name is the host's. The first of an id is kept; at most `MAX_MACS`. */
+function pairings(x: unknown): Pairing[] {
+  if (!Array.isArray(x)) return [];
+  const out: Pairing[] = [];
+  const ids = new Set<string>();
+  for (const item of x as unknown[]) {
+    if (out.length >= MAX_MACS) break;
+    if (!isObj(item)) continue;
+    const id = typeof item.id === "string" && MAC_ID.test(item.id) ? item.id : null;
+    const hubUrl = text(item.hubUrl);
+    const deviceName = text(item.deviceName);
+    if (id === null || ids.has(id) || !hubUrl || deviceName === null) continue;
+    ids.add(id);
+    out.push({ id, hubUrl, deviceName, macName: cleanMacName(item.macName) ?? macNameOf(hubUrl) });
+  }
+  return out;
+}
+/** The ids still to forget: Mac ids only, each once, at most a few. */
+const FORGET_MAX = 16;
+function forget(x: unknown): string[] {
+  if (!Array.isArray(x)) return [];
+  const ids = (x as unknown[]).filter((id): id is string => typeof id === "string" && MAC_ID.test(id));
+  return [...new Set(ids)].slice(-FORGET_MAX);
 }
 const textSize = (x: unknown): TextSize => (TEXT_SIZES as readonly unknown[]).includes(x) ? (x as TextSize) : DEFAULT_SETTINGS.textSize;
 
@@ -83,6 +118,8 @@ export async function readSettings(): Promise<{ ok: true; settings: Settings } |
         deviceName: text(value.deviceName),
         faceId: typeof value.faceId === "boolean" ? value.faceId : DEFAULT_SETTINGS.faceId,
         hubUrl: text(value.hubUrl),
+        pairings: pairings(value.pairings),
+        forget: forget(value.forget),
         notifications,
         pushKinds: upgraded ? ALL_PUSH_KINDS : pushKinds(value.pushKinds),
         textSize: textSize(value.textSize),
@@ -105,22 +142,30 @@ let saving: Promise<boolean> = Promise.resolve(true);
 /** Saves `patch` over what is saved. A failed write is dropped (settings are a convenience) and
  * reported as false, for the few callers that cannot go on without it. */
 export function saveSettings(patch: Partial<Settings>): Promise<boolean> {
-  saving = saving.then(() => write(patch));
+  return updateSettings(() => patch);
+}
+
+/** `saveSettings` with the patch made from what is saved, in the same turn: for a change to a
+ * list (the pairings) that must not lose another change made just before it. */
+export function updateSettings(change: (saved: Settings) => Partial<Settings>): Promise<boolean> {
+  saving = saving.then(() => write(change));
   return saving;
 }
 
-async function write(patch: Partial<Settings>): Promise<boolean> {
+async function write(change: (saved: Settings) => Partial<Settings>): Promise<boolean> {
   try {
-    // A read that failed would write the defaults over what is saved (the hub address too).
+    // A read that failed would write the defaults over what is saved (the pairings too).
     const read = await readSettings();
     if (!read.ok) return false;
-    const next: Settings = { ...read.settings, ...patch };
+    const next: Settings = { ...read.settings, ...change(read.settings) };
     await AsyncStorage.setItem(
       SETTINGS_KEY,
       JSON.stringify({
         deviceName: next.deviceName,
         faceId: next.faceId,
         hubUrl: next.hubUrl,
+        pairings: next.pairings,
+        forget: next.forget,
         notifications: next.notifications,
         pushKinds: next.pushKinds,
         textSize: next.textSize,

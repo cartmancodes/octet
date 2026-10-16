@@ -4,7 +4,7 @@ import { memo, useEffect, useRef } from "react";
 import { openSession } from "../navigation";
 import type { SessionInfo } from "../protocol";
 import { sessionName } from "../sessions";
-import { useListed, useSessions } from "../store";
+import { useListedMacs, useSessions, type ListedSession } from "../store";
 import { showToast } from "../toast";
 
 /** The words on the toast, before its View. */
@@ -19,13 +19,13 @@ const VIEW = "View";
  * a front approval that `toasted` (the last front id each session showed) already has:
  * a session's row can lose its front for a moment and show it again. O(n).
  */
-export function freshApprovals(
-  before: readonly SessionInfo[],
-  next: readonly SessionInfo[],
+export function freshApprovals<T extends SessionInfo>(
+  before: readonly T[],
+  next: readonly T[],
   toasted: ReadonlyMap<string, number> = NONE,
-): SessionInfo[] {
+): T[] {
   const was = new Map(before.map((s) => [s.id, s]));
-  const fresh: SessionInfo[] = [];
+  const fresh: T[] = [];
   for (const s of next) {
     if (s.approvals <= 0) continue;
     const old = was.get(s.id);
@@ -43,6 +43,7 @@ export function freshApprovals(
 }
 
 const NONE: ReadonlyMap<string, number> = new Map();
+const NO_MACS: ReadonlySet<string> = new Set();
 
 /** The session a Conversation path shows, or null on any other screen. The path holds the key,
  * `/` and all (expo-router gives it decoded), or the key percent-encoded. */
@@ -60,21 +61,22 @@ function onScreen(pathname: string): string | null {
 /**
  * Mounted once, in the shell: when an approval newly comes to a session that is not on screen,
  * a toast says so with a View that opens it. Not on the Inbox, which shows it as a card, and not
- * for the Conversation on screen, which shows its Permission card. The sessions the phone first
- * hears of when it connects are the baseline: approvals already waiting then are not news. Draws nothing.
+ * for the Conversation on screen, which shows its Permission card. Each Mac's first list (since
+ * it was paired, or paired again) is its baseline: approvals already waiting then are not news,
+ * whenever that Mac comes. Draws nothing.
  */
 export const ApprovalToasts = memo(function ApprovalToasts() {
   const router = useRouter();
   const nav = useNavigationContainerRef();
   const pathname = usePathname();
   const sessions = useSessions();
-  const listed = useListed();
+  const listed = useListedMacs();
   // The latest screen, for the effect below, which runs on the sessions only.
   const here = useRef(pathname);
   useEffect(() => {
     here.current = pathname;
   });
-  const seen = useRef<{ listed: boolean; sessions: readonly SessionInfo[] }>({ listed: false, sessions: [] });
+  const seen = useRef<{ listed: ReadonlySet<string>; sessions: readonly ListedSession[] }>({ listed: NO_MACS, sessions: [] });
   // The front approval each session last showed, so that one returning after a gap is not news.
   const toasted = useRef(new Map<string, number>());
 
@@ -85,14 +87,16 @@ export const ApprovalToasts = memo(function ApprovalToasts() {
     // A session with nothing waiting is forgotten, and one gone from the list.
     const live = new Set(sessions.filter((x) => x.approvals > 0).map((x) => x.id));
     for (const id of memory.keys()) if (!live.has(id)) memory.delete(id);
-    // The first listing is the baseline: what waits then is not news.
-    const news = listed && before.listed ? freshApprovals(before.sessions, sessions, memory) : [];
+    // Each Mac's first listing is its baseline: what waits then is not news. A Mac counts as
+    // listed before only when it was listed at the last look too (a reset in between starts over).
+    const known = (mac: string) => listed.has(mac) && before.listed.has(mac);
+    const news = freshApprovals(before.sessions, sessions, memory).filter((x) => known(x.mac));
     for (const x of sessions) if (x.approvals > 0 && x.approval) memory.set(x.id, x.approval.id);
     const fresh = news[0];
     if (!fresh || here.current === "/" || onScreen(here.current) === fresh.id) return;
     const id = fresh.id;
     // View opens it as the drawer does: back to it when it is in the stack already.
-    showToast(`${sessionName(fresh.workspace)}${APPROVAL_TOAST}`, () => openSession(router, nav.getRootState(), here.current, id), VIEW);
+    showToast(`${sessionName(fresh.workspace)}${APPROVAL_TOAST}`, () => openSession(router, nav.getRootState(), here.current, id), VIEW, fresh.mac);
   }, [sessions, listed, router, nav]);
 
   return null;

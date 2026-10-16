@@ -8,14 +8,17 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import Pair from "../app/pair";
 import { FakeClock, Sockets } from "./client/fakes";
 import { DEV_BUILD_WARNING } from "./components/DevBuildBanner";
-import { HubContext, HubController, TOKEN_KEY } from "./hub";
+import { HubContext, HubController, TOKEN_KEY, tokenKeyOf } from "./hub";
+import { TOO_MANY_MACS } from "./macs";
 import { loadSettings, saveSettings } from "./persist";
 import { createOctetStore } from "./store";
 import { dark, light } from "./theme";
 import { hideToast, toastStore } from "./toast";
+import { M, newM } from "./testKeys";
 
-const mockRouter = { replace: jest.fn(), push: jest.fn() };
-jest.mock("expo-router", () => ({ useRouter: () => mockRouter }));
+const mockRouter = { replace: jest.fn(), push: jest.fn(), back: jest.fn(), canGoBack: jest.fn(() => true) };
+let mockParams: Record<string, string> = {};
+jest.mock("expo-router", () => ({ useRouter: () => mockRouter, useLocalSearchParams: () => mockParams }));
 
 type Permission = { granted: boolean; canAskAgain: boolean; status: string } | null;
 const mockCamera: { permission: Permission; request: jest.Mock; props: Record<string, unknown> | null } = {
@@ -59,6 +62,7 @@ async function open(permission: Permission = GRANTED) {
     factory: sockets.factory,
     store: createOctetStore(),
     clientOptions: { now: clock.now, schedule: clock.schedule },
+    newId: newM,
   });
   await hub.init();
   await render(
@@ -97,7 +101,10 @@ const scan = async (data: string) => {
 beforeEach(async () => {
   await AsyncStorage.clear();
   await SecureStore.deleteItemAsync(TOKEN_KEY);
+  await SecureStore.deleteItemAsync(tokenKeyOf(M));
   jest.clearAllMocks();
+  mockRouter.canGoBack.mockReturnValue(true);
+  mockParams = {};
   hideToast();
   mockCamera.props = null;
   mockProject = undefined;
@@ -148,12 +155,6 @@ describe("the Pair screen", () => {
     expect(screen.getByText("No Mac yet")).toBeTruthy();
   });
 
-  it("lists the Mac this phone was paired with when it pairs again", async () => {
-    await saveSettings({ hubUrl: "wss://studio-mac.tail1234.ts.net/" });
-    await open();
-    expect(await screen.findByText("○ studio-mac")).toBeTruthy();
-    expect(screen.queryByText("No Mac yet")).toBeNull();
-  });
 
   it("toasts 'Paired with <mac>' after a pairing, and not before", async () => {
     const rig = await open();
@@ -204,8 +205,8 @@ describe("the Pair screen", () => {
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
-    expect((await loadSettings()).hubUrl).toBe("wss://mac.tail1234.ts.net/");
+    expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
+    expect((await loadSettings()).pairings.map((p) => p.hubUrl)).toEqual(["wss://mac.tail1234.ts.net/"]);
   });
 
   it("Cancel drops a scanned link without pairing", async () => {
@@ -230,7 +231,7 @@ describe("the Pair screen", () => {
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+    expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
   });
 
   it("an invalid pasted link says so, keeps Pair off and opens nothing", async () => {
@@ -314,7 +315,7 @@ describe("the Pair screen", () => {
     rig.sockets.last.receive({ type: "refused", req: command?.req, reason: "A device with that name is already paired", code: "invalid" });
     expect(await screen.findByText("A device with that name is already paired")).toBeTruthy();
     expect(mockRouter.replace).not.toHaveBeenCalled();
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBeNull();
     // The Mac kept the code: the link stays, to pair again under another name.
     expect(screen.getByLabelText("Pairing link").props.value).toBe(LINK);
   });
@@ -456,5 +457,56 @@ describe("the notifications step after pairing", () => {
     accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
     expect(screen.queryByRole("button", { name: "Turn on notifications" })).toBeNull();
+  });
+});
+
+describe("pairing another machine", () => {
+  /** A phone paired with `hosts` already, each pairing's token in its keychain entry. */
+  async function pairedWith(...hosts: string[]) {
+    const pairings = hosts.map((host, i) => ({ id: `m0000000${(10 + i).toString(16)}`, hubUrl: `wss://${host}.tail1234.ts.net/`, deviceName: "iPhone", macName: host }));
+    for (const p of pairings) await SecureStore.setItemAsync(tokenKeyOf(p.id), TOKEN);
+    await saveSettings({ pairings });
+    return pairings;
+  }
+
+  it("lists the Macs paired already under PAIRED, says Pair another machine, and adds the next", async () => {
+    const [studio] = await pairedWith("studio-mac");
+    mockParams = { add: "1" };
+    const rig = await open();
+    expect(screen.getByText("Pair another machine")).toBeTruthy();
+    expect(screen.getByText("○ studio-mac")).toBeTruthy();
+    expect(screen.queryByText("No Mac yet")).toBeNull();
+    await paste(LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    accept(rig);
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
+    expect(rig.hub.snapshot().macs.map((m) => m.id)).toEqual([studio?.id, M]);
+    expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
+  });
+
+  it("Cancel goes back, pairing nothing", async () => {
+    await pairedWith("studio-mac");
+    mockParams = { add: "1" };
+    const rig = await open();
+    await fireEvent.press(screen.getByRole("button", { name: "Cancel adding a Mac" }));
+    expect(mockRouter.back).toHaveBeenCalledTimes(1);
+    expect(rig.sockets.all).toHaveLength(0);
+  });
+
+  it("a 5th Mac is refused in so many words, before any network call", async () => {
+    await pairedWith("a1", "a2", "a3", "a4");
+    mockParams = { add: "1" };
+    const rig = await open();
+    await paste(LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    expect(await screen.findByText(TOO_MANY_MACS)).toBeTruthy();
+    expect(rig.sockets.all).toHaveLength(0);
+  });
+
+  it("is the first pairing's screen without the add mode, however many Macs", async () => {
+    await pairedWith("studio-mac");
+    await open();
+    expect(screen.getByText("Scan the code from /remote-control pair")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Cancel adding a Mac" })).toBeNull();
   });
 });

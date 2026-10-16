@@ -10,8 +10,9 @@ import Session from "../app/session/[id]";
 import Usage from "../app/usage";
 import { isSessionPath, openSession } from "./navigation";
 import { info, launch, pairedStorage } from "./screenRig";
+import { M } from "./testKeys";
 
-const KEY = "m0/123-456";
+const KEY = `${M}/123-456`;
 
 function Opener() {
   const router = useRouter();
@@ -43,7 +44,7 @@ describe("a keyed session route", () => {
     await act(async () => fireEvent.press(screen.getByLabelText("Open")));
     expect(screen.getByTestId("key").props.children).toBe(KEY);
     expect(screen.getByTestId("here").props.children).toBe("true");
-    // One route segment, the key encoded in it: not /session/m0 with a stray 123-456.
+    // One route segment, the key encoded in it: not /session/<mac> with a stray 123-456.
     expect(view.getSegments()).toEqual(["session", "[id]"]);
     // Opening it again from its own screen is nothing: no second copy.
     await act(async () => fireEvent.press(screen.getByLabelText("Open")));

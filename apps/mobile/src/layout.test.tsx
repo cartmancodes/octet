@@ -12,11 +12,11 @@ import { AppState, Text } from "react-native";
 import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
 import { FakeClock, Sockets } from "./client/fakes";
-import { HubContext, HubController, TOKEN_KEY, UNPAIRED_NOTICE } from "./hub";
+import { HubContext, HubController, TOKEN_KEY, tokenKeyOf, unpairedNotice } from "./hub";
 import { saveSettings } from "./persist";
 import { createOctetStore } from "./store";
 import { dark, light } from "./theme";
-import { k, sessionPath } from "./testKeys";
+import { M, k, newM, sessionPath } from "./testKeys";
 
 jest.mock("expo-camera", () => ({
   CameraView: () => null,
@@ -43,6 +43,7 @@ beforeEach(async () => {
   mockProject = undefined;
   await AsyncStorage.clear();
   await SecureStore.deleteItemAsync(TOKEN_KEY);
+  await SecureStore.deleteItemAsync(tokenKeyOf(M));
   jest.spyOn(AppState, "addEventListener").mockImplementation((_type, listener) => {
     changeAppState = listener as (state: string) => void;
     return { remove: jest.fn() };
@@ -63,6 +64,7 @@ async function launch(opts: { paired?: boolean } = {}) {
     store: createOctetStore(),
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
+    newId: newM,
   });
   const Layout = () => (
     <HubContext.Provider value={hub}>
@@ -141,6 +143,16 @@ describe("the app shell", () => {
     expect(sockets.all).toHaveLength(1);
   });
 
+  it("a paired phone can open Pair to add a Mac, and the Mac it has stays paired", async () => {
+    const { sockets } = await launch({ paired: true });
+    await screen.findByText("Sessions list");
+    connected({ sockets });
+    await act(async () => router.push("/pair?add=1"));
+    expect(await screen.findByText("Pair another machine")).toBeTruthy();
+    expect(screen.getByText("● mac")).toBeTruthy();
+    expect(sockets.last.closed).toBe(false);
+  });
+
   it("pairing goes to Sessions and connects with the new token", async () => {
     const { sockets } = await launch();
     await fireEvent.changeText(await screen.findByLabelText("Pairing link"), LINK);
@@ -149,7 +161,7 @@ describe("the app shell", () => {
     const [command] = sockets.last.commandsOf("pair");
     sockets.last.receive({ type: "paired", req: command?.req, token: TOKEN, device: "iPhone" });
     expect(await screen.findByText("Sessions list")).toBeTruthy();
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+    expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
     sockets.last.open();
     expect(sockets.last.commandsOf("hello")).toEqual([expect.objectContaining({ token: TOKEN })]);
   });
@@ -195,9 +207,9 @@ describe("the app shell", () => {
       sockets.last.receive({ type: "refused", req: 0, reason: "This device was revoked", code: "revoked" });
     });
     expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
-    expect(screen.getByText(UNPAIRED_NOTICE)).toBeTruthy();
+    expect(screen.getByText(unpairedNotice("mac"))).toBeTruthy();
     expect(screen.queryByText("Sessions list")).toBeNull();
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBeNull();
   });
 
   it("a network drop leaves the user on Sessions with the token kept", async () => {
@@ -209,8 +221,8 @@ describe("the app shell", () => {
       clock.advance(60_000);
     });
     expect(screen.getByText("Sessions list")).toBeTruthy();
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
-    await waitFor(() => expect(screen.queryByText(UNPAIRED_NOTICE)).toBeNull());
+    expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
+    await waitFor(() => expect(screen.queryByText(unpairedNotice("mac"))).toBeNull());
   });
 
   describe("the root view behind the screens (Android's, and iOS's under a sheet)", () => {
@@ -250,7 +262,7 @@ describe("notifications", () => {
       factory: new Sockets().factory,
       store: createOctetStore(),
       platform: "ios",
-      tokens: { load: () => new Promise(() => {}), save: async () => {}, clear: async () => {} },
+      keychain: { get: () => new Promise(() => {}), set: async () => {}, delete: async () => {} },
     });
     const Layout = () => (
       <HubContext.Provider value={hub}>

@@ -22,6 +22,7 @@ import {
   type TurnEnd,
 } from "./model/session";
 import { clearParsed } from "./markdown/blocks";
+import { hideToastOf } from "./toast";
 import type { Entry } from "./model/transcript";
 import { FIELD_CHARS, field } from "./model/text";
 import { isKnownEvent, type ApprovalInfo, type CatalogInfo, type SessionInfo } from "./protocol";
@@ -276,7 +277,11 @@ export function createOctetStore(): OctetStore {
     replyTo: null,
 
     reset(mac) {
-      clearParsed(); // what the old Mac's replies parsed to
+      // What the old Mac's replies parsed to. The cache is keyed by text, not by Mac, so it all
+      // goes: the other Macs' replies parse again when next drawn.
+      clearParsed();
+      // An approval toast of the Mac (or of any Mac) points at a session that is going.
+      hideToastOf(mac);
       if (mac === undefined) {
         set({
           sessions: [],
@@ -536,6 +541,9 @@ export const ENDED_KEPT_MS = 10 * 60_000;
 export interface ConnectOptions {
   /** The phone's id for the Mac the client reaches: every session it names is keyed by it. */
   mac: string;
+  /** Where each Mac's client is (the Fleet's, src/hub.ts): the view budget asks it for the client
+   * of each key it lets go. Read at each use, so it must follow the Macs as they change. */
+  links: Links;
   /** Runs `fn` after `ms`; returns the function that cancels it. */
   schedule?: (fn: () => void, ms: number) => () => void;
   now?: () => number;
@@ -558,14 +566,6 @@ function coalescerOf(store: OctetStore, options: ConnectOptions): Coalescer {
   }
   return c;
 }
-
-/** The client feeding each Mac's sessions into each store, for letting go of a key's transcript. */
-const feeds = new WeakMap<OctetStore, Map<string, HubClient>>();
-const feedsOf = (store: OctetStore): Map<string, HubClient> => {
-  let map = feeds.get(store);
-  if (!map) feeds.set(store, (map = new Map()));
-  return map;
-};
 
 /** The timers that will release ended sessions, per client, by key. */
 const releases = new WeakMap<HubClient, Map<string, () => void>>();
@@ -601,11 +601,10 @@ function keyFrames(mac: string, frames: readonly BatchItem[]): BatchItem[] {
  * view for `ENDED_KEPT_MS`, then is released and forgotten (one with no view is forgotten at
  * once). Returns the function that stops all of it. */
 export function connectStore(store: OctetStore, client: HubClient, options: ConnectOptions): () => void {
-  const { mac } = options;
+  const { mac, links } = options;
   const schedule = options.schedule ?? defaultSchedule;
   const coalescer = options.coalescer ?? coalescerOf(store, options);
   const mine = ofMac(mac);
-  feedsOf(store).set(mac, client);
   const timers = timersOf(client);
   const cancel = (session: string) => {
     timers.get(session)?.();
@@ -647,7 +646,7 @@ export function connectStore(store: OctetStore, client: HubClient, options: Conn
       for (const session of failed) {
         if (shown(client).has(session) && store.getState().bySession.get(session)?.failed === null) {
           // The screen already holds it: streaming again adds no hold of its own.
-          stream(store, client, session);
+          stream(store, links, client, session);
         }
       }
       failed = [];
@@ -667,7 +666,6 @@ export function connectStore(store: OctetStore, client: HubClient, options: Conn
     offFailed();
     coalescer.drop(mac, sink); // a newer feed of the same Mac keeps what it has waiting
     for (const session of [...timers.keys()]) cancel(session);
-    if (feedsOf(store).get(mac) === client) feedsOf(store).delete(mac);
   };
 }
 
@@ -728,15 +726,14 @@ const visitsOf = (store: OctetStore): string[] => {
 };
 
 /** Lets go of the transcripts of live sessions past the `MAX_VIEWS` seen last, of whichever Mac,
- * but never one on a screen. Each is forgotten by its Mac's client too, so the next `watch`
- * replays it from the start. */
-function keepRecent(store: OctetStore): void {
+ * but never one on a screen. Each is forgotten by its Mac's client too (found through `links`),
+ * so the next `watch` replays it from the start. */
+function keepRecent(store: OctetStore, links: Links): void {
   const visits = visitsOf(store);
   const views = store.getState().bySession;
-  const clients = feedsOf(store);
   const clientOf = (id: string): HubClient | undefined => {
     const mac = macOfKey(id);
-    return mac === null ? undefined : clients.get(mac);
+    return (mac === null ? null : links.client(mac)) ?? undefined;
   };
   const onScreen = (id: string): boolean => {
     const client = clientOf(id);
@@ -784,11 +781,12 @@ export function watch(store: OctetStore, links: Links, session: string): void {
   if (!link) return;
   const holds = holdsOf(link.client);
   holds.set(session, (holds.get(session) ?? 0) + 1);
-  stream(store, link.client, session);
+  stream(store, links, link.client, session);
 }
 
-/** Streams `session` for the screens that hold it (`watch` counts them; this does not). */
-function stream(store: OctetStore, client: HubClient, session: string): void {
+/** Streams `session` from `client` for the screens that hold it (`watch` counts them; this does
+ * not). */
+function stream(store: OctetStore, links: Links, client: HubClient, session: string): void {
   const raw = rawOf(session);
   if (raw === null) return;
   const fresh = !store.getState().bySession.has(session) && !requested(client).has(session);
@@ -797,7 +795,7 @@ function stream(store: OctetStore, client: HubClient, session: string): void {
   const visits = visitsOf(store).filter((id) => id !== session);
   visits.push(session);
   visited.set(store, visits);
-  keepRecent(store);
+  keepRecent(store, links);
   client.subscribe(raw, fresh);
 }
 
@@ -879,6 +877,9 @@ export function bindHooks(store: OctetStore) {
     /** A sessions frame came from `mac` (with none, from any Mac) since the store began or was
      * reset. */
     useListed: (mac?: string): boolean => useStore(store, (s) => (mac === undefined ? s.listed.size > 0 : s.listed.has(mac))),
+    /** The Macs whose sessions frame came since the store began or was reset; the same set until
+     * that changes. */
+    useListedMacs: (): ReadonlySet<string> => useStore(store, (s) => s.listed),
     /** A session's draft (its first prompt, not taken by the Mac), or undefined. */
     useDraft: (id: string): string | undefined => useStore(store, (s) => s.drafts.get(id)),
     /** The texts the Mac took from this phone for a session, newest last; the same array until
@@ -938,6 +939,7 @@ export const {
   useSessionState,
   useSessionStatus,
   useListed,
+  useListedMacs,
   useTaskOpen,
   useReplying,
   useDraft,

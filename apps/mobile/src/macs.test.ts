@@ -1,4 +1,4 @@
-import { SOLO_MAC, keyOf, macNameOf, macOfHost, rawOf, soloLinks, splitKey } from "./macs";
+import { MAC_ID, cleanMacName, keyOf, linksOf, macNameOf, macOfHost, newMacId, rawOf, splitKey } from "./macs";
 
 describe("session keys", () => {
   it("round-trip a Mac and a raw id", () => {
@@ -17,10 +17,6 @@ describe("session keys", () => {
   it("are null for anything that is not a key", () => {
     for (const bad of ["", "123-456", "/123-456", "m1/", "/"]) expect(splitKey(bad)).toBeNull();
     expect(rawOf("123-456")).toBeNull();
-  });
-
-  it("use the one Mac's id until pairings give real ones", () => {
-    expect(SOLO_MAC).toBe("m0");
   });
 });
 
@@ -58,14 +54,55 @@ describe("macNameOf", () => {
   });
 });
 
-describe("soloLinks", () => {
-  it("names the one Mac while there is a client, and none without", () => {
-    const client = { url: "wss://x/" } as never;
-    const links = soloLinks(client);
-    expect(links.macs()).toEqual([SOLO_MAC]);
-    expect(links.client(SOLO_MAC)).toBe(client);
-    expect(links.client("m1")).toBeNull();
-    expect(soloLinks(null).macs()).toEqual([]);
-    expect(soloLinks(null).client(SOLO_MAC)).toBeNull();
+describe("linksOf", () => {
+  it("names each Mac with a client, in order, and no other", () => {
+    const a = { url: "wss://a/" } as never;
+    const b = { url: "wss://b/" } as never;
+    const links = linksOf(new Map([["m00000001", a], ["m00000002", b]]));
+    expect(links.macs()).toEqual(["m00000001", "m00000002"]);
+    expect(links.client("m00000002")).toBe(b);
+    expect(links.client("m00000003")).toBeNull();
+    expect(linksOf(new Map()).macs()).toEqual([]);
+  });
+});
+
+describe("newMacId", () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it("is m and 8 lowercase hex characters, from the CSPRNG, and not the same twice", () => {
+    const spy = jest.spyOn(globalThis.crypto, "getRandomValues");
+    const ids = new Set(Array.from({ length: 50 }, () => newMacId()));
+    expect(ids.size).toBe(50);
+    for (const id of ids) expect(id).toMatch(MAC_ID);
+    expect(MAC_ID.test("m0123abcd")).toBe(true);
+    for (const bad of ["m0", "m0123ABCD", "x0123abcd", "m0123abcde", "m0123abc/"]) expect(MAC_ID.test(bad)).toBe(false);
+    expect(spy).toHaveBeenCalledTimes(50);
+  });
+
+  it("falls back to the native UUID where the runtime has no getRandomValues", () => {
+    const g = globalThis as { crypto?: unknown; expo?: { uuidv4?: () => string } };
+    const crypto = g.crypto;
+    const uuid = jest.fn(() => "9F86D081-884C-4D63-9E8B-0123456789AB");
+    const expo = g.expo;
+    try {
+      Object.defineProperty(globalThis, "crypto", { value: {}, configurable: true });
+      g.expo = { uuidv4: uuid };
+      expect(newMacId()).toBe("m9f86d081");
+      g.expo = {};
+      expect(() => newMacId()).toThrow();
+    } finally {
+      Object.defineProperty(globalThis, "crypto", { value: crypto, configurable: true });
+      g.expo = expo;
+    }
+  });
+});
+
+describe("cleanMacName", () => {
+  it("drops control and bidi characters, folds spaces, and keeps 40 characters", () => {
+    expect(cleanMacName("  Studio\u0007 \n Mac ")).toBe("Studio Mac");
+    expect(cleanMacName("a\u202Eb")).toBe("ab");
+    expect(cleanMacName("z".repeat(41))).toBe("z".repeat(40));
+    expect(cleanMacName("   ")).toBeNull();
+    expect(cleanMacName(5)).toBeNull();
   });
 });

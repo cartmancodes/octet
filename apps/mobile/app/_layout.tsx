@@ -8,7 +8,7 @@ import { AppState, View } from "react-native";
 import { ApprovalToasts } from "../src/components/ApprovalToasts";
 import { Drawer, DrawerHost } from "../src/components/Drawer";
 import { closeDrawer, drawerScreen, setDrawerEnabled } from "../src/drawer";
-import { useHubController, useHubSnapshot, useLinks } from "../src/hub";
+import { useFleet, useHubController, useLinks } from "../src/hub";
 import { keyOf } from "../src/macs";
 import { openSession } from "../src/navigation";
 import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
@@ -25,16 +25,17 @@ SplashScreen.preventAutoHideAsync().catch(() => undefined);
 const OWN_EDGE = { gestureEnabled: false, fullScreenGestureEnabled: false } as const;
 
 /**
- * The shell. The app makes one hub connection (`hub` in src/hub.ts, the context's default).
- * Without a token the user can reach only Pair (`Stack.Protected` redirects), and a token the
- * Mac revoked sends them back there. Put every other screen inside the paired group below.
+ * The shell. The app's Fleet (`hub` in src/hub.ts, the context's default) connects to every
+ * paired Mac. With no pairing the user can reach only Pair (`Stack.Protected` redirects), and the
+ * last Mac revoking the phone sends them back there. Pair stays reachable while paired, to pair
+ * another machine (`/pair?add=1`). Put every other screen inside the paired group below.
  */
 export default function RootLayout() {
   const theme = useTheme();
   const hub = useHubController();
   const router = useRouter();
   const nav = useNavigationContainerRef();
-  const { status, offer } = useHubSnapshot();
+  const { status, offer } = useFleet();
   const links = useLinks();
   const pathname = usePathname();
 
@@ -49,7 +50,7 @@ export default function RootLayout() {
   useEffect(() => closeDrawer(), [pathname]);
 
   useEffect(() => {
-    // The socket and its timers live only while the app is in the foreground. `inactive` is a
+    // The sockets and their timers live only while the app is in the foreground. `inactive` is a
     // pause (a Face ID prompt, the app switcher), not the background. A launch that reports no
     // state yet counts as foreground. Back in the app, the notifications in the tray are old
     // news: the screens show the live state.
@@ -132,9 +133,8 @@ export default function RootLayout() {
             <Stack.Screen name="usage" options={{ title: "Usage", headerShown: false }} />
             <Stack.Screen name="changes" options={{ title: "Changes", headerShown: false }} />
           </Stack.Protected>
-          <Stack.Protected guard={!paired || offer}>
-            <Stack.Screen name="pair" options={{ title: "Pair", headerShown: false }} />
-          </Stack.Protected>
+          {/* Unguarded: the only screen of a phone with no Mac, and how a paired one adds another. */}
+          <Stack.Screen name="pair" options={{ title: "Pair", headerShown: false }} />
         </Stack>
       </DrawerHost>
       {paired && !offer ? <ApprovalToasts /> : null}

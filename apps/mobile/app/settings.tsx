@@ -4,11 +4,10 @@ import { Alert, ScrollView, StyleSheet, Switch, Text, View } from "react-native"
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { confirmBiometric } from "../src/auth";
-import { hubHost } from "../src/client/link";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { openDrawer } from "../src/drawer";
-import { useHubController, useHubSnapshot } from "../src/hub";
+import { useFleet, useHubController } from "../src/hub";
 import { macName } from "../src/inbox";
 import { NO_PROJECT_ID, projectId } from "../src/notifications";
 import { NOT_SAVED, loadSettings, saveSettings, type Settings as Saved } from "../src/persist";
@@ -36,7 +35,7 @@ export default function Settings() {
   const [saved, setSaved] = useState<Saved | null>(null);
   const [error, setError] = useState(false);
   const checking = useRef(false);
-  const { pushNotice } = useHubSnapshot();
+  const { pushNotice, macs } = useFleet();
   const [pushError, setPushError] = useState<string | null>(null);
   const pushing = useRef(false);
   /** The switch is being worked on: "on" or "off"; null when idle. */
@@ -123,7 +122,9 @@ export default function Settings() {
   const stuck = !hasProject || working !== null;
   const pushWords =
     working === "on" ? "Turning on…" : working === "off" ? "Turning off…" : (pushError ?? (hasProject ? pushNotice : NO_PROJECT_ID));
-  const mac = macName(saved.hubUrl);
+  // The first Mac paired, until Machines lists each (Phase D, Task 4).
+  const first = macs[0];
+  const mac = first?.macName ?? macName(null);
   return (
     <View style={[styles.screen, { backgroundColor: theme.bg, paddingTop: insets.top }]}>
       <View style={styles.header}>
@@ -143,7 +144,7 @@ export default function Settings() {
             </Text>
             <Text style={[type.body, { color: theme.muted }]}>{online ? "online" : "offline"}</Text>
           </View>
-          <Text style={[type.label, { color: theme.muted }]}>{saved.hubUrl === null ? "Not paired" : hubHost(saved.hubUrl)}</Text>
+          <Text style={[type.label, { color: theme.muted }]}>{first === undefined ? "Not paired" : first.host}</Text>
           <View style={[styles.row, styles.rule, { borderTopColor: theme.edge }]}>
             <Text style={[type.body, { color: theme.muted }]}>This phone</Text>
             <Text numberOfLines={1} style={[type.body, styles.grow, styles.right, { color: theme.fg }]}>

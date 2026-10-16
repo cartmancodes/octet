@@ -21,7 +21,7 @@ import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol"
 import * as words from "./session";
 import * as cardWords from "./inbox";
 import { octetStore } from "./store";
-import { applyM, k, sessionPath } from "./testKeys";
+import { applyM, k, newM, sessionPath } from "./testKeys";
 import { resetTextSize } from "./textSizeRig";
 import { dark, light } from "./theme";
 
@@ -73,6 +73,7 @@ async function launch(list: SessionInfo[], at?: string) {
     store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
+    newId: newM,
   });
   const Layout = () => (
     <HubContext.Provider value={hub}>

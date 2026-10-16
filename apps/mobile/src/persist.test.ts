@@ -12,6 +12,8 @@ describe("settings", () => {
       deviceName: null,
       faceId: true,
       hubUrl: null,
+      pairings: [],
+      forget: [],
       notifications: false,
       pushKinds: { approvals: true, errors: true, turns: false },
       textSize: 13,
@@ -25,6 +27,8 @@ describe("settings", () => {
       deviceName: "Shubho's iPhone",
       faceId: false,
       hubUrl: "wss://mac.tail1234.ts.net/",
+      pairings: [],
+      forget: [],
       notifications: false,
       pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
@@ -62,6 +66,8 @@ describe("settings", () => {
       deviceName: "Old",
       faceId: false,
       hubUrl: "wss://mac.tail1234.ts.net/",
+      pairings: [],
+      forget: [],
       notifications: false,
       pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
@@ -143,6 +149,8 @@ describe("settings", () => {
       deviceName: "P",
       faceId: false,
       hubUrl: "wss://a/",
+      pairings: [],
+      forget: [],
       notifications: false,
       pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
@@ -152,6 +160,54 @@ describe("settings", () => {
   it("never hold a token", async () => {
     await saveSettings({ hubUrl: "wss://x/" });
     const raw = (await AsyncStorage.getItem(SETTINGS_KEY)) ?? "";
-    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "hubUrl", "notifications", "pushKinds", "textSize"]);
+    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "forget", "hubUrl", "notifications", "pairings", "pushKinds", "textSize"]);
+  });
+});
+
+describe("pairings", () => {
+  const p = (id: string, host = id, extra: object = {}) => ({
+    id,
+    hubUrl: `wss://${host}.tail1.ts.net/`,
+    deviceName: "iPhone",
+    macName: host,
+    ...extra,
+  });
+
+  it("round-trip, at most 4, duplicates by id dropped, each cleaned", async () => {
+    await AsyncStorage.setItem(
+      SETTINGS_KEY,
+      JSON.stringify({
+        pairings: [
+          p("m00000001", "studio"),
+          p("m00000001", "again"), // the same id: the first stays
+          "junk",
+          { id: "m00000002" }, // no address
+          p("not-an-id"),
+          p("m00000003", "laptop", { macName: "  Lap\u0007top\n " }),
+          p("m00000004", "mini", { macName: "" }), // no name: the host's first label
+          p("m00000005", "five"),
+          p("m00000006", "six"), // past four
+        ],
+      }),
+    );
+    const s = await loadSettings();
+    expect(s.pairings.map((x) => [x.id, x.macName])).toEqual([
+      ["m00000001", "studio"],
+      ["m00000003", "Laptop"],
+      ["m00000004", "mini"],
+      ["m00000005", "five"],
+    ]);
+    expect(await saveSettings({ faceId: false })).toBe(true);
+    expect((await loadSettings()).pairings).toEqual(s.pairings);
+  });
+
+  it("are not a list: none", async () => {
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ pairings: { a: 1 } }));
+    expect((await loadSettings()).pairings).toEqual([]);
+  });
+
+  it("keep a long name to 40 characters", async () => {
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ pairings: [p("m0000000a", "studio", { macName: "y".repeat(90) })] }));
+    expect((await loadSettings()).pairings[0]?.macName).toBe("y".repeat(40));
   });
 });

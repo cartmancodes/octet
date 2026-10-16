@@ -10,6 +10,8 @@ import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { hear, info, launch, pairedStorage, type Rig } from "./screenRig";
 import { hideToast, toastStore } from "./toast";
 import { k, sessionPath } from "./testKeys";
+import { keyOf } from "./macs";
+import { octetStore } from "./store";
 
 const gist = (id: number): ApprovalInfo => ({
   id,
@@ -188,5 +190,43 @@ describe("the approval toast", () => {
     await hear(rig, [waiting("b", 1, { workspace: "/w/<b>[go](evil.test)" })]);
     const shown = screen.getByText("<b>[go](evil.test) needs approval");
     expect(shown.props.onPress).toBeUndefined();
+  });
+
+  describe("a second Mac (the baseline is per Mac)", () => {
+    const OTHER = "m0000000b";
+    /** The other Mac's list, keyed as its feed keys it. */
+    const listOther = (rows: SessionInfo[]) =>
+      act(async () => {
+        octetStore.getState().applyBatch(OTHER, [{ v: 1, type: "sessions", sessions: rows.map((r) => ({ ...r, id: keyOf(OTHER, r.id) })) }]);
+      });
+
+    it("its first list is its own baseline: an approval already waiting there is not news", async () => {
+      await openAt("/settings", [info("b")]);
+      await listOther([waiting("x", 1)]);
+      expect(toastText()).toBeNull();
+      await listOther([waiting("x", 2)]);
+      expect(toastText()).toBe("x needs approval");
+    });
+
+    it("a Mac paired again starts a new baseline", async () => {
+      await openAt("/settings", [info("b")]);
+      await listOther([info("x")]);
+      await act(async () => octetStore.getState().reset(OTHER));
+      await listOther([waiting("x", 1)]);
+      expect(toastText()).toBeNull();
+    });
+
+    it("its reset takes its toast down, and leaves another Mac's", async () => {
+      const rig = await openAt("/settings", [info("b")]);
+      await listOther([info("x")]);
+      await listOther([waiting("x", 1)]);
+      expect(toastText()).toBe("x needs approval");
+      await act(async () => octetStore.getState().reset(OTHER));
+      expect(toastText()).toBeNull();
+      await hear(rig, [waiting("b", 1)]);
+      expect(toastText()).toBe("b needs approval");
+      await act(async () => octetStore.getState().reset(OTHER));
+      expect(toastText()).toBe("b needs approval");
+    });
   });
 });

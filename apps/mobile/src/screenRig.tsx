@@ -16,6 +16,7 @@ import { HubContext, HubController, TOKEN_KEY } from "./hub";
 import { saveSettings } from "./persist";
 import type { SessionInfo } from "./protocol";
 import { octetStore } from "./store";
+import { newM } from "./testKeys";
 
 jest.mock("expo-camera", () => ({
   CameraView: () => null,
@@ -55,6 +56,7 @@ export async function mount(url: string, routes: Record<string, ComponentType>) 
     store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
+    newId: newM,
   });
   const Layout = () => (
     <HubContext.Provider value={hub}>
