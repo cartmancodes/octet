@@ -12,37 +12,51 @@ Claude Code and Codex CLIs.
 ### Added
 
 - A Live Activity for the phone app, in the Dynamic Island and on the Lock
-  Screen (iOS 17.2 or later; the app still runs on iOS 16.4): whether a
-  session runs, waits for approval or is done, and for how long, with the
-  waiting approval's session name and command, which the app keeps in the
+  Screen (iOS 17.2 or later; the app still runs on iOS 16.4). It shows whether
+  a session runs, waits for approval or is done, and for how long, with the
+  waiting approval's session name and command. The app keeps those in the
   phone's App Group only (at most 64, privacy-sensitive, cleared on unpair).
-  There is one activity with two drivers: while the app is open (on any
-  screen) it drives the activity itself, at most once a second; while it
-  isn't, one Mac's hub starts, updates and ends it through APNs with
-  content-free pushes (the state, the hub's session id, its host, two times
-  and a count; stale 15 minutes on) signed with your own `.p8` key, named in
-  `hub.json` (`apns: {team_id, key_id, key_path, sandbox}`; the key must be
-  `0600` and yours, or APNs stays off with one log line). The phone gives its
-  ActivityKit tokens (`register_activity`) to one Mac, the one of the lead
-  session when the app was last in front, and tells the others
-  `clear_activity`; while you are away the Island follows that Mac, and the
-  others still send notifications. A new activity's token that comes while
-  the app is in the background is handed over on a short connection whose
-  hello says `background: true`. **Deny** on the Island answers no on the Mac
-  that owns the approval, from the background too, over such a connection;
-  **Allow** opens `octet://approve/...`, the approval's session, behind Face
-  ID and the arm, and a forged or stale link opens the Inbox. **Settings ›
-  Live Activity** (on by default) turns it all off, and follows the phone's
-  own setting. An approval that starts the activity while you are away brings
-  two alerts, the push and the activity's. Limits: the hand-over and a
-  background Deny need iOS to give the app background time, and an unlocked
-  phone, since the Macs' device tokens are readable only while unlocked. On a
-  locked phone the Mac can neither update nor end the activity it started
-  until you unlock and open the app: it shows as stale after 15 minutes, no
-  second one starts for up to 8 hours, and a Deny waits for the unlock. The
-  Swift is unverified until the first device build. The contract test checks
-  one content-free start, then an update to the handed-over token and no
-  end, at a local stand-in for APNs.
+  - **One activity, two drivers.** While the app is open (on any screen), the
+    app drives the activity itself, at most once a second. While it isn't, one
+    Mac's hub starts, updates and ends it through APNs, signed with your own
+    `.p8` key named in `hub.json` (`apns: {team_id, key_id, key_path,
+    sandbox}`). The key must be `0600` and yours, or APNs stays off with one
+    log line. The pushes are content-free: the state, the hub's session id,
+    its host, two times and a count. Each is stale 15 minutes on, and a stale
+    activity shows dimmed, marked **Stale**.
+  - **One Mac drives it.** The phone gives its ActivityKit tokens
+    (`register_activity`) to one Mac, the one of the lead session when the app
+    was last in front, and tells the others `clear_activity`. While you are
+    away the Island follows that Mac, and the others still send
+    notifications. A Mac that missed its `clear_activity` is told again on its
+    next connection and each time you come back to the app. A registration
+    refused for now is tried once more 5 seconds later.
+  - **The background.** A new activity's token that comes while the app is in
+    the background is handed over on a short connection whose hello says
+    `background: true`. When activities appear together, only the ones seen
+    earlier are ended, so one always stays.
+  - **Deny and Allow.** **Deny** on the Island answers no on the Mac that owns
+    the approval, from the background too, over such a connection. **Allow**
+    opens `octet://approve/...`, the approval's session, behind Face ID and
+    the arm; a forged or stale link opens the Inbox.
+  - **Settings › Live Activity** (on by default) turns it all off, and follows
+    the phone's own setting.
+  - **Tests.** The contract test checks one content-free start, then an update
+    to the handed-over token and no end, at a local stand-in for APNs.
+  - **Known limits:**
+    - An approval that starts the activity while you are away brings two
+      alerts, the push's and the activity's.
+    - The hand-over and a background Deny need iOS to give the app background
+      time, and an unlocked phone, since the Macs' device tokens are readable
+      only while unlocked.
+    - On a locked phone, the Mac can neither update nor end the activity it
+      started until you unlock and open the app. The activity shows as stale
+      after 15 minutes, and a Deny waits for the unlock.
+    - No second activity starts for up to 8 hours while the first awaits its
+      token. Opening the app with nothing to take over lifts that hold.
+    - A token counts as live for 12 hours from its first registration.
+    - The Swift is parsed and type-checked against the Mac Catalyst SDK only.
+      It is unverified until the first device build.
 - The phone app pairs with up to 4 Macs. Each pairing keeps its token in its
   own keychain entry, the one pairing of an earlier version moves over on
   first launch, and every Mac stays connected while the app is open. The
@@ -218,6 +232,28 @@ Claude Code and Codex CLIs.
 
 ### Changed
 
+- The hub and the phone at the stated scale (4 Macs, 200 sessions each).
+  - The sessions list goes to the phones at most four times a second. A
+    change after a quiet spell goes at once, and the rest within a quarter of
+    a second, together.
+  - Each list is made once and shared by every phone. A phone behind gets the
+    newest list, not every one it missed.
+  - A list holds at most 200 rows, the most recently active, in at most
+    96 KiB. Past that, rows drop the approval's gist, then the usage line,
+    the NOW line and the goal, least recently active first. The approvals
+    count always stays, and the phone keeps the gist it had while that count
+    says the approval still waits.
+  - The phone cleans only the last list of each Mac's batch. A test streams
+    4 × 200 rows with the whole shell up and holds each store commit to the
+    50 ms between commits.
+  - `devices.json` is written off the hub loop. New sessions' journals are
+    read 8 at a time at start-up.
+  - A phone's `/export` runs as the desk's own export job, so the desk keeps
+    working while it copies.
+  - At most 32 connections wait to say hello. A newer one pushes out the
+    oldest only once that one has waited 2 seconds; with every waiter younger,
+    the hub answers `503 Too many connections` and the app retries with its
+    backoff.
 - The phone app has a new look, drawn after the terminal: an Inbox of your
   sessions in three tabs with approvals answered on their cards, a side
   drawer, a redrawn New session and Conversation (permission card, slash menu
@@ -284,6 +320,14 @@ Claude Code and Codex CLIs.
 
 ### Fixed
 
+- A session's error push, question or usage could wait until another session
+  changed, when the hub's tail pass was cut short.
+- After a Lock Screen start that never handed its token over, the Island
+  stayed off for up to 8 hours, even after opening the app.
+- A launch that registered the same Live Activity token again reset its
+  12-hour count.
+- Two Live Activities appearing together could end each other and leave none.
+- A reconnect storm could push out a phone that was slow to say hello.
 - A failed disk write could be reported as written (a torn journal record,
   a truncated goal file installed over a good one); every write is now
   flushed and checked, and new files and renames are synced.

@@ -199,9 +199,9 @@ side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Se
   asks for Face ID; full access always asks). **Live Activity** (only on an iPhone that has Live
   Activities: iOS 17.2 or later): on by default; see [Live Activity](#live-activity-dynamic-island).
   The footer names the app version.
-- **Toasts.** One line at the bottom of a screen. When an approval newly arrives for a session
-  other than the one you are in (and you are not on the Inbox), `<name> needs approval` appears
-  with **View**, which opens it.
+- **Toasts.** One line at the top of a screen, under its header (over the drawer too). When an
+  approval newly arrives for a session other than the one you are in (and you are not on the
+  Inbox), `<name> needs approval` appears with **View**, which opens it.
 
 ## Notifications
 
@@ -264,10 +264,12 @@ shows no switch for it.
   is run by both sides' tests), so the activity looks the same whoever drives it. An activity that is
   already there (the hub started it while you were away) is taken over as soon as ActivityKit hands
   its token to the app, even with every session idle: it is updated, and ended 5 minutes after they
-  went idle. When a new activity appears, the native module ends any older one, so they don't stack.
+  went idle. When a new activity appears, the native module ends the ones it saw before it, so they
+  don't stack; one it already saw, or one already over, ends nothing, so one activity always stays.
 - **While it isn't**, one Mac's hub starts, updates and ends that same activity through APNs, with
   content-free pushes (the state, the hub's own session id, its host, two times and a count; no
-  names or commands), each start and update stale 15 minutes on. It updates it through the activity
+  names or commands), each start and update stale 15 minutes on: the widget then dims it and shows a
+  muted **Stale**. It updates it through the activity
   token the phone registered, so only once that token has reached the hub. That needs your APNs key
   in the hub's `hub.json`: the setup, and exactly what is sent, are in [the
   guide](../../docs/remote-control.md#live-activity-dynamic-island). Coming back to the app ends
@@ -276,9 +278,14 @@ shows no switch for it.
   Mac of the lead session while the app is in front (else the one it chose before, which it
   remembers, else the first paired Mac). Every other Mac is told `clear_activity`, so two hubs never
   fight over one activity. The choice moves only while the app is in front. While you are away the
-  Island follows that Mac; the other Macs still send their push notifications.
+  Island follows that Mac; the other Macs still send their push notifications. A Mac out of reach
+  when the choice moves away from it is told on its next connection, and again each time you come
+  back to the app.
 - **Tokens.** The app gives the driving Mac its ActivityKit tokens (`register_activity`) over its
-  own connection, when they change, and when it is out of reach, on its next connection. A token per
+  own connection, when they change, and when it is out of reach, on its next connection. A
+  registration or `clear_activity` the Mac turns away for now (busy, rate-limited, not saved, timed
+  out) is tried once more 5 seconds later. The hub counts a token's 12 hours from its first
+  registration, so the app registering it again at each launch doesn't stretch them. A token per
   activity is kept, so one activity's end never takes back another's token. A new activity token
   that comes while the app is in the background (an activity the hub just started) is handed over at
   once, over a short background connection to that Mac (its hello says `background: true`, so the
@@ -289,9 +296,11 @@ shows no switch for it.
   while unlocked (`WHEN_UNLOCKED_THIS_DEVICE_ONLY`).
 - **What a locked phone costs.** Without the hand-over (a locked phone, or no background time), the
   Mac never gets the token of the activity it started: it can neither update nor end it until you
-  unlock and open the app. That activity keeps what it started with, shows as stale 15 minutes on,
-  and the Mac starts no second one for up to 8 hours while it waits for the token. Opening the app
-  takes it over and brings it up to date. Unpairing a Mac stops any background send to it, then
+  unlock and open the app. That activity keeps what it started with, shows as stale (dimmed, marked
+  **Stale**) 15 minutes on, and the Mac starts no second one for up to 8 hours while it waits for
+  the token. Opening the app takes it over and brings it up to date; opened with no activity left to
+  take over (you dismissed it), the Mac's hold ends at once, and the next approval while you are
+  away starts one again. Unpairing a Mac stops any background send to it, then
   tells it `clear_activity` as well as "notifications off".
 - **The names and commands** the widget shows come from the phone only: the app writes each waiting
   approval's session name (at most 80 characters) and command (folded like the Permission card, at
@@ -318,8 +327,9 @@ shows no switch for it.
   in the phone's settings, it acts as the switch off (and hides it); turned back on, it registers
   again, and the switch in Settings comes and goes with it. A dismissed activity is not started
   again by opening the app, only by a change. One that lands while the switch is off is ended.
-- **Not built yet.** The Swift (`modules/octet-live` and `targets/octet-live`) can't be compiled
-  here (no iOS SDK): it is checked as text and by its tests, and is unverified until the first device
+- **Not built yet.** The Swift (`modules/octet-live` and `targets/octet-live`) can't be built here
+  (no iOS SDK): it is checked as text by its tests, parsed with `swiftc -parse`, and type-checked
+  against the Mac Catalyst SDK's ActivityKit and WidgetKit, and is unverified until the first device
   build. The device pass below starts with it.
 
 ## Device pass
@@ -373,9 +383,9 @@ workspace. Tick each one on each phone.
       that an `activity registered` line follows the start within seconds (iOS gave the app
       background time for the token), and that the activity then updates as the session changes.
       With the phone **locked** expect no such line: the keychain can't be read while locked, so
-      the Mac can neither update nor end that activity; it shows as stale 15 minutes on, no second
-      one starts, and opening the app takes it over. If no line comes even unlocked, iOS gave no
-      background time.
+      the Mac can neither update nor end that activity; it shows as stale (dimmed, marked **Stale**)
+      15 minutes on, no second one starts, and opening the app takes it over. If no line comes even
+      unlocked, iOS gave no background time.
 - [ ] Two Macs, one idle, the phone away for more than 5 minutes while the other runs a turn: the
       activity is not ended, and follows the busy Mac (the lead's when you left). The idle Mac's
       `hub-audit.jsonl` shows `activity cleared` for this phone.
@@ -390,13 +400,14 @@ workspace. Tick each one on each phone.
 ## Performance notes
 
 - Every list over a few items is a FlashList (v2, which measures rows itself: no
-  `estimatedItemSize`). Sessions and Recent use `keyExtractor` and `extraData` for the one flag
-  that changes how rows draw. The transcript adds `getItemType` (one type per entry kind, so
+  `estimatedItemSize`). The Inbox, the drawer, Recent and Changes use `keyExtractor`, and
+  `extraData` for what changes how their rows draw. The transcript adds `getItemType` (one type per entry kind, so
   recycled rows are like for like), `maintainVisibleContentPosition={{ startRenderingFromBottom:
   true }}` (it opens at the end and keeps its place when rows change), and `scrollEventThrottle`
   32 for the follow-the-output logic.
-- Rows (`TranscriptRow`, `SessionCard`, `RecentRow`) are `React.memo` with stable callbacks and no
-  inline object or function props.
+- Rows (`TranscriptRow`, `InboxCard`, the drawer's rows, `RecentRow`) are `React.memo` with stable
+  callbacks and no inline object or function props. An Inbox card draws again only when what it
+  shows changed (`sameItem`).
 - A reply is Markdown, whether it is streaming or done. A streaming reply keeps the blocks before
   its last whole one and parses only what came since, so a chunk costs the same however long the
   reply is. A finished reply is parsed once per text, in a cache of at most 2 MB that unpairing
@@ -404,9 +415,14 @@ workspace. Tick each one on each phone.
 - A reply draws its newest 400 blocks, under "N earlier blocks of this reply are on the Mac".
 - A tool call costs a fixed 256 bytes toward the memory limits, even when its strings are empty.
   A tools entry holds 500 calls, then "N more calls on the Mac". An end finds its call by id.
-- The client delivers frames in one batch at most every 50 ms; the store applies a batch in one
-  `set`, and every part a batch did not change keeps its identity, so a screen that selects
-  narrowly does not draw for another session's output.
+- The client delivers frames in one batch at most every 50 ms, and every Mac's batches go into one
+  store commit at most every 50 ms; the store applies them in one `set`, and every part a batch did
+  not change keeps its identity, so a screen that selects narrowly does not draw for another
+  session's output.
+- Each Mac's sessions list is whole, at most 200 rows in 96 KiB, at most four a second (see [what
+  the phone is sent](../../docs/remote-control.md#what-the-phone-is-sent)). The store cleans only
+  the last list of a Mac's batch, and a row the hub left a field out of keeps the approval's gist
+  it had while the count says it still waits.
 - The phone keeps the transcripts of the 4 sessions you looked at last. Opening another one
   replays it from the Mac.
 - Budgets that tests hold, with room for a busy machine:
@@ -420,6 +436,13 @@ workspace. Tick each one on each phone.
       never another session's transcript or a card;
     - 10 chunks into a streaming reply of 16,000 paragraphs in under 500 ms;
     - a finished reply of 16,000 code fences with fewer than 1,000 text nodes.
+  - `src/perf.scale.test.tsx`, at several Macs' scale: 4 Macs of 200 sessions each, each sending
+    three lists every 50 ms, with the whole shell up (the Inbox, the drawer open, the Live Activity
+    controller and the toasts):
+    - each store commit in under 50 ms on average (about 4 ms alone);
+    - at most one commit per 50 ms, and one list cleaned per Mac per commit;
+    - the Inbox's cards drawn only when what they show changed, and its lists made once a commit;
+    - no toast, no App Group write, and the Island changed at most once a second.
 
 ## Troubleshooting
 

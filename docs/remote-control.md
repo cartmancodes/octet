@@ -362,6 +362,21 @@ an iPhone or an Android phone, working on it, pairing, and what to check when
 the app can't reach the Mac, says it is unpaired, or doesn't show a session
 you started.
 
+Set it up in this order. The first four steps are all a phone needs:
+
+1. [Start the hub](#start-the-hub), and if you like, [keep it
+   running](#keep-the-hub-running) as a service.
+2. [Put it on your tailnet](#put-it-on-your-tailnet).
+3. [Pair a phone](#pair-a-phone).
+4. Optionally, [push notifications](#push-notifications), the [Live
+   Activity](#live-activity-dynamic-island) (iPhone, with your own APNs key),
+   and [more Macs](#more-than-one-mac).
+
+After those come [what the phone is sent](#what-the-phone-is-sent), [changes
+and commits](#changes-and-commits-from-the-phone), [keeping a session
+private](#keep-a-session-off-the-phone) and the [hub security
+notes](#hub-security-notes).
+
 ### Start the hub
 
 ```sh
@@ -433,6 +448,53 @@ environment, even after a login with no tmux running. The service doesn't use
 - **Linux without a login session.** A systemd user service stops when you log
   out unless lingering is on: `loginctl enable-linger "$USER"`.
 
+### Put it on your tailnet
+
+The hub never listens on the network. Publish it with Tailscale, which adds
+HTTPS on the Mac's `*.ts.net` name and tells the hub which tailnet user is
+connecting:
+
+```sh
+tailscale serve --bg 47823
+```
+
+Only devices on your tailnet can open that address. Use `tailscale serve
+status` to see it, and `tailscale serve --https=443 off` to take it down.
+Never publish the hub with `tailscale funnel`: Funnel puts it on the public
+internet, and the hub is for your tailnet only.
+
+### Pair a phone
+
+In an Octet session on the Mac, type:
+
+```
+/remote-control pair
+```
+
+It shows a QR code and a link. In the phone app choose **Pair** and scan it.
+The code works once and expires after 10 minutes. If the hub isn't running,
+Octet says `Start the hub first: octet hub`; if it isn't published yet, Octet
+makes no code and says `Publish it first: tailscale serve --bg 47823`.
+Plain `/remote-control` also reports the hub: whether it is running, whether
+it is published, and how many phones are paired. The hub checks Tailscale when
+it starts and every 10 seconds after, so a `tailscale serve` you just ran can
+take that long to show.
+
+To list the paired phones, or remove one:
+
+```sh
+octet hub devices
+octet hub revoke "My iPhone"
+```
+
+A revoked phone is disconnected within two seconds and can't come back
+without pairing again. Run `octet hub devices` and `revoke` with the same
+`--journal-dir` as the hub if you gave it one. Neither reads `hub.json`, so a
+mistake there never blocks a revoke. A relative `--journal-dir` is resolved
+to an absolute path when Octet starts. The hub, the sessions at your desk and
+the sessions a phone starts then use the same directory, whatever directory
+each one runs in.
+
 ### Push notifications
 
 When an agent needs your approval, hits an error, or finishes a turn, the hub
@@ -460,11 +522,13 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
   app sends its switches with its push token (`register_push`); an older app
   that sends none keeps what the hub has.
 - **Where it goes.** The hub posts each push to Expo's push service, `https://exp.host/--/api/v2/push/send`,
-  which hands it to Apple or Google. That request is the only thing the hub
-  sends outside your Mac and your tailnet, and it carries the phone's Expo
-  push token, which the hub keeps in `devices.json` (readable by you alone)
-  and never writes to logs, journals, the audit file or a command line.
-  Expo, Apple and Google see that a push for that token happened, and when.
+  which hands it to Apple or Google. These requests, and the Live Activity's
+  to Apple once you add an APNs key ([below](#live-activity-dynamic-island)),
+  are the only things the hub sends outside your Mac and your tailnet. A push
+  carries the phone's Expo push token, which the hub keeps in `devices.json`
+  (readable by you alone) and never writes to logs, journals, the audit file
+  or a command line. Expo, Apple and Google see that a push for that token
+  happened, and when.
 - **Which phones.** A phone gets a push only if it turned notifications on and
   has no open connection to the hub (a short background connection the app
   makes for the Live Activity doesn't count). The app closes its connection when it goes
@@ -507,7 +571,9 @@ was last in front (the oldest waiting approval, else the newest running turn, el
 finish), or, before any, the first Mac you paired. Every other Mac is told to forget them
 (`clear_activity`), so no two hubs ever start, update or end the same activity. While you are away
 the Island follows that one Mac; the other Macs still send their push notifications. The choice moves
-only while the app is in front, and the phone remembers it.
+only while the app is in front, and the phone remembers it. A Mac that is out of reach when the
+choice moves away from it keeps the tokens until the phone can tell it: on its next connection, and
+again each time you come back to the app. Until then both Macs can drive the activity.
 
 **Set up APNs** (once, with your own Apple developer account; nothing here makes one):
 
@@ -561,7 +627,8 @@ only while the app is in front, and the phone remembers it.
   to finish), or empty; `mac` is the host of the hub's published address, or empty; `since` is
   when that session's state began; `approvals` counts the approvals waiting.
 - `stale-date` is 15 minutes after the send, on every start and update: an activity the hub can't
-  keep up to date shows as stale after that, rather than looking current.
+  keep up to date shows as stale after that, rather than looking current. Its content dims and a
+  muted **Stale** shows under it, on the Lock Screen and in the Island.
 - `attributes-type`, `attributes` and `alert` go on a start only (its alert body is `Approval
   waiting` or `Session running`); an end adds `dismissal-date` and has no `stale-date`.
 - No session name, workspace, command, file name, prompt or reply ever goes in it, so Apple never
@@ -585,8 +652,12 @@ in its hello (`background: true`) and doesn't count. While the phone is away, th
 - **ends** it 5 minutes after every session went idle, and then forgets that token for good.
 
 Coming back to the app ends nothing: the app takes the same activity over. A token counts as live
-for 12 hours at most (ActivityKit ends an activity within that), and while an activity the hub
-started still waits for its token, the hub starts no other for up to 8 hours. Activity sends share
+for 12 hours at most from when the phone first registered it (ActivityKit ends an activity within
+that); the same token registered again, at each launch, doesn't restart the count. While an activity
+the hub started still waits for its token, the hub starts no other for up to 8 hours. That hold
+ends early when you open the app and the Mac still holds no live activity token for the phone (the
+activity it started never handed over, and you dismissed it or it ended): the next approval while
+you are away starts one again. Activity sends share
 the pushes' limit of six a minute per phone, at most three of them, so approval pushes always have
 room. Apple answering that a token is gone (410) drops that token, and an approval still waiting
 then starts a new activity; any other failure is logged, without the token, and not retried in a
@@ -602,7 +673,10 @@ When a new activity's token comes while the app is in the background (an activit
 started), the app hands it over at once: it opens a short background connection to that Mac, which
 registers the token and closes once the Mac answers or after 10 seconds. It does this too when iOS
 launches the closed app in the background for the token, once the app has read its settings and
-pairings. When a new activity appears, the app ends any older one, so they don't stack. The
+pairings. When a new activity appears, the app ends the ones it saw before it, so they don't stack;
+one it already saw, or one already over, ends nothing, so one activity always stays. A registration
+or clear the Mac turns away for now (busy, rate-limited, not saved, or timed out) is tried once more
+5 seconds later; any other is tried again on the next change, connection or return to the app. The
 hand-over needs two things:
 
 - **Time in the background.** iOS must give the app time when the activity's token arrives.
@@ -614,10 +688,10 @@ hand-over needs two things:
 Screen case, or no background time), the Mac never gets the token of the activity it started, so it
 can neither update nor end that activity until you unlock and open the app. The activity keeps
 showing what it started with (`Approval waiting`, say, after you answered at the desk), it shows as
-stale 15 minutes after the start, and the Mac starts no second one for up to 8 hours while the
-first still waits for its token. Once you open the app, the app takes the activity over and brings
-it up to date. This follows from keeping the Macs' device tokens unreadable while the phone is
-locked.
+stale (dimmed, marked **Stale**) 15 minutes after the start, and the Mac starts no second one for up
+to 8 hours while the first still waits for its token. Once you open the app, the app takes the
+activity over and brings it up to date. This follows from keeping the Macs' device tokens unreadable
+while the phone is locked.
 
 The hub keeps the tokens per phone in `devices.json`, records `activity registered` (or `activity
 cleared`) with the phone's name in `hub-audit.jsonl`, never the token, and drops them on `octet hub
@@ -655,55 +729,9 @@ on registers again. To stop every phone's activity pushes, remove the `apns` blo
 and restart the hub.
 
 **Not yet tested on a phone.** The Swift code (the app's Live Activity module and the widget) has
-been checked here only as source, never built for iOS. The first device build (with EAS, on your
+been checked here only as source (parsed, and type-checked against the Mac Catalyst SDK's
+ActivityKit and WidgetKit), never built for iOS. The first device build (with EAS, on your
 account) is its first real check; see the app's [device pass](../apps/mobile/README.md#device-pass).
-
-### Put it on your tailnet
-
-The hub never listens on the network. Publish it with Tailscale, which adds
-HTTPS on the Mac's `*.ts.net` name and tells the hub which tailnet user is
-connecting:
-
-```sh
-tailscale serve --bg 47823
-```
-
-Only devices on your tailnet can open that address. Use `tailscale serve
-status` to see it, and `tailscale serve --https=443 off` to take it down.
-Never publish the hub with `tailscale funnel`: Funnel puts it on the public
-internet, and the hub is for your tailnet only.
-
-### Pair a phone
-
-In an Octet session on the Mac, type:
-
-```
-/remote-control pair
-```
-
-It shows a QR code and a link. In the phone app choose **Pair** and scan it.
-The code works once and expires after 10 minutes. If the hub isn't running,
-Octet says `Start the hub first: octet hub`; if it isn't published yet, Octet
-makes no code and says `Publish it first: tailscale serve --bg 47823`.
-Plain `/remote-control` also reports the hub: whether it is running, whether
-it is published, and how many phones are paired. The hub checks Tailscale when
-it starts and every 10 seconds after, so a `tailscale serve` you just ran can
-take that long to show.
-
-To list the paired phones, or remove one:
-
-```sh
-octet hub devices
-octet hub revoke "My iPhone"
-```
-
-A revoked phone is disconnected within two seconds and can't come back
-without pairing again. Run `octet hub devices` and `revoke` with the same
-`--journal-dir` as the hub if you gave it one. Neither reads `hub.json`, so a
-mistake there never blocks a revoke. A relative `--journal-dir` is resolved
-to an absolute path when Octet starts. The hub, the sessions at your desk and
-the sessions a phone starts then use the same directory, whatever directory
-each one runs in.
 
 ### More than one Mac
 
@@ -748,17 +776,27 @@ phone already has (the same host) replaces its pairing and keeps its name. A
   when the phone had no connection to it at all (its pairing credentials
   couldn't be read).
 
-### Keep a session off the phone
+### What the phone is sent
 
-Each Octet session shares itself with the hub through a private socket in
-`run/` beside its journals, and a file saying which engine, workspace and mode
-it uses. To keep one session private, start it with:
+A paired phone is sent the list of live sessions, one row each: what it is
+doing, its workspace, mode and model, how many approvals wait (with a short
+gist of the first), its goal, the NOW line, a usage line, and whether its turn
+ended on a question. It is sent the transcript, state and catalog only of the
+sessions it opens.
 
-```sh
-octet --no-remote
-```
-
-It then creates no socket and no file, and the hub and the phone never see it.
+- **When.** The list goes when a row changes, at most four times a second: a
+  change after a quiet spell goes at once, and the changes after it within a
+  quarter of a second, together. A row can trail its session by up to 250 ms
+  (an open session's own state comes at once). A phone gets the whole list as
+  soon as it says hello.
+- **How much.** At most 200 sessions, the most recently active, in at most
+  96 KiB. Past that the rows drop what can wait, least recently active first:
+  the approval's gist, then the usage line, then the NOW line, then the goal.
+  Then the least recently active rows go. The count of approvals waiting always
+  stays, and the phone keeps the gist it already had while that count says the
+  approval still waits.
+- **One copy.** The hub makes each list once and shares it with every phone. A
+  phone that falls behind gets the newest list, not every one it missed.
 
 ### Changes and commits from the phone
 
@@ -817,6 +855,18 @@ again`). If the repository signs commits (`commit.gpgsign`), the signing
 program runs on the Mac: a passphrase or Touch ID prompt there must be
 answered within those 10 seconds, or the commit fails.
 
+### Keep a session off the phone
+
+Each Octet session shares itself with the hub through a private socket in
+`run/` beside its journals, and a file saying which engine, workspace and mode
+it uses. To keep one session private, start it with:
+
+```sh
+octet --no-remote
+```
+
+It then creates no socket and no file, and the hub and the phone never see it.
+
 ### Hub security notes
 
 - The hub listens on `127.0.0.1` only. The only way in from outside is
@@ -833,11 +883,15 @@ answered within those 10 seconds, or the commit fails.
   `tailscale serve` publishes it at.
 - Connections that stall mid-request can't keep a phone out. Each one must
   finish connecting within 5 seconds, and once 32 are connecting at once, a new
-  one pushes out the oldest. A stalled one never counts against the 8 that may
-  wait to say hello.
+  one pushes out the oldest. A stalled one never counts among those waiting to
+  say hello.
 - Connections that connect and then never say hello can't keep a phone out
-  either. Each one is closed after 10 seconds, and once 8 are waiting, a new
-  one pushes out the oldest of them, so a phone that says hello always gets in.
+  for long either. Each one is closed after 10 seconds. At most 32 wait to say
+  hello at once: a new one pushes out the oldest once that one has waited
+  2 seconds, so a phone gets in unless 32 connections younger than 2 seconds
+  are all waiting. Then the hub turns it away (`503 Too many connections`, as
+  it does past 64 open connections), and the app tries again with its usual
+  backoff: from about half a second, doubling to 30 seconds.
 - The hub won't start if `run/` in the data directory is a symlink, isn't a
   directory, or belongs to another user. It names the path. If `run/` is
   readable by others, the hub makes it `0700`.
@@ -877,7 +931,9 @@ answered within those 10 seconds, or the commit fails.
   - `/session` and `/help` only read. `/help` lists the phone's commands.
   - `/export` writes the journal to the desk's default path, the workspace and
     the journal's file name, exactly as `/export` with no argument does at the
-    desk. It is refused during a turn or while another desk job runs.
+    desk. It is refused during a turn or while another desk job runs. It runs
+    as the desk's own export job: the desk shows `Exporting the journal…` and
+    keeps working, and the phone's answer comes when the copy is done.
 - Git from the phone runs in the session's own workspace, which the hub takes
   from the session's registration, never from the phone. The hub fixes every
   argument: the phone names only the session, a path from the hub's own last
@@ -889,6 +945,18 @@ answered within those 10 seconds, or the commit fails.
 - The phone can't run any other slash command, `!` shell commands or `/goal`,
   edit files outside a session, push or open a pull request, or see sessions
   started with `--no-remote`.
+- What leaves the Mac and the tailnet: pushes to Expo
+  (`exp.host`), for phones that turned notifications on, and, with an `apns`
+  block in `hub.json`, Live Activity pushes straight to Apple
+  (`api.push.apple.com`, or `api.sandbox.push.apple.com` with `sandbox`), for
+  phones that turned the Live Activity on. Both carry no prompt, command, file
+  name, workspace, model or reply text (see [what is
+  sent](#push-notifications) and [the activity's
+  payload](#live-activity-dynamic-island)). Only a phone's own
+  `register_push`, `register_activity` and `clear_activity` change who
+  receives them, besides unpairing and `octet hub revoke`. Each is recorded in
+  `hub-audit.jsonl` (`push on`, `push off`, `activity registered`, `activity
+  cleared`).
 - Pairing codes, device tokens, push tokens, ActivityKit tokens, the APNs key
   and its JWT are never written to logs or journals.
 
