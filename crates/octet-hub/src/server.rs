@@ -1591,8 +1591,9 @@ impl Hub {
     }
 
     /// `conn`, of `device`, sent a `subscribe`: the app is in the foreground. The first time, the
-    /// Live Activity the hub started for the device ends, and the app drives it from now on. A
-    /// connection that only says hello or registers tokens (a background wake) never gets here.
+    /// news so far is spent; the Live Activity goes on, and the app drives it while it is in
+    /// front. A connection that only says hello or registers tokens (a background wake) never
+    /// gets here.
     fn streaming(&mut self, conn: u64, device: &Device) {
         let Some(state) = self.conns.get_mut(&conn) else {
             return;
@@ -1734,10 +1735,10 @@ impl Hub {
         self.sender.dispatch(batch, mac);
     }
 
-    /// Sends what each device's Live Activity is due, in the background: a start or an update to
-    /// a device with no connection streaming a session, an end to one whose app came back to the
-    /// foreground or whose sessions have all been idle long enough. Each send takes from the
-    /// allowance pushes use.
+    /// Sends what each device's Live Activity is due, in the background, while no connection of
+    /// the device streams a session: an update to its activity, a start when it has none, an end
+    /// once its sessions have all been idle long enough. Each send takes from the allowance
+    /// pushes use.
     fn flush_activity(&mut self) {
         let Some(activity) = self.activity.as_mut() else {
             return;
