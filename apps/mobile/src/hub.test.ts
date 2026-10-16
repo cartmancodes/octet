@@ -1082,6 +1082,24 @@ describe("unpair and push", () => {
     expect(n.unregisterForNotificationsAsync).not.toHaveBeenCalled();
   });
 
+  it("tells the Mac to forget the Live Activity's tokens too, first, so the hub has it before the goodbye's answer", async () => {
+    const r = await readyWithPush();
+    answer(r);
+    const socket = r.sockets.last;
+    await r.hub.unpair();
+    const types = socket.commands().map((c) => c.type);
+    const clear = types.lastIndexOf("clear_activity");
+    expect(clear).toBeGreaterThanOrEqual(0);
+    expect(clear).toBeLessThan(types.lastIndexOf("register_push"));
+    // Its answer, or a refusal, changes nothing: the goodbye ends on register_push's.
+    const sent = socket.commandsOf("clear_activity")[0];
+    socket.receive({ type: "refused", req: sent?.req, code: "invalid", reason: "no" });
+    answer(r, "Notifications off");
+    await settle();
+    expect(socket.closed).toBe(true);
+    expect(n.unregisterForNotificationsAsync).not.toHaveBeenCalled();
+  });
+
   it("closes the connection after 2 s if the Mac never answers, and drops the push registration", async () => {
     const r = await readyWithPush();
     answer(r);
@@ -1119,6 +1137,7 @@ describe("unpair and push", () => {
     await r.hub.unpair();
     await settle();
     expect(socket.commandsOf("register_push").filter((c) => c.token === null)).toHaveLength(0);
+    expect(socket.commandsOf("clear_activity")).toHaveLength(0);
     expect(r.hub.snapshot().status).toBe("unpaired");
     expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
   });

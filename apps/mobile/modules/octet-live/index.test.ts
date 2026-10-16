@@ -105,6 +105,11 @@ describe("events from the native side", () => {
   it("passes a lowercase hex token, or null for a token that is gone, and drops anything else", () => {
     expect(asTokenEvent({ token: "0a1b2c" })).toEqual({ token: "0a1b2c" });
     expect(asTokenEvent({ token: null })).toEqual({ token: null });
+    // Which activity it is: the token of one activity, or its end, never another's.
+    expect(asTokenEvent({ token: "0a1b2c", activity: "A1B2-C3" })).toEqual({ token: "0a1b2c", activity: "A1B2-C3" });
+    expect(asTokenEvent({ token: null, activity: "A1B2-C3" })).toEqual({ token: null, activity: "A1B2-C3" });
+    expect(asTokenEvent({ token: "0a1b2c", activity: 5 })).toEqual({ token: "0a1b2c" });
+    expect(asTokenEvent({ token: "0a1b2c", activity: "x".repeat(129) })).toEqual({ token: "0a1b2c" });
     for (const bad of [null, {}, { token: "" }, { token: "0A1B" }, { token: "xyz" }, { token: 5 }, { token: "a".repeat(201) }]) {
       expect(asTokenEvent(bad)).toBeNull();
     }

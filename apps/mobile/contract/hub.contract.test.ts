@@ -45,6 +45,8 @@ const PUSH_TOKEN = "ExponentPushToken[contract-test-token]";
 const SESSION_TEXT = "Claude Code · opus · ask mode · /work";
 /** The phone's push-to-start token, as ActivityKit gives it: lowercase hex. */
 const START_TOKEN = "5ab1e5".repeat(8);
+/** The token of the activity that start made, as ActivityKit hands it to the app. */
+const ACTIVITY_TOKEN = "ac71".repeat(16);
 const TEAM_ID = "ABCDE12345";
 const KEY_ID = "KEY1234567";
 /** The test key: a P-256 key that signs nothing real (its file says so above the PEM block). */
@@ -659,7 +661,7 @@ run("the app's hub client against the real octet hub", () => {
     expect(both).toMatchObject({ type: "ack", message: "Notifications on" });
   });
 
-  it("registers the Live Activity's start token; with the phone away, an approval starts it once, content-free; clear_activity", async () => {
+  it("registers the Live Activity's start token; with the phone away, an approval starts it once, content-free; a register-only hand-over of its token gets its updates and no end; clear_activity", async () => {
     // The body the app sends (src/activityModel.ts, as src/activity.ts sends it): only the push-to-start token, as before any
     // activity runs; a token left out is one the phone has not got.
     const body = activityRegistration({ token: null, start: START_TOKEN });
@@ -701,7 +703,7 @@ run("the app's hub client against the real octet hub", () => {
     }
     await sleep(3500);
     expect(apnsFake?.requests).toHaveLength(1);
-    // The token is in neither the hub's output nor its audit file; the registration is audited.
+    // The start token is in neither the hub's output nor its audit file; the registration is audited.
     expect(hubLog).not.toContain(START_TOKEN);
     const audit = readFileSync(path.join(root, "hub-audit.jsonl"), "utf8");
     expect(audit).not.toContain(START_TOKEN);
@@ -709,13 +711,44 @@ run("the app's hub client against the real octet hub", () => {
       "activity registered",
     );
 
-    // Back in the foreground, the phone turns the Live Activity off: the hub forgets the tokens.
+    // The app, woken in the background with that activity's token, hands it over as Fleet.handOver
+    // does: a connection of its own that says hello, registers, and closes, subscribing to nothing.
+    const handOver = new HubClient({ url: `ws://127.0.0.1:${port}/`, token: client?.token ?? null, factory: nodeSocketFactory(OWNER, sockets) });
+    handOver.start();
+    await until("the hand-over connection", () => handOver.state === "ready");
+    const both = activityRegistration({ token: ACTIVITY_TOKEN, start: START_TOKEN });
+    if (!both) throw new Error("no registration");
+    expect(await handOver.request(both)).toMatchObject({ type: "ack" });
+    handOver.stop();
+    // That connection was not the phone coming back: the approval is answered on the desk, and the
+    // hub updates the activity it started through the token it was handed, and ends nothing.
+    bridge?.send(bridgeState([]));
+    const updated = await until("the update to the handed-over token", () => apnsFake?.requests.find((r) => r.path === `/3/device/${ACTIVITY_TOKEN}`), 15_000);
+    const update = JSON.parse(updated.body) as { aps: Record<string, unknown> };
+    expect(update.aps.event).toBe("update");
+    expect(update.aps["content-state"]).toEqual({ kind: "done", session: sessionId, mac: "mac.test.ts.net", since: expect.any(Number), approvals: 0 });
+    expect(update.aps).not.toHaveProperty("alert");
+    for (const secret of ["/work", workspace, "opus", "claude", PHONE]) expect(updated.body).not.toContain(secret);
+    expect(hubLog).not.toContain(ACTIVITY_TOKEN);
+    await sleep(2500);
+    const sentTo = (apnsFake?.requests ?? []).map((r) => [r.path, (JSON.parse(r.body) as { aps: { event: string } }).aps.event]);
+    expect(sentTo).toEqual([
+      [`/3/device/${START_TOKEN}`, "start"],
+      [`/3/device/${ACTIVITY_TOKEN}`, "update"],
+    ]);
+
+    // The phone turns the Live Activity off (here on a register-only connection, so the streaming
+    // client's return below can't race it): the hub forgets the tokens and acks.
+    const off = new HubClient({ url: `ws://127.0.0.1:${port}/`, token: client?.token ?? null, factory: nodeSocketFactory(OWNER, sockets) });
+    off.start();
+    await until("the clearing connection", () => off.state === "ready");
+    expect(await off.request({ type: "clear_activity" })).toMatchObject({ type: "ack" });
+    off.stop();
+    // Back in the foreground, streaming again: with no token, nothing more goes to Apple.
     client?.start();
     await until("the client to be ready", () => client?.state === "ready");
-    const cleared = await client?.request({ type: "clear_activity" });
-    expect(cleared).toMatchObject({ type: "ack" });
     await sleep(1500);
-    expect(apnsFake?.requests).toHaveLength(1);
+    expect(apnsFake?.requests).toHaveLength(2);
   });
 
   it("is unpaired once the Mac revokes the phone", async () => {

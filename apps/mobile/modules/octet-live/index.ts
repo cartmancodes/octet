@@ -26,9 +26,12 @@ export interface DenyEvent {
   approval: string;
 }
 
-/** An ActivityKit token as lowercase hex, or null when the running activity's token is gone. */
+/** An ActivityKit token as lowercase hex, or null when the running activity's token is gone.
+ * `activity` is the id of the activity it is for, when the native side names it (a push-to-start
+ * token is for none). */
 export interface TokenEvent {
   token: string | null;
+  activity?: string;
 }
 
 /** What the widget shows for one session's waiting approval. */
@@ -84,13 +87,16 @@ export async function setEntries(entries: Record<string, WidgetEntry>): Promise<
 }
 
 const TOKEN = /^[0-9a-f]{1,200}$/;
+/** An activity's id is a UUID; anything longer is not one. */
+const ACTIVITY_ID_CHARS = 128;
 
 /** A token event from native, or null if it isn't one. */
 export function asTokenEvent(raw: unknown): TokenEvent | null {
   if (typeof raw !== "object" || raw === null) return null;
-  const { token } = raw as { token?: unknown };
-  if (token === null) return { token: null };
-  return typeof token === "string" && TOKEN.test(token) ? { token } : null;
+  const { token, activity } = raw as { token?: unknown; activity?: unknown };
+  const named = typeof activity === "string" && activity !== "" && activity.length <= ACTIVITY_ID_CHARS ? { activity } : {};
+  if (token === null) return { token: null, ...named };
+  return typeof token === "string" && TOKEN.test(token) ? { token, ...named } : null;
 }
 
 /** A deny event from native, or null if it isn't one. */

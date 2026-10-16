@@ -9,8 +9,8 @@ import { createContext, useContext } from "react";
 import * as octetLive from "../modules/octet-live";
 import type { ActivityState, DenyEvent, Subscription, TokenEvent, WidgetEntry } from "../modules/octet-live";
 import { ActivityModel, IDLE_END_MS, activityRegistration, rowsOf, widgetEntries, type ActivityTokens } from "./activityModel";
-import { Refusal, type HubClient } from "./client/HubClient";
-import { macOfKey, splitKey, type Links } from "./macs";
+import { Refusal, type HubClient, type RequestBody } from "./client/HubClient";
+import { hostKey, macOfKey, splitKey, type Links } from "./macs";
 import { parseApprovalId } from "./navigation";
 import { loadSettings, saveSettings } from "./persist";
 import { sendTo, sendVia } from "./sendVia";
@@ -30,6 +30,7 @@ export {
   type ActivityTokens,
   type Lead,
 } from "./activityModel";
+export { HAND_OVER_MS } from "./fleet/fleet";
 
 /** The least time between two changes the app makes to the activity. */
 export const DRIVE_GAP_MS = 1_000;
@@ -70,6 +71,9 @@ export interface ActivityFleet {
   subscribe(fn: () => void): () => void;
   readonly links: Links;
   keyFor(host: string | null, raw: string): string | null;
+  /** Sends `body` to Macs `macs` over register-only connections of their own (the app in the
+   * background); resolves to the Macs that acked. */
+  handOver(macs: readonly string[], body: RequestBody): Promise<string[]>;
 }
 
 export interface LiveActivityOptions {
@@ -99,9 +103,19 @@ const stateKey = (s: ActivityState): string => `${s.kind}\n${s.session}\n${s.mac
  * activity again after each write so the widget reads them anew. Answers each Deny once, to the Mac
  * its host names. Turned off, it ends the activity, tells every Mac to forget the tokens and
  * empties the entries.
+ *
+ * One activity, two drivers: an activity that is already there (the hub started it while the phone
+ * was away) is adopted as soon as ActivityKit hands over its token, and driven from then on, done
+ * or not. A token that comes while the app is in the background is handed to each Mac over a
+ * register-only connection (`Fleet.handOver`), so the hub can update that activity. One the user
+ * dismissed is not started again until what it would show changes. Whether the phone has Live
+ * Activities (`isSupported()`, which the user can change in the phone's settings) is asked again at
+ * each foreground: gone, every Mac forgets the tokens and the entries empty, as with the switch off.
  */
 export class LiveActivity {
-  readonly supported: boolean;
+  private supportedNow: boolean;
+  /** Following the store, the Fleet and the native events: from the first time it is supported. */
+  private attached = false;
   private readonly api: LiveApi;
   private readonly fleet: ActivityFleet;
   private readonly store: OctetStore;
@@ -117,6 +131,11 @@ export class LiveActivity {
 
   /** Whether an activity the app started (or took over) may still run. */
   private live = false;
+  /** The last activity known ended or was dismissed, and none is live since: it is not started
+   * again for nothing (coming back to the app, the entries written again), only for a change. */
+  private dismissed = false;
+  /** Each live activity's push token, by its id ("" for an event that names none), the newest last. */
+  private readonly activities = new Map<string, string>();
   /** What the activity was last given, or tried with. */
   private sent: string | null = null;
   private lastAt = -Infinity;
@@ -157,7 +176,12 @@ export class LiveActivity {
         const id = setTimeout(fn, ms);
         return () => clearTimeout(id);
       });
-    this.supported = api.isSupported();
+    this.supportedNow = api.isSupported();
+  }
+
+  /** Whether the phone has Live Activities, as last asked (at the start and each foreground). */
+  get supported(): boolean {
+    return this.supportedNow;
   }
 
   /** The switch, as saved; on until the setting is read. */
@@ -165,10 +189,16 @@ export class LiveActivity {
     return this.on ?? true;
   }
 
-  /** Starts following the store, the Fleet and the native events. Nothing where unsupported. */
+  /** Starts following the store, the Fleet and the native events; where unsupported, nothing, until
+   * a foreground finds it supported. */
   start(): void {
-    if (!this.supported || !this.stopped) return;
+    if (!this.stopped) return;
     this.stopped = false;
+    if (this.supportedNow) this.attach();
+  }
+
+  private attach(): void {
+    this.attached = true;
     this.macs = this.fleet.snapshot().macs;
     this.model.observe(rowsOf(this.store.getState().sessions), this.now());
     this.offs = [
@@ -177,12 +207,18 @@ export class LiveActivity {
     ];
     const subscriptions = [
       this.api.addPushToStartTokenListener((e) => this.startToken(e.token)),
-      this.api.addPushTokenListener((e) => this.activityToken(e.token)),
+      this.api.addPushTokenListener((e) => this.activityToken(e)),
       this.api.addDenyListener((e) => this.deny(e)),
     ];
     this.offs.push(() => {
       for (const s of subscriptions) s.remove();
     });
+    if (this.on !== null) {
+      this.syncAll();
+      this.writeEntries();
+      this.drive(true);
+      return;
+    }
     void loadSettings().then((s) => {
       if (this.stopped || this.on !== null) return;
       this.on = s.liveActivity;
@@ -195,6 +231,7 @@ export class LiveActivity {
 
   stop(): void {
     this.stopped = true;
+    this.attached = false;
     for (const off of this.offs) off();
     this.offs = [];
     this.cancelTimers();
@@ -204,8 +241,37 @@ export class LiveActivity {
    * (the hub drives it while the phone is away). */
   setForeground(active: boolean): void {
     this.foreground = active;
-    if (active) this.drive(true);
-    else this.cancelTimers();
+    if (!active) {
+      this.cancelTimers();
+      return;
+    }
+    const supported = this.api.isSupported();
+    if (supported !== this.supportedNow && !this.stopped) this.supportChanged(supported);
+    this.drive(true);
+  }
+
+  /** Live Activities came or went in the phone's settings. Gone: as with the switch off, every Mac
+   * is told to forget the tokens, then the App Group empties. Back: registered again. */
+  private supportChanged(supported: boolean): void {
+    this.supportedNow = supported;
+    if (!this.attached) {
+      if (supported) this.attach();
+      return;
+    }
+    this.told = new WeakMap();
+    this.telling = new WeakMap();
+    this.cleared = new WeakSet();
+    this.entries = null;
+    if (!supported) {
+      this.cancelTimers();
+      this.live = false;
+      this.sent = null;
+      this.syncAll();
+      if (this.on === true) void this.api.setEntries({}).catch(() => undefined);
+      return;
+    }
+    this.syncAll();
+    this.writeEntries();
   }
 
   /** Turns the Live Activity on or off, saved first. Off: the activity ends, every Mac is told to
@@ -214,7 +280,7 @@ export class LiveActivity {
   async setEnabled(on: boolean): Promise<boolean> {
     if (!(await saveSettings({ liveActivity: on }))) return false;
     this.on = on;
-    if (!this.supported || this.stopped) return true;
+    if (!this.attached || this.stopped) return true;
     if (!on) {
       this.cancelTimers();
       this.live = false;
@@ -236,9 +302,15 @@ export class LiveActivity {
 
   // What the activity shows
 
-  /** On, read, started and in the foreground. */
+  /** Whether the activity is wanted: the switch on and the phone supporting it; null until the
+   * setting is read. */
+  private wanted(): boolean | null {
+    return this.on === null ? null : this.on && this.supportedNow;
+  }
+
+  /** Wanted, started and in the foreground. */
   private driving(): boolean {
-    return this.supported && this.on === true && this.foreground && !this.stopped;
+    return this.wanted() === true && this.attached && this.foreground && !this.stopped;
   }
 
   private hostOf = (mac: string): string | null => this.macs.find((m) => m.id === mac)?.host ?? null;
@@ -281,7 +353,9 @@ export class LiveActivity {
     const now = this.now();
     const state = this.stateNow();
     const key = stateKey(state);
-    const changed = key !== this.sent || this.force;
+    // Forced (coming back, the entries written again) shows a live activity again, but starts no
+    // new one over one the user dismissed: only a change does.
+    const changed = key !== this.sent || (this.force && (this.live || !this.dismissed));
     let call: "start" | "update" | "end" | null = null;
     if (state.kind === "done") {
       const idle = this.model.idleSince() ?? now;
@@ -306,6 +380,7 @@ export class LiveActivity {
       if (call === "start") {
         await this.api.start(state);
         this.live = true;
+        this.dismissed = false;
         // Switched off while it was starting: the end went first, so this one ends now.
         if (this.on === false) {
           this.live = false;
@@ -369,7 +444,7 @@ export class LiveActivity {
 
   /** Writes the entries when they changed, then shows the activity again. */
   private writeEntries(): void {
-    if (!this.supported || this.on !== true || this.stopped) return;
+    if (this.wanted() !== true || !this.attached || this.stopped) return;
     const entries = widgetEntries(this.store.getState().sessions, this.hostOf);
     const text = JSON.stringify(entries);
     if (text === this.entries) return;
@@ -390,15 +465,59 @@ export class LiveActivity {
     this.syncAll();
   }
 
-  private activityToken(token: string | null): void {
+  /** A live activity's token, or its end. The token registered is the newest live activity's: the
+   * end of another (older, or already over) leaves it. A token means an activity is live, whoever
+   * started it: it is adopted and driven from now on. */
+  private activityToken({ token, activity = "" }: TokenEvent): void {
     if (token === null) {
-      // That activity ended (or was dismissed): the next change starts one, not this one.
-      this.live = false;
-      if (this.driving()) this.sent = stateKey(this.stateNow());
+      this.activities.delete(activity);
+      if (this.activities.size === 0) {
+        // The last one ended (or was dismissed): the next change starts one, not this one.
+        this.live = false;
+        this.dismissed = true;
+        if (this.driving()) this.sent = stateKey(this.stateNow());
+      }
+    } else {
+      this.activities.delete(activity);
+      this.activities.set(activity, token);
+      this.live = true;
+      this.dismissed = false;
+      this.drive(true);
     }
-    if (token === this.tokens.token) return;
-    this.tokens = { ...this.tokens, token };
+    const newest = [...this.activities.values()].at(-1) ?? null;
+    if (newest === this.tokens.token) return;
+    this.tokens = { ...this.tokens, token: newest };
     this.syncAll();
+    if (newest !== null && !this.foreground) this.handOver();
+  }
+
+  /** In the background every link is closed: the new token goes to each Mac that lacks it over a
+   * register-only connection, so the hub can update the activity while the phone is away. This
+   * needs iOS to give the app time in the background for the token; without it the Mac gets the
+   * token on the next foreground. */
+  private handOver(): void {
+    if (this.wanted() !== true || this.stopped) return;
+    const body = activityRegistration(this.tokens);
+    if (body === null) return;
+    const said = JSON.stringify(body);
+    const macs = this.fleet.links.macs().filter((mac) => {
+      const client = this.fleet.links.client(mac);
+      return client !== null && this.told.get(client) !== said && this.telling.get(client) !== said;
+    });
+    if (macs.length === 0) return;
+    for (const mac of macs) {
+      const client = this.fleet.links.client(mac);
+      if (client) this.telling.set(client, said);
+    }
+    void this.fleet.handOver(macs, body).then((acked) => {
+      for (const mac of macs) {
+        const client = this.fleet.links.client(mac);
+        if (!client || this.telling.get(client) !== said) continue;
+        this.telling.delete(client);
+        if (acked.includes(mac)) this.told.set(client, said);
+        else this.sync(mac); // back in the foreground meanwhile: over the link
+      }
+    });
   }
 
   private syncAll(): void {
@@ -409,9 +528,10 @@ export class LiveActivity {
    * it has them already or they are on their way. */
   private sync(mac: string): void {
     const client = this.fleet.links.client(mac);
-    if (!client || client.state !== "ready" || this.stopped) return;
-    if (this.on === null) return; // the setting is not read yet
-    if (!this.on) {
+    if (!client || client.state !== "ready" || this.stopped || !this.attached) return;
+    const wanted = this.wanted();
+    if (wanted === null) return; // the setting is not read yet
+    if (!wanted) {
       if (this.cleared.has(client)) return;
       this.cleared.add(client);
       sendTo(this.fleet.links, mac, { type: "clear_activity" }).catch(() => {
@@ -445,7 +565,7 @@ export class LiveActivity {
     }
     const approval = parseApprovalId(event.approval);
     if (approval === null) return;
-    const mark = `${event.mac}\n${event.session}\n${approval}`;
+    const mark = `${hostKey(event.mac)}\n${event.session}\n${approval}`;
     if (this.denied.includes(mark)) return;
     this.denied.push(mark);
     if (this.denied.length > DENIES_SEEN) this.denied.shift();

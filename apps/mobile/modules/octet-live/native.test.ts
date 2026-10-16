@@ -224,9 +224,15 @@ describe("what the native side keeps, and how", () => {
     expect(hear).not.toContain("lock.unlock()\n");
   });
 
+  it("names the activity in every pushToken event, so an old activity's end never clears the live one's token", () => {
+    const sends = [...moduleSwift.matchAll(/sendEvent\("pushToken", (\[[^\]]*\])\)/g)].map((m) => m[1]);
+    expect(sends.length).toBe(3);
+    for (const payload of sends) expect(payload).toMatch(/"activity": activity\.id\]$/);
+  });
+
   it("watches only a live activity, stops on cancel, and forgets each task when its loop ends", () => {
     const watch = block(moduleSwift, /private func watch\(_ activity: Activity<OctetActivity>\)/);
-    expect(watch).toMatch(/guard activity\.activityState == \.active \|\| activity\.activityState == \.stale else \{\s*sendEvent\("pushToken", \["token": nil\]\)/);
+    expect(watch).toMatch(/guard activity\.activityState == \.active \|\| activity\.activityState == \.stale else \{\s*sendEvent\("pushToken", \["token": nil, "activity": activity\.id\]\)/);
     for (const loop of moduleSwift.matchAll(/for await [^\n]*\{\n([^\n]*)/g)) {
       expect(loop[1]).toMatch(/if Task\.isCancelled \{ break \}/);
     }

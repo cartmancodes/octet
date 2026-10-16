@@ -2,7 +2,7 @@
 // and notifications do to them.
 import { Platform } from "react-native";
 
-import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from "../client/HubClient";
+import { HubClient, Refusal, type HubClientOptions, type RequestBody, type SocketFactory } from "../client/HubClient";
 import { NOT_A_LINK, isHubUrl, pairLinkProblem, parsePairLink } from "../client/link";
 import { webSocketFactory } from "../client/socket";
 import { DEFAULT_PUSH_KINDS, NOT_SAVED, loadSettings, readSettings, updateSettings, type Settings } from "../persist";
@@ -18,6 +18,9 @@ import { MacLink, UNREACHABLE, type LinkHost, type MacInfo, type PushResult } fr
 export { NOT_A_LINK };
 /** How long an approve link waits for its Mac's list before it gives up (and the Inbox stays). */
 export const APPROVE_WAIT_MS = 8_000;
+/** How long a hand-over connection (`Fleet.handOver`) stays open, at most: well inside the time iOS
+ * gives an app woken in the background. */
+export const HAND_OVER_MS = 10_000;
 /** The Mac revoked this phone: only that pairing goes. */
 export const unpairedNotice = (macName: string): string => `This phone was unpaired on ${macName}`;
 export const UNPAIR_FAILED_NOTICE = "This phone couldn't delete its pairing. Pair again to replace it.";
@@ -578,7 +581,7 @@ export class Fleet {
   /**
    * The key of the session whose approval an approve link (the Island's Allow) names, now: the
    * link's session on its Mac, by `keyFor`, only while that Mac lists it as live with that approval
-   * waiting (its row's first, or one its stream holds); null for the Inbox; undefined while that
+   * at the front of its waiting ones; null for the Inbox; undefined while that
    * Mac has not listed yet (see `approveKey`). Nothing is sent either way: the session's screen
    * answers it, behind Face ID and the arm.
    */
@@ -590,9 +593,9 @@ export class Fleet {
     if (hasEnded(state, key)) return null;
     if (!state.listed.has(mac)) return undefined; // not told yet
     const row = state.sessions.find((s) => s.id === key);
-    if (!row || row.approvals === 0) return null;
-    const open = row.approval?.id === link.approval || (state.bySession.get(key)?.approvals ?? []).some((a) => a.id === link.approval);
-    return open ? key : null;
+    // Only the session's front approval: that is the one its Permission card shows, so the screen
+    // the link opens is the approval it names. One waiting behind it is the Inbox's.
+    return row && row.approvals > 0 && row.approval?.id === link.approval ? key : null;
   }
 
   /** `approveNow`, waiting for the Mac's list when it has not come yet, at most `APPROVE_WAIT_MS`
@@ -617,6 +620,49 @@ export class Fleet {
       });
       cancel = this.schedule(() => finish(null), APPROVE_WAIT_MS);
     });
+  }
+
+  /**
+   * Sends `body` to each of Macs `macs` over a connection of its own, made for it alone: hello,
+   * `body`, then closed, once the Mac answers or after `HAND_OVER_MS`. It subscribes to nothing, so
+   * the hub does not count it as the phone being back, and it feeds nothing to the store. For the
+   * app in the background (its links are closed), such as handing the hub a Live Activity's new
+   * token. Resolves to the Macs that acked.
+   */
+  async handOver(macs: readonly string[], body: RequestBody): Promise<string[]> {
+    const targets = this.all.filter((link) => macs.includes(link.id) && link.client.token !== null);
+    const results = await Promise.all(
+      targets.map(
+        (link) =>
+          new Promise<string | null>((resolve) => {
+            const client = new HubClient({ ...this.clientOptions, url: link.pairing.hubUrl, token: link.client.token, factory: this.factory });
+            let done = false;
+            let asked = false;
+            let cancel = () => {};
+            let off = () => {};
+            const finish = (acked: boolean) => {
+              if (done) return;
+              done = true;
+              cancel();
+              off();
+              client.stop();
+              resolve(acked && !link.gone ? link.id : null);
+            };
+            off = client.onState((state) => {
+              if (state === "unpaired") finish(false);
+              if (state !== "ready" || asked) return;
+              asked = true;
+              client.request(body).then(
+                () => finish(true),
+                () => finish(false),
+              );
+            });
+            cancel = this.schedule(() => finish(false), HAND_OVER_MS);
+            client.start();
+          }),
+      ),
+    );
+    return results.filter((mac): mac is string => mac !== null);
   }
 
   /** The user dismissed the notice the Inbox shows (a Mac that unpaired this phone, an unpair

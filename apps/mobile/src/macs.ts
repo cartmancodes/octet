@@ -74,8 +74,11 @@ export function hostOf(url: string | null | undefined): string | null {
   return HOST.exec(url ?? "")?.[1] ?? null;
 }
 
+/** A host as it compares: without case or a trailing dot. */
+export const hostKey = (host: string): string => host.replace(/\.$/, "").toLowerCase();
+
 /** Whether two hosts are the same, without case or a trailing dot. */
-export const sameHost = (a: string, b: string): boolean => a.replace(/\.$/, "").toLowerCase() === b.replace(/\.$/, "").toLowerCase();
+export const sameHost = (a: string, b: string): boolean => hostKey(a) === hostKey(b);
 
 /** The pairing whose hub host is `host`, compared without case; null when none is. */
 export function macOfHost(pairings: readonly Pick<Pairing, "id" | "hubUrl">[], host: string): string | null {

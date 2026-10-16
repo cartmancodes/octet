@@ -34,9 +34,10 @@ export class FakeLive implements LiveApi {
   addPushToStartTokenListener = (fn: (e: TokenEvent) => void): Subscription => add(this.starts, fn);
   addDenyListener = (fn: (e: DenyEvent) => void): Subscription => add(this.denies, fn);
 
-  /** ActivityKit hands over a running activity's token, or says it ended (null). */
-  pushToken(token: string | null): void {
-    for (const fn of [...this.tokens]) fn({ token });
+  /** ActivityKit hands over a running activity's token, or says it ended (null); `activity` is
+   * its id, which the native module names. */
+  pushToken(token: string | null, activity?: string): void {
+    for (const fn of [...this.tokens]) fn(activity === undefined ? { token } : { token, activity });
   }
   /** ActivityKit hands over the push-to-start token. */
   pushToStartToken(token: string): void {

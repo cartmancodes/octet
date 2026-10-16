@@ -28,8 +28,13 @@ Claude Code and Codex CLIs.
   arm, and a forged or stale link opens the Inbox. **Settings › Live
   Activity** (on by default) turns it all off. An approval that starts the
   activity while you are away brings two alerts, the push and the activity's.
-  The Swift is unverified until the first device build. The contract test
-  checks one content-free start at a local stand-in for APNs.
+  There is one activity with two drivers: the app takes over an activity the
+  hub started, and hands a new activity token to each Mac from the
+  background over a register-only connection (if iOS gives it the time), so
+  the hub can update it. Unpairing a Mac clears its tokens there. The Swift is
+  unverified until the first device build. The contract test checks one
+  content-free start, then an update to the handed-over token and no end, at
+  a local stand-in for APNs.
 - The phone app pairs with up to 4 Macs. Each pairing keeps its token in its
   own keychain entry, the one pairing of an earlier version moves over on
   first launch, and every Mac stays connected while the app is open. The

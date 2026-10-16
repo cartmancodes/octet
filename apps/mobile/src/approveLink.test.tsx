@@ -235,9 +235,10 @@ describe("approve_link_never_allows_alone", () => {
     ["forged", "octet://approve/garbage"],
     ["for an unknown Mac", link("evil.example.com", S, 3)],
     ["stale: its approval was answered", link(HOST, S, 9)],
-    ["for a session that ended", link(HOST, "4822-1790000000", 3)],
+    ["for a session its Mac doesn't list", link(HOST, "4822-1790000000", 3)],
+    ["for an approval that waits behind the front one", link(HOST, "4824-1790000000", 4)],
   ])("a link %s opens the Inbox and sends nothing", async (_what, url) => {
-    const rig = await launch([waiting(), info("4823-1790000000")]);
+    const rig = await launch([waiting(), info("4823-1790000000"), info("4824-1790000000", { approvals: 2, approval: { id: 3, summary } })]);
     await act(async () => router.push("/settings"));
     expect(rig.view.getPathname()).toBe("/settings");
     await open(url);
@@ -245,6 +246,35 @@ describe("approve_link_never_allows_alone", () => {
     expect(rig.view.getPathname()).toBe("/");
     expect(answers(rig)).toEqual([]);
     expect(rig.sockets.last.commandsOf("subscribe")).toEqual([]);
+  });
+
+  it("a link for an approval behind the front one opens the Inbox, even with the stream holding it", async () => {
+    const rig = await launch([info(S, { approvals: 2, approval: { id: 3, summary } })]);
+    await open(link(HOST, S, 3));
+    expect(rig.view.getPathname()).toBe(`/session/${k(S)}`);
+    await feed(rig, subscribed(), ev({ type: "approval", data: { id: 3, detail: "", summary } }), ev({ type: "approval", data: { id: 4, detail: "", summary } }));
+    expect(octetStore.getState().bySession.get(k(S))?.approvals.map((a) => a.id)).toEqual([3, 4]);
+    await act(async () => router.push("/settings"));
+    await open(link(HOST, S, 4));
+    await wait(10_000);
+    expect(rig.view.getPathname()).toBe("/");
+    expect(answers(rig)).toEqual([]);
+  });
+
+  it("a link for a session that ended (its view kept, marked ended) opens the Inbox", async () => {
+    const rig = await launch([waiting()]);
+    await open(link(HOST, S, 3));
+    expect(rig.view.getPathname()).toBe(`/session/${k(S)}`);
+    await feed(rig, subscribed());
+    await feed(rig, { type: "sessions", sessions: [] }); // the session ended
+    expect(octetStore.getState().bySession.get(k(S))?.ended).toBe(true);
+    await act(async () => router.push("/settings"));
+    const before = rig.sockets.last.commandsOf("subscribe").length;
+    await open(link(HOST, S, 3));
+    await wait(10_000);
+    expect(rig.view.getPathname()).toBe("/");
+    expect(answers(rig)).toEqual([]);
+    expect(rig.sockets.last.commandsOf("subscribe")).toHaveLength(before);
   });
 
   it("a session with nothing waiting opens the Inbox", async () => {

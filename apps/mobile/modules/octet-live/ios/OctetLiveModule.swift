@@ -172,19 +172,20 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
     }
   }
 
-  /// Reports a live activity's push token as it changes, and null once it is over. An activity that
+  /// Reports a live activity's push token as it changes, and null once it is over, each naming the
+  /// activity (its `id`), so the app never takes one activity's end for another's. An activity that
   /// has already ended gets its null at once and no watching.
   @available(iOS 17.2, *)
   private func watch(_ activity: Activity<OctetActivity>) {
     guard activity.activityState == .active || activity.activityState == .stale else {
-      sendEvent("pushToken", ["token": nil])
+      sendEvent("pushToken", ["token": nil, "activity": activity.id])
       return
     }
     track("token:" + activity.id) { key, id in
       Task { [weak self] in
         for await data in activity.pushTokenUpdates {
           if Task.isCancelled { break }
-          self?.sendEvent("pushToken", ["token": hex(data)])
+          self?.sendEvent("pushToken", ["token": hex(data), "activity": activity.id])
         }
         self?.forget(key, id)
       }
@@ -194,7 +195,7 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
         for await state in activity.activityStateUpdates {
           if Task.isCancelled { break }
           if state == .ended || state == .dismissed {
-            self?.sendEvent("pushToken", ["token": nil])
+            self?.sendEvent("pushToken", ["token": nil, "activity": activity.id])
             break
           }
         }

@@ -10,6 +10,7 @@ export { MacLink, type MacInfo, type PushResult } from "./fleet/macLink";
 export {
   APPROVE_WAIT_MS,
   Fleet,
+  HAND_OVER_MS,
   NOT_A_LINK,
   UNPAIR_FAILED_NOTICE,
   unpairedNotice,

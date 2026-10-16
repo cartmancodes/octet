@@ -4,6 +4,7 @@
 // no native module, no storage (src/activity.ts drives it).
 import { entryKey, type ActivityKind, type WidgetEntry } from "../modules/octet-live";
 import type { RequestBody } from "./client/HubClient";
+import { isSessionId } from "./macs";
 import { foldCommand } from "./model/command";
 import { field } from "./model/text";
 import { sessionName } from "./sessions";
@@ -164,7 +165,7 @@ const newestFirst = (a: ListedSession, b: ListedSession): number =>
  * `NAME_CHARS`), what the approval runs (its command, folded so no line of it hides below blank
  * ones, else its action; at most `COMMAND_CHARS`) and the approval's id. Each value is cleaned of
  * control characters. Newest first, at most `ENTRIES_LIMIT`, within `ENTRIES_BYTES` of JSON. A
- * session whose Mac has no host (`hostOf` null) is left out.
+ * session whose Mac has no host (`hostOf` null), or whose raw id is not a session id, is left out.
  */
 export function widgetEntries(sessions: readonly ListedSession[], hostOf: (mac: string) => string | null): Record<string, WidgetEntry> {
   const out: Record<string, WidgetEntry> = {};
@@ -173,7 +174,8 @@ export function widgetEntries(sessions: readonly ListedSession[], hostOf: (mac: 
   for (const s of sessions.filter((x) => x.approvals > 0 && x.approval).sort(newestFirst)) {
     if (count >= ENTRIES_LIMIT) break;
     const host = hostOf(s.mac);
-    if (host === null || !s.approval) continue;
+    // A key the widget could never be shown (an id not of the hub's shape) is not kept.
+    if (host === null || !s.approval || !isSessionId(s.raw)) continue;
     const { id, summary } = s.approval;
     const key = entryKey(host, s.raw);
     const entry: WidgetEntry = {

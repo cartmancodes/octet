@@ -115,10 +115,14 @@ export class MacLink {
     for (const done of [...this.waiters]) done(false);
   }
 
-  /** Stops the client, but first, on a ready link, tells the Mac "notifications off" and keeps
-   * the link until the Mac answers or refuses, or `GOODBYE_MS` pass. Nothing waits on it. If the
-   * Mac did not ack it and `dropRegistration` (no other Mac pushes to this phone), the phone drops
-   * its push registration instead, so that the Mac's pushes bounce and it forgets the token. */
+  /** Stops the client, but first, on a ready link, tells the Mac to forget this phone's Live
+   * Activity tokens (`clear_activity`, so it neither starts nor updates an activity for a Mac the
+   * phone no longer has) and "notifications off", and keeps the link until the Mac answers the
+   * second or refuses it, or `GOODBYE_MS` pass. The hub answers in order, so an answer to the
+   * second comes after the first was handled; the first's own answer, or refusal, changes nothing.
+   * Nothing waits on it. If the Mac did not ack "notifications off" and `dropRegistration` (no
+   * other Mac pushes to this phone), the phone drops its push registration instead, so that the
+   * Mac's pushes bounce and it forgets the token. */
   goodbye(dropRegistration: boolean): void {
     const { client } = this;
     if (client.state !== "ready") {
@@ -136,6 +140,7 @@ export class MacLink {
       if (!heard && dropRegistration) void dropPushRegistration();
     };
     cancel = this.host.schedule(() => finish(false), GOODBYE_MS);
+    client.request({ type: "clear_activity" }).catch(() => undefined);
     client.request({ type: "register_push", token: null }).then(
       () => finish(true),
       () => finish(false),

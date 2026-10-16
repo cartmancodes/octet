@@ -492,10 +492,13 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
 
 On an iPhone with iOS 17.2 or later, a Live Activity in the Dynamic Island and on the Lock Screen
 shows whether a session is running, waiting for approval, or done, and for how long. The app runs
-on iOS 16.4 and later, but below 17.2 it has no Live Activity. While the app is open, the app keeps
-the activity up to date itself. While it isn't, the hub starts, updates and ends the activity
-through Apple's push service (APNs), and for that it needs your APNs key. Without one the activity
-shows only while the app is open, and the hub sends Apple nothing.
+on iOS 16.4 and later, but below 17.2 it has no Live Activity.
+
+There is one activity, with two drivers. While the app is open, the app keeps it up to date
+itself. While it isn't, the hub starts, updates and ends that same activity through Apple's push
+service (APNs), and for that it needs your APNs key. When you come back and open a session, the app
+takes the activity over where it is, whoever started it. Without a key the activity shows only while
+the app is open, and the hub sends Apple nothing.
 
 **Set up APNs** (once, with your own Apple developer account; nothing here makes one):
 
@@ -560,9 +563,13 @@ shows only while the app is open, and the hub sends Apple nothing.
   journal or the audit file.
 
 **When.** The hub starts the activity when an approval waits or a turn starts while the phone has
-no connection streaming a session (the app is closed or in the background); updates it when what it
-shows changes, at most once every 2 seconds; and ends it 5 minutes after every session went idle,
-or when the app opens a session again (from then on the app drives it). These sends share the
+no connection streaming a session (the app is closed or in the background) and the hub holds no
+token of a live activity for it. While the phone is away the hub updates the activity through its
+registered token when what it shows changes, at most once every 2 seconds, and ends it 5 minutes
+after every session went idle. Opening a session in the app ends nothing: the app takes the same
+activity over. The hub can update an activity only once its token has reached it. For an activity
+the hub just started, that token reaches the hub only if iOS wakes the app in the background with it
+(see **Tokens**); until then the hub can start and end that activity but not update it. These sends share the
 pushes' limit of six a minute per phone, and always leave room for an approval's push. Apple
 answering that a token is gone (410) drops that token; any other failure is logged, without the
 token, and not retried in a loop.
@@ -573,8 +580,15 @@ activity's own start alert, which Apple requires to start one by push. That is e
 
 **Tokens.** The app gives each paired Mac its ActivityKit tokens (`register_activity`) over its own
 connection, whenever they change: the push-to-start token, and the running activity's own token.
-The hub keeps them per phone in `devices.json`, records `activity registered` (or `activity cleared`)
-with the phone's name in `hub-audit.jsonl`, never the token, and drops them on `octet hub revoke`.
+When a new activity token comes while the app is in the background (an activity the hub started),
+the app hands it over at once: it opens a short connection to each Mac that only says hello,
+registers the token and closes, once the Mac answers or after 10 seconds, subscribing to nothing, so
+the hub doesn't take it for the phone coming back. This relies on iOS giving the app time in the
+background when the activity's token arrives. If iOS doesn't, the hub can only start and end that
+activity, not update it, until you open the app. The hub keeps the tokens per phone in
+`devices.json`, records `activity registered` (or `activity cleared`) with the phone's name in
+`hub-audit.jsonl`, never the token, and drops them on `octet hub revoke` and when you unpair that
+Mac in the app.
 
 **Deny and Allow on the Island.** While an approval waits, the expanded activity shows it with
 **Deny** and **Allow**.
@@ -584,8 +598,10 @@ with the phone's name in `hub-audit.jsonl`, never the token, and drops them on `
   minutes). A Deny that names no paired Mac sends nothing.
 - **Allow** only opens the app (`octet://approve/<host>/<session>/<approval>`), at that approval in
   its session, where Allow asks for Face ID and waits out its short arm as always. The link allows
-  nothing by itself. A link for a Mac that isn't paired, a session that ended, or an approval that
-  was already answered, or one that is malformed, opens the Inbox and sends nothing.
+  nothing by itself. It opens the session only while the approval it names is the one at the front
+  of that session's waiting approvals (the one its Permission card shows). A link for a Mac that
+  isn't paired, a session that ended, an approval that was already answered or that waits behind
+  another, or one that is malformed, opens the Inbox and sends nothing.
 
 **On the phone.** The widget shows a session's name (at most 80 characters) and the command it
 asks to run (at most 200) from the app's shared storage on the phone (the App Group
@@ -595,7 +611,8 @@ Screen. Nothing of them leaves the phone.
 
 **Turn it off.** In the app, **Settings › Live Activity**: the activity ends, every Mac is told to
 forget the phone's tokens (`clear_activity`; a Mac out of reach is told on its next connection), and
-the widget's names are cleared. To stop every phone's activity pushes, remove the `apns` block from
+the widget's names are cleared. Turning Live Activities off for Octet in the phone's own settings
+does the same the next time you open the app; turning them back on registers again. To stop every phone's activity pushes, remove the `apns` block from
 `hub.json` and restart the hub.
 
 **Not yet tested on a phone.** The Swift code (the app's Live Activity module and the widget) has
@@ -678,11 +695,14 @@ phone already has (the same host) replaces its pairing and keeps its name. A
   A hub that isn't published sends no `mac`; with one Mac paired the tap still
   opens its session.
 - **Unpairing a Mac that can't be reached.** Unpairing tells that Mac
-  "notifications off" when it can. A Mac that is asleep or away when you
+  "notifications off" when it can, and to forget the phone's Live Activity
+  tokens (`clear_activity`), so it starts and updates no more activities on
+  the phone. A Mac that is asleep or away when you
   unpair it doesn't hear that, and since the phone's push token is the same
   for all your Macs, the phone can't make the token stop working without
   stopping every Mac's pushes. That Mac keeps pushing until you run
-  `octet hub revoke "NAME"` on it (`octet hub devices` lists the names). The
+  `octet hub revoke "NAME"` on it (`octet hub devices` lists the names), and
+  keeps its Live Activity tokens until then too. The
   app ignores those pushes' sessions (their host matches no pairing, so a tap
   only opens the Inbox), but they still show. Unpairing the last Mac also
   turns the phone's push registration off when that Mac doesn't answer, or

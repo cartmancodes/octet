@@ -10,6 +10,7 @@ import {
   COMMAND_CHARS,
   DRIVE_GAP_MS,
   ENTRIES_BYTES,
+  HAND_OVER_MS,
   ENTRIES_LIMIT,
   IDLE_END_MS,
   LiveActivity,
@@ -482,5 +483,192 @@ describe("the switch", () => {
     await r.advance(5 * DRIVE_GAP_MS);
     expect(r.api.shown()).toEqual([]);
     expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([]);
+  });
+});
+
+describe("the activity that is already there (one activity, two drivers)", () => {
+  it("adopts a live activity while every session is idle: it is updated, then ended 5 minutes on", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    await r.list(STUDIO_HOST, [info(A)]);
+    await r.advance(DRIVE_GAP_MS);
+    expect(r.api.shown()).toEqual([]); // nothing runs or waits: the app starts nothing
+    r.api.pushToken("cd34", "hub-started"); // the hub started one while the phone was away
+    await r.advance(DRIVE_GAP_MS);
+    expect(r.api.of("start")).toEqual([]);
+    expect(r.api.of("update")).toEqual([expect.objectContaining({ arg: expect.objectContaining({ kind: "done" }) })]);
+    expect(r.api.of("end")).toEqual([]);
+    await r.advance(IDLE_END_MS);
+    expect(r.api.of("end")).toHaveLength(1);
+  });
+
+  it("an adopted activity is updated, not started again, when a turn starts", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    r.api.pushToken("cd34", "hub-started");
+    await r.list(STUDIO_HOST, [info(A, { phase: "running" })]);
+    await r.advance(DRIVE_GAP_MS);
+    expect(r.api.of("start")).toEqual([]);
+    expect(r.api.of("update").at(-1)?.arg).toMatchObject({ kind: "running", session: A });
+  });
+
+  it("keeps each activity's token apart: an old activity's end leaves the live one's token registered", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    r.api.pushToStartToken("ab12");
+    r.api.pushToken("cd34", "old");
+    r.api.pushToken("ef56", "new");
+    await settle();
+    await r.ack(STUDIO_HOST, "register_activity");
+    const before = r.socketOf(STUDIO_HOST).commandsOf("register_activity").length;
+    r.api.pushToken(null, "old");
+    await settle();
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(before);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity").at(-1)).toMatchObject({ token: "ef56", start_token: "ab12" });
+    // A null that names no activity is ignored while one that is named lives.
+    r.api.pushToken(null);
+    await settle();
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(before);
+    // The live one ends: only the push-to-start token is left.
+    r.api.pushToken(null, "new");
+    await settle();
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity").at(-1)).toEqual(expect.not.objectContaining({ token: expect.anything() }));
+  });
+
+  it("an activity the user dismissed is not started again by coming back to the app, only by a change", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    await r.list(STUDIO_HOST, [info(A, { phase: "running" })]);
+    expect(r.api.of("start")).toHaveLength(1);
+    r.api.pushToken("cd34", "mine");
+    await settle();
+    r.api.pushToken(null, "mine"); // dismissed from the Lock Screen
+    await r.advance(DRIVE_GAP_MS);
+    r.live.setForeground(false);
+    r.live.setForeground(true);
+    await r.advance(5 * DRIVE_GAP_MS);
+    expect(r.api.of("start")).toHaveLength(1);
+    await r.list(STUDIO_HOST, [info(A, { phase: "running", approvals: 1, approval: approval(1) })]);
+    await r.advance(DRIVE_GAP_MS);
+    expect(r.api.of("start")).toHaveLength(2);
+  });
+});
+
+describe("the hand-over in the background", () => {
+  /** The app goes to the background, as the shell does it: every link closes. */
+  const background = async (r: Awaited<ReturnType<typeof rig>>) => {
+    r.fleet.setForeground(false);
+    r.live.setForeground(false);
+    await settle();
+  };
+
+  it("an activity token that comes in the background is registered over a connection that only says hello, and closes", async () => {
+    const r = await rig();
+    r.api.pushToStartToken("ab12");
+    await settle();
+    for (const host of [STUDIO_HOST, MINI_HOST]) await r.ack(host, "register_activity");
+    await background(r);
+    const before = r.sockets.all.length;
+    r.api.pushToken("cd34", "hub-started");
+    r.api.pushToken("cd34", "hub-started"); // said twice: one hand-over
+    await settle();
+    const opened = r.sockets.all.slice(before);
+    expect(opened.map((s) => s.url).sort()).toEqual([urlOf(MINI_HOST), urlOf(STUDIO_HOST)]);
+    for (const socket of opened) {
+      socket.open();
+      socket.receive({ type: "welcome", device: "iPhone" });
+    }
+    await settle();
+    for (const socket of opened) {
+      expect(socket.commands().map((c) => c.type)).toEqual(["hello", "register_activity"]);
+      expect(socket.commandsOf("register_activity")[0]).toMatchObject({ token: "cd34", start_token: "ab12" });
+    }
+    const [studio, mini] = [opened.find((s) => s.url === urlOf(STUDIO_HOST)), opened.find((s) => s.url === urlOf(MINI_HOST))];
+    studio?.receive({ type: "ack", req: studio.commandsOf("register_activity")[0]?.req, message: "Activity registered" });
+    await settle();
+    expect(studio?.closed).toBe(true);
+    expect(mini?.closed).toBe(false);
+    await r.advance(HAND_OVER_MS); // mini never answers: closed at the end of the window
+    expect(mini?.closed).toBe(true);
+    expect(r.clock.pending).toBe(0);
+
+    // Back in the foreground: studio has it already; mini is told on its link.
+    r.fleet.setForeground(true);
+    r.live.setForeground(true);
+    await settle();
+    for (const host of [STUDIO_HOST, MINI_HOST]) await r.ready(host);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([]);
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toEqual([expect.objectContaining({ token: "cd34" })]);
+  });
+
+  it("nothing is handed over with the switch off, or for a token that is gone", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    r.api.pushToken("cd34", "a");
+    await settle();
+    await r.ack(STUDIO_HOST, "register_activity");
+    await background(r);
+    const before = r.sockets.all.length;
+    r.api.pushToken(null, "a");
+    await settle();
+    expect(r.sockets.all.length).toBe(before);
+    await r.live.setEnabled(false);
+    r.api.pushToken("ef56", "b");
+    await settle();
+    expect(r.sockets.all.length).toBe(before);
+  });
+});
+
+describe("Live Activities turned off or on in the phone's settings", () => {
+  it("off: every Mac forgets the tokens and the App Group empties, at the next foreground; on again: registered again", async () => {
+    const r = await rig();
+    r.api.pushToStartToken("ab12");
+    await r.list(STUDIO_HOST, [info(A, { approvals: 1, approval: approval(1) })]);
+    for (const host of [STUDIO_HOST, MINI_HOST]) await r.ack(host, "register_activity");
+    r.live.setForeground(false);
+    r.api.supported = false;
+    r.live.setForeground(true);
+    await settle();
+    expect(r.live.supported).toBe(false);
+    for (const host of [STUDIO_HOST, MINI_HOST]) expect(r.socketOf(host).commandsOf("clear_activity")).toHaveLength(1);
+    expect(r.api.of("setEntries").at(-1)?.arg).toEqual({});
+    r.api.pushToken("cd34", "x");
+    await r.list(STUDIO_HOST, [info(A, { phase: "running", approvals: 2, approval: approval(1) })]);
+    await r.advance(5 * DRIVE_GAP_MS);
+    for (const host of [STUDIO_HOST, MINI_HOST]) expect(r.socketOf(host).commandsOf("register_activity")).toHaveLength(1);
+    expect(r.api.shown().filter((c) => (c.arg as ActivityState).approvals === 2)).toEqual([]);
+
+    r.live.setForeground(false);
+    r.api.supported = true;
+    r.live.setForeground(true);
+    await settle();
+    expect(r.live.supported).toBe(true);
+    for (const host of [STUDIO_HOST, MINI_HOST]) {
+      expect(r.socketOf(host).commandsOf("register_activity").at(-1)).toMatchObject({ token: "cd34", start_token: "ab12" });
+    }
+    expect(Object.keys((r.api.of("setEntries").at(-1)?.arg ?? {}) as object)).toEqual([`${STUDIO_HOST}/${A}`]);
+  });
+
+  it("supported only from a later foreground: it starts following then", async () => {
+    const r = await rig({ macs: [STUDIO_HOST], supported: false });
+    expect(r.api.listening()).toBe(0);
+    r.live.setForeground(false);
+    r.api.supported = true;
+    r.live.setForeground(true);
+    await settle();
+    expect(r.api.listening()).toBe(3);
+    await r.list(STUDIO_HOST, [info(A, { phase: "running" })]);
+    expect(r.api.of("start")).toHaveLength(1);
+  });
+});
+
+describe("what the App Group and Deny take", () => {
+  it("leaves out a row whose raw id is not a session id", () => {
+    const row = (raw: string) => ({ ...info(raw, { approvals: 1, approval: approval(1) }), id: keyOf(STUDIO, raw), mac: STUDIO, raw }) as ListedSession;
+    expect(Object.keys(widgetEntries([row(A), row("../x"), row("4821")], () => STUDIO_HOST))).toEqual([`${STUDIO_HOST}/${A}`]);
+  });
+
+  it("a Deny is answered once whatever the case of its host, or a trailing dot", async () => {
+    const r = await rig();
+    r.api.deny({ mac: "MINI.tail1234.ts.net", session: A, approval: "3" });
+    r.api.deny({ mac: "mini.tail1234.ts.net.", session: A, approval: "3" });
+    r.api.deny({ mac: MINI_HOST, session: A, approval: "3" });
+    await settle();
+    expect(r.socketOf(MINI_HOST).commandsOf("answer")).toHaveLength(1);
   });
 });

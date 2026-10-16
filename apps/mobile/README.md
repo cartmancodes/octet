@@ -257,16 +257,26 @@ waiting approval's session and command, with **Deny** and **Allow**. The app its
 and later; below 17.2 (and on Android, and in Expo Go) there is no Live Activity, and **Settings**
 shows no switch for it.
 
-- **While the app is open** the app drives the activity: it starts it while a session runs or an
-  approval waits, changes it at most once a second, and ends it 5 minutes after every session went
-  idle. It reads what to show from the same lists as the Inbox, with the hub's rules, so the
-  activity looks the same whoever drives it.
-- **While it isn't**, the Mac's hub starts, updates and ends it through APNs, with content-free
-  pushes (the state, the hub's own session id, its host, two times and a count; no names or
-  commands). That needs your APNs key in the hub's `hub.json`: the setup, and exactly what is sent,
-  are in [the guide](../../docs/remote-control.md#live-activity-dynamic-island). The app gives each
-  Mac its ActivityKit tokens (`register_activity`) over its own connection, when they change; a Mac
-  out of reach gets them on its next connection.
+- **One activity, two drivers.** While the app is open the app drives the activity: it starts it
+  while a session runs or an approval waits, changes it at most once a second, and ends it 5 minutes
+  after every session went idle. It reads what to show from the same lists as the Inbox, with the
+  hub's rules, so the activity looks the same whoever drives it. An activity that is already there
+  (the hub started it while you were away) is taken over as soon as ActivityKit hands its token to
+  the app, even with every session idle: it is updated, and ended 5 minutes after they went idle.
+- **While it isn't**, the Mac's hub starts, updates and ends that same activity through APNs, with
+  content-free pushes (the state, the hub's own session id, its host, two times and a count; no
+  names or commands). It updates it through the activity token the phone registered, so only once
+  that token has reached the hub. That needs your APNs key in the hub's `hub.json`: the setup, and
+  exactly what is sent, are in [the guide](../../docs/remote-control.md#live-activity-dynamic-island).
+  Opening a session ends nothing: the app takes the activity over.
+- **Tokens.** The app gives each Mac its ActivityKit tokens (`register_activity`) over its own
+  connection, when they change, and a Mac out of reach gets them on its next connection. A token
+  per activity is kept, so one activity's end never takes back another's token. A new activity token
+  that comes while the app is in the background (an activity the hub just started) is handed over at
+  once, over a short connection to each Mac that only says hello, registers and closes (on the
+  answer, or after 10 seconds), subscribing to nothing. This relies on iOS giving the app time in
+  the background when the token arrives; if it doesn't, the hub can only start and end that activity
+  until you open the app. Unpairing a Mac tells it `clear_activity` as well as "notifications off".
 - **The names and commands** the widget shows come from the phone only: the app writes each waiting
   approval's session name (at most 80 characters) and command (folded like the Permission card, at
   most 200) to the App Group `group.dev.octet.mobile`, at most 64 of them, newest first, whenever the
@@ -275,12 +285,17 @@ shows no switch for it.
   allows nothing). Each Deny is sent once; one for a Mac out of reach goes on its next connection.
 - **Allow** opens `octet://approve/<host>/<session>/<approval>`. The app opens that approval's
   session, where Allow asks for Face ID (if **Face ID to allow** is on) and waits out the 400 ms arm,
-  as anywhere else: the link alone never allows. A malformed link, one for a Mac that isn't paired,
-  a session that ended or an approval already answered opens the Inbox and sends nothing.
+  as anywhere else: the link alone never allows. It opens the session only while the approval is
+  the session's front one, the one its Permission card shows. A malformed link, one for a Mac that
+  isn't paired, a session that ended, an approval already answered or one waiting behind another
+  opens the Inbox and sends nothing.
 - **Two alerts for one approval** that starts the activity while you are away: the push notification
   and the activity's start alert (Apple requires one to start an activity by push).
 - **Turning it off** in **Settings › Live Activity** ends the activity, tells every Mac to forget
   this phone's tokens (`clear_activity`) and empties the App Group. Turning it on registers again.
+  The app asks the phone again at each foreground whether Live Activities are on for it: turned off
+  in the phone's settings, it acts as the switch off (and hides it); turned back on, it registers
+  again. A dismissed activity is not started again by opening the app, only by a change.
 - **Not built yet.** The Swift (`modules/octet-live` and `targets/octet-live`) can't be compiled
   here (no iOS SDK): it is checked as text and by its tests, and is unverified until the first device
   build. The device pass below starts with it.
@@ -329,6 +344,12 @@ workspace. Tick each one on each phone.
       notification beside it), and nothing in it names the session beyond what the App Group holds.
 - [ ] **Deny** on the Island: the approval is denied on the desk, the app never opened. **Allow**:
       the app opens on that session, asks for Face ID, and allows only after it.
+- [ ] Background hand-over: with the app in the background and the activity started by push, check
+      in `hub-audit.jsonl` that an `activity registered` line follows the start within seconds (iOS
+      gave the app background time for the token), and that the activity then updates as the
+      session changes. If no line comes, the hub can only start and end it until the app is opened.
+- [ ] Open a session while the hub's activity shows: the same activity goes on, now driven by the
+      app (no second activity, no blink). Unpair the Mac: no activity starts again from it.
 - [ ] Turn **Settings › Live Activity** off: the activity ends and no push starts one again; on
       again: the next approval while away starts it.
 
