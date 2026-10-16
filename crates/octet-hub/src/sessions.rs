@@ -733,9 +733,7 @@ impl Sessions {
     }
 
     fn push_changed(&mut self) {
-        if self.pending.back() != Some(&SessionUpdate::Changed) {
-            self.pending.push_back(SessionUpdate::Changed);
-        }
+        push_changed(&mut self.pending);
     }
 
     /// Applies a frame from a bridge; one from a link that has since been replaced is ignored.
@@ -782,10 +780,10 @@ impl Sessions {
 
     /// Reads every session's journals for records written since the last pass: the journals
     /// it moved on from first, each let go once it stops or its time is up, then the newest. A
-    /// change to the sessions' facts is one `Changed` after the events.
+    /// change to a session's facts is a `Changed` queued right after that journal's events, so
+    /// a pass the hub loop drops halfway loses none.
     async fn poll_tails(&mut self) {
         let now = Instant::now();
-        let mut changed = false;
         for at in 0..self.live.len() {
             let live = &mut self.live[at];
             let id = &live.registration.id;
@@ -805,7 +803,9 @@ impl Sessions {
                     Err(_) => Emitted::default(),
                 };
                 wrote |= found.any;
-                changed |= found.changed;
+                if found.changed {
+                    push_changed(&mut self.pending);
+                }
                 if found.stopped {
                     live.previous.remove(index);
                 } else {
@@ -823,14 +823,13 @@ impl Sessions {
                     &records,
                 );
                 wrote |= found.any;
-                changed |= found.changed;
+                if found.changed {
+                    push_changed(&mut self.pending);
+                }
             }
             if wrote {
                 live.last_activity = activity(&live.registration.journals).await;
             }
-        }
-        if changed {
-            self.push_changed();
         }
     }
 
@@ -860,6 +859,13 @@ impl Sessions {
             reader,
             writer,
         })
+    }
+}
+
+/// Queues a `Changed`, unless one is already the last thing queued.
+fn push_changed(pending: &mut VecDeque<SessionUpdate>) {
+    if pending.back() != Some(&SessionUpdate::Changed) {
+        pending.push_back(SessionUpdate::Changed);
     }
 }
 
@@ -2058,6 +2064,45 @@ mod tests {
         let got = until_changed(&mut sessions).await;
         assert_eq!(got.len(), 2, "{got:?}");
         assert!(sessions.list()[0].get("question").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pass_dropped_midway_still_says_the_facts_changed() {
+        let env = Env::new();
+        let mut bridges = Vec::new();
+        for i in 0..60u32 {
+            let name = format!("session-{}-1.jsonl", i + 1);
+            env.write(&name, 0, "notice", &json!("start"));
+            let registration = env.registration(4300 + i, &[name.as_str()]);
+            bridges.push(Env::listen(&registration));
+            registration.write(&env.run).await.unwrap();
+        }
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        let quiet = timeout(Duration::from_millis(300), sessions.next()).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+        // The first session the pass reads gets an error: a fact the pusher acts on.
+        env.write("session-1-1.jsonl", 1, "error", &json!("boom"));
+        tokio::time::sleep(TAIL_EVERY + Duration::from_millis(50)).await;
+        {
+            // The hub loop drops `next` when another branch fires: here, a few reads into the
+            // pass, each read given time to finish so every poll moves it on by one.
+            let mut pass = std::pin::pin!(sessions.next());
+            for poll in 0..20 {
+                let polled =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(pass.as_mut().poll(cx))).await;
+                assert!(polled.is_pending(), "the pass ended by poll {poll}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(sessions.snapshots()[0].errors, 1, "the error was read");
+        // The change is not lost with the pass: it comes after the record's event.
+        let got = timeout(Duration::from_secs(1), until_changed(&mut sessions))
+            .await
+            .expect("the change still comes");
+        assert_eq!(event(&got[0]), ("session-1-1.jsonl", 1));
+        drop(bridges);
     }
 
     #[test]
