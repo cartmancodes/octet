@@ -6,7 +6,7 @@ import * as SecureStore from "expo-secure-store";
 
 import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
 import { Fleet, TOKEN_KEY, tokenKeyOf, unpairedNotice, type Keychain } from "./hub";
-import { MAC_ID, TOO_MANY_MACS, keyOf } from "./macs";
+import { MAC_ID, TOO_MANY_MACS, keyOf, macStatus } from "./macs";
 import { SETTINGS_KEY, loadSettings, saveSettings } from "./persist";
 import { createOctetStore } from "./store";
 import { showToast, toastStore } from "./toast";
@@ -650,6 +650,28 @@ describe("fix round 1", () => {
     r.fleet.setForeground(true);
     expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "connecting", tried: false });
     socketOf(r, "studio").drop();
+    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: true });
+  });
+
+  it("a Mac back from the background is connecting, not asleep, until its first attempt ends", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio");
+    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "ready", tried: true });
+    r.fleet.setForeground(false);
+    r.fleet.setForeground(true);
+    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "connecting", tried: false });
+    expect(macStatus("connecting", false)).toBe("connecting…");
+    socketOf(r, "studio").drop();
+    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: true });
+    // A drop from ready while in front is a Mac asleep, at once.
+    r.clock.advance(60_000);
+    const again = socketOf(r, "studio");
+    again.open();
+    again.receive({ type: "welcome", device: "iPhone" });
+    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "ready", tried: true });
+    again.drop();
     expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: true });
   });
 

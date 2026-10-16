@@ -48,8 +48,8 @@ export interface MacInfo {
   /** The hub's host, as the pairing link gave it. */
   host: string;
   state: HubState;
-  /** The link's first connection attempt has ended (well or not): until then a Mac that is not
-   * ready is coming, not asleep. */
+  /** An attempt of the link's run (since the app last came to the foreground) has ended, well or
+   * not: until then a Mac that is not ready is coming, not asleep. */
   tried: boolean;
 }
 
@@ -216,10 +216,17 @@ export class MacLink {
   }
 
   /** The app goes to the background: the attempt under way, if any, did not end on its own, so
-   * the stop that follows is not the Mac failing to answer (`tried` stays as it is). */
+   * the stop that follows is not the Mac failing to answer. The run is over: back in the
+   * foreground the Mac is coming again (not asleep) until an attempt of the new run ends. */
   stop(): void {
     this.attempting = false;
+    this.tried = false;
     this.client.stop();
+    // A link already offline (waiting out a backoff) says nothing as it stops.
+    if (this.shown.tried || this.shown.state !== this.client.state) {
+      this.shown = this.describe();
+      this.host.changed(this);
+    }
   }
 
   /** Stops the client, but first, on a ready link, tells the Mac "notifications off" and keeps
