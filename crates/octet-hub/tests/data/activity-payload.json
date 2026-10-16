@@ -1,0 +1,52 @@
+{
+  "start": {
+    "aps": {
+      "timestamp": 1790000101,
+      "event": "start",
+      "content-state": {
+        "kind": "approval",
+        "session": "6101-1790000000",
+        "mac": "mac.tail1234.ts.net",
+        "since": 1790000059,
+        "approvals": 2
+      },
+      "attributes-type": "OctetActivity",
+      "attributes": {},
+      "alert": {
+        "title": "Octet",
+        "body": "Session running"
+      }
+    }
+  },
+  "update": {
+    "aps": {
+      "timestamp": 1790000101,
+      "event": "update",
+      "content-state": {
+        "kind": "running",
+        "session": "6101-1790000000",
+        "mac": "mac.tail1234.ts.net",
+        "since": 1790000059,
+        "approvals": 0
+      },
+      "attributes-type": "OctetActivity",
+      "attributes": {}
+    }
+  },
+  "end": {
+    "aps": {
+      "timestamp": 1790000101,
+      "event": "end",
+      "content-state": {
+        "kind": "done",
+        "session": "6101-1790000000",
+        "mac": "mac.tail1234.ts.net",
+        "since": 1790000059,
+        "approvals": 0
+      },
+      "attributes-type": "OctetActivity",
+      "attributes": {},
+      "dismissal-date": 1790000101
+    }
+  }
+}

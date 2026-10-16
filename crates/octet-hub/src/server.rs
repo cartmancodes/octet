@@ -43,10 +43,12 @@
 //! journal read again. Live frames go through a queue of
 //! 512: a phone that lets it fill is dropped.
 use crate::{
+    activity::{Activity, Report},
+    apns::Signer,
     git::{self, Git},
     launch::{self, Launches, StartRequest, clip as clip_to},
     owner::published_url,
-    push::{self, Pusher, Sender},
+    push::{self, Limiter, Pusher, Sender},
     sessions::{SessionUpdate, Sessions},
     store::{ActivityTokens, Device, SECRET_REFUSED, Store},
     tail::{self, file_name},
@@ -178,6 +180,10 @@ const ACTIVITY_NOT_SAVED: &str = "Could not save the Live Activity; try again";
 const ACTIVITY_NOT_CLEARED: &str = "Could not update the Live Activity; try again";
 /// Reports of dead push tokens waiting for the hub loop.
 const PUSH_QUEUE: usize = 16;
+/// Reports of Live Activity sends waiting for the hub loop.
+const ACTIVITY_QUEUE: usize = 16;
+/// Logged when a dead Live Activity token could not be dropped; it names no token or path.
+const ACTIVITY_NOT_DROPPED: &str = "Couldn't drop a Live Activity token";
 /// How long a scan or a start may take in all.
 const JOB_WITHIN: Duration = Duration::from_secs(30);
 /// The longest workspace path kept in an audit line, in characters.
@@ -600,6 +606,11 @@ pub struct Hub {
     pusher: Pusher,
     /// Posts pushes in the background.
     sender: Sender,
+    /// Each device's sends in the last minute, pushes and Live Activity alike.
+    cap: Limiter,
+    /// The Live Activity while phones are away; none unless `hub.json` names APNs and its key
+    /// loads.
+    activity: Option<Activity>,
     /// Where the hub is published, as Tailscale last said: each push names its host as `mac`.
     published: Published,
     /// The last id given to a connection, hub req or replay.
@@ -687,6 +698,8 @@ impl Hub {
             .port();
         let (events, mut inbox) = mpsc::channel(EVENT_QUEUE);
         let (dead_tokens, mut dead) = mpsc::channel(PUSH_QUEUE);
+        let (activity_reports, mut reports) = mpsc::channel(ACTIVITY_QUEUE);
+        let activity = load_activity(&store, activity_reports).await;
         let (streams, mut accepted) = mpsc::channel(16);
         let room = Arc::new(Room::default());
         let (requests, mut controls) = mpsc::channel(16);
@@ -721,6 +734,8 @@ impl Hub {
             events,
             pusher: Pusher::default(),
             sender: Sender::new(push::endpoint(), dead_tokens),
+            cap: Limiter::default(),
+            activity,
             published,
             ids: 0,
         };
@@ -743,11 +758,11 @@ impl Hub {
                 Some(request) = controls.recv() => hub.on_control(request).await,
                 _ = refresh.tick() => hub.sessions.refresh().await,
                 _ = reload.tick() => hub.reload().await,
-                _ = sweep.tick() => {
-                    hub.sweep();
-                    hub.flush_push();
-                }
+                _ = sweep.tick() => hub.tick(),
                 Some(tokens) = dead.recv() => hub.drop_push_tokens(&tokens).await,
+                Some(report) = reports.recv(), if hub.activity.is_some() => {
+                    hub.on_activity_report(&report).await;
+                }
             }
         }
         control_task.abort();
@@ -874,6 +889,10 @@ impl Hub {
                     return;
                 };
                 let name = device.name.clone();
+                // The phone drives its Live Activity while it is here: the hub's ends.
+                if let Some(activity) = self.activity.as_mut() {
+                    activity.connected(&device.token_sha256);
+                }
                 // Out of the waiting room before the phone hears it is in.
                 if let Some(state) = self.conns.get_mut(&conn) {
                     state.device = Some(device);
@@ -1354,7 +1373,7 @@ impl Hub {
                 }
                 // A row shows the state's phase, mode and approvals.
                 self.relist();
-                self.observe_push();
+                self.observe_sessions();
             }
             SessionUpdate::Catalog { id } => {
                 if let Some(catalog) = self.sessions.catalog(&id) {
@@ -1387,7 +1406,7 @@ impl Hub {
                 self.update_turns();
                 self.refuse_ended();
                 self.relist();
-                self.observe_push();
+                self.observe_sessions();
             }
         }
     }
@@ -1560,6 +1579,13 @@ impl Hub {
         }
     }
 
+    /// Every second: refuses what timed out, and sends the pushes and Live Activity sends due.
+    fn tick(&mut self) {
+        self.sweep();
+        self.flush_push();
+        self.flush_activity();
+    }
+
     /// Whether `device` is still paired.
     fn paired(&self, device: &Device) -> bool {
         self.store
@@ -1630,11 +1656,16 @@ impl Hub {
         });
     }
 
-    /// Hands the pusher what the sessions look like; what it finds new waits in a window for
-    /// each device with a push token (whether it is connected is judged when the window closes).
-    fn observe_push(&mut self) {
-        let notices = self.pusher.observe(&self.sessions.snapshots());
+    /// Hands the pusher and the Live Activity driver what the sessions look like; what the
+    /// pusher finds new waits in a window for each device with a push token (whether it is
+    /// connected is judged when the window closes).
+    fn observe_sessions(&mut self) {
+        let snapshots = self.sessions.snapshots();
+        let notices = self.pusher.observe(&snapshots);
         let now = Instant::now();
+        if let Some(activity) = self.activity.as_mut() {
+            activity.observe(&snapshots, now);
+        }
         for device in self.store.devices() {
             if device.push_token.is_some() {
                 self.pusher.offer(&device.token_sha256, &notices, now);
@@ -1646,7 +1677,8 @@ impl Hub {
     /// connected right now is looked at, so it gets none.
     fn flush_push(&mut self) {
         let now = Instant::now();
-        self.pusher.prune(now);
+        self.pusher.prune();
+        self.cap.prune(now);
         let mut batch = Vec::new();
         for key in self.pusher.waiting() {
             let known = self
@@ -1662,7 +1694,9 @@ impl Hub {
                         .as_ref()
                         .is_some_and(|device| device.token_sha256 == key)
                 });
-            let due = self.pusher.due_for(&key, connected, kinds, now);
+            let due = self
+                .pusher
+                .due_for(&key, connected, kinds, &mut self.cap, now);
             if let (Some(due), Some(token)) = (due, token) {
                 batch.push((token, due));
             }
@@ -1672,6 +1706,57 @@ impl Hub {
         }
         let mac = push_mac(&self.published.borrow());
         self.sender.dispatch(batch, mac);
+    }
+
+    /// Sends what each device's Live Activity is due, in the background: a start or an update to
+    /// a device with no phone connected, an end to one whose phone came back or whose sessions
+    /// have all been idle long enough. Each send takes from the allowance pushes use.
+    fn flush_activity(&mut self) {
+        let Some(activity) = self.activity.as_mut() else {
+            return;
+        };
+        let mac = push_mac(&self.published.borrow());
+        let conns = &self.conns;
+        let connected = |key: &str| {
+            conns.values().any(|conn| {
+                conn.device
+                    .as_ref()
+                    .is_some_and(|device| device.token_sha256 == key)
+            })
+        };
+        activity.flush(
+            self.store.devices(),
+            connected,
+            &mut self.cap,
+            mac.as_deref(),
+            (Instant::now(), SystemTime::now()),
+        );
+    }
+
+    /// Takes what a Live Activity send came to. A token APNs says is gone (410) is cleared, by
+    /// value, from `devices.json` and from the connections' copies of their devices.
+    async fn on_activity_report(&mut self, report: &Report) {
+        let Some(activity) = self.activity.as_mut() else {
+            return;
+        };
+        if !activity.reported(report) {
+            return;
+        }
+        match self.store.drop_activity_token(&report.token).await {
+            Ok(Some(name)) => self.store.audit(&name, "", "activity dropped").await,
+            Ok(None) => {}
+            Err(_) => eprintln!("{ACTIVITY_NOT_DROPPED}"),
+        }
+        let devices = self.store.devices();
+        for held in self
+            .conns
+            .values_mut()
+            .filter_map(|state| state.device.as_mut())
+        {
+            if let Some(stored) = devices.iter().find(|d| d.token_sha256 == held.token_sha256) {
+                held.activity.clone_from(&stored.activity);
+            }
+        }
     }
 
     /// Clears push tokens Expo says no device has, from `devices.json` and the connections'
@@ -1896,6 +1981,20 @@ enum Publication {
 
 /// The hub's [`Publication`], as last asked.
 type Published = watch::Receiver<Publication>;
+
+/// The Live Activity, when `hub.json` names APNs and its key loads (read once, off the hub's
+/// thread); `None` otherwise, and then nothing of it runs. The key is never read again: a hub
+/// whose key changes is restarted.
+async fn load_activity(store: &Store, reports: mpsc::Sender<Report>) -> Option<Activity> {
+    let config = store.config().apns.clone()?;
+    let (config, signer) = tokio::task::spawn_blocking(move || {
+        let signer = Signer::load(&config)?;
+        Some((config, signer))
+    })
+    .await
+    .ok()??;
+    Some(Activity::new(config, signer, reports))
+}
 
 /// The `mac` a push names: the host of the hub's published URL, when it is published and that
 /// host is a DNS name ([`push::mac_of`]); `None` otherwise.
