@@ -585,9 +585,13 @@ The hub refuses a commit:
   it what it is doing (`The session is not connected`);
 - while two other git calls run (`Git is busy; try again`).
 
-The repository's commit hooks run, as they do at the desk. If a hook fails,
-the phone shows git's own words, and the files stay staged. A git call,
-hooks included, is stopped after 10 seconds (`Git took too long; try again`).
+The repository's commit hooks run, as they do at the desk, however much they
+print. If a hook fails, the phone shows the end of git's own words, up to
+2,000 characters, where a hook puts its summary, and the files stay staged. A
+git call, hooks included, is stopped after 10 seconds (`Git took too long; try
+again`). If the repository signs commits (`commit.gpgsign`), the signing
+program runs on the Mac: a passphrase or Touch ID prompt there must be
+answered within those 10 seconds, or the commit fails.
 
 ### Hub security notes
 

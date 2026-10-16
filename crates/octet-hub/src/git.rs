@@ -21,6 +21,10 @@
 //! - **Time.** A call runs in a process group of its own, which is killed when the call takes
 //!   over 10 seconds, or when the call is dropped before git ended, so no hook outlives it. At
 //!   most two calls run at once; a third is refused as busy.
+//! - **Output.** What git says on stderr, and what `add` and `commit` print, is read to the end
+//!   and only its last 16 KiB kept, so git and its hooks are never cut off however much they say;
+//!   a refusal carries the end of it, where a hook puts its summary. Only a read call's stdout
+//!   (a listing, a diff) is cut off past its limit, which the call allows for.
 use octet_core::remote::protocol::{
     ChangesInfo, Code, DiffInfo, FileChange, FileStatus, MAX_MESSAGE,
 };
@@ -65,8 +69,10 @@ const BINARY_SNIFF: usize = 8 * 1024;
 pub(crate) const GIT_WORDS: usize = 2000;
 /// The most bytes of `status` or `numstat` output read.
 const LIST_OUTPUT: usize = 32 * 1024 * 1024;
-/// The most bytes read of anything else git says.
+/// The most bytes kept of anything else git says: its stderr, and what a write call prints.
 const WORDS_OUTPUT: usize = 16 * 1024;
+/// The most bytes read of the paths `rev-parse` reports: six of the longest a path can be fit.
+const PATHS_OUTPUT: usize = 64 * 1024;
 /// The longest branch or upstream name kept, in characters.
 const NAME_CHARS: usize = 200;
 /// The JSON a `changes` or `diff` frame may spend on paths and text: [`MAX_MESSAGE`], less room
@@ -162,8 +168,19 @@ struct Ran {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    /// Whether stdout went past its limit (and git was cut off there).
+    /// Whether stdout went past what was kept of it: for [`Keep::Head`], git was cut off there.
     clipped: bool,
+}
+
+/// What a git call keeps of its stdout.
+#[derive(Debug, Clone, Copy)]
+enum Keep {
+    /// The first this many bytes; past them the pipe is closed, and git is cut off by SIGPIPE.
+    /// Only for a read call, which says it was cut off with [`Ran::clipped`] and allows for it.
+    Head(usize),
+    /// The last [`WORDS_OUTPUT`] bytes, read to the end so git is never cut off: for `add` and
+    /// `commit`, which must finish whatever they and their hooks say.
+    Tail,
 }
 
 /// One file of a listing: git's bytes for its path, and what the diff needs to know.
@@ -309,11 +326,14 @@ impl Git {
             "--",
             HERE,
         ];
-        let ran = self.run(ws, &status, None, self.list_limit).await?;
+        let ran = self
+            .run(ws, &status, None, Keep::Head(self.list_limit))
+            .await?;
         // Output past its limit was cut off by the hub: what came is listed, and `more` says
-        // there was more.
+        // there was more. `top` found a work tree, so any other failure is git's to explain (a
+        // corrupt index, say).
         if !ran.status.success() && !ran.clipped {
-            return Err(not_a_repository());
+            return Err((Code::Unavailable, words(&ran)));
         }
         let cut_short = ran.clipped;
         let status = parse_status(&ran.stdout);
@@ -322,22 +342,7 @@ impl Git {
         } else {
             "HEAD".to_owned()
         };
-        let numstat = [
-            READ_ONLY,
-            "diff",
-            "--numstat",
-            "--no-ext-diff",
-            "--no-textconv",
-            "-z",
-            base.as_str(),
-            "--",
-            HERE,
-        ];
-        let ran = self.run(ws, &numstat, None, self.list_limit).await?;
-        if !ran.status.success() && !ran.clipped {
-            return Err((Code::Unavailable, words(&ran)));
-        }
-        let counts = parse_numstat(&ran.stdout);
+        let counts = self.numstat(ws, &base).await?;
         let total = status.entries.len();
         let mut files = Vec::new();
         let mut listed = HashMap::new();
@@ -400,6 +405,36 @@ impl Git {
         })
     }
 
+    /// `(added, deleted, binary)` of each tracked file of `ws` changed against `base`, by path
+    /// from the top, from one `numstat`.
+    async fn numstat(
+        &self,
+        ws: &Path,
+        base: &str,
+    ) -> Result<HashMap<Vec<u8>, (u64, u64, bool)>, Refusal> {
+        // `--no-relative`: a user's `diff.relative` would name paths from the workspace, and
+        // they would match none of the status's, which are from the top.
+        let numstat = [
+            READ_ONLY,
+            "diff",
+            "--numstat",
+            "--no-relative",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-z",
+            base,
+            "--",
+            HERE,
+        ];
+        let ran = self
+            .run(ws, &numstat, None, Keep::Head(self.list_limit))
+            .await?;
+        if !ran.status.success() && !ran.clipped {
+            return Err((Code::Unavailable, words(&ran)));
+        }
+        Ok(parse_numstat(&ran.stdout))
+    }
+
     /// One listed file's diff against the listing's base, clipped at 64 KiB, 2,000 lines, or
     /// what the frame has room for. An untracked file is diffed against `/dev/null`.
     ///
@@ -432,7 +467,9 @@ impl Git {
                 args.push(literal(orig));
             }
         }
-        let ran = self.run(&target.top, &args, None, DIFF_BYTES).await?;
+        let ran = self
+            .run(&target.top, &args, None, Keep::Head(DIFF_BYTES))
+            .await?;
         // `--no-index` exits 1 for differences, and for a file it cannot read (saying so on
         // stderr, with no diff); anything cut short was cut off by the hub.
         let fine = match ran.status.code() {
@@ -504,9 +541,12 @@ impl Git {
             "--",
             HERE,
         ];
-        let ran = self.run(ws, &status, None, WORDS_OUTPUT).await?;
+        // Only whether it says anything matters: past its first bytes, git is cut off.
+        let ran = self
+            .run(ws, &status, None, Keep::Head(WORDS_OUTPUT))
+            .await?;
         if !ran.status.success() && !ran.clipped {
-            return Err(not_a_repository());
+            return Err((Code::Unavailable, words(&ran)));
         }
         if ran.stdout.is_empty() {
             return Err(refusal(Code::Invalid, NOTHING_TO_COMMIT));
@@ -516,14 +556,15 @@ impl Git {
         }
         *added = true;
         let ran = self
-            .run(ws, &["add", "-A", "--", HERE], None, WORDS_OUTPUT)
+            .run(ws, &["add", "-A", "--", HERE], None, Keep::Tail)
             .await?;
         if !ran.status.success() {
             return Err((Code::NotAllowed, words(&ran)));
         }
-        let commit = ["commit", "-F", "-", "--", HERE];
+        // `--quiet`: no summary, no ` create mode` line per file; the hash comes from `rev-parse`.
+        let commit = ["commit", "--quiet", "-F", "-", "--", HERE];
         let ran = self
-            .run(ws, &commit, Some(message.as_bytes()), WORDS_OUTPUT)
+            .run(ws, &commit, Some(message.as_bytes()), Keep::Tail)
             .await?;
         if !ran.status.success() {
             let said = words(&ran);
@@ -533,7 +574,7 @@ impl Git {
             return Err((Code::NotAllowed, said));
         }
         let short = [READ_ONLY, "rev-parse", "--short", "HEAD"];
-        let ran = self.run(ws, &short, None, WORDS_OUTPUT).await?;
+        let ran = self.run(ws, &short, None, Keep::Head(WORDS_OUTPUT)).await?;
         let hash = String::from_utf8_lossy(&ran.stdout).trim().to_owned();
         Ok(if ran.status.success() {
             hash
@@ -553,7 +594,7 @@ impl Git {
                 ws,
                 &[READ_ONLY, "rev-parse", "--show-toplevel"],
                 None,
-                WORDS_OUTPUT,
+                Keep::Head(PATHS_OUTPUT),
             )
             .await?;
         let mut out = ran.stdout;
@@ -573,7 +614,7 @@ impl Git {
         for marker in UNDER_WAY {
             args.extend(["--git-path", marker]);
         }
-        let ran = self.run(ws, &args, None, WORDS_OUTPUT).await?;
+        let ran = self.run(ws, &args, None, Keep::Head(PATHS_OUTPUT)).await?;
         if !ran.status.success() || ran.clipped {
             return Err(not_a_repository());
         }
@@ -590,7 +631,7 @@ impl Git {
     /// The empty tree's id in `ws`'s object format.
     async fn empty_tree(&self, ws: &Path) -> Result<String, Refusal> {
         let args = [READ_ONLY, "hash-object", "-t", "tree", "/dev/null"];
-        let ran = self.run(ws, &args, None, WORDS_OUTPUT).await?;
+        let ran = self.run(ws, &args, None, Keep::Head(WORDS_OUTPUT)).await?;
         let id = String::from_utf8_lossy(&ran.stdout).trim().to_owned();
         if !ran.status.success() || id.is_empty() {
             return Err((Code::Unavailable, words(&ran)));
@@ -598,15 +639,15 @@ impl Git {
         Ok(id)
     }
 
-    /// Runs `git -C dir <args>`, feeding `input` on stdin (null without), keeping at most
-    /// `limit` bytes of stdout: past it the pipe is closed and git is cut off. Past the time
-    /// limit, git's process group is killed.
+    /// Runs `git -C dir <args>`, feeding `input` on stdin (null without), keeping of stdout what
+    /// `keep` says and the last [`WORDS_OUTPUT`] bytes of stderr, which is read to the end. Past
+    /// the time limit, git's process group is killed.
     async fn run<S: AsRef<OsStr>>(
         &self,
         dir: &Path,
         args: &[S],
         input: Option<&[u8]>,
-        limit: usize,
+        keep: Keep,
     ) -> Result<Ran, Refusal> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let inherited = match &self.environment {
@@ -653,11 +694,14 @@ impl Git {
                     let _ = pipe.write_all(bytes).await;
                 }
             };
-            let ((), (stdout, clipped), (stderr, _)) = tokio::join!(
-                feed,
-                read_capped(stdout, limit),
-                read_capped(stderr, WORDS_OUTPUT)
-            );
+            let stdout = async move {
+                match keep {
+                    Keep::Head(limit) => read_head(stdout, limit).await,
+                    Keep::Tail => read_tail(stdout, WORDS_OUTPUT).await,
+                }
+            };
+            let ((), (stdout, clipped), (stderr, _)) =
+                tokio::join!(feed, stdout, read_tail(stderr, WORDS_OUTPUT));
             let status = child.wait().await;
             if status.is_ok() {
                 // Waited for: its pid may be another's now.
@@ -679,8 +723,9 @@ impl Git {
     }
 }
 
-/// Up to `limit` bytes from `pipe`, and whether there was more; the pipe is closed after.
-async fn read_capped(pipe: Option<impl AsyncRead + Unpin>, limit: usize) -> (Vec<u8>, bool) {
+/// Up to `limit` bytes from `pipe`, and whether there was more; the pipe is closed after, so a
+/// writer still writing is cut off.
+async fn read_head(pipe: Option<impl AsyncRead + Unpin>, limit: usize) -> (Vec<u8>, bool) {
     let mut bytes = Vec::new();
     if let Some(pipe) = pipe {
         let wanted = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
@@ -691,7 +736,30 @@ async fn read_capped(pipe: Option<impl AsyncRead + Unpin>, limit: usize) -> (Vec
     (bytes, clipped)
 }
 
-/// What git said on stderr, then stdout, clipped to [`GIT_WORDS`] characters.
+/// All of `pipe`, read to its end so the writer is never cut off, of which the last `limit` bytes
+/// are kept (at most twice that is held at once); and whether any were thrown away.
+async fn read_tail(pipe: Option<impl AsyncRead + Unpin>, limit: usize) -> (Vec<u8>, bool) {
+    let mut kept = Vec::new();
+    let mut dropped = false;
+    if let Some(mut pipe) = pipe {
+        let mut chunk = vec![0; 8 * 1024];
+        while let Ok(n @ 1..) = pipe.read(&mut chunk).await {
+            kept.extend_from_slice(&chunk[..n]);
+            if kept.len() > 2 * limit {
+                kept.drain(..kept.len() - limit);
+                dropped = true;
+            }
+        }
+    }
+    if kept.len() > limit {
+        kept.drain(..kept.len() - limit);
+        dropped = true;
+    }
+    (kept, dropped)
+}
+
+/// What git said on stderr, then stdout: its last [`GIT_WORDS`] characters, where a hook puts
+/// its summary, behind `…` when the start was dropped.
 fn words(ran: &Ran) -> String {
     let mut said = String::from_utf8_lossy(&ran.stderr).trim().to_owned();
     let out = String::from_utf8_lossy(&ran.stdout);
@@ -705,7 +773,13 @@ fn words(ran: &Ran) -> String {
     if said.is_empty() {
         return GIT_FAILED.to_owned();
     }
-    said.chars().take(GIT_WORDS).collect()
+    let count = said.chars().count();
+    if count <= GIT_WORDS {
+        return said;
+    }
+    // A character the hub's own cut split in two reads as U+FFFD.
+    let tail: String = said.chars().skip(count - (GIT_WORDS - 1)).collect();
+    format!("…{}", tail.trim_start_matches(['\u{fffd}', ' ', '\n']))
 }
 
 /// The bytes `text` takes as a JSON string, quotes included.
@@ -1563,7 +1637,11 @@ mod tests {
             .await
             .expect_err("the hook refuses");
         assert_eq!(code, Code::NotAllowed);
-        assert!(words.starts_with("lint failed: xxx"), "{words}");
+        // The end of what git said, behind a mark that its start was dropped.
+        assert!(
+            words.starts_with("…xxx") && words.ends_with("xxx"),
+            "{words}"
+        );
         assert!(words.chars().count() <= GIT_WORDS, "{}", words.len());
         // The index stays as git left it: `add -A` ran.
         assert!(git_in(ws, &["diff", "--cached", "--name-only"]).contains("new.txt"));
@@ -1636,6 +1714,196 @@ mod tests {
         assert_eq!(shown + changes.info.more, 600);
         let frame = changes_frame(1, &changes.info).to_string();
         assert!(frame.len() < MAX_MESSAGE, "{}", frame.len());
+    }
+
+    #[tokio::test]
+    async fn a_commit_of_many_new_files_acks() {
+        let git = Git::new();
+        let dir = committed("octet-git-many");
+        let ws = dir.path();
+        // Git says ` create mode 100644 <name>` of each file after it has moved HEAD: about
+        // 38 KB here, more than the hub keeps of what git says.
+        for n in 0..500 {
+            let name = format!("a-rather-long-file-name-for-its-create-mode-line-{n:04}.txt");
+            std::fs::write(ws.join(name), "x\n").expect("write");
+        }
+        let hash = commit(&git, ws, "Many").await.expect("committed");
+        assert_eq!(hash, git_in(ws, &["rev-parse", "--short", "HEAD"]).trim());
+        assert_eq!(git_in(ws, &["rev-list", "--count", "HEAD"]).trim(), "2");
+        assert_eq!(git_in(ws, &["status", "--porcelain"]), "");
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_says_a_lot_still_commits() {
+        let git = Git::new();
+        let dir = committed("octet-git-chatty");
+        let ws = dir.path();
+        std::fs::write(ws.join("new.txt"), "new\n").expect("write");
+        // About 100 KB, which git passes on to its stderr, then success.
+        hook(
+            ws,
+            "pre-commit",
+            "i=0\nwhile [ $i -lt 3000 ]; do echo \"lint: checked file number $i ok\"; i=$((i+1)); done\nexit 0",
+        );
+        let hash = commit(&git, ws, "Chatty").await.expect("committed");
+        assert_eq!(hash, git_in(ws, &["rev-parse", "--short", "HEAD"]).trim());
+        assert_eq!(git_in(ws, &["rev-list", "--count", "HEAD"]).trim(), "2");
+    }
+
+    #[tokio::test]
+    async fn a_failing_hook_keeps_its_last_words() {
+        let git = Git::new();
+        let dir = committed("octet-git-last-words");
+        let ws = dir.path();
+        std::fs::write(ws.join("new.txt"), "new\n").expect("write");
+        hook(
+            ws,
+            "pre-commit",
+            "i=0\nwhile [ $i -lt 3000 ]; do echo \"lint: checked file number $i ok\"; i=$((i+1)); done\n\
+             echo 'lint: 3 errors in src/app.rs' >&2\nexit 1",
+        );
+        let (code, words) = commit(&git, ws, "Refused")
+            .await
+            .expect_err("the hook refuses");
+        assert_eq!(code, Code::NotAllowed);
+        assert!(words.ends_with("lint: 3 errors in src/app.rs"), "{words}");
+        assert!(words.starts_with('…'), "{words}");
+        assert!(
+            words.chars().count() <= GIT_WORDS,
+            "{}",
+            words.chars().count()
+        );
+        assert_eq!(git_in(ws, &["rev-list", "--count", "HEAD"]).trim(), "1");
+    }
+
+    #[tokio::test]
+    async fn a_read_call_that_warns_a_lot_is_not_cut_off() {
+        // A stand-in for git that warns past what the hub keeps on stderr, then answers.
+        let bin = TempDir::new("octet-git-fake-bin");
+        std::fs::create_dir_all(bin.path()).expect("bin");
+        let fake = bin.path().join("git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 3000 ]; do echo \"warning: could not open directory number $i\" >&2; i=$((i+1)); done\necho listed\n",
+        )
+        .expect("fake git");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let git = Git::with_environment(vec![("PATH".into(), bin.path().into())]);
+        let ws = TempDir::new("octet-git-fake-ws");
+        std::fs::create_dir_all(ws.path()).expect("ws");
+        let ran = git
+            .run(
+                ws.path(),
+                &[READ_ONLY, "status"],
+                None,
+                Keep::Head(WORDS_OUTPUT),
+            )
+            .await
+            .expect("ran");
+        assert!(ran.status.success(), "{:?}", ran.status);
+        assert_eq!(ran.stdout, b"listed\n");
+        assert!(!ran.clipped);
+        assert!(ran.stderr.len() <= WORDS_OUTPUT);
+        let said = String::from_utf8_lossy(&ran.stderr);
+        assert!(said.trim_end().ends_with("number 2999"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_relative_diff_setting_leaves_the_counts_alone() {
+        let git = Git::new();
+        let dir = repo("octet-git-relative");
+        let top = dir.path();
+        let ws = top.join("ws");
+        std::fs::create_dir_all(&ws).expect("ws");
+        std::fs::write(ws.join("a.txt"), "one\n").expect("write");
+        git_in(top, &["add", "-A"]);
+        git_in(top, &["commit", "-q", "-m", "First"]);
+        // The user's own setting: numstat would name paths from the workspace, not the top.
+        git_in(top, &["config", "diff.relative", "true"]);
+        std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\n").expect("write");
+        let changes = git.changes(&ws).await.expect("changes");
+        let counts: Vec<(&str, u64, u64)> = changes
+            .info
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.add, f.del))
+            .collect();
+        assert_eq!(counts, [("ws/a.txt", 2, 0)]);
+    }
+
+    #[tokio::test]
+    async fn a_status_that_fails_in_a_repository_says_what_git_said() {
+        let git = Git::new();
+        let dir = committed("octet-git-bad-index");
+        let ws = dir.path();
+        std::fs::write(ws.join("new.txt"), "new\n").expect("write");
+        std::fs::write(ws.join(".git/index"), "not an index").expect("index");
+        let (code, words) = git.changes(ws).await.expect_err("refused");
+        assert_eq!(code, Code::Unavailable);
+        assert!(words.contains("index"), "{words}");
+        assert_ne!(words, NOT_A_REPOSITORY);
+        let (code, words) = commit(&git, ws, "Message").await.expect_err("refused");
+        assert_eq!(code, Code::Unavailable);
+        assert!(words.contains("index"), "{words}");
+    }
+
+    #[tokio::test]
+    async fn a_huge_change_of_tracked_files_costs_one_numstat() {
+        let git = Git::new();
+        let dir = committed("octet-git-huge-tracked");
+        let ws = dir.path();
+        let vendor = ws.join("vendor");
+        std::fs::create_dir_all(&vendor).expect("vendor");
+        for n in 0..20_000 {
+            std::fs::write(vendor.join(format!("f{n:05}.js")), "x\n").expect("write");
+        }
+        git_in(ws, &["add", "-A"]);
+        git_in(ws, &["commit", "-q", "-m", "Vendor"]);
+        // A vendored update: every tracked file changed, which numstat diffs one by one.
+        for n in 0..20_000 {
+            std::fs::write(vendor.join(format!("f{n:05}.js")), "y\ny\n").expect("write");
+        }
+        let before = git.calls();
+        let began = Instant::now();
+        let changes = git.changes(ws).await.expect("changes");
+        assert!(began.elapsed() < GIT_WITHIN, "{:?}", began.elapsed());
+        assert_eq!(git.calls() - before, 3);
+        assert_eq!(changes.info.files.len(), FILES_LIMIT);
+        assert_eq!(changes.info.more, 20_000 - FILES_LIMIT as u64);
+        assert!(
+            changes
+                .info
+                .files
+                .iter()
+                .all(|f| (f.add, f.del, f.status) == (2, 1, FileStatus::Modified)),
+            "{:?}",
+            changes.info.files.first()
+        );
+        let frame = changes_frame(1, &changes.info).to_string();
+        assert!(frame.len() < MAX_MESSAGE, "{}", frame.len());
+    }
+
+    #[tokio::test]
+    async fn a_commit_during_a_merge_is_refused_below_the_top_too() {
+        let git = Git::new();
+        let dir = repo("octet-git-merge-below");
+        let top = dir.path();
+        let ws = top.join("ws");
+        std::fs::create_dir_all(&ws).expect("ws");
+        std::fs::write(ws.join("a.txt"), "one\n").expect("write");
+        git_in(top, &["add", "-A"]);
+        git_in(top, &["commit", "-q", "-m", "First"]);
+        std::fs::write(ws.join("a.txt"), "two\n").expect("write");
+        let head = git_in(top, &["rev-parse", "HEAD"]);
+        std::fs::write(top.join(".git/MERGE_HEAD"), head).expect("marker");
+        let commit = git.commit(&ws, "Mid-merge", &watch::channel(true).1).await;
+        assert_eq!(
+            (commit.result, commit.added),
+            (Err((Code::Busy, MERGE_FIRST.to_owned())), false)
+        );
+        assert_eq!(git_in(top, &["diff", "--cached", "--name-only"]), "");
+        std::fs::remove_file(top.join(".git/MERGE_HEAD")).expect("unmark");
+        assert!(commit_now(&git, &ws).await.is_ok());
     }
 
     #[tokio::test]
