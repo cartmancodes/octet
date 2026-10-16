@@ -337,6 +337,13 @@ export interface RegisterActivityCommand {
   start_token?: string | null;
 }
 
+/** Forget the ActivityKit tokens the hub had, so it no longer starts or updates a Live Activity on this phone. */
+export interface ClearActivityCommand {
+  v: 1;
+  type: "clear_activity";
+  req: number;
+}
+
 /** Ask the hub to answer, to tell a live connection from a dead one. */
 export interface PingCommand {
   v: 1;
@@ -602,6 +609,7 @@ export type FromPhone =
   | PairCommand
   | RegisterPushCommand
   | RegisterActivityCommand
+  | ClearActivityCommand
   | PingCommand
   | SubscribeCommand
   | UnsubscribeCommand

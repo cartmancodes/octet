@@ -55,9 +55,9 @@ use futures_util::{SinkExt, StreamExt};
 use octet_core::PROMPT_LIMIT;
 use octet_core::remote::{
     protocol::{
-        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, Secret, ack,
-        catalog_frame, event_frame, full_access_confirmed, paired, parse_phone, recent_frame,
-        refused, req_of, sessions_frame, state_frame, subscribed_frame, welcome,
+        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, ack, catalog_frame,
+        event_frame, full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of,
+        sessions_frame, state_frame, subscribed_frame, welcome,
     },
     run::run_dir,
 };
@@ -946,10 +946,8 @@ impl Hub {
                 let token = token.map(|token| token.expose().to_owned());
                 return self.register_push(conn, device, req, token, kinds).await;
             }
-            PhoneCommand::RegisterActivity { token, start_token } => {
-                return self
-                    .register_activity(conn, device, req, &token, start_token)
-                    .await;
+            command @ (PhoneCommand::RegisterActivity { .. } | PhoneCommand::ClearActivity) => {
+                return self.activity(conn, device, req, command).await;
             }
             PhoneCommand::Subscribe { session, after } => {
                 self.subscribe(conn, req, session, after);
@@ -1069,25 +1067,24 @@ impl Hub {
         self.send(conn, &ack(req, message));
     }
 
-    /// Stores `device`'s `ActivityKit` tokens, replacing both it had, and answers `req`. Neither
-    /// token nor the device's hash reaches the audit line or a log.
-    async fn register_activity(
-        &mut self,
-        conn: u64,
-        device: &Device,
-        req: u64,
-        token: &Secret,
-        start_token: Option<Secret>,
-    ) {
-        let activity = ActivityTokens {
-            token: token.expose().to_owned(),
-            start_token: start_token.map(|token| token.expose().to_owned()),
-        };
-        match self
-            .store
-            .set_activity(&device.token_sha256, activity.clone())
-            .await
-        {
+    /// Stores `device`'s `ActivityKit` tokens for `register_activity`, replacing both it had and
+    /// taking them from any other device that held them, or removes them for `clear_activity`;
+    /// then answers `req`. Neither a token nor the device's hash reaches the audit line or a log.
+    async fn activity(&mut self, conn: u64, device: &Device, req: u64, command: PhoneCommand) {
+        let hash = &device.token_sha256;
+        let (saved, message, what) =
+            if let PhoneCommand::RegisterActivity { token, start_token } = command {
+                let activity = ActivityTokens {
+                    token: token.expose().to_owned(),
+                    start_token: start_token.map(|token| token.expose().to_owned()),
+                };
+                let saved = self.store.set_activity(hash, activity).await;
+                (saved, "Activity registered", "activity registered")
+            } else {
+                let saved = self.store.drop_activity(hash).await;
+                (saved, "Activity cleared", "activity cleared")
+            };
+        match saved {
             Ok(true) => {}
             Ok(false) => {
                 self.refuse(conn, req, Code::Unavailable, ACTIVITY_NOT_SAVED);
@@ -1100,20 +1097,19 @@ impl Hub {
                 return;
             }
         }
-        // The connections of this device carry a copy of it.
-        for state in self.conns.values_mut() {
-            if let Some(held) = state
-                .device
-                .as_mut()
-                .filter(|held| held.token_sha256 == device.token_sha256)
-            {
-                held.activity = Some(activity.clone());
+        // Connections carry a copy of their device, and tokens may have left another device.
+        let devices = self.store.devices();
+        for held in self
+            .conns
+            .values_mut()
+            .filter_map(|state| state.device.as_mut())
+        {
+            if let Some(stored) = devices.iter().find(|d| d.token_sha256 == held.token_sha256) {
+                held.activity.clone_from(&stored.activity);
             }
         }
-        self.store
-            .audit(&device.name, "", "activity registered")
-            .await;
-        self.send(conn, &ack(req, "Activity registered"));
+        self.store.audit(&device.name, "", what).await;
+        self.send(conn, &ack(req, message));
     }
 
     /// Lists resumable sessions in the background; the scan reads up to 400 journals, and only

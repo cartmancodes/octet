@@ -391,7 +391,10 @@ impl Store {
 
     /// Sets the `ActivityKit` tokens of the device whose token hash is `token_sha256`, replacing
     /// both it had: an `activity` without a start token clears the stored one. False if there is
-    /// no such device. A revoke removes the device, and its tokens with it.
+    /// no such device. A token is on one device only, the newest to register it, as a push token
+    /// is: another device holding either token as its activity token loses its tokens, and one
+    /// holding it as its start token loses that, in the same write. A revoke removes the device,
+    /// and its tokens with it.
     ///
     /// # Errors
     ///
@@ -402,14 +405,55 @@ impl Store {
         activity: ActivityTokens,
     ) -> io::Result<bool> {
         self.update(|devices| {
+            if !devices
+                .iter()
+                .any(|device| device.token_sha256 == token_sha256)
+            {
+                return (false, false);
+            }
+            let ours = |token: &str| {
+                activity.token == token || activity.start_token.as_deref() == Some(token)
+            };
+            let mut changed = false;
+            for device in devices.iter_mut() {
+                let wanted = if device.token_sha256 == token_sha256 {
+                    Some(activity.clone())
+                } else {
+                    match &device.activity {
+                        Some(held) if ours(&held.token) => None,
+                        Some(held) if held.start_token.as_deref().is_some_and(ours) => {
+                            Some(ActivityTokens {
+                                start_token: None,
+                                ..held.clone()
+                            })
+                        }
+                        _ => continue,
+                    }
+                };
+                changed |= device.activity != wanted;
+                device.activity = wanted;
+            }
+            (true, changed)
+        })
+        .await
+    }
+
+    /// Removes the `ActivityKit` tokens of the device whose token hash is `token_sha256`: for a
+    /// phone that turned its Live Activity off, or tokens APNs says are gone. False if there is
+    /// no such device; a device with none is left as it is, unwritten.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
+    pub async fn drop_activity(&mut self, token_sha256: &str) -> io::Result<bool> {
+        self.update(|devices| {
             let Some(device) = devices
                 .iter_mut()
                 .find(|device| device.token_sha256 == token_sha256)
             else {
                 return (false, false);
             };
-            let changed = device.activity.as_ref() != Some(&activity);
-            device.activity = Some(activity);
+            let changed = device.activity.take().is_some();
             (true, changed)
         })
         .await
@@ -1332,6 +1376,125 @@ mod tests {
         let reopened = Store::open(dir.path()).await.unwrap();
         assert_eq!(reopened.devices().len(), 1);
         assert_eq!(reopened.devices()[0].activity, None);
+    }
+
+    #[tokio::test]
+    async fn drop_activity_removes_only_that_devices_tokens() {
+        let dir = TempDir::new("hub-dropactivity");
+        let mut store = store(&dir).await;
+        let one = paired(&mut store, "One", epoch(1)).await;
+        let two = paired(&mut store, "Two", epoch(1)).await;
+        let one = store.authenticate(&one, LOGIN, epoch(2)).await.unwrap();
+        let two = store.authenticate(&two, LOGIN, epoch(2)).await.unwrap();
+        let theirs = "0123456789abcdef5ec7e7dddd";
+        assert!(
+            store
+                .set_activity(&one.token_sha256, activity(ACTIVITY, Some(START)))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_activity(&two.token_sha256, activity(theirs, None))
+                .await
+                .unwrap()
+        );
+        let file = dir.path().join("devices.json");
+        assert!(store.drop_activity(&one.token_sha256).await.unwrap());
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains(ACTIVITY) && !text.contains(START) && text.contains(theirs),
+            "{text}"
+        );
+        let reopened = Store::open(dir.path()).await.unwrap();
+        let held: Vec<_> = reopened
+            .devices()
+            .iter()
+            .map(|d| (d.name.as_str(), d.activity.clone()))
+            .collect();
+        assert_eq!(held, [("One", None), ("Two", Some(activity(theirs, None)))]);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Dropping again finds the device with nothing to drop, and writes nothing.
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert!(store.drop_activity(&one.token_sha256).await.unwrap());
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            before
+        );
+        // An unknown device is reported.
+        assert!(!store.drop_activity(&"0".repeat(64)).await.unwrap());
+        assert_eq!(store.devices()[1].activity, Some(activity(theirs, None)));
+    }
+
+    #[tokio::test]
+    async fn an_activity_token_is_held_by_the_newest_device_only() {
+        let dir = TempDir::new("hub-activityunique");
+        let mut store = store(&dir).await;
+        let mut hashes = Vec::new();
+        for name in ["One", "Two", "Three"] {
+            let token = paired(&mut store, name, epoch(1)).await;
+            let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+            hashes.push(device.token_sha256);
+        }
+        let held = |store: &Store| -> Vec<Option<ActivityTokens>> {
+            store.devices().iter().map(|d| d.activity.clone()).collect()
+        };
+        let other = "0123456789abcdef5ec7e7eeee";
+        assert!(
+            store
+                .set_activity(&hashes[0], activity(ACTIVITY, Some(START)))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_activity(&hashes[2], activity(other, Some(START)))
+                .await
+                .unwrap()
+        );
+        // The start token moved; One keeps its own activity token.
+        assert_eq!(
+            held(&store),
+            [
+                Some(activity(ACTIVITY, None)),
+                None,
+                Some(activity(other, Some(START)))
+            ]
+        );
+        // Two registers One's activity token: One loses its tokens, Three keeps its own.
+        assert!(
+            store
+                .set_activity(&hashes[1], activity(ACTIVITY, None))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            held(&store),
+            [
+                None,
+                Some(activity(ACTIVITY, None)),
+                Some(activity(other, Some(START)))
+            ]
+        );
+        // A token seen in either place moves: One registers Three's start token as its
+        // activity token, and Three keeps only its activity token.
+        assert!(
+            store
+                .set_activity(&hashes[0], activity(START, None))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            held(&Store::open(dir.path()).await.unwrap()),
+            [
+                Some(activity(START, None)),
+                Some(activity(ACTIVITY, None)),
+                Some(activity(other, None))
+            ]
+        );
     }
 
     #[tokio::test]

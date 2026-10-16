@@ -1399,17 +1399,113 @@ async fn bad_activity_tokens_are_refused_as_invalid_and_the_connection_goes_on()
     assert!(!text.contains("\"activity\""), "{text}");
 }
 
+fn clear_activity(req: u64) -> Value {
+    json!({"v": 1, "req": req, "type": "clear_activity"})
+}
+
 #[tokio::test]
-async fn register_activity_before_hello_is_refused_as_unpaired() {
+async fn clear_activity_removes_the_tokens_and_is_acked_and_audited() {
     let mut env = Env::new();
     env.start().await;
-    let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
-    send(&mut stranger, register_activity(44, ACTIVITY, Some(START))).await;
-    let refusal = recv(&mut stranger).await;
-    assert_eq!(refusal["type"], "refused", "{refusal}");
-    assert_eq!(refusal["req"], 44);
-    assert_eq!(refusal["code"], "unpaired");
-    assert!(closes(&mut stranger).await);
+    let (mut phone, _) = env.phone("Test phone").await;
+    let (mut other, _) = env.phone("Other phone").await;
+    let theirs = "0123456789abcdef5ec7e7dddd";
+    send(&mut phone, register_activity(1, ACTIVITY, Some(START))).await;
+    recv_kind(&mut phone, "ack").await;
+    send(&mut other, register_activity(1, theirs, None)).await;
+    recv_kind(&mut other, "ack").await;
+
+    send(&mut phone, clear_activity(2)).await;
+    assert_eq!(
+        recv_kind(&mut phone, "ack").await,
+        ack(2, "Activity cleared")
+    );
+    assert_eq!(
+        stored_activity(&env).await,
+        [
+            ("Test phone".to_owned(), None),
+            ("Other phone".to_owned(), Some((theirs.to_owned(), None))),
+        ]
+    );
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(!text.contains(ACTIVITY) && !text.contains(START), "{text}");
+    // Clearing again is still acked: there is nothing left to start one.
+    send(&mut phone, clear_activity(3)).await;
+    assert_eq!(
+        recv_kind(&mut phone, "ack").await,
+        ack(3, "Activity cleared")
+    );
+    // An extra field is refused, and the connection goes on.
+    let mut extra = clear_activity(4);
+    extra["token"] = json!(ACTIVITY);
+    send(&mut phone, extra).await;
+    let refusal = recv_kind(&mut phone, "refused").await;
+    assert_eq!(
+        (refusal["req"].as_u64(), refusal["code"].as_str()),
+        (Some(4), Some("invalid")),
+        "{refusal}"
+    );
+    send(&mut phone, json!({"v": 1, "req": 5, "type": "ping"})).await;
+    assert_eq!(recv_kind(&mut phone, "ack").await["message"], "pong");
+
+    let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
+    let lines: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect();
+    let cleared: Vec<_> = lines
+        .iter()
+        .filter(|l| l["what"] == "activity cleared")
+        .collect();
+    assert_eq!(cleared.len(), 2, "{audit}");
+    assert!(
+        cleared
+            .iter()
+            .all(|l| l["device"] == "Test phone" && l["session"] == ""),
+        "{audit}"
+    );
+    assert!(!audit.contains("5ec7e7"), "{audit}");
+}
+
+#[tokio::test]
+async fn activity_tokens_follow_the_newest_phone_to_register_them() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut old, _) = env.phone("Old pairing").await;
+    let (mut new, _) = env.phone("New pairing").await;
+    send(&mut old, register_activity(1, ACTIVITY, Some(START))).await;
+    recv_kind(&mut old, "ack").await;
+    send(&mut new, register_activity(1, ACTIVITY, Some(START))).await;
+    recv_kind(&mut new, "ack").await;
+    assert_eq!(
+        stored_activity(&env).await,
+        [
+            ("Old pairing".to_owned(), None),
+            (
+                "New pairing".to_owned(),
+                Some((ACTIVITY.to_owned(), Some(START.to_owned())))
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn activity_commands_before_hello_are_refused_as_unpaired() {
+    let mut env = Env::new();
+    env.start().await;
+    for command in [
+        register_activity(44, ACTIVITY, Some(START)),
+        clear_activity(45),
+    ] {
+        let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
+        let req = command["req"].clone();
+        send(&mut stranger, command).await;
+        let refusal = recv(&mut stranger).await;
+        assert_eq!(refusal["type"], "refused", "{refusal}");
+        assert_eq!(refusal["req"], req);
+        assert_eq!(refusal["code"], "unpaired");
+        assert!(closes(&mut stranger).await);
+    }
     let devices = env.root.join("devices.json");
     if let Ok(text) = std::fs::read_to_string(devices) {
         assert!(!text.contains(ACTIVITY), "{text}");
@@ -1441,6 +1537,32 @@ async fn register_activity_spends_the_rate_limit_like_any_command() {
     );
     let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
     assert!(!text.contains(ACTIVITY), "{text}");
+}
+
+#[tokio::test]
+async fn clear_activity_spends_the_rate_limit_like_any_command() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut spender, _) = env.phone("Spender").await;
+    send(&mut spender, register_activity(1, ACTIVITY, Some(START))).await;
+    recv_kind(&mut spender, "ack").await;
+    // A few past the burst, so a refill while they are sent still leaves none.
+    for req in 2..=BURST as u64 + 4 {
+        send(&mut spender, json!({"v": 1, "req": req, "type": "ping"})).await;
+    }
+    send(&mut spender, clear_activity(1_000)).await;
+    let frame = loop {
+        let frame = recv(&mut spender).await;
+        if frame["req"] == 1_000 {
+            break frame;
+        }
+    };
+    assert_eq!(
+        (frame["type"].as_str(), frame["code"].as_str()),
+        (Some("refused"), Some("rate_limited"))
+    );
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(text.contains(ACTIVITY), "{text}");
 }
 
 #[tokio::test]

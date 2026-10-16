@@ -601,6 +601,13 @@ pub static MESSAGES: &[Message] = &[
          clears the start token the hub had.",
     ),
     message(
+        "clear_activity",
+        FromPhone,
+        &[],
+        "Forget the ActivityKit tokens the hub had, so it no longer starts or updates a Live \
+         Activity on this phone.",
+    ),
+    message(
         "ping",
         FromPhone,
         &[],
@@ -1070,6 +1077,8 @@ pub enum PhoneCommand {
         /// The checked push-to-start token; `None` clears the one the hub had.
         start_token: Option<Secret>,
     },
+    /// Forget the `ActivityKit` tokens the hub had for this device.
+    ClearActivity,
     /// Answer with an ack, to show the connection is alive.
     Ping,
     /// Replay a session after `after`, then stream it.
@@ -1517,6 +1526,7 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
             token: activity_token(m, "token")?.ok_or("Missing token")?,
             start_token: activity_token(m, "start_token")?,
         },
+        "clear_activity" => PhoneCommand::ClearActivity,
         "ping" => PhoneCommand::Ping,
         "subscribe" => PhoneCommand::Subscribe {
             session: text(m, "session"),
@@ -2793,6 +2803,28 @@ mod tests {
         assert!(!is_activity_token(""));
         assert!(!is_activity_token("A"));
         assert!(!is_activity_token(&too_long));
+    }
+
+    #[test]
+    fn clear_activity_takes_no_fields() {
+        let (req, command) = parse_phone(r#"{"v":1,"req":3,"type":"clear_activity"}"#).unwrap();
+        assert_eq!((req, command), (3, PhoneCommand::ClearActivity));
+        for fields in [r#","token":"abc""#, r#","x":1"#, r#","start_token":null"#] {
+            let text = format!(r#"{{"v":1,"req":3,"type":"clear_activity"{fields}}}"#);
+            let reason = parse_phone(&text).expect_err(&text);
+            assert!(!reason.contains("abc"), "{reason}");
+        }
+        let ts = typescript();
+        let interface = ts
+            .split("export interface ClearActivityCommand {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the interface");
+        assert!(
+            interface.contains("  type: \"clear_activity\";"),
+            "{interface}"
+        );
+        assert!(ts.contains("  | ClearActivityCommand"), "{ts}");
     }
 
     #[test]
