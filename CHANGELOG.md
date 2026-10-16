@@ -15,26 +15,34 @@ Claude Code and Codex CLIs.
   Screen (iOS 17.2 or later; the app still runs on iOS 16.4): whether a
   session runs, waits for approval or is done, and for how long, with the
   waiting approval's session name and command, which the app keeps in the
-  phone's App Group only (at most 64, cleared on unpair). While the app is open
-  it drives the activity itself, at most once a second; while it isn't, the
-  hub starts, updates and ends it through APNs with content-free pushes (the
-  state, the hub's session id, its host, two times and a count) signed with
-  your own `.p8` key, named in `hub.json` (`apns: {team_id, key_id, key_path,
-  sandbox}`; the key must be `0600` and yours, or APNs stays off with one log
-  line). The phone gives each Mac its ActivityKit tokens with
-  `register_activity` and takes them back with `clear_activity`. **Deny** on
-  the Island answers no at once, to the Mac that owns the approval; **Allow**
-  opens `octet://approve/...`, the approval's session, behind Face ID and the
-  arm, and a forged or stale link opens the Inbox. **Settings › Live
-  Activity** (on by default) turns it all off. An approval that starts the
-  activity while you are away brings two alerts, the push and the activity's.
-  There is one activity with two drivers: the app takes over an activity the
-  hub started, and hands a new activity token to each Mac from the
-  background over a register-only connection (if iOS gives it the time), so
-  the hub can update it. Unpairing a Mac clears its tokens there. The Swift is
-  unverified until the first device build. The contract test checks one
-  content-free start, then an update to the handed-over token and no end, at
-  a local stand-in for APNs.
+  phone's App Group only (at most 64, privacy-sensitive, cleared on unpair).
+  There is one activity with two drivers: while the app is open (on any
+  screen) it drives the activity itself, at most once a second; while it
+  isn't, one Mac's hub starts, updates and ends it through APNs with
+  content-free pushes (the state, the hub's session id, its host, two times
+  and a count; stale 15 minutes on) signed with your own `.p8` key, named in
+  `hub.json` (`apns: {team_id, key_id, key_path, sandbox}`; the key must be
+  `0600` and yours, or APNs stays off with one log line). The phone gives its
+  ActivityKit tokens (`register_activity`) to one Mac, the one of the lead
+  session when the app was last in front, and tells the others
+  `clear_activity`; while you are away the Island follows that Mac, and the
+  others still send notifications. A new activity's token that comes while
+  the app is in the background is handed over on a short connection whose
+  hello says `background: true`. **Deny** on the Island answers no on the Mac
+  that owns the approval, from the background too, over such a connection;
+  **Allow** opens `octet://approve/...`, the approval's session, behind Face
+  ID and the arm, and a forged or stale link opens the Inbox. **Settings ›
+  Live Activity** (on by default) turns it all off, and follows the phone's
+  own setting. An approval that starts the activity while you are away brings
+  two alerts, the push and the activity's. Limits: the hand-over and a
+  background Deny need iOS to give the app background time, and an unlocked
+  phone, since the Macs' device tokens are readable only while unlocked. On a
+  locked phone the Mac can neither update nor end the activity it started
+  until you unlock and open the app: it shows as stale after 15 minutes, no
+  second one starts for up to 8 hours, and a Deny waits for the unlock. The
+  Swift is unverified until the first device build. The contract test checks
+  one content-free start, then an update to the handed-over token and no
+  end, at a local stand-in for APNs.
 - The phone app pairs with up to 4 Macs. Each pairing keeps its token in its
   own keychain entry, the one pairing of an earlier version moves over on
   first launch, and every Mac stays connected while the app is open. The
