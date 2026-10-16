@@ -9,19 +9,36 @@ use octet_core::{
 
 const CONFIRM: &str = "Full access needs confirm: \"full access\"";
 
-/// Runs `command` as the device "iPhone 15" sent it.
+/// `command` as the device "iPhone 15" sent it.
+fn from_phone(command: BridgeCommand) -> Remote {
+    Remote {
+        peer: 1,
+        req: 5,
+        by: "iPhone 15".into(),
+        command,
+    }
+}
+
+/// Runs `command` as the device "iPhone 15" sent it, and its reply. A command answered when the
+/// job it started ends (an export) has that job run to its end, as the event loop does.
 async fn run(
     app: &mut App,
     vendor: &RecordingVendor,
     command: BridgeCommand,
 ) -> (Result<String, String>, Action) {
-    let remote = Remote {
-        peer: 1,
-        req: 5,
-        by: "iPhone 15".into(),
-        command,
-    };
-    crate::bridge::handle_remote(app, vendor, remote, false).await
+    match crate::bridge::handle_remote(app, vendor, from_phone(command), false).await {
+        (Some(reply), action) => (reply, action),
+        (None, Action::Job(job)) => {
+            let mut running = crate::jobs::Running::spawn(job);
+            let ended = running.wait().await;
+            let asker = running.into_asker().expect("the phone that asked");
+            (
+                crate::bridge::answer_job(app, ended, &asker),
+                Action::Continue,
+            )
+        }
+        (None, _) => panic!("no reply and no job"),
+    }
 }
 
 fn prompt(text: &str) -> BridgeCommand {
@@ -581,13 +598,9 @@ async fn run_editing(
     vendor: &RecordingVendor,
     command: BridgeCommand,
 ) -> (Result<String, String>, Action) {
-    let remote = Remote {
-        peer: 1,
-        req: 5,
-        by: "iPhone 15".into(),
-        command,
-    };
-    crate::bridge::handle_remote(app, vendor, remote, true).await
+    let (reply, action) =
+        crate::bridge::handle_remote(app, vendor, from_phone(command), true).await;
+    (reply.expect("answered at once"), action)
 }
 
 #[tokio::test]
@@ -772,7 +785,7 @@ async fn export_answers_with_the_desk_words() {
         result,
         Ok(format!("Exported the journal to {}", target.display()))
     );
-    // The copy was done inline: no job, and the file is there.
+    // Once its job is done, the file is there.
     assert!(matches!(action, Action::Continue));
     assert!(app.job.is_none());
     let before = std::fs::read(&target).unwrap();
@@ -803,6 +816,59 @@ async fn export_answers_with_the_desk_words() {
         std::fs::read(&target).unwrap(),
         before,
         "the first export is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_phone_export_is_the_desks_own_job_and_is_answered_when_it_is_done() {
+    let (mut app, workspace, _data) = exportable("export-job");
+    let vendor = RecordingVendor::default();
+    let target = workspace.path().join("session-7.jsonl");
+    let (reply, action) = crate::bridge::handle_remote(
+        &mut app,
+        &vendor,
+        from_phone(typed(CommandName::Export)),
+        false,
+    )
+    .await;
+    // Nothing is copied while the command is handled, so the desk does not wait for it: the copy
+    // is a job, like the desk's own `/export`, and the phone hears when it is done.
+    assert_eq!(reply, None);
+    assert!(!target.exists(), "copied while the desk waited");
+    let Action::Job(job) = action else {
+        panic!("no export job")
+    };
+    assert_eq!(
+        (job.label, job.must_finish),
+        ("Exporting the journal…", true)
+    );
+    let asker = crate::jobs::Asker {
+        peer: 1,
+        req: 5,
+        by: "iPhone 15".into(),
+    };
+    assert_eq!(job.asker.as_ref(), Some(&asker));
+    // The desk goes on meanwhile, and another export waits for this one, in the desk's words.
+    app.job = Some(crate::jobs::Running::spawn(job));
+    let (busy, _) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    assert_eq!(busy, Err("Wait for: Exporting the journal…".into()));
+    let (prompt, _) = run(&mut app, &vendor, prompt("meanwhile")).await;
+    assert_eq!(prompt, Ok("Sent".into()));
+    // When the job ends, the event loop answers the phone that asked.
+    let mut running = app.job.take().expect("the export runs");
+    let ended = running.wait().await;
+    assert_eq!(running.into_asker(), Some(asker.clone()));
+    let answer = crate::bridge::answer_job(&mut app, ended, &asker);
+    assert_eq!(
+        answer,
+        Ok(format!("Exported the journal to {}", target.display()))
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"{}\n");
+    assert!(
+        app.entries_text()
+            .contains("Exported the journal from iPhone 15"),
+        "{}",
+        app.entries_text()
     );
 }
 
@@ -848,6 +914,7 @@ async fn export_waits_for_a_job_and_for_a_turn_like_the_desk() {
     busy.job = Some(crate::jobs::Running::spawn(crate::jobs::Job {
         label: "Reading recent sessions…",
         must_finish: false,
+        asker: None,
         work: Box::pin(std::future::pending()),
     }));
     let (result, action) = run(&mut busy, &vendor, typed(CommandName::Export)).await;
