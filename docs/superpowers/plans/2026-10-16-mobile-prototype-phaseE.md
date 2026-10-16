@@ -61,7 +61,7 @@
 
   ```
   {"aps":{"timestamp":<secs>,"event":"start"|"update"|"end",
-          "content-state":{"kind":"running"|"approval"|"done","session":<key or "">,
+          "content-state":{"kind":"running"|"approval"|"done","session":<raw hub id or "">,
                            "mac":<host or "">,"since":<secs>,"approvals":<n>},
           "attributes-type":"OctetActivity","attributes":{}}}
   ```
@@ -69,16 +69,17 @@
   `start` adds `"alert":{"title":"Octet","body":"Session running"}`, as ActivityKit requires an alert for push-to-start; `end` adds `"dismissal-date"`.
 - **Content-free**
   - No names, commands, workspaces or file names in the payload.
-  - `session` is the phone's `mac/session` key form for the session that leads, with `mac` the hub's published host as in Phase D.
+  - `session` is the hub's own raw id of the session that leads, and `mac` is the hub's published host, as in Phase D's push data. The hub never knows the phone's pairing ids, so it never sends a key.
+  - **The phone owns every key.** It resolves `{mac: host, session: raw}` through `fleet.keyFor(host, raw)`, the one resolver push taps already use (Phase D's final fix wave).
 - **Lifecycle (hub)**
   - **Start** with `start_token` when an approval waits or a turn starts and the device has no live connection.
   - **Update** when the kind or the approval count changes, at most once per 2 s per device.
   - **End** 5 minutes after every session is idle, or when the phone connects. From then on the app drives the activity itself.
 - **Bounds:** these sends count against the same per-device cap of 6 per minute as the other pushes. A 410 drops the token, and any other failure is logged without the token.
 - **App**
-  - **The App Group** is `group.dev.octet.mobile`. The app writes `{"<key>": {"name", "command"}}` (each value cleaned, at most 64 entries, names ≤ 80 characters and commands ≤ 200) whenever the Inbox's approvals change, and clears it on unpair.
-  - **Deny** is a `LiveActivityIntent` that posts an event to the JS module, which sends `answer allow:false` to the key's Mac. Deny needs no Face ID, since it widens nothing.
-  - **Allow** opens `octet://approve/<mac>/<session>/<approval>`. The app shows that approval's sheet with Face ID and the 400 ms arm, as in the Inbox. It never allows from the link alone.
+  - **The App Group** is `group.dev.octet.mobile`. The app writes `{"<host>/<raw>": {"name", "command"}}`, keyed the way the widget sees a session (host and raw id from the content state) (each value cleaned, at most 64 entries, names ≤ 80 characters and commands ≤ 200) whenever the Inbox's approvals change, and clears it on unpair.
+  - **Deny** is a `LiveActivityIntent` that posts an event to the JS module, which resolves the content state's host and raw id with `fleet.keyFor` and sends `answer allow:false` to that Mac. An unresolvable one sends nothing. Deny needs no Face ID, since it widens nothing.
+  - **Allow** opens `octet://approve/<host>/<raw session>/<approval>`, with each part validated by Phase D's host and session-id rules and resolved with `fleet.keyFor`. The app shows that approval's sheet with Face ID and the 400 ms arm, as in the Inbox. It never allows from the link alone.
   - **Off by default.** On Android and in jest the module is a no-op with `isSupported() === false`, and every call is safe.
 - **Commits:** stage by path. Never stage `output/` or `crates/octet-tui/src/tests/keys.rs`. Use the trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -202,13 +203,13 @@
 
 **Files:**
 - Create `apps/mobile/src/activity.ts`:
-  - It derives `{kind, session, mac, since, approvals}` from the store, the same way the hub's driver does: lead session, kind and since.
+  - It derives `{kind, session, mac, since, approvals}` from the store, the same way the hub's driver does: lead session, kind and since. Here too `session` is the raw hub id and `mac` the Mac's host (from its pairing), so the widget sees one shape whoever sent it.
   - It starts, updates and ends the activity while the app is in the foreground, at most once per second.
   - It registers the tokens with every Mac through `register_activity`.
   - It writes the App Group JSON.
-  - It handles `deny` events by sending `answer allow:false` to the key's Mac.
+  - It handles `deny` events by resolving `{mac: host, session: raw}` with `fleet.keyFor` and sending `answer allow:false` to that Mac; an unresolvable event sends nothing.
 - Modify:
-  - `app/_layout.tsx` and `src/navigation.ts`: handle `octet://approve/<mac>/<session>/<approval>`. A known Mac, a live session and a waiting approval open that approval's sheet, through `useApprovalAnswer`, with Face ID and the arm. Anything else opens the Inbox.
+  - `app/_layout.tsx` and `src/navigation.ts`: handle `octet://approve/<host>/<raw session>/<approval>`, resolved with `fleet.keyFor`. A known Mac, a live session and a waiting approval open that approval's sheet, through `useApprovalAnswer`, with Face ID and the arm. Anything else opens the Inbox.
   - `app/settings.tsx`: a "Live Activity" switch, on by default where supported and hidden elsewhere. Turning it off ends the activity and registers no tokens.
 - Extend `apps/mobile/contract/hub.contract.test.ts` with `register_activity`. Then:
   - the hub stores the token;
@@ -220,7 +221,7 @@
   - updates are throttled;
   - registration goes to every Mac;
   - the App Group JSON is cleaned and bounded, and cleared on unpair;
-  - a deny event sends `allow:false` only to the key's Mac;
+  - a deny event sends `allow:false` only to the Mac its host resolves to, and nothing for an unknown host;
   - `approve_link_never_allows_alone`: the link opens the sheet, and nothing is sent until Face ID and the arm;
   - a forged or stale link opens the Inbox;
   - the setting switches it off;
