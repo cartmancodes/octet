@@ -134,6 +134,21 @@ async function open(rig: Rig, id: string) {
 const color = (node: { props: { style?: unknown } }): unknown =>
   (StyleSheet.flatten(node.props.style as never) as { color?: unknown } | undefined)?.color;
 
+
+type Fiber = { memoizedProps?: Record<string, unknown> | null; return: Fiber | null; type: unknown } | null | undefined;
+
+/** The `onPress` a press of `element` runs, found as RNTL's `fireEvent` finds it: on the element's
+ * fiber or the components above it, up to the next host element. */
+function pressHandler(element: { unstable_fiber?: unknown }): (() => void) | undefined {
+  for (let fiber = element.unstable_fiber as Fiber; fiber; fiber = fiber.return) {
+    const onPress = fiber.memoizedProps?.onPress;
+    if (typeof onPress === "function") return onPress as () => void;
+    const parent = fiber.return;
+    if (!parent || typeof parent.type === "string") return undefined;
+  }
+  return undefined;
+}
+
 describe("the Session screen", () => {
   it("streams the session while shown, and stops when the user leaves", async () => {
     const rig = await launch([info("a")]);
@@ -417,9 +432,13 @@ describe("the Session screen", () => {
       const rig = await launch([info("a")]);
       await open(rig, "a");
       const more = screen.getByRole("button", { name: "Usage" });
+      // Two presses in one frame: the handler runs twice inside one act, with no render between
+      // them (two `fireEvent.press` calls would each open an act of their own, overlapping).
+      const press = pressHandler(more);
+      expect(typeof press).toBe("function");
       await act(async () => {
-        fireEvent.press(more);
-        fireEvent.press(more);
+        press?.();
+        press?.();
       });
       expect(rig.view.getPathname()).toBe("/usage");
       await fireEvent.press(screen.getByRole("button", { name: "Back" }));

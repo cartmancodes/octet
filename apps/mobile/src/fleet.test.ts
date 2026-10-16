@@ -766,3 +766,66 @@ describe("fix round 1", () => {
     expect(r.fleet.snapshot().macs).toBe(macs);
   });
 });
+
+describe("unpairing the last pairing, one with no link", () => {
+  /** studio and laptop paired, then a launch whose keychain will not give the tokens of `locked`. */
+  async function relaunch(...locked: string[]) {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio", "aa".repeat(32));
+    await pairWith(r, "laptop", "bb".repeat(32));
+    r.fleet.setForeground(false);
+    const keychain: Keychain = {
+      get: async (key) => {
+        if (locked.some((id) => key === tokenKeyOf(id))) throw new Error("locked");
+        return SecureStore.getItemAsync(key);
+      },
+      set: (key, value) => SecureStore.setItemAsync(key, value),
+      delete: (key) => SecureStore.deleteItemAsync(key),
+    };
+    const again = rig(keychain);
+    again.fleet.setForeground(true);
+    await again.fleet.init();
+    n.unregisterForNotificationsAsync.mockClear();
+    return again;
+  }
+
+  it("drops the phone's push registration: no Mac is left to say notifications off to", async () => {
+    const r = await relaunch("m00000001", "m00000002");
+    expect(r.fleet.snapshot().status).toBe("unpaired");
+    await r.fleet.unpair("m00000001");
+    await settle();
+    expect(n.unregisterForNotificationsAsync).not.toHaveBeenCalled(); // laptop's pairing is still kept
+    await r.fleet.unpair("m00000002");
+    await settle();
+    expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops it once when all go at once and none has a link", async () => {
+    const r = await relaunch("m00000001", "m00000002");
+    await r.fleet.unpair();
+    await settle();
+    expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves it to the linked Mac's goodbye when one goes with it: once if unheard, none if heard", async () => {
+    const r = await relaunch("m00000002");
+    const studio = socketOf(r, "studio");
+    studio.open();
+    studio.receive({ type: "welcome", device: "iPhone" });
+    await settle();
+    await r.fleet.unpair();
+    await settle();
+    expect(n.unregisterForNotificationsAsync).not.toHaveBeenCalled(); // the goodbye is out
+    const [bye] = studio.commandsOf("register_push").filter((c) => c.token === null);
+    studio.receive({ type: "ack", req: bye?.req, message: "Notifications off" });
+    await settle();
+    expect(n.unregisterForNotificationsAsync).not.toHaveBeenCalled();
+
+    const other = await relaunch("m00000002");
+    await other.fleet.unpair(); // studio is not ready: its goodbye drops the registration
+    await settle();
+    expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
+  });
+});

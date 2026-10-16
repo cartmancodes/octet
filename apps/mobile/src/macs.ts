@@ -64,9 +64,12 @@ export interface Pairing {
   macName: string;
 }
 
-const HOST = /^[a-z][a-z0-9+.-]*:\/\/(\[[^\]/]*\]|[^/:?#[\]]+)/i;
+/** A scheme, `//`, the host (never holding `@`), an optional port of 1 to 5 digits, then the end,
+ * a path, a query or a fragment: user info, or a `:` that is not such a port, matches nothing. */
+const HOST = /^[a-z][a-z0-9+.-]*:\/\/(\[[^\]/@]*\]|[^/:?#[\]@]+)(?::\d{1,5})?(?=$|[/?#])/i;
 
-/** The host of a hub address, as written ("[::1]" keeps its brackets); null when it has none. */
+/** The host of a hub address, as written ("[::1]" keeps its brackets); null when it has none, and
+ * for an address with user info or a port that is not 1 to 5 digits (the hub's rule for `mac`). */
 export function hostOf(url: string | null | undefined): string | null {
   return HOST.exec(url ?? "")?.[1] ?? null;
 }

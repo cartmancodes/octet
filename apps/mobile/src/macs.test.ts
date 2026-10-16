@@ -1,4 +1,4 @@
-import { MAC_ID, cleanMacName, keyOf, linksOf, machineWords, macNameOf, macOfHost, newMacId, rawOf, splitKey, tapKey } from "./macs";
+import { MAC_ID, cleanMacName, hostOf, keyOf, linksOf, machineWords, macNameOf, macOfHost, newMacId, rawOf, splitKey, tapKey } from "./macs";
 
 describe("session keys", () => {
   it("round-trip a Mac and a raw id", () => {
@@ -17,6 +17,30 @@ describe("session keys", () => {
   it("are null for anything that is not a key", () => {
     for (const bad of ["", "123-456", "/123-456", "m1/", "/"]) expect(splitKey(bad)).toBeNull();
     expect(rawOf("123-456")).toBeNull();
+  });
+});
+
+describe("hostOf", () => {
+  it("is the host of a hub address, without its port or path", () => {
+    expect(hostOf("wss://studio.tail1.ts.net/")).toBe("studio.tail1.ts.net");
+    expect(hostOf("wss://studio.tail1.ts.net:8443/")).toBe("studio.tail1.ts.net");
+    expect(hostOf("wss://studio.tail1.ts.net")).toBe("studio.tail1.ts.net");
+    expect(hostOf("wss://[::1]:443/")).toBe("[::1]");
+  });
+
+  it.each([
+    "wss://user@studio.tail1.ts.net/",
+    "wss://user:pass@studio.tail1.ts.net/",
+    "wss://evil.com:x@studio.tail1.ts.net/",
+    "wss://studio.tail1.ts.net@evil.com/",
+    "wss://studio.tail1.ts.net:/",
+    "wss://studio.tail1.ts.net:notaport/",
+    "wss://studio.tail1.ts.net:443:1/",
+    "wss://studio.tail1.ts.net:123456/",
+    "studio.tail1.ts.net",
+    "",
+  ])("is null for user info, a port that is not 1 to 5 digits, or no scheme: %s", (url) => {
+    expect(hostOf(url)).toBeNull();
   });
 });
 

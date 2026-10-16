@@ -676,7 +676,8 @@ export class Fleet {
    * The user unpairs Mac `mac` (with none, every Mac): each one's connection and what it sent
    * (keys, views, drafts, sent texts and toasts) are dropped at once, and Pair shows, with no
    * notice, when no Mac is left. Each ready link first tells its Mac "notifications off" (see
-   * `MacLink.goodbye`). Then the pairing leaves settings and its token the keychain (tried
+   * `MacLink.goodbye`); when no Mac is left and none of those unpaired had a link, the phone
+   * drops its push registration instead. Then the pairing leaves settings and its token the keychain (tried
    * twice). If either will not go, the notice says so; a token left behind is deleted at the next
    * launch. The device name stays to prefill the next pairing. The Mac keeps listing the phone
    * until `octet hub revoke` there. Pairing waits for the writes, so they cannot delete a new
@@ -689,11 +690,16 @@ export class Fleet {
     this.unpairing += 1;
     try {
       const last = ids.length === this.pairings.length;
-      for (const link of this.all.filter((l) => ids.includes(l.id))) {
+      const going = this.all.filter((l) => ids.includes(l.id));
+      for (const link of going) {
         // Best effort, sent before the link is released and never waited on.
         link.goodbye(last);
         this.drop(link);
       }
+      // No Mac is left, and none of these had a link to say "notifications off" on (each had its
+      // token unreadable, or still on its way): the phone drops its push registration itself, so
+      // that any Mac still pushing to it bounces and forgets the token.
+      if (last && going.length === 0) void dropPushRegistration();
       const removed = this.removeStored(ids, last);
       // Before any await: a foreground event now finds no client to start.
       this.emit(this.all.length === 0 ? { status: "unpaired", notice: null, offer: false } : { notice: null });

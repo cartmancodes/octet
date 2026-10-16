@@ -170,6 +170,21 @@ class FakeBridge {
   }
 }
 
+/** Whether `child` still runs: it has neither an exit code nor the signal that ended it. */
+const running = (child: ChildProcess): boolean => child.exitCode === null && child.signalCode === null;
+
+/** Stops `child` (TERM, then KILL after 3 s) and waits for it to end; returns at once for one that
+ * has already ended, by exiting or by a signal (whose `exit` has been emitted, so waiting for it
+ * would never end). */
+async function stopChild(child: ChildProcess | null): Promise<void> {
+  if (!child || !running(child)) return;
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.kill("SIGTERM");
+  const giveUp = setTimeout(() => child.kill("SIGKILL"), 3000);
+  await exited;
+  clearTimeout(giveUp);
+}
+
 run("the app's hub client against the real octet hub", () => {
   let root = "";
   let binDir = "";
@@ -297,13 +312,7 @@ run("the app's hub client against the real octet hub", () => {
     for (const ws of sockets) ws.terminate();
     bridge?.close();
     pushFake?.close();
-    if (hub && hub.exitCode === null) {
-      const exited = new Promise<void>((resolve) => hub?.once("exit", () => resolve()));
-      hub.kill("SIGTERM");
-      const giveUp = setTimeout(() => hub?.kill("SIGKILL"), 3000);
-      await exited;
-      clearTimeout(giveUp);
-    }
+    await stopChild(hub);
     if (root) rmSync(root, { recursive: true, force: true });
     if (binDir) rmSync(binDir, { recursive: true, force: true });
   });
@@ -599,83 +608,112 @@ interface MacHub {
   control: (request: Obj) => Promise<Obj>;
 }
 
+/** What a start made, filled in as it goes, so that a test can check a failed start left none of
+ * it behind. */
+interface StartSeen {
+  dirs?: string[];
+  bridge?: FakeBridge;
+  child?: ChildProcess;
+}
+
+interface StartOptions {
+  /** The `octet` to run; the built one unless a test gives a stand-in. */
+  binary?: string;
+  /** How long to wait for the hub to say it is published. */
+  readyMs?: number;
+  seen?: StartSeen;
+}
+
 /** Starts `octet hub` on a fresh port and temp root, published (to the stand-in) at `host`, with
- * a fake bridge whose one session is `${pid}-1790000000`: two of these list the same raw id. */
-async function startMacHub(host: string): Promise<MacHub> {
+ * a fake bridge whose one session is `${pid}-1790000000`: two of these list the same raw id. A
+ * start that fails (the hub exits, or never says it is published within `readyMs`) stops the
+ * child, closes the bridge and removes both temp dirs before it rejects, so nothing is left to
+ * keep jest running. */
+async function startMacHub(host: string, { binary = BINARY, readyMs = 8000, seen = {} }: StartOptions = {}): Promise<MacHub> {
   const root = mkdtempSync(path.join(tmpdir(), "omd"));
   const binDir = mkdtempSync(path.join(tmpdir(), "omb"));
-  const runDir = path.join(root, "run");
-  const sock = path.join(runDir, "hub.sock");
-  if (sock.length > 100) throw new Error(`the temp path is too long for a Unix socket: ${sock}`);
-  mkdirSync(runDir, { recursive: true });
-  const port = await freePort();
-  const serveStatus = JSON.stringify({
-    TCP: { "443": { HTTPS: true } },
-    Web: { [`${host}:443`]: { Handlers: { "/": { Proxy: `http://127.0.0.1:${port}` } } } },
-  });
-  const script = path.join(binDir, "tailscale");
-  writeFileSync(
-    script,
-    `#!/bin/sh\nif [ "$1 $2 $3" = "serve status --json" ]; then printf '%s' '${serveStatus}'; else exit 1; fi\n`,
-  );
-  chmodSync(script, 0o755);
-  let seq = 0;
-  const journal = (type: string, data: unknown): number => {
-    appendFileSync(path.join(root, JOURNAL), `${JSON.stringify({ format: "octet-preview-1", seq, type, data })}\n`);
-    return seq++;
-  };
-  journal("text", `hello from ${host}`);
-  const pid = process.pid;
-  const sessionId = `${pid}-1790000000`;
-  const bridge = new FakeBridge(path.join(runDir, `${pid}.sock`), (line) => ({ v: 1, type: "ack", req: line.req, message: "answered" }));
-  await bridge.listen();
-  writeFileSync(
-    path.join(runDir, `${pid}.json`),
-    JSON.stringify({
-      id: sessionId,
-      pid,
-      started: 1_790_000_000,
-      socket: bridge.socketPath,
-      engine: "claude",
-      workspace: path.join(root, "ws"),
-      model: "opus",
-      mode: "ask",
-      vendor_session: "",
-      journals: [path.join(root, JOURNAL)],
-      from_phone: false,
-    }),
-  );
-  const child = spawn(BINARY, ["hub", "--journal-dir", root, "--port", String(port), "--owner", OWNER], {
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}`, NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  process.once("exit", () => child.kill("SIGKILL"));
+  seen.dirs = [root, binDir];
+  let bridge: FakeBridge | null = null;
+  let child: ChildProcess | null = null;
   let out = "";
-  child.stdout?.on("data", (d: Buffer) => (out += d.toString()));
-  child.stderr?.on("data", (d: Buffer) => (out += d.toString()));
-  const end = Date.now() + 8000;
-  for (;;) {
-    const published = await control(sock, { type: "status" }).then(
-      (status) => status.published === true,
-      () => false,
+  try {
+    const runDir = path.join(root, "run");
+    const sock = path.join(runDir, "hub.sock");
+    if (sock.length > 100) throw new Error(`the temp path is too long for a Unix socket: ${sock}`);
+    mkdirSync(runDir, { recursive: true });
+    const port = await freePort();
+    const serveStatus = JSON.stringify({
+      TCP: { "443": { HTTPS: true } },
+      Web: { [`${host}:443`]: { Handlers: { "/": { Proxy: `http://127.0.0.1:${port}` } } } },
+    });
+    const script = path.join(binDir, "tailscale");
+    writeFileSync(
+      script,
+      `#!/bin/sh\nif [ "$1 $2 $3" = "serve status --json" ]; then printf '%s' '${serveStatus}'; else exit 1; fi\n`,
     );
-    if (published) break;
-    if (Date.now() > end) throw new Error(`timed out waiting for the hub at ${host}\n${out}`);
-    await sleep(50);
+    chmodSync(script, 0o755);
+    let seq = 0;
+    const journal = (type: string, data: unknown): number => {
+      appendFileSync(path.join(root, JOURNAL), `${JSON.stringify({ format: "octet-preview-1", seq, type, data })}\n`);
+      return seq++;
+    };
+    journal("text", `hello from ${host}`);
+    const pid = process.pid;
+    const sessionId = `${pid}-1790000000`;
+    bridge = new FakeBridge(path.join(runDir, `${pid}.sock`), (line) => ({ v: 1, type: "ack", req: line.req, message: "answered" }));
+    seen.bridge = bridge;
+    await bridge.listen();
+    writeFileSync(
+      path.join(runDir, `${pid}.json`),
+      JSON.stringify({
+        id: sessionId,
+        pid,
+        started: 1_790_000_000,
+        socket: bridge.socketPath,
+        engine: "claude",
+        workspace: path.join(root, "ws"),
+        model: "opus",
+        mode: "ask",
+        vendor_session: "",
+        journals: [path.join(root, JOURNAL)],
+        from_phone: false,
+      }),
+    );
+    const started = spawn(binary, ["hub", "--journal-dir", root, "--port", String(port), "--owner", OWNER], {
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}`, NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child = started;
+    seen.child = started;
+    process.once("exit", () => started.kill("SIGKILL"));
+    started.stdout?.on("data", (d: Buffer) => (out += d.toString()));
+    started.stderr?.on("data", (d: Buffer) => (out += d.toString()));
+    const end = Date.now() + readyMs;
+    for (;;) {
+      const published = await control(sock, { type: "status" }).then(
+        (status) => status.published === true,
+        () => false,
+      );
+      if (published) break;
+      if (!running(started)) throw new Error(`the hub at ${host} exited before it was published\n${out}`);
+      if (Date.now() > end) throw new Error(`timed out waiting for the hub at ${host}\n${out}`);
+      await sleep(50);
+    }
+    const hubBridge = bridge;
+    return { host, root, binDir, port, sessionId, bridge: hubBridge, child: started, log: () => out, journal, control: (request) => control(sock, request) };
+  } catch (error) {
+    await stopChild(child);
+    bridge?.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    throw error;
   }
-  return { host, root, binDir, port, sessionId, bridge, child, log: () => out, journal, control: (request) => control(sock, request) };
 }
 
 async function stopMacHub(mac: MacHub | null): Promise<void> {
   if (!mac) return;
   mac.bridge.close();
-  if (mac.child.exitCode === null) {
-    const exited = new Promise<void>((resolve) => mac.child.once("exit", () => resolve()));
-    mac.child.kill("SIGTERM");
-    const giveUp = setTimeout(() => mac.child.kill("SIGKILL"), 3000);
-    await exited;
-    clearTimeout(giveUp);
-  }
+  await stopChild(mac.child);
   rmSync(mac.root, { recursive: true, force: true });
   rmSync(mac.binDir, { recursive: true, force: true });
 }
@@ -709,7 +747,11 @@ run("two Macs: the phone's store fed by two real hubs", () => {
   const transcript = (key: string): string => JSON.stringify(entriesNow(store, key));
 
   beforeAll(async () => {
-    [studio, mini] = await Promise.all([startMacHub("studio.test.ts.net"), startMacHub("mini.test.ts.net")]);
+    // Each start is kept whether or not the other fails, so afterAll stops whichever came up.
+    const [a, b] = await Promise.allSettled([startMacHub("studio.test.ts.net"), startMacHub("mini.test.ts.net")]);
+    studio = a.status === "fulfilled" ? a.value : null;
+    mini = b.status === "fulfilled" ? b.value : null;
+    for (const start of [a, b]) if (start.status === "rejected") throw start.reason;
   });
 
   afterAll(async () => {
@@ -777,5 +819,50 @@ run("two Macs: the phone's store fed by two real hubs", () => {
       code: "unsent",
     });
     expect(studio.bridge.lines.filter((l) => l.type === "answer")).toEqual([]);
+  });
+});
+
+// The helpers above, on their own: a start that fails leaves nothing behind, and stopping a hub
+// that already died returns at once. Neither needs the octet binary.
+describe("the contract's hub helpers", () => {
+  const scratch: string[] = [];
+  afterAll(() => {
+    for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
+  });
+  /** A stand-in for `octet` that runs `body`. */
+  function fakeBinary(body: string): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "omf"));
+    scratch.push(dir);
+    const file = path.join(dir, "octet");
+    writeFileSync(file, `#!/bin/sh\n${body}\n`);
+    chmodSync(file, 0o755);
+    return file;
+  }
+
+  it.each([
+    ["never publishes", "exec sleep 30"],
+    ["exits at once", "exit 3"],
+  ])("a hub that %s: the start rejects, the child is stopped, the bridge closed and the temp dirs gone", async (_what, body) => {
+    const seen: StartSeen = {};
+    await expect(startMacHub("dead.test.ts.net", { binary: fakeBinary(body), readyMs: 1500, seen })).rejects.toThrow(
+      /timed out waiting for the hub at dead\.test\.ts\.net|the hub at dead\.test\.ts\.net exited/,
+    );
+    expect(seen.child).toBeDefined();
+    expect(seen.child && running(seen.child)).toBe(false);
+    expect(seen.bridge?.server.listening).toBe(false);
+    expect(seen.dirs?.length).toBe(2);
+    for (const dir of seen.dirs ?? []) expect(existsSync(dir)).toBe(false);
+  });
+
+  it("stopping a hub that a signal already ended returns at once", async () => {
+    const child = spawn("sleep", ["30"], { stdio: "ignore" });
+    await new Promise<void>((resolve) => child.once("spawn", () => resolve()));
+    const ended = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    child.kill("SIGKILL");
+    await ended;
+    expect(child.exitCode).toBeNull();
+    expect(child.signalCode).toBe("SIGKILL");
+    const late = new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 1000));
+    await expect(Promise.race([stopChild(child).then(() => "stopped"), late])).resolves.toBe("stopped");
   });
 });

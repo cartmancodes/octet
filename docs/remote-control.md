@@ -571,7 +571,9 @@ phone already has (the same host) replaces its pairing and keeps its name. A
   `octet hub revoke "NAME"` on it (`octet hub devices` lists the names). The
   app ignores those pushes' sessions (their host matches no pairing, so a tap
   only opens the Inbox), but they still show. Unpairing the last Mac also
-  turns the phone's push registration off when that Mac doesn't answer.
+  turns the phone's push registration off when that Mac doesn't answer, or
+  when the phone had no connection to it at all (its pairing credentials
+  couldn't be read).
 
 ### Keep a session off the phone
 

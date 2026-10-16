@@ -225,6 +225,8 @@ describe("what a tap names of its Mac", () => {
     ["a port", "studio.tail1.ts.net:443"],
     ["a path", "studio/../x"],
     ["user info", "me@studio.ts.net"],
+    ["user info with a password", "user:pass@studio.ts.net"],
+    ["user info that looks like a host and port", "evil.com:x@studio.ts.net"],
     ["a space", "stu dio.ts.net"],
     ["a newline", "studio.ts.net\n"],
     ["a leading hyphen", "-studio.ts.net"],
