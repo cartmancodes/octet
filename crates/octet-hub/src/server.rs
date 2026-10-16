@@ -596,6 +596,8 @@ pub struct Hub {
     pusher: Pusher,
     /// Posts pushes in the background.
     sender: Sender,
+    /// Where the hub is published, as Tailscale last said: each push names its host as `mac`.
+    published: Published,
     /// The last id given to a connection, hub req or replay.
     ids: u64,
 }
@@ -693,7 +695,8 @@ impl Hub {
         let accept_task = tokio::spawn(accept_tcp(listener, gate, streams)).abort_handle();
         let publish_task =
             tokio::spawn(watch_published(port, publisher, recheck, published_in)).abort_handle();
-        let control_task = tokio::spawn(serve_control(control, requests, published)).abort_handle();
+        let control_task =
+            tokio::spawn(serve_control(control, requests, published.clone())).abort_handle();
         let mut hub = Hub {
             store,
             sessions: Sessions::new(run),
@@ -714,6 +717,7 @@ impl Hub {
             events,
             pusher: Pusher::default(),
             sender: Sender::new(push::endpoint(), dead_tokens),
+            published,
             ids: 0,
         };
         hub.sessions.refresh().await;
@@ -1603,7 +1607,8 @@ impl Hub {
         if batch.is_empty() {
             return;
         }
-        self.sender.dispatch(batch);
+        let mac = push_mac(&self.published.borrow());
+        self.sender.dispatch(batch, mac);
     }
 
     /// Clears push tokens Expo says no device has, from `devices.json` and the connections'
@@ -1828,6 +1833,15 @@ enum Publication {
 
 /// The hub's [`Publication`], as last asked.
 type Published = watch::Receiver<Publication>;
+
+/// The `mac` a push names: the host of the hub's published URL, when it is published and that
+/// host is a DNS name ([`push::mac_of`]); `None` otherwise.
+fn push_mac(publication: &Publication) -> Option<String> {
+    match publication {
+        Publication::At(url) => push::mac_of(url),
+        Publication::Unknown | Publication::Nowhere => None,
+    }
+}
 
 /// Asks `publisher` where `port` is published, now and then every `recheck`, so that control
 /// requests answer from what it last said and never wait on Tailscale.
@@ -2330,6 +2344,20 @@ mod tests {
             .iter()
             .map(|&(journal, seq)| (journal.to_owned(), seq, format!("{journal}{seq}")))
             .collect()
+    }
+
+    #[test]
+    fn pushes_name_the_mac_only_while_the_hub_is_published() {
+        let at = |url: &str| Publication::At(url.to_owned());
+        assert_eq!(
+            push_mac(&at("https://Studio.tail1234.ts.net")).as_deref(),
+            Some("studio.tail1234.ts.net")
+        );
+        assert_eq!(push_mac(&Publication::Unknown), None);
+        assert_eq!(push_mac(&Publication::Nowhere), None);
+        // A published URL whose host is no DNS name is no `mac`.
+        assert_eq!(push_mac(&at("https://user@studio.ts.net")), None);
+        assert_eq!(push_mac(&at("https://-studio.ts.net")), None);
     }
 
     #[test]

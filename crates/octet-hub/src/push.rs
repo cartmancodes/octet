@@ -18,6 +18,10 @@
 //! arrive before a session's first bridge state are absorbed into the pusher's seed, and push
 //! nothing.
 //!
+//! A push's data is the session's opaque id and, while the hub is published, `mac`: the host of
+//! its published URL ([`mac_of`]), which the phone paired with and uses to pick the Mac a tap is
+//! for. The title and body never change.
+//!
 //! [`send`] posts a batch with `curl`: literal argv, the JSON body on stdin, so no token is in
 //! `ps`. The only log lines are `Push failed` and `Push refused: <code>`.
 use octet_core::remote::protocol::PushKinds;
@@ -89,6 +93,34 @@ fn endpoint_from(seam: Option<&str>) -> String {
     local.unwrap_or(EXPO_URL).to_owned()
 }
 
+/// The longest DNS name a push names as its `mac`.
+const MAC_CHARS: usize = 253;
+/// The longest label of that name.
+const LABEL_CHARS: usize = 63;
+
+/// The `mac` of a push: the host of the hub's published URL (its scheme, port, path, query and
+/// fragment dropped), lowercased, when it is a DNS name of at most 253 characters whose labels are
+/// 1 to 63 of `a-z`, `0-9` and `-`, never starting or ending with `-`; `None` for anything else
+/// (no `://`, user info, an IP v6 literal, a trailing dot, any other character).
+pub(crate) fn mac_of(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let label_ok = |label: &str| {
+        (1..=LABEL_CHARS).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    (host.len() <= MAC_CHARS && host.split('.').all(label_ok)).then_some(host)
+}
+
 /// What one session looked like at one moment.
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
@@ -134,13 +166,19 @@ pub(crate) struct Due {
 }
 
 impl Due {
-    /// The Expo message for `token`: a fixed title and body, the session's opaque id, nothing else.
-    pub(crate) fn message(&self, token: &str) -> Value {
+    /// The Expo message for `token`: a fixed title and body, the session's opaque id and, when
+    /// the hub knows it, `mac`, the host it is published at (which the phone paired with, so it
+    /// names nothing the phone does not hold already), nothing else. `mac` goes in the data only,
+    /// never in what the notification shows.
+    pub(crate) fn message(&self, token: &str, mac: Option<&str>) -> Value {
         let mut message = json!({
             "to": token,
             "title": "Octet",
             "data": {"session": self.session},
         });
+        if let Some(mac) = mac {
+            message["data"]["mac"] = json!(mac);
+        }
         let (body, priority, channel) = match self.kind {
             Kind::Approval => ("Approval waiting", "high", "approvals"),
             Kind::Error => ("Session error", "high", "errors"),
@@ -561,10 +599,10 @@ impl Sender {
         }
     }
 
-    /// Posts the pushes `batch` (a token and what it is for) in a task of their own, and reports
-    /// the dead tokens. If every slot is busy the batch is dropped, logged as `Push failed`, and
-    /// this is false. Never waits.
-    pub(crate) fn dispatch(&self, batch: Vec<(String, Due)>) -> bool {
+    /// Posts the pushes `batch` (a token and what it is for), each naming `mac` (see
+    /// [`Due::message`]), in a task of their own, and reports the dead tokens. If every slot is
+    /// busy the batch is dropped, logged as `Push failed`, and this is false. Never waits.
+    pub(crate) fn dispatch(&self, batch: Vec<(String, Due)>, mac: Option<String>) -> bool {
         let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() else {
             report(&[Outcome::Failed]);
             return false;
@@ -577,7 +615,7 @@ impl Sender {
         tokio::spawn(async move {
             let messages: Vec<Value> = batch
                 .iter()
-                .map(|(token, due)| due.message(token))
+                .map(|(token, due)| due.message(token, mac.as_deref()))
                 .collect();
             let outcomes = send_with(&program, &endpoint, &messages).await;
             drop(slot);
@@ -1109,7 +1147,7 @@ mod tests {
             session: "123-456".into(),
         };
         assert_eq!(
-            approval.message(token),
+            approval.message(token, None),
             json!({"to": token, "title": "Octet", "body": "Approval waiting",
                 "data": {"session": "123-456"}, "sound": "default", "priority": "high",
                 "channelId": "approvals"})
@@ -1119,7 +1157,7 @@ mod tests {
             session: "123-456".into(),
         };
         assert_eq!(
-            turn.message(token),
+            turn.message(token, None),
             json!({"to": token, "title": "Octet", "body": "Turn finished",
                 "data": {"session": "123-456"}, "priority": "normal", "channelId": "turns"})
         );
@@ -1128,10 +1166,91 @@ mod tests {
             session: "123-456".into(),
         };
         assert_eq!(
-            error.message(token),
+            error.message(token, None),
             json!({"to": token, "title": "Octet", "body": "Session error",
                 "data": {"session": "123-456"}, "priority": "high", "channelId": "errors"})
         );
+    }
+
+    #[test]
+    fn a_published_hub_names_its_mac_in_the_data_only() {
+        let token = "ExpoPushToken[abc]";
+        for kind in [Kind::Approval, Kind::Error, Kind::Turn] {
+            let due = Due {
+                kind,
+                session: "123-456".into(),
+            };
+            let plain = due.message(token, None);
+            let named = due.message(token, Some("studio.tail1.ts.net"));
+            assert_eq!(
+                named["data"],
+                json!({"session": "123-456", "mac": "studio.tail1.ts.net"})
+            );
+            // Everything else is the content-free message as it was: the title and the body
+            // never carry the host.
+            let mut without = named.clone();
+            without["data"] = plain["data"].clone();
+            assert_eq!(without, plain);
+            assert_eq!(named["title"], "Octet");
+            assert!(
+                !named["body"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("studio")
+            );
+        }
+    }
+
+    #[test]
+    fn the_mac_is_the_published_hosts_name_lowercased() {
+        for (url, mac) in [
+            ("https://studio.tail1234.ts.net", "studio.tail1234.ts.net"),
+            ("https://Studio.Tail1234.TS.net/", "studio.tail1234.ts.net"),
+            (
+                "https://mac.tail1.ts.net:8443/hub?x=1#y",
+                "mac.tail1.ts.net",
+            ),
+            ("https://mac-mini-2.tail1.ts.net", "mac-mini-2.tail1.ts.net"),
+            ("https://100.64.0.7", "100.64.0.7"),
+            ("https://localhost", "localhost"),
+        ] {
+            assert_eq!(mac_of(url).as_deref(), Some(mac), "{url}");
+        }
+        // The longest name and label that are allowed.
+        let label = "a".repeat(63);
+        let long = format!("{label}.{label}.{label}.{}", "b".repeat(61));
+        assert_eq!(long.len(), 253);
+        assert_eq!(mac_of(&format!("https://{long}/")), Some(long));
+    }
+
+    #[test]
+    fn a_hostile_or_odd_host_is_left_out() {
+        let label = "a".repeat(63);
+        let too_long = format!("https://{label}.{label}.{label}.{}", "b".repeat(62));
+        let too_long_label = format!("https://{}.ts.net", "a".repeat(64));
+        for url in [
+            "",
+            "studio.tail1.ts.net",
+            "https://",
+            "https:///path",
+            "https://-studio.ts.net",
+            "https://studio-.ts.net",
+            "https://studio..ts.net",
+            "https://.studio.ts.net",
+            "https://studio.ts.net.",
+            "https://stu_dio.ts.net",
+            "https://stu dio.ts.net",
+            "https://user@studio.ts.net",
+            "https://studio.ts.net%2f",
+            "https://[::1]:443/",
+            "https://studio.ts.net\n.evil",
+            "https://stüdio.ts.net",
+            "https://studio\u{202e}.ts.net",
+            too_long.as_str(),
+            too_long_label.as_str(),
+        ] {
+            assert_eq!(mac_of(url), None, "{url:?}");
+        }
     }
 
     #[test]
@@ -1294,7 +1413,7 @@ mod tests {
                 },
             )]
         };
-        let accepted: Vec<bool> = (0..6).map(|_| sender.dispatch(batch())).collect();
+        let accepted: Vec<bool> = (0..6).map(|_| sender.dispatch(batch(), None)).collect();
         assert_eq!(accepted, [true, true, true, true, false, false]);
         let _ = std::fs::remove_dir_all(&dir);
     }

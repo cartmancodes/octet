@@ -36,6 +36,8 @@ const WAIT: Duration = Duration::from_secs(5);
 /// How long a push may take: the 2 s window, the hub's 1 s sweep, and `curl`.
 const PUSH_WITHIN: Duration = Duration::from_secs(10);
 const JOURNAL: &str = "session-1-1.jsonl";
+/// The host every hub here is published at, as its pushes name it.
+const MAC: &str = "mac.tail1234.ts.net";
 
 type Phone = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -380,10 +382,11 @@ async fn pushes_after(fake: &Fake, token: &str, wait: Duration) -> usize {
     fake.to(token).len()
 }
 
-/// What a push looks like on the phone: exactly these keys, nothing from the session.
+/// What a push looks like on the phone: exactly these keys, nothing from the session, and the
+/// hub's own published host as `mac`.
 fn approval_message(token: &str, session: &str) -> Value {
     json!({"to": token, "title": "Octet", "body": "Approval waiting",
-        "data": {"session": session}, "sound": "default", "priority": "high",
+        "data": {"session": session, "mac": MAC}, "sound": "default", "priority": "high",
         "channelId": "approvals"})
 }
 
@@ -510,7 +513,7 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     assert_eq!(
         turn,
         json!({"to": TOKEN, "title": "Octet", "body": "Turn finished",
-            "data": {"session": env.id}, "priority": "normal", "channelId": "turns"})
+            "data": {"session": env.id, "mac": MAC}, "priority": "normal", "channelId": "turns"})
     );
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 2);
     // An error in the session's journal: one push, which says nothing of the error.
@@ -520,7 +523,7 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     assert_eq!(
         error,
         json!({"to": TOKEN, "title": "Octet", "body": "Session error",
-            "data": {"session": env.id}, "priority": "high", "channelId": "errors"})
+            "data": {"session": env.id, "mac": MAC}, "priority": "high", "channelId": "errors"})
     );
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 3);
 
