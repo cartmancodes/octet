@@ -1762,7 +1762,13 @@ impl Hub {
         let Some(activity) = self.activity.as_mut() else {
             return;
         };
-        if !activity.reported(report) {
+        let stored = self
+            .store
+            .devices()
+            .iter()
+            .find(|device| device.token_sha256 == report.device)
+            .and_then(|device| device.activity.as_ref()?.token.clone());
+        if !activity.reported(report, stored.as_deref()) {
             return;
         }
         match self.store.drop_activity_token(&report.token).await {

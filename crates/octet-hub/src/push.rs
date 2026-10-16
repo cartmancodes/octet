@@ -251,6 +251,12 @@ impl std::fmt::Debug for Limiter {
 impl Limiter {
     /// Whether `device` may be sent one more at `now`; if so, it is counted.
     pub(crate) fn allow(&mut self, device: &str, now: Instant) -> bool {
+        self.allow_keeping(device, now, 0)
+    }
+
+    /// Whether `device` may be sent one more at `now` and still have `keep` left in its minute
+    /// for others; if so, it is counted. [`allow`](Self::allow) keeps none.
+    pub(crate) fn allow_keeping(&mut self, device: &str, now: Instant, keep: usize) -> bool {
         let sent = self.sent.entry(device.to_owned()).or_default();
         while sent
             .front()
@@ -258,7 +264,7 @@ impl Limiter {
         {
             sent.pop_front();
         }
-        if sent.len() >= CAP {
+        if sent.len() + keep >= CAP {
             return false;
         }
         sent.push_back(now);

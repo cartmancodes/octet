@@ -16,16 +16,18 @@
 //!   that starts) while the device is not connected and has no activity the hub knows of. News
 //!   seen while it is connected is spent, so leaving the app starts nothing by itself. A
 //!   session's first state only seeds, so a hub restart starts nothing either.
-//! - **Update**, to the device's activity `token`: when the kind or the approval count changes,
-//!   at most once per [`UPDATE_GAP`]. Without an activity token the hub cannot update; it only
+//! - **Update**, to the device's activity `token`: when the kind, the approval count or the
+//!   leading session changes, at most once per [`UPDATE_GAP`]. Without an activity token the hub cannot update; it only
 //!   starts and ends.
 //! - **End**, to the activity token, with `dismissal-date`: [`IDLE_END`] after every session went
 //!   idle, or when a connection of the device starts streaming, after which the app drives the
 //!   activity itself.
 //!
 //! Every send also takes one from the device's allowance in the [`Limiter`] the pushes use, so the
-//! two together stay within its cap. One the allowance has no room for waits for the next look;
-//! nothing retries a send that went out.
+//! two together stay within its cap, and goes only while one more is left after it, so an approval
+//! push that follows still fits. One the allowance has no room for waits for the next look, as
+//! does one with no free send slot. Nothing retries a send that went out, but an end APNs failed
+//! (other than with a 410) is sent again, a few times at most.
 //!
 //! The payload ([`Due::payload`]) names no session name, workspace, command or file: only the
 //! kind, the hub's raw session id, the host the hub is published at (`mac`), two times and a
@@ -48,7 +50,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     time::Instant,
 };
 
@@ -56,6 +58,11 @@ use tokio::{
 pub(crate) const UPDATE_GAP: Duration = Duration::from_secs(2);
 /// How long every session must have been idle before the hub ends the activity.
 pub(crate) const IDLE_END: Duration = Duration::from_mins(5);
+/// Sends a device's minute keeps for its pushes: a Live Activity send goes only while at least
+/// one more is left after it, so an approval push that follows still fits.
+const KEEP_FOR_PUSHES: usize = 1;
+/// How many times one end is sent, at most, while APNs fails it (a 410 is never tried again).
+const END_TRIES: u8 = 3;
 /// The one log line: a send that failed, naming no token, JWT or host.
 pub(crate) const SEND_FAILED: &str = "Live Activity push failed";
 /// Sends that may run at once; one that finds them all busy is not sent.
@@ -125,6 +132,8 @@ pub(crate) struct Content {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Due {
     pub event: Event,
+    /// Which of the device's activities it is for: each start begins a new one.
+    pub run: u64,
     /// The `ActivityKit` token it goes to.
     pub token: String,
     pub content: Content,
@@ -135,6 +144,7 @@ impl fmt::Debug for Due {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Due")
             .field("event", &self.event)
+            .field("run", &self.run)
             .field("token", &"<redacted>")
             .field("content", &self.content)
             .finish()
@@ -142,10 +152,15 @@ impl fmt::Debug for Due {
 }
 
 impl Due {
-    /// How soon APNs should deliver it: at once for a start and for an approval, else when it
-    /// suits the phone.
+    /// How soon APNs should deliver it: at once for a start and for an update while an approval
+    /// waits; an end, and any other update, when it suits the phone.
     pub(crate) fn priority(&self) -> Priority {
-        if self.event == Event::Start || self.content.kind == Kind::Approval {
+        let urgent = match self.event {
+            Event::Start => true,
+            Event::Update => self.content.kind == Kind::Approval,
+            Event::End => false,
+        };
+        if urgent {
             Priority::Immediate
         } else {
             Priority::Normal
@@ -173,7 +188,8 @@ impl Due {
         match self.event {
             Event::Start => {
                 // ActivityKit makes the activity from the attributes, and wants an alert to start
-                // one by push.
+                // one by push. For an approval that alert comes on top of the push notification
+                // the pusher sends for it: two alerts for one approval, which is accepted.
                 let body = if self.content.kind == Kind::Approval {
                     "Approval waiting"
                 } else {
@@ -227,19 +243,25 @@ impl Session {
     }
 }
 
-/// What the driver remembers of one device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the driver remembers of one device. It holds a token, so it has no `Debug`.
 struct Phone {
     /// Whether an activity the hub started since the device last connected may still run.
     live: bool,
-    /// The kind and the count that activity was last sent.
-    told: Option<(Kind, usize)>,
+    /// The kind, the count and the leading session that activity was last sent.
+    told: Option<(Kind, usize, String)>,
     /// When the hub last sent to it.
     last: Option<Instant>,
     /// The driver's news this device was last judged on.
     news: u64,
     /// Whether an end waits to go out.
     end: bool,
+    /// The activity the hub last started for it ([`Due::run`]); 0 for none.
+    run: u64,
+    /// The activity token the device held when that activity started, which belongs to an
+    /// earlier one: a 410 on it says nothing of this one.
+    stale: Option<String>,
+    /// How many times that activity's end was sent.
+    ends: u8,
 }
 
 impl Phone {
@@ -251,6 +273,9 @@ impl Phone {
             last: None,
             news,
             end: false,
+            run: 0,
+            stale: None,
+            ends: 0,
         }
     }
 
@@ -271,6 +296,8 @@ pub(crate) struct Driver {
     sessions: HashMap<String, Session>,
     /// Bumped for each look that found news: a new approval or a turn that starts.
     news: u64,
+    /// Bumped for each start, so a report can say which activity it was about.
+    runs: u64,
     /// When every session last went idle; none while one waits or runs, or before the first look.
     idle_since: Option<Instant>,
     /// By device key.
@@ -410,12 +437,53 @@ impl Driver {
         phone.news = news;
     }
 
-    /// The activity the hub drives for `device` is not there: its start did not go out, or APNs
-    /// said its token is gone. The next news starts another.
-    pub(crate) fn lost(&mut self, device: &str) {
-        if let Some(phone) = self.phones.get_mut(device) {
-            phone.live = false;
-            phone.told = None;
+    /// What APNs said to a send that did not go well, given the activity token the device holds
+    /// now (`stored`). Only a report about the activity the hub drives now counts:
+    ///
+    /// - a start that did not go out leaves the device with none, so the next news starts one;
+    /// - a 410 on an update forgets the activity only when the token is the one the device holds
+    ///   now and was registered after the start (one from before belongs to an earlier activity,
+    ///   and one since replaced says nothing either);
+    /// - an end that failed, other than with a 410, is sent again at a later look, within the
+    ///   cap, [`END_TRIES`] times in all.
+    pub(crate) fn failed(&mut self, report: &Report, stored: Option<&str>) {
+        let Some(phone) = self.phones.get_mut(&report.device) else {
+            return;
+        };
+        if phone.run != report.run {
+            return;
+        }
+        let token = report.token.as_str();
+        match (report.event, report.outcome) {
+            (_, Outcome::Sent)
+            | (Event::Update, Outcome::Failed(_))
+            | (Event::End, Outcome::Gone) => {}
+            (Event::Start, _) => {
+                phone.live = false;
+                phone.told = None;
+            }
+            (Event::Update, Outcome::Gone) => {
+                if stored == Some(token) && phone.stale.as_deref() != Some(token) {
+                    phone.live = false;
+                    phone.told = None;
+                }
+            }
+            (Event::End, Outcome::Failed(_)) => {
+                if !phone.live && phone.ends < END_TRIES {
+                    phone.end = true;
+                }
+            }
+        }
+    }
+
+    /// The device has no tokens (`clear_activity`): an activity the hub was driving, or an end
+    /// waiting, is forgotten, so tokens registered again start afresh.
+    fn cleared(&mut self, device: &str) {
+        let news = self.news;
+        if let Some(phone) = self.phones.get_mut(device)
+            && (phone.live || phone.end)
+        {
+            *phone = Phone::new(news);
         }
     }
 
@@ -425,7 +493,7 @@ impl Driver {
     }
 
     /// The send due to `device` at `now`, given its tokens and whether it is `connected`, if
-    /// there is one and `cap` has room for it (which it then takes).
+    /// there is one and `cap` has room for it with [`KEEP_FOR_PUSHES`] left (it then takes one).
     pub(crate) fn due_for(
         &mut self,
         device: &str,
@@ -434,6 +502,10 @@ impl Driver {
         cap: &mut Limiter,
         now: Instant,
     ) -> Option<Due> {
+        let Some(tokens) = tokens else {
+            self.cleared(device);
+            return None;
+        };
         let content = self.content(now);
         let idle_long = content.kind == Kind::Done
             && self
@@ -444,7 +516,7 @@ impl Driver {
             .phones
             .entry(device.to_owned())
             .or_insert_with(|| Phone::new(news));
-        let token = tokens.and_then(|tokens| tokens.token.clone());
+        let token = tokens.token.clone();
         if phone.live && idle_long {
             phone.ending();
         }
@@ -454,12 +526,14 @@ impl Driver {
                 phone.end = false;
                 return None;
             };
-            if !cap.allow(device, now) {
+            if !cap.allow_keeping(device, now, KEEP_FOR_PUSHES) {
                 return None;
             }
             phone.end = false;
+            phone.ends += 1;
             phone.last = Some(now);
             return Some(Due {
+                run: phone.run,
                 event: Event::End,
                 token,
                 content,
@@ -469,22 +543,23 @@ impl Driver {
             phone.news = news;
             return None;
         }
-        let shown = (content.kind, content.approvals);
+        let shown = (content.kind, content.approvals, content.session.clone());
         if phone.live {
             phone.news = news;
-            if phone.told == Some(shown) {
+            if phone.told.as_ref() == Some(&shown) {
                 return None;
             }
             let token = token?;
             let soon = phone
                 .last
                 .is_some_and(|at| now.saturating_duration_since(at) < UPDATE_GAP);
-            if soon || !cap.allow(device, now) {
+            if soon || !cap.allow_keeping(device, now, KEEP_FOR_PUSHES) {
                 return None;
             }
             phone.told = Some(shown);
             phone.last = Some(now);
             return Some(Due {
+                run: phone.run,
                 event: Event::Update,
                 token,
                 content,
@@ -493,23 +568,28 @@ impl Driver {
         if phone.news == news {
             return None;
         }
-        let start = tokens.and_then(|tokens| tokens.start_token.clone());
+        let start = tokens.start_token.clone();
         let Some(start) = start.filter(|_| content.kind != Kind::Done) else {
             // Nothing to show, or nothing to start it with: this news is spent.
             phone.news = news;
             return None;
         };
-        if !cap.allow(device, now) {
+        if !cap.allow_keeping(device, now, KEEP_FOR_PUSHES) {
             return None;
         }
+        self.runs += 1;
         *phone = Phone {
             live: true,
             told: Some(shown),
             last: Some(now),
             news,
             end: false,
+            run: self.runs,
+            stale: token,
+            ends: 0,
         };
         Some(Due {
+            run: self.runs,
             event: Event::Start,
             token: start,
             content,
@@ -526,6 +606,8 @@ pub(crate) struct Report {
     /// The token it went to.
     pub token: String,
     pub event: Event,
+    /// Which activity it was for ([`Due::run`]).
+    pub run: u64,
     pub outcome: Outcome,
 }
 
@@ -545,6 +627,7 @@ pub(crate) struct Activity {
     driver: Driver,
     signer: Signer,
     config: ApnsConfig,
+    program: String,
     slots: Arc<Semaphore>,
     /// Told the sends that did not go well.
     reports: mpsc::Sender<Report>,
@@ -569,6 +652,7 @@ impl Activity {
             driver: Driver::default(),
             signer,
             config,
+            program: CURL.to_owned(),
             slots: Arc::new(Semaphore::new(SENDS_AT_ONCE)),
             reports,
         }
@@ -589,14 +673,11 @@ impl Activity {
         self.driver.connected(device);
     }
 
-    /// Takes what a send came to: a start that did not go out, or any send whose token is gone,
-    /// leaves the device with no activity. Says whether the token is to be dropped (a 410).
-    pub(crate) fn reported(&mut self, report: &Report) -> bool {
-        let gone = report.outcome == Outcome::Gone;
-        if gone || (report.event == Event::Start && report.outcome != Outcome::Sent) {
-            self.driver.lost(&report.device);
-        }
-        gone
+    /// Takes what a send came to, given the activity token the device holds now (see
+    /// [`Driver::failed`]). Says whether the token is to be dropped (a 410).
+    pub(crate) fn reported(&mut self, report: &Report, stored: Option<&str>) -> bool {
+        self.driver.failed(report, stored);
+        report.outcome == Outcome::Gone
     }
 
     /// Sends, in the background, what is due at `now` (wall-clock `wall`) to each of `devices`
@@ -612,33 +693,46 @@ impl Activity {
     ) {
         self.driver
             .prune(|key| devices.iter().any(|device| device.token_sha256 == key));
-        for device in devices.iter().filter(|device| device.activity.is_some()) {
+        for device in devices {
             let key = &device.token_sha256;
             let tokens = device.activity.as_ref();
+            if tokens.is_none() {
+                // Forgets what it drove for a device that turned the Live Activity off.
+                self.driver.due_for(key, None, false, cap, now);
+                continue;
+            }
+            // A slot first: a send there is no room to run takes nothing from the cap, and is
+            // judged again at the next look.
+            let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() else {
+                continue;
+            };
             let Some(due) = self.driver.due_for(key, tokens, connected(key), cap, now) else {
                 continue;
             };
             let payload = due.payload(mac, now, wall);
             let jwt = self.signer.jwt(wall).to_owned();
-            let event = due.event;
-            if !self.dispatch(key.clone(), due, payload, jwt) && event == Event::Start {
-                self.driver.lost(key);
-            }
+            self.dispatch(slot, key.clone(), due, payload, jwt);
         }
     }
 
-    /// Sends `payload` for `due` to `device` in a task of its own, and reports it if it did not
-    /// go well. If every slot is busy it is not sent, is logged as [`SEND_FAILED`], and this is
-    /// false. Never waits.
-    fn dispatch(&self, device: String, due: Due, payload: Value, jwt: String) -> bool {
-        let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() else {
-            eprintln!("{SEND_FAILED}");
-            return false;
-        };
-        let (config, reports) = (self.config.clone(), self.reports.clone());
+    /// Sends `payload` for `due` to `device` in a task of its own, holding `slot` until it is
+    /// done, and reports it if it did not go well. Never waits.
+    fn dispatch(
+        &self,
+        slot: OwnedSemaphorePermit,
+        device: String,
+        due: Due,
+        payload: Value,
+        jwt: String,
+    ) {
+        let (config, reports, program) = (
+            self.config.clone(),
+            self.reports.clone(),
+            self.program.clone(),
+        );
         tokio::spawn(async move {
             let priority = due.priority();
-            let outcome = apns::send(CURL, &config, &jwt, &due.token, &payload, priority).await;
+            let outcome = apns::send(&program, &config, &jwt, &due.token, &payload, priority).await;
             drop(slot);
             if outcome == Outcome::Sent {
                 return;
@@ -650,11 +744,11 @@ impl Activity {
                 device,
                 token: due.token,
                 event: due.event,
+                run: due.run,
                 outcome,
             };
             let _ = reports.send(report).await;
         });
-        true
     }
 }
 
@@ -662,6 +756,7 @@ impl Activity {
 mod tests {
     use super::*;
     use crate::push::CAP;
+    use tokio::time::timeout;
 
     /// The activity token and the push-to-start token of the device under test.
     const TOKEN: &str = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
@@ -856,7 +951,8 @@ mod tests {
             sent(Some(due)),
             expect(Event::Update, TOKEN, Kind::Running, "s1", 0)
         );
-        // Another session's turn starting changes neither the kind nor the count: nothing.
+        // Another session's turn starting changes neither the kind nor the count, but the lead:
+        // an update that names it.
         rig.observe(
             10.0,
             &[
@@ -864,11 +960,15 @@ mod tests {
                 snap("s2", Some("running"), &[]),
             ],
         );
-        assert_eq!(rig.away(12.0), None);
-        // All done: an update to done.
-        rig.observe(13.0, &[idle("s1"), idle("s2")]);
         assert_eq!(
-            sent(rig.away(13.0)),
+            sent(rig.away(12.0)),
+            expect(Event::Update, TOKEN, Kind::Running, "s2", 0)
+        );
+        // All done: an update to done, 2 s after the last.
+        rig.observe(13.0, &[idle("s1"), idle("s2")]);
+        assert_eq!(rig.away(13.0), None);
+        assert_eq!(
+            sent(rig.away(14.0)),
             expect(Event::Update, TOKEN, Kind::Done, "s2", 0)
         );
         // A change while connected is not sent.
@@ -949,7 +1049,10 @@ mod tests {
                 .count();
             assert!(within <= CAP, "{within} in a minute: {dues:?}");
         }
-        assert_eq!(dues.len(), CAP - 2, "{dues:?}");
+        // Activity sends leave the last of the minute to the pushes: with two pushes before
+        // them, three activity sends went out, and an approval push after them still fits.
+        assert_eq!(dues.len(), CAP - 3, "{dues:?}");
+        assert!(rig.cap.allow("dev", rig.at(59.0)), "a push still fits");
         // The count shown last is not yet the latest; once the minute is over, it is.
         assert_ne!(dues.last().map(|(_, due)| due.content.approvals), Some(20));
         let due = rig.away(61.0).expect("the latest");
@@ -990,8 +1093,11 @@ mod tests {
 
         // The phone connects: the activity ends at once, even mid-approval, and the app takes over.
         rig.driver.connected("dev");
+        let end = rig.due(701.0, true).expect("an end");
+        // An end is never urgent, even with an approval waiting.
+        assert_eq!(end.priority(), Priority::Normal);
         assert_eq!(
-            sent(rig.due(701.0, true)),
+            sent(Some(end)),
             expect(Event::End, TOKEN, Kind::Approval, "s1", 1)
         );
         assert_eq!(rig.due(702.0, true), None);
@@ -1019,14 +1125,18 @@ mod tests {
         let mut rig = Rig::new(&["s1"]);
         rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
         assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
-        for _ in 1..CAP {
+        // Four pushes after the start: one send is left in the minute, and that is the pushes'.
+        for _ in 2..CAP {
             assert!(rig.cap.allow("dev", rig.at(2.0)));
         }
         rig.driver.connected("dev");
         assert_eq!(rig.due(3.0, true), None);
         assert_eq!(rig.due(60.0, true), None);
-        assert_eq!(rig.due(61.0, true).map(|due| due.event), Some(Event::End));
+        // The start's minute is over: two are left, and the end takes one.
+        let end = rig.due(61.0, true).expect("the end");
+        assert_eq!((end.event, end.priority()), (Event::End, Priority::Normal));
         assert_eq!(rig.due(62.0, true), None);
+        assert!(rig.cap.allow("dev", rig.at(62.0)), "a push still fits");
     }
 
     #[test]
@@ -1078,20 +1188,293 @@ mod tests {
         );
     }
 
+    /// What APNs said to `due` for `device`, as the hub reports it, with the token it now stores.
+    fn answer(rig: &mut Rig, due: &Due, outcome: Outcome) {
+        let report = Report {
+            device: "dev".into(),
+            token: due.token.clone(),
+            event: due.event,
+            run: due.run,
+            outcome,
+        };
+        let stored = rig.tokens.token.clone();
+        rig.driver.failed(&report, stored.as_deref());
+    }
+
+    #[test]
+    fn a_stale_tokens_410_forgets_no_live_activity() {
+        const OLD: &str = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
+        const NEW: &str = "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3";
+        let mut rig = Rig::with(&["s1"], tokens(Some(OLD), Some(START)));
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        let start = rig.away(1.0).expect("a start");
+        assert_eq!(start.event, Event::Start);
+        // An update goes to the token the phone had before the start, which belongs to an
+        // older activity.
+        rig.observe(3.0, &[snap("s1", Some("idle"), &[1, 2])]);
+        let stale = rig.away(3.0).expect("an update");
+        assert_eq!((stale.event, stale.token.as_str()), (Event::Update, OLD));
+        // A background wake hands over the new activity's token; then APNs answers 410 to OLD.
+        rig.tokens = tokens(Some(NEW), Some(START));
+        answer(&mut rig, &stale, Outcome::Gone);
+        // The activity goes on: the next change is an update to the new token, no second start.
+        rig.observe(5.0, &[snap("s1", Some("idle"), &[1, 2, 3])]);
+        assert_eq!(
+            sent(rig.away(5.0)),
+            expect(Event::Update, NEW, Kind::Approval, "s1", 3)
+        );
+        // A 410 on the token the activity uses now does forget it: the next news starts one.
+        rig.observe(7.0, &[snap("s1", Some("idle"), &[1, 2, 3, 4])]);
+        let current = rig.away(7.0).expect("an update");
+        answer(&mut rig, &current, Outcome::Gone);
+        rig.observe(9.0, &[snap("s1", Some("idle"), &[1, 2, 3, 4, 5])]);
+        assert_eq!(rig.away(9.0).map(|due| due.event), Some(Event::Start));
+        // A start that does not go out forgets it too.
+        let mut rig = Rig::new(&["s1"]);
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        let start = rig.away(1.0).expect("a start");
+        answer(&mut rig, &start, Outcome::Failed(0));
+        rig.observe(2.0, &[snap("s1", Some("idle"), &[1, 2])]);
+        assert_eq!(rig.away(2.0).map(|due| due.event), Some(Event::Start));
+    }
+
+    #[test]
+    fn a_410_on_a_token_from_before_the_start_starts_no_third() {
+        let mut rig = Rig::new(&["s1"]);
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
+        // The app streams a session: the end goes to TOKEN, which stays stored.
+        rig.driver.connected("dev");
+        let end = rig.due(2.0, true).expect("an end");
+        assert_eq!((end.event, end.token.as_str()), (Event::End, TOKEN));
+        // Away again: a second start, and an update to TOKEN, the ended activity's token.
+        rig.observe(10.0, &[snap("s1", Some("idle"), &[1, 2])]);
+        assert_eq!(rig.away(10.0).map(|due| due.event), Some(Event::Start));
+        rig.observe(12.0, &[snap("s1", Some("running"), &[])]);
+        let update = rig.away(12.0).expect("an update");
+        assert_eq!(update.token, TOKEN);
+        // Both 410s on TOKEN arrive now: neither is the second activity's.
+        answer(&mut rig, &end, Outcome::Gone);
+        answer(&mut rig, &update, Outcome::Gone);
+        rig.observe(14.0, &[snap("s1", Some("running"), &[3])]);
+        assert_eq!(rig.away(14.0).map(|due| due.event), Some(Event::Update));
+    }
+
+    #[test]
+    fn a_failed_end_is_sent_again_within_the_cap() {
+        let mut rig = Rig::new(&["s1"]);
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
+        rig.driver.connected("dev");
+        let first = rig.due(2.0, true).expect("an end");
+        // APNs failed it: it goes again at the next look, not at once in a loop.
+        answer(&mut rig, &first, Outcome::Failed(500));
+        let second = rig.due(3.0, true).expect("the end again");
+        assert_eq!((second.event, second.token.as_str()), (Event::End, TOKEN));
+        answer(&mut rig, &second, Outcome::Failed(0));
+        let third = rig.due(4.0, true).expect("the end a third time");
+        assert_eq!(third.event, Event::End);
+        // Three tries in all.
+        answer(&mut rig, &third, Outcome::Failed(0));
+        assert_eq!(rig.due(5.0, true), None);
+        assert_eq!(rig.due(70.0, true), None);
+        // A 410 to an end is not tried again: that activity is gone.
+        let mut rig = Rig::new(&["s1"]);
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
+        rig.driver.connected("dev");
+        let end = rig.due(2.0, true).expect("an end");
+        answer(&mut rig, &end, Outcome::Gone);
+        assert_eq!(rig.due(3.0, true), None);
+        // Nor is an end whose failure comes back after another activity started.
+        let mut rig = Rig::new(&["s1"]);
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
+        rig.driver.connected("dev");
+        let end = rig.due(2.0, true).expect("an end");
+        rig.observe(5.0, &[snap("s1", Some("idle"), &[1, 2])]);
+        assert_eq!(rig.away(5.0).map(|due| due.event), Some(Event::Start));
+        answer(&mut rig, &end, Outcome::Failed(500));
+        assert_eq!(rig.away(6.0), None);
+        // A retried end still waits for room in the cap.
+        let mut rig = Rig::new(&["s1"]);
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
+        rig.driver.connected("dev");
+        let end = rig.due(2.0, true).expect("an end");
+        for _ in 2..CAP {
+            assert!(rig.cap.allow("dev", rig.at(2.5)));
+        }
+        answer(&mut rig, &end, Outcome::Failed(500));
+        assert_eq!(rig.due(3.0, true), None);
+        assert_eq!(rig.due(61.0, true), None);
+        assert_eq!(rig.due(62.0, true).map(|due| due.event), Some(Event::End));
+    }
+
+    #[test]
+    fn a_cleared_activity_starts_afresh() {
+        let mut rig = Rig::new(&["s1"]);
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
+        // The phone turns the Live Activity off: `clear_activity` leaves it no tokens.
+        let now = rig.at(2.0);
+        assert_eq!(
+            rig.driver.due_for("dev", None, false, &mut rig.cap, now),
+            None
+        );
+        // Then on again, with both tokens: the next news is a start, not an update.
+        rig.observe(5.0, &[snap("s1", Some("idle"), &[1, 2])]);
+        assert_eq!(
+            sent(rig.away(5.0)),
+            expect(Event::Start, START, Kind::Approval, "s1", 2)
+        );
+    }
+
+    #[test]
+    fn a_new_lead_session_is_an_update() {
+        let mut rig = Rig::new(&["s1", "s2"]);
+        rig.observe(
+            1.0,
+            &[
+                snap("s1", Some("idle"), &[1]),
+                snap("s2", Some("idle"), &[5]),
+            ],
+        );
+        assert_eq!(
+            sent(rig.away(1.0)),
+            expect(Event::Start, START, Kind::Approval, "s1", 2)
+        );
+        // s1's approval is answered and another comes: still two waiting, but s2's is the
+        // oldest now, so the widget's buttons must point at s2.
+        rig.observe(
+            2.0,
+            &[
+                snap("s1", Some("idle"), &[2]),
+                snap("s2", Some("idle"), &[5]),
+            ],
+        );
+        assert_eq!(rig.away(2.0), None);
+        assert_eq!(
+            sent(rig.away(3.0)),
+            expect(Event::Update, TOKEN, Kind::Approval, "s2", 2)
+        );
+        assert_eq!(rig.away(9.0), None);
+    }
+
+    /// An activity over the test key, sending with a `curl` that is not there, so nothing leaves
+    /// the machine.
+    fn activity(dir: &octet_testkit::TempDir) -> (Activity, mpsc::Receiver<Report>) {
+        use std::os::unix::fs::PermissionsExt;
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/apns-test.p8");
+        let text = std::fs::read_to_string(data).expect("the test key");
+        let pem = &text[text.find("-----BEGIN").expect("a PEM block")..];
+        std::fs::create_dir_all(dir.path()).expect("dir");
+        let key = dir.path().join("key.p8");
+        std::fs::write(&key, pem).expect("key");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        let config = ApnsConfig {
+            team_id: "TEAM123456".into(),
+            key_id: "KEY1234567".into(),
+            key_path: key,
+            sandbox: true,
+        };
+        let signer = Signer::load(&config).expect("the test key loads");
+        let (reports, received) = mpsc::channel(4);
+        let mut activity = Activity::new(config, signer, reports);
+        activity.program = "/nonexistent/curl".into();
+        (activity, received)
+    }
+
+    fn device(tokens: Option<ActivityTokens>) -> Device {
+        Device {
+            name: "Test phone".into(),
+            platform: "ios".into(),
+            login: "owner@example".into(),
+            created: 0,
+            last_seen: 0,
+            token_sha256: "dev".into(),
+            push_token: None,
+            push_kinds: octet_core::remote::protocol::PushKinds::default(),
+            activity: tokens,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_send_with_no_slot_takes_nothing_from_the_cap() {
+        let dir = octet_testkit::TempDir::new("activity-slots");
+        let (mut activity, mut received) = activity(&dir);
+        let devices = [device(Some(tokens(Some(TOKEN), Some(START))))];
+        let base = Instant::now();
+        let wall = SystemTime::now();
+        let mut cap = Limiter::default();
+        activity.observe(&[idle("s1")], base);
+        activity.hello("dev");
+        activity.observe(&[snap("s1", Some("idle"), &[1])], later(base, 1.0));
+        // Every slot busy: nothing is judged, nothing is taken from the cap.
+        let busy = Arc::clone(&activity.slots)
+            .try_acquire_many_owned(u32::try_from(SENDS_AT_ONCE).expect("small"))
+            .expect("the slots");
+        activity.flush(
+            &devices,
+            |_| false,
+            &mut cap,
+            None,
+            (later(base, 1.0), wall),
+        );
+        assert_eq!(cap.remembered(), 0);
+        // With a slot free, the start goes, and takes one.
+        drop(busy);
+        activity.flush(
+            &devices,
+            |_| false,
+            &mut cap,
+            None,
+            (later(base, 2.0), wall),
+        );
+        assert_eq!(cap.remembered(), 1);
+        // The `curl` that is not there fails it, and the hub hears so; the start is forgotten.
+        let report = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .expect("a report")
+            .expect("a report");
+        assert_eq!(
+            (report.event, report.outcome),
+            (Event::Start, Outcome::Failed(0))
+        );
+        assert!(!activity.reported(&report, Some(TOKEN)));
+        activity.observe(&[snap("s1", Some("idle"), &[1, 2])], later(base, 3.0));
+        let mut cap = Limiter::default();
+        activity.flush(
+            &devices,
+            |_| false,
+            &mut cap,
+            None,
+            (later(base, 3.0), wall),
+        );
+        assert_eq!(cap.remembered(), 1, "started again");
+    }
+
     #[test]
     fn a_lost_activity_is_started_again_by_the_next_news() {
         let mut rig = Rig::new(&["s1"]);
         rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
-        assert_eq!(rig.away(1.0).map(|due| due.event), Some(Event::Start));
-        // APNs refused the start, or said the token is gone.
-        rig.driver.lost("dev");
+        let start = rig.away(1.0).expect("a start");
+        // APNs said the start token is gone.
+        answer(&mut rig, &start, Outcome::Gone);
         rig.observe(4.0, &[snap("s1", Some("idle"), &[1, 2])]);
         assert_eq!(
             sent(rig.away(4.0)),
             expect(Event::Start, START, Kind::Approval, "s1", 2)
         );
         // A device the driver never saw is nothing to lose.
-        rig.driver.lost("nobody");
+        let stranger = Report {
+            device: "nobody".into(),
+            token: START.into(),
+            event: Event::Start,
+            run: 2,
+            outcome: Outcome::Gone,
+        };
+        rig.driver.failed(&stranger, None);
         // Forgotten devices are judged afresh, on the news as it stands.
         rig.driver.prune(|device| device != "dev");
         rig.observe(5.0, &[snap("s1", Some("idle"), &[1, 2, 3])]);
@@ -1196,6 +1579,7 @@ mod tests {
         let wall = UNIX_EPOCH + Duration::from_secs(1_790_000_101);
         let due = |event, kind, approvals| Due {
             event,
+            run: 1,
             token: TOKEN.into(),
             content: Content {
                 kind,
@@ -1292,6 +1676,7 @@ mod tests {
         // Nothing prints a token.
         let due = Due {
             event: Event::Start,
+            run: 1,
             token: START.into(),
             content: rig.driver.content(rig.at(5.0)),
         };
@@ -1299,6 +1684,7 @@ mod tests {
             device: "f".repeat(64),
             token: TOKEN.into(),
             event: Event::Update,
+            run: 1,
             outcome: Outcome::Gone,
         };
         let printed = format!("{due:?} {report:?} {:?}", rig.driver);
