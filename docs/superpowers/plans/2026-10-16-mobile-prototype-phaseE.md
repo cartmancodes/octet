@@ -74,6 +74,9 @@
   - `session` is the hub's own raw id of the session that leads, and `mac` is the hub's published host, as in Phase D's push data. The hub never knows the phone's pairing ids, so it never sends a key.
   - **The phone owns every key.** It resolves `{mac: host, session: raw}` through `fleet.keyFor(host, raw)`, the one resolver push taps already use (Phase D's final fix wave).
 - **Lifecycle (hub)**
+  - **One driving Mac.** The app gives its activity and push-to-start tokens to one Mac at a time: the Mac of its current lead session, else the first paired Mac, and sends `clear_activity` to the others. The owner changes only while the app is in front. Other Macs still send notifications.
+  - **Presence.** `hello` takes an optional `background: true` for a connection that only hands a token over or sends a Deny; every other connection means the app is in front.
+  - **Freshness.** Every `start` and `update` carries `"stale-date"` = now + 15 minutes. An ended token is dropped from the store, and a token registered over 12 hours ago counts as spent. While a push-started activity waits for its token, no new push-start for up to 8 hours.
   - **One activity, two drivers.** A device's registered activity `token` is a live activity whoever started it (the app in the foreground, or the hub by push-to-start). While the phone is away the hub updates that token; the app adopts the same activity when it comes back.
   - **Start** with `start_token` when an approval waits or a turn starts, the device has no live connection, and it has no usable activity `token`.
   - **Update** when the kind or the approval count changes, at most once per 2 s per device.
