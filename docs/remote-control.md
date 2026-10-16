@@ -569,7 +569,8 @@ registered token when what it shows changes, at most once every 2 seconds, and e
 after every session went idle. Opening a session in the app ends nothing: the app takes the same
 activity over. The hub can update an activity only once its token has reached it. For an activity
 the hub just started, that token reaches the hub only if iOS wakes the app in the background with it
-(see **Tokens**); until then the hub can start and end that activity but not update it. These sends share the
+while the phone is unlocked (see **Tokens**); until then the hub can start and end that activity but
+not update it. These sends share the
 pushes' limit of six a minute per phone, and always leave room for an approval's push. Apple
 answering that a token is gone (410) drops that token; any other failure is logged, without the
 token, and not retried in a loop.
@@ -583,9 +584,17 @@ connection, whenever they change: the push-to-start token, and the running activ
 When a new activity token comes while the app is in the background (an activity the hub started),
 the app hands it over at once: it opens a short connection to each Mac that only says hello,
 registers the token and closes, once the Mac answers or after 10 seconds, subscribing to nothing, so
-the hub doesn't take it for the phone coming back. This relies on iOS giving the app time in the
-background when the activity's token arrives. If iOS doesn't, the hub can only start and end that
-activity, not update it, until you open the app. The hub keeps the tokens per phone in
+the hub doesn't take it for the phone coming back. It does this too when iOS launches the closed
+app in the background for the token, once the app has read its settings and pairings. The hand-over
+needs two things:
+
+- **Time in the background.** iOS must give the app time when the activity's token arrives.
+- **An unlocked phone.** Each Mac's device token is kept in the keychain readable only while the
+  phone is unlocked (`WHEN_UNLOCKED_THIS_DEVICE_ONLY`), so on a locked phone the app can't
+  reach any Mac.
+
+Without either, the hub can only start and end that activity, not update it: on a locked phone, the
+Mac's updates begin only after you unlock and open the app. The hub keeps the tokens per phone in
 `devices.json`, records `activity registered` (or `activity cleared`) with the phone's name in
 `hub-audit.jsonl`, never the token, and drops them on `octet hub revoke` and when you unpair that
 Mac in the app.

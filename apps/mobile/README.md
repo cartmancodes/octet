@@ -274,9 +274,13 @@ shows no switch for it.
   per activity is kept, so one activity's end never takes back another's token. A new activity token
   that comes while the app is in the background (an activity the hub just started) is handed over at
   once, over a short connection to each Mac that only says hello, registers and closes (on the
-  answer, or after 10 seconds), subscribing to nothing. This relies on iOS giving the app time in
-  the background when the token arrives; if it doesn't, the hub can only start and end that activity
-  until you open the app. Unpairing a Mac tells it `clear_activity` as well as "notifications off".
+  answer, or after 10 seconds), subscribing to nothing; a closed app that iOS launches in the
+  background for the token hands it over once it has read its settings and pairings. This needs iOS
+  to give the app time in the background when the token arrives, and the phone unlocked: each Mac's
+  device token is in the keychain readable only while unlocked (`WHEN_UNLOCKED_THIS_DEVICE_ONLY`). On
+  a locked phone, or without that time, the hub can only start and end that activity, and the Mac's
+  updates begin only after you unlock and open the app. Unpairing a Mac stops any hand-over to it,
+  then tells it `clear_activity` as well as "notifications off".
 - **The names and commands** the widget shows come from the phone only: the app writes each waiting
   approval's session name (at most 80 characters) and command (folded like the Permission card, at
   most 200) to the App Group `group.dev.octet.mobile`, at most 64 of them, newest first, whenever the
@@ -344,10 +348,13 @@ workspace. Tick each one on each phone.
       notification beside it), and nothing in it names the session beyond what the App Group holds.
 - [ ] **Deny** on the Island: the approval is denied on the desk, the app never opened. **Allow**:
       the app opens on that session, asks for Face ID, and allows only after it.
-- [ ] Background hand-over: with the app in the background and the activity started by push, check
-      in `hub-audit.jsonl` that an `activity registered` line follows the start within seconds (iOS
-      gave the app background time for the token), and that the activity then updates as the
-      session changes. If no line comes, the hub can only start and end it until the app is opened.
+- [ ] Background hand-over, with the phone **unlocked**: with the app in the background, and again
+      with it closed (swiped away), and the activity started by push, check in `hub-audit.jsonl`
+      that an `activity registered` line follows the start within seconds (iOS gave the app
+      background time for the token), and that the activity then updates as the session changes.
+      With the phone **locked** expect no such line: the keychain can't be read while locked, so the
+      hub only starts and ends the activity, and its updates begin after you unlock and open the
+      app. If no line comes even unlocked, iOS gave no background time.
 - [ ] Open a session while the hub's activity shows: the same activity goes on, now driven by the
       app (no second activity, no blink). Unpair the Mac: no activity starts again from it.
 - [ ] Turn **Settings › Live Activity** off: the activity ends and no push starts one again; on

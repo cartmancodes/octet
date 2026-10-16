@@ -154,6 +154,9 @@ export class LiveActivity {
    * other link's Mac is told on its next connection: one that missed the turn-off, in this run or
    * an earlier one, would go on starting activities the user turned off. */
   private cleared = new WeakSet<HubClient>();
+  /** What each link's Mac was last handed over in the background, answered or not: a hand-over is
+   * tried once per Mac for a body, so nothing in the background tries it again and again. */
+  private handedOver = new WeakMap<HubClient, string>();
 
   /** The App Group's entries as last written; null when they are to be written again. */
   private entries: string | null = null;
@@ -226,6 +229,8 @@ export class LiveActivity {
       if (!this.on) return;
       this.writeEntries();
       this.drive(true);
+      // Launched in the background for a token (iOS woke a closed app): it came before the setting.
+      if (!this.foreground) this.handOver();
     });
   }
 
@@ -261,6 +266,7 @@ export class LiveActivity {
     this.told = new WeakMap();
     this.telling = new WeakMap();
     this.cleared = new WeakSet();
+    this.handedOver = new WeakMap();
     this.entries = null;
     if (!supported) {
       this.cancelTimers();
@@ -291,6 +297,7 @@ export class LiveActivity {
       this.told = new WeakMap();
       this.telling = new WeakMap();
       this.cleared = new WeakSet();
+      this.handedOver = new WeakMap();
       this.syncAll();
       return true;
     }
@@ -433,6 +440,8 @@ export class LiveActivity {
       this.early = [];
       for (const event of early) this.deny(event);
     }
+    // Launched in the background for a token: it came before the pairings were read.
+    if (snapshot.status !== "loading" && !this.foreground) this.handOver();
     const macs = snapshot.macs;
     if (macs === this.macs) return;
     this.macs = macs;
@@ -469,6 +478,9 @@ export class LiveActivity {
    * end of another (older, or already over) leaves it. A token means an activity is live, whoever
    * started it: it is adopted and driven from now on. */
   private activityToken({ token, activity = "" }: TokenEvent): void {
+    // The end of an activity it never saw (one already over when the native side looked) says
+    // nothing of the one that is live.
+    if (token === null && activity !== "" && !this.activities.has(activity)) return;
     if (token === null) {
       this.activities.delete(activity);
       if (this.activities.size === 0) {
@@ -492,22 +504,27 @@ export class LiveActivity {
   }
 
   /** In the background every link is closed: the new token goes to each Mac that lacks it over a
-   * register-only connection, so the hub can update the activity while the phone is away. This
-   * needs iOS to give the app time in the background for the token; without it the Mac gets the
-   * token on the next foreground. */
+   * register-only connection, so the hub can update the activity while the phone is away. Tried
+   * when the token comes, and again once the setting and the pairings are read (a closed app that
+   * iOS launched in the background for it), at most once per Mac for the same body. This needs iOS
+   * to give the app time in the background for the token, and the phone unlocked (a Mac's device
+   * token is in the keychain, readable only then: a locked phone's pairings have no link); without
+   * either the Mac gets the token on the next foreground. */
   private handOver(): void {
-    if (this.wanted() !== true || this.stopped) return;
+    if (this.wanted() !== true || this.stopped || this.tokens.token === null) return;
     const body = activityRegistration(this.tokens);
     if (body === null) return;
     const said = JSON.stringify(body);
     const macs = this.fleet.links.macs().filter((mac) => {
       const client = this.fleet.links.client(mac);
-      return client !== null && this.told.get(client) !== said && this.telling.get(client) !== said;
+      return client !== null && this.told.get(client) !== said && this.telling.get(client) !== said && this.handedOver.get(client) !== said;
     });
     if (macs.length === 0) return;
     for (const mac of macs) {
       const client = this.fleet.links.client(mac);
-      if (client) this.telling.set(client, said);
+      if (!client) continue;
+      this.telling.set(client, said);
+      this.handedOver.set(client, said);
     }
     void this.fleet.handOver(macs, body).then((acked) => {
       for (const mac of macs) {

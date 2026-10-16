@@ -532,6 +532,21 @@ describe("the activity that is already there (one activity, two drivers)", () =>
     expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity").at(-1)).toEqual(expect.not.objectContaining({ token: expect.anything() }));
   });
 
+  it("a null for an activity it never saw is ignored: the activity is still live, nothing counts as dismissed", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    await r.list(STUDIO_HOST, [info(A, { phase: "running" })]);
+    expect(r.api.of("start")).toHaveLength(1);
+    r.api.pushToken(null, "never-seen"); // one that had already ended when it was looked at
+    await r.list(STUDIO_HOST, [info(A, { phase: "running", approvals: 1, approval: approval(1) })]);
+    await r.advance(DRIVE_GAP_MS);
+    expect(r.api.of("start")).toHaveLength(1);
+    expect(r.api.of("update").at(-1)?.arg).toMatchObject({ kind: "approval" });
+    r.live.setForeground(false);
+    r.live.setForeground(true);
+    await r.advance(DRIVE_GAP_MS);
+    expect(r.api.of("start")).toHaveLength(1);
+  });
+
   it("an activity the user dismissed is not started again by coming back to the app, only by a change", async () => {
     const r = await rig({ macs: [STUDIO_HOST] });
     await r.list(STUDIO_HOST, [info(A, { phase: "running" })]);
@@ -595,6 +610,79 @@ describe("the hand-over in the background", () => {
     for (const host of [STUDIO_HOST, MINI_HOST]) await r.ready(host);
     expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([]);
     expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toEqual([expect.objectContaining({ token: "cd34" })]);
+  });
+
+  it("a cold launch in the background for the token: handed over once the settings and pairings are read, once per Mac", async () => {
+    for (const id of [STUDIO, MINI]) await SecureStore.setItemAsync(tokenKeyOf(id), TOKEN);
+    await saveSettings({
+      deviceName: "iPhone",
+      pairings: [
+        { id: STUDIO, hubUrl: urlOf(STUDIO_HOST), deviceName: "iPhone", macName: "studio" },
+        { id: MINI, hubUrl: urlOf(MINI_HOST), deviceName: "iPhone", macName: "mini" },
+      ],
+    });
+    const sockets = new Sockets();
+    const clock = new FakeClock();
+    const store = createOctetStore();
+    const fleet = new Fleet({ factory: sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
+    const api = new FakeLive(clock.now);
+    const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
+    // iOS launches the app in the background: the shell starts, nothing is in the foreground.
+    fleet.setForeground(false);
+    live.start();
+    live.setForeground(false);
+    api.pushToken("cd34", "hub-started"); // before the settings or the pairings are read
+    api.pushToken("cd34", "hub-started");
+    expect(sockets.all).toEqual([]);
+    await fleet.init();
+    await settle();
+    expect(sockets.all.map((s) => s.url).sort()).toEqual([urlOf(MINI_HOST), urlOf(STUDIO_HOST)]);
+    for (const socket of sockets.all) {
+      socket.open();
+      socket.receive({ type: "welcome", device: "iPhone" });
+    }
+    await settle();
+    for (const socket of sockets.all) {
+      expect(socket.commands().map((c) => c.type)).toEqual(["hello", "register_activity"]);
+      socket.receive({ type: "ack", req: socket.commandsOf("register_activity")[0]?.req, message: "Activity registered" });
+    }
+    await settle();
+    expect(sockets.all.every((s) => s.closed)).toBe(true);
+    // Anything else the Fleet says meanwhile hands nothing over again.
+    await fleet.rename(STUDIO, "Studio");
+    await settle();
+    expect(sockets.all).toHaveLength(2);
+    live.stop();
+  });
+
+  it("a hand-over that fails is not tried again in the background for the same token", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    await background(r);
+    const before = r.sockets.all.length;
+    r.api.pushToken("cd34", "a");
+    await settle();
+    await r.advance(HAND_OVER_MS); // the Mac never answers
+    await r.fleet.rename(STUDIO, "Studio");
+    await settle();
+    expect(r.sockets.all.length).toBe(before + 1);
+  });
+
+  it("unpairing a Mac stops a hand-over to it that is under way: no register_activity can follow the goodbye", async () => {
+    const r = await rig();
+    await background(r);
+    const before = r.sockets.all.length;
+    r.api.pushToken("cd34", "a");
+    await settle();
+    const studio = r.sockets.all.slice(before).find((s) => s.url === urlOf(STUDIO_HOST));
+    const mini = r.sockets.all.slice(before).find((s) => s.url === urlOf(MINI_HOST));
+    await r.fleet.unpair(STUDIO);
+    await settle();
+    expect(studio?.closed).toBe(true);
+    expect(mini?.closed).toBe(false); // the other Mac's goes on
+    studio?.open();
+    studio?.receive({ type: "welcome", device: "iPhone" });
+    await settle();
+    expect(studio?.commandsOf("register_activity")).toEqual([]);
   });
 
   it("nothing is handed over with the switch off, or for a token that is gone", async () => {

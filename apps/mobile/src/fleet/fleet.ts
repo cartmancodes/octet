@@ -105,6 +105,8 @@ export class Fleet {
   private starting: Promise<void> | null = null;
   /** Unpairs whose storage writes are not done: pairing waits for them. */
   private unpairing = 0;
+  /** The hand-overs under way (`handOver`), by Mac: each one's stop. */
+  private readonly handing = new Map<string, Set<() => void>>();
   /** Push registrations wait their turn, so that each Mac ends with the last one asked for. */
   private pushQueue: Promise<unknown> = Promise.resolve();
   private readonly host: LinkHost;
@@ -397,6 +399,9 @@ export class Fleet {
     try {
       const last = ids.length === this.pairings.length;
       const going = this.all.filter((l) => ids.includes(l.id));
+      // A hand-over still on its way could land a register_activity after the goodbye's
+      // clear_activity: it stops first.
+      for (const id of ids) this.stopHandOvers(id);
       for (const link of going) {
         // Best effort, sent before the link is released and never waited on.
         link.goodbye(last);
@@ -432,6 +437,7 @@ export class Fleet {
 
   /** Lets go of `link`: it stops feeding the store, and the store forgets what its Mac sent. */
   private drop(link: MacLink): void {
+    this.stopHandOvers(link.id);
     link.release();
     this.all = this.all.filter((l) => l !== link);
     this.store.getState().reset(link.id);
@@ -640,14 +646,20 @@ export class Fleet {
             let asked = false;
             let cancel = () => {};
             let off = () => {};
+            const stops = this.handing.get(link.id) ?? new Set<() => void>();
+            this.handing.set(link.id, stops);
             const finish = (acked: boolean) => {
               if (done) return;
               done = true;
+              stops.delete(stop);
+              if (stops.size === 0 && this.handing.get(link.id) === stops) this.handing.delete(link.id);
               cancel();
               off();
               client.stop();
               resolve(acked && !link.gone ? link.id : null);
             };
+            const stop = () => finish(false);
+            stops.add(stop);
             off = client.onState((state) => {
               if (state === "unpaired") finish(false);
               if (state !== "ready" || asked) return;
@@ -663,6 +675,11 @@ export class Fleet {
       ),
     );
     return results.filter((mac): mac is string => mac !== null);
+  }
+
+  /** Stops every hand-over to Mac `mac` that is under way (it resolves as not acked). */
+  private stopHandOvers(mac: string): void {
+    for (const stop of [...(this.handing.get(mac) ?? [])]) stop();
   }
 
   /** The user dismissed the notice the Inbox shows (a Mac that unpaired this phone, an unpair
