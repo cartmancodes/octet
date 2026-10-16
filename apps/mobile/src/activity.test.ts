@@ -8,18 +8,17 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import type { ActivityState, WidgetEntry } from "../modules/octet-live";
+import { DRIVE_GAP_MS, LiveActivity, REGISTER_RETRY_MS } from "./activity";
 import {
   COMMAND_CHARS,
-  DRIVE_GAP_MS,
   ENTRIES_BYTES,
   ENTRIES_LIMIT,
   IDLE_END_MS,
-  LiveActivity,
   NAME_CHARS,
   ActivityModel,
   widgetEntries,
   type ActivityRow,
-} from "./activity";
+} from "./activityModel";
 import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
 import { FakeLive } from "./liveRig";
 import { Fleet, HAND_OVER_MS, tokenKeyOf } from "./hub";
@@ -323,6 +322,81 @@ describe("registration: one Mac drives the Island", () => {
     await r.advance(60_000); // the link tries again
     await r.ready(STUDIO_HOST);
     expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([expect.objectContaining({ start_token: "ab12" })]);
+  });
+
+  it("an old owner out of reach when the tokens moved is told to forget them on the next foreground", async () => {
+    const r = await rig();
+    r.api.pushToStartToken("ab12");
+    r.api.pushToken("cd34", "a");
+    await settle();
+    await r.ack(STUDIO_HOST, "register_activity");
+    await r.ack(MINI_HOST, "clear_activity");
+    // Studio drops; then a lead on mini moves the tokens there while studio can't be told.
+    r.socketOf(STUDIO_HOST).drop();
+    await settle();
+    await r.list(MINI_HOST, [info(B, { phase: "running" })]);
+    expect(r.socketOf(MINI_HOST).commandsOf("register_activity")).toHaveLength(1);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("clear_activity")).toEqual([]);
+    // The app leaves before studio is back, and comes to the front again.
+    r.live.setForeground(false);
+    r.fleet.setForeground(false);
+    await settle();
+    r.fleet.setForeground(true);
+    r.live.setForeground(true);
+    await settle();
+    await r.ready(STUDIO_HOST);
+    await r.ready(MINI_HOST);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("clear_activity")).toHaveLength(1);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toEqual([]);
+    // Refused (the hub was busy): it is told again at the next foreground, the link up all along.
+    await r.list(MINI_HOST, [info(B, { phase: "running" })]);
+    for (const c of r.socketOf(STUDIO_HOST).commandsOf("clear_activity")) {
+      r.socketOf(STUDIO_HOST).receive({ type: "refused", req: c.req, code: "not_allowed", reason: "no" });
+    }
+    await settle();
+    r.live.setForeground(false);
+    r.live.setForeground(true);
+    await settle();
+    expect(r.socketOf(STUDIO_HOST).commandsOf("clear_activity")).toHaveLength(2);
+  });
+
+  it(`a register or clear the hub refuses for now is tried once more, ${REGISTER_RETRY_MS / 1000} s on`, async () => {
+    const r = await rig();
+    r.api.pushToStartToken("ab12");
+    await settle();
+    const refuse = async (host: string, type: string, code: string) => {
+      const c = r.socketOf(host).commandsOf(type).at(-1);
+      r.socketOf(host).receive({ type: "refused", req: c?.req, code, reason: "Too many commands" });
+      await settle();
+    };
+    await refuse(STUDIO_HOST, "register_activity", "rate_limited");
+    await refuse(MINI_HOST, "clear_activity", "unavailable");
+    await r.advance(REGISTER_RETRY_MS - 1);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(1);
+    expect(r.socketOf(MINI_HOST).commandsOf("clear_activity")).toHaveLength(1);
+    await r.advance(1);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(2);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")[1]).toMatchObject({ start_token: "ab12" });
+    expect(r.socketOf(MINI_HOST).commandsOf("clear_activity")).toHaveLength(2);
+    // Refused again: once is all, until something changes or the link comes back.
+    await refuse(STUDIO_HOST, "register_activity", "rate_limited");
+    await r.advance(2 * REGISTER_RETRY_MS); // short of the 25 s ping: the link stays the same
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(2);
+    // A definite no is not tried again by itself.
+    r.api.pushToken("cd34");
+    await settle();
+    await refuse(STUDIO_HOST, "register_activity", "invalid");
+    await r.advance(2 * REGISTER_RETRY_MS); // short of the 25 s ping: the link stays the same
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(3);
+    // A retry that would say what is no longer wanted is not sent: the newest body goes instead.
+    r.api.pushToken("ef56");
+    await settle();
+    await refuse(STUDIO_HOST, "register_activity", "busy");
+    r.api.pushToken("0a0b");
+    await settle();
+    await r.ack(STUDIO_HOST, "register_activity");
+    await r.advance(REGISTER_RETRY_MS);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity").map((c) => c.token)).toEqual([undefined, undefined, "cd34", "ef56", "0a0b"]);
   });
 
   it("an ended activity's token is taken back: only the push-to-start token is left", async () => {

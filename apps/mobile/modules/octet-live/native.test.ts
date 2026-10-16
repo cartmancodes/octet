@@ -223,7 +223,29 @@ describe("what the native side keeps, and how", () => {
     expect(keep).toMatch(/lock\.lock\(\)/);
     expect(keep).toMatch(/newestId = newest\.id/);
     expect(keep).toMatch(/\.end\(nil, dismissalPolicy: \.immediate\)/);
-    expect(keep).toMatch(/!= newest\.id|!== newest\.id|\.id != /);
+    // Never the newest itself: only those seen before it (the next test).
+    expect(keep).toMatch(/guard self\?\.isNewest\(id\) == true else \{ return \}/);
+  });
+
+  it("never lets two arrivals end each other: an id already seen, or one not live, is ignored, and only earlier arrivals are ended", () => {
+    const keep = block(moduleSwift, /private func keepOnly\(_ newest: Activity<OctetActivity>\)/);
+    // An activity that is over can't be the one kept.
+    expect(keep).toMatch(/guard newest\.activityState == \.active \|\| newest\.activityState == \.stale else \{ return \}/);
+    // `activityUpdates` yielding an activity again (or the app's own start, then its update) changes nothing.
+    expect(keep).toMatch(/if seen\.contains\(id\) \{/);
+    // First-seen order decides: what is ended is what was seen before this one, never a later arrival,
+    // so the last one seen is never ended by anyone.
+    expect(keep).toMatch(/let earlier = Set\(seen\)/);
+    expect(keep).toMatch(/for activity in liveActivities\(\) where earlier\.contains\(activity\.id\)/);
+    expect(keep).toMatch(/remember\(id\)/);
+    expect(block(moduleSwift, /private func remember\(_ id: String\)/)).toMatch(/seen\.append\(id\)/);
+    // The activities already there when the app starts listening come first in that order.
+    const listening = block(moduleSwift, /OnStartObserving\("pushToken"\)/);
+    expect(listening).toMatch(/self\.see\(activity\)/);
+    // The order is kept under the lock, and bounded.
+    const see = block(moduleSwift, /private func see\(_ activity: Activity<OctetActivity>\)/);
+    expect(see).toMatch(/lock\.lock\(\)/);
+    expect(moduleSwift).toMatch(/private let seenLimit = \d+/);
   });
 
   it("drains on one serial queue, so no key is emitted twice", () => {
@@ -290,6 +312,22 @@ describe("the widget's buttons and links", () => {
 
   it("gives the whole Deny label its tap area", () => {
     expect(block(block(widgetSwift, /private struct Actions: View/), /Button\(intent: deny\)/)).toMatch(/\.contentShape\(Rectangle\(\)\)/);
+  });
+
+  it("dims a stale activity and labels it Stale, muted, on the Lock Screen and in the Island", () => {
+    // ActivityKit marks the activity stale past the stale-date the hub (and the app) set.
+    expect([...widgetSwift.matchAll(/Shown\(context\.state, stale: context\.isStale\)/g)].length).toBe(2);
+    const shown = block(widgetSwift, /private struct Shown \{/);
+    expect(shown).toMatch(/let stale: Bool/);
+    const label = block(widgetSwift, /private struct StaleLabel: View/);
+    expect(label).toContain('Text("Stale")');
+    expect(label).toMatch(/\.foregroundStyle\(\.secondary\)/);
+    expect(label).toMatch(/if shown\.stale/);
+    // The content dims: one opacity, used wherever the content is drawn.
+    expect(widgetSwift).toMatch(/private let staleOpacity = 0\.\d+/);
+    expect([...widgetSwift.matchAll(/\.opacity\(shown\.stale \? staleOpacity : 1\)/g)].length).toBeGreaterThanOrEqual(3);
+    expect(block(widgetSwift, /private struct LockScreen: View/)).toMatch(/StaleLabel\(shown: shown\)/);
+    expect(block(widgetSwift, /DynamicIslandExpandedRegion\(\.center\)/)).toMatch(/StaleLabel\(shown: shown\)/);
   });
 
   it("gives Allow and Deny a hit area at least 44 points tall", () => {

@@ -11,29 +11,19 @@ import * as octetLive from "../modules/octet-live";
 import type { ActivityState, DenyEvent, Subscription, TokenEvent, WidgetEntry } from "../modules/octet-live";
 import { IslandDenies, type DenyFleet } from "./activityDeny";
 import { ActivityModel, IDLE_END_MS, activityRegistration, rowsOf, widgetEntries, type ActivityTokens } from "./activityModel";
-import type { HubClient, RequestBody } from "./client/HubClient";
+import { Refusal, type HubClient, type RequestBody } from "./client/HubClient";
 import { MAC_ID, macOfKey, splitKey } from "./macs";
 import { loadSettings, saveSettings } from "./persist";
 import { sendTo } from "./sendVia";
 import type { OctetState, OctetStore } from "./store";
 
-export {
-  ActivityModel,
-  COMMAND_CHARS,
-  ENTRIES_BYTES,
-  ENTRIES_LIMIT,
-  IDLE_END_MS,
-  NAME_CHARS,
-  activityRegistration,
-  rowsOf,
-  widgetEntries,
-  type ActivityRow,
-  type ActivityTokens,
-  type Lead,
-} from "./activityModel";
-
 /** The least time between two changes the app makes to the activity. */
 export const DRIVE_GAP_MS = 1_000;
+/** How long a register or clear the hub refused for now (`RETRIED`) waits before it is tried once more. */
+export const REGISTER_RETRY_MS = 5_000;
+/** The refusals that may pass: the hub was busy, rate-limited, or could not save. Any other is a
+ * definite no, tried again only on the next change or connection. */
+const RETRIED: ReadonlySet<string> = new Set(["rate_limited", "busy", "unavailable", "timeout"]);
 /** What a Mac is told when it is not the one that drives the Island (or the switch is off). */
 const CLEAR: RequestBody = { type: "clear_activity" };
 
@@ -146,6 +136,10 @@ export class LiveActivity {
   /** What each link's Mac was last handed over in the background, answered or not: a hand-over is
    * tried once per Mac for a body, so nothing in the background tries it again and again. */
   private handedOver = new WeakMap<HubClient, string>();
+  /** What each link's Mac refused for now and was given a second try at: one per body. */
+  private retried = new WeakMap<HubClient, string>();
+  /** The second try waiting, by Mac. */
+  private readonly retries = new Map<string, () => void>();
 
   /** The App Group's entries as last written; null when they are to be written again. */
   private entries: string | null = null;
@@ -240,10 +234,15 @@ export class LiveActivity {
     for (const off of this.offs) off();
     this.offs = [];
     this.cancelTimers();
+    for (const cancel of this.retries.values()) cancel();
+    this.retries.clear();
   }
 
   /** The app came to the foreground, or left it: the activity is driven only in the foreground
-   * (the hub drives it while the phone is away). */
+   * (the hub drives it while the phone is away). In front again, every Mac whose link is up is told
+   * what it is to hold, unless it took that already: an old owner that missed its `clear_activity`
+   * (out of reach when the tokens moved, or it refused) forgets them now; one whose link is still
+   * coming is told when it is ready. */
   setForeground(active: boolean): void {
     this.foreground = active;
     if (!active) {
@@ -253,6 +252,7 @@ export class LiveActivity {
     const supported = this.api.isSupported();
     if (supported !== this.supportedNow && !this.stopped) this.supportChanged(supported);
     this.chooseOwner();
+    this.syncAll();
     this.drive(true);
   }
 
@@ -576,8 +576,10 @@ export class LiveActivity {
 
   /** Tells Mac `mac` what it is to hold, over a link that is up, unless it has it already or it is
    * on its way: the tokens, for the owner while the Live Activity is wanted; `clear_activity` for
-   * every other Mac, and for every Mac while it is off. A refusal or a dropped link is tried again
-   * on the next change or connection. */
+   * every other Mac, and for every Mac while it is off. A refusal for now (`RETRIED`: busy, rate
+   * limited, not saved) is tried once more `REGISTER_RETRY_MS` on, if that Mac is still to hold
+   * the same; any refusal, and a dropped link, is tried again on the next change, connection or
+   * foreground. */
   private sync(mac: string): void {
     const client = this.fleet.links.client(mac);
     if (!client || client.state !== "ready" || this.stopped || !this.attached) return;
@@ -592,12 +594,30 @@ export class LiveActivity {
       .then(
         () => {
           if (this.telling.get(client) === said) this.told.set(client, said);
+          if (this.retried.get(client) === said) this.retried.delete(client);
         },
-        () => undefined,
+        (error: unknown) => {
+          if (!(error instanceof Refusal) || !RETRIED.has(error.code) || this.retried.get(client) === said) return;
+          this.retried.set(client, said);
+          this.retryLater(mac);
+        },
       )
       .finally(() => {
         if (this.telling.get(client) === said) this.telling.delete(client);
       });
+  }
+
+  /** Syncs Mac `mac` again `REGISTER_RETRY_MS` from now: whatever it is to hold then, which a
+   * newer registration may have given it already. */
+  private retryLater(mac: string): void {
+    this.retries.get(mac)?.();
+    this.retries.set(
+      mac,
+      this.schedule(() => {
+        this.retries.delete(mac);
+        this.sync(mac);
+      }, REGISTER_RETRY_MS),
+    );
   }
 }
 

@@ -11,6 +11,8 @@ private let appGroup = "group.dev.octet.mobile"
 private let entriesKey = "entries"
 /// The module refuses anything larger; a store past this is not read at all.
 private let entriesByteLimit = 64 * 1024
+/// How much of a stale activity's content shows: dimmed, so it reads as old at a glance.
+private let staleOpacity = 0.45
 
 /// One session's waiting approval, as the app wrote it.
 private struct Entry {
@@ -41,9 +43,13 @@ private func clip(_ text: String, _ limit: Int) -> String? {
 private struct Shown {
   let state: OctetActivity.ContentState
   let entry: Entry?
+  /// ActivityKit's word that the activity is past its stale-date (the hub and the app set one 15
+  /// minutes on): nobody has updated it since, so what it shows may be old.
+  let stale: Bool
 
-  init(_ state: OctetActivity.ContentState) {
+  init(_ state: OctetActivity.ContentState, stale: Bool) {
     self.state = state
+    self.stale = stale
     self.entry = Shown.entry(forKey: hostKey(state.mac) + "/" + state.session)
   }
 
@@ -156,6 +162,21 @@ private struct Particulars: View {
   }
 }
 
+/// "Stale", muted, under a stale activity's dimmed content; nothing otherwise.
+private struct StaleLabel: View {
+  let shown: Shown
+
+  var body: some View {
+    if shown.stale {
+      Text("Stale")
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .accessibilityLabel("Stale: this may be out of date")
+    }
+  }
+}
+
 private struct Details: View {
   let shown: Shown
 
@@ -207,9 +228,12 @@ private struct LockScreen: View {
           .font(.headline)
           .frame(maxWidth: 72, alignment: .trailing)
       }
+      .opacity(shown.stale ? staleOpacity : 1)
       if shown.isApproval {
         Actions(shown: shown)
+          .opacity(shown.stale ? staleOpacity : 1)
       }
+      StaleLabel(shown: shown)
     }
     .padding(14)
   }
@@ -233,23 +257,29 @@ private struct CompactTrailing: View {
 struct OctetLiveWidget: Widget {
   var body: some WidgetConfiguration {
     ActivityConfiguration(for: OctetActivity.self) { context in
-      LockScreen(shown: Shown(context.state))
+      LockScreen(shown: Shown(context.state, stale: context.isStale))
         .widgetURL(URL(string: "octet://"))
     } dynamicIsland: { context in
-      let shown = Shown(context.state)
+      let shown = Shown(context.state, stale: context.isStale)
       return DynamicIsland {
         DynamicIslandExpandedRegion(.leading) {
           MascotImage(pose: shown.pose, height: 36)
+            .opacity(shown.stale ? staleOpacity : 1)
         }
         DynamicIslandExpandedRegion(.trailing) {
           Elapsed(shown: shown)
             .font(.headline)
             .frame(maxWidth: 72, alignment: .trailing)
+            .opacity(shown.stale ? staleOpacity : 1)
         }
         DynamicIslandExpandedRegion(.center) {
-          Text(shown.title)
-            .font(.headline)
-            .lineLimit(1)
+          VStack(spacing: 2) {
+            Text(shown.title)
+              .font(.headline)
+              .lineLimit(1)
+              .opacity(shown.stale ? staleOpacity : 1)
+            StaleLabel(shown: shown)
+          }
         }
         DynamicIslandExpandedRegion(.bottom) {
           VStack(alignment: .leading, spacing: 6) {
@@ -258,13 +288,17 @@ struct OctetLiveWidget: Widget {
               Actions(shown: shown)
             }
           }
+          .opacity(shown.stale ? staleOpacity : 1)
         }
       } compactLeading: {
         MascotImage(pose: shown.pose, height: 18)
+          .opacity(shown.stale ? staleOpacity : 1)
       } compactTrailing: {
         CompactTrailing(shown: shown)
+          .opacity(shown.stale ? staleOpacity : 1)
       } minimal: {
         MascotImage(pose: shown.pose, height: 16)
+          .opacity(shown.stale ? staleOpacity : 1)
       }
       .widgetURL(shown.inboxURL)
     }

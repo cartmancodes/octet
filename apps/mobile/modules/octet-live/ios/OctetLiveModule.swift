@@ -14,6 +14,8 @@ private let denyPrefix = "deny."
 private let denyNotification = "dev.octet.mobile.deny"
 /// A Deny older than this is dropped, not sent: its approval has long moved on.
 private let denyMaxAge: TimeInterval = 10 * 60
+/// The activity ids remembered in the order first seen; past this many the oldest are forgotten.
+private let seenLimit = 32
 
 /// The content state as JavaScript passes it: the same five fields as the hub's payload.
 struct ActivityStateRecord: Record {
@@ -57,16 +59,18 @@ private func hex(_ data: Data) -> String {
 /// The app runs on iOS 16.4, but the activity needs 17.2 (push-to-start tokens). `OctetActivity` is
 /// marked `@available(iOS 17.2, *)`, so every ActivityKit call here sits behind `#available`; below
 /// 17.2 isSupported() is false and every function resolves without doing anything.
-// @unchecked Sendable: its only mutable state, `tasks`, `hearingDenies` and `newestId`, is behind
-// `lock`.
+// @unchecked Sendable: its only mutable state, `tasks`, `hearingDenies`, `newestId` and `seen`, is
+// behind `lock`.
 public final class OctetLiveModule: Module, @unchecked Sendable {
-  /// Guards `tasks`, `hearingDenies` and `newestId`.
+  /// Guards `tasks`, `hearingDenies`, `newestId` and `seen`.
   private let lock = NSLock()
   /// Each watching task by key, with an id so a finished task forgets only itself.
   private var tasks: [String: (id: UUID, task: Task<Void, Never>)] = [:]
   private var hearingDenies = false
-  /// The id of the activity that appeared last: the one kept when another appears.
+  /// The id of the activity first seen last: the one kept when another appears.
   private var newestId: String?
+  /// Activity ids in the order they were first seen, oldest first (at most `seenLimit`).
+  private var seen: [String] = []
   /// Drains run one at a time, so a key is emitted once before it is removed.
   private let denyQueue = DispatchQueue(label: "dev.octet.mobile.deny")
 
@@ -155,6 +159,7 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
         }
       }
       for activity in Activity<OctetActivity>.activities {
+        self.see(activity)
         self.watch(activity)
       }
     }
@@ -209,21 +214,51 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
     }
   }
 
-  /// A new activity (one the hub started by push, or one the app started) is the one to keep: every
-  /// other live one is ended at once, so they never stack on the Lock Screen. Which one is newest is
-  /// decided under the lock, and checked again before each end, so an earlier arrival's ends stop
-  /// once a later one has appeared. Needs no keychain, so it works with the phone locked.
+  /// A new activity (one the hub started by push, or one the app started) is the one to keep: the
+  /// live ones seen before it are ended at once, so they never stack on the Lock Screen. The order is
+  /// the order first seen, decided under the lock: an activity seen already (`activityUpdates` may
+  /// yield one again, or after a newer one), or one no longer live, changes nothing, and no arrival
+  /// ever ends one seen after it. So the last one seen is never ended here, and two arrivals can't
+  /// end each other and leave none. The newest is checked again before each end, so an earlier
+  /// arrival stops ending once a later one has taken over. Needs no keychain, so it works with the
+  /// phone locked.
   @available(iOS 17.2, *)
   private func keepOnly(_ newest: Activity<OctetActivity>) {
+    guard newest.activityState == .active || newest.activityState == .stale else { return }
     let id = newest.id
     lock.lock()
+    if seen.contains(id) {
+      lock.unlock()
+      return
+    }
+    let earlier = Set(seen)
+    remember(id)
     newestId = newest.id
     lock.unlock()
     Task { [weak self] in
-      for activity in liveActivities() where activity.id != id {
+      for activity in liveActivities() where earlier.contains(activity.id) {
         guard self?.isNewest(id) == true else { return }
         await activity.end(nil, dismissalPolicy: .immediate)
       }
+    }
+  }
+
+  /// An activity that is there when the app starts listening: first in the order, ended by any
+  /// later arrival, ending none itself.
+  @available(iOS 17.2, *)
+  private func see(_ activity: Activity<OctetActivity>) {
+    lock.lock()
+    defer { lock.unlock() }
+    if !seen.contains(activity.id) {
+      remember(activity.id)
+    }
+  }
+
+  /// Adds `id` last to the first-seen order, forgetting the oldest past `seenLimit`. Under `lock`.
+  private func remember(_ id: String) {
+    seen.append(id)
+    if seen.count > seenLimit {
+      seen.removeFirst(seen.count - seenLimit)
     }
   }
 
