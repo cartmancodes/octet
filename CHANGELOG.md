@@ -11,6 +11,25 @@ Claude Code and Codex CLIs.
 
 ### Added
 
+- A Live Activity for the phone app, in the Dynamic Island and on the Lock
+  Screen (iOS 17.2 or later; the app still runs on iOS 16.4): whether a
+  session runs, waits for approval or is done, and for how long, with the
+  waiting approval's session name and command, which the app keeps in the
+  phone's App Group only (at most 64, cleared on unpair). While the app is open
+  it drives the activity itself, at most once a second; while it isn't, the
+  hub starts, updates and ends it through APNs with content-free pushes (the
+  state, the hub's session id, its host, two times and a count) signed with
+  your own `.p8` key, named in `hub.json` (`apns: {team_id, key_id, key_path,
+  sandbox}`; the key must be `0600` and yours, or APNs stays off with one log
+  line). The phone gives each Mac its ActivityKit tokens with
+  `register_activity` and takes them back with `clear_activity`. **Deny** on
+  the Island answers no at once, to the Mac that owns the approval; **Allow**
+  opens `octet://approve/...`, the approval's session, behind Face ID and the
+  arm, and a forged or stale link opens the Inbox. **Settings › Live
+  Activity** (on by default) turns it all off. An approval that starts the
+  activity while you are away brings two alerts, the push and the activity's.
+  The Swift is unverified until the first device build. The contract test
+  checks one content-free start at a local stand-in for APNs.
 - The phone app pairs with up to 4 Macs. Each pairing keeps its token in its
   own keychain entry, the one pairing of an earlier version moves over on
   first launch, and every Mac stays connected while the app is open. The

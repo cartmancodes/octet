@@ -488,6 +488,120 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
   "NAME"` on the Mac, removes its token as well. Stopping the hub stops
   every push.
 
+### Live Activity (Dynamic Island)
+
+On an iPhone with iOS 17.2 or later, a Live Activity in the Dynamic Island and on the Lock Screen
+shows whether a session is running, waiting for approval, or done, and for how long. The app runs
+on iOS 16.4 and later, but below 17.2 it has no Live Activity. While the app is open, the app keeps
+the activity up to date itself. While it isn't, the hub starts, updates and ends the activity
+through Apple's push service (APNs), and for that it needs your APNs key. Without one the activity
+shows only while the app is open, and the hub sends Apple nothing.
+
+**Set up APNs** (once, with your own Apple developer account; nothing here makes one):
+
+1. In the Apple developer site, under **Certificates, Identifiers & Profiles › Keys**, make a key
+   with **Apple Push Notifications service (APNs)** on, and download its `AuthKey_<KEY ID>.p8`
+   (Apple lets you download it only once). Note the **Key ID** and your **Team ID**: 10 upper-case
+   letters and digits each.
+2. Put the key on the Mac in a file only you can read, owned by the user the hub runs as, and not a
+   symlink:
+
+   ```sh
+   mkdir -p ~/.config/octet && mv ~/Downloads/AuthKey_KEY1234567.p8 ~/.config/octet/
+   chmod 600 ~/.config/octet/AuthKey_KEY1234567.p8
+   ```
+
+3. Name it in `hub.json` in the data directory (beside `devices.json`; see the end of [Hub
+   security notes](#hub-security-notes)), with the absolute path:
+
+   ```json
+   {
+     "apns": {
+       "team_id": "ABCDE12345",
+       "key_id": "KEY1234567",
+       "key_path": "/Users/you/.config/octet/AuthKey_KEY1234567.p8",
+       "sandbox": false
+     }
+   }
+   ```
+
+   `sandbox` picks Apple's host: `true` sends to `api.sandbox.push.apple.com`, for a build signed for
+   development (from Xcode, or an EAS development build); `false` sends to `api.push.apple.com`, for
+   an EAS `preview` (ad hoc) build, TestFlight or the App Store. The wrong one gets no activity.
+4. Restart the hub. If the key is missing, is a symlink, isn't mode `0600`, belongs to another
+   user, or isn't a PKCS#8 P-256 key, or the block is malformed, Live Activity pushes are off and
+   the hub logs one line saying why (for example `APNs key must be 0600`); everything else works as
+   before.
+
+**What is sent.** Exactly this, and only to a phone that turned the Live Activity on:
+
+```json
+{"aps": {"timestamp": 1790000101, "event": "start",
+         "content-state": {"kind": "approval", "session": "4821-1790000000",
+                           "mac": "studio.tail1234.ts.net", "since": 1790000059, "approvals": 2},
+         "attributes-type": "OctetActivity", "attributes": {},
+         "alert": {"title": "Octet", "body": "Approval waiting"}}}
+```
+
+- `kind` is `running`, `approval` or `done`; `session` is the hub's own opaque id of the session
+  that leads (the one with the oldest waiting approval, else the newest running turn, else the last
+  to finish), or empty; `mac` is the host of the hub's published address, or empty; `since` is
+  when that session's state began; `approvals` counts the approvals waiting.
+- `attributes-type`, `attributes` and `alert` go on a start only (its alert body is `Approval
+  waiting` or `Session running`); an end adds `dismissal-date`; an update has neither.
+- No session name, workspace, command, file name, prompt or reply ever goes in it, so Apple never
+  sees what you are working on. The widget reads names and commands from the phone itself (see
+  below).
+- The request goes to Apple with the headers `apns-topic: dev.octet.mobile.push-type.liveactivity`,
+  `apns-push-type: liveactivity`, `apns-priority` (10 for a start and while an approval waits, 5
+  otherwise) and a bearer token: an ES256 JWT signed with your key, made again every 50 minutes.
+  The hub runs `curl -q --http2 -K -` and gives it the address, the headers and the body on standard
+  input, so neither the key, the JWT nor the phone's token is ever on a command line, in a log, a
+  journal or the audit file.
+
+**When.** The hub starts the activity when an approval waits or a turn starts while the phone has
+no connection streaming a session (the app is closed or in the background); updates it when what it
+shows changes, at most once every 2 seconds; and ends it 5 minutes after every session went idle,
+or when the app opens a session again (from then on the app drives it). These sends share the
+pushes' limit of six a minute per phone, and always leave room for an approval's push. Apple
+answering that a token is gone (410) drops that token; any other failure is logged, without the
+token, and not retried in a loop.
+
+**Two alerts for one approval.** An approval that starts the activity while you are away brings
+two alerts: the push notification (`Approval waiting`, with **An action needs approval** on) and the
+activity's own start alert, which Apple requires to start one by push. That is expected.
+
+**Tokens.** The app gives each paired Mac its ActivityKit tokens (`register_activity`) over its own
+connection, whenever they change: the push-to-start token, and the running activity's own token.
+The hub keeps them per phone in `devices.json`, records `activity registered` (or `activity cleared`)
+with the phone's name in `hub-audit.jsonl`, never the token, and drops them on `octet hub revoke`.
+
+**Deny and Allow on the Island.** While an approval waits, the expanded activity shows it with
+**Deny** and **Allow**.
+
+- **Deny** answers that approval no, to the Mac that owns it, without opening the app and without
+  Face ID, since it allows nothing. A Mac out of reach is sent it on its next connection (within 10
+  minutes). A Deny that names no paired Mac sends nothing.
+- **Allow** only opens the app (`octet://approve/<host>/<session>/<approval>`), at that approval in
+  its session, where Allow asks for Face ID and waits out its short arm as always. The link allows
+  nothing by itself. A link for a Mac that isn't paired, a session that ended, or an approval that
+  was already answered, or one that is malformed, opens the Inbox and sends nothing.
+
+**On the phone.** The widget shows a session's name (at most 80 characters) and the command it
+asks to run (at most 200) from the app's shared storage on the phone (the App Group
+`group.dev.octet.mobile`), which the app writes while it runs, for each waiting approval (at most
+64), and clears when you unpair that Mac or turn the Live Activity off. These show on the Lock
+Screen. Nothing of them leaves the phone.
+
+**Turn it off.** In the app, **Settings › Live Activity**: the activity ends, every Mac is told to
+forget the phone's tokens (`clear_activity`; a Mac out of reach is told on its next connection), and
+the widget's names are cleared. To stop every phone's activity pushes, remove the `apns` block from
+`hub.json` and restart the hub.
+
+**Not yet tested on a phone.** The Swift code (the app's Live Activity module and the widget) has
+been checked here only as source, never built for iOS. The first device build (with EAS, on your
+account) is its first real check; see the app's [device pass](../apps/mobile/README.md#device-pass).
+
 ### Put it on your tailnet
 
 The hub never listens on the network. Publish it with Tailscale, which adds
@@ -713,8 +827,8 @@ answered within those 10 seconds, or the commit fails.
 - The phone can't run any other slash command, `!` shell commands or `/goal`,
   edit files outside a session, push or open a pull request, or see sessions
   started with `--no-remote`.
-- Pairing codes, device tokens and push tokens are never written to logs or
-  journals.
+- Pairing codes, device tokens, push tokens, ActivityKit tokens, the APNs key
+  and its JWT are never written to logs or journals.
 
 The hub's files (`devices.json`, `hub.json`, `hub-audit.jsonl`) and the
 `run/` directory live beside the journals: `$XDG_DATA_HOME/octet/rust-preview`,

@@ -196,7 +196,9 @@ side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Se
   errors on and finished turns off; an app updated from before the switches, with notifications
   on, shows all three on, which is what the Mac was sending it.
   **Face ID to allow**: turns the Face ID check on allowing an approval on or off (turning it off
-  asks for Face ID; full access always asks). The footer names the app version.
+  asks for Face ID; full access always asks). **Live Activity** (only on an iPhone that has Live
+  Activities: iOS 17.2 or later): on by default; see [Live Activity](#live-activity-dynamic-island).
+  The footer names the app version.
 - **Toasts.** One line at the bottom of a screen. When an approval newly arrives for a session
   other than the one you are in (and you are not on the Inbox), `<name> needs approval` appears
   with **View**, which opens it.
@@ -247,6 +249,42 @@ finished`. On Android each goes to its own channel (**Approvals**, **Session err
 turns**), which the phone's settings can silence one by one; approvals and errors sound, finished
 turns don't. What the hub sends, where, and when is in [the guide](../../docs/remote-control.md#push-notifications).
 
+## Live Activity (Dynamic Island)
+
+On iOS 17.2 and later a Live Activity shows, in the Dynamic Island and on the Lock Screen, whether a
+session is running, waiting for approval or done, with the time since; the expanded view names the
+waiting approval's session and command, with **Deny** and **Allow**. The app itself runs on iOS 16.4
+and later; below 17.2 (and on Android, and in Expo Go) there is no Live Activity, and **Settings**
+shows no switch for it.
+
+- **While the app is open** the app drives the activity: it starts it while a session runs or an
+  approval waits, changes it at most once a second, and ends it 5 minutes after every session went
+  idle. It reads what to show from the same lists as the Inbox, with the hub's rules, so the
+  activity looks the same whoever drives it.
+- **While it isn't**, the Mac's hub starts, updates and ends it through APNs, with content-free
+  pushes (the state, the hub's own session id, its host, two times and a count; no names or
+  commands). That needs your APNs key in the hub's `hub.json`: the setup, and exactly what is sent,
+  are in [the guide](../../docs/remote-control.md#live-activity-dynamic-island). The app gives each
+  Mac its ActivityKit tokens (`register_activity`) over its own connection, when they change; a Mac
+  out of reach gets them on its next connection.
+- **The names and commands** the widget shows come from the phone only: the app writes each waiting
+  approval's session name (at most 80 characters) and command (folded like the Permission card, at
+  most 200) to the App Group `group.dev.octet.mobile`, at most 64 of them, newest first, whenever the
+  approvals change. Unpairing a Mac removes its entries.
+- **Deny** answers no to that approval, on the Mac that owns it, at once and without Face ID (it
+  allows nothing). Each Deny is sent once; one for a Mac out of reach goes on its next connection.
+- **Allow** opens `octet://approve/<host>/<session>/<approval>`. The app opens that approval's
+  session, where Allow asks for Face ID (if **Face ID to allow** is on) and waits out the 400 ms arm,
+  as anywhere else: the link alone never allows. A malformed link, one for a Mac that isn't paired,
+  a session that ended or an approval already answered opens the Inbox and sends nothing.
+- **Two alerts for one approval** that starts the activity while you are away: the push notification
+  and the activity's start alert (Apple requires one to start an activity by push).
+- **Turning it off** in **Settings › Live Activity** ends the activity, tells every Mac to forget
+  this phone's tokens (`clear_activity`) and empties the App Group. Turning it on registers again.
+- **Not built yet.** The Swift (`modules/octet-live` and `targets/octet-live`) can't be compiled
+  here (no iOS SDK): it is checked as text and by its tests, and is unverified until the first device
+  build. The device pass below starts with it.
+
 ## Device pass
 
 The tests cannot cover a real phone. Run this on the iPhone 15 and on the Gemini 10 with a `preview`
@@ -280,6 +318,19 @@ workspace. Tick each one on each phone.
       each named. A push from each Mac, tapped, opens that Mac's session.
 - [ ] Rename a Mac; unpair it while its conversation is open: the app goes back to the Inbox and
       the other Mac keeps working.
+- [ ] Live Activity (iPhone, iOS 17.2 or later): `npx expo prebuild` and the device build succeed
+      with the widget target (the Swift has never been compiled before this). On iOS 16.4–17.1 the
+      app installs and runs with no Live Activity and no switch.
+- [ ] With the app open, start a turn: the Island shows the coding mascot and the time; an approval
+      shows the approval pose, the session's name and its command; the activity ends 5 minutes after
+      every session is idle.
+- [ ] With your APNs key in `hub.json` (`sandbox` matching the build), lock the phone and start a
+      turn that needs approval: the activity starts by push (with its alert, and the push
+      notification beside it), and nothing in it names the session beyond what the App Group holds.
+- [ ] **Deny** on the Island: the approval is denied on the desk, the app never opened. **Allow**:
+      the app opens on that session, asks for Face ID, and allows only after it.
+- [ ] Turn **Settings › Live Activity** off: the activity ends and no push starts one again; on
+      again: the next approval while away starts it.
 
 ## Performance notes
 
