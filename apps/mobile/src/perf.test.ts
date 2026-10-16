@@ -4,6 +4,7 @@
 import type { BatchItem } from "./client/HubClient";
 import { MAX_BYTES, MAX_CALLS, MAX_ENTRIES, callIndexSize } from "./model/transcript";
 import { createOctetStore } from "./store";
+import { applyM, k } from "./testKeys";
 
 const SESSION = "a";
 const OTHER = "b";
@@ -60,8 +61,8 @@ describe("performance budgets", () => {
   it(`applies ${TEXT_EVENTS} text and ${TOOL_EVENTS} tool events in under ${BUDGET_MS} ms`, () => {
     const store = createOctetStore();
     // Another session, with a view of its own, that the stream never touches.
-    store.getState().applyBatch([event(OTHER, { type: "text", data: "quiet" })]);
-    const other = store.getState().bySession.get(OTHER);
+    applyM(store, [event(OTHER, { type: "text", data: "quiet" })]);
+    const other = store.getState().bySession.get(k(OTHER));
     expect(other).toBeDefined();
 
     const frames = stream();
@@ -69,12 +70,12 @@ describe("performance budgets", () => {
     for (let i = 0; i < frames.length; i += BATCH) batches.push(frames.slice(i, i + BATCH));
 
     const started = performance.now();
-    for (const batch of batches) store.getState().applyBatch(batch);
+    for (const batch of batches) applyM(store, batch);
     const took = performance.now() - started;
     console.log(`perf: ${frames.length} frames in ${batches.length} batches took ${took.toFixed(0)} ms`);
 
     expect(took).toBeLessThan(BUDGET_MS);
-    const view = store.getState().bySession.get(SESSION);
+    const view = store.getState().bySession.get(k(SESSION));
     expect(view?.transcript.entries.length).toBeGreaterThan(40); // the prompts and turns are there
     const calls = view?.transcript.entries.flatMap((e) => (e.kind === "tools" ? e.calls : [])) ?? [];
     expect(calls.length).toBeGreaterThan(0);
@@ -82,7 +83,7 @@ describe("performance budgets", () => {
     expect(replies.at(-1)).toMatchObject({ done: true });
     expect(replies.at(-1)).toHaveProperty("text", expect.stringContaining("word19999 "));
     // Session B's view is the very object it was: nothing about A touched it.
-    expect(store.getState().bySession.get(OTHER)).toBe(other);
+    expect(store.getState().bySession.get(k(OTHER))).toBe(other);
   });
 
   /** Applies `frames` in batches of `size`; the total and the worst batch, in ms. */
@@ -91,7 +92,7 @@ describe("performance budgets", () => {
     const started = performance.now();
     for (let i = 0; i < frames.length; i += size) {
       const t = performance.now();
-      store.getState().applyBatch(frames.slice(i, i + size));
+      applyM(store, frames.slice(i, i + size));
       worst = Math.max(worst, performance.now() - t);
     }
     return { took: performance.now() - started, worst };
@@ -110,13 +111,13 @@ describe("performance budgets", () => {
     return frames;
   };
   const toolsOf = (store: ReturnType<typeof createOctetStore>) =>
-    (store.getState().bySession.get(SESSION)?.transcript.entries ?? []).flatMap((e) => (e.kind === "tools" ? [e] : []));
+    (store.getState().bySession.get(k(SESSION))?.transcript.entries ?? []).flatMap((e) => (e.kind === "tools" ? [e] : []));
 
   it(`holds a hostile turn of ${HOSTILE_CALLS} empty calls in bounded memory, in under ${HOSTILE_BUDGET_MS} ms`, () => {
     const store = createOctetStore();
     const { took, worst } = timed(store, calls(HOSTILE_CALLS, () => ({ name: "", target: "", detail: "" })), 200);
     console.log(`perf: ${HOSTILE_CALLS} empty calls took ${took.toFixed(0)} ms, worst batch ${worst.toFixed(1)} ms`);
-    const transcript = store.getState().bySession.get(SESSION)?.transcript;
+    const transcript = store.getState().bySession.get(k(SESSION))?.transcript;
     const entries = toolsOf(store);
     // Every call is charged for: the entry is not free, and none holds more than MAX_CALLS.
     expect(transcript?.bytes).toBeGreaterThan(0);
@@ -147,7 +148,7 @@ describe("performance budgets", () => {
       frames.push(event(SESSION, { type: "tool", data: { id: `call-${k}`, name: "R", target: "", phase: "running", detail: "" } }));
     }
     const { took, worst } = timed(store, frames, 200);
-    const transcript = store.getState().bySession.get(SESSION)?.transcript;
+    const transcript = store.getState().bySession.get(k(SESSION))?.transcript;
     const size = transcript ? callIndexSize(transcript) : -1;
     console.log(`perf: ${PAIRS} text and call pairs took ${took.toFixed(0)} ms, worst batch ${worst.toFixed(1)} ms, ${size} ids kept`);
     expect(took).toBeLessThan(PAIRS_BUDGET_MS);
@@ -158,8 +159,8 @@ describe("performance budgets", () => {
   it("keeps a session's transcript inside its limits however much streams", () => {
     const store = createOctetStore();
     const frames = stream();
-    for (let i = 0; i < frames.length; i += BATCH) store.getState().applyBatch(frames.slice(i, i + BATCH));
-    const { transcript } = store.getState().bySession.get(SESSION) ?? { transcript: null };
+    for (let i = 0; i < frames.length; i += BATCH) applyM(store, frames.slice(i, i + BATCH));
+    const { transcript } = store.getState().bySession.get(k(SESSION)) ?? { transcript: null };
     expect(transcript?.entries.length).toBeLessThanOrEqual(1_000);
     expect(transcript?.bytes).toBeLessThanOrEqual(4 * 1024 * 1024);
   });

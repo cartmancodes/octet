@@ -44,8 +44,9 @@ export function freshApprovals(
 
 const NONE: ReadonlyMap<string, number> = new Map();
 
-/** The session a Conversation path shows, or null on any other screen. */
-const SESSION_PATH = /^\/session\/([^/]+)$/;
+/** The session a Conversation path shows, or null on any other screen. The path holds the key,
+ * `/` and all (expo-router gives it decoded), or the key percent-encoded. */
+const SESSION_PATH = /^\/session\/(.+)$/;
 function onScreen(pathname: string): string | null {
   const id = SESSION_PATH.exec(pathname)?.[1];
   if (id === undefined) return null;

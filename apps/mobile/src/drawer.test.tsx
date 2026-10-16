@@ -11,6 +11,7 @@ import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { hideToast, showToast } from "./toast";
 import { TOKEN_KEY } from "./hub";
 import { dark, light } from "./theme";
+import { k, sessionPath } from "./testKeys";
 
 const gist = (id: number): ApprovalInfo => ({
   id,
@@ -287,8 +288,8 @@ describe("the drawer", () => {
       ]);
       await openFromMenu();
       const rows = inDrawer().getAllByTestId(/^drawer-row-/);
-      expect(rows.map((r) => r.props.testID)).toEqual(["drawer-row-ask", "drawer-row-run", "drawer-row-old"]);
-      const word = (id: string, text: string) => within(screen.getByTestId(`drawer-row-${id}`)).getByText(text);
+      expect(rows.map((r) => r.props.testID)).toEqual(["ask", "run", "old"].map((id) => `drawer-row-${k(id)}`));
+      const word = (id: string, text: string) => within(screen.getByTestId(`drawer-row-${k(id)}`)).getByText(text);
       expect([dark.amber, light.amber]).toContain(style(word("ask", "approve")).color);
       expect([dark.accent, light.accent]).toContain(style(word("run", "thinking")).color);
       expect([dark.muted, light.muted]).toContain(style(word("old", "3h")).color);
@@ -308,8 +309,8 @@ describe("the drawer", () => {
       const rig = await open([info("a"), info("b")]);
       await openFromMenu();
       await fireEvent.press(inDrawer().getByRole("button", { name: /^b/ }));
-      expect(rig.view.getPathname()).toBe("/session/b");
-      expect(screen.getByTestId("opened").children).toEqual(["b"]);
+      expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
+      expect(screen.getByTestId("opened").children).toEqual([k("b")]);
       expect(drawerStore.getState().open).toBe(false);
       await wait(DRAWER_MS + 20);
       expect(isOpen()).toBe(false);
@@ -317,21 +318,21 @@ describe("the drawer", () => {
 
     it("from one session, a tap on another replaces it: back goes to the Inbox", async () => {
       const rig = await open([info("a"), info("b")]);
-      await act(async () => router.push("/session/a"));
+      await act(async () => router.push(sessionPath("a")));
       await openFromStore();
       await fireEvent.press(inDrawer().getByRole("button", { name: /^b/ }));
-      expect(rig.view.getPathname()).toBe("/session/b");
+      expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
       await act(async () => router.back());
       expect(rig.view.getPathname()).toBe("/");
     });
 
     it("a tap on a session already in the stack goes back to it: no second copy", async () => {
       const rig = await open([info("a"), info("b")]);
-      await act(async () => router.push("/session/a"));
+      await act(async () => router.push(sessionPath("a")));
       await act(async () => router.push("/settings"));
       await openFromStore();
       await fireEvent.press(inDrawer().getByRole("button", { name: /^a/ }));
-      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
       await act(async () => router.back());
       expect(rig.view.getPathname()).toBe("/");
       expect(router.canGoBack()).toBe(false);
@@ -369,7 +370,7 @@ describe("the drawer", () => {
 
     it("marks the screen it is on", async () => {
       await open([info("a"), info("b")]);
-      await act(async () => router.push("/session/a"));
+      await act(async () => router.push(sessionPath("a")));
       await openFromStore();
       const selected = (name: string | RegExp) => inDrawer().getByRole("button", { name }).props.accessibilityState?.selected === true;
       expect(selected(/^a/)).toBe(true);
@@ -383,7 +384,7 @@ describe("the drawer", () => {
     it("closes when the screen changes: a notification tap, a link, any navigation", async () => {
       await open([info("a")]);
       await openFromMenu();
-      await act(async () => router.push("/session/a"));
+      await act(async () => router.push(sessionPath("a")));
       expect(drawerStore.getState().open).toBe(false);
       await wait(DRAWER_MS + 20);
       expect(isOpen()).toBe(false);
@@ -393,7 +394,7 @@ describe("the drawer", () => {
     });
 
     it("keeps the ago texts moving: the clock ticks every 30 s, and is read afresh when it opens", async () => {
-      const ago = (id: string) => within(screen.getByTestId(`drawer-row-${id}`)).getByText(/^\d+[mhd]$/);
+      const ago = (id: string) => within(screen.getByTestId(`drawer-row-${k(id)}`)).getByText(/^\d+[mhd]$/);
       await open([info("a", { last_activity: Date.now() / 1000 - 60 })]);
       // shut for ten minutes: nothing is drawn, and it opens on the time it is
       await wait(600_000);
@@ -494,7 +495,7 @@ describe("the drawer", () => {
 
     it("is on the Conversation and Settings too", async () => {
       await open([info("a")]);
-      await act(async () => router.push("/session/a"));
+      await act(async () => router.push(sessionPath("a")));
       await dragEdge([[40, 0]]);
       expect(drawerStore.getState().open).toBe(true);
       await act(async () => closeDrawer());
@@ -523,7 +524,7 @@ describe("the drawer", () => {
 
     it("leaves out what is under the prompt line, measured: its top, as the keyboard moves it", async () => {
       await launch("/", { ...ROUTES, "session/[id]": Session }, [info("a")]);
-      await act(async () => router.push("/session/a"));
+      await act(async () => router.push(sessionPath("a")));
       await screen.findByTestId("prompt-area");
       await fireEvent(screen.getByTestId("prompt-area"), "layout", { nativeEvent: { layout: { x: 0, y: 900, width: 400, height: 140 } } });
       expect(drawerStore.getState().edge?.bottom).toBe(900);
@@ -562,7 +563,7 @@ describe("the drawer", () => {
 
     it("leaves the screens' own back-swipe off: the drawer owns the left edge", async () => {
       await open([info("a")]);
-      await act(async () => router.push("/session/a"));
+      await act(async () => router.push(sessionPath("a")));
       await act(async () => router.push("/settings"));
       const screens = nativeScreens();
       expect(screens).toHaveLength(3);

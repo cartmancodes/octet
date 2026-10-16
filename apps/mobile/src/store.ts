@@ -1,11 +1,15 @@
-// The app's state: the sessions the hub lists and, for each, what the phone knows of it. A
-// zustand store without React in it; the hooks at the bottom select parts of it so a screen
-// re-renders only for what it shows. A client batch is applied in one `set`, and every part that
-// a batch did not change keeps its identity.
+// The app's state: the sessions each paired Mac's hub lists and, for each, what the phone knows of
+// it. Every session is keyed `"<mac>/<session>"` (src/macs.ts): the hub's raw id is only on the
+// wire. A zustand store without React in it; the hooks at the bottom select parts of it so a
+// screen re-renders only for what it shows. The batches of every Mac's client go through one
+// coalescer (src/coalesce.ts) and are applied in one `set`, and every part that a batch did not
+// change keeps its identity.
 import { useShallow } from "zustand/react/shallow";
 import { createStore, useStore, type StoreApi } from "zustand";
 
 import type { BatchItem, HubClient, HubState } from "./client/HubClient";
+import { createCoalescer, type Batch, type Coalescer, type Sink } from "./coalesce";
+import { keyOf, macOfKey, rawOf, splitKey, type Links } from "./macs";
 import { ENGINES, MODES, PHASES, count, member } from "./model/enums";
 import {
   EMPTY_VIEW,
@@ -23,26 +27,37 @@ import { FIELD_CHARS, field } from "./model/text";
 import { isKnownEvent, type ApprovalInfo, type CatalogInfo, type SessionInfo } from "./protocol";
 import type { SessionHead } from "./session";
 
+/** A listed session. Its `id` is the store's key, `"<mac>/<session>"`; `raw` is the hub's own id,
+ * which goes only on the wire, and `mac` the phone's id for the Mac that listed it. */
+export type ListedSession = SessionInfo & { mac: string; raw: string };
+
 export interface OctetState {
-  /** The live sessions, as the hub listed them last. */
-  sessions: SessionInfo[];
-  /** What the phone knows of each session it has heard of. A Map: the keys are the hub's. */
+  /** The live sessions of every Mac, each Mac's as it listed them last, Mac after Mac. */
+  sessions: ListedSession[];
+  /** The same rows by Mac: a Mac's sessions frame replaces only its own. */
+  slices: ReadonlyMap<string, ListedSession[]>;
+  /** What the phone knows of each session it has heard of, by key. A Map: the keys hold the
+   * hub's ids. */
   bySession: ReadonlyMap<string, SessionView>;
-  hub: HubState;
-  /** A sessions frame came since the store began or was reset: until then an empty `sessions`
-   * means "not told yet", not "none". */
-  listed: boolean;
-  /** Applies the client's frames, in order, in one commit. Returns the sessions that just
-   * ended (they were listed before and are not now): their views stay, marked `ended`, until
-   * the caller releases them. */
-  applyBatch(frames: readonly BatchItem[]): string[];
+  /** The link to each Mac. `bestHub` gives the app's. */
+  hubs: ReadonlyMap<string, HubState>;
+  /** The Macs whose sessions frame came since the store began or was reset: until a Mac's comes,
+   * its having no rows means "not told yet", not "none". */
+  listed: ReadonlySet<string>;
+  /** Applies one Mac's frames, their sessions already keyed by it, in order, in one commit.
+   * Returns the sessions that just ended (they were listed before and are not now): their views
+   * stay, marked `ended`, until the caller releases them. Throws, applying nothing, when a frame
+   * names a key of another Mac. */
+  applyBatch(mac: string, frames: readonly BatchItem[]): string[];
+  /** `applyBatch` for several Macs at once, in one commit; the ended sessions of each, in order. */
+  applyBatches(batches: readonly Batch[]): string[][];
   /** Drops the view of an ended session, or of a failed one the hub does not list. False for
    * any other. */
   release(session: string): boolean;
   /** The Task strip is open: one choice for every session's screen, for the app run. */
   taskOpen: boolean;
   setTaskOpen(open: boolean): void;
-  setHub(state: HubState): void;
+  setHub(mac: string, state: HubState): void;
   /** The first prompt of a session that the Mac did not take, keyed by session: the user's words,
    * kept for that session's prompt box. At most `MAX_DRAFTS`, the oldest dropped. */
   drafts: ReadonlyMap<string, string>;
@@ -56,7 +71,7 @@ export interface OctetState {
   /** Sessions whose question the user answered from this phone, whose rows the Mac may not have
    * caught up with: such a row's `question` is not kept. A session leaves this when a row of
    * it comes without a question (the Mac caught up), when it leaves the list, when the link to
-   * the Mac is ready again, and on reset. */
+   * its Mac is ready again, and on reset. */
   answered: ReadonlySet<string>;
   /** The user sent something to `session`: its row stops asking, at once. Nothing for a session
    * that is not asking now (a question that comes later must show). */
@@ -64,8 +79,9 @@ export interface OctetState {
   /** The session whose prompt the Inbox's Reply asked to focus; null for none. */
   replyTo: string | null;
   setReplyTo(session: string | null): void;
-  /** Forgets everything the hub sent, for a phone unpaired from its Mac or paired with another. */
-  reset(): void;
+  /** Forgets everything one Mac sent (a Mac unpaired, or paired again), or with no argument
+   * everything every Mac sent. */
+  reset(mac?: string): void;
   /** The hub refused to stream `session` for good. */
   subscribeFailed(session: string, reason: string): void;
   /** Marks a fresh start the Mac took: its divider goes before the first record of the
@@ -80,7 +96,7 @@ export interface OctetState {
 
 export type OctetStore = StoreApi<OctetState>;
 
-/** Sessions listed, at most. */
+/** Sessions listed, at most, per Mac. */
 const MAX_SESSIONS = 200;
 /** Drafts kept, at most. */
 const MAX_DRAFTS = 16;
@@ -89,6 +105,8 @@ export const MAX_SENT = 20;
 const MAX_SENT_SESSIONS = 16;
 const NO_SENT: readonly string[] = [];
 const NO_ANSWERED: ReadonlySet<string> = new Set();
+const NO_LISTED: ReadonlySet<string> = new Set();
+const NO_ROWS: ListedSession[] = [];
 const FIELD = FIELD_CHARS;
 /** The longest usage line kept: the hub clips it to this too. */
 const USAGE_CHARS = 200;
@@ -123,11 +141,19 @@ function cleanSession(raw: unknown): SessionInfo | null {
   return info;
 }
 
+/** A row of Mac `mac`, its id a key of that Mac; null for one that is not a session. */
+function cleanRow(mac: string, raw: unknown): ListedSession | null {
+  const info = cleanSession(raw);
+  const split = info ? splitKey(info.id) : null;
+  if (!info || split?.mac !== mac) return null;
+  return { ...info, mac, raw: split.raw };
+}
+
 /** Two cleaned approvals say the same (their summaries are small and bounded). */
 const sameApproval = (a: ApprovalInfo | null | undefined, b: ApprovalInfo | null | undefined): boolean =>
   a === b || (!!a && !!b && a.id === b.id && JSON.stringify(a.summary) === JSON.stringify(b.summary));
 
-const sameSession = (a: SessionInfo, b: SessionInfo): boolean => {
+const sameSession = (a: ListedSession, b: ListedSession): boolean => {
   const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
   for (const k of keys) {
     if (k === "approval") continue;
@@ -136,21 +162,24 @@ const sameSession = (a: SessionInfo, b: SessionInfo): boolean => {
   return sameApproval(a.approval, b.approval);
 };
 
-/** The listed sessions, reusing the previous object of each session that did not change, and the
- * previous array when none did. A session in `answered` that still says question is shown as not
- * asking, and stays in the set; one whose row no longer asks (the Mac caught up), or that is not
- * listed, leaves it. */
+/** Mac `mac`'s listed sessions, reusing the previous object of each session that did not change,
+ * and the previous array when none did. A session in `answered` that still says question is
+ * shown as not asking, and stays in the set; one of this Mac whose row no longer asks (the Mac
+ * caught up), or that is not listed, leaves it. Other Macs' marks are kept. */
 function reconcile(
-  prev: SessionInfo[],
+  mac: string,
+  prev: ListedSession[],
   raw: unknown[],
   answered: ReadonlySet<string>,
-): { sessions: SessionInfo[]; answered: ReadonlySet<string> } {
+): { sessions: ListedSession[]; answered: ReadonlySet<string> } {
+  const prefix = `${mac}/`;
   const before = new Map(prev.map((s) => [s.id, s]));
-  const next: SessionInfo[] = [];
+  const next: ListedSession[] = [];
   const seen = new Set<string>();
   const kept = new Set<string>();
+  for (const id of answered) if (!id.startsWith(prefix)) kept.add(id);
   for (const item of raw.slice(0, MAX_SESSIONS)) {
-    const info = cleanSession(item);
+    const info = cleanRow(mac, item);
     if (!info || seen.has(info.id)) continue;
     seen.add(info.id);
     if (info.question && answered.has(info.id)) {
@@ -166,30 +195,107 @@ function reconcile(
   };
 }
 
+/** Every Mac's rows, Mac after Mac. */
+const merged = (slices: ReadonlyMap<string, ListedSession[]>): ListedSession[] => {
+  const all: ListedSession[] = [];
+  for (const rows of slices.values()) for (const row of rows) all.push(row);
+  return all;
+};
+
+/** Throws unless every key the frames would make or change is one of Mac `mac`'s. */
+function assertOwn(mac: string, frames: readonly BatchItem[]): void {
+  const prefix = `${mac}/`;
+  for (const frame of frames) {
+    if (frame.type === "sessions") {
+      if (!Array.isArray(frame.sessions)) continue;
+      for (const row of frame.sessions as unknown[]) {
+        if (isObj(row) && typeof row.id === "string" && row.id !== "" && !row.id.startsWith(prefix)) {
+          throw new Error(`a sessions frame of ${mac} lists another Mac's session`);
+        }
+      }
+    } else if ("session" in frame && !(typeof frame.session === "string" && frame.session.startsWith(prefix))) {
+      throw new Error(`a frame of ${mac} names another Mac's session`);
+    }
+  }
+}
+
+/** Whether `key` is one of Mac `mac`'s. */
+const ofMac = (mac: string) => {
+  const prefix = `${mac}/`;
+  return (key: string): boolean => key.startsWith(prefix);
+};
+
+/** `map` without the keys `drop` picks; the same map when it has none of them. */
+function without<V>(map: ReadonlyMap<string, V>, drop: (key: string) => boolean): ReadonlyMap<string, V> {
+  let next: Map<string, V> | null = null;
+  for (const key of map.keys()) if (drop(key)) (next ??= new Map(map)).delete(key);
+  return next ?? map;
+}
+
+/** How good each link state is, for `bestHub`. */
+const RANK: Record<HubState, number> = { ready: 4, authenticating: 3, connecting: 2, offline: 1, unpaired: 0 };
+
+/** The best link of every Mac's: `ready` when any is, and `offline` with none. */
+export function bestHub(state: Pick<OctetState, "hubs">): HubState {
+  let best: HubState = "offline";
+  let rank = -1;
+  for (const hub of state.hubs.values()) {
+    if (RANK[hub] > rank) {
+      best = hub;
+      rank = RANK[hub];
+    }
+  }
+  return best;
+}
+
 export function createOctetStore(): OctetStore {
   return createStore<OctetState>()((set, get) => ({
     sessions: [],
+    slices: new Map(),
     bySession: new Map(),
-    hub: "offline",
-    listed: false,
+    hubs: new Map(),
+    listed: NO_LISTED,
     taskOpen: false,
     drafts: new Map(),
     sent: new Map(),
     answered: NO_ANSWERED,
     replyTo: null,
 
-    reset() {
+    reset(mac) {
       clearParsed(); // what the old Mac's replies parsed to
+      if (mac === undefined) {
+        set({
+          sessions: [],
+          slices: new Map(),
+          bySession: new Map(),
+          hubs: new Map(),
+          listed: NO_LISTED,
+          taskOpen: false,
+          drafts: new Map(),
+          sent: new Map(),
+          answered: NO_ANSWERED,
+          replyTo: null,
+        });
+        return;
+      }
+      const mine = ofMac(mac);
+      const st = get();
+      const slices = new Map(st.slices);
+      slices.delete(mac);
+      const listed = new Set(st.listed);
+      listed.delete(mac);
+      const hubs = new Map(st.hubs);
+      hubs.delete(mac);
       set({
-        sessions: [],
-        bySession: new Map(),
-        hub: "offline",
-        listed: false,
-        taskOpen: false,
-        drafts: new Map(),
-        sent: new Map(),
-        answered: NO_ANSWERED,
-        replyTo: null,
+        sessions: merged(slices),
+        slices,
+        bySession: without(st.bySession, mine),
+        hubs,
+        listed,
+        drafts: without(st.drafts, mine),
+        sent: without(st.sent, mine),
+        answered: new Set([...st.answered].filter((id) => !mine(id))),
+        replyTo: st.replyTo !== null && mine(st.replyTo) ? null : st.replyTo,
       });
     },
 
@@ -227,14 +333,17 @@ export function createOctetStore(): OctetStore {
     },
 
     markAnswered(session) {
-      const { sessions, answered } = get();
-      const at = sessions.findIndex((x) => x.id === session);
-      const row = sessions[at];
-      if (!row?.question) return;
+      const { slices, answered } = get();
+      const mac = macOfKey(session);
+      const rows = mac === null ? undefined : slices.get(mac);
+      const at = rows?.findIndex((x) => x.id === session) ?? -1;
+      const row = rows?.[at];
+      if (mac === null || !rows || !row?.question) return;
       const { question: _asked, ...quiet } = row;
-      const next = sessions.slice();
+      const next = rows.slice();
       next[at] = quiet;
-      set({ sessions: next, answered: new Set(answered).add(session) });
+      const all = new Map(slices).set(mac, next);
+      set({ sessions: merged(all), slices: all, answered: new Set(answered).add(session) });
     },
 
     setReplyTo(replyTo) {
@@ -245,77 +354,94 @@ export function createOctetStore(): OctetStore {
       if (get().taskOpen !== taskOpen) set({ taskOpen });
     },
 
-    applyBatch(frames) {
-      const { sessions: before, bySession, listed: wasListed, answered: wasAnswered } = get();
-      let sessions = before;
-      let answered = wasAnswered;
-      let listed = wasListed;
-      const ops = new Map<string, Op[]>();
-      const push = (session: string, op: Op) => {
-        const list = ops.get(session);
-        if (list) list.push(op);
-        else ops.set(session, [op]);
-      };
-      for (const frame of frames) {
-        switch (frame.type) {
-          case "sessions":
-            if (Array.isArray(frame.sessions)) {
-              ({ sessions, answered } = reconcile(sessions, frame.sessions, answered));
-              listed = true;
-            }
-            break;
-          case "subscribed":
-            if (frame.from === "start") push(frame.session, { op: "reset" });
-            push(frame.session, { op: "journals", journals: frame.journals });
-            break;
-          case "event":
-            if (isKnownEvent(frame.event)) push(frame.session, { op: "event", ev: frame.event, journal: frame.journal });
-            break;
-          case "state":
-            push(frame.session, { op: "state", state: frame.state });
-            break;
-          case "catalog":
-            push(frame.session, { op: "catalog", catalog: frame.catalog });
-            break;
-          case "replayed":
-            push(frame.session, { op: "replayed" });
-            break;
-          default:
-            break; // replies to requests are the client's
-        }
-      }
+    applyBatch(mac, frames) {
+      return get().applyBatches([{ mac, frames }])[0] ?? [];
+    },
 
-      // A listed session is live; one that was listed and is not now has ended, and keeps its view.
-      // One refused for good that comes into the list is a session again (it started since a deep
-      // link asked for it, or started over under its id): its failure is over.
-      const ended: string[] = [];
-      if (sessions !== before) {
-        const now = new Set(sessions.map((s) => s.id));
-        const was = new Set(before.map((s) => s.id));
-        for (const s of before) {
-          if (now.has(s.id)) continue;
-          ended.push(s.id);
-          if (bySession.has(s.id) || ops.has(s.id)) push(s.id, { op: "ended", ended: true });
-        }
-        for (const id of now) {
-          const old = bySession.get(id);
-          if (old?.ended) push(id, { op: "ended", ended: false });
-          if (old?.failed != null && !was.has(id)) push(id, { op: "failed", reason: null });
-        }
-      }
+    applyBatches(batches) {
+      // Nothing is applied unless every frame keeps to its own Mac's keys.
+      for (const { mac, frames } of batches) assertOwn(mac, frames);
+      const st = get();
+      let slices = st.slices;
+      let answered = st.answered;
+      let listed = st.listed;
       let views: Map<string, SessionView> | null = null;
-      for (const [session, list] of ops) {
-        const old = bySession.get(session);
-        const next = reduceView(old ?? EMPTY_VIEW, list);
-        if (next === old || (old === undefined && next === EMPTY_VIEW)) continue;
-        (views ??= new Map(bySession)).set(session, next);
+      const ended: string[][] = [];
+      for (const { mac, frames } of batches) {
+        const before = slices.get(mac) ?? NO_ROWS;
+        let rows = before;
+        let heard = false;
+        const ops = new Map<string, Op[]>();
+        const push = (session: string, op: Op) => {
+          const list = ops.get(session);
+          if (list) list.push(op);
+          else ops.set(session, [op]);
+        };
+        for (const frame of frames) {
+          switch (frame.type) {
+            case "sessions":
+              if (Array.isArray(frame.sessions)) {
+                ({ sessions: rows, answered } = reconcile(mac, rows, frame.sessions, answered));
+                heard = true;
+              }
+              break;
+            case "subscribed":
+              if (frame.from === "start") push(frame.session, { op: "reset" });
+              push(frame.session, { op: "journals", journals: frame.journals });
+              break;
+            case "event":
+              if (isKnownEvent(frame.event)) push(frame.session, { op: "event", ev: frame.event, journal: frame.journal });
+              break;
+            case "state":
+              push(frame.session, { op: "state", state: frame.state });
+              break;
+            case "catalog":
+              push(frame.session, { op: "catalog", catalog: frame.catalog });
+              break;
+            case "replayed":
+              push(frame.session, { op: "replayed" });
+              break;
+            default:
+              break; // replies to requests are the client's
+          }
+        }
+        if (heard && !listed.has(mac)) listed = new Set(listed).add(mac);
+        // The first list of a Mac places it among the others, rows or none.
+        if (rows !== before || (heard && !slices.has(mac))) slices = new Map(slices).set(mac, rows);
+
+        // A listed session is live; one that was listed and is not now has ended, and keeps its
+        // view. One refused for good that comes into the list is a session again (it started
+        // since a deep link asked for it, or started over under its id): its failure is over.
+        const gone: string[] = [];
+        const known = views ?? st.bySession;
+        if (rows !== before) {
+          const now = new Set(rows.map((s) => s.id));
+          const was = new Set(before.map((s) => s.id));
+          for (const s of before) {
+            if (now.has(s.id)) continue;
+            gone.push(s.id);
+            if (known.has(s.id) || ops.has(s.id)) push(s.id, { op: "ended", ended: true });
+          }
+          for (const id of now) {
+            const old = known.get(id);
+            if (old?.ended) push(id, { op: "ended", ended: false });
+            if (old?.failed != null && !was.has(id)) push(id, { op: "failed", reason: null });
+          }
+        }
+        for (const [session, list] of ops) {
+          const old = (views ?? st.bySession).get(session);
+          const next = reduceView(old ?? EMPTY_VIEW, list);
+          if (next === old || (old === undefined && next === EMPTY_VIEW)) continue;
+          (views ??= new Map(st.bySession)).set(session, next);
+        }
+        ended.push(gone);
       }
-      if (views === null && sessions === before && listed === wasListed && answered === wasAnswered) return ended;
+      if (views === null && slices === st.slices && listed === st.listed && answered === st.answered) return ended;
       set({
-        sessions,
+        ...(slices !== st.slices ? { slices, sessions: merged(slices) } : {}),
         ...(views ? { bySession: views } : {}),
-        ...(listed !== wasListed ? { listed } : {}),
-        ...(answered !== wasAnswered ? { answered } : {}),
+        ...(listed !== st.listed ? { listed } : {}),
+        ...(answered !== st.answered ? { answered } : {}),
       });
       return ended;
     },
@@ -331,12 +457,19 @@ export function createOctetStore(): OctetStore {
       return true;
     },
 
-    setHub(hub) {
-      const was = get().hub;
-      if (was === hub) return;
+    setHub(mac, hub) {
+      const st = get();
+      if (st.hubs.get(mac) === hub) return;
+      const hubs = new Map(st.hubs).set(mac, hub);
       // A link ready again brings a fresh list, which is the truth: an answer the Mac never heard
       // (the link went down first) must not hide its question.
-      set(hub === "ready" ? { hub, answered: NO_ANSWERED } : { hub });
+      if (hub !== "ready") {
+        set({ hubs });
+        return;
+      }
+      const mine = ofMac(mac);
+      const answered = [...st.answered].some(mine) ? new Set([...st.answered].filter((id) => !mine(id))) : st.answered;
+      set({ hubs, answered: answered.size === 0 ? NO_ANSWERED : answered });
     },
 
     evict(session) {
@@ -368,8 +501,13 @@ export function createOctetStore(): OctetStore {
 export const ENDED_KEPT_MS = 10 * 60_000;
 
 export interface ConnectOptions {
+  /** The phone's id for the Mac the client reaches: every session it names is keyed by it. */
+  mac: string;
   /** Runs `fn` after `ms`; returns the function that cancels it. */
   schedule?: (fn: () => void, ms: number) => () => void;
+  now?: () => number;
+  /** The coalescer every Mac's batches go through; the store's own when none is given. */
+  coalescer?: Coalescer;
 }
 
 const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
@@ -377,7 +515,26 @@ const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
   return () => clearTimeout(id);
 };
 
-/** The timers that will release ended sessions, per client. */
+/** Each store's shared coalescer, for feeds not given one. */
+const coalescers = new WeakMap<OctetStore, Coalescer>();
+function coalescerOf(store: OctetStore, options: ConnectOptions): Coalescer {
+  let c = coalescers.get(store);
+  if (!c) {
+    c = createCoalescer((batches) => store.getState().applyBatches(batches), { now: options.now, schedule: options.schedule });
+    coalescers.set(store, c);
+  }
+  return c;
+}
+
+/** The client feeding each Mac's sessions into each store, for letting go of a key's transcript. */
+const feeds = new WeakMap<OctetStore, Map<string, HubClient>>();
+const feedsOf = (store: OctetStore): Map<string, HubClient> => {
+  let map = feeds.get(store);
+  if (!map) feeds.set(store, (map = new Map()));
+  return map;
+};
+
+/** The timers that will release ended sessions, per client, by key. */
 const releases = new WeakMap<HubClient, Map<string, () => void>>();
 const timersOf = (client: HubClient): Map<string, () => void> => {
   let map = releases.get(client);
@@ -385,13 +542,37 @@ const timersOf = (client: HubClient): Map<string, () => void> => {
   return map;
 };
 
-/** Feeds the store from `client`: its batches, its connection state, and the sessions the hub
- * refused for good (forgotten, and their views marked failed). A session that leaves the hub's
- * list keeps its view for `ENDED_KEPT_MS`, then is released and forgotten (one with no view is
- * forgotten at once). Returns the function
- * that stops all of it. */
-export function connectStore(store: OctetStore, client: HubClient, options: ConnectOptions = {}): () => void {
+const isRow = (x: unknown): x is Record<string, unknown> & { id: string } => isObj(x) && typeof x.id === "string" && x.id !== "";
+
+/** A client's frames with every session they name keyed by `mac`. A frame whose session is not a
+ * string is dropped. */
+function keyFrames(mac: string, frames: readonly BatchItem[]): BatchItem[] {
+  const out: BatchItem[] = [];
+  for (const frame of frames) {
+    if (frame.type === "sessions") {
+      out.push(
+        Array.isArray(frame.sessions)
+          ? { ...frame, sessions: (frame.sessions as unknown[]).map((row) => (isRow(row) ? { ...row, id: keyOf(mac, row.id) } : row)) as SessionInfo[] }
+          : frame,
+      );
+    } else if ("session" in frame) {
+      if (typeof frame.session === "string") out.push({ ...frame, session: keyOf(mac, frame.session) });
+    } else out.push(frame);
+  }
+  return out;
+}
+
+/** Feeds the store from `client`, the link to Mac `options.mac`: its batches (every session keyed
+ * by that Mac, through the coalescer), its connection state, and the sessions the hub refused for
+ * good (forgotten, and their views marked failed). A session that leaves the hub's list keeps its
+ * view for `ENDED_KEPT_MS`, then is released and forgotten (one with no view is forgotten at
+ * once). Returns the function that stops all of it. */
+export function connectStore(store: OctetStore, client: HubClient, options: ConnectOptions): () => void {
+  const { mac } = options;
   const schedule = options.schedule ?? defaultSchedule;
+  const coalescer = options.coalescer ?? coalescerOf(store, options);
+  const mine = ofMac(mac);
+  feedsOf(store).set(mac, client);
   const timers = timersOf(client);
   const cancel = (session: string) => {
     timers.get(session)?.();
@@ -400,63 +581,83 @@ export function connectStore(store: OctetStore, client: HubClient, options: Conn
   const forget = (session: string) => {
     cancel(session);
     requested(client).delete(session);
-    client.forget(session);
+    const raw = rawOf(session);
+    if (raw !== null) client.forget(raw);
   };
-  const offBatch = client.onBatch((frames) => {
-    const state = store.getState();
-    // Only a list can end a failure: look for failed views only when one came.
-    const failed = frames.some((f) => f.type === "sessions")
-      ? [...state.bySession].flatMap(([id, v]) => (v.failed !== null ? [id] : []))
-      : [];
-    for (const ended of state.applyBatch(frames)) {
-      cancel(ended);
-      // Nothing to hold for a screen: the client lets it go now rather than never.
-      if (!store.getState().bySession.has(ended)) {
-        forget(ended);
-        continue;
+  // The failed views of this Mac when a list came: only a list can end a failure.
+  let failed: string[] = [];
+  const sink: Sink = {
+    before(frames) {
+      failed = frames.some((f) => f.type === "sessions")
+        ? [...store.getState().bySession].flatMap(([id, v]) => (v.failed !== null && mine(id) ? [id] : []))
+        : [];
+    },
+    after(ended) {
+      for (const session of ended) {
+        cancel(session);
+        // Nothing to hold for a screen: the client lets it go now rather than never.
+        if (!store.getState().bySession.has(session)) {
+          forget(session);
+          continue;
+        }
+        timers.set(
+          session,
+          schedule(() => {
+            timers.delete(session);
+            if (store.getState().release(session)) forget(session);
+          }, ENDED_KEPT_MS),
+        );
       }
-      timers.set(
-        ended,
-        schedule(() => {
-          timers.delete(ended);
-          if (store.getState().release(ended)) forget(ended);
-        }, ENDED_KEPT_MS),
-      );
-    }
-    // A session listed again is live: its timer goes.
-    for (const [session] of timers) if (store.getState().bySession.get(session)?.ended === false) cancel(session);
-    // A failure the list ended: the screen showing the session streams it again.
-    for (const session of failed) {
-      if (shown(client).has(session) && store.getState().bySession.get(session)?.failed === null) {
-        // The screen already holds it: streaming again adds no hold of its own.
-        stream(store, client, session);
+      // A session listed again is live: its timer goes.
+      for (const [session] of timers) if (store.getState().bySession.get(session)?.ended === false) cancel(session);
+      // A failure the list ended: the screen showing the session streams it again.
+      for (const session of failed) {
+        if (shown(client).has(session) && store.getState().bySession.get(session)?.failed === null) {
+          // The screen already holds it: streaming again adds no hold of its own.
+          stream(store, client, session);
+        }
       }
-    }
-  });
-  const offState = client.onState((state) => store.getState().setHub(state));
-  const offFailed = client.onSubscribeFailed((session, refusal) => {
+      failed = [];
+    },
+  };
+  const offBatch = client.onBatch((frames) => coalescer.push(mac, keyFrames(mac, frames), sink));
+  const offState = client.onState((state) => store.getState().setHub(mac, state));
+  const offFailed = client.onSubscribeFailed((raw, refusal) => {
+    const session = keyOf(mac, raw);
     forget(session);
     store.getState().subscribeFailed(session, refusal.message);
   });
-  store.getState().setHub(client.state);
+  store.getState().setHub(mac, client.state);
   return () => {
     offBatch();
     offState();
     offFailed();
+    coalescer.drop(mac);
     for (const session of [...timers.keys()]) cancel(session);
+    if (feedsOf(store).get(mac) === client) feedsOf(store).delete(mac);
   };
 }
 
-/** The user left the screen of an ended session: its view is dropped and the client forgets it. */
-export function releaseSession(store: OctetStore, client: HubClient, session: string): void {
-  if (!store.getState().release(session)) return;
-  timersOf(client).get(session)?.();
-  timersOf(client).delete(session);
-  requested(client).delete(session);
-  client.forget(session);
+/** The client of `session`'s Mac, and its raw id; null for a key on no Mac connected. */
+function linkOf(links: Links, session: string): { client: HubClient; raw: string } | null {
+  const split = splitKey(session);
+  const client = split ? links.client(split.mac) : null;
+  return split && client ? { client, raw: split.raw } : null;
 }
 
-/** The sessions each client was asked to stream and not since released. */
+/** The user left the screen of an ended session: its view is dropped and its Mac's client
+ * forgets it. */
+export function releaseSession(store: OctetStore, links: Links, session: string): void {
+  if (!store.getState().release(session)) return;
+  const link = linkOf(links, session);
+  if (!link) return;
+  timersOf(link.client).get(session)?.();
+  timersOf(link.client).delete(session);
+  requested(link.client).delete(session);
+  link.client.forget(link.raw);
+}
+
+/** The sessions each client was asked to stream and not since released, by key. */
 const asked = new WeakMap<HubClient, Set<string>>();
 const requested = (client: HubClient): Set<string> => {
   let set = asked.get(client);
@@ -481,34 +682,45 @@ const holdsOf = (client: HubClient): Map<string, number> => {
   return map;
 };
 
-/** Live sessions whose transcripts the phone keeps, the ones seen last: each holds up to 1,000
- * entries and 4 MiB, and nothing else bounds the total. */
+/** Live sessions whose transcripts the phone keeps, across every Mac, the ones seen last: each
+ * holds up to 1,000 entries and 4 MiB, and nothing else bounds the total. */
 export const MAX_VIEWS = 4;
 
-/** The sessions each client streamed for a screen, the one seen last at the end. */
-const visited = new WeakMap<HubClient, string[]>();
-const visitsOf = (client: HubClient): string[] => {
-  let list = visited.get(client);
-  if (!list) visited.set(client, (list = []));
+/** The sessions streamed for a screen, of every Mac, the one seen last at the end. */
+const visited = new WeakMap<OctetStore, string[]>();
+const visitsOf = (store: OctetStore): string[] => {
+  let list = visited.get(store);
+  if (!list) visited.set(store, (list = []));
   return list;
 };
 
-/** Lets go of the transcripts of live sessions past the `MAX_VIEWS` seen last, but never one on
- * a screen. Each is forgotten by the client too, so the next `watch` replays it from the start. */
-function keepRecent(store: OctetStore, client: HubClient): void {
-  const visits = visitsOf(client);
+/** Lets go of the transcripts of live sessions past the `MAX_VIEWS` seen last, of whichever Mac,
+ * but never one on a screen. Each is forgotten by its Mac's client too, so the next `watch`
+ * replays it from the start. */
+function keepRecent(store: OctetStore): void {
+  const visits = visitsOf(store);
   const views = store.getState().bySession;
+  const clients = feedsOf(store);
+  const clientOf = (id: string): HubClient | undefined => {
+    const mac = macOfKey(id);
+    return mac === null ? undefined : clients.get(mac);
+  };
+  const onScreen = (id: string): boolean => {
+    const client = clientOf(id);
+    return client !== undefined && shown(client).has(id);
+  };
   const holding = (id: string) => {
     const v = views.get(id);
     return v !== undefined && !v.ended && (v.transcript.entries.length > 0 || v.held !== null || v.approvals.length > 0);
   };
   // Newest first: a session not seen yet (a view a refusal made) counts as the oldest.
   const order = [...visits].reverse();
-  for (const id of views.keys()) if (!visits.includes(id)) order.push(id);
+  const seen = new Set(visits);
+  for (const id of views.keys()) if (!seen.has(id)) order.push(id);
   let kept = 0;
   for (const id of order) {
     // One on a screen is kept, and counts, whether or not its replay has brought anything yet.
-    if (shown(client).has(id)) {
+    if (onScreen(id)) {
       kept += 1;
       continue;
     }
@@ -518,38 +730,49 @@ function keepRecent(store: OctetStore, client: HubClient): void {
       continue;
     }
     if (store.getState().evict(id)) {
-      requested(client).delete(id);
-      client.forget(id);
+      const client = clientOf(id);
+      const raw = rawOf(id);
+      if (client && raw !== null) {
+        requested(client).delete(id);
+        client.forget(raw);
+      }
     }
   }
   // Forget visits to sessions with no view and no screen, so the list stays as small as the store.
-  visited.set(client, visits.filter((id) => views.has(id) || shown(client).has(id)));
+  visited.set(store, visits.filter((id) => views.has(id) || onScreen(id)));
 }
 
-/** Streams `session`. One the store holds nothing of, and that was not asked for yet, subscribes
- * fresh, from the start of its journal: cursors are only in memory, so a cold start has no
- * transcript to resume. Asking again changes nothing. Seeing it makes it the newest of the
- * `MAX_VIEWS` whose transcripts are kept. */
-export function watch(store: OctetStore, client: HubClient, session: string): void {
-  const holds = holdsOf(client);
+/** Streams `session` from its Mac. One the store holds nothing of, and that was not asked for
+ * yet, subscribes fresh, from the start of its journal: cursors are only in memory, so a cold
+ * start has no transcript to resume. Asking again changes nothing. Seeing it makes it the newest
+ * of the `MAX_VIEWS` whose transcripts are kept. Nothing for a key on no Mac connected. */
+export function watch(store: OctetStore, links: Links, session: string): void {
+  const link = linkOf(links, session);
+  if (!link) return;
+  const holds = holdsOf(link.client);
   holds.set(session, (holds.get(session) ?? 0) + 1);
-  stream(store, client, session);
+  stream(store, link.client, session);
 }
 
 /** Streams `session` for the screens that hold it (`watch` counts them; this does not). */
 function stream(store: OctetStore, client: HubClient, session: string): void {
+  const raw = rawOf(session);
+  if (raw === null) return;
   const fresh = !store.getState().bySession.has(session) && !requested(client).has(session);
   requested(client).add(session);
   shown(client).add(session);
-  const visits = visitsOf(client).filter((id) => id !== session);
+  const visits = visitsOf(store).filter((id) => id !== session);
   visits.push(session);
-  visited.set(client, visits);
-  keepRecent(store, client);
-  client.subscribe(session, fresh);
+  visited.set(store, visits);
+  keepRecent(store);
+  client.subscribe(raw, fresh);
 }
 
 /** Stops streaming `session`; the store keeps what it holds, and a later `watch` resumes. */
-export function unwatch(client: HubClient, session: string): void {
+export function unwatch(links: Links, session: string): void {
+  const link = linkOf(links, session);
+  if (!link) return;
+  const { client } = link;
   // Screens that stream one session (a Conversation, and the Usage over it) hold it together: it
   // stops when the last of them lets go, whichever order they blur in.
   const holds = holdsOf(client);
@@ -561,7 +784,7 @@ export function unwatch(client: HubClient, session: string): void {
   holds.delete(session);
   requested(client).delete(session);
   shown(client).delete(session);
-  client.unsubscribe(session);
+  client.unsubscribe(link.raw);
 }
 
 const NO_APPROVALS: PendingApproval[] = [];
@@ -593,9 +816,9 @@ export function bindHooks(store: OctetStore) {
   return {
     /** Everything the phone knows of a session; the same object until it changes. */
     useSession: (id: string): SessionView => useStore(store, (s) => s.bySession.get(id) ?? EMPTY_VIEW),
-    /** The listed sessions; the same array until the list changes. */
-    useSessions: (): SessionInfo[] => useStore(store, useShallow((s) => s.sessions)),
-    useSessionInfo: (id: string): SessionInfo | undefined => useStore(store, (s) => s.sessions.find((x) => x.id === id)),
+    /** The listed sessions of every Mac; the same array until the list changes. */
+    useSessions: (): ListedSession[] => useStore(store, useShallow((s) => s.sessions)),
+    useSessionInfo: (id: string): ListedSession | undefined => useStore(store, (s) => s.sessions.find((x) => x.id === id)),
     /** What a session's header says of it from the list (workspace, engine, model, mode): new only
      * when one of those changes, not with its NOW line or phase. */
     useSessionHead: (id: string): SessionHead =>
@@ -620,8 +843,9 @@ export function bindHooks(store: OctetStore) {
           return { known: v !== undefined, ended: v?.ended ?? false, failed: v?.failed ?? null, epoch: v?.epoch ?? 0 };
         }),
       ),
-    /** A sessions frame came since the store began or was reset. */
-    useListed: (): boolean => useStore(store, (s) => s.listed),
+    /** A sessions frame came from `mac` (with none, from any Mac) since the store began or was
+     * reset. */
+    useListed: (mac?: string): boolean => useStore(store, (s) => (mac === undefined ? s.listed.size > 0 : s.listed.has(mac))),
     /** A session's draft (its first prompt, not taken by the Mac), or undefined. */
     useDraft: (id: string): string | undefined => useStore(store, (s) => s.drafts.get(id)),
     /** The texts the Mac took from this phone for a session, newest last; the same array until
@@ -653,7 +877,8 @@ export function bindHooks(store: OctetStore) {
           return catalogs;
         }),
       ),
-    useHub: (): HubState => useStore(store, (s) => s.hub),
+    /** The link to `mac`; with none, the best link of every Mac's (`bestHub`). */
+    useHub: (mac?: string): HubState => useStore(store, (s) => (mac === undefined ? bestHub(s) : (s.hubs.get(mac) ?? "offline"))),
     /** How the session's last turn ended, for its mascot; null before one ends and while one runs. */
     useSessionTurn: (id: string): TurnEnd | null => useStore(store, (s) => s.bySession.get(id)?.turn ?? null),
     /** The turns a session has finished: the `finished` records counted by its view's reducer. */
@@ -665,7 +890,7 @@ export function bindHooks(store: OctetStore) {
     useJournals: (id: string): readonly string[] => useStore(store, (s) => s.bySession.get(id)?.journals ?? NO_JOURNALS),
     /** The listed sessions that report usage, in list order; each row the same object until it
      * changes. */
-    useUsageRows: (): SessionInfo[] => useStore(store, useShallow((s) => s.sessions.filter((x) => !!x.usage))),
+    useUsageRows: (): ListedSession[] => useStore(store, useShallow((s) => s.sessions.filter((x) => !!x.usage))),
   };
 }
 

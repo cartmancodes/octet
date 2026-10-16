@@ -17,7 +17,8 @@ import * as inboxWords from "./inbox";
 import * as navigation from "./navigation";
 import { saveSettings } from "./persist";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
-import { octetStore } from "./store";
+import { bestHub, octetStore } from "./store";
+import { k } from "./testKeys";
 import { hideToast } from "./toast";
 import { dark, light } from "./theme";
 
@@ -119,7 +120,7 @@ async function hear({ sockets, clock }: Rig, list: SessionInfo[]) {
 // renderRouter runs on fake timers.
 const wait = (ms: number) => act(async () => void jest.advanceTimersByTime(ms));
 const flush = () => act(async () => {});
-const card = (id: string) => screen.getByTestId(`inbox-card-${id}`);
+const card = (id: string) => screen.getByTestId(`inbox-card-${k(id)}`);
 const inCard = (id: string) => within(card(id));
 const answers = (rig: Rig) => rig.sockets.all.flatMap((s) => s.commandsOf("answer"));
 const answered = (rig: Rig) => answers(rig).map(({ session, approval, allow }) => ({ session, approval, allow }));
@@ -189,14 +190,14 @@ describe("the Inbox", () => {
       expect(tab("Done")).toBeTruthy();
       expect(card("w1")).toBeTruthy();
       expect(card("w2")).toBeTruthy();
-      expect(screen.queryByTestId("inbox-card-busy")).toBeNull();
+      expect(screen.queryByTestId(`inbox-card-${k("busy")}`)).toBeNull();
     });
 
     it("show each list on its tab", async () => {
       await launch(list());
       await fireEvent.press(tab("Running 1"));
       expect(card("busy")).toBeTruthy();
-      expect(screen.queryByTestId("inbox-card-w1")).toBeNull();
+      expect(screen.queryByTestId(`inbox-card-${k("w1")}`)).toBeNull();
       expect(inCard("busy").getByText("● THINKING · claude")).toBeTruthy();
       await fireEvent.press(tab("Done"));
       expect(card("idle1")).toBeTruthy();
@@ -283,7 +284,7 @@ describe("the Inbox", () => {
       expect(inCard("a").getByText("src/main.rs")).toBeTruthy();
       expect(inCard("a").queryByRole("button", { name: "Deny for a" })).toBeNull();
       await fireEvent.press(inCard("a").getByRole("button", { name: "Review a" }));
-      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
       expect(answers(rig)).toEqual([]);
     });
 
@@ -336,7 +337,7 @@ describe("the Inbox", () => {
       const rig = await launch([info("a", { approvals: 1 })]);
       expect(inCard("a").queryByRole("button", { name: /^Allow once/ })).toBeNull();
       await fireEvent.press(inCard("a").getByRole("button", { name: "Review a" }));
-      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
     });
 
     it("a command the hub cut offers Review in place of Allow once, and still Deny", async () => {
@@ -350,7 +351,7 @@ describe("the Inbox", () => {
       expect(c.queryByText(/^Shortened/)).toBeNull();
       expect(c.getByRole("button", { name: /^a, / }).props.accessibilityLabel).toMatch(/Shortened: review it in the session$/);
       await fireEvent.press(c.getByRole("button", { name: "Review a" }));
-      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
       expect(answers(rig)).toEqual([]);
     });
 
@@ -415,7 +416,7 @@ describe("the Inbox", () => {
         await flush();
         expect(auth.authenticateAsync).toHaveBeenCalledTimes(1);
         await hear(rig, [info("a", { phase: "running" })]);
-        expect(screen.queryByTestId("inbox-card-a")).toBeNull();
+        expect(screen.queryByTestId(`inbox-card-${k("a")}`)).toBeNull();
         await pass();
         expect(answers(rig)).toEqual([]);
         expect(Haptics.notificationAsync).not.toHaveBeenCalled();
@@ -479,7 +480,7 @@ describe("the Inbox", () => {
   describe("under the drawer", () => {
     // The drawer is modal, so what is under it is hidden from a screen reader (and from queries).
     const under = { hidden: true } as const;
-    const cardUnder = (id: string) => within(screen.getByTestId(`inbox-card-${id}`, under));
+    const cardUnder = (id: string) => within(screen.getByTestId(`inbox-card-${k(id)}`, under));
     const menu = () => screen.getByRole("button", { name: "Menu" });
     const scrim = () => screen.getByRole("button", { name: "Close menu" });
 
@@ -817,14 +818,14 @@ describe("the Inbox", () => {
       const { view } = await launch([info("a"), info("b")]);
       await fireEvent.press(tab("Done"));
       await fireEvent.press(screen.getByRole("button", { name: /^b, / }));
-      expect(view.getPathname()).toBe("/session/b");
+      expect(view.getPathname()).toBe(`/session/${k("b")}`);
     });
 
     it("opens a session whose id is odd as that session, not as another route", async () => {
       const { view } = await launch([info("a/../b?x=1", { approvals: 1 })]);
       await fireEvent.press(screen.getByRole("button", { name: /^b\?x=1, / }));
       expect(view.getSegments()).toEqual(["session", "[id]"]);
-      expect(screen.getByTestId("opened").children).toEqual(["a/../b?x=1"]);
+      expect(screen.getByTestId("opened").children).toEqual([k("a/../b?x=1")]);
     });
   });
 
@@ -835,7 +836,7 @@ describe("the Inbox", () => {
       const rig = await launch([info("a")]);
       const first = rig.sockets.last;
       const states: string[] = [];
-      const off = octetStore.subscribe((s) => states.push(s.hub));
+      const off = octetStore.subscribe((s) => states.push(bestHub(s)));
       await act(async () => {
         list().props.refreshControl.props.onRefresh();
       });
@@ -927,16 +928,16 @@ describe("the Inbox", () => {
     it("is not in Running or Done", async () => {
       await launch([asking("a"), info("b")]);
       await fireEvent.press(tab("Done"));
-      expect(screen.queryByTestId("inbox-card-a")).toBeNull();
-      expect(screen.getByTestId("inbox-card-b")).toBeTruthy();
+      expect(screen.queryByTestId(`inbox-card-${k("a")}`)).toBeNull();
+      expect(screen.getByTestId(`inbox-card-${k("b")}`)).toBeTruthy();
     });
 
     it("Reply opens the conversation and asks for its prompt to be focused", async () => {
       const rig = await launch([asking("a")]);
       expect(octetStore.getState().replyTo).toBeNull();
       await fireEvent.press(inCard("a").getByRole("button", { name: "Reply to a" }));
-      expect(rig.view.getPathname()).toBe("/session/a");
-      expect(octetStore.getState().replyTo).toBe("a");
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
+      expect(octetStore.getState().replyTo).toBe(k("a"));
       expect(answers(rig)).toEqual([]);
     });
 
@@ -944,7 +945,7 @@ describe("the Inbox", () => {
       const rig = await launch([asking("a")]);
       octetStore.getState().setReplyTo("zzz");
       await fireEvent.press(inCard("a").getByRole("button", { name: /^a, / }));
-      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
       expect(octetStore.getState().replyTo).toBeNull();
     });
 
@@ -973,7 +974,7 @@ describe("the Inbox", () => {
     it("goes when the Mac's row stops saying question", async () => {
       const rig = await launch([asking("a")]);
       await hear(rig, [info("a")]);
-      expect(screen.queryByTestId("inbox-card-a")).toBeNull();
+      expect(screen.queryByTestId(`inbox-card-${k("a")}`)).toBeNull();
     });
   });
 
@@ -985,15 +986,15 @@ describe("the Inbox", () => {
       await fireEvent.press(inCard("a").getByRole("button", { name: /^a, / }));
       expect(open).toHaveBeenCalledTimes(1);
       expect(open.mock.calls[0]?.[2]).toBe("/");
-      expect(open.mock.calls[0]?.[3]).toBe("a");
-      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(open.mock.calls[0]?.[3]).toBe(k("a"));
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
     });
 
     it("Review goes through it too", async () => {
       const open = jest.spyOn(navigation, "openSession");
       await launch([waiting("a", gist(1, { action: "Edit", command: null, files: ["x.rs"] }))]);
       await fireEvent.press(inCard("a").getByRole("button", { name: "Review a" }));
-      expect(open).toHaveBeenCalledWith(expect.anything(), expect.anything(), "/", "a");
+      expect(open).toHaveBeenCalledWith(expect.anything(), expect.anything(), "/", k("a"));
     });
   });
 });

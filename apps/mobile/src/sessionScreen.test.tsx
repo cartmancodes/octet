@@ -21,6 +21,7 @@ import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol"
 import * as words from "./session";
 import * as cardWords from "./inbox";
 import { octetStore } from "./store";
+import { applyM, k, sessionPath } from "./testKeys";
 import { resetTextSize } from "./textSizeRig";
 import { dark, light } from "./theme";
 
@@ -408,7 +409,7 @@ describe("the Session screen", () => {
       expect(rig.view.getPathname()).toBe("/usage");
       expect(screen.getByText("a · a")).toBeTruthy();
       await fireEvent.press(screen.getByRole("button", { name: "Back" }));
-      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
     });
 
     it("⋯ pressed twice in one frame opens Usage once", async () => {
@@ -421,7 +422,7 @@ describe("the Session screen", () => {
       });
       expect(rig.view.getPathname()).toBe("/usage");
       await fireEvent.press(screen.getByRole("button", { name: "Back" }));
-      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
     });
 
     it("⋯ passes the workspace on, and the conversation keeps streaming under Usage", async () => {
@@ -429,7 +430,7 @@ describe("the Session screen", () => {
       await open(rig, "a");
       await feed(rig, subscribed(), ev({ type: "usage", data: "5h 1%" }));
       await fireEvent.press(screen.getByRole("button", { name: "Usage" }));
-      expect(rig.view.getSearchParams()).toMatchObject({ id: "a", workspace: "/Users/me/Projects/a" });
+      expect(rig.view.getSearchParams()).toMatchObject({ id: k("a"), workspace: "/Users/me/Projects/a" });
       // The Conversation let go as it left the front and Usage asks for the session: the Mac acks
       // the unsubscribe, and the subscribe that was waiting for it goes out and resumes.
       const handOver = async () => {
@@ -455,7 +456,7 @@ describe("the Session screen", () => {
       await feed(rig, { type: "sessions", sessions: [info("b")] });
       await fireEvent.press(screen.getByRole("button", { name: "Usage" }));
       expect(within(screen.getByTestId("this-session")).getByText("5h 9%")).toBeTruthy();
-      expect(octetStore.getState().bySession.has("a")).toBe(true);
+      expect(octetStore.getState().bySession.has(k("a"))).toBe(true);
       expect(within(screen.getByTestId("this-session")).getByText("a")).toBeTruthy();
     });
 
@@ -505,8 +506,8 @@ describe("the Session screen", () => {
       await open(rig, "a");
       await act(async () => openDrawer());
       await act(async () => void jest.advanceTimersByTime(DRAWER_MS + 20)); // renderRouter runs on fake timers
-      await fireEvent.press(screen.getByTestId("drawer-row-b"));
-      expect(rig.view.getPathname()).toBe("/session/b");
+      await fireEvent.press(screen.getByTestId(`drawer-row-${k("b")}`));
+      expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
       await act(async () => void jest.advanceTimersByTime(DRAWER_MS + 20));
       await feed(rig, subscribed("b"));
       await fireEvent.press(screen.getByRole("button", { name: /^b, / }));
@@ -587,9 +588,9 @@ describe("the Session screen", () => {
       await feed(rig, { type: "sessions", sessions: [info("b")] });
       expect(screen.getByText("This session ended")).toBeTruthy();
       expect(screen.getByText("Fix the hub")).toBeTruthy();
-      expect(octetStore.getState().bySession.has("a")).toBe(true);
+      expect(octetStore.getState().bySession.has(k("a"))).toBe(true);
       await act(async () => router.back());
-      expect(octetStore.getState().bySession.has("a")).toBe(false);
+      expect(octetStore.getState().bySession.has(k("a"))).toBe(false);
     });
 
     it("a session the hub refused to stream shows the reason", async () => {
@@ -601,7 +602,7 @@ describe("the Session screen", () => {
     });
 
     it("a session the phone knows nothing of and the Mac does not list is gone, with a way back", async () => {
-      const rig = await launch([info("a")], "/session/zzz");
+      const rig = await launch([info("a")], sessionPath("zzz"));
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();
       expect(screen.getByText("Back to the Inbox")).toBeTruthy();
       await fireEvent.press(screen.getByRole("button", { name: "Back to the Inbox" }));
@@ -609,16 +610,16 @@ describe("the Session screen", () => {
     });
 
     it("a deep-linked session the hub refuses is gone too, with a way back, and its view is dropped on leaving", async () => {
-      const rig = await launch([info("a")], "/session/zzz");
+      const rig = await launch([info("a")], sessionPath("zzz"));
       const [command] = rig.sockets.last.commandsOf("subscribe");
       expect(command).toMatchObject({ session: "zzz" });
       await feed(rig, { type: "refused", req: command?.req, reason: "No such session", code: "invalid" });
-      expect(octetStore.getState().bySession.get("zzz")?.failed).toBe("No such session");
+      expect(octetStore.getState().bySession.get(k("zzz"))?.failed).toBe("No such session");
       expect(screen.getByText("This session isn't running anymore")).toBeTruthy();
       expect(screen.queryByTestId("transcript")).toBeNull();
       await fireEvent.press(screen.getByRole("button", { name: "Back to the Inbox" }));
       expect(rig.view.getPathname()).toBe("/");
-      expect(octetStore.getState().bySession.has("zzz")).toBe(false);
+      expect(octetStore.getState().bySession.has(k("zzz"))).toBe(false);
     });
 
     it("offline, the transcript stays under a banner", async () => {
@@ -671,11 +672,11 @@ describe("the Session screen", () => {
     // Another session's output, straight into the store: nothing on this screen draws again.
     rows.mockClear();
     await act(async () => {
-      octetStore.getState().applyBatch(
+      applyM(octetStore, 
         Array.from({ length: 50 }, (_, i) => ({ v: 1, ...ev({ type: "text", data: `b${i}` }, "b") }) as never),
       );
     });
-    expect(octetStore.getState().bySession.get("b")?.transcript.entries).toHaveLength(1);
+    expect(octetStore.getState().bySession.get(k("b"))?.transcript.entries).toHaveLength(1);
     expect(rows).not.toHaveBeenCalled();
   });
 
@@ -953,7 +954,7 @@ describe("the Session screen", () => {
       await act(async () => router.push("/settings"));
       await wait(1_000);
       await act(async () => router.back());
-      expect(rig.view.getPathname()).toBe("/session/a");
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
       expect(off("Allow")).toBe(true);
       expect(off("Deny")).toBe(true);
       await fireEvent.press(screen.getByRole("button", { name: "Allow" }));
@@ -966,7 +967,7 @@ describe("the Session screen", () => {
     });
 
     it("has none of them for a session that is gone", async () => {
-      await launch([info("a")], "/session/zzz");
+      await launch([info("a")], sessionPath("zzz"));
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();
       expect(screen.queryByLabelText("Message")).toBeNull();
     });

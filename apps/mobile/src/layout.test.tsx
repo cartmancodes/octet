@@ -16,6 +16,7 @@ import { HubContext, HubController, TOKEN_KEY, UNPAIRED_NOTICE } from "./hub";
 import { saveSettings } from "./persist";
 import { createOctetStore } from "./store";
 import { dark, light } from "./theme";
+import { k, sessionPath } from "./testKeys";
 
 jest.mock("expo-camera", () => ({
   CameraView: () => null,
@@ -124,7 +125,7 @@ describe("the app shell", () => {
     );
     const view = renderRouter(
       { _layout: Layout, index: () => <Text>Sessions list</Text>, pair: Pair, "session/[id]": () => <Text>Session x</Text>, recent: () => null, new: () => null, settings: () => null, usage: () => <Text>Usage x</Text>, changes: () => null },
-      { initialUrl: "/session/x" },
+      { initialUrl: sessionPath("x") },
     );
     await view;
     expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
@@ -265,17 +266,17 @@ describe("notifications", () => {
     await screen.findByText("Sessions list");
     connected({ sockets });
     await act(async () => listener()?.(tap({ session: SESSION })));
-    expect(view.getPathname()).toBe(`/session/${SESSION}`);
+    expect(view.getPathname()).toBe(`/session/${k(SESSION)}`);
   });
 
   it("a tap for a session already in the stack goes back to it: no second copy", async () => {
     const { sockets, view } = await launch({ paired: true });
     await screen.findByText("Sessions list");
     connected({ sockets });
-    await act(async () => router.push(`/session/${SESSION}`));
+    await act(async () => router.push(sessionPath(SESSION)));
     await act(async () => router.push("/settings"));
     await act(async () => listener()?.(tap({ session: SESSION })));
-    expect(view.getPathname()).toBe(`/session/${SESSION}`);
+    expect(view.getPathname()).toBe(`/session/${k(SESSION)}`);
     await act(async () => router.back());
     expect(view.getPathname()).toBe("/");
     expect(router.canGoBack()).toBe(false);
@@ -300,7 +301,7 @@ describe("notifications", () => {
   it("a cold start from a tap opens the session once the app knows it is paired", async () => {
     n.getLastNotificationResponse.mockReturnValue(tap({ session: SESSION }));
     const { view } = await launch({ paired: true });
-    await waitFor(() => expect(view.getPathname()).toBe(`/session/${SESSION}`));
+    await waitFor(() => expect(view.getPathname()).toBe(`/session/${k(SESSION)}`));
   });
 
   it("a cold start from a tap while unpaired lands on Pair", async () => {
@@ -324,7 +325,7 @@ describe("notifications", () => {
       last = null;
     });
     const first = await launch({ paired: true });
-    await waitFor(() => expect(first.view.getPathname()).toBe(`/session/${SESSION}`));
+    await waitFor(() => expect(first.view.getPathname()).toBe(`/session/${k(SESSION)}`));
     await act(async () => screen.unmount());
     const second = await launch({ paired: true });
     await screen.findByText("Sessions list");
@@ -343,7 +344,7 @@ describe("notifications", () => {
     await act(async () => listener()?.(tap({ session: SESSION })));
     expect(view.getPathname()).toBe("/pair");
     await fireEvent.press(skip);
-    await waitFor(() => expect(view.getPathname()).toBe(`/session/${SESSION}`));
+    await waitFor(() => expect(view.getPathname()).toBe(`/session/${k(SESSION)}`));
   });
 
   it("stops listening when the shell goes", async () => {

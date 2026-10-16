@@ -14,6 +14,7 @@ import { InboxCard } from "./components/InboxCard";
 import { TranscriptRow } from "./components/TranscriptRow";
 import * as cardWords from "./inbox";
 import { bindHooks, createOctetStore } from "./store";
+import { applyM, k } from "./testKeys";
 import type { SessionInfo } from "./protocol";
 import * as rowWords from "./session";
 
@@ -74,7 +75,7 @@ const info = (id: string): SessionInfo => ({
 });
 
 function Transcript({ session }: { session: string }) {
-  const entries = useEntries(session);
+  const entries = useEntries(k(session));
   const toggle = useCallback(() => undefined, []);
   return (
     <View testID={`transcript-${session}`}>
@@ -88,16 +89,16 @@ function Transcript({ session }: { session: string }) {
 /** A conversation's foot as its screen mounts it, under a body that draws with every batch: the
  * Permission card, the prompt line and the key bar, with the props the screen gives them. */
 function Conversation({ session }: { session: string }) {
-  const entries = useEntries(session);
-  const approvals = useApprovals(session);
-  const catalog = useCatalog(session);
-  const phase = useSessionState(session)?.phase ?? "running";
+  const entries = useEntries(k(session));
+  const approvals = useApprovals(k(session));
+  const catalog = useCatalog(k(session));
+  const phase = useSessionState(k(session))?.phase ?? "running";
   const send = useCallback(async () => undefined, []);
   return (
     <View>
       <Text testID={`entries-${session}`}>{entries.length}</Text>
       <ConvoControls
-        session={session}
+        session={k(session)}
         phase={phase}
         engine="claude"
         mode={catalog?.current_mode ?? "ask"}
@@ -173,7 +174,7 @@ describe("one long reply", () => {
 
 describe("render budgets", () => {
   it("streams 100 text events into session A: its transcript draws once per batch, B's not at all", async () => {
-    store.getState().applyBatch([
+    applyM(store, [
       { v: 1, type: "sessions", sessions: [info("a"), info("b")] },
       { v: 1, type: "subscribed", session: "a", from: "start", journals: ["j1"] },
       event("a", "start"),
@@ -201,7 +202,7 @@ describe("render budgets", () => {
     for (let b = 0; b < BATCHES; b++) {
       await act(async () => {
         const batch = Array.from({ length: EVENTS / BATCHES }, (_, i) => event("a", ` ${b * 10 + i}`));
-        store.getState().applyBatch(batch);
+        applyM(store, batch);
       });
     }
 
@@ -218,7 +219,7 @@ describe("render budgets", () => {
 
     // The same probes do fire when B's own data changes, so the zeros above mean something.
     await act(async () => {
-      store.getState().applyBatch([
+      applyM(store, [
         event("b", " more"),
         { v: 1, type: "sessions", sessions: [info("a"), { ...info("b"), phase: "idle" }] },
       ] as BatchItem[]);
@@ -229,7 +230,7 @@ describe("render budgets", () => {
   });
 
   it("streams 100 entries into a conversation: its prompt line and key bar draw 0 times", async () => {
-    store.getState().applyBatch([
+    applyM(store, [
       { v: 1, type: "sessions", sessions: [info("c")] },
       { v: 1, type: "subscribed", session: "c", from: "start", journals: ["j1"] },
       event("c", "start"),
@@ -242,7 +243,7 @@ describe("render budgets", () => {
 
     for (let b = 0; b < BATCHES; b++) {
       await act(async () => {
-        store.getState().applyBatch(
+        applyM(store, 
           Array.from({ length: EVENTS / BATCHES }, (_, i) => ({
             v: 1,
             type: "event",
@@ -262,7 +263,7 @@ describe("render budgets", () => {
 
     // The same probes do fire when what the controls show changes, so the zeros mean something.
     await act(async () => {
-      store.getState().applyBatch([
+      applyM(store, [
         { v: 1, type: "event", session: "c", journal: "j1", seq: ++seq, event: { type: "approval", data: { id: 1, detail: "", summary: { action: "Run", command: "make", files: [], scope: "once" } } } },
       ] as BatchItem[]);
     });

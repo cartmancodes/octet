@@ -10,6 +10,7 @@ import { hear, info, launch, pairedStorage, type Rig } from "./screenRig";
 import type { CatalogInfo, RecentInfo } from "./protocol";
 import { octetStore } from "./store";
 import { dark, light } from "./theme";
+import { applyM, k, sessionPath } from "./testKeys";
 
 const auth = LocalAuthentication as jest.Mocked<typeof LocalAuthentication>;
 
@@ -41,7 +42,7 @@ const MODELS: CatalogInfo["models"] = [
 ];
 const hearCatalog = async (rig: Rig, models = MODELS) => {
   await act(async () => {
-    octetStore.getState().applyBatch([{ v: 1, type: "catalog", session: "live", catalog: catalog(models) }]);
+    applyM(octetStore, [{ v: 1, type: "catalog", session: "live", catalog: catalog(models) }]);
     rig.clock.advance(50);
   });
   await flush();
@@ -142,7 +143,7 @@ describe("New session", () => {
       await ack(rig, "start", "Starting octet-a1b2c3 in /Users/me/Projects/octet");
       await hear(rig, [info("live"), info("new-id", { tmux: "octet-a1b2c3", from_phone: true })]);
       await flush();
-      expect(rig.view.getPathname()).toBe("/session/new-id");
+      expect(rig.view.getPathname()).toBe(`/session/${k("new-id")}`);
       await act(async () => router.back());
       expect(rig.view.getPathname()).toBe("/");
     });
@@ -304,7 +305,7 @@ describe("New session", () => {
       await hear(rig, [info("live"), info("fresh", { tmux: "octet-0a1b2c", from_phone: true })]);
       await flush();
       expect(prompts(rig)).toEqual([expect.objectContaining({ type: "prompt", session: "fresh", text: "fix the build" })]);
-      expect(rig.view.getPathname()).toBe("/session/fresh");
+      expect(rig.view.getPathname()).toBe(`/session/${k("fresh")}`);
       // replaced, not pushed: back does not land on New session
       await act(async () => router.back());
       expect(rig.view.getPathname()).toBe("/");
@@ -330,7 +331,7 @@ describe("New session", () => {
       await ack(rig, "start", "Starting octet-0a1b2c in /w");
       await flush();
       expect(prompts(rig)).toEqual([expect.objectContaining({ session: "early", text: "hi" })]);
-      expect(rig.view.getPathname()).toBe("/session/early");
+      expect(rig.view.getPathname()).toBe(`/session/${k("early")}`);
     });
 
     it("still opens the conversation when the prompt is refused, and shows the hub's words", async () => {
@@ -340,10 +341,10 @@ describe("New session", () => {
       await ack(rig, "start", "Starting octet-0a1b2c in /w");
       await hear(rig, [info("live"), info("fresh", { tmux: "octet-0a1b2c" })]);
       await flush();
-      expect(rig.view.getPathname()).toBe("/session/fresh");
+      expect(rig.view.getPathname()).toBe(`/session/${k("fresh")}`);
       await refuse(rig, "prompt", "That session is busy", "busy");
       expect(screen.getByText("That session is busy. Your text is in the prompt.")).toBeTruthy();
-      expect(rig.view.getPathname()).toBe("/session/fresh");
+      expect(rig.view.getPathname()).toBe(`/session/${k("fresh")}`);
     });
 
     it("a refused first prompt keeps the text as that session's draft, in its composer", async () => {
@@ -353,7 +354,7 @@ describe("New session", () => {
       await ack(rig, "start", "Starting octet-0a1b2c in /w");
       await hear(rig, [info("live"), info("fresh", { tmux: "octet-0a1b2c" })]);
       await flush();
-      expect(rig.view.getPathname()).toBe("/session/fresh");
+      expect(rig.view.getPathname()).toBe(`/session/${k("fresh")}`);
       await refuse(rig, "prompt", "That session is busy", "busy");
       expect(screen.getByText("That session is busy. Your text is in the prompt.")).toBeTruthy();
       expect(screen.getByLabelText("Message").props.value).toBe("hello there");
@@ -361,12 +362,12 @@ describe("New session", () => {
 
     it("a draft waiting for a conversation fills its composer when it opens", async () => {
       const rig = await open();
-      octetStore.getState().setDraft("fresh", "kept words");
-      await act(async () => router.push("/session/fresh"));
+      octetStore.getState().setDraft(k("fresh"), "kept words");
+      await act(async () => router.push(sessionPath("fresh")));
       await hear(rig, [info("live"), info("fresh")]);
       await flush();
       expect(screen.getByLabelText("Message").props.value).toBe("kept words");
-      expect(octetStore.getState().drafts.has("fresh")).toBe(false); // taken
+      expect(octetStore.getState().drafts.has(k("fresh"))).toBe(false); // taken
     });
 
     it("shows a refused start as a toast with the hub's words, and allows another try", async () => {
@@ -407,7 +408,7 @@ describe("New session", () => {
       await hear(rig, [info("late", { tmux: "octet-0a1b2c" })]);
       await flush();
       expect(prompts(rig)).toEqual([expect.objectContaining({ session: "late", text: "go" })]);
-      expect(rig.view.getPathname()).toBe("/session/late");
+      expect(rig.view.getPathname()).toBe(`/session/${k("late")}`);
     });
 
     it("two presses in one frame send one start", async () => {

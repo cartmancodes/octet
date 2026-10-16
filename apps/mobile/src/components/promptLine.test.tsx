@@ -11,6 +11,7 @@ import { StyleSheet, TextInput } from "react-native";
 import { Refusal } from "../client/HubClient";
 import { saveSettings } from "../persist";
 import { octetStore } from "../store";
+import { applyM, k } from "../testKeys";
 import { dark, light } from "../theme";
 import { approval, controls, disabled, flush, input, key, rig, settle } from "./controlsRig";
 import { JUST_APPEARED, PLACEHOLDER, PROMPT_LINES, PROMPT_MAX_HEIGHT, PROMPT_PAD, placeholderFor } from "./PromptLine";
@@ -59,9 +60,9 @@ describe("the prompt line", () => {
 
   it("marks the session's question answered when the Mac takes a prompt, and not when it refuses", async () => {
     const row = { id: "s", engine: "claude", workspace: "/w", mode: "ask", phase: "idle", approvals: 0, from_phone: false, question: true };
-    octetStore.getState().applyBatch([{ v: 1, type: "sessions", sessions: [row] } as never]);
+    applyM(octetStore, [{ v: 1, type: "sessions", sessions: [row] } as never]);
     const r = rig();
-    await render(controls(r.send, { question: true }));
+    await render(controls(r.send, { question: true, session: k("s") }));
     await fireEvent.changeText(input(), "yes");
     await fireEvent.press(sendKey());
     await flush();

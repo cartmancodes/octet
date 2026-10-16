@@ -6,7 +6,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { FreshConfirm } from "../src/components/CommandSheet";
 import { useDeskCommand } from "../src/components/deskCommand";
 import { useSend } from "../src/components/send";
-import { useHubClient } from "../src/hub";
+import { useLinks } from "../src/hub";
+import { macOfKey, rawOf } from "../src/macs";
 import { field } from "../src/model/text";
 import { engineModel, shortId } from "../src/session";
 import { sessionName } from "../src/sessions";
@@ -62,7 +63,10 @@ export default function Usage() {
   const routed = typeof params.workspace === "string" ? field(params.workspace, ROUTE_CHARS) : "";
   const info = useSessionInfo(id);
   const head = useSessionHead(id);
-  const client = useHubClient();
+  // The key names the Mac the session is on: its link and its commands.
+  const macId = macOfKey(id);
+  const links = useLinks();
+  const client = macId === null ? null : links.client(macId);
 
   // The session streams while this screen is in front, as it does for the Conversation under it:
   // USAGE and TURNS are live. An ended session has nothing more to stream. Navigation blurs the
@@ -76,9 +80,9 @@ export default function Usage() {
       if (!client || id === "") return;
       if (octetStore.getState().bySession.get(id)?.ended) return;
       if (octetStore.getState().sessions.every((x) => x.id !== id)) return; // not in the list: the hub would refuse
-      watch(octetStore, client, id);
-      return () => unwatch(client, id);
-    }, [client, id]),
+      watch(octetStore, links, id);
+      return () => unwatch(links, id);
+    }, [client, links, id]),
   );
 
   // The workspace outlives the session's place in the list; the route (from the Conversation) gives
@@ -92,9 +96,9 @@ export default function Usage() {
   const turns = useTurns(id);
   const journals = useJournals(id);
   const rows = useUsageRows();
-  const hub = useHub();
+  const hub = useHub(macId ?? undefined);
 
-  const send = useSend();
+  const send = useSend(id);
   const desk = useDeskCommand(id, send);
   const { run, busy } = desk;
   const [asking, setAsking] = useState(false);
@@ -188,7 +192,7 @@ export default function Usage() {
               <View style={s.row}>
                 <Text style={s.label}>SESSION</Text>
                 <Text selectable style={s.value}>
-                  {id}
+                  {rawOf(id) ?? id}
                 </Text>
               </View>
               <View style={s.row}>

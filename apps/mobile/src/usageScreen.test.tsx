@@ -10,6 +10,7 @@ import { hear, info, launch, pairedStorage, type Rig } from "./screenRig";
 import type { BatchItem } from "./client/HubClient";
 import type { JournalEvent, SessionInfo } from "./protocol";
 import { octetStore } from "./store";
+import { applyM, k } from "./testKeys";
 import { hideToast, toastStore } from "./toast";
 
 const SESSION = "a1b2c3d4";
@@ -29,7 +30,7 @@ const ev = (event: JournalEvent, session = SESSION, journal = "a-2.jsonl") => ({
 /** Frames for the session, as the hub would deliver them (the conversation behind this screen is
  * not streaming, so they go straight to the store). */
 async function feed(_rig: Rig, ...frames: object[]) {
-  await act(async () => void octetStore.getState().applyBatch(frames.map((f) => ({ v: 1, ...f })) as BatchItem[]));
+  await act(async () => void applyM(octetStore, frames.map((f) => ({ v: 1, ...f })) as BatchItem[]));
 }
 /** Frames over the socket, as the Mac sends them: the client must be subscribed to deliver them. */
 async function socketFeed({ sockets, clock }: Rig, ...frames: object[]) {
@@ -46,7 +47,7 @@ const A = (extra: Partial<SessionInfo> = {}) => info("a1b2c3d4", { workspace: "/
 async function open(list: SessionInfo[] = [A()], id = SESSION) {
   seq = 0;
   const rig = await launch("/", { usage: Usage }, list);
-  await act(async () => router.push({ pathname: "/usage", params: { id } }));
+  await act(async () => router.push({ pathname: "/usage", params: { id: k(id) } }));
   await flush();
   return rig;
 }
@@ -185,7 +186,7 @@ describe("This session: who", () => {
   it("takes the workspace from the route when the row is already gone, as plain text", async () => {
     seq = 0;
     await launch("/", { usage: Usage }, [info("other")]);
-    await act(async () => router.push({ pathname: "/usage", params: { id: SESSION, workspace: "/w/<b>octet</b>\u001b[2J" } }));
+    await act(async () => router.push({ pathname: "/usage", params: { id: k(SESSION), workspace: "/w/<b>octet</b>\u001b[2J" } }));
     await flush();
     expect(within(screen.getByTestId("this-session")).getByText("/w/<b>octet</b>")).toBeTruthy();
   });
@@ -195,7 +196,7 @@ describe("the workspace param", () => {
   it("is clipped to 512 characters", async () => {
     seq = 0;
     await launch("/", { usage: Usage }, [info("other")]);
-    await act(async () => router.push({ pathname: "/usage", params: { id: SESSION, workspace: `/w/${"x".repeat(2_000)}` } }));
+    await act(async () => router.push({ pathname: "/usage", params: { id: k(SESSION), workspace: `/w/${"x".repeat(2_000)}` } }));
     await flush();
     const shown = within(screen.getByTestId("this-session")).getByText(/^\/w\/x+$/);
     expect(String(shown.props.children).length).toBe(512);

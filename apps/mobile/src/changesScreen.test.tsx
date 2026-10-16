@@ -15,6 +15,7 @@ import { MENU_DISMISS_MS } from "./components/ModelModeMenu";
 import type { FileChange, JournalEvent, SessionInfo, ToolData } from "./protocol";
 import { info, launch, pairedStorage, type Rig } from "./screenRig";
 import { octetStore } from "./store";
+import { applyM, k } from "./testKeys";
 import { dark, light, type Theme } from "./theme";
 
 const SESSION = "a1b2c3d4";
@@ -38,7 +39,7 @@ const FILES = [file("src/app.ts", 3, 1), file("README.md", 20, 0, { status: "A" 
 /** The app on the Inbox, then Changes on top of it for `id`. */
 async function open(params: Record<string, string> = {}, list: SessionInfo[] = [A()]) {
   const rig = await launch("/", { changes: Changes, usage: Usage }, list);
-  await act(async () => router.push({ pathname: "/changes", params: { id: SESSION, ...params } }));
+  await act(async () => router.push({ pathname: "/changes", params: { id: k(SESSION), ...params } }));
   await flush();
   return rig;
 }
@@ -85,7 +86,7 @@ const tool = (id: string, name: string, target: string, phase: ToolData["phase"]
 /** Frames for the session straight into the store, as the hub would deliver them. */
 async function feed(...frames: object[]) {
   await act(async () =>
-    void octetStore.getState().applyBatch([{ type: "subscribed", session: SESSION, from: "start", journals: ["a-1.jsonl"] }, ...frames].map((f) => ({ v: 1, ...f })) as BatchItem[]),
+    void applyM(octetStore, [{ type: "subscribed", session: SESSION, from: "start", journals: ["a-1.jsonl"] }, ...frames].map((f) => ({ v: 1, ...f })) as BatchItem[]),
   );
 }
 
@@ -743,7 +744,7 @@ describe("the ways there", () => {
 
   it("a file-edit tool entry ends in view ›, which opens Changes with that file expanded", async () => {
     seq = 0;
-    const rig = await launch(`/session/${SESSION}`, { "session/[id]": Session, changes: Changes, usage: Usage }, [A()]);
+    const rig = await launch(`/session/${encodeURIComponent(k(SESSION))}`, { "session/[id]": Session, changes: Changes, usage: Usage }, [A()]);
     await flush();
     await feed(tool("e1", "Read", "/Users/me/Projects/octet/README.md", "done"), tool("e2", "Edit", "/Users/me/Projects/octet/src/app.ts", "done"));
     // A tools entry that edited nothing has no link.
@@ -764,7 +765,7 @@ describe("the ways there", () => {
 
   it("Usage has a Changes › row", async () => {
     const rig = await launch("/", { changes: Changes, usage: Usage }, [A()]);
-    await act(async () => router.push({ pathname: "/usage", params: { id: SESSION } }));
+    await act(async () => router.push({ pathname: "/usage", params: { id: k(SESSION) } }));
     await flush();
     expect(screen.getByText("Changes ›")).toBeTruthy();
     await fireEvent.press(screen.getByRole("button", { name: "Changes" }));
@@ -774,7 +775,7 @@ describe("the ways there", () => {
   });
 
   it("Session info has a Changes › row", async () => {
-    const rig = await launch(`/session/${SESSION}`, { "session/[id]": Session, changes: Changes, usage: Usage }, [A()]);
+    const rig = await launch(`/session/${encodeURIComponent(k(SESSION))}`, { "session/[id]": Session, changes: Changes, usage: Usage }, [A()]);
     await flush();
     await fireEvent.press(screen.getByTestId("convo-title"));
     await fireEvent.press(screen.getByRole("button", { name: "Session info, a1b2c3" }));

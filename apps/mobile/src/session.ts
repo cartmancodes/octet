@@ -1,6 +1,7 @@
 // What the Session screen derives from a session's view: the role of each transcript row, and
 // the Task strip's words (the terminal UI's Task card, crates/octet-tui/src/view.rs `sidebar`).
 // Pure; the components only draw it.
+import { rawOf } from "./macs";
 import type { PoseName } from "./mascot/poses";
 import type { SessionState } from "./model/session";
 import type { Entry } from "./model/transcript";
@@ -108,8 +109,9 @@ export function engineModel(catalog: CatalogInfo | null, head: SessionHead): str
   return model ? `${engine} / ${model}` : engine;
 }
 
-/** The first characters of a session id, as the prototype's short hash. */
-export const shortId = (id: string): string => id.slice(0, 6);
+/** The first characters of a session's hub id, as the prototype's short hash: a key's Mac is not
+ * part of it. */
+export const shortId = (id: string): string => (rawOf(id) ?? id).slice(0, 6);
 
 /** A workspace with the home folder as `~` ("/Users/me/code/octet" -> "~/code/octet"). */
 export function homePath(path: string): string {

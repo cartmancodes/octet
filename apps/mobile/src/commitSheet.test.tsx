@@ -16,6 +16,7 @@ import { saveSettings } from "./persist";
 import type { FileChange, JournalEvent, SessionInfo } from "./protocol";
 import { info, launch, pairedStorage, type Rig } from "./screenRig";
 import { octetStore } from "./store";
+import { applyM, k } from "./testKeys";
 import { MONO, dark, light, type Theme } from "./theme";
 import { hideToast, toastStore } from "./toast";
 
@@ -42,7 +43,7 @@ const FILES = [file("src/app.ts"), file("README.md", 20, 0)];
 
 async function open(list: SessionInfo[] = [A()]) {
   const rig = await launch("/", { changes: Changes }, list);
-  await act(async () => router.push({ pathname: "/changes", params: { id: SESSION } }));
+  await act(async () => router.push({ pathname: "/changes", params: { id: k(SESSION) } }));
   await flush();
   return rig;
 }
@@ -75,7 +76,7 @@ const approval = (id: number) =>
   ev({ type: "approval", data: { id, detail: "", summary: { action: "Run tests", command: null, files: [], cwd: null, scope: "once" } } });
 async function feed(...frames: object[]) {
   await act(async () =>
-    void octetStore.getState().applyBatch([{ type: "subscribed", session: SESSION, from: "start", journals: ["a-1.jsonl"] }, ...frames].map((f) => ({ v: 1, ...f })) as BatchItem[]),
+    void applyM(octetStore, [{ type: "subscribed", session: SESSION, from: "start", journals: ["a-1.jsonl"] }, ...frames].map((f) => ({ v: 1, ...f })) as BatchItem[]),
   );
 }
 
@@ -265,15 +266,15 @@ describe("the commit sheet", () => {
     const none = () => undefined;
     await render(
       <Profiler id="sheet" onRender={() => void (commits += 1)}>
-        <CommitSheet session={SESSION} scope={null} blocked={false} onCommitted={none} onLost={none} onClose={none} />
+        <CommitSheet session={k(SESSION)} scope={null} blocked={false} onCommitted={none} onLost={none} onClose={none} />
       </Profiler>,
     );
     expect(screen.getByLabelText("Commit message").props.value).toBe("Fix the login bug");
     commits = 0;
     for (let n = 0; n < 5; n++) {
-      await act(async () => void octetStore.getState().applyBatch([{ v: 1, ...ev({ type: "text", data: ` word ${n}` }) }] as BatchItem[]));
+      await act(async () => void applyM(octetStore, [{ v: 1, ...ev({ type: "text", data: ` word ${n}` }) }] as BatchItem[]));
     }
-    expect(octetStore.getState().bySession.get(SESSION)?.transcript.entries.length).toBeGreaterThan(1);
+    expect(octetStore.getState().bySession.get(k(SESSION))?.transcript.entries.length).toBeGreaterThan(1);
     expect(commits).toBe(0);
   });
 

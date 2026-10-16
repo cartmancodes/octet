@@ -1,5 +1,6 @@
 // What the Inbox derives from the hub's sessions list: which tab each session is on, in what
 // order, and the words on its card. Pure; the screen only draws it.
+import { macNameOf } from "./macs";
 import { foldCommand } from "./model/command";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { clipLabel, phaseWords, sessionName, sessionPose } from "./sessions";
@@ -51,8 +52,6 @@ export const NO_GIST_LINE = "Open the session to see what it asks.";
 /** The excerpt of a session whose last turn ended on a question. */
 export const QUESTION_LINE = "Ended on a question";
 
-/** The name for the Mac when the hub's address says nothing. */
-const SOME_MAC = "Mac";
 /** How the hub marks a string it shortened. */
 const CLIP_MARK = "…";
 /** The hub's last entry of a file list it cut (`gist`, crates/octet-hub/src/sessions.rs). */
@@ -61,18 +60,10 @@ const MORE_FILES = /^\+\d+ more$/;
 const NO_FILES: readonly string[] = [];
 /** What a screen reader adds for a shortened request. */
 export const SHORTENED_LABEL = "Shortened: review it in the session";
-const LABEL_MAX = 63;
 
 /** The Mac's name: the first label of the hub's host ("studio-mac" from
  * "wss://studio-mac.tail1234.ts.net/"). An IP address is kept whole. "Mac" without an address. */
-export function macName(hubUrl: string | null | undefined): string {
-  const match = /^[a-z][a-z0-9+.-]*:\/\/(\[[^\]/]*\]|[^/:?#[\]]+)/i.exec(hubUrl ?? "");
-  const host = match?.[1];
-  if (!host) return SOME_MAC;
-  if (host.startsWith("[") || /^[0-9.]+$/.test(host)) return host;
-  const first = host.split(".")[0] ?? "";
-  return first === "" ? SOME_MAC : first.slice(0, LABEL_MAX);
-}
+export const macName = macNameOf;
 
 const MINUTE = 60;
 const HOUR = 3_600;

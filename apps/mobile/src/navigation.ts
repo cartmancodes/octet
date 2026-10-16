@@ -14,7 +14,8 @@ export interface NavState {
 /** The Conversation's route. */
 const SESSION_ROUTE = "session/[id]";
 
-/** Whether `pathname` (expo-router's) is the Conversation of `id`. */
+/** Whether `pathname` (expo-router's) is the Conversation of `id`, a session key: its `/` comes
+ * decoded in the path, or percent-encoded. */
 export const isSessionPath = (pathname: string, id: string): boolean =>
   pathname === `/session/${id}` || pathname === `/session/${encodeURIComponent(id)}`;
 

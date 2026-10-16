@@ -13,8 +13,9 @@ import { TaskStrip } from "../../src/components/TaskStrip";
 import { TranscriptHeader } from "../../src/components/TranscriptHeader";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
 import { clearEdgeBottom, setEdgeBottom, useDrawerOpen } from "../../src/drawer";
-import { useHubClient } from "../../src/hub";
+import { useLinks } from "../../src/hub";
 import { macName } from "../../src/inbox";
+import { macOfKey } from "../../src/macs";
 import type { Entry } from "../../src/model/transcript";
 import { engineModel, headEngine, headMode, headModel, nowLine, type SessionHead } from "../../src/session";
 import { poseOf } from "../../src/sessions";
@@ -56,14 +57,17 @@ export default function Session() {
   const id = typeof params.id === "string" ? params.id : "";
   const theme = useTheme();
   const router = useRouter();
-  const client = useHubClient();
+  // The key names the Mac the session is on: its link, its list and its commands.
+  const macId = macOfKey(id);
+  const links = useLinks();
+  const client = macId === null ? null : links.client(macId);
   const focused = useIsFocused();
   const info = useSessionInfo(id);
   const entries = useEntries(id);
   const state = useSessionState(id);
   const status = useSessionStatus(id);
-  const listed = useListed();
-  const hub = useHub();
+  const listed = useListed(macId ?? "");
+  const hub = useHub(macId ?? "");
   const taskOpen = useTaskOpen();
   const approvals = useApprovals(id);
   const catalog = useCatalog(id);
@@ -79,12 +83,12 @@ export default function Session() {
       toOwn.current = false; // in front again
       if (!client || id === "") return;
       // An ended session's view is what it left behind: there is nothing more to stream.
-      if (!octetStore.getState().bySession.get(id)?.ended) watch(octetStore, client, id);
+      if (!octetStore.getState().bySession.get(id)?.ended) watch(octetStore, links, id);
       return () => {
-        unwatch(client, id);
-        if (!toOwn.current) releaseSession(octetStore, client, id);
+        unwatch(links, id);
+        if (!toOwn.current) releaseSession(octetStore, links, id);
       };
-    }, [client, id]),
+    }, [client, links, id]),
   );
 
   // The workspace outlives the session's place in the list.
@@ -156,8 +160,8 @@ export default function Session() {
   const gone = info === undefined && ((listed && !status.known) || (status.failed !== null && entries.length === 0));
   const now = nowLine(state, info);
 
-  // Commands go to the Mac through the one client; with none (not paired yet) they are unsent.
-  const send = useSend();
+  // Commands go to the session's Mac; with no link to it (not paired yet) they are unsent.
+  const send = useSend(id);
   // Only a live session takes commands: not an ended one, one the hub refused, or one that is gone.
   const live = !gone && !status.ended && status.failed === null;
   // While the Mac can't be reached the screen shows its last state, greyed, and takes no command

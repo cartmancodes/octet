@@ -9,6 +9,7 @@ import Settings from "../app/settings";
 import { hear, info, launch, pairedStorage, type Rig } from "./screenRig";
 import type { RecentInfo } from "./protocol";
 import { dark, light } from "./theme";
+import { k } from "./testKeys";
 
 const auth = LocalAuthentication as jest.Mocked<typeof LocalAuthentication>;
 
@@ -256,7 +257,7 @@ describe("Recent", () => {
       expect(rig.view.getPathname()).toBe("/recent");
       await hear(rig, [info("live"), info("new-id", { tmux: "octet-a1b2c3", from_phone: true })]);
       await flush();
-      expect(rig.view.getPathname()).toBe("/session/new-id");
+      expect(rig.view.getPathname()).toBe(`/session/${k("new-id")}`);
       // replaced, not pushed: back does not land on Recent
       await act(async () => router.back());
       expect(rig.view.getPathname()).toBe("/");
@@ -269,7 +270,7 @@ describe("Recent", () => {
       await hear(rig, [info("live"), info("early", { tmux: "octet-a1b2c3" })]);
       await ack(rig, "start", "Starting octet-a1b2c3 in /w");
       await flush();
-      expect(rig.view.getPathname()).toBe("/session/early");
+      expect(rig.view.getPathname()).toBe(`/session/${k("early")}`);
     });
 
     it("says it has not appeared after 30 seconds, and still opens it if it comes later", async () => {
@@ -284,7 +285,7 @@ describe("Recent", () => {
       expect(screen.queryByText(/it will appear in the Inbox/)).toBeNull();
       await hear(rig, [info("late", { tmux: "octet-a1b2c3" })]);
       await flush();
-      expect(rig.view.getPathname()).toBe("/session/late");
+      expect(rig.view.getPathname()).toBe(`/session/${k("late")}`);
     });
 
     it("leaving the screen cancels the watch", async () => {
@@ -327,7 +328,7 @@ describe("Recent", () => {
       await ack(rig, "start", "Starting octet-bbbbbb in /w");
       await hear(rig, [info("first", { tmux: "octet-aaaaaa" }), info("second", { tmux: "octet-bbbbbb" })]);
       await flush();
-      expect(rig.view.getPathname()).toBe("/session/second");
+      expect(rig.view.getPathname()).toBe(`/session/${k("second")}`);
     });
 
     it("tells the user it started even if the hub's words do not name the session", async () => {

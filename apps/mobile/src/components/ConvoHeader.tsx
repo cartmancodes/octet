@@ -4,6 +4,7 @@ import { AccessibilityInfo, Modal, Pressable, StyleSheet, Text, View } from "rea
 import { onMenuRequest } from "../convoMenu";
 import { openDrawer } from "../drawer";
 import type { Phase } from "../protocol";
+import { rawOf } from "../macs";
 import { engineModel, headEngine, headLine, headMode } from "../session";
 import { clipLabel, sessionName } from "../sessions";
 import { useCatalog, useSessionHead } from "../store";
@@ -243,7 +244,7 @@ export const ConvoHeader = memo(function ConvoHeader({
               <Field label="Engine / model" value={engineModel(catalog, head)} />
               <Field label="Mode" value={headMode(catalog, head)} />
               <Field label="Workspace" value={workspace ?? ""} />
-              <Field label="Session" value={session} />
+              <Field label="Session" value={rawOf(session) ?? session} />
               <View style={s.endRow}>
                 <Button label="Changes ›" accessibilityLabel="Changes" onPress={toChanges} />
               </View>

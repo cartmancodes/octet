@@ -31,7 +31,7 @@ export function clearEdgeBottom(owner: object): void {
  * The screens that have the drawer: the Inbox, a Conversation and Settings. On any other (Pair,
  * New session) it is closed and stays closed. `pathname` is expo-router's.
  */
-export const drawerScreen = (pathname: string): boolean => pathname === "/" || pathname === "/settings" || /^\/session\/[^/]+$/.test(pathname);
+export const drawerScreen = (pathname: string): boolean => pathname === "/" || pathname === "/settings" || /^\/session\/.+$/.test(pathname);
 
 /** Whether the screen showing has a drawer; one that has not closes it. */
 export function setDrawerEnabled(enabled: boolean): void {

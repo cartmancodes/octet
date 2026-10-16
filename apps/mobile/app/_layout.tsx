@@ -8,7 +8,8 @@ import { AppState, View } from "react-native";
 import { ApprovalToasts } from "../src/components/ApprovalToasts";
 import { Drawer, DrawerHost } from "../src/components/Drawer";
 import { closeDrawer, drawerScreen, setDrawerEnabled } from "../src/drawer";
-import { useHubController, useHubSnapshot } from "../src/hub";
+import { useHubController, useHubSnapshot, useLinks } from "../src/hub";
+import { keyOf } from "../src/macs";
 import { openSession } from "../src/navigation";
 import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
 import { useTheme } from "../src/theme";
@@ -34,6 +35,7 @@ export default function RootLayout() {
   const router = useRouter();
   const nav = useNavigationContainerRef();
   const { status, offer } = useHubSnapshot();
+  const links = useLinks();
   const pathname = usePathname();
 
   // The drawer belongs to the Inbox, a Conversation and Settings of a paired phone: anywhere else
@@ -64,11 +66,14 @@ export default function RootLayout() {
 
   // A tap opens the session it names, as the drawer does (back to it when it is in the stack);
   // unpaired, the phone can only pair; a tap that names no valid session lands on the Inbox. (The
-  // Session screen already handles a session that is gone.)
+  // Session screen already handles a session that is gone.) A push names the hub's raw id: it is
+  // the only Mac's; with no one Mac to own it, the tap lands on the Inbox.
   const open = (session: string | null) => {
+    const macs = links.macs();
+    const only = macs.length === 1 ? macs[0] : undefined;
     if (status === "unpaired") router.replace("/pair");
-    else if (session === null) router.replace("/");
-    else openSession(router, nav.getRootState(), pathname, session);
+    else if (session === null || only === undefined) router.replace("/");
+    else openSession(router, nav.getRootState(), pathname, keyOf(only, session));
   };
   // The latest of these, for the listener below, which is set up once.
   const route = useRef({ status, offer, open });

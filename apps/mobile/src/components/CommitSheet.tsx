@@ -91,7 +91,7 @@ export const CommitSheet = memo(function CommitSheet({ session, scope, blocked, 
   const s = theme === light ? LIGHT : DARK;
   // Read once, as the sheet opens: the session's stream never draws the sheet again.
   const [message, setMessage] = useState(() => firstPrompt(entriesNow(octetStore, session)));
-  const send = useSend();
+  const send = useSend(session);
   const alive = useAlive();
   // "checking": the Face ID prompt is up. "sending": the commit is out, waiting for its ack.
   const [stage, setStage] = useState<"checking" | "sending" | null>(null);

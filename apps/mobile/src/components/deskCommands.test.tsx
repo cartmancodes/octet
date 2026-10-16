@@ -9,6 +9,7 @@ import { StyleSheet } from "react-native";
 import { Refusal } from "../client/HubClient";
 import { saveSettings } from "../persist";
 import { octetStore } from "../store";
+import { applyM, k } from "../testKeys";
 import { toastStore, hideToast } from "../toast";
 import { approval, controls, disabled, flush, input, rig, settle } from "./controlsRig";
 import { FRESH_QUESTION } from "./CommandSheet";
@@ -98,18 +99,18 @@ describe("/new", () => {
 
 describe("/new marks the fresh start", () => {
   const hold = () =>
-    octetStore.getState().applyBatch([
+    applyM(octetStore, [
       { v: 1, type: "subscribed", session: "s", from: "start", journals: ["j1"] },
       { v: 1, type: "event", session: "s", journal: "j1", seq: 1, event: { type: "user", data: "old question" } },
       { v: 1, type: "replayed", session: "s" } as never, // the replay is over
     ]);
-  const notes = () => (octetStore.getState().bySession.get("s")?.transcript.entries ?? []).filter((e) => e.kind === "note");
+  const notes = () => (octetStore.getState().bySession.get(k("s"))?.transcript.entries ?? []).filter((e) => e.kind === "note");
 
   it("marks the start on the ack: one divider, before the new journal's first record, below the old one's last", async () => {
     expect(FRESH_NOTE).toBe("Fresh conversation — the earlier one is above.");
     hold();
     const r = rig();
-    await render(controls(r.send));
+    await render(controls(r.send, { session: k("s") }));
     await type("/new");
     await fireEvent.press(row("/new"));
     await fireEvent.press(button("Start fresh") as never);
@@ -117,23 +118,23 @@ describe("/new marks the fresh start", () => {
     r.waiting[0]?.resolve({ message: "Starting a fresh conversation" });
     await flush();
     // The old journal's last words are still to come: they go above it.
-    octetStore.getState().applyBatch([{ v: 1, type: "event", session: "s", journal: "j1", seq: 2, event: { type: "error", data: "last words" } }]);
+    applyM(octetStore, [{ v: 1, type: "event", session: "s", journal: "j1", seq: 2, event: { type: "error", data: "last words" } }]);
     expect(notes()).toHaveLength(0);
-    octetStore.getState().applyBatch([{ v: 1, type: "event", session: "s", journal: "j2", seq: 1, event: { type: "user", data: "new question" } }]);
+    applyM(octetStore, [{ v: 1, type: "event", session: "s", journal: "j2", seq: 1, event: { type: "user", data: "new question" } }]);
     expect(notes()).toEqual([expect.objectContaining({ text: FRESH_NOTE })]);
-    const kinds = (octetStore.getState().bySession.get("s")?.transcript.entries ?? []).map((e) => ("text" in e ? e.text : ""));
+    const kinds = (octetStore.getState().bySession.get(k("s"))?.transcript.entries ?? []).map((e) => ("text" in e ? e.text : ""));
     expect(kinds).toEqual(["old question", "last words", FRESH_NOTE, "new question"]);
   });
 
   it("the session's question is answered by the fresh start: its row stops asking on the ack", async () => {
     hold();
-    octetStore.getState().applyBatch([
+    applyM(octetStore, [
       { v: 1, type: "sessions", sessions: [{ id: "s", engine: "claude", workspace: "/w", mode: "ask", phase: "idle", approvals: 0, from_phone: false, question: true }] },
     ]);
     const asking = () => octetStore.getState().sessions[0]?.question;
     expect(asking()).toBe(true);
     const r = rig();
-    await render(controls(r.send));
+    await render(controls(r.send, { session: k("s") }));
     await type("/new");
     await fireEvent.press(row("/new"));
     await fireEvent.press(button("Start fresh") as never);
@@ -146,7 +147,7 @@ describe("/new marks the fresh start", () => {
   it("a refused /new, and the other commands, add none", async () => {
     hold();
     const r = rig();
-    await render(controls(r.send));
+    await render(controls(r.send, { session: k("s") }));
     await type("/new");
     await fireEvent.press(row("/new"));
     await fireEvent.press(button("Start fresh") as never);
@@ -157,7 +158,7 @@ describe("/new marks the fresh start", () => {
     r.waiting[1]?.resolve({ message: "Exported" });
     await flush();
     // The next journal's first record finds no fresh start to mark.
-    octetStore.getState().applyBatch([{ v: 1, type: "event", session: "s", journal: "j2", seq: 1, event: { type: "user", data: "new question" } }]);
+    applyM(octetStore, [{ v: 1, type: "event", session: "s", journal: "j2", seq: 1, event: { type: "user", data: "new question" } }]);
     expect(notes()).toHaveLength(0);
   });
 });

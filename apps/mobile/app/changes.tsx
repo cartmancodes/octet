@@ -24,7 +24,8 @@ import { CommitSheet, PrSheet } from "../src/components/CommitSheet";
 import { DiffLineRow, DiffNote, FileRow, SIDE } from "../src/components/FileRow";
 import { HubBanner } from "../src/components/HubBanner";
 import { failure, useAlive, useSend, type Failure } from "../src/components/send";
-import { useHubClient } from "../src/hub";
+import { useLinks } from "../src/hub";
+import { macOfKey } from "../src/macs";
 import { FIELD_CHARS, field } from "../src/model/text";
 import type { DiffFrame, FileChange } from "../src/protocol";
 import { sessionName } from "../src/sessions";
@@ -119,11 +120,14 @@ export default function Changes() {
   const params = useLocalSearchParams<{ id?: string | string[]; file?: string | string[] }>();
   const id = typeof params.id === "string" ? params.id : "";
   const file = typeof params.file === "string" ? field(params.file, FIELD_CHARS) : "";
-  const client = useHubClient();
-  const hub = useHub();
+  // The key names the Mac the session is on: its link and its commands.
+  const macId = macOfKey(id);
+  const links = useLinks();
+  const client = macId === null ? null : links.client(macId);
+  const hub = useHub(macId ?? undefined);
   const focused = useIsFocused();
   const head = useSessionHead(id);
-  const send = useSend();
+  const send = useSend(id);
   const alive = useAlive();
   const waiting = useApprovals(id).length > 0;
 
@@ -133,9 +137,9 @@ export default function Changes() {
       if (!client || id === "") return;
       if (octetStore.getState().bySession.get(id)?.ended) return;
       if (octetStore.getState().sessions.every((x) => x.id !== id)) return; // not in the list: the hub would refuse
-      watch(octetStore, client, id);
-      return () => unwatch(client, id);
-    }, [client, id]),
+      watch(octetStore, links, id);
+      return () => unwatch(links, id);
+    }, [client, links, id]),
   );
 
   const [lastWorkspace, setLastWorkspace] = useState(head.workspace);

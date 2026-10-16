@@ -1,7 +1,7 @@
 // The one hub connection of the app run: where the device token comes from, how pairing keeps it,
 // and what the app's lifecycle does to it. No JSX here; `app/_layout.tsx` provides it to screens.
 import * as SecureStore from "expo-secure-store";
-import { createContext, useContext, useSyncExternalStore } from "react";
+import { createContext, useContext, useMemo, useSyncExternalStore } from "react";
 import { Platform } from "react-native";
 
 import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from "./client/HubClient";
@@ -9,6 +9,8 @@ import { NOT_A_LINK, isHubUrl, pairLinkProblem, parsePairLink } from "./client/l
 import { webSocketFactory } from "./client/socket";
 import { isDevBuild } from "./build";
 import { DEFAULT_PUSH_KINDS, NOT_SAVED, loadSettings, readSettings, saveSettings } from "./persist";
+import { createCoalescer, type Coalescer } from "./coalesce";
+import { SOLO_MAC, soloLinks, type Links } from "./macs";
 import { DENIED, askForToken, currentToken, dropPushRegistration, onTokenChange, projectId } from "./notifications";
 import type { PushKinds } from "./protocol";
 import { connectStore, octetStore, type OctetStore } from "./store";
@@ -95,6 +97,8 @@ export class HubController {
   private readonly platform: string;
   private readonly clientOptions: NonNullable<HubControllerOptions["clientOptions"]>;
   private readonly schedule: (fn: () => void, ms: number) => () => void;
+  /** One store commit per 50 ms, whichever Mac's client the batches come from. */
+  private readonly coalescer: Coalescer;
 
   private current: HubSnapshot = { status: "loading", notice: null, client: null, offer: false, pushNotice: null };
   private readonly listeners = new Set<() => void>();
@@ -120,6 +124,11 @@ export class HubController {
         const id = setTimeout(fn, ms);
         return () => clearTimeout(id);
       });
+    const store = this.store;
+    this.coalescer = createCoalescer((batches) => store.getState().applyBatches(batches), {
+      now: this.clientOptions.now,
+      schedule: this.schedule,
+    });
   }
 
   // What screens read
@@ -428,7 +437,7 @@ export class HubController {
   private adopt(client: HubClient, offer = false): void {
     this.release();
     this.current.client?.stop();
-    const offStore = connectStore(this.store, client);
+    const offStore = connectStore(this.store, client, { mac: SOLO_MAC, coalescer: this.coalescer });
     const offState = client.onState((state) => {
       if (state === "unpaired") void this.unpaired(client);
       else if (state === "ready") void this.syncPush(client);
@@ -488,3 +497,10 @@ export function useHubSnapshot(): HubSnapshot {
 
 /** The connection while paired; null before pairing and after the Mac unpaired this phone. */
 export const useHubClient = (): HubClient | null => useHubSnapshot().client;
+
+/** The connection by Mac, for code that holds a session key: the one Mac, `SOLO_MAC`, while
+ * paired. A new object when the connection changes, the same one until then. */
+export function useLinks(): Links {
+  const client = useHubClient();
+  return useMemo(() => soloLinks(client), [client]);
+}

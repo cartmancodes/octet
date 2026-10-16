@@ -2,8 +2,9 @@
 // the limits on what is sent, and the words for a command that did not work.
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { Refusal, type RequestBody } from "../client/HubClient";
-import { useHubClient } from "../hub";
+import { Refusal, type Ack, type RequestBody } from "../client/HubClient";
+import { useLinks } from "../hub";
+import { splitKey, type Links } from "../macs";
 
 /** Sends a command to the Mac; resolves on its ack, rejects with a `Refusal`. */
 export type Send = (body: RequestBody) => Promise<unknown>;
@@ -33,14 +34,46 @@ export function failure(error: unknown): Failure {
   return { text: "Something went wrong. Try again.", retry: false };
 }
 
-/** A `Send` over the app's one connection; with none (not paired yet) every command is unsent.
- * Stable while the connection is. */
-export function useSend(): Send {
-  const client = useHubClient();
-  return useCallback<Send>(
-    (body) => (client ? client.request(body) : Promise.reject(new Refusal("unsent", "Can't reach your Mac"))),
-    [client],
-  );
+export const UNREACHABLE = "Can't reach your Mac";
+export const CHOOSE_MAC = "Choose a Mac";
+
+/**
+ * Sends `body` to the Mac it is for, through `links`, with the hub's raw id in place of the key
+ * in its `session`. The Mac is the one of the body's `session` (a key), else of `key`; a body
+ * that names neither goes to the only Mac. Never sent, refused as `unsent`: a session that is not
+ * a key, a body for another Mac than `key`'s, no Mac connected, or no Mac named while there are
+ * several.
+ */
+export function sendVia(links: Links, key: string | undefined, body: RequestBody): Promise<Ack> {
+  const unsent = (words: string) => Promise.reject(new Refusal("unsent", words));
+  const named = "session" in body ? body.session : undefined;
+  const target = named ?? key;
+  let mac: string;
+  if (target === undefined) {
+    const macs = links.macs();
+    if (macs.length > 1) return unsent(CHOOSE_MAC);
+    const only = macs[0];
+    if (only === undefined) return unsent(UNREACHABLE);
+    mac = only;
+  } else {
+    const split = splitKey(target);
+    if (split === null) return unsent(UNREACHABLE);
+    if (key !== undefined && named !== undefined && splitKey(key)?.mac !== split.mac) return unsent(UNREACHABLE);
+    mac = split.mac;
+  }
+  const client = links.client(mac);
+  if (client === null) return unsent(UNREACHABLE);
+  if (named === undefined) return client.request(body);
+  const raw = splitKey(named)?.raw ?? "";
+  return client.request({ ...body, session: raw } as RequestBody);
+}
+
+/** A `Send` to the Mac of `key` (or of each body's session; with neither, the only Mac): see
+ * `sendVia`. With no Mac connected (not paired yet) every command is unsent. Stable while the
+ * links are. */
+export function useSend(key?: string): Send {
+  const links = useLinks();
+  return useCallback<Send>((body) => sendVia(links, key, body), [links, key]);
 }
 
 const isLow = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;

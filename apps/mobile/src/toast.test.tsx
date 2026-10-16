@@ -9,6 +9,7 @@ import { closeDrawer } from "./drawer";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { hear, info, launch, pairedStorage, type Rig } from "./screenRig";
 import { hideToast, toastStore } from "./toast";
+import { k, sessionPath } from "./testKeys";
 
 const gist = (id: number): ApprovalInfo => ({
   id,
@@ -100,29 +101,29 @@ describe("the approval toast", () => {
     await hear(rig, [waiting("b", 1)]);
     await fireEvent.press(screen.getByRole("button", { name: "View" }));
     await flush();
-    expect(rig.view.getPathname()).toBe("/session/b");
-    expect(screen.getByTestId("opened").props.children).toBe("b");
+    expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
+    expect(screen.getByTestId("opened").props.children).toBe(k("b"));
     expect(toastText()).toBeNull();
   });
 
   it("View for a session already in the stack goes back to it: no second copy", async () => {
-    const rig = await openAt("/session/b", [info("b")]);
+    const rig = await openAt(sessionPath("b"), [info("b")]);
     await act(async () => router.push("/settings"));
     await hear(rig, [waiting("b", 1)]);
     await fireEvent.press(screen.getByRole("button", { name: "View" }));
     await flush();
-    expect(rig.view.getPathname()).toBe("/session/b");
+    expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
     await act(async () => router.back());
     expect(rig.view.getPathname()).toBe("/");
     expect(router.canGoBack()).toBe(false);
   });
 
   it("View from one session to another replaces it: back goes to the Inbox", async () => {
-    const rig = await openAt("/session/a", [info("a"), info("b")]);
+    const rig = await openAt(sessionPath("a"), [info("a"), info("b")]);
     await hear(rig, [info("a"), waiting("b", 1)]);
     await fireEvent.press(screen.getByRole("button", { name: "View" }));
     await flush();
-    expect(rig.view.getPathname()).toBe("/session/b");
+    expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
     await act(async () => router.back());
     expect(rig.view.getPathname()).toBe("/");
   });
@@ -169,7 +170,7 @@ describe("the approval toast", () => {
   });
 
   it("does not show for the session on screen, but does for another", async () => {
-    const rig = await openAt("/session/a", [info("a"), info("b")]);
+    const rig = await openAt(sessionPath("a"), [info("a"), info("b")]);
     await hear(rig, [waiting("a", 1), info("b")]);
     expect(toastText()).toBeNull();
     await hear(rig, [waiting("a", 1), waiting("b", 7)]);

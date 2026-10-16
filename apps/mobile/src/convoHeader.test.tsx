@@ -15,6 +15,7 @@ import { SETTINGS_KEY, saveSettings } from "./persist";
 import { requestMenu } from "./convoMenu";
 import type { CatalogInfo, Phase, SessionInfo } from "./protocol";
 import { octetStore } from "./store";
+import { applyM, k } from "./testKeys";
 import { textSizeStore } from "./textSize";
 import { resetTextSize } from "./textSizeRig";
 import { dark, light } from "./theme";
@@ -33,10 +34,12 @@ const CATALOG: CatalogInfo = {
   current: { engine: "claude", selection: "sonnet" },
 };
 
-const SESSION = "a1b2c3d4e5";
+/** The session's hub id, and the store's key of it on the one Mac. */
+const RAW = "a1b2c3d4e5";
+const SESSION = k(RAW);
 
 const info = (extra: Partial<SessionInfo> = {}): SessionInfo => ({
-  id: SESSION,
+  id: RAW,
   engine: "claude",
   workspace: "/Users/me/Projects/octet",
   mode: "ask",
@@ -61,8 +64,8 @@ type Rig = ReturnType<typeof rig>;
 /** The store, as the hub would fill it: the session listed and, when given, its catalog. */
 async function hear(catalog: CatalogInfo | null, extra: Partial<SessionInfo> = {}) {
   const frames: object[] = [{ v: 1, type: "sessions", sessions: [info(extra)] }];
-  if (catalog) frames.push({ v: 1, type: "catalog", session: SESSION, catalog });
-  await act(async () => void octetStore.getState().applyBatch(frames as BatchItem[]));
+  if (catalog) frames.push({ v: 1, type: "catalog", session: RAW, catalog });
+  await act(async () => void applyM(octetStore, frames as BatchItem[]));
 }
 
 const flush = () => act(async () => void (await new Promise((resolve) => setTimeout(resolve, 0))));
@@ -158,7 +161,7 @@ describe("the conversation header", () => {
   it("keeps the title once the session leaves the list", async () => {
     await hear(CATALOG);
     await render(header(rig()));
-    await act(async () => void octetStore.getState().applyBatch([{ v: 1, type: "sessions", sessions: [] }] as BatchItem[]));
+    await act(async () => void applyM(octetStore, [{ v: 1, type: "sessions", sessions: [] }] as BatchItem[]));
     expect(screen.getByText("octet")).toBeTruthy();
   });
 
@@ -182,11 +185,11 @@ describe("the conversation header", () => {
     let seq = 0;
     for (let b = 0; b < 10; b++) {
       await act(async () => {
-        octetStore.getState().applyBatch(
+        applyM(octetStore, 
           Array.from({ length: 10 }, (_, i) => ({
             v: 1,
             type: "event",
-            session: SESSION,
+            session: RAW,
             journal: "j1",
             seq: ++seq,
             event: { type: "text", data: ` ${b * 10 + i}` },
@@ -195,9 +198,9 @@ describe("the conversation header", () => {
       });
     }
     await act(async () => {
-      octetStore.getState().applyBatch([
+      applyM(octetStore, [
         { v: 1, type: "sessions", sessions: [info(), { ...info(), id: "other", phase: "running" }] },
-        { v: 1, type: "state", session: SESSION, state: { phase: "running", queue: [], queued: 0, mode: "ask", approvals: [], now: "Thinking" } },
+        { v: 1, type: "state", session: RAW, state: { phase: "running", queue: [], queued: 0, mode: "ask", approvals: [], now: "Thinking" } },
       ] as BatchItem[]);
     });
     expect(octetStore.getState().bySession.get(SESSION)?.transcript.entries.length).toBeGreaterThan(0);
@@ -263,7 +266,7 @@ describe("the conversation header", () => {
       expect(sheet.getByText("claude / Sonnet")).toBeTruthy();
       expect(sheet.getByText("ask")).toBeTruthy();
       expect(sheet.getByText("/Users/me/Projects/octet")).toBeTruthy();
-      expect(sheet.getByText(SESSION)).toBeTruthy();
+      expect(sheet.getByText(RAW)).toBeTruthy();
       expect(covered).toHaveBeenLastCalledWith(true);
       await press("Close");
       expect(screen.queryByTestId("info")).toBeNull();
@@ -280,7 +283,7 @@ describe("the conversation header", () => {
       expect(screen.queryByTestId("menu")).toBeNull();
       expect(screen.queryByTestId("info")).toBeNull();
       await act(async () => void (await new Promise((resolve) => setTimeout(resolve, MENU_DISMISS_MS + 50))));
-      expect(within(screen.getByTestId("info")).getByText(SESSION)).toBeTruthy();
+      expect(within(screen.getByTestId("info")).getByText(RAW)).toBeTruthy();
     });
   });
 
