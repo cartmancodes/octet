@@ -35,8 +35,10 @@
   - Rust: `p256`, exact version with features `ecdsa`, `pkcs8`, `pem`. Its licences must pass `deny.toml` (MIT or Apache-2.0).
   - Base64url is written in-crate, about 30 lines, tested against RFC 4648 vectors. Don't add a `base64` dependency.
   - npm: `@bacons/apple-targets`, an exact version at least two weeks old, as a dev dependency. No other new packages.
-- **`register_activity {token, start_token?}`**
+- **`register_activity {token?, start_token?}`**
+  - At least one is present: ActivityKit gives a push-to-start token while no activity runs, and a running activity's token only while it lives. The message states the phone's current tokens; an absent field means none.
   - Each token is lowercase hex, 1–200 characters. Anything else is refused as `invalid`.
+  - `clear_activity` (no fields) removes them, for a phone that turns the Live Activity off.
   - It's refused before hello, rate-limited, and audited as `activity registered` with the device name.
   - Tokens are stored per device, redacted in `Debug` and in logs, and dropped on revoke and on an APNs 410.
 - **APNs configuration** (in `hub.json`)
