@@ -66,7 +66,7 @@ const SEND_WITHIN: Duration = Duration::from_secs(15);
 /// The length of a team id and of a key id.
 const ID_CHARS: usize = 10;
 /// The most of a key file that is read; a `.p8` is about 250 bytes.
-const KEY_BYTES: u64 = 16 * 1024;
+const KEY_BYTES: usize = 16 * 1024;
 
 /// A team or key id is not 10 upper-case letters and digits.
 const IDS_MALFORMED: &str = "APNs is off: the team or key id is malformed";
@@ -271,26 +271,44 @@ fn read_key(path: &Path) -> Result<SigningKey, &'static str> {
         _ => KEY_UNREADABLE,
     })?;
     let stat = rustix::fs::fstat(&fd).map_err(|_| KEY_UNREADABLE)?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Err(KEY_NOT_FILE);
-    }
-    if Mode::from_raw_mode(stat.st_mode) != Mode::RUSR | Mode::WUSR {
-        return Err(KEY_MODE);
-    }
-    if stat.st_uid != rustix::process::geteuid().as_raw() {
-        return Err(KEY_OWNER);
-    }
-    let mut text = String::new();
-    std::fs::File::from(fd)
-        .take(KEY_BYTES)
-        .read_to_string(&mut text)
-        .map_err(|_| KEY_NOT_P256)?;
-    let key = SigningKey::from_pkcs8_pem(&text).map_err(|_| KEY_NOT_P256);
-    // The PEM is not kept: what can be wiped is.
+    check(
+        FileType::from_raw_mode(stat.st_mode),
+        Mode::from_raw_mode(stat.st_mode),
+        stat.st_uid,
+        rustix::process::geteuid().as_raw(),
+    )?;
+    // One buffer, big enough for all that is read, so the PEM is never copied by a regrowth.
+    let mut text = String::with_capacity(KEY_BYTES);
+    let read = std::fs::File::from(fd)
+        .take(KEY_BYTES as u64)
+        .read_to_string(&mut text);
+    let key = read
+        .ok()
+        .and_then(|_| SigningKey::from_pkcs8_pem(&text).ok())
+        .ok_or(KEY_NOT_P256);
+    // The PEM is not kept: the whole buffer is wiped, past its length too (a read that failed
+    // half way leaves bytes there).
     let mut bytes = text.into_bytes();
-    bytes.fill(0);
+    bytes.clear();
+    bytes.resize(bytes.capacity(), 0);
     std::hint::black_box(&bytes);
     key
+}
+
+/// Whether a key file of `file_type` and permission bits `mode`, owned by `uid`, may be used by
+/// a hub running as `euid`: a regular file, of exactly 0600 (no setuid, setgid or sticky bit),
+/// owned by the hub's user; or the log line for why not.
+fn check(file_type: FileType, mode: Mode, uid: u32, euid: u32) -> Result<(), &'static str> {
+    if file_type != FileType::RegularFile {
+        return Err(KEY_NOT_FILE);
+    }
+    if mode != Mode::RUSR | Mode::WUSR {
+        return Err(KEY_MODE);
+    }
+    if uid != euid {
+        return Err(KEY_OWNER);
+    }
+    Ok(())
 }
 
 /// Base64url without padding (RFC 4648 §5).
@@ -389,10 +407,22 @@ fn quoted(value: &str) -> Option<String> {
     Some(value.replace('\\', r"\\").replace('"', r#"\""#))
 }
 
-/// Sends `payload` to the device `token` at `url_base` (see [`ApnsConfig::url_base`]) with
-/// `program` (`curl`), signed with `jwt`, and says what APNs answered. argv is
-/// [`CURL_ARGS`]; the URL, the headers and the body go on stdin.
+/// Sends `payload` to the device `token` at the host `config` names ([`ApnsConfig::url_base`])
+/// with `program` (`curl`), signed with `jwt`, and says what APNs answered. argv is
+/// [`CURL_ARGS`]; the URL, the headers and the body go on stdin. The JWT goes nowhere but there.
 pub async fn send(
+    program: &str,
+    config: &ApnsConfig,
+    jwt: &str,
+    token: &str,
+    payload: &Value,
+    priority: Priority,
+) -> Outcome {
+    send_to(program, &config.url_base(), jwt, token, payload, priority).await
+}
+
+/// [`send`], to `url_base`.
+async fn send_to(
     program: &str,
     url_base: &str,
     jwt: &str,
@@ -404,14 +434,7 @@ pub async fn send(
         return Outcome::Failed(0);
     };
     let post = async {
-        let mut child = Command::new(program)
-            .args(CURL_ARGS)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .ok()?;
+        let mut child = curl_command(program).spawn().ok()?;
         let mut stdin = child.stdin.take()?;
         stdin.write_all(config.as_bytes()).await.ok()?;
         drop(stdin);
@@ -430,6 +453,21 @@ pub async fn send(
         Ok(Some(status)) => Outcome::Failed(status),
         _ => Outcome::Failed(0),
     }
+}
+
+/// `program` (`curl`) with [`CURL_ARGS`], its stdin and stdout piped, and without
+/// `SSLKEYLOGFILE`, which would have it write the TLS secrets of the request (and so the JWT) to
+/// a file.
+fn curl_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(CURL_ARGS)
+        .env_remove("SSLKEYLOGFILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
 }
 
 #[cfg(test)]
@@ -852,7 +890,7 @@ mod tests {
         let jwt = test_signer(&dir).jwt(at(IAT)).to_owned();
         // A body with a quote, a backslash and an escaped newline in a string.
         let payload = json!({"aps": {"event": "update", "note": "a\"b\\c\nd"}});
-        let outcome = send(
+        let outcome = send_to(
             curl.to_str().expect("utf-8"),
             "https://api.push.apple.com",
             &jwt,
@@ -889,7 +927,7 @@ mod tests {
         let dir = TempDir::new("apns-stdin-normal");
         let curl = recording_curl(&dir, "200", 0);
         let program = curl.to_str().expect("utf-8");
-        send(
+        send_to(
             program,
             "https://h",
             "j",
@@ -918,7 +956,7 @@ mod tests {
             ("https://h", "j", ""),
             ("https://h", "j", "../x"),
         ] {
-            let outcome = send(program, base, jwt, token, &body, Priority::Normal).await;
+            let outcome = send_to(program, base, jwt, token, &body, Priority::Normal).await;
             assert_eq!(outcome, Outcome::Failed(0), "{jwt:?} {token:?}");
         }
         assert_eq!(record(&dir, "argv"), None, "curl never ran");
@@ -953,11 +991,11 @@ mod tests {
         ] {
             std::fs::write(dir.path().join("status"), status).expect("status");
             std::fs::write(dir.path().join("exit"), exit.to_string()).expect("exit");
-            let answer = send(program, "https://h", "j", TOKEN, &body, Priority::Normal).await;
+            let answer = send_to(program, "https://h", "j", TOKEN, &body, Priority::Normal).await;
             assert_eq!(answer, outcome, "{status} exit {exit}");
         }
         // No curl at all, and a real curl with nothing listening.
-        let missing = send(
+        let missing = send_to(
             "/nonexistent/curl",
             "https://h",
             "j",
@@ -966,7 +1004,7 @@ mod tests {
             Priority::Normal,
         );
         assert_eq!(missing.await, Outcome::Failed(0));
-        let real = send(
+        let real = send_to(
             "curl",
             "http://127.0.0.1:1",
             "j",
@@ -1016,7 +1054,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         let server = tokio::spawn(serve_one(listener, "410 Gone"));
         let payload = json!({"aps": {"event": "end", "note": "a\"b\\c\nd"}});
-        let outcome = send("curl", &base, "h.c.s", TOKEN, &payload, Priority::Normal).await;
+        let outcome = send_to("curl", &base, "h.c.s", TOKEN, &payload, Priority::Normal).await;
         assert_eq!(outcome, Outcome::Gone);
         let (head, body) = server.await.expect("server");
         assert_eq!(head[0], format!("POST /3/device/{TOKEN} HTTP/1.1"));
@@ -1029,5 +1067,86 @@ mod tests {
             assert!(head.iter().any(|line| line == header), "{header}: {head:?}");
         }
         assert_eq!(body, serde_json::to_string(&payload).expect("json"));
+    }
+
+    #[test]
+    fn the_key_must_be_a_private_regular_file_of_the_hubs_user() {
+        let private = Mode::RUSR | Mode::WUSR;
+        assert_eq!(check(FileType::RegularFile, private, 501, 501), Ok(()));
+        assert_eq!(check(FileType::RegularFile, private, 0, 0), Ok(()));
+        // Another user's file, even a private one, and root's file for another user.
+        assert_eq!(
+            check(FileType::RegularFile, private, 502, 501),
+            Err(KEY_OWNER)
+        );
+        assert_eq!(
+            check(FileType::RegularFile, private, 0, 501),
+            Err(KEY_OWNER)
+        );
+        // Setuid, setgid and sticky bits are not 0600.
+        for raw in [0o4600, 0o2600, 0o1600, 0o7600, 0o600 | 0o4000 | 0o0040] {
+            assert_eq!(
+                check(FileType::RegularFile, Mode::from_raw_mode(raw), 501, 501),
+                Err(KEY_MODE),
+                "{raw:o}"
+            );
+        }
+        for raw in [0o644, 0o400, 0o640, 0o700, 0o601, 0o000] {
+            assert_eq!(
+                check(FileType::RegularFile, Mode::from_raw_mode(raw), 501, 501),
+                Err(KEY_MODE),
+                "{raw:o}"
+            );
+        }
+        // Not a regular file comes first, whatever its mode and owner.
+        for kind in [
+            FileType::Directory,
+            FileType::Fifo,
+            FileType::Socket,
+            FileType::CharacterDevice,
+            FileType::Symlink,
+        ] {
+            assert_eq!(
+                check(kind, private, 501, 501),
+                Err(KEY_NOT_FILE),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn curl_never_inherits_a_key_log() {
+        let command = curl_command("curl");
+        let envs: Vec<_> = command.as_std().get_envs().collect();
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new("SSLKEYLOGFILE"), None)),
+            "{envs:?}"
+        );
+        assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), CURL_ARGS);
+    }
+
+    #[tokio::test]
+    async fn send_goes_only_where_the_config_says() {
+        let dir = TempDir::new("apns-config-host");
+        let curl = recording_curl(&dir, "200", 0);
+        let sandbox = config("/k".into(), true);
+        let outcome = send(
+            curl.to_str().expect("utf-8"),
+            &sandbox,
+            "j",
+            TOKEN,
+            &json!({}),
+            Priority::Normal,
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Sent);
+        let stdin = record(&dir, "stdin").expect("stdin");
+        assert!(
+            stdin.starts_with(&format!(
+                "url = \"{}/3/device/{TOKEN}\"\n",
+                sandbox.url_base()
+            )),
+            "{stdin}"
+        );
     }
 }

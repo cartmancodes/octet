@@ -489,20 +489,7 @@ async fn send_with(program: &str, endpoint: &str, messages: &[Value]) -> Vec<Out
         return failed();
     };
     let post = async {
-        // `-q` must come first: it stops curl reading `~/.curlrc`, which could add options (a
-        // trace, a proxy, an output file) the hub never chose.
-        let mut child = Command::new(program)
-            .args(["-q", "-sS", "--max-time", "10"])
-            .args(["-H", "Content-Type: application/json"])
-            .args(["-H", "Accept: application/json"])
-            .args(["--data-binary", "@-"])
-            .arg(endpoint)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .ok()?;
+        let mut child = curl_command(program, endpoint).spawn().ok()?;
         let mut stdin = child.stdin.take()?;
         stdin.write_all(&body).await.ok()?;
         drop(stdin);
@@ -513,6 +500,26 @@ async fn send_with(program: &str, endpoint: &str, messages: &[Value]) -> Vec<Out
         Ok(Some(answer)) => tickets(&answer, messages.len()),
         _ => failed(),
     }
+}
+
+/// `program` (`curl`) posting stdin to `endpoint` as JSON, and without `SSLKEYLOGFILE`, which
+/// would have it write the TLS secrets of the request to a file. `-q` must come first: it stops
+/// curl reading `~/.curlrc`, which could add options (a trace, a proxy, an output file) the hub
+/// never chose.
+fn curl_command(program: &str, endpoint: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(["-q", "-sS", "--max-time", "10"])
+        .args(["-H", "Content-Type: application/json"])
+        .args(["-H", "Accept: application/json"])
+        .args(["--data-binary", "@-"])
+        .arg(endpoint)
+        .env_remove("SSLKEYLOGFILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
 }
 
 /// Reads Expo's answer to a batch of `count` messages.
@@ -1445,5 +1452,16 @@ mod tests {
         let accepted: Vec<bool> = (0..6).map(|_| sender.dispatch(batch(), None)).collect();
         assert_eq!(accepted, [true, true, true, true, false, false]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn curl_never_inherits_a_key_log() {
+        let command = curl_command("curl", "http://127.0.0.1:1");
+        let envs: Vec<_> = command.as_std().get_envs().collect();
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new("SSLKEYLOGFILE"), None)),
+            "{envs:?}"
+        );
+        assert_eq!(command.as_std().get_args().next(), Some("-q".as_ref()));
     }
 }
