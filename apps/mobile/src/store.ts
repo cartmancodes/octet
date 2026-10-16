@@ -41,8 +41,13 @@ export interface OctetState {
   /** What the phone knows of each session it has heard of, by key. A Map: the keys hold the
    * hub's ids. */
   bySession: ReadonlyMap<string, SessionView>;
-  /** The link to each Mac. `bestHub` gives the app's. */
+  /** The link to each Mac. `bestHub` gives the app's. The one place a link's state is kept:
+   * the Fleet's `MacInfo` holds only a Mac's name and host. */
   hubs: ReadonlyMap<string, HubState>;
+  /** The Macs whose link has ended an attempt (ready, refused, or failed) of its run, the run
+   * since its client last started (the app came to the foreground, or it was paired): until then
+   * a Mac that is not ready is coming, not asleep. */
+  tried: ReadonlySet<string>;
   /** The Macs whose sessions frame came since the store began or was reset: until a Mac's comes,
    * its having no rows means "not told yet", not "none". */
   listed: ReadonlySet<string>;
@@ -62,7 +67,9 @@ export interface OctetState {
   /** The Task strip is open: one choice for every session's screen, for the app run. */
   taskOpen: boolean;
   setTaskOpen(open: boolean): void;
-  setHub(mac: string, state: HubState): void;
+  /** Mac `mac`'s link is `state`, and with `tried` given, has (or has not) ended an attempt of
+   * its run. */
+  setHub(mac: string, state: HubState, tried?: boolean): void;
   /** The first prompt of a session that the Mac did not take, keyed by session: the user's words,
    * kept for that session's prompt box. At most `MAX_DRAFTS`, the oldest dropped. */
   drafts: ReadonlyMap<string, string>;
@@ -111,6 +118,7 @@ const MAX_SENT_SESSIONS = 16;
 const NO_SENT: readonly string[] = [];
 const NO_ANSWERED: ReadonlySet<string> = new Set();
 const NO_LISTED: ReadonlySet<string> = new Set();
+const NO_TRIED: ReadonlySet<string> = new Set();
 const NO_ROWS: ListedSession[] = [];
 const FIELD = FIELD_CHARS;
 /** The longest usage line kept: the hub clips it to this too. */
@@ -270,6 +278,7 @@ export function createOctetStore(): OctetStore {
     slices: new Map(),
     bySession: new Map(),
     hubs: new Map(),
+    tried: NO_TRIED,
     listed: NO_LISTED,
     taskOpen: false,
     drafts: new Map(),
@@ -289,6 +298,7 @@ export function createOctetStore(): OctetStore {
           slices: new Map(),
           bySession: new Map(),
           hubs: new Map(),
+          tried: NO_TRIED,
           listed: NO_LISTED,
           taskOpen: false,
           drafts: new Map(),
@@ -306,11 +316,13 @@ export function createOctetStore(): OctetStore {
       listed.delete(mac);
       const hubs = new Map(st.hubs);
       hubs.delete(mac);
+      const tried = st.tried.has(mac) ? new Set([...st.tried].filter((m) => m !== mac)) : st.tried;
       set({
         sessions: merged(slices),
         slices,
         bySession: without(st.bySession, mine),
         hubs,
+        tried,
         listed,
         drafts: without(st.drafts, mine),
         sent: without(st.sent, mine),
@@ -496,19 +508,29 @@ export function createOctetStore(): OctetStore {
       return true;
     },
 
-    setHub(mac, hub) {
+    setHub(mac, hub, attempted) {
       const st = get();
-      if (st.hubs.get(mac) === hub) return;
+      const was = st.tried.has(mac);
+      const tried =
+        attempted === undefined || attempted === was
+          ? st.tried
+          : attempted
+            ? new Set(st.tried).add(mac)
+            : new Set([...st.tried].filter((m) => m !== mac));
+      if (st.hubs.get(mac) === hub) {
+        if (tried !== st.tried) set({ tried });
+        return;
+      }
       const hubs = new Map(st.hubs).set(mac, hub);
       // A link ready again brings a fresh list, which is the truth: an answer the Mac never heard
       // (the link went down first) must not hide its question.
       if (hub !== "ready") {
-        set({ hubs });
+        set({ hubs, tried });
         return;
       }
       const mine = ofMac(mac);
       const answered = [...st.answered].some(mine) ? new Set([...st.answered].filter((id) => !mine(id))) : st.answered;
-      set({ hubs, answered: answered.size === 0 ? NO_ANSWERED : answered });
+      set({ hubs, tried, answered: answered.size === 0 ? NO_ANSWERED : answered });
     },
 
     evict(session) {
@@ -654,13 +676,30 @@ export function connectStore(store: OctetStore, client: HubClient, options: Conn
     },
   };
   const offBatch = client.onBatch((frames) => coalescer.push(mac, keyFrames(mac, frames), sink));
-  const offState = client.onState((state) => store.getState().setHub(mac, state));
+  // Whether an attempt of the client's run has ended: each run (a `start()`) begins untried; a
+  // stop (the app going to the background) is not the Mac failing to answer, and ends the run.
+  let run = client.run;
+  let attempting = false;
+  let tried = false;
+  const follow = (state: HubState) => {
+    if (client.run !== run) {
+      run = client.run;
+      attempting = false;
+      tried = false;
+    }
+    if (state === "connecting" || state === "authenticating") attempting = true;
+    else if (run !== null && (attempting || state === "ready")) tried = true;
+    else if (state === "unpaired") tried = true;
+    store.getState().setHub(mac, state, tried);
+  };
+  const offState = client.onState(follow);
   const offFailed = client.onSubscribeFailed((raw, refusal) => {
     const session = keyOf(mac, raw);
     forget(session);
     store.getState().subscribeFailed(session, refusal.message);
   });
-  store.getState().setHub(mac, client.state);
+  // As the feed begins, nothing of the run is heard yet.
+  store.getState().setHub(mac, client.state, false);
   return () => {
     offBatch();
     offState();
@@ -933,6 +972,11 @@ export function bindHooks(store: OctetStore) {
       ),
     /** The link to `mac`; with none, the best link of every Mac's (`bestHub`). */
     useHub: (mac?: string): HubState => useStore(store, (s) => (mac === undefined ? bestHub(s) : (s.hubs.get(mac) ?? "offline"))),
+    /** Whether Mac `mac`'s link has ended an attempt of its run (see `OctetState.tried`). */
+    useTried: (mac: string): boolean => useStore(store, (s) => s.tried.has(mac)),
+    /** Some Mac's link is connecting (or saying hello). */
+    useConnecting: (): boolean =>
+      useStore(store, (s) => [...s.hubs.values()].some((hub) => hub === "connecting" || hub === "authenticating")),
     /** The Macs whose link is ready; the same set until one comes or goes. */
     useReadyMacs: (): ReadonlySet<string> => {
       const key = useStore(store, (s) => readyKey(s.hubs));
@@ -974,6 +1018,8 @@ export const {
   useCatalog,
   useCatalogs,
   useHub,
+  useTried,
+  useConnecting,
   useReadyMacs,
   useSessionTurn,
   useTurns,

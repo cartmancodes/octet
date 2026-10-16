@@ -9,10 +9,11 @@ import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { confirmUnpair } from "../src/components/unpair";
 import { openDrawer } from "../src/drawer";
-import { useHubController, useMacs, usePushNotice, type MacInfo } from "../src/hub";
+import { useHubController, useMacs, useNotices, type MacInfo } from "../src/hub";
 import { MAC_NAME_CHARS, MAX_MACS, cleanMacName, machineWords } from "../src/macs";
 import { NO_PROJECT_ID, projectId } from "../src/notifications";
 import { NOT_SAVED, loadSettings, saveSettings, type Settings as Saved } from "../src/persist";
+import { useHub, useTried } from "../src/store";
 import type { PushKinds } from "../src/protocol";
 import { radius, spacing, type, useTheme } from "../src/theme";
 import { Button, Card } from "../src/ui";
@@ -35,7 +36,9 @@ export default function Settings() {
   const [saved, setSaved] = useState<Saved | null>(null);
   const [error, setError] = useState(false);
   const checking = useRef(false);
-  const pushNotice = usePushNotice();
+  // Why some Mac did not take the push registration: one line each.
+  const notices = useNotices();
+  const pushNotice = notices.length > 0 ? notices.join("\n") : null;
   const macs = useMacs();
   const [pushError, setPushError] = useState<string | null>(null);
   const pushing = useRef(false);
@@ -207,7 +210,9 @@ const MachineRow = memo(function MachineRow({ mac, first, onRename, onUnpair }: 
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState(false);
   const saving = useRef(false);
-  const online = mac.state === "ready";
+  const hub = useHub(mac.id);
+  const tried = useTried(mac.id);
+  const online = hub === "ready";
   const name = draft === null ? null : cleanMacName(draft);
 
   const startRename = useCallback(() => {
@@ -237,7 +242,7 @@ const MachineRow = memo(function MachineRow({ mac, first, onRename, onUnpair }: 
           <Text style={{ color: online ? theme.accent : theme.muted }}>{online ? "●" : "○"}</Text>
           {` ${mac.macName}`}
         </Text>
-        <Text style={[type.body, { color: theme.muted }]}>{machineWords(mac.state, mac.tried)}</Text>
+        <Text style={[type.body, { color: theme.muted }]}>{machineWords(hub, tried)}</Text>
       </View>
       <Text numberOfLines={1} style={[type.label, { color: theme.muted }]}>
         {mac.host}

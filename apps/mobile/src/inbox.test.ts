@@ -1,4 +1,4 @@
-import { NO_GIST_LINE, cardLabel, classify, drawerList, drawerSub, macName, sameItem, shortAgo } from "./inbox";
+import { NO_GIST_LINE, cardLabel, classify, drawerList, drawerSub, inboxOf, macName, sameItem, shortAgo } from "./inbox";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 
 const NOW_MS = 1_800_000_000 * 1000;
@@ -24,6 +24,30 @@ const gist = (id: number, summary: Partial<ApprovalInfo["summary"]> = {}): Appro
 const frontsOf = (list: SessionInfo[]) => new Map(list.map((s) => [s.id, s.approval ?? null]));
 
 const run = (list: SessionInfo[], mac = "studio-mac") => classify(list, frontsOf(list), { mac, now: NOW_MS });
+
+describe("inboxOf: one classify for the Inbox and the drawer", () => {
+  afterEach(() => jest.restoreAllMocks());
+  const list = [info("a", { last_activity: NOW_S - 60 }), info("b", { approvals: 1, approval: gist(1) }), info("c", { phase: "running" })];
+
+  it("is classify with each row's own front approval, made once for the same sessions, clock and names", () => {
+    const inbox = inboxOf(list, { mac: "studio", now: NOW_MS });
+    expect(inbox).toEqual(classify(list, frontsOf(list), { mac: "studio", now: NOW_MS }));
+    expect(inboxOf([...list], { mac: "studio", now: NOW_MS })).toBe(inbox);
+    expect(inboxOf(list, { mac: "studio", now: NOW_MS + 30_000 })).not.toBe(inbox);
+  });
+
+  it("the drawer reuses the Inbox's lists: the sessions are sorted once between them", () => {
+    const names = new Map([["m1", "studio"], ["m2", "mini"]]);
+    const rows = list.map((s, i) => ({ ...s, id: `m${(i % 2) + 1}/${s.id}`, mac: `m${(i % 2) + 1}` }));
+    const inbox = inboxOf(rows, { mac: "studio", now: NOW_MS, names });
+    const sorts = jest.spyOn(Array.prototype, "sort");
+    // Its own map of the same names, as each screen's hook makes one.
+    const drawer = drawerList(rows, NOW_MS, new Map(names), "Mac");
+    expect(sorts).not.toHaveBeenCalled();
+    expect(drawer.rows.map((r) => r.id)).toEqual([...inbox.needs, ...inbox.running, ...inbox.done].map((i) => i.id));
+    expect(inboxOf(rows, { mac: "studio", now: NOW_MS, names })).toBe(inbox);
+  });
+});
 
 describe("macName", () => {
   it("is the hub host's first label", () => {

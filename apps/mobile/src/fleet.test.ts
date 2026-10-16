@@ -95,6 +95,12 @@ function socketOf(r: Rig, host: string): FakeSocket {
   return socket;
 }
 
+/** What the store holds of Mac `id`'s link: the one place its state is kept. */
+const linkOf = (r: Pick<Rig, "store">, id: string) => {
+  const s = r.store.getState();
+  return { state: s.hubs.get(id) ?? "offline", tried: s.tried.has(id) };
+};
+
 const settle = async () => {
   for (let i = 0; i < 30; i++) await Promise.resolve();
 };
@@ -261,7 +267,7 @@ describe("pairing more than one Mac", () => {
     await r.fleet.init();
     await pairWith(r, "studio", "aa".repeat(32));
     await pairWith(r, "laptop", "bb".repeat(32));
-    expect(r.fleet.snapshot().macs.map((m) => [m.id, m.macName, m.state])).toEqual([
+    expect(r.fleet.snapshot().macs.map((m) => [m.id, m.macName, r.store.getState().hubs.get(m.id)])).toEqual([
       ["m00000001", "studio", "ready"],
       ["m00000002", "laptop", "ready"],
     ]);
@@ -271,8 +277,6 @@ describe("pairing more than one Mac", () => {
       ["m00000001", urlOf("studio"), "studio"],
       ["m00000002", urlOf("laptop"), "laptop"],
     ]);
-    // With several Macs there is no one client.
-    expect(r.fleet.snapshot().client).toBeNull();
     expect(r.fleet.links.macs()).toEqual(["m00000001", "m00000002"]);
     expect(r.fleet.links.client("m00000002")?.url).toBe(urlOf("laptop"));
   });
@@ -343,9 +347,50 @@ describe("pairing more than one Mac", () => {
     pairing.open();
     pairing.receive({ type: "paired", req: pairing.commandsOf("pair")[0]?.req, token: TOKEN, device: "iPhone" });
     await pending;
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "connecting", tried: false });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "connecting", tried: false });
     socketOf(r, "studio").drop();
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: true });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "offline", tried: true });
+  });
+});
+
+describe("keyFor", () => {
+  it("resolves a hub's published host and raw id to the phone's key, through the pairings", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio");
+    expect(r.fleet.keyFor("studio.tail1234.ts.net", "1-2")).toBe(keyOf("m00000001", "1-2"));
+    expect(r.fleet.keyFor(null, "1-2")).toBe(keyOf("m00000001", "1-2"));
+    await pairWith(r, "laptop");
+    expect(r.fleet.keyFor("Laptop.tail1234.ts.net", "1-2")).toBe(keyOf("m00000002", "1-2"));
+    expect(r.fleet.keyFor(null, "1-2")).toBeNull();
+    expect(r.fleet.keyFor("air.tail1234.ts.net", "1-2")).toBeNull();
+    expect(r.fleet.keyFor("studio.tail1234.ts.net", "m00000002/1-2")).toBeNull();
+    // A tap resolves the same way, and opens the Inbox for a session its Mac has ended.
+    expect(r.fleet.tapKey({ host: "laptop.tail1234.ts.net", session: "1-2" })).toBe(keyOf("m00000002", "1-2"));
+    socketOf(r, "laptop").receive({ type: "sessions", sessions: [] });
+    r.clock.advance(50);
+    expect(r.fleet.tapKey({ host: "laptop.tail1234.ts.net", session: "1-2" })).toBeNull();
+  });
+});
+
+describe("links", () => {
+  it("are one object for the Fleet's life, resolving each Mac as it is at the call", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const links = r.fleet.links;
+    await pairWith(r, "studio");
+    const studio = links.client("m00000001");
+    await pairWith(r, "laptop");
+    await r.fleet.unpair("m00000002");
+    expect(r.fleet.links).toBe(links);
+    expect(links.client("m00000001")).toBe(studio);
+    expect(links.client("m00000002")).toBeNull();
+    // Paired again: the same links name the new client.
+    await pairWith(r, "studio");
+    expect(links.client("m00000001")).not.toBe(studio);
+    expect(links.macs()).toEqual(["m00000001"]);
   });
 });
 
@@ -432,7 +477,7 @@ describe("unpair_one_mac", () => {
     const { r } = await two(false);
     await r.fleet.unpair("m00000001");
     await r.fleet.unpair("m00000002");
-    expect(r.fleet.snapshot()).toMatchObject({ status: "unpaired", macs: [], client: null });
+    expect(r.fleet.snapshot()).toMatchObject({ status: "unpaired", macs: [] });
     expect((await loadSettings()).pairings).toEqual([]);
   });
 
@@ -508,7 +553,6 @@ describe("push across Macs", () => {
     await expect(done).resolves.toEqual({ ok: true });
     expect((await loadSettings()).notifications).toBe(true);
     expect(r.fleet.snapshot().notices).toEqual(["laptop: No push here"]);
-    expect(r.fleet.snapshot().pushNotice).toBe("laptop: No push here");
   });
 
   it("every Mac failing fails, naming each, and saves nothing", async () => {
@@ -644,13 +688,13 @@ describe("fix round 1", () => {
     pairing.open();
     pairing.receive({ type: "paired", req: pairing.commandsOf("pair")[0]?.req, token: TOKEN, device: "iPhone" });
     await pending;
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "connecting", tried: false });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "connecting", tried: false });
     r.fleet.setForeground(false);
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: false });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "offline", tried: false });
     r.fleet.setForeground(true);
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "connecting", tried: false });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "connecting", tried: false });
     socketOf(r, "studio").drop();
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: true });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "offline", tried: true });
   });
 
   it("a Mac back from the background is connecting, not asleep, until its first attempt ends", async () => {
@@ -658,21 +702,21 @@ describe("fix round 1", () => {
     r.fleet.setForeground(true);
     await r.fleet.init();
     await pairWith(r, "studio");
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "ready", tried: true });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "ready", tried: true });
     r.fleet.setForeground(false);
     r.fleet.setForeground(true);
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "connecting", tried: false });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "connecting", tried: false });
     expect(macStatus("connecting", false)).toBe("connecting…");
     socketOf(r, "studio").drop();
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: true });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "offline", tried: true });
     // A drop from ready while in front is a Mac asleep, at once.
     r.clock.advance(60_000);
     const again = socketOf(r, "studio");
     again.open();
     again.receive({ type: "welcome", device: "iPhone" });
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "ready", tried: true });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "ready", tried: true });
     again.drop();
-    expect(r.fleet.snapshot().macs[0]).toMatchObject({ state: "offline", tried: true });
+    expect(linkOf(r, "m00000001")).toEqual({ state: "offline", tried: true });
   });
 
   it("an unpair while that host pairs again never deletes the token the pairing just saved", async () => {
@@ -735,9 +779,11 @@ describe("fix round 1", () => {
     await again.fleet.init();
     expect(again.fleet.snapshot().macs).toEqual([
       expect.objectContaining({ id: "m00000001" }),
-      { id: "m00000002", macName: "laptop", host: "laptop.tail1234.ts.net", state: "offline", tried: false },
+      { id: "m00000002", macName: "laptop", host: "laptop.tail1234.ts.net" },
     ]);
     expect(again.fleet.links.macs()).toEqual(["m00000001"]);
+    // The store holds no link of it: offline, and not tried.
+    expect(linkOf(again, "m00000002")).toEqual({ state: "offline", tried: false });
     await again.fleet.unpair("m00000002");
     expect(again.fleet.snapshot().macs.map((m) => m.id)).toEqual(["m00000001"]);
     expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001"]);
@@ -757,7 +803,7 @@ describe("fix round 1", () => {
     await r.fleet.init();
     expect(r.fleet.snapshot()).toMatchObject({
       status: "unpaired",
-      macs: [{ id: "m00000001", macName: "studio", state: "offline", tried: false }],
+      macs: [{ id: "m00000001", macName: "studio" }],
     });
     k.keychain.set = set;
     await r.fleet.unpair("m00000001");

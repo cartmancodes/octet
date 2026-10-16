@@ -5,11 +5,12 @@ import { AccessibilityInfo, Animated, BackHandler, PanResponder, Pressable, Styl
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { closeDrawer, openDrawer, useDrawerEnabled, useDrawerOpen, useEdgeBottom } from "../drawer";
+import { tickAgo, useAgoClock } from "../agoClock";
 import { useMac, useMacNames } from "../hub";
 import { drawerList, drawerRowLabel, drawerSub, type DrawerItem, type DrawerRow } from "../inbox";
 import { macStatus } from "../macs";
 import { isSessionPath, openSession } from "../navigation";
-import { useHub, useSessions } from "../store";
+import { useHub, useSessions, useTried } from "../store";
 import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
 
 /** The drawer's width, and how long it takes to open or close. */
@@ -24,8 +25,6 @@ export const CLOSE_DRAG = 40;
 const SCRIM = 0.6;
 /** A leftward drag this long, and mostly horizontal, is the drawer's to take from its children. */
 const CLAIM_DRAG = 8;
-/** How often the open drawer's "how long ago" moves on. */
-const AGO_TICK_MS = 30_000;
 /** The edge strip leaves the header and the prompt line alone: it starts this far under the safe
  * area's top, and ends at the prompt line's measured top or, unmeasured, this far over the safe
  * area's bottom. */
@@ -161,8 +160,10 @@ const MacHeader = memo(function MacHeader({ mac }: { mac: string }) {
   const theme = useTheme();
   const s = theme === light ? LIGHT : DARK;
   const info = useMac(mac);
+  const hub = useHub(mac);
+  const tried = useTried(mac);
   if (!info) return null;
-  const word = macStatus(info.state, info.tried);
+  const word = macStatus(hub, tried);
   const online = word === null;
   return (
     <Text testID={`drawer-mac-${mac}`} accessibilityRole="header" style={s.macHead}>
@@ -176,7 +177,6 @@ const MacHeader = memo(function MacHeader({ mac }: { mac: string }) {
 
 const keyOf = (item: DrawerItem): string => item.id;
 const typeOf = (item: DrawerItem): string => item.kind;
-const readClock = (): number => Date.now();
 
 /**
  * The side drawer: the Inbox, the Mac's sessions and Settings. Mounted once, over the stack, in
@@ -261,22 +261,16 @@ export function Drawer() {
     });
   });
 
-  // The clock the "ago" texts count from: read afresh each time it opens, then every 30 s while
-  // it is open (nothing is drawn while it is shut).
-  const [clock, setClock] = useState(readClock);
-  const [wasOpen, setWasOpen] = useState(open);
-  if (open !== wasOpen) {
-    setWasOpen(open);
-    if (open) setClock(readClock());
-  }
-  useEffect(() => {
-    if (!open) return;
-    const timer = setInterval(() => setClock(readClock()), AGO_TICK_MS);
-    return () => clearInterval(timer);
+  // The clock the "ago" texts count from, the Inbox's (so the drawer reuses its lists): read
+  // afresh each time it opens, before it is drawn, then every 30 s while it is up (nothing is drawn
+  // while it is shut).
+  const clock = useAgoClock(mounted);
+  useLayoutEffect(() => {
+    if (open) tickAgo();
   }, [open]);
   const list = useMemo(
-    () => (mounted ? drawerList(sessions, clock, several ? names : undefined) : null),
-    [mounted, sessions, clock, several, names],
+    () => (mounted ? drawerList(sessions, clock, several ? names : undefined, mac) : null),
+    [mounted, sessions, clock, several, names, mac],
   );
   const items = list?.items ?? NONE;
 

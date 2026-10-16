@@ -18,6 +18,7 @@ import type { ApprovalInfo, RecentInfo, SessionInfo } from "./protocol";
 import { MACS, hearOn, info, launch, launchMacs, pairedMacs, pairedStorage, socketTo, type Rig } from "./screenRig";
 import * as recentWords from "./recent";
 import { mergeRecent } from "./recent";
+import { octetStore } from "./store";
 import { hideToast } from "./toast";
 import { k } from "./testKeys";
 
@@ -225,6 +226,47 @@ describe("the banner shows the Fleet's notice", () => {
     await fireEvent.press(screen.getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByText("This phone was unpaired on mini")).toBeNull();
     expect(rig.hub.snapshot().notice).toBeNull();
+  });
+});
+
+describe("a Mac coming or going leaves the session in front alone", () => {
+  beforeEach(() => pairedMacs(2));
+
+  /** Mac `host` revokes this phone: only its pairing goes. */
+  async function revoke(rig: Rig, host: string) {
+    await act(async () => {
+      socketTo(rig, host).receive({ type: "refused", req: 0, reason: "This device was revoked", code: "revoked" });
+      rig.clock.advance(50);
+    });
+    await flush();
+  }
+
+  it("a live session streams on: nothing more is asked of its Mac", async () => {
+    const rig = await launchMacs("/", ROUTES, { studio: [info("a")], mini: [info("b")] });
+    await act(async () => router.push(`/session/${encodeURIComponent(inStudio("a"))}`));
+    await flush();
+    const studio = socketTo(rig, "studio");
+    expect(studio.commandsOf("subscribe")).toHaveLength(1);
+    await revoke(rig, "mini");
+    expect(rig.hub.snapshot().macs.map((m) => m.id)).toEqual([STUDIO.id]);
+    expect(studio.commandsOf("subscribe")).toHaveLength(1);
+    expect(studio.commandsOf("unsubscribe")).toEqual([]);
+  });
+
+  it("an ended session keeps what it left on the screen", async () => {
+    const rig = await launchMacs("/", ROUTES, { studio: [info("a")], mini: [info("b")] });
+    await act(async () => router.push(`/session/${encodeURIComponent(inStudio("a"))}`));
+    await flush();
+    await act(async () => {
+      socketTo(rig, "studio").receive({ type: "subscribed", session: "a", from: "start", journals: ["j1"] });
+      rig.clock.advance(50);
+    });
+    await hearOn(rig, "studio", []);
+    expect(octetStore.getState().bySession.get(inStudio("a"))?.ended).toBe(true);
+    await revoke(rig, "mini");
+    expect(octetStore.getState().bySession.get(inStudio("a"))?.ended).toBe(true);
+    expect(socketTo(rig, "studio").commandsOf("subscribe")).toHaveLength(1);
+    expect(rig.view.getPathname()).toBe(`/session/${inStudio("a")}`);
   });
 });
 

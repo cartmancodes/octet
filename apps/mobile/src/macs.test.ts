@@ -1,4 +1,4 @@
-import { MAC_ID, cleanMacName, hostOf, keyOf, linksOf, machineWords, macNameOf, macOfHost, newMacId, rawOf, splitKey, tapKey } from "./macs";
+import { MAC_ID, cleanMacName, hostOf, keyFor, keyOf, linksOf, machineWords, macNameOf, macOfHost, newMacId, rawOf, splitKey, tapKey } from "./macs";
 
 describe("session keys", () => {
   it("round-trip a Mac and a raw id", () => {
@@ -61,6 +61,34 @@ describe("macOfHost", () => {
     expect(macOfHost(pairings, "")).toBeNull();
     expect(macOfHost(pairings, "studio")).toBeNull();
     expect(macOfHost([{ id: "m1", hubUrl: "not a url" }], "not a url")).toBeNull();
+  });
+});
+
+describe("keyFor", () => {
+  const studio = { id: "m00000001", hubUrl: "wss://studio.tail1.ts.net/" };
+  const mini = { id: "m00000002", hubUrl: "wss://mini.tail1.ts.net:8443/" };
+
+  it("is the phone's key of a raw session on the pairing of the hub's published host", () => {
+    expect(keyFor([studio, mini], "mini.tail1.ts.net", "41-1700000000")).toBe("m00000002/41-1700000000");
+    expect(keyFor([studio, mini], "STUDIO.tail1.ts.net.", "41-1700000000")).toBe("m00000001/41-1700000000");
+  });
+
+  it("with no host, the only pairing; with several, none", () => {
+    expect(keyFor([mini], null, "1-2")).toBe("m00000002/1-2");
+    expect(keyFor([studio, mini], null, "1-2")).toBeNull();
+    expect(keyFor([], null, "1-2")).toBeNull();
+  });
+
+  it("null for a host no pairing has", () => {
+    expect(keyFor([studio, mini], "air.tail1.ts.net", "1-2")).toBeNull();
+    expect(keyFor([studio], "studio", "1-2")).toBeNull();
+    expect(keyFor([studio], "", "1-2")).toBeNull();
+  });
+
+  it("null for a raw id that is not the hub's: never a key that splits elsewhere", () => {
+    for (const raw of ["", "a", "1-2/3", "../1-2", "m00000002/1-2", "1-2 ", `${"1".repeat(128)}-2`]) {
+      expect(keyFor([studio], "studio.tail1.ts.net", raw)).toBeNull();
+    }
   });
 });
 

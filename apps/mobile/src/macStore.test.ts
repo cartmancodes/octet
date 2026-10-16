@@ -358,6 +358,36 @@ describe("link state per Mac", () => {
     expect(store.getState().hubs.get("m1")).toBe("connecting");
   });
 
+  it("is the one place a link's state is kept: whether an attempt of its run ended follows the client", () => {
+    const clock = new FakeClock();
+    const sockets = new Sockets();
+    const client = new HubClient({ url: "wss://m1.tail1.ts.net/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
+    const off = connectStore(store, client, { mac: "m1", links: { client: () => client, macs: () => ["m1"] }, now: clock.now, schedule: clock.schedule });
+    const link = () => [store.getState().hubs.get("m1"), store.getState().tried.has("m1")];
+    expect(link()).toEqual(["offline", false]);
+    client.start();
+    expect(link()).toEqual(["connecting", false]);
+    sockets.last.drop(); // the first attempt ends without ready: asleep
+    expect(link()).toEqual(["offline", true]);
+    clock.advance(60_000);
+    sockets.last.open();
+    sockets.last.receive({ type: "welcome", device: "iPhone" });
+    expect(link()).toEqual(["ready", true]);
+    client.stop(); // the background: the run is over
+    expect(link()).toEqual(["offline", false]);
+    client.start(); // the foreground: a new run, coming until its first attempt ends
+    expect(link()).toEqual(["connecting", false]);
+    sockets.last.drop();
+    expect(link()).toEqual(["offline", true]);
+    // Stopped while waiting out a backoff (no state to tell), then started: a new run all the same.
+    client.stop();
+    client.start();
+    expect(link()).toEqual(["connecting", false]);
+    off();
+    store.getState().reset("m1");
+    expect(link()).toEqual([undefined, false]);
+  });
+
   it("a ready link forgets only its own Mac's answered questions", () => {
     store.getState().applyBatch("m1", [{ v: 1, type: "sessions", sessions: [info("m1/a", { question: true })] }]);
     store.getState().applyBatch("m2", [{ v: 1, type: "sessions", sessions: [info("m2/a", { question: true })] }]);

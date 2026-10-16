@@ -7,7 +7,7 @@ import { FreshConfirm } from "../src/components/CommandSheet";
 import { useDeskCommand } from "../src/components/deskCommand";
 import { useSend } from "../src/components/send";
 import { useInboxWhenUnpaired } from "../src/components/unpair";
-import { useLinks } from "../src/hub";
+import { useClient, useLinks } from "../src/hub";
 import { macOfKey, rawOf } from "../src/macs";
 import { field } from "../src/model/text";
 import { engineModel, shortId } from "../src/session";
@@ -67,7 +67,7 @@ export default function Usage() {
   // The key names the Mac the session is on: its link and its commands.
   const macId = macOfKey(id);
   const links = useLinks();
-  const client = macId === null ? null : links.client(macId);
+  const client = useClient(macId);
   // Its Mac unpaired: back to the Inbox.
   useInboxWhenUnpaired(id);
 
@@ -84,8 +84,11 @@ export default function Usage() {
       if (octetStore.getState().bySession.get(id)?.ended) return;
       if (octetStore.getState().sessions.every((x) => x.id !== id)) return; // not in the list: the hub would refuse
       watch(octetStore, links, id);
-      return () => unwatch(links, id);
-    }, [client, links, id]),
+      return () => {
+        // Its Mac went, or paired again: the new client is not this effect's to let go of.
+        if (macId !== null && links.client(macId) === client) unwatch(links, id);
+      };
+    }, [client, links, macId, id]),
   );
 
   // The workspace outlives the session's place in the list; the route (from the Conversation) gives

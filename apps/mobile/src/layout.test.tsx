@@ -12,10 +12,10 @@ import { AppState, Text } from "react-native";
 import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
 import { FakeClock, Sockets } from "./client/fakes";
-import { HubContext, HubController, TOKEN_KEY, tokenKeyOf, unpairedNotice } from "./hub";
+import { HubContext, Fleet, TOKEN_KEY, tokenKeyOf, unpairedNotice } from "./hub";
 import { drawerScreen } from "./drawer";
 import { saveSettings } from "./persist";
-import { createOctetStore } from "./store";
+import { createOctetStore, octetStore } from "./store";
 import { dark, light } from "./theme";
 import { M, k, newM, sessionPath } from "./testKeys";
 
@@ -67,9 +67,11 @@ async function launch(opts: { paired?: boolean } = {}) {
   }
   const sockets = new Sockets();
   const clock = new FakeClock();
-  const hub = new HubController({
+  // The app's store: the screens read each Mac's link from it.
+  octetStore.getState().reset();
+  const hub = new Fleet({
     factory: sockets.factory,
-    store: createOctetStore(),
+    store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
     newId: newM,
@@ -112,7 +114,7 @@ describe("the app shell", () => {
 
   it("a link to Usage before pairing lands on Pair, not Usage", async () => {
     const sockets = new Sockets();
-    const hub = new HubController({ factory: sockets.factory, store: createOctetStore(), platform: "ios" });
+    const hub = new Fleet({ factory: sockets.factory, store: createOctetStore(), platform: "ios" });
     const Layout = () => (
       <HubContext.Provider value={hub}>
         <RootLayout />
@@ -129,7 +131,7 @@ describe("the app shell", () => {
 
   it("a link to a session before pairing lands on Pair, not the session", async () => {
     const sockets = new Sockets();
-    const hub = new HubController({ factory: sockets.factory, store: createOctetStore(), platform: "ios" });
+    const hub = new Fleet({ factory: sockets.factory, store: createOctetStore(), platform: "ios" });
     const Layout = () => (
       <HubContext.Provider value={hub}>
         <RootLayout />
@@ -286,7 +288,7 @@ describe("notifications", () => {
   });
 
   it("keeps the splash up while the saved pairing is being read", async () => {
-    const hub = new HubController({
+    const hub = new Fleet({
       factory: new Sockets().factory,
       store: createOctetStore(),
       platform: "ios",

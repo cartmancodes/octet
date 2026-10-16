@@ -159,6 +159,8 @@ export class HubClient {
 
   private stateValue: HubState;
   private running = false;
+  /** How many times `start()` has started the client. */
+  private started = 0;
   private socket: Socket | null = null;
   private nextReq = 1;
   private cancelReconnect: (() => void) | null = null;
@@ -212,6 +214,12 @@ export class HubClient {
 
   get state(): HubState {
     return this.stateValue;
+  }
+
+  /** Which run the client is in: a new number at each `start()` that connects, and null while it
+   * is stopped (by `stop()`, or the hub refusing the token). Every attempt to connect is of a run. */
+  get run(): number | null {
+    return this.running ? this.started : null;
   }
 
   /** The device token; null before pairing and after the hub unpaired this phone. */
@@ -283,6 +291,7 @@ export class HubClient {
   start(): void {
     if (this.running || this.tokenValue === null) return;
     this.running = true;
+    this.started += 1;
     this.backoff.reset();
     this.connect();
   }

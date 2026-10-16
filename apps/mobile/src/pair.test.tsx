@@ -8,7 +8,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import Pair from "../app/pair";
 import { FakeClock, Sockets } from "./client/fakes";
 import { DEV_BUILD_WARNING } from "./components/DevBuildBanner";
-import { HubContext, HubController, TOKEN_KEY, tokenKeyOf } from "./hub";
+import { HubContext, Fleet, TOKEN_KEY, tokenKeyOf } from "./hub";
 import { TOO_MANY_MACS } from "./macs";
 import { loadSettings, saveSettings } from "./persist";
 import { createOctetStore } from "./store";
@@ -58,7 +58,7 @@ async function open(permission: Permission = GRANTED) {
   mockCamera.permission = permission;
   const sockets = new Sockets();
   const clock = new FakeClock();
-  const hub = new HubController({
+  const hub = new Fleet({
     factory: sockets.factory,
     store: createOctetStore(),
     clientOptions: { now: clock.now, schedule: clock.schedule },

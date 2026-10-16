@@ -11,6 +11,7 @@ import { confirmUnpair } from "../src/components/unpair";
 import { NOT_A_LINK, useFleetStatus, useHubController, useMacs, useNotice, useOffer, type MacInfo, type Fleet } from "../src/hub";
 import { macName } from "../src/inbox";
 import { Mascot } from "../src/mascot/Mascot";
+import { useHub } from "../src/store";
 import { radius, spacing, type, useTheme } from "../src/theme";
 import { showToast } from "../src/toast";
 import { Button } from "../src/ui";
@@ -265,10 +266,11 @@ interface PairedRowProps {
 const PairedRow = memo(function PairedRow({ mac, hub, unpairable }: PairedRowProps) {
   const theme = useTheme();
   const unpair = useCallback(() => confirmUnpair(mac.macName, () => void hub.unpair(mac.id)), [hub, mac.id, mac.macName]);
+  const online = useHub(mac.id) === "ready";
   return (
     <View style={[styles.mac, styles.macRow]}>
-      <Text numberOfLines={1} style={[type.body, styles.grow, { color: mac.state === "ready" ? theme.fg : theme.muted }]}>
-        {`${mac.state === "ready" ? "●" : "○"} ${mac.macName}`}
+      <Text numberOfLines={1} style={[type.body, styles.grow, { color: online ? theme.fg : theme.muted }]}>
+        {`${online ? "●" : "○"} ${mac.macName}`}
       </Text>
       {unpairable ? <Button label="Unpair" accessibilityLabel={`Unpair ${mac.macName}`} onPress={unpair} /> : null}
     </View>

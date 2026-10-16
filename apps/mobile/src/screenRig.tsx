@@ -12,7 +12,7 @@ import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
 import Sessions from "../app/index";
 import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
-import { HubContext, HubController, TOKEN_KEY, tokenKeyOf } from "./hub";
+import { HubContext, Fleet, TOKEN_KEY, tokenKeyOf } from "./hub";
 import { saveSettings } from "./persist";
 import type { SessionInfo } from "./protocol";
 import { octetStore } from "./store";
@@ -51,7 +51,7 @@ export async function pairedStorage(): Promise<void> {
 export async function mount(url: string, routes: Record<string, ComponentType>) {
   const sockets = new Sockets();
   const clock = new FakeClock();
-  const hub = new HubController({
+  const hub = new Fleet({
     factory: sockets.factory,
     store: octetStore,
     platform: "ios",

@@ -12,7 +12,7 @@ import Sessions from "../app/index";
 import Session from "../app/session/[id]";
 import Usage from "../app/usage";
 import { FakeClock, Sockets } from "./client/fakes";
-import { HubContext, HubController, TOKEN_KEY } from "./hub";
+import { HubContext, Fleet, TOKEN_KEY } from "./hub";
 import { DRAWER_MS } from "./components/Drawer";
 import { MENU_DISMISS_MS } from "./components/ModelModeMenu";
 import { closeDrawer, openDrawer } from "./drawer";
@@ -68,7 +68,7 @@ async function launch(list: SessionInfo[], at?: string) {
   seq = 0;
   const sockets = new Sockets();
   const clock = new FakeClock();
-  const hub = new HubController({
+  const hub = new Fleet({
     factory: sockets.factory,
     store: octetStore,
     platform: "ios",

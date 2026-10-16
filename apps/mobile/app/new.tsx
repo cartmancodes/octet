@@ -14,7 +14,7 @@ import type { Engine, Mode } from "../src/protocol";
 import { modelsFor } from "../src/recent";
 import { sessionName } from "../src/sessions";
 import { NO_WORKSPACE, useStartSession, useWorkspaceChoices, type StartBody } from "../src/start";
-import { octetStore, useCatalogs, useHub } from "../src/store";
+import { octetStore, useCatalogs, useHub, useReadyMacs } from "../src/store";
 import { spacing, type, useTheme } from "../src/theme";
 import { showToast } from "../src/toast";
 
@@ -51,7 +51,8 @@ export default function NewSession() {
   // else the first online Mac; else the first paired. With one Mac, that one.
   const macs = useMacs();
   const [chosen, setChosen] = useState<string | null>(null);
-  const online = useMemo(() => macs.filter((m) => m.state === "ready"), [macs]);
+  const ready = useReadyMacs();
+  const online = useMemo(() => macs.filter((m) => ready.has(m.id)), [macs, ready]);
   const target = online.find((m) => m.id === chosen) ?? online[0] ?? macs[0];
   const targetId = target?.id;
   const targetName = target?.macName ?? "Mac";

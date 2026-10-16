@@ -196,6 +196,42 @@ export function classify(
   return out;
 }
 
+/** The lists `inboxOf` made last, and what from. */
+let made: { sessions: readonly MacSession[]; mac: string; now: number; names: ReadonlyMap<string, string> | undefined; inbox: Inbox } | null = null;
+
+/** The same rows, in the same order. */
+const sameRows = (a: readonly MacSession[], b: readonly MacSession[]): boolean =>
+  a === b || (a.length === b.length && a.every((s, i) => s === b[i]));
+
+/** The same names by id, in the same order (each screen's hook makes its own map). */
+function sameNames(a: ReadonlyMap<string, string> | undefined, b: ReadonlyMap<string, string> | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.size !== b.size) return false;
+  const theirs = [...b];
+  return [...a].every(([id, name], i) => theirs[i]?.[0] === id && theirs[i]?.[1] === name);
+}
+
+/**
+ * The Inbox's lists of `sessions` (see `classify`), each card answering its own row's front
+ * approval: made once for the same rows, clock, Mac name and names, and the same object until one
+ * of them changes. The Inbox and the drawer read the same clock (`useAgoClock`), so whichever
+ * draws second after a change reuses what the first made: the sessions are sorted once per
+ * change, not once per list. With `names`, `mac` says nothing (each card names its own Mac).
+ */
+export function inboxOf(
+  sessions: readonly MacSession[],
+  { mac, now, names }: { mac: string; now: number; names?: ReadonlyMap<string, string> },
+): Inbox {
+  const name = names ? "" : mac;
+  if (made && made.now === now && made.mac === name && sameNames(made.names, names) && sameRows(made.sessions, sessions)) {
+    return made.inbox;
+  }
+  const fronts = new Map(sessions.map((s) => [s.id, s.approval ?? null]));
+  const inbox = classify(sessions, fronts, names ? { mac: name, now, names } : { mac: name, now });
+  made = { sessions, mac: name, now, names, inbox };
+  return inbox;
+}
+
 /** What a screen reader says for a card: its name, how long ago, its status, its files and its
  * line, each part clipped (a screen reader reads every word), and whether the request is
  * shortened. */
@@ -268,15 +304,16 @@ export interface DrawerList {
 
 /**
  * The drawer's sessions, in the Inbox's order (needs you, running, then the rest, each newest
- * first). A session waiting on an approval says "approve"; one that ended on a question says
- * "question"; one running says what it is doing in a
- * word; one that finished well says "done"; any other says how long ago it last did anything.
- * `now` is the clock in milliseconds. `names`, the paired Macs' names by id, is given only when
- * there are several: the rows are then grouped by Mac, in the Inbox's order within each.
+ * first): the Inbox's own lists (`inboxOf`), so the two sort once between them. A session waiting
+ * on an approval says "approve"; one that ended on a question says "question"; one running says
+ * what it is doing in a word; one that finished well says "done"; any other says how long ago it
+ * last did anything. `now` is the clock in milliseconds. `names`, the paired Macs' names by id, is
+ * given only when there are several: the rows are then grouped by Mac, in the Inbox's order within
+ * each. `mac` is the one Mac's name, as the Inbox has it.
  */
-export function drawerList(sessions: readonly MacSession[], now: number, names?: ReadonlyMap<string, string>): DrawerList {
+export function drawerList(sessions: readonly MacSession[], now: number, names?: ReadonlyMap<string, string>, mac = "Mac"): DrawerList {
   const byId = new Map(sessions.map((s) => [s.id, s]));
-  const { needs, running, done } = classify(sessions, new Map(), { mac: "", now, names });
+  const { needs, running, done } = inboxOf(sessions, names ? { mac, now, names } : { mac, now });
   const rows: DrawerRow[] = [];
   for (const item of [...needs, ...running, ...done]) {
     const s = byId.get(item.id);

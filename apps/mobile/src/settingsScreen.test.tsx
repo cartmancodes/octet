@@ -234,7 +234,7 @@ describe("Settings", () => {
       await flush();
       expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBeNull();
       expect((await loadSettings()).pairings).toEqual([]);
-      expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null, macs: [], notices: [] });
+      expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, offer: false, macs: [], notices: [] });
       expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
       expect(rig.view.getPathname()).toBe("/pair");
       expect(screen.queryByText(/unpaired on/)).toBeNull();

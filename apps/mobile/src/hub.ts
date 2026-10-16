@@ -6,13 +6,13 @@ import * as SecureStore from "expo-secure-store";
 import { createContext, useContext, useMemo, useSyncExternalStore } from "react";
 import { Platform } from "react-native";
 
-import { HubClient, Refusal, type HubClientOptions, type HubState, type SocketFactory } from "./client/HubClient";
+import { HubClient, Refusal, type HubClientOptions, type SocketFactory } from "./client/HubClient";
 import { NOT_A_LINK, isHubUrl, pairLinkProblem, parsePairLink } from "./client/link";
 import { webSocketFactory } from "./client/socket";
 import { isDevBuild } from "./build";
 import { DEFAULT_PUSH_KINDS, NOT_SAVED, loadSettings, readSettings, updateSettings, type Settings } from "./persist";
 import { createCoalescer, type Coalescer } from "./coalesce";
-import { MAX_MACS, TOO_MANY_MACS, cleanMacName, hostOf, macNameOf, macOfHost, newMacId, tapKey, type Links, type Pairing, type Tap } from "./macs";
+import { MAX_MACS, TOO_MANY_MACS, cleanMacName, hostOf, keyFor, macNameOf, macOfHost, newMacId, tapKey, type Links, type Pairing, type Tap } from "./macs";
 import { DENIED, askForToken, currentToken, dropPushRegistration, onTokenChange, projectId } from "./notifications";
 import type { PushKinds } from "./protocol";
 import { connectStore, hasEnded, octetStore, type OctetStore } from "./store";
@@ -40,17 +40,14 @@ const unsaved = (name: string): string =>
  * shows Pair. */
 export type HubStatus = "loading" | "unpaired" | "paired";
 
-/** One paired Mac, as screens show it. */
+/** One paired Mac, as screens show it. Its link's state is the store's (`useHub`, `useTried`):
+ * kept in one place, so no screen can read two that disagree. */
 export interface MacInfo {
   /** The phone's id for the pairing: every key of the Mac's sessions starts `<id>/`. */
   id: string;
   macName: string;
   /** The hub's host, as the pairing link gave it. */
   host: string;
-  state: HubState;
-  /** An attempt of the link's run (since the app last came to the foreground) has ended, well or
-   * not: until then a Mac that is not ready is coming, not asleep. */
-  tried: boolean;
 }
 
 export interface FleetSnapshot {
@@ -65,13 +62,7 @@ export interface FleetSnapshot {
   /** Why the user is on Pair (a Mac unpaired this phone, or an unpair did not finish); null for
    * a plain first pairing. Set too when one of several Macs unpaired this phone. */
   notice: string | null;
-  /** @deprecated One-Mac code only: the only Mac's connection; null with none or several. */
-  client: HubClient | null;
-  /** @deprecated One-Mac code only: `notices` as one text; null when there are none. */
-  pushNotice: string | null;
 }
-/** @deprecated The Fleet's snapshot, by its one-Mac name. */
-export type HubSnapshot = FleetSnapshot;
 
 /** Whether any kind of push is wanted. */
 const anyKind = (kinds: PushKinds): boolean => kinds.approvals || kinds.errors || kinds.turns;
@@ -126,12 +117,12 @@ const tokenStore = (keychain: Keychain, id: string): TokenStore => ({
 interface LinkHost {
   readonly store: OctetStore;
   readonly coalescer: Coalescer;
-  /** Every Mac's client, as the Fleet has them now. */
+  /** Every Mac's client, as the Fleet has them at each call. */
   readonly links: Links;
   readonly schedule: (fn: () => void, ms: number) => () => void;
   /** Runs a push job after every one before it, of whichever Mac. */
   inTurn<T>(job: () => Promise<T>): Promise<T>;
-  /** The link's state, name or notice changed. */
+  /** The link's push notice changed. */
   changed(link: MacLink): void;
   /** The Mac refused this phone's token as unpaired or revoked. */
   unpaired(link: MacLink): void;
@@ -143,14 +134,12 @@ interface LinkHost {
  * the last one that did not work. What it feeds the store is keyed by its id.
  */
 export class MacLink {
-  tried = false;
   /** Why this Mac did not take the push registration; null when the last one worked. */
   pushNotice: string | null = null;
   /** Turning notifications off did not reach this Mac: it is told on its next ready. */
   owesOff = false;
   /** Released: whatever answers come for it now are for a pairing that is gone. */
   gone = false;
-  private attempting = false;
   private shown: MacInfo;
   private detach: (() => void) | null = null;
   /** The `whenReady` calls waiting: each ends false at `release`. */
@@ -169,7 +158,7 @@ export class MacLink {
     return this.pairing.id;
   }
 
-  /** What screens show of it; the same object until something in it changes. */
+  /** What screens show of it; the same object until it is renamed. */
   info(): MacInfo {
     return this.shown;
   }
@@ -180,18 +169,15 @@ export class MacLink {
   }
 
   private describe(): MacInfo {
-    return { id: this.id, macName: this.pairing.macName, host: hostOf(this.pairing.hubUrl) ?? "", state: this.client.state, tried: this.tried };
+    return { id: this.id, macName: this.pairing.macName, host: hostOf(this.pairing.hubUrl) ?? "" };
   }
 
-  /** Feeds the store from the client, keyed by this Mac, and follows its state and the push token. */
+  /** Feeds the store from the client, keyed by this Mac (its link's state included), and follows
+   * its state for the push registration and a refused token, and the push token. */
   attach(): void {
     const { client } = this;
     const offStore = connectStore(this.host.store, client, { mac: this.id, links: this.host.links, coalescer: this.host.coalescer });
     const offState = client.onState((state) => {
-      if (state === "connecting" || state === "authenticating") this.attempting = true;
-      else if (this.attempting || state === "ready" || state === "unpaired") this.tried = true;
-      this.shown = this.describe();
-      this.host.changed(this);
       if (state === "unpaired") this.host.unpaired(this);
       else if (state === "ready") void this.syncPush();
     });
@@ -213,20 +199,6 @@ export class MacLink {
     this.detach?.();
     this.detach = null;
     for (const done of [...this.waiters]) done(false);
-  }
-
-  /** The app goes to the background: the attempt under way, if any, did not end on its own, so
-   * the stop that follows is not the Mac failing to answer. The run is over: back in the
-   * foreground the Mac is coming again (not asleep) until an attempt of the new run ends. */
-  stop(): void {
-    this.attempting = false;
-    this.tried = false;
-    this.client.stop();
-    // A link already offline (waiting out a backoff) says nothing as it stops.
-    if (this.shown.tried || this.shown.state !== this.client.state) {
-      this.shown = this.describe();
-      this.host.changed(this);
-    }
   }
 
   /** Stops the client, but first, on a ready link, tells the Mac "notifications off" and keeps
@@ -364,8 +336,6 @@ export interface FleetOptions {
   /** Makes a new pairing's id; `newMacId` unless a test gives its own. */
   newId?: () => string;
 }
-/** @deprecated The Fleet's options, by their one-Mac name. */
-export type HubControllerOptions = FleetOptions;
 
 /**
  * Every pairing of the app run, one `MacLink` each: all connected in the foreground, all closed
@@ -386,8 +356,7 @@ export class Fleet {
   private pairings: Pairing[] = [];
   /** The links, in the pairings' order: the one map from Mac to client. */
   private all: MacLink[] = [];
-  private current: FleetSnapshot = { status: "loading", macs: [], offer: false, notices: [], notice: null, client: null, pushNotice: null };
-  private view: Links;
+  private current: FleetSnapshot = { status: "loading", macs: [], offer: false, notices: [], notice: null };
   private readonly listeners = new Set<() => void>();
   private foreground = false;
   private savedName: string | null = null;
@@ -426,11 +395,11 @@ export class Fleet {
       now: this.clientOptions.now,
       schedule: this.schedule,
     });
-    this.view = this.makeLinks();
+    this.links = this.makeLinks();
     this.host = {
       store: this.store,
       coalescer: this.coalescer,
-      links: this.makeLinks(),
+      links: this.links,
       schedule: this.schedule,
       inTurn: (job) => this.inTurn(job),
       changed: () => this.emit(),
@@ -447,13 +416,10 @@ export class Fleet {
     return () => this.listeners.delete(fn);
   };
 
-  /** Every Mac's client, now and as the Macs change: a new object when a Mac comes or goes (or
-   * its client is replaced), the same one until then. */
-  get links(): Links {
-    return this.view;
-  }
-
-  linksNow = (): Links => this.view;
+  /** Every Mac's client, as the Fleet has them at each call: one object for the Fleet's life, so
+   * that a Mac coming or going (or paired again) changes nothing that holds it. A screen that
+   * shows one Mac's client reads it with `useClient`. */
+  readonly links: Links;
 
   /** "Android phone" on Android, "iPhone" otherwise. */
   defaultName(): string {
@@ -516,7 +482,6 @@ export class Fleet {
     this.pairings = kept;
     this.all = links;
     for (const link of links) link.attach();
-    this.relink();
     this.emit({ status: links.length > 0 ? "paired" : "unpaired" });
     if (this.foreground) for (const link of links) link.client.start();
   }
@@ -599,7 +564,9 @@ export class Fleet {
       for (const link of this.all) link.client.retry(); // a start when stopped; leaves a live or opening link alone
     } else {
       this.pairing?.stop();
-      for (const link of this.all) link.stop();
+      // A stop ends each link's run: back in the foreground each Mac is coming, not asleep, until
+      // an attempt of the new run ends (the store's `tried`).
+      for (const link of this.all) link.client.stop();
     }
   }
 
@@ -736,7 +703,6 @@ export class Fleet {
     link.release();
     this.all = this.all.filter((l) => l !== link);
     this.store.getState().reset(link.id);
-    this.relink();
   }
 
   /** Removes pairings `ids` from settings and their tokens from the keychain. With `last`, no Mac
@@ -775,7 +741,6 @@ export class Fleet {
     const order = (l: MacLink) => this.pairings.findIndex((p) => p.id === l.id);
     this.all = [...this.all, link].sort((a, b) => order(a) - order(b));
     link.attach();
-    this.relink();
     this.emit({ status: "paired", notice: null, offer });
     if (this.foreground) client.start();
   }
@@ -865,9 +830,17 @@ export class Fleet {
     return saved ? { ok: true } : { ok: false, message: NOT_SAVED };
   }
 
-  /** The key a push tap opens (see `tapKey`): the session on the pairing whose host the tap
-   * names, or, with no host, on the only pairing; null for the Inbox, and for a session that Mac
-   * has ended. A pairing with no link counts: its session's screen says it can't be reached. */
+  /** The phone's key of session `raw` on the Mac whose hub publishes `host` (see `keyFor`): the
+   * one way from what a hub sends (a push, and in time the Island and an approve link) to a key.
+   * Null for a host no pairing has, for no host with several pairings, and for a raw id that is
+   * not one. A pairing with no link counts. */
+  keyFor(host: string | null, raw: string): string | null {
+    return keyFor(this.pairings, host, raw);
+  }
+
+  /** The key a push tap opens (see `tapKey`, which resolves through `keyFor`): null for the Inbox,
+   * and for a session that Mac has ended. A pairing with no link counts: its session's screen
+   * says it can't be reached. */
   tapKey(tap: Tap): string | null {
     const state = this.store.getState();
     return tapKey(tap, this.pairings, (key) => hasEnded(state, key));
@@ -899,13 +872,8 @@ export class Fleet {
     };
   }
 
-  /** A Mac came or went, or its client was replaced: hooks holding the links see a new object. */
-  private relink(): void {
-    this.view = this.makeLinks();
-  }
-
-  /** What `macs` shows of each pairing, in order: its link's, or, with no link, offline and not
-   * tried. */
+  /** What `macs` shows of each pairing, in order: its link's, or, with no link, its own (the
+   * store holds no link state for it, so it reads offline and not tried). */
   private describeMacs(): MacInfo[] {
     const unlinked = new Map<string, MacInfo>();
     const macs = this.pairings.map((p) => {
@@ -913,7 +881,7 @@ export class Fleet {
       if (link) return link.info();
       const host = hostOf(p.hubUrl) ?? "";
       const had = this.unlinked.get(p.id);
-      const info: MacInfo = had && had.macName === p.macName && had.host === host ? had : { id: p.id, macName: p.macName, host, state: "offline", tried: false };
+      const info: MacInfo = had && had.macName === p.macName && had.host === host ? had : { id: p.id, macName: p.macName, host };
       unlinked.set(p.id, info);
       return info;
     });
@@ -931,14 +899,7 @@ export class Fleet {
       before.notices,
       this.all.flatMap((l) => (l.pushNotice === null ? [] : [this.named(l, l.pushNotice)])),
     );
-    this.current = {
-      ...before,
-      ...patch,
-      macs,
-      client: this.all.length === 1 ? (this.all[0]?.client ?? null) : null,
-      notices,
-      pushNotice: notices.length > 0 ? notices.join("\n") : null,
-    };
+    this.current = { ...before, ...patch, macs, notices };
     for (const fn of [...this.listeners]) fn();
   }
 }
@@ -973,23 +934,12 @@ async function keepToken(tokens: TokenStore, token: string): Promise<boolean> {
 /** The words for a failed command: the hub's own, else a plain one. */
 const wordsOf = (error: unknown): string => (error instanceof Refusal ? error.message : "Something went wrong. Try again.");
 
-/** @deprecated The Fleet, by its one-Mac name (for `new HubController(...)`; the type is `Fleet`). */
-export const HubController = Fleet;
-
 /** The app's Macs. */
 export const hub = new Fleet();
 
 export const HubContext = createContext<Fleet>(hub);
 
 export const useHubController = (): Fleet => useContext(HubContext);
-
-/** The whole snapshot: a new object whenever any part changes (a link's state included). A
- * screen that reads only some of it selects those parts with the hooks below, so that it does
- * not render again for the rest. */
-export function useFleet(): FleetSnapshot {
-  const fleet = useHubController();
-  return useSyncExternalStore(fleet.subscribe, fleet.snapshot, fleet.snapshot);
-}
 
 /** One part of the snapshot. `pick` must return a part as it is (each keeps its identity while
  * it is the same) or a primitive: the hook renders again only when that changes. */
@@ -1029,20 +979,14 @@ export function useMacNames(): ReadonlyMap<string, string> {
   }, [key]);
 }
 
-/** @deprecated One-Mac code only; `useFleet` is the same snapshot. */
-export const useHubSnapshot = useFleet;
+/** The connection by Mac, for code that holds a session key: the Fleet's `links`, one object
+ * that resolves each Mac at the call, so nothing that holds it renders again as Macs come or go. */
+export const useLinks = (): Links => useHubController().links;
 
-/** @deprecated One-Mac code only: `notices` as one text, or null. */
-export const usePushNotice = (): string | null => useFleetPart((s) => s.pushNotice);
-
-/** @deprecated One-Mac code only: the only Mac's connection; null before pairing, after the last
- * Mac unpaired this phone, and with several Macs. Code that holds a session key asks `useLinks`.
- * Renders again only when that connection changes. */
-export const useHubClient = (): HubClient | null => useFleetPart((s) => s.client);
-
-/** The connection by Mac, for code that holds a session key. A new object when a Mac comes or
- * goes, the same one until then. */
-export function useLinks(): Links {
+/** The connection to Mac `mac`; null for none, and for a Mac with no link. Renders again only when
+ * that Mac's connection changes (it is paired again, or goes). */
+export function useClient(mac: string | null): HubClient | null {
   const fleet = useHubController();
-  return useSyncExternalStore(fleet.subscribe, fleet.linksNow, fleet.linksNow);
+  const get = () => (mac === null ? null : fleet.links.client(mac));
+  return useSyncExternalStore(fleet.subscribe, get, get);
 }

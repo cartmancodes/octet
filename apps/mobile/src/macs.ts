@@ -87,6 +87,28 @@ export function macOfHost(pairings: readonly Pick<Pairing, "id" | "hubUrl">[], h
   return null;
 }
 
+/** The hub's session ids are `{pid}-{started}`, both numbers. */
+const SESSION_ID = /^[0-9]+-[0-9]+$/;
+/** No id the hub makes is longer; what names one from outside the app (a push's data) may be. */
+const SESSION_ID_CHARS = 128;
+
+/** Whether `raw` is a session id of the hub's shape. */
+export const isSessionId = (raw: string): boolean => raw.length <= SESSION_ID_CHARS && SESSION_ID.test(raw);
+
+/**
+ * The phone's key of session `raw` on the Mac whose hub publishes `host`: the one way from what a
+ * hub sends outside its link (a push's `mac` and `session`; in time the Island's and an approve
+ * link's) to a key, so that nothing splits a key that came from outside. The Mac is the pairing
+ * whose hub host is `host`, without case or a trailing dot; with no host, the only pairing, if
+ * there is just one. Null for a host no pairing has, no host with several pairings, and a raw id
+ * that is not one.
+ */
+export function keyFor(pairings: readonly Pick<Pairing, "id" | "hubUrl">[], host: string | null, raw: string): string | null {
+  if (!isSessionId(raw)) return null;
+  const mac = host !== null ? macOfHost(pairings, host) : pairings.length === 1 ? (pairings[0]?.id ?? null) : null;
+  return mac === null ? null : keyOf(mac, raw);
+}
+
 /** What a push tap names: the host of the Mac that sent it (its `mac`; null when it named none
  * that is a host name) and the hub's raw session id (null when it named none that is valid). */
 export interface Tap {
@@ -95,17 +117,12 @@ export interface Tap {
 }
 
 /**
- * The key a push tap opens, or null for the Inbox. The Mac is the pairing whose hub host is the
- * tap's host (without case or a trailing dot); with no host, the only pairing, if there is just
- * one. A host no pairing has, no host with several pairings, no session, or a session `ended`
- * says is over: the Inbox.
+ * The key a push tap opens, or null for the Inbox: the tap's session on its Mac, by `keyFor`. No
+ * session, any tap `keyFor` finds no key for, or a session `ended` says is over: the Inbox.
  */
 export function tapKey(tap: Tap, pairings: readonly Pick<Pairing, "id" | "hubUrl">[], ended: (key: string) => boolean): string | null {
-  if (tap.session === null) return null;
-  const mac = tap.host !== null ? macOfHost(pairings, tap.host) : pairings.length === 1 ? (pairings[0]?.id ?? null) : null;
-  if (mac === null) return null;
-  const key = keyOf(mac, tap.session);
-  return ended(key) ? null : key;
+  const key = tap.session === null ? null : keyFor(pairings, tap.host, tap.session);
+  return key === null || ended(key) ? null : key;
 }
 
 const SOME_MAC = "Mac";

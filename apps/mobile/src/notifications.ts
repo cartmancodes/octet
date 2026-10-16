@@ -8,7 +8,7 @@ import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
 
-import type { Tap } from "./macs";
+import { isSessionId, type Tap } from "./macs";
 
 export type { Tap };
 
@@ -18,10 +18,6 @@ const FAILED = "Couldn't turn on notifications. Try again.";
 
 /** What Expo's push service hands out; the hub accepts the same shape and no other. */
 const PUSH_TOKEN = /^Expo(nent)?PushToken\[[A-Za-z0-9_-]{1,200}\]$/;
-/** The hub's session ids are `{pid}-{started}`, both numbers. */
-const SESSION_ID = /^[0-9]+-[0-9]+$/;
-/** No id the hub makes is longer; a tap's data comes from outside the app. */
-const SESSION_ID_CHARS = 128;
 /** How long a push token fetch may take. It can hang (no network to Expo, or to Apple or
  * Google), and push work runs one job at a time, so a hung fetch would hold every later one. */
 const TOKEN_WAIT_MS = 15_000;
@@ -37,9 +33,7 @@ export function projectId(): string | null {
 export function sessionFromData(data: unknown): string | null {
   if (typeof data !== "object" || data === null) return null;
   const session = (data as { session?: unknown }).session;
-  return typeof session === "string" && session.length <= SESSION_ID_CHARS && SESSION_ID.test(session)
-    ? session
-    : null;
+  return typeof session === "string" && isSessionId(session) ? session : null;
 }
 
 /** The longest DNS name, and the longest label of one. */

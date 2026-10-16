@@ -11,7 +11,7 @@ import RootLayout from "../app/_layout";
 import Inbox from "../app/index";
 import Pair from "../app/pair";
 import { FakeClock, Sockets } from "./client/fakes";
-import { HubContext, HubController, TOKEN_KEY } from "./hub";
+import { HubContext, Fleet, TOKEN_KEY } from "./hub";
 import { closeDrawer } from "./drawer";
 import * as inboxWords from "./inbox";
 import * as navigation from "./navigation";
@@ -72,7 +72,7 @@ afterEach(() => {
 async function launch(list: SessionInfo[] | null) {
   const sockets = new Sockets();
   const clock = new FakeClock();
-  const hub = new HubController({
+  const hub = new Fleet({
     factory: sockets.factory,
     store: octetStore,
     platform: "ios",

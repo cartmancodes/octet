@@ -14,7 +14,7 @@ import { TranscriptHeader } from "../../src/components/TranscriptHeader";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
 import { useInboxWhenUnpaired } from "../../src/components/unpair";
 import { clearEdgeBottom, setEdgeBottom, useDrawerOpen } from "../../src/drawer";
-import { useLinks } from "../../src/hub";
+import { useClient, useLinks } from "../../src/hub";
 import { macName } from "../../src/inbox";
 import { macOfKey } from "../../src/macs";
 import type { Entry } from "../../src/model/transcript";
@@ -61,7 +61,7 @@ export default function Session() {
   // The key names the Mac the session is on: its link, its list and its commands.
   const macId = macOfKey(id);
   const links = useLinks();
-  const client = macId === null ? null : links.client(macId);
+  const client = useClient(macId);
   // Its Mac unpaired: back to the Inbox.
   useInboxWhenUnpaired(id);
   const focused = useIsFocused();
@@ -90,10 +90,13 @@ export default function Session() {
       // An ended session's view is what it left behind: there is nothing more to stream.
       if (!octetStore.getState().bySession.get(id)?.ended) watch(octetStore, links, id);
       return () => {
+        // Its Mac went, or paired again: what the old client held went with it (the store forgot
+        // that Mac), and a new client is not this effect's to let go of.
+        if (macId === null || links.client(macId) !== client) return;
         unwatch(links, id);
         if (!toOwn.current) releaseSession(octetStore, links, id);
       };
-    }, [client, links, id]),
+    }, [client, links, macId, id]),
   );
 
   // The workspace outlives the session's place in the list.

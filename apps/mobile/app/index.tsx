@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, use
 import { StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { useAgoClock } from "../src/agoClock";
 import { NO_FACE_ID, allowAll, approvalKey, createAnswerLedger, useArm } from "../src/approvals";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { HubBanner } from "../src/components/HubBanner";
@@ -13,12 +14,12 @@ import { openDrawer, useDrawerOpen } from "../src/drawer";
 import { successTap } from "../src/haptics";
 import type { HubState } from "../src/client/HubClient";
 import { useLinks, useMacNames, useMacs } from "../src/hub";
-import { classify, type InboxItem } from "../src/inbox";
+import { inboxOf, type InboxItem } from "../src/inbox";
 import { fleetLine, macOfKey } from "../src/macs";
 import { Mascot } from "../src/mascot/Mascot";
 import { openSession } from "../src/navigation";
 import type { ApprovalInfo } from "../src/protocol";
-import { octetStore, useListed, useReadyMacs, useSessions } from "../src/store";
+import { octetStore, useConnecting, useListed, useReadyMacs, useSessions } from "../src/store";
 import { spacing, type, useTheme } from "../src/theme";
 import { BAR_GAP, BAR_HEIGHT, Button, Segmented } from "../src/ui";
 
@@ -28,8 +29,6 @@ const MASCOT = 59;
 const REFRESH_MAX_MS = 8_000;
 /** On a live link the list is pushed as it changes: a pull only waits this long for a sessions frame. */
 export const LIVE_PULL_MS = 1_000;
-/** How often the cards' "how long ago" moves on. */
-const AGO_TICK_MS = 30_000;
 /** Allow all shows from this many approvals the Inbox can answer. */
 const ALL_FROM = 2;
 
@@ -43,7 +42,6 @@ const EMPTY: Record<Tab, { pose: "success" | "sleeping"; text: string; offline: 
 
 const keyOf = (item: InboxItem): string => item.id;
 const NO_PULL: ReadonlyMap<string, "live" | "connect"> = new Map();
-const readClock = (): number => Date.now();
 
 /** Whether `id` is still `session`'s front approval, as the store has it this instant. */
 const isFront = (session: string, id: number): boolean =>
@@ -74,6 +72,7 @@ export default function Inbox() {
   const several = names.size > 1;
   // Offline is per Mac: a card is greyed, and answers nothing, while its own Mac is not ready.
   const ready = useReadyMacs();
+  const connecting = useConnecting();
   const sessions = useSessions();
   const listed = useListed();
   const focused = useIsFocused();
@@ -89,22 +88,16 @@ export default function Inbox() {
   const mac = macs[0]?.macName ?? "Mac";
   const online = macs.reduce((n, m) => (ready.has(m.id) ? n + 1 : n), 0);
   // What the banner over the list says: with several Macs, only when none can be reached.
-  const bannerState: HubState = reachable ? "ready" : macs.some((m) => m.state === "connecting" || m.state === "authenticating") ? "connecting" : "offline";
+  const bannerState: HubState = reachable ? "ready" : connecting ? "connecting" : "offline";
   const [tab, setTab] = useState<Tab>("needs");
   // The Macs a pull waits for: "live", pulled on a live link (until its next list); "connect",
   // pulled while that Mac could not be reached (until it can). Empty when no pull is out.
   const [pull, setPull] = useState(NO_PULL);
 
-  // The clock the cards count "ago" from, moved on by a timer rather than read during render.
-  const [now, setNow] = useState(readClock);
-  useEffect(() => {
-    const timer = setInterval(() => setNow(readClock()), AGO_TICK_MS);
-    return () => clearInterval(timer);
-  }, []);
-  const inbox = useMemo(() => {
-    const fronts = new Map(sessions.map((s) => [s.id, s.approval ?? null]));
-    return classify(sessions, fronts, several ? { mac, now, names } : { mac, now });
-  }, [sessions, mac, now, several, names]);
+  // The clock the cards count "ago" from, moved on by a timer rather than read during render: the
+  // drawer's too, so that it reuses these lists.
+  const now = useAgoClock();
+  const inbox = useMemo(() => inboxOf(sessions, several ? { mac, now, names } : { mac, now }), [sessions, mac, now, several, names]);
 
   // The answers out and given from this screen, shared by the cards and Allow all. What it has
   // given is read as a store, so Allow all's count drops the moment a card's answer is taken.

@@ -25,7 +25,7 @@ import { DiffLineRow, DiffNote, FileRow, SIDE } from "../src/components/FileRow"
 import { HubBanner } from "../src/components/HubBanner";
 import { failure, useAlive, useSend, type Failure } from "../src/components/send";
 import { useInboxWhenUnpaired } from "../src/components/unpair";
-import { useLinks } from "../src/hub";
+import { useClient, useLinks } from "../src/hub";
 import { macOfKey } from "../src/macs";
 import { FIELD_CHARS, field } from "../src/model/text";
 import type { DiffFrame, FileChange } from "../src/protocol";
@@ -124,7 +124,7 @@ export default function Changes() {
   // The key names the Mac the session is on: its link and its commands.
   const macId = macOfKey(id);
   const links = useLinks();
-  const client = macId === null ? null : links.client(macId);
+  const client = useClient(macId);
   // Its Mac unpaired: back to the Inbox.
   useInboxWhenUnpaired(id);
   // No id, or one that is not a key, names no session on any Mac: nothing is asked of a Mac,
@@ -144,8 +144,11 @@ export default function Changes() {
       if (octetStore.getState().bySession.get(id)?.ended) return;
       if (octetStore.getState().sessions.every((x) => x.id !== id)) return; // not in the list: the hub would refuse
       watch(octetStore, links, id);
-      return () => unwatch(links, id);
-    }, [client, links, id]),
+      return () => {
+        // Its Mac went, or paired again: the new client is not this effect's to let go of.
+        if (macId !== null && links.client(macId) === client) unwatch(links, id);
+      };
+    }, [client, links, macId, id]),
   );
 
   const [lastWorkspace, setLastWorkspace] = useState(head.workspace);

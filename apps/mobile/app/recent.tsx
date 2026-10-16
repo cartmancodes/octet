@@ -7,11 +7,11 @@ import type { HubState } from "../src/client/HubClient";
 import { HubBanner } from "../src/components/HubBanner";
 import { RecentRow } from "../src/components/RecentRow";
 import { failure, sendTo, useAlive, type Failure } from "../src/components/send";
-import { useLinks, useMacNames, useMacs } from "../src/hub";
+import { useLinks, useMacNames } from "../src/hub";
 import type { RecentInfo } from "../src/protocol";
 import { mergeRecent, recentItems, recentKey, type RecentItem } from "../src/recent";
 import { useStartSession } from "../src/start";
-import { useHub, useReadyMacs } from "../src/store";
+import { useConnecting, useHub, useReadyMacs } from "../src/store";
 import { radius, spacing, type, useTheme } from "../src/theme";
 
 /** What one Mac answered last. */
@@ -43,11 +43,11 @@ export default function Recent() {
   const router = useRouter();
   const alive = useAlive();
   const links = useLinks();
-  const macs = useMacs();
   const names = useMacNames();
   const several = names.size > 1;
   const only = several ? undefined : names.keys().next().value;
   const ready = useReadyMacs();
+  const connecting = useConnecting();
   const onlyHub = useHub(only ?? "");
   const focused = useIsFocused();
   const [loaded, setLoaded] = useState<Loaded>({ byMac: new Map(), pulling: false });
@@ -169,7 +169,7 @@ export default function Recent() {
   const bannerState: HubState = several
     ? ready.size > 0
       ? "ready"
-      : macs.some((m) => m.state === "connecting" || m.state === "authenticating")
+      : connecting
         ? "connecting"
         : "offline"
     : onlyHub;
