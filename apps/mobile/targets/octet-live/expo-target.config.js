@@ -5,7 +5,8 @@ module.exports = {
   type: "widget",
   name: "OctetLiveWidget",
   displayName: "Octet",
-  // pushToStartTokenUpdates and LiveActivityIntent buttons need iOS 17.2; app.json matches it.
+  // The Island needs iOS 17.2 (push-to-start tokens). The app itself stays on 16.4; an extension
+  // may require a newer iOS than its app, and the module checks availability at run time.
   deploymentTarget: "17.2",
   entitlements: {
     "com.apple.security.application-groups": ["group.dev.octet.mobile"],

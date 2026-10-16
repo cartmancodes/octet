@@ -10,7 +10,6 @@
     "ios": {
       "bundleIdentifier": "dev.octet.mobile",
       "supportsTablet": false,
-      "deploymentTarget": "17.2",
       "entitlements": {
         "com.apple.security.application-groups": ["group.dev.octet.mobile"]
       },

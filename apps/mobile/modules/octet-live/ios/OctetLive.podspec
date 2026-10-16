@@ -6,9 +6,10 @@ Pod::Spec.new do |s|
   s.author         = 'Octet'
   s.homepage       = 'https://docs.expo.dev/modules/'
   s.license        = { :type => 'MIT' }
-  # pushToStartTokenUpdates arrived in iOS 17.2; app.json sets the app's deployment target to match.
+  # The app's floor (Expo's 16.4). ActivityKit is used only behind `#available(iOS 17.2, *)`, the
+  # first with push-to-start tokens; below it the module reports unsupported and does nothing.
   s.platforms      = {
-    :ios => '17.2'
+    :ios => '16.4'
   }
   s.source         = { git: '' }
   s.static_framework = true

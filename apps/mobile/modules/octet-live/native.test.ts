@@ -69,8 +69,24 @@ describe("the Expo module", () => {
     expect(moduleSwift).toMatch(/Events\("pushToken",\s*"pushToStartToken",\s*"deny"\)/);
   });
 
-  it("requires iOS 17.2", () => {
-    expect(podspec).toMatch(/:ios\s*=>\s*'17\.2'/);
+  it("installs where the app does: Expo's own iOS floor, not the Island's", () => {
+    const expoCore = readFileSync(path.join(app, "node_modules", "expo-modules-core", "ExpoModulesCore.podspec"), "utf8");
+    const floor = /:ios\s*=>\s*'([\d.]+)'/.exec(expoCore)?.[1];
+    expect(floor).toBe("16.4");
+    expect(/:ios\s*=>\s*'([\d.]+)'/.exec(podspec)?.[1]).toBe(floor);
+  });
+
+  it("keeps the activity type behind iOS 17.2, so the compiler guards every ActivityKit call", () => {
+    for (const swift of [moduleAttributes, widgetAttributes]) {
+      expect(swift).toMatch(/@available\(iOS 17\.2, \*\)\s*\nstruct OctetActivity\b/);
+    }
+    expect(denySwift).toMatch(/@available\(iOS 17\.2, \*\)\s*\nstruct DenyIntent\b/);
+  });
+
+  it("is unsupported below iOS 17.2", () => {
+    expect(moduleSwift).toMatch(
+      /Function\("isSupported"\) \{ \(\) -> Bool in\s*if #available\(iOS 17\.2, \*\) \{\s*return ActivityAuthorizationInfo\(\)\.areActivitiesEnabled\s*\}\s*return false/,
+    );
   });
 });
 
@@ -124,10 +140,16 @@ describe("the App Group contract", () => {
     expect(widgetSwift).toContain('"entries"');
   });
 
-  it("hands a deny over under one key and one Darwin notification", () => {
+  it("hands each deny over under its own deny.<uuid> key, pinged by one Darwin notification", () => {
     for (const swift of [moduleSwift, denySwift]) {
-      expect(swift).toContain('"denies"');
+      expect(swift).toContain('"deny."');
       expect(swift).toContain('"dev.octet.mobile.deny"');
+      // No shared list that a read-modify-write could lose a deny from.
+      expect(swift).not.toMatch(/array\(forKey:/);
+      expect(swift).not.toContain('"denies"');
     }
+    expect(denySwift).toContain("UUID().uuidString");
+    expect(moduleSwift).toMatch(/hasPrefix\(denyPrefix\)/);
+    expect(moduleSwift).toMatch(/removeObject\(forKey: key\)/);
   });
 });

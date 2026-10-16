@@ -70,8 +70,13 @@ describe("the Live Activity", () => {
     expect(config.ios.infoPlist?.NSSupportsLiveActivitiesFrequentUpdates).toBe(false);
   });
 
-  it("needs iOS 17.2, the first with push-to-start tokens", () => {
-    expect(config.ios.deploymentTarget).toBe("17.2");
+  it("doesn't raise the app's iOS floor: only the widget needs iOS 17.2", () => {
+    expect(config.ios.deploymentTarget).toBeUndefined();
+  });
+
+  it("doesn't link apple-targets' own ExtensionStorage module into the app", () => {
+    const autolinking = (packageJson as { expo?: { autolinking?: { exclude?: string[] } } }).expo?.autolinking;
+    expect(autolinking?.exclude).toEqual(["@bacons/apple-targets"]);
   });
 });
 
