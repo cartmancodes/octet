@@ -74,9 +74,10 @@
   - `session` is the hub's own raw id of the session that leads, and `mac` is the hub's published host, as in Phase D's push data. The hub never knows the phone's pairing ids, so it never sends a key.
   - **The phone owns every key.** It resolves `{mac: host, session: raw}` through `fleet.keyFor(host, raw)`, the one resolver push taps already use (Phase D's final fix wave).
 - **Lifecycle (hub)**
-  - **Start** with `start_token` when an approval waits or a turn starts and the device has no live connection.
+  - **One activity, two drivers.** A device's registered activity `token` is a live activity whoever started it (the app in the foreground, or the hub by push-to-start). While the phone is away the hub updates that token; the app adopts the same activity when it comes back.
+  - **Start** with `start_token` when an approval waits or a turn starts, the device has no live connection, and it has no usable activity `token`.
   - **Update** when the kind or the approval count changes, at most once per 2 s per device.
-  - **End** 5 minutes after every session is idle, or when the phone opens a session stream (a foreground UI). From then on the app drives the activity itself. A connection that only registers tokens (a background wake for a hub-started activity) does not end it.
+  - **End** 5 minutes after every session is idle while the phone is away. A session stream (the app in the foreground) does not end it: the app takes the same activity over. A connection that only registers tokens does not count as the phone being back.
 - **Bounds:** these sends count against the same per-device cap of 6 per minute as the other pushes. A 410 drops the token, and any other failure is logged without the token.
 - **App**
   - **The App Group** is `group.dev.octet.mobile`. The app writes `{"<host>/<raw>": {"name", "command"}}`, keyed the way the widget sees a session (host and raw id from the content state) (each value cleaned, at most 64 entries, names ≤ 80 characters and commands ≤ 200) whenever the Inbox's approvals change, and clears it on unpair.
