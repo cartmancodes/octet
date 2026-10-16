@@ -12,6 +12,7 @@ import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
 import Sessions from "../app/index";
 import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
+import { LiveApiContext, type LiveApi } from "./activity";
 import { HubContext, Fleet, TOKEN_KEY, tokenKeyOf } from "./hub";
 import { saveSettings } from "./persist";
 import type { SessionInfo } from "./protocol";
@@ -46,9 +47,15 @@ export async function pairedStorage(): Promise<void> {
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
 }
 
+/** What a rig may change: `live`, the Live Activity's native module (none, as in jest, unless a
+ * test gives a fake). */
+export interface RigOptions {
+  live?: LiveApi;
+}
+
 /** Opens the app at `url` with `routes` beside the shell, Sessions and Pair. Nothing is waited for:
  * a phone that is not paired never opens a socket. */
-export async function mount(url: string, routes: Record<string, ComponentType>) {
+export async function mount(url: string, routes: Record<string, ComponentType>, { live }: RigOptions = {}) {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const hub = new Fleet({
@@ -58,11 +65,18 @@ export async function mount(url: string, routes: Record<string, ComponentType>) 
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
     newId: newM,
   });
-  const Layout = () => (
-    <HubContext.Provider value={hub}>
-      <RootLayout />
-    </HubContext.Provider>
-  );
+  const Layout = () =>
+    live ? (
+      <LiveApiContext.Provider value={live}>
+        <HubContext.Provider value={hub}>
+          <RootLayout />
+        </HubContext.Provider>
+      </LiveApiContext.Provider>
+    ) : (
+      <HubContext.Provider value={hub}>
+        <RootLayout />
+      </HubContext.Provider>
+    );
   const view = renderRouter(
     {
       _layout: Layout,
@@ -86,8 +100,8 @@ export async function mount(url: string, routes: Record<string, ComponentType>) 
 
 /** Opens the app at `url` with `routes` beside the shell, Sessions and Pair. The Mac welcomes the
  * phone and lists `list`. */
-export async function launch(url: string, routes: Record<string, ComponentType>, list: SessionInfo[] = []) {
-  const rig = await mount(url, routes);
+export async function launch(url: string, routes: Record<string, ComponentType>, list: SessionInfo[] = [], options: RigOptions = {}) {
+  const rig = await mount(url, routes, options);
   const { sockets } = rig;
   await waitFor(() => expect(sockets.all.length).toBeGreaterThan(0));
   await hear(rig, list);

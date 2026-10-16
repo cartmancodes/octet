@@ -10,6 +10,11 @@
 // - `OCTET_HUB_PUSH_URL` points the hub's pushes at a local HTTP server instead of exp.host (the
 //   hub honours it only for `http://127.0.0.1:<port>`). The hub posts with `curl`, so the real
 //   one stays on its PATH behind the stand-in directory. Nothing here reaches Expo.
+// - `OCTET_HUB_APNS_URL` (honoured by debug builds only, for `http://127.0.0.1:<port>`) points the
+//   hub's Live Activity sends at a local HTTP server instead of APNs, and `hub.json` names a test
+//   key (crates/octet-hub/tests/data/apns-test.p8, which signs nothing real) in a private 0600 copy.
+//   `curl --http2` against plain http speaks HTTP/1.1, which the stand-in answers. Nothing here
+//   reaches Apple.
 // - the WebSocket factory sets `Tailscale-User-Login`, which `tailscale serve` adds in real life.
 //   The app itself never sends that header.
 // The last part runs two hubs at once, as two Macs, each with its own run dir, port, journal dir,
@@ -24,6 +29,7 @@ import path from "node:path";
 import WebSocket from "ws";
 
 import { type BatchItem, HubClient } from "../src/client/HubClient";
+import { activityRegistration } from "../src/activityModel";
 import { sendVia } from "../src/sendVia";
 import { parsePairLink } from "../src/client/link";
 import { keyFor, keyOf, linksOf, tapKey } from "../src/macs";
@@ -37,6 +43,12 @@ const PHONE = "Contract phone";
 const JOURNAL = "session-1-1.jsonl";
 const PUSH_TOKEN = "ExponentPushToken[contract-test-token]";
 const SESSION_TEXT = "Claude Code · opus · ask mode · /work";
+/** The phone's push-to-start token, as ActivityKit gives it: lowercase hex. */
+const START_TOKEN = "5ab1e5".repeat(8);
+const TEAM_ID = "ABCDE12345";
+const KEY_ID = "KEY1234567";
+/** The test key: a P-256 key that signs nothing real (its file says so above the PEM block). */
+const TEST_KEY = path.resolve(__dirname, "../../../crates/octet-hub/tests/data/apns-test.p8");
 const run = existsSync(BINARY) ? describe : describe.skip;
 
 type Obj = Record<string, unknown>;
@@ -109,6 +121,42 @@ class PushFake {
     this.server.close();
   }
 }
+
+/** One request the APNs stand-in took. */
+interface ApnsRequest {
+  method: string;
+  path: string;
+  headers: http.IncomingHttpHeaders;
+  body: string;
+}
+
+/** A local stand-in for APNs: keeps every request and answers 200 with no body, as APNs does. */
+class ApnsFake {
+  readonly requests: ApnsRequest[] = [];
+  readonly server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk: Buffer) => (body += chunk.toString()));
+    req.on("end", () => {
+      this.requests.push({ method: req.method ?? "", path: req.url ?? "", headers: req.headers, body });
+      res.writeHead(200, { "apns-id": "00000000-0000-0000-0000-000000000000" });
+      res.end();
+    });
+  });
+
+  listen(): Promise<number> {
+    return new Promise((resolve) =>
+      this.server.listen(0, "127.0.0.1", () => resolve((this.server.address() as net.AddressInfo).port)),
+    );
+  }
+
+  close(): void {
+    this.server.closeAllConnections();
+    this.server.close();
+  }
+}
+
+/** A base64url JWT part, decoded. */
+const jwtPart = (part: string | undefined): unknown => JSON.parse(Buffer.from(part ?? "", "base64url").toString("utf8"));
 
 /** The bridge's `state` frame: the phase and the approvals open now. The hub's pusher reads these,
  * not the journal, and the summary here is what a push must never carry. */
@@ -198,6 +246,7 @@ run("the app's hub client against the real octet hub", () => {
   let workspace = "";
   let bridge: FakeBridge | null = null;
   let pushFake: PushFake | null = null;
+  let apnsFake: ApnsFake | null = null;
   let seq = 0;
   let client: HubClient | null = null;
   /** The pairing link the Mac shows for the secret the phone paired with, as the terminal UI
@@ -288,6 +337,18 @@ run("the app's hub client against the real octet hub", () => {
     pushFake = new PushFake();
     const pushPort = await pushFake.listen();
 
+    // APNs: the stand-in, and `hub.json` naming the test key, its PEM block alone in a 0600 file.
+    apnsFake = new ApnsFake();
+    const apnsPort = await apnsFake.listen();
+    const keyText = readFileSync(TEST_KEY, "utf8");
+    const keyPath = path.join(root, "AuthKey_TEST.p8");
+    writeFileSync(keyPath, keyText.slice(keyText.indexOf("-----BEGIN")), { mode: 0o600 });
+    chmodSync(keyPath, 0o600);
+    writeFileSync(
+      path.join(root, "hub.json"),
+      JSON.stringify({ apns: { team_id: TEAM_ID, key_id: KEY_ID, key_path: keyPath, sandbox: true } }),
+    );
+
     hub = spawn(BINARY, ["hub", "--journal-dir", root, "--port", String(port), "--owner", OWNER], {
       env: {
         ...process.env,
@@ -296,6 +357,7 @@ run("the app's hub client against the real octet hub", () => {
         NO_PROXY: "127.0.0.1",
         no_proxy: "127.0.0.1",
         OCTET_HUB_PUSH_URL: `http://127.0.0.1:${pushPort}/--/api/v2/push/send`,
+        OCTET_HUB_APNS_URL: `http://127.0.0.1:${apnsPort}`,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -316,6 +378,7 @@ run("the app's hub client against the real octet hub", () => {
     for (const ws of sockets) ws.terminate();
     bridge?.close();
     pushFake?.close();
+    apnsFake?.close();
     await stopChild(hub);
     if (root) rmSync(root, { recursive: true, force: true });
     if (binDir) rmSync(binDir, { recursive: true, force: true });
@@ -594,6 +657,65 @@ run("the app's hub client against the real octet hub", () => {
       kinds: { approvals: true, errors: true, turns: false },
     });
     expect(both).toMatchObject({ type: "ack", message: "Notifications on" });
+  });
+
+  it("registers the Live Activity's start token; with the phone away, an approval starts it once, content-free; clear_activity", async () => {
+    // The body the app sends (src/activityModel.ts, as src/activity.ts sends it): only the push-to-start token, as before any
+    // activity runs; a token left out is one the phone has not got.
+    const body = activityRegistration({ token: null, start: START_TOKEN });
+    expect(body).toEqual({ type: "register_activity", start_token: START_TOKEN });
+    if (!body) throw new Error("no registration");
+    const registered = await client?.request(body);
+    expect(registered).toMatchObject({ type: "ack" });
+
+    // The phone goes to the background; an approval while it is away is news to start on.
+    client?.stop();
+    await sleep(500);
+    bridge?.send(bridgeState([]));
+    bridge?.send(bridgeState([10]));
+    const start = await until("the start at the APNs stand-in", () => apnsFake?.requests[0], 15_000);
+    expect(start.method).toBe("POST");
+    expect(start.path).toBe(`/3/device/${START_TOKEN}`);
+    expect(start.headers["apns-push-type"]).toBe("liveactivity");
+    expect(start.headers["apns-topic"]).toBe("dev.octet.mobile.push-type.liveactivity");
+    expect(start.headers["apns-priority"]).toBe("10");
+    const bearer = /^bearer ([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(start.headers.authorization ?? "");
+    expect(bearer).not.toBeNull();
+    expect(jwtPart(bearer?.[1])).toEqual({ alg: "ES256", kid: KEY_ID });
+    expect(jwtPart(bearer?.[2])).toEqual({ iss: TEAM_ID, iat: expect.any(Number) });
+
+    const payload = JSON.parse(start.body) as { aps: Record<string, unknown> };
+    expect(payload).toEqual({
+      aps: {
+        timestamp: expect.any(Number),
+        event: "start",
+        "content-state": { kind: "approval", session: sessionId, mac: "mac.test.ts.net", since: expect.any(Number), approvals: 1 },
+        "attributes-type": "OctetActivity",
+        attributes: {},
+        alert: { title: "Octet", body: "Approval waiting" },
+      },
+    });
+    // Nothing of the session, its workspace, the request or the vendor.
+    for (const secret of ["/work", workspace, root, "rm -rf", "secret-dir", "private", "opus", "claude", JOURNAL, PHONE]) {
+      expect(start.body).not.toContain(secret);
+    }
+    await sleep(3500);
+    expect(apnsFake?.requests).toHaveLength(1);
+    // The token is in neither the hub's output nor its audit file; the registration is audited.
+    expect(hubLog).not.toContain(START_TOKEN);
+    const audit = readFileSync(path.join(root, "hub-audit.jsonl"), "utf8");
+    expect(audit).not.toContain(START_TOKEN);
+    expect(audit.split("\n").filter((line) => line !== "").map((line) => (JSON.parse(line) as { what?: unknown }).what)).toContain(
+      "activity registered",
+    );
+
+    // Back in the foreground, the phone turns the Live Activity off: the hub forgets the tokens.
+    client?.start();
+    await until("the client to be ready", () => client?.state === "ready");
+    const cleared = await client?.request({ type: "clear_activity" });
+    expect(cleared).toMatchObject({ type: "ack" });
+    await sleep(1500);
+    expect(apnsFake?.requests).toHaveLength(1);
   });
 
   it("is unpaired once the Mac revokes the phone", async () => {

@@ -17,6 +17,7 @@ describe("settings", () => {
       notifications: false,
       pushKinds: { approvals: true, errors: true, turns: false },
       textSize: 13,
+      liveActivity: true,
     });
   });
 
@@ -32,6 +33,7 @@ describe("settings", () => {
       notifications: false,
       pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
+      liveActivity: true,
     });
   });
 
@@ -57,6 +59,16 @@ describe("settings", () => {
     }
   });
 
+  it("the Live Activity is on by default, round-trips, and junk is the default", async () => {
+    expect((await loadSettings()).liveActivity).toBe(true);
+    await saveSettings({ liveActivity: false });
+    expect((await loadSettings()).liveActivity).toBe(false);
+    await saveSettings({ deviceName: "p" });
+    expect((await loadSettings()).liveActivity).toBe(false);
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ liveActivity: "no" }));
+    expect((await loadSettings()).liveActivity).toBe(true);
+  });
+
   it("notifications are off by default, round-trip, and an old record without the field still loads", async () => {
     await AsyncStorage.setItem(
       SETTINGS_KEY,
@@ -71,6 +83,7 @@ describe("settings", () => {
       notifications: false,
       pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
+      liveActivity: true,
     });
     await saveSettings({ notifications: true });
     expect((await loadSettings()).notifications).toBe(true);
@@ -154,13 +167,14 @@ describe("settings", () => {
       notifications: false,
       pushKinds: DEFAULT_PUSH_KINDS,
       textSize: 13,
+      liveActivity: true,
     });
   });
 
   it("never hold a token", async () => {
     await saveSettings({ hubUrl: "wss://x/" });
     const raw = (await AsyncStorage.getItem(SETTINGS_KEY)) ?? "";
-    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "forget", "hubUrl", "notifications", "pairings", "pushKinds", "textSize"]);
+    expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(["deviceName", "faceId", "forget", "hubUrl", "liveActivity", "notifications", "pairings", "pushKinds", "textSize"]);
   });
 });
 

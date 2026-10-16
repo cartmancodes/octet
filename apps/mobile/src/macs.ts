@@ -87,6 +87,16 @@ export function macOfHost(pairings: readonly Pick<Pairing, "id" | "hubUrl">[], h
   return null;
 }
 
+/** The longest DNS name, and the longest label of one. */
+const HOST_CHARS = 253;
+const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+/** Whether `host` is a DNS name, as a hub publishes itself (a push's `mac`, the Island's): 253
+ * characters at most, each label 1 to 63 letters, digits and hyphens, never starting or ending
+ * with a hyphen. */
+export const isHostName = (host: string): boolean =>
+  host.length <= HOST_CHARS && host.split(".").every((label) => HOST_LABEL.test(label));
+
 /** The hub's session ids are `{pid}-{started}`, both numbers. */
 const SESSION_ID = /^[0-9]+-[0-9]+$/;
 /** No id the hub makes is longer; what names one from outside the app (a push's data) may be. */

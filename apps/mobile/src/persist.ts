@@ -28,6 +28,9 @@ export interface Settings {
   pushKinds: PushKinds;
   /** The transcript's text size in points, which `Aa` cycles. */
   textSize: TextSize;
+  /** The Live Activity (the Dynamic Island and the Lock Screen) is on, where the phone has it. On
+   * unless the user turned it off. */
+  liveActivity: boolean;
 }
 
 export const TEXT_SIZES = [12, 13, 14] as const;
@@ -47,6 +50,7 @@ export const DEFAULT_SETTINGS: Settings = {
   notifications: false,
   pushKinds: DEFAULT_PUSH_KINDS,
   textSize: 13,
+  liveActivity: true,
 };
 export const SETTINGS_KEY = "octet.settings.v1";
 /** What to tell the user when a settings write failed. */
@@ -123,6 +127,7 @@ export async function readSettings(): Promise<{ ok: true; settings: Settings } |
         notifications,
         pushKinds: upgraded ? ALL_PUSH_KINDS : pushKinds(value.pushKinds),
         textSize: textSize(value.textSize),
+        liveActivity: typeof value.liveActivity === "boolean" ? value.liveActivity : DEFAULT_SETTINGS.liveActivity,
       },
     };
   } catch {
@@ -169,6 +174,7 @@ async function write(change: (saved: Settings) => Partial<Settings>): Promise<bo
         notifications: next.notifications,
         pushKinds: next.pushKinds,
         textSize: next.textSize,
+        liveActivity: next.liveActivity,
       }),
     );
     return true;

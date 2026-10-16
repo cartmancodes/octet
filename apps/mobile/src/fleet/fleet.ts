@@ -7,7 +7,8 @@ import { NOT_A_LINK, isHubUrl, pairLinkProblem, parsePairLink } from "../client/
 import { webSocketFactory } from "../client/socket";
 import { DEFAULT_PUSH_KINDS, NOT_SAVED, loadSettings, readSettings, updateSettings, type Settings } from "../persist";
 import { createCoalescer, type Coalescer } from "../coalesce";
-import { MAX_MACS, TOO_MANY_MACS, cleanMacName, hostOf, keyFor, macNameOf, macOfHost, newMacId, tapKey, type Links, type Pairing, type Tap } from "../macs";
+import { MAX_MACS, TOO_MANY_MACS, cleanMacName, hostOf, keyFor, macNameOf, macOfHost, macOfKey, newMacId, tapKey, type Links, type Pairing, type Tap } from "../macs";
+import type { ApproveLink } from "../navigation";
 import { askForToken, currentToken, dropPushRegistration, projectId } from "../notifications";
 import type { PushKinds } from "../protocol";
 import { hasEnded, octetStore, type OctetStore } from "../store";
@@ -15,6 +16,8 @@ import { TOKEN_KEY, keepToken, secureStore, tokenKeyOf, tokenStore, type Keychai
 import { MacLink, UNREACHABLE, type LinkHost, type MacInfo, type PushResult } from "./macLink";
 
 export { NOT_A_LINK };
+/** How long an approve link waits for its Mac's list before it gives up (and the Inbox stays). */
+export const APPROVE_WAIT_MS = 8_000;
 /** The Mac revoked this phone: only that pairing goes. */
 export const unpairedNotice = (macName: string): string => `This phone was unpaired on ${macName}`;
 export const UNPAIR_FAILED_NOTICE = "This phone couldn't delete its pairing. Pair again to replace it.";
@@ -69,7 +72,8 @@ export interface FleetOptions {
  */
 export class Fleet {
   private readonly factory: SocketFactory;
-  private readonly store: OctetStore;
+  /** The store every link feeds. */
+  readonly store: OctetStore;
   private readonly keychain: Keychain;
   private readonly platform: string;
   private readonly clientOptions: NonNullable<FleetOptions["clientOptions"]>;
@@ -569,6 +573,50 @@ export class Fleet {
   tapKey(tap: Tap): string | null {
     const state = this.store.getState();
     return tapKey(tap, this.pairings, (key) => hasEnded(state, key));
+  }
+
+  /**
+   * The key of the session whose approval an approve link (the Island's Allow) names, now: the
+   * link's session on its Mac, by `keyFor`, only while that Mac lists it as live with that approval
+   * waiting (its row's first, or one its stream holds); null for the Inbox; undefined while that
+   * Mac has not listed yet (see `approveKey`). Nothing is sent either way: the session's screen
+   * answers it, behind Face ID and the arm.
+   */
+  approveNow(link: ApproveLink): string | null | undefined {
+    const key = this.keyFor(link.host, link.raw);
+    const mac = key === null ? null : macOfKey(key);
+    if (key === null || mac === null) return null;
+    const state = this.store.getState();
+    if (hasEnded(state, key)) return null;
+    if (!state.listed.has(mac)) return undefined; // not told yet
+    const row = state.sessions.find((s) => s.id === key);
+    if (!row || row.approvals === 0) return null;
+    const open = row.approval?.id === link.approval || (state.bySession.get(key)?.approvals ?? []).some((a) => a.id === link.approval);
+    return open ? key : null;
+  }
+
+  /** `approveNow`, waiting for the Mac's list when it has not come yet, at most `APPROVE_WAIT_MS`
+   * (then null). */
+  approveKey(link: ApproveLink): Promise<string | null> {
+    const now = this.approveNow(link);
+    if (now !== undefined) return Promise.resolve(now);
+    return new Promise((resolve) => {
+      let done = false;
+      let cancel = () => {};
+      let off = () => {};
+      const finish = (key: string | null) => {
+        if (done) return;
+        done = true;
+        cancel();
+        off();
+        resolve(key);
+      };
+      off = this.store.subscribe(() => {
+        const got = this.approveNow(link);
+        if (got !== undefined) finish(got);
+      });
+      cancel = this.schedule(() => finish(null), APPROVE_WAIT_MS);
+    });
   }
 
   /** The user dismissed the notice the Inbox shows (a Mac that unpaired this phone, an unpair

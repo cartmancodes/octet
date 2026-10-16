@@ -2,14 +2,15 @@ import { Stack, useNavigationContainerRef, usePathname, useRouter } from "expo-r
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import * as SystemUI from "expo-system-ui";
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { AppState, View } from "react-native";
 
+import { LiveActivity, LiveActivityContext, LiveApiContext } from "../src/activity";
 import { ApprovalToasts } from "../src/components/ApprovalToasts";
 import { Drawer, DrawerHost } from "../src/components/Drawer";
 import { closeDrawer, drawerScreen, setDrawerEnabled } from "../src/drawer";
 import { useFleetStatus, useHubController, useOffer } from "../src/hub";
-import { openSession } from "../src/navigation";
+import { openSession, parseApproveLink, watchApproveLinks } from "../src/navigation";
 import { clearDelivered, configureNotifications, watchTaps, type Tap } from "../src/notifications";
 import { useTheme } from "../src/theme";
 import { ToastHost } from "../src/ui";
@@ -38,6 +39,13 @@ export default function RootLayout() {
   const status = useFleetStatus();
   const offer = useOffer();
   const pathname = usePathname();
+  // The Live Activity, driven from the same store and Macs as the screens (src/activity.ts).
+  const liveApi = useContext(LiveApiContext);
+  const live = useMemo(() => new LiveActivity({ api: liveApi, fleet: hub, store: hub.store }), [liveApi, hub]);
+  useEffect(() => {
+    live.start();
+    return () => live.stop();
+  }, [live]);
 
   // The drawer belongs to the Inbox, a Conversation and Settings of a paired phone: anywhere else
   // (Pair, New session) it is closed and disabled. A layout effect, so no frame shows it open there.
@@ -54,16 +62,22 @@ export default function RootLayout() {
     // pause (a Face ID prompt, the app switcher), not the background. A launch that reports no
     // state yet counts as foreground. Back in the app, the notifications in the tray are old
     // news: the screens show the live state.
-    hub.setForeground(AppState.currentState !== "background");
+    const foreground = AppState.currentState !== "background";
+    hub.setForeground(foreground);
+    live.setForeground(foreground);
     const subscription = AppState.addEventListener("change", (state) => {
       if (state === "active") {
         hub.setForeground(true);
+        live.setForeground(true);
         void clearDelivered();
-      } else if (state === "background") hub.setForeground(false);
+      } else if (state === "background") {
+        hub.setForeground(false);
+        live.setForeground(false);
+      }
     });
     void hub.init();
     return () => subscription.remove();
-  }, [hub]);
+  }, [hub, live]);
 
   // A tap opens the session it names on the Mac it names (`Fleet.tapKey`: the pairing of the
   // push's host, or the only one when it names none), as the drawer does (back to it when it is in
@@ -79,17 +93,59 @@ export default function RootLayout() {
     if (key === null) router.replace("/");
     else openSession(router, nav.getRootState(), pathname, key);
   };
-  // The latest of these, for the listener below, which is set up once.
-  const route = useRef({ status, offer, open });
+  // The Island's Allow (`octet://approve/<host>/<raw>/<approval>`, src/navigation.ts): for a known
+  // Mac (`Fleet.approveNow`, through `keyFor`), a session it lists as live and that approval
+  // waiting there, the session opens as from a tap, and its Permission card asks for Face ID and
+  // waits out the arm as everywhere. Anything else, a forged, stale or unknown link, opens the
+  // Inbox. The link sends nothing. Before that Mac has listed (just after a cold start) the Inbox
+  // shows while it waits, and the session opens over it only if the user is still there and no
+  // newer link came.
+  const approve = (url: string) => {
+    if (status === "unpaired") {
+      router.replace("/pair");
+      return;
+    }
+    const link = parseApproveLink(url);
+    const now = link === null ? null : hub.approveNow(link);
+    links.current += 1;
+    if (typeof now === "string") {
+      openSession(router, nav.getRootState(), pathname, now);
+      return;
+    }
+    router.replace("/");
+    if (link === null || now === null) return;
+    const seq = links.current;
+    void hub.approveKey(link).then((key) => {
+      if (key === null || links.current !== seq || route.current.pathname !== "/") return;
+      openSession(router, nav.getRootState(), "/", key);
+    });
+  };
+  const links = useRef(0);
+  // The latest of these, for the listeners below, which are set up once.
+  const route = useRef({ status, offer, open, approve, pathname });
   const waiting = useRef<Tap | null>(null);
+  const waitingLink = useRef<string | null>(null);
   useEffect(() => {
-    route.current = { status, offer, open };
-    if (status === "loading" || offer || waiting.current === null) return;
-    // A tap that arrived before the saved pairings were read, or during the notifications step.
+    route.current = { status, offer, open, approve, pathname };
+    if (status === "loading" || offer) return;
+    // A tap or a link that arrived before the saved pairings were read, or during the
+    // notifications step.
     const tap = waiting.current;
+    const url = waitingLink.current;
     waiting.current = null;
-    open(tap);
+    waitingLink.current = null;
+    if (tap !== null) open(tap);
+    if (url !== null) approve(url);
   });
+
+  useEffect(
+    () =>
+      watchApproveLinks((url) => {
+        if (route.current.status === "loading" || route.current.offer) waitingLink.current = url;
+        else route.current.approve(url);
+      }),
+    [],
+  );
 
   // Nothing shows while the app is open; Android gets its channels. Then taps on notifications,
   // the one that launched the app included.
@@ -116,7 +172,7 @@ export default function RootLayout() {
 
   const paired = status === "paired";
   return (
-    <>
+    <LiveActivityContext.Provider value={live}>
       <StatusBar style="auto" />
       <DrawerHost>
         <Stack
@@ -144,6 +200,6 @@ export default function RootLayout() {
       {paired && !offer ? <Drawer /> : null}
       {/* Last, so a toast draws over the drawer and its scrim: its action still works there. */}
       <ToastHost />
-    </>
+    </LiveActivityContext.Provider>
   );
 }

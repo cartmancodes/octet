@@ -8,6 +8,7 @@
 export { TOKEN_KEY, tokenKey, tokenKeyOf, type Keychain, type TokenStore } from "./fleet/keychain";
 export { MacLink, type MacInfo, type PushResult } from "./fleet/macLink";
 export {
+  APPROVE_WAIT_MS,
   Fleet,
   NOT_A_LINK,
   UNPAIR_FAILED_NOTICE,

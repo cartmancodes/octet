@@ -8,7 +8,7 @@ import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
 
-import { isSessionId, type Tap } from "./macs";
+import { isHostName, isSessionId, type Tap } from "./macs";
 
 export type { Tap };
 
@@ -36,18 +36,12 @@ export function sessionFromData(data: unknown): string | null {
   return typeof session === "string" && isSessionId(session) ? session : null;
 }
 
-/** The longest DNS name, and the longest label of one. */
-const HOST_CHARS = 253;
-const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
-
 /** The host a notification names as its Mac (`data.mac`), or null for data that is not a DNS
- * name: 253 characters at most, each label 1 to 63 letters, digits and hyphens, never starting or
- * ending with a hyphen. */
+ * name (`isHostName`). */
 function hostFromData(data: unknown): string | null {
   if (typeof data !== "object" || data === null) return null;
   const mac = (data as { mac?: unknown }).mac;
-  if (typeof mac !== "string" || mac.length > HOST_CHARS) return null;
-  return mac.split(".").every((label) => HOST_LABEL.test(label)) ? mac : null;
+  return typeof mac === "string" && isHostName(mac) ? mac : null;
 }
 
 /** What a notification's data names: the session, and the host of the Mac that sent it. Each is

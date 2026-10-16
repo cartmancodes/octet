@@ -4,6 +4,7 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { useLiveActivity } from "../src/activity";
 import { confirmBiometric } from "../src/auth";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
@@ -44,6 +45,10 @@ export default function Settings() {
   const pushing = useRef(false);
   /** The switch is being worked on: "on" or "off"; null when idle. */
   const [working, setWorking] = useState<"on" | "off" | null>(null);
+  // The Live Activity's switch: only where the phone has Live Activities.
+  const live = useLiveActivity();
+  const [liveError, setLiveError] = useState(false);
+  const flipping = useRef(false);
 
   useEffect(() => {
     let live = true;
@@ -109,6 +114,25 @@ export default function Settings() {
   const flipTurns = useCallback((on: boolean) => void changeKind("turns", on), [changeKind]);
   const flipErrors = useCallback((on: boolean) => void changeKind("errors", on), [changeKind]);
 
+  // On or off, saved first: off ends the activity and has every Mac forget this phone's tokens.
+  const flipLive = useCallback(
+    async (on: boolean) => {
+      if (!live || flipping.current) return;
+      flipping.current = true;
+      try {
+        setLiveError(false);
+        const kept = await live.setEnabled(on);
+        if (!alive()) return;
+        if (kept) setSaved((s) => (s ? { ...s, liveActivity: on } : s));
+        else setLiveError(true);
+      } finally {
+        flipping.current = false;
+      }
+    },
+    [alive, live],
+  );
+  const onLive = useCallback((on: boolean) => void flipLive(on), [flipLive]);
+
   const openMenu = useCallback(() => openDrawer(), []);
 
   const rename = useCallback((mac: string, name: string) => hub.rename(mac, name), [hub]);
@@ -173,6 +197,20 @@ export default function Settings() {
             </View>
           ) : null}
         </Card>
+
+        {live?.supported ? (
+          <Card title="Live Activity">
+            <SwitchRow label="Show sessions in the Dynamic Island" accessibilityLabel="Live Activity" value={saved.liveActivity} onValueChange={onLive} />
+            <Text style={[type.caption, styles.words, { color: theme.muted }]}>
+              {"While the app is away, your Macs start it with no names or commands: only whether a session runs or waits, and since when."}
+            </Text>
+            {liveError ? (
+              <View accessibilityLiveRegion="polite" style={styles.words}>
+                <Text style={[type.caption, { color: theme.fg }]}>{NOT_SAVED}</Text>
+              </View>
+            ) : null}
+          </Card>
+        ) : null}
 
         <Card title="Face ID to allow">
           <SwitchRow label="Ask before allowing" accessibilityLabel="Face ID to allow" value={saved.faceId} onValueChange={flip} />

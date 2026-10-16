@@ -10,6 +10,7 @@ import Settings from "../app/settings";
 import { drawerStore, closeDrawer } from "./drawer";
 import { tokenKeyOf } from "./hub";
 import { loadSettings, saveSettings } from "./persist";
+import { FakeLive } from "./liveRig";
 import { info, launch, pairedStorage } from "./screenRig";
 import { M } from "./testKeys";
 
@@ -499,5 +500,53 @@ describe("Settings", () => {
       expect(31 + slop.top + slop.bottom).toBeGreaterThanOrEqual(44);
       expect(51 + slop.left + slop.right).toBeGreaterThanOrEqual(44);
     });
+  });
+});
+
+describe("Settings › Live Activity", () => {
+  const island = () => screen.queryByRole("switch", { name: "Live Activity" });
+
+  async function openWith(api?: FakeLive) {
+    const rig = await launch("/", { settings: Settings }, [info("live")], api ? { live: api } : {});
+    await act(async () => router.push("/settings"));
+    await flush();
+    return rig;
+  }
+
+  it("is not there where Live Activities are not supported (Android, Expo Go, jest)", async () => {
+    await openWith();
+    expect(island()).toBeNull();
+    expect(screen.queryByText("Live Activity")).toBeNull();
+  });
+
+  it("is there, and on, where they are", async () => {
+    await openWith(new FakeLive());
+    expect(island()?.props.value).toBe(true);
+    const slop = island()?.props.hitSlop as { top: number; bottom: number };
+    expect(31 + slop.top + slop.bottom).toBeGreaterThanOrEqual(44);
+  });
+
+  it("off ends the activity, tells the Mac to forget the tokens and empties the widget's entries; on registers again", async () => {
+    const api = new FakeLive();
+    const rig = await openWith(api);
+    await act(async () => api.pushToStartToken("ab12"));
+    await flush();
+    const socket = rig.sockets.last;
+    expect(socket.commandsOf("register_activity")).toEqual([expect.objectContaining({ start_token: "ab12" })]);
+    await act(async () => socket.receive({ type: "ack", req: socket.commandsOf("register_activity")[0]?.req, message: "Activity registered" }));
+
+    await fireEvent(screen.getByRole("switch", { name: "Live Activity" }), "valueChange", false);
+    await flush();
+    expect(island()?.props.value).toBe(false);
+    expect((await loadSettings()).liveActivity).toBe(false);
+    expect(api.of("end")).toHaveLength(1);
+    expect(api.of("setEntries").at(-1)?.arg).toEqual({});
+    expect(socket.commandsOf("clear_activity")).toHaveLength(1);
+
+    await fireEvent(screen.getByRole("switch", { name: "Live Activity" }), "valueChange", true);
+    await flush();
+    expect(island()?.props.value).toBe(true);
+    expect((await loadSettings()).liveActivity).toBe(true);
+    expect(socket.commandsOf("register_activity")).toHaveLength(2);
   });
 });
