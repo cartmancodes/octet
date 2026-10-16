@@ -1,5 +1,5 @@
 //! Devices, pairing secrets, hub config and the audit log.
-use octet_core::remote::protocol::{PushKinds, is_push_token};
+use octet_core::remote::protocol::{PushKinds, is_activity_token, is_push_token};
 use octet_store::{create_private, create_private_dir, sync_directory};
 use sha2::{Digest, Sha256};
 use std::{
@@ -47,9 +47,33 @@ pub struct Device {
     /// What it is pushed: the defaults for a new pairing, every kind for one from before kinds,
     /// until the phone says.
     pub push_kinds: PushKinds,
+    /// The `ActivityKit` tokens its Live Activity pushes go to, if the phone registered them.
+    pub activity: Option<ActivityTokens>,
 }
 
-/// Shows the device without its token hash or push token.
+/// A device's `ActivityKit` tokens, from its last `register_activity`, which replaced both.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActivityTokens {
+    /// The running activity's push token: lowercase hex.
+    pub token: String,
+    /// The push-to-start token, lowercase hex; none if the last registration left it out.
+    pub start_token: Option<String>,
+}
+
+/// Shows whether each token is there, never the token.
+impl std::fmt::Debug for ActivityTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivityTokens")
+            .field("token", &"<redacted>")
+            .field(
+                "start_token",
+                &self.start_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Shows the device without its token hash, push token or activity tokens.
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Device")
@@ -64,6 +88,7 @@ impl std::fmt::Debug for Device {
                 &self.push_token.as_ref().map(|_| "<redacted>"),
             )
             .field("push_kinds", &self.push_kinds)
+            .field("activity", &self.activity)
             .finish()
     }
 }
@@ -208,6 +233,7 @@ impl Store {
             token_sha256: sha256_hex(&token),
             push_token: None,
             push_kinds: PushKinds::default(),
+            activity: None,
         };
         self.update(|devices| {
             if devices.iter().any(|kept| kept.name == device.name) {
@@ -363,6 +389,32 @@ impl Store {
         .await
     }
 
+    /// Sets the `ActivityKit` tokens of the device whose token hash is `token_sha256`, replacing
+    /// both it had: an `activity` without a start token clears the stored one. False if there is
+    /// no such device. A revoke removes the device, and its tokens with it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
+    pub async fn set_activity(
+        &mut self,
+        token_sha256: &str,
+        activity: ActivityTokens,
+    ) -> io::Result<bool> {
+        self.update(|devices| {
+            let Some(device) = devices
+                .iter_mut()
+                .find(|device| device.token_sha256 == token_sha256)
+            else {
+                return (false, false);
+            };
+            let changed = device.activity.as_ref() != Some(&activity);
+            device.activity = Some(activity);
+            (true, changed)
+        })
+        .await
+    }
+
     /// The paired devices.
     pub fn devices(&self) -> &[Device] {
         &self.devices
@@ -464,6 +516,12 @@ impl Store {
                         "errors": kinds.errors,
                         "turns": kinds.turns,
                     });
+                    if let Some(activity) = &device.activity {
+                        entry["activity"] = serde_json::json!({ "token": activity.token });
+                        if let Some(start) = &activity.start_token {
+                            entry["activity"]["start_token"] = serde_json::json!(start);
+                        }
+                    }
                     entry
                 })
                 .collect::<Vec<_>>();
@@ -546,6 +604,7 @@ async fn read_devices(directory: &Path) -> io::Result<(Vec<Device>, Option<Stamp
                 token_sha256: text("token_sha256")?,
                 push_token: text("push_token").filter(|token| is_push_token(token)),
                 push_kinds: push_kinds(&entry["push_kinds"]),
+                activity: activity(&entry["activity"]),
             })
             .filter(|device| {
                 !device.login.is_empty()
@@ -571,6 +630,21 @@ fn push_kinds(stored: &serde_json::Value) -> PushKinds {
         errors: kind("errors"),
         turns: kind("turns"),
     }
+}
+
+/// A device's stored `ActivityKit` tokens. A file from before them has none, as has one whose
+/// `token` is not lowercase hex; a start token that is not is dropped alone.
+fn activity(stored: &serde_json::Value) -> Option<ActivityTokens> {
+    let checked = |key: &str| {
+        stored[key]
+            .as_str()
+            .filter(|token| is_activity_token(token))
+            .map(str::to_owned)
+    };
+    Some(ActivityTokens {
+        token: checked("token")?,
+        start_token: checked("start_token"),
+    })
 }
 
 /// The settings when `hub.json` names none: port 47823 and no extra workspaces.
@@ -1156,6 +1230,163 @@ mod tests {
         let store = store(&dir).await;
         assert_eq!(store.devices().len(), 1);
         assert_eq!(store.devices()[0].push_token, None);
+    }
+
+    const ACTIVITY: &str = "5ec7e7aaaa0123456789abcdef";
+    const START: &str = "5ec7e7bbbb0123456789abcdef";
+
+    fn activity(token: &str, start_token: Option<&str>) -> ActivityTokens {
+        ActivityTokens {
+            token: token.to_owned(),
+            start_token: start_token.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_tokens_are_kept_private_replaced_and_dropped_on_revoke() {
+        let dir = TempDir::new("hub-activity");
+        let mut store = store(&dir).await;
+        let token = paired(&mut store, "Gemini 10", epoch(1)).await;
+        let other = paired(&mut store, "Other", epoch(1)).await;
+        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        assert_eq!(device.activity, None);
+
+        // Setting stores both in the 0600 file, and they read back.
+        assert!(
+            store
+                .set_activity(&device.token_sha256, activity(ACTIVITY, Some(START)))
+                .await
+                .unwrap()
+        );
+        let file = dir.path().join("devices.json");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("\"activity\""), "{text}");
+        assert!(text.contains(ACTIVITY) && text.contains(START), "{text}");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let reopened = Store::open(dir.path()).await.unwrap();
+        let held: Vec<_> = reopened
+            .devices()
+            .iter()
+            .map(|d| (d.name.as_str(), d.activity.clone()))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("Gemini 10", Some(activity(ACTIVITY, Some(START)))),
+                ("Other", None)
+            ]
+        );
+        let seen = store.authenticate(&token, LOGIN, epoch(3)).await.unwrap();
+        assert_eq!(seen.activity, Some(activity(ACTIVITY, Some(START))));
+
+        // Debug shows neither token, on the device or on its own.
+        for shown in [
+            format!("{:?}", reopened.devices()[0]),
+            format!("{:?}", activity(ACTIVITY, Some(START))),
+        ] {
+            assert!(!shown.contains("5ec7e7"), "{shown}");
+            assert!(shown.contains("redacted"), "{shown}");
+        }
+        assert!(format!("{:?}", reopened.devices()[0]).contains("activity"));
+
+        // A later registration replaces both; one without a start token clears it.
+        let newer = "0123456789abcdef5ec7e7cccc";
+        assert!(
+            store
+                .set_activity(&device.token_sha256, activity(newer, None))
+                .await
+                .unwrap()
+        );
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains(newer)
+                && !text.contains(ACTIVITY)
+                && !text.contains(START)
+                && !text.contains("start_token"),
+            "{text}"
+        );
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(reopened.devices()[0].activity, Some(activity(newer, None)));
+        assert!(store.authenticate(&other, LOGIN, epoch(4)).await.is_some());
+        assert_eq!(store.devices()[1].activity, None);
+
+        // An unknown device is reported and nothing is written.
+        assert!(
+            !store
+                .set_activity(&"0".repeat(64), activity(ACTIVITY, Some(START)))
+                .await
+                .unwrap()
+        );
+        assert!(!std::fs::read_to_string(&file).unwrap().contains(ACTIVITY));
+
+        // A revoke drops the tokens with the device.
+        assert!(store.revoke("Gemini 10").await);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains(newer) && !text.contains("\"activity\""),
+            "{text}"
+        );
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(reopened.devices().len(), 1);
+        assert_eq!(reopened.devices()[0].activity, None);
+    }
+
+    #[tokio::test]
+    async fn a_devices_file_from_before_activity_tokens_still_loads_and_bad_ones_are_dropped() {
+        let dir = TempDir::new("hub-oldactivity");
+        let entry = |name: &str, c: &str, extra: &str| {
+            format!(
+                r#"{{"name":"{name}","platform":"ios","login":"{LOGIN}","created":1,"last_seen":2,"token_sha256":"{}","push_token":"{PUSH}","push_kinds":{{"approvals":true,"errors":true,"turns":false}}{extra}}}"#,
+                c.repeat(64)
+            )
+        };
+        let file = format!(
+            r#"{{"devices":[{},{},{},{},{},{},{}]}}"#,
+            entry("Old", "a", ""),
+            entry(
+                "Good",
+                "b",
+                &format!(r#","activity":{{"token":"{ACTIVITY}","start_token":"{START}"}}"#)
+            ),
+            entry(
+                "NoStart",
+                "c",
+                &format!(r#","activity":{{"token":"{ACTIVITY}"}}"#)
+            ),
+            entry(
+                "BadStart",
+                "d",
+                &format!(r#","activity":{{"token":"{ACTIVITY}","start_token":"NOPE"}}"#)
+            ),
+            entry("Upper", "e", r#","activity":{"token":"ABCDEF"}"#),
+            entry("Word", "f", r#","activity":"on""#),
+            entry("Null", "1", r#","activity":null"#),
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("devices.json"), file).unwrap();
+        let store = store(&dir).await;
+        let held: Vec<_> = store
+            .devices()
+            .iter()
+            .map(|d| (d.name.as_str(), d.activity.clone()))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("Old", None),
+                ("Good", Some(activity(ACTIVITY, Some(START)))),
+                ("NoStart", Some(activity(ACTIVITY, None))),
+                ("BadStart", Some(activity(ACTIVITY, None))),
+                ("Upper", None),
+                ("Word", None),
+                ("Null", None),
+            ]
+        );
+        // The rest of an old device is untouched.
+        assert_eq!(store.devices()[0].push_token.as_deref(), Some(PUSH));
     }
 
     #[tokio::test]

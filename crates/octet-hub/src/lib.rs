@@ -12,5 +12,5 @@ mod tail;
 mod watch;
 pub use owner::{owner_login, published_url};
 pub use server::{Hub, Publisher};
-pub use store::{Device, HubConfig, Store};
+pub use store::{ActivityTokens, Device, HubConfig, Store};
 pub use watch::{Lines, NOT_RUNNING, plain, watch};

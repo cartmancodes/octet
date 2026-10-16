@@ -328,6 +328,15 @@ export interface RegisterPushCommand {
   kinds?: PushKinds | null;
 }
 
+/** Set the ActivityKit tokens the hub's Live Activity pushes go to: `token`, the running activity's push token, and `start_token`, the push-to-start token, each 1 to 200 lowercase hex digits. Each registration replaces both: one without `start_token` clears the start token the hub had. */
+export interface RegisterActivityCommand {
+  v: 1;
+  type: "register_activity";
+  req: number;
+  token: string;
+  start_token?: string | null;
+}
+
 /** Ask the hub to answer, to tell a live connection from a dead one. */
 export interface PingCommand {
   v: 1;
@@ -592,6 +601,7 @@ export type FromPhone =
   | HelloCommand
   | PairCommand
   | RegisterPushCommand
+  | RegisterActivityCommand
   | PingCommand
   | SubscribeCommand
   | UnsubscribeCommand

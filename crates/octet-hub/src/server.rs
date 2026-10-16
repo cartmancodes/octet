@@ -48,16 +48,16 @@ use crate::{
     owner::published_url,
     push::{self, Pusher, Sender},
     sessions::{SessionUpdate, Sessions},
-    store::{Device, SECRET_REFUSED, Store},
+    store::{ActivityTokens, Device, SECRET_REFUSED, Store},
     tail::{self, file_name},
 };
 use futures_util::{SinkExt, StreamExt};
 use octet_core::PROMPT_LIMIT;
 use octet_core::remote::{
     protocol::{
-        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, ack, catalog_frame,
-        event_frame, full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of,
-        sessions_frame, state_frame, subscribed_frame, welcome,
+        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, Secret, ack,
+        catalog_frame, event_frame, full_access_confirmed, paired, parse_phone, recent_frame,
+        refused, req_of, sessions_frame, state_frame, subscribed_frame, welcome,
     },
     run::run_dir,
 };
@@ -172,6 +172,8 @@ const SCAN_RUNNING: &str = "A recent-sessions scan is running; try again";
 const JOB_TIMED_OUT: &str = "That took too long; try again";
 /// The refusal for a push registration that could not be written.
 const PUSH_NOT_SAVED: &str = "Could not save the notification setting; try again";
+/// Refuses a Live Activity registration the store could not save.
+const ACTIVITY_NOT_SAVED: &str = "Could not save the Live Activity; try again";
 /// Reports of dead push tokens waiting for the hub loop.
 const PUSH_QUEUE: usize = 16;
 /// How long a scan or a start may take in all.
@@ -944,6 +946,11 @@ impl Hub {
                 let token = token.map(|token| token.expose().to_owned());
                 return self.register_push(conn, device, req, token, kinds).await;
             }
+            PhoneCommand::RegisterActivity { token, start_token } => {
+                return self
+                    .register_activity(conn, device, req, &token, start_token)
+                    .await;
+            }
             PhoneCommand::Subscribe { session, after } => {
                 self.subscribe(conn, req, session, after);
                 return;
@@ -1060,6 +1067,53 @@ impl Hub {
         };
         self.store.audit(&device.name, "", what).await;
         self.send(conn, &ack(req, message));
+    }
+
+    /// Stores `device`'s `ActivityKit` tokens, replacing both it had, and answers `req`. Neither
+    /// token nor the device's hash reaches the audit line or a log.
+    async fn register_activity(
+        &mut self,
+        conn: u64,
+        device: &Device,
+        req: u64,
+        token: &Secret,
+        start_token: Option<Secret>,
+    ) {
+        let activity = ActivityTokens {
+            token: token.expose().to_owned(),
+            start_token: start_token.map(|token| token.expose().to_owned()),
+        };
+        match self
+            .store
+            .set_activity(&device.token_sha256, activity.clone())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.refuse(conn, req, Code::Unavailable, ACTIVITY_NOT_SAVED);
+                return;
+            }
+            Err(error) => {
+                // The error names a kind, never a token or the device's hash.
+                eprintln!("Couldn't save a phone's Live Activity: {}", error.kind());
+                self.refuse(conn, req, Code::Unavailable, ACTIVITY_NOT_SAVED);
+                return;
+            }
+        }
+        // The connections of this device carry a copy of it.
+        for state in self.conns.values_mut() {
+            if let Some(held) = state
+                .device
+                .as_mut()
+                .filter(|held| held.token_sha256 == device.token_sha256)
+            {
+                held.activity = Some(activity.clone());
+            }
+        }
+        self.store
+            .audit(&device.name, "", "activity registered")
+            .await;
+        self.send(conn, &ack(req, "Activity registered"));
     }
 
     /// Lists resumable sessions in the background; the scan reads up to 400 journals, and only
