@@ -10,10 +10,16 @@
     "ios": {
       "bundleIdentifier": "dev.octet.mobile",
       "supportsTablet": false,
+      "deploymentTarget": "17.2",
+      "entitlements": {
+        "com.apple.security.application-groups": ["group.dev.octet.mobile"]
+      },
       "infoPlist": {
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": false
-        }
+        },
+        "NSSupportsLiveActivities": true,
+        "NSSupportsLiveActivitiesFrequentUpdates": false
       }
     },
     "android": {
@@ -44,6 +50,7 @@
         }
       ],
       "expo-notifications",
+      "@bacons/apple-targets",
       [
         "expo-splash-screen",
         {

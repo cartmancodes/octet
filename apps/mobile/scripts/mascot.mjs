@@ -5,15 +5,23 @@
 // Each colour is merged into one path. No dependencies: the SVGs are plain,
 // machine-written XML, so a small attribute parser is enough.
 //
-//   node scripts/mascot.mjs            write src/mascot/poses.ts
-//   node scripts/mascot.mjs --stdout   print it instead (the test compares)
-import { readFileSync, writeFileSync } from "node:fs";
+// It also writes the Live Activity widget's poses (one per activity kind) as
+// PNGs into its asset catalog, since a widget can't draw react-native-svg.
+//
+//   node scripts/mascot.mjs            write src/mascot/poses.ts and the widget's PNGs
+//   node scripts/mascot.mjs --stdout   print poses.ts instead (the test compares)
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { deflateSync } from "node:zlib";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const svgDir = path.resolve(here, "..", "..", "..", "docs", "design", "octet-agent-modes");
 const outFile = path.resolve(here, "..", "src", "mascot", "poses.ts");
+const widgetAssets = path.resolve(here, "..", "targets", "octet-live", "Assets.xcassets");
+
+/** The widget's poses: running codes, an approval asks, done succeeds. */
+export const WIDGET_POSES = ["coding", "approval", "success"];
 
 export const POSES = [
   "idle",
@@ -100,11 +108,78 @@ export function generate() {
   return lines.join("\n");
 }
 
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function chunk(type, data) {
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(data.length, 0);
+  head.write(type, 4, "latin1");
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), data])), 0);
+  return Buffer.concat([head, data, crc]);
+}
+
+/** One pose as an 8-bit RGBA PNG at its own pixel size: each colour's rects, in order. */
+export function png({ viewBox, paths }) {
+  const [, , width, height] = viewBox.split(" ").map(Number);
+  const stride = width * 4 + 1;
+  const raw = Buffer.alloc(stride * height); // each row starts with filter 0
+  for (const { fill, d } of paths) {
+    const rgb = [1, 3, 5].map((i) => parseInt(fill.slice(i, i + 2), 16));
+    let covered = 0;
+    for (const m of d.matchAll(/M(\d+) (\d+)h(\d+)v(\d+)h-\d+[zZ]/g)) {
+      covered += m[0].length;
+      const [x0, y0, w, h] = m.slice(1, 5).map(Number);
+      for (let y = y0; y < y0 + h; y++) {
+        for (let x = x0; x < x0 + w; x++) raw.set([...rgb, 255], y * stride + 1 + x * 4);
+      }
+    }
+    if (covered !== d.length) throw new Error(`a path that isn't whole-pixel rects: ${d.slice(0, 40)}`);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr.set([8, 6, 0, 0, 0], 8); // 8-bit RGBA, no interlace
+  return Buffer.concat([
+    Buffer.from("89504e470d0a1a0a", "hex"),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw, { level: 9 })),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+/** Writes each widget pose as a single-scale imageset; the widget scales it without smoothing. */
+export function writeWidgetPoses() {
+  for (const name of WIDGET_POSES) {
+    const svg = readFileSync(path.join(svgDir, `octet-${name}.svg`), "utf8");
+    const set = path.join(widgetAssets, `mascot-${name}.imageset`);
+    mkdirSync(set, { recursive: true });
+    writeFileSync(path.join(set, `mascot-${name}.png`), png(parse(name, svg)));
+    const contents = {
+      images: [{ filename: `mascot-${name}.png`, idiom: "universal" }],
+      info: { author: "xcode", version: 1 },
+    };
+    writeFileSync(path.join(set, "Contents.json"), `${JSON.stringify(contents, null, 2)}\n`);
+  }
+  process.stderr.write(`wrote ${WIDGET_POSES.length} widget poses into ${widgetAssets}\n`);
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const text = generate();
   if (process.argv.includes("--stdout")) process.stdout.write(text);
   else {
     writeFileSync(outFile, text);
     process.stderr.write(`wrote ${outFile} (${text.length} bytes)\n`);
+    writeWidgetPoses();
   }
 }
