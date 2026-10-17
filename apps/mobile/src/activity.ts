@@ -293,12 +293,14 @@ export class LiveActivity {
       this.live = false;
       this.sent = null;
       this.entries = null;
-      await this.api.end().catch(() => undefined);
-      await this.api.setEntries({}).catch(() => undefined);
+      // Every Mac is told before the end, once: the end makes ActivityKit report the token gone,
+      // and the sync that sets off finds each clear on its way already.
       this.told = new WeakMap();
       this.telling = new WeakMap();
       this.handedOver = new WeakMap();
       this.syncAll();
+      await this.api.end().catch(() => undefined);
+      await this.api.setEntries({}).catch(() => undefined);
       return true;
     }
     this.syncAll();

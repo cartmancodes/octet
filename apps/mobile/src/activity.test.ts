@@ -629,6 +629,26 @@ describe("the switch", () => {
     expect(r.api.of("start").length + r.api.of("update").length).toBeGreaterThan(0);
   });
 
+  it("off clears each Mac once, though ending the activity says its token is gone", async () => {
+    const r = await rig();
+    r.api.pushToken("ef56", "act-1");
+    await settle();
+    await r.ack(STUDIO_HOST, "register_activity");
+    await r.ack(MINI_HOST, "clear_activity");
+    // As on the phone: the end makes ActivityKit report the activity's token gone, at once.
+    r.api.end = async () => {
+      r.api.calls.push({ what: "end", at: r.clock.now() });
+      r.api.pushToken(null, "act-1");
+    };
+    const studio = r.socketOf(STUDIO_HOST).commandsOf("clear_activity").length;
+    const mini = r.socketOf(MINI_HOST).commandsOf("clear_activity").length;
+    expect(await r.live.setEnabled(false)).toBe(true);
+    await settle();
+    expect(r.socketOf(STUDIO_HOST).commandsOf("clear_activity")).toHaveLength(studio + 1);
+    expect(r.socketOf(MINI_HOST).commandsOf("clear_activity")).toHaveLength(mini + 1);
+    expect(r.api.of("end")).toHaveLength(1);
+  });
+
   it("off while a start is on its way: that activity is ended too", async () => {
     const r = await rig({ macs: [STUDIO_HOST] });
     let finish = () => {};
