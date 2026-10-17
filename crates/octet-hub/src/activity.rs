@@ -12,7 +12,8 @@
 //! - **What it shows** ([`Content`]): `approval` if any approval waits, else `running` if any
 //!   session runs, else `done`. The session that leads is the one with the oldest waiting
 //!   approval, else the most recently started running one, else the last that finished; `since`
-//!   is when that session's own kind began, and `approvals` counts every approval waiting.
+//!   is when that session's own kind began, by the wall clock as read then (so each send for it
+//!   says the same), and `approvals` counts every approval waiting.
 //! - **In front** means that the device has a connection whose `hello` is not a background one:
 //!   the app is open, on any screen. Nothing is sent then. A background connection (the app
 //!   handing a token over, or sending a Deny) never counts. The app leaving the front counts as
@@ -145,6 +146,9 @@ pub(crate) struct Content {
     pub session: String,
     /// When the leading session's kind began.
     pub since: Instant,
+    /// The wall-clock time `since` was, read once then, so every send for this lead says the same
+    /// `since`; none before the hub's first look, when `since` is the send's own now.
+    pub since_wall: Option<SystemTime>,
     /// The approvals waiting, in every session.
     pub approvals: usize,
 }
@@ -188,13 +192,14 @@ impl Due {
         }
     }
 
-    /// The APNs payload at `now` (whose wall-clock time is `wall`), naming `mac` (the host the hub
-    /// is published at, or nothing): the event and the content state; a start adds the
-    /// attributes and an alert ("Approval waiting" for an approval, else "Session running"), and
-    /// an end a `dismissal-date`. Nothing else.
-    pub(crate) fn payload(&self, mac: Option<&str>, now: Instant, wall: SystemTime) -> Value {
-        let timestamp = wall.duration_since(UNIX_EPOCH).map_or(0, |at| at.as_secs());
-        let age = now.saturating_duration_since(self.content.since).as_secs();
+    /// The APNs payload at wall-clock time `wall`, naming `mac` (the host the hub is published
+    /// at, or nothing): the event and the content state, whose `since` is the wall-clock time
+    /// stored with it; a start adds the attributes and an alert ("Approval waiting" for an
+    /// approval, else "Session running"), and an end a `dismissal-date`. Nothing else.
+    pub(crate) fn payload(&self, mac: Option<&str>, wall: SystemTime) -> Value {
+        let seconds = |at: SystemTime| at.duration_since(UNIX_EPOCH).map_or(0, |at| at.as_secs());
+        let timestamp = seconds(wall);
+        let since = self.content.since_wall.map_or(timestamp, seconds);
         let mut aps = json!({
             "timestamp": timestamp,
             "event": self.event.label(),
@@ -202,7 +207,7 @@ impl Due {
                 "kind": self.content.kind.label(),
                 "session": self.content.session,
                 "mac": mac.unwrap_or_default(),
-                "since": timestamp.saturating_sub(age),
+                "since": since,
                 "approvals": self.content.approvals,
             },
         });
@@ -241,9 +246,10 @@ struct Session {
     seen: HashSet<u64>,
     /// The approvals open now, with when each was first seen open.
     open: Vec<(u64, Instant)>,
-    /// What it shows on its own, and since when.
+    /// What it shows on its own, and since when (and that moment's wall-clock time).
     kind: Kind,
     since: Instant,
+    since_wall: SystemTime,
     /// When it last went from running or waiting to done.
     finished: Option<Instant>,
 }
@@ -353,8 +359,9 @@ pub(crate) struct Driver {
     news: u64,
     /// Bumped for each start, so a report can say which activity it was about.
     runs: u64,
-    /// When every session last went idle; none while one waits or runs, or before the first look.
-    idle_since: Option<Instant>,
+    /// When every session last went idle, and that moment's wall-clock time; none while one waits
+    /// or runs, or before the first look.
+    idle_since: Option<(Instant, SystemTime)>,
     /// By device key.
     phones: HashMap<String, Phone>,
 }
@@ -371,9 +378,10 @@ impl fmt::Debug for Driver {
 }
 
 impl Driver {
-    /// Takes the sessions as they stand at `now`. A session seen for the first time with a state
-    /// only seeds; one that is gone is forgotten.
-    pub(crate) fn observe(&mut self, snapshots: &[Snapshot], now: Instant) {
+    /// Takes the sessions as they stand at `now` (wall-clock `wall`, kept with each `since` it
+    /// sets). A session seen for the first time with a state only seeds; one that is gone is
+    /// forgotten.
+    pub(crate) fn observe(&mut self, snapshots: &[Snapshot], (now, wall): (Instant, SystemTime)) {
         let mut news = false;
         for snapshot in snapshots {
             let Some(session) = self.sessions.get_mut(&snapshot.id) else {
@@ -386,6 +394,7 @@ impl Driver {
                         open: snapshot.approvals.iter().map(|id| (*id, now)).collect(),
                         kind: Kind::Done,
                         since: now,
+                        since_wall: wall,
                         finished: None,
                     };
                     session.kind = session.own_kind();
@@ -427,6 +436,7 @@ impl Driver {
                 }
                 session.kind = kind;
                 session.since = now;
+                session.since_wall = wall;
             }
         }
         let present: HashSet<&str> = snapshots.iter().map(|s| s.id.as_str()).collect();
@@ -435,7 +445,7 @@ impl Driver {
             self.news += 1;
         }
         if self.content(now).kind == Kind::Done {
-            self.idle_since.get_or_insert(now);
+            self.idle_since.get_or_insert((now, wall));
         } else {
             self.idle_since = None;
         }
@@ -458,12 +468,14 @@ impl Driver {
                 kind: session.kind,
                 session: id.clone(),
                 since: session.since,
+                since_wall: Some(session.since_wall),
                 approvals,
             },
             None => Content {
                 kind: Kind::Done,
                 session: String::new(),
-                since: self.idle_since.unwrap_or(now),
+                since: self.idle_since.map_or(now, |(at, _)| at),
+                since_wall: self.idle_since.map(|(_, wall)| wall),
                 approvals,
             },
         }
@@ -611,7 +623,10 @@ impl Driver {
             return None;
         };
         let content = self.content(now);
-        let idle_since = self.idle_since.filter(|_| content.kind == Kind::Done);
+        let idle_since = self
+            .idle_since
+            .map(|(at, _)| at)
+            .filter(|_| content.kind == Kind::Done);
         let news = self.news;
         let phone = self
             .phones
@@ -828,8 +843,8 @@ impl Activity {
     }
 
     /// See [`Driver::observe`].
-    pub(crate) fn observe(&mut self, snapshots: &[Snapshot], now: Instant) {
-        self.driver.observe(snapshots, now);
+    pub(crate) fn observe(&mut self, snapshots: &[Snapshot], at: (Instant, SystemTime)) {
+        self.driver.observe(snapshots, at);
     }
 
     /// See [`Driver::hello`].
@@ -905,7 +920,7 @@ impl Activity {
             let Some(due) = self.driver.due_for(key, tokens, connected(key), cap, now) else {
                 continue;
             };
-            let payload = due.payload(mac, now, wall);
+            let payload = due.payload(mac, wall);
             let jwt = self.signer.jwt(wall).to_owned();
             self.dispatch(slot, key.clone(), due, payload, jwt);
         }
@@ -996,6 +1011,8 @@ mod tests {
         cap: Limiter,
         tokens: ActivityTokens,
         base: Instant,
+        /// The wall-clock time at `base`: part way into a second, as a real clock reads.
+        wall: SystemTime,
         /// Whether the app wakes after each start to hand over the new activity's token: the
         /// first is `TOKEN`, the next `TOKEN2`, and so on.
         wakes: bool,
@@ -1029,11 +1046,12 @@ mod tests {
                 cap: Limiter::default(),
                 tokens,
                 base,
+                wall: UNIX_EPOCH + Duration::from_millis(1_790_000_000_600),
                 wakes: false,
                 starts: 0,
             };
             let rows: Vec<Snapshot> = sessions.iter().map(|id| idle(id)).collect();
-            rig.driver.observe(&rows, base);
+            rig.driver.observe(&rows, (base, rig.wall));
             // The device is judged once at the seed, as the hub does every second, with the app in
             // front (where it registered its tokens).
             assert_eq!(rig.due(0.0, true), None);
@@ -1044,9 +1062,14 @@ mod tests {
             later(self.base, seconds)
         }
 
+        /// The wall-clock time at `seconds`.
+        fn wall_at(&self, seconds: f64) -> SystemTime {
+            self.wall + Duration::from_secs_f64(seconds)
+        }
+
         fn observe(&mut self, seconds: f64, rows: &[Snapshot]) {
-            let now = self.at(seconds);
-            self.driver.observe(rows, now);
+            let at = (self.at(seconds), self.wall_at(seconds));
+            self.driver.observe(rows, at);
         }
 
         /// What is due to the device at `seconds`, with no phone connected.
@@ -1953,9 +1976,9 @@ mod tests {
         let base = Instant::now();
         let wall = SystemTime::now();
         let mut cap = Limiter::default();
-        activity.observe(&[idle("s1")], base);
+        activity.observe(&[idle("s1")], (base, wall));
         activity.hello("dev");
-        activity.observe(&[snap("s1", Some("idle"), &[1])], later(base, 1.0));
+        activity.observe(&[snap("s1", Some("idle"), &[1])], (later(base, 1.0), wall));
         // Every slot busy: nothing is judged, nothing is taken from the cap.
         let busy = Arc::clone(&activity.slots)
             .try_acquire_many_owned(u32::try_from(SENDS_AT_ONCE).expect("small"))
@@ -1988,7 +2011,10 @@ mod tests {
             (Event::Start, Outcome::Failed(0))
         );
         assert!(!activity.reported(&report, Some(TOKEN)));
-        activity.observe(&[snap("s1", Some("idle"), &[1, 2])], later(base, 3.0));
+        activity.observe(
+            &[snap("s1", Some("idle"), &[1, 2])],
+            (later(base, 3.0), wall),
+        );
         let mut cap = Limiter::default();
         activity.flush(
             &devices,
@@ -2196,20 +2222,21 @@ mod tests {
                 kind,
                 session: "6101-1790000000".into(),
                 since: now - Duration::from_secs(42),
+                since_wall: Some(wall - Duration::from_secs(42)),
                 approvals,
             },
         };
         let fixture = fixture();
         assert_eq!(
-            due(Event::Start, Kind::Approval, 2).payload(Some(MAC), now, wall),
+            due(Event::Start, Kind::Approval, 2).payload(Some(MAC), wall),
             fixture["start"]
         );
         assert_eq!(
-            due(Event::Update, Kind::Running, 0).payload(Some(MAC), now, wall),
+            due(Event::Update, Kind::Running, 0).payload(Some(MAC), wall),
             fixture["update"]
         );
         assert_eq!(
-            due(Event::End, Kind::Done, 0).payload(Some(MAC), now, wall),
+            due(Event::End, Kind::Done, 0).payload(Some(MAC), wall),
             fixture["end"]
         );
         assert_eq!(fixture.as_object().map(serde_json::Map::len), Some(3));
@@ -2227,7 +2254,7 @@ mod tests {
             Priority::Normal
         );
         // A start for a turn says so; one for an approval says that instead.
-        let running = due(Event::Start, Kind::Running, 0).payload(Some(MAC), now, wall);
+        let running = due(Event::Start, Kind::Running, 0).payload(Some(MAC), wall);
         assert_eq!(
             running["aps"]["alert"],
             json!({"title": "Octet", "body": "Session running"})
@@ -2257,9 +2284,26 @@ mod tests {
         // Unpublished, `mac` is empty; with no session leading, so is `session`.
         let mut lone = due(Event::Update, Kind::Done, 0);
         lone.content.session.clear();
-        let payload = lone.payload(None, now, wall);
+        let payload = lone.payload(None, wall);
         assert_eq!(payload["aps"]["content-state"]["mac"], "");
         assert_eq!(payload["aps"]["content-state"]["session"], "");
+    }
+
+    #[test]
+    fn since_is_the_same_at_every_send_for_the_same_lead() {
+        // The clock reads 0.6 s into a second at the seed; the approval begins 0.5 s on, at
+        // 1_790_000_001.1, and the sends come at whole and part seconds after it.
+        let mut rig = Rig::with(&["s1"], tokens(Some(TOKEN), None));
+        rig.observe(0.5, &[snap("s1", Some("idle"), &[1])]);
+        let mut sinces = Vec::new();
+        for (at, approvals) in [(0.5, &[1][..]), (4.45, &[1, 2]), (8.9, &[1, 2, 3])] {
+            rig.observe(at, &[snap("s1", Some("idle"), approvals)]);
+            let due = rig.away(at).expect("an update");
+            assert_eq!(due.event, Event::Update);
+            let payload = due.payload(Some(MAC), rig.wall_at(at));
+            sinces.push(payload["aps"]["content-state"]["since"].as_u64());
+        }
+        assert_eq!(sinces, [Some(1_790_000_001); 3]);
     }
 
     #[test]
@@ -2279,7 +2323,7 @@ mod tests {
             (update, &["stale-date"][..]),
             (end, &["dismissal-date"][..]),
         ] {
-            let payload = due.payload(Some(MAC), rig.at(4.0), wall);
+            let payload = due.payload(Some(MAC), wall);
             let text = payload.to_string();
             for secret in ["/work", "secret", "jsonl", "session-1", TOKEN, START] {
                 assert!(!text.contains(secret), "{secret} in {text}");

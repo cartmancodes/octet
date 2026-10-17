@@ -2060,7 +2060,7 @@ impl Hub {
         let notices = self.pusher.observe(&snapshots);
         let now = Instant::now();
         if let Some(activity) = self.activity.as_mut() {
-            activity.observe(&snapshots, now);
+            activity.observe(&snapshots, (now, SystemTime::now()));
         }
         for device in self.store.devices() {
             if device.push_token.is_some() {
