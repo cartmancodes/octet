@@ -15,7 +15,8 @@
 //!   is when that session's own kind began, and `approvals` counts every approval waiting.
 //! - **In front** means that the device has a connection whose `hello` is not a background one:
 //!   the app is open, on any screen. Nothing is sent then. A background connection (the app
-//!   handing a token over, or sending a Deny) never counts.
+//!   handing a token over, or sending a Deny) never counts. The app leaving the front counts as
+//!   a last look while it was there: its activity is taken to show the state as it stands then.
 //! - **Update**, to the device's activity `token` while the phone is away: when the kind, the
 //!   approval count or the leading session changes, at most once per [`UPDATE_GAP`]. A token
 //!   the hub has told nothing yet (one a wake handed over) is told the state as it stands.
@@ -320,6 +321,18 @@ impl Phone {
         self.spent.iter().any(|spent| spent == token)
     }
 
+    /// The app is in front holding `tokens`, so it drives the activity and keeps it current: it
+    /// shows `shown`, the news so far (`news`) is spent, and an end that was waiting is the app's
+    /// to make or not.
+    fn drives(&mut self, shown: (Kind, usize, String), tokens: &ActivityTokens, news: u64) {
+        self.news = news;
+        if let Some(ending) = self.end.take() {
+            self.spent.retain(|spent| *spent != ending);
+        }
+        self.told = Some(shown);
+        self.told_to = tokens.token.clone().filter(|token| !self.is_spent(token));
+    }
+
     /// Marks `token` as no live activity any more.
     fn spend(&mut self, token: &str) {
         if !self.is_spent(token) {
@@ -488,6 +501,29 @@ impl Driver {
         }
     }
 
+    /// `device`'s app left the front (its last connection in front went) holding `tokens` (those
+    /// not spent by age), at `now`. Until then it kept its activity current, so this counts as a
+    /// look while it was in front: the activity is taken to show the state as it stands, and the
+    /// first look away sends only what changes after. Without it, a look the hub was too busy to
+    /// make before the app left would cost the Island a needless update, taken from its
+    /// allowance, and the next real one would wait out [`UPDATE_GAP`].
+    pub(crate) fn left(&mut self, device: &str, tokens: Option<&ActivityTokens>, now: Instant) {
+        let Some(tokens) = tokens else {
+            return;
+        };
+        let content = self.content(now);
+        let news = self.news;
+        let phone = self
+            .phones
+            .entry(device.to_owned())
+            .or_insert_with(|| Phone::new(news));
+        phone.drives(
+            (content.kind, content.approvals, content.session),
+            tokens,
+            news,
+        );
+    }
+
     /// What APNs said to a send that did not go well, given the activity token the device holds
     /// now (`stored`). Only a report since the hub's last push-start counts:
     ///
@@ -599,14 +635,7 @@ impl Driver {
         }
         let shown = (content.kind, content.approvals, content.session.clone());
         if connected {
-            // The app drives the activity while it is in front, and keeps it current; an end
-            // that was waiting is the app's to make or not.
-            phone.news = news;
-            if let Some(ending) = phone.end.take() {
-                phone.spent.retain(|spent| *spent != ending);
-            }
-            phone.told = Some(shown);
-            phone.told_to = tokens.token.clone().filter(|token| !phone.is_spent(token));
+            phone.drives(shown, tokens, news);
             return None;
         }
         if let Some(ending) = phone.end.clone() {
@@ -822,6 +851,17 @@ impl Activity {
     ) {
         let tokens = tokens.map(|held| fresh(held, wall));
         self.driver.connected(device, tokens.as_ref());
+    }
+
+    /// See [`Driver::left`]: `tokens` are the device's as stored, at `now` (wall-clock `wall`).
+    pub(crate) fn left(
+        &mut self,
+        device: &str,
+        tokens: Option<&ActivityTokens>,
+        (now, wall): (Instant, SystemTime),
+    ) {
+        let tokens = tokens.map(|held| fresh(held, wall));
+        self.driver.left(device, tokens.as_ref(), now);
     }
 
     /// Takes what a send came to, given the activity token the device holds now (see
@@ -1420,6 +1460,34 @@ mod tests {
         rig.cap = Limiter::default();
         rig.observe(60.0, &[snap("s1", Some("idle"), &[1, 2, 3, 4])]);
         assert_eq!(rig.away(60.0).map(|due| due.event), Some(Event::Update));
+    }
+
+    #[test]
+    fn the_app_leaving_is_a_look_so_nothing_stale_is_sent() {
+        const NEW: &str = "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3";
+        let mut rig = Rig::with(&["s1"], tokens(Some(TOKEN), Some(START)));
+        // In front, the app registers a new activity's token and an approval comes, but the hub,
+        // slow, makes no look before the app leaves.
+        rig.tokens = tokens(Some(NEW), Some(START));
+        rig.observe(1.0, &[snap("s1", Some("idle"), &[1])]);
+        let (held, now) = (rig.tokens.clone(), rig.at(1.5));
+        rig.driver.left("dev", Some(&held), now);
+        // The app kept its activity current until it left: the first look away sends nothing,
+        // and takes nothing from the allowance.
+        assert_eq!(rig.away(2.0), None);
+        assert_eq!(rig.sends(2.0), 0);
+        // What changes after does go, at once.
+        rig.observe(3.0, &[snap("s1", Some("idle"), &[1, 2])]);
+        assert_eq!(
+            sent(rig.away(3.0)),
+            expect(Event::Update, NEW, Kind::Approval, "s1", 2)
+        );
+        // An app that leaves holding no live token leaves nothing to tell: news starts one.
+        let mut rig = Rig::with(&["s1"], tokens(None, Some(START)));
+        let (held, now) = (rig.tokens.clone(), rig.at(1.0));
+        rig.driver.left("dev", Some(&held), now);
+        rig.observe(2.0, &[snap("s1", Some("idle"), &[1])]);
+        assert_eq!(rig.away(2.0).map(|due| due.event), Some(Event::Start));
     }
 
     /// What APNs said to `due` for `device`, as the hub reports it, with the token it now stores.

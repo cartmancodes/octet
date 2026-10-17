@@ -2168,6 +2168,16 @@ impl Hub {
             let key = &device.token_sha256;
             // A background connection going was never the app in front.
             let still_here = state.background || in_front(&self.conns, key);
+            // The app leaves the front: what its activity shows is current as of now.
+            if !still_here && let Some(activity) = self.activity.as_mut() {
+                let tokens = self
+                    .store
+                    .devices()
+                    .iter()
+                    .find(|known| &known.token_sha256 == key)
+                    .and_then(|known| known.activity.as_ref());
+                activity.left(key, tokens, (Instant::now(), SystemTime::now()));
+            }
             // A device unpaired, or without a push token, has nowhere to be told.
             let reachable = self
                 .store
