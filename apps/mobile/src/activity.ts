@@ -258,6 +258,10 @@ export class LiveActivity {
     this.foreground = active;
     if (!active) {
       this.cancelTimers();
+      // A token that came as the app was leaving went over the link while it still counted as in
+      // front, and the native side may hold background time for it: with nothing on its way now,
+      // that time ends (a call with nothing held does nothing).
+      this.handOverSettled();
       return;
     }
     const supported = this.api.isSupported();

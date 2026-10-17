@@ -786,6 +786,10 @@ describe("the app is kept running until a background send settles", () => {
     r.fleet.setForeground(false);
     r.live.setForeground(false);
     await settle();
+    // Leaving with nothing on its way settles once (any hold from a token as it left); the
+    // hand-overs below are counted from here.
+    expect(r.api.handOversSettled).toBe(1);
+    r.api.handOversSettled = 0;
   };
   const ID = "6F9619FF-8B86-D011-B42D-00C04FC964FF";
   const id = (n: number) => ID.slice(0, -2) + String(n).padStart(2, "0");
@@ -918,6 +922,31 @@ describe("the app is kept running until a background send settles", () => {
     r.api.pushToken("cd34", "a"); // the owner has it already
     await settle();
     expect(r.api.handOversSettled).toBe(1);
+  });
+
+  it("a token that came as the app was leaving, sent over the link, is settled when the app is in the background", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    // The native side holds background time for it (the app was leaving); JS still thought it was
+    // in front, and sent it over the link.
+    r.api.pushToken("cd34", "a");
+    await settle();
+    expect(r.socketOf(STUDIO_HOST).commandsOf("register_activity")).toHaveLength(1);
+    expect(r.api.handOversSettled).toBe(0);
+    r.live.setForeground(false);
+    expect(r.api.handOversSettled).toBe(1);
+  });
+
+  it("leaving the front settles nothing while a hand-over is on its way; its end does", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    await background(r);
+    const left = r.api.handOversSettled; // 0: counted from the leave
+    r.api.pushToken("cd34", "a");
+    await settle();
+    r.live.setForeground(true);
+    r.live.setForeground(false); // back and away again, the hand-over still out
+    expect(r.api.handOversSettled).toBe(left);
+    await r.advance(HAND_OVER_MS);
+    expect(r.api.handOversSettled).toBe(left + 1);
   });
 
   it("a cold launch in the background for a token is settled only after the hand-over it waited for", async () => {
