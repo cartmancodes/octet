@@ -593,8 +593,10 @@ async fn a_clear_and_a_register_start_afresh(fake: &Fake, root: PathBuf) {
     assert_state(&second, "start", "approval", &env.id, 2);
 }
 
-/// The app's own activity is gone: APNs answers 410 to its token, which is dropped, and the next
-/// news push-starts one.
+/// The app's own activity is gone: APNs answers 410 to its token, which is dropped, and the news
+/// that update carried is judged again, so the next look push-starts an activity showing the
+/// approval still waiting, without waiting for more news. A later approval starts no second one:
+/// the started activity's token has yet to come.
 async fn a_410_on_the_apps_activity_starts_one(fake: &Fake, root: PathBuf) {
     const TOKEN: &str = "deada1a1a1a1a1a1a1a1a1a1a1a1a1a1";
     const START: &str = "5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d";
@@ -617,10 +619,11 @@ async fn a_410_on_the_apps_activity_starts_one(fake: &Fake, root: PathBuf) {
     })
     .await
     .expect("the dead token is dropped");
-    link.state("idle", &[1, 2]).await;
     let start = fake.wait_for(START, 0).await;
-    assert_state(&start, "start", "approval", &env.id, 2);
-    assert_eq!(fake.to(TOKEN).len(), 1);
+    assert_state(&start, "start", "approval", &env.id, 1);
+    link.state("idle", &[1, 2]).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!((fake.to(START).len(), fake.to(TOKEN).len()), (1, 1));
 }
 
 /// The app in front is any connection whose hello is not a background one, whether it streams a
