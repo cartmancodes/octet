@@ -58,7 +58,9 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
         Cmd::Sessions => return start_job(app, sessions_job(app)),
         Cmd::Resume => return Some(resume_command(app, argument)),
         Cmd::Steer if argument.is_empty() => app.note("Use /steer <text>"),
-        Cmd::Steer => steer(app, vendor, argument.to_owned()),
+        Cmd::Steer => {
+            steer(app, vendor, argument.to_owned());
+        }
         Cmd::Copy => copy_reply(app),
         Cmd::Model => return Some(model_command(app, argument)),
         Cmd::Skills => {
@@ -83,8 +85,9 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
         )),
         Cmd::Goal => goal_command(app, vendor, argument).await,
         Cmd::RemoteControl => match argument {
-            "" | "status" => return start_job(app, Job::remote()),
-            _ => app.note("Use /remote-control or /remote-control status"),
+            "" | "status" => return start_job(app, Job::remote(data_directory(app))),
+            "pair" => return start_job(app, Job::pair(data_directory(app))),
+            _ => app.note("Use /remote-control, /remote-control status or /remote-control pair"),
         },
         Cmd::Export => return start_job(app, export_job(app, argument)),
     }
@@ -257,16 +260,30 @@ fn compact_command(app: &mut App, vendor: &dyn Vendor) {
 
 /// `/steer`: adds `text` to the running turn where the provider can; queues
 /// it as the next prompt where it cannot, or while the turn is stopping; and
-/// sends it as a prompt when idle.
-pub(crate) fn steer(app: &mut App, vendor: &dyn Vendor, text: String) {
+/// sends it as a prompt when idle. Whether it was sent or queued.
+pub(crate) fn steer(app: &mut App, vendor: &dyn Vendor, text: String) -> bool {
+    steer_with(app, vendor, text, submit)
+}
+
+/// [`steer`], with `send` taking the text where it goes as a prompt.
+pub(crate) fn steer_with(
+    app: &mut App,
+    vendor: &dyn Vendor,
+    text: String,
+    send: fn(&mut App, &dyn Vendor, String) -> bool,
+) -> bool {
     let running = app.conn.is_running();
     if running && app.conn.engine.provider().steer && !app.conn.is_cancelling() {
         if let Err(error) = vendor.send(Command::Steer(text)) {
             app.error(error.to_string());
+            return false;
         }
-        return;
+        return true;
     }
-    if submit(app, vendor, text) && running {
+    if !send(app, vendor, text) {
+        return false;
+    }
+    if running {
         app.note(if app.conn.is_cancelling() {
             "The turn is stopping; queued the steer as the next prompt".to_owned()
         } else {
@@ -276,6 +293,7 @@ pub(crate) fn steer(app: &mut App, vendor: &dyn Vendor, text: String) {
             )
         });
     }
+    true
 }
 
 /// Switches the permission mode live; the vendor confirms it later.
@@ -383,13 +401,39 @@ fn start_job(app: &mut App, job: Job) -> Option<Action> {
 /// `/sessions`: this workspace's recent vendor sessions, from the journals
 /// beside this one.
 fn sessions_job(app: &App) -> Job {
-    let directory = app
-        .conn
+    Job::sessions(
+        data_directory(app),
+        app.composer.root.clone(),
+        SESSIONS_LISTED,
+    )
+}
+
+/// The directory this interface keeps its journals in, which is also where the hub's run directory is.
+fn data_directory(app: &App) -> std::path::PathBuf {
+    app.conn
         .journal
         .parent()
         .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    Job::sessions(directory, app.composer.root.clone(), SESSIONS_LISTED)
+        .unwrap_or_default()
+}
+
+/// Shows what asking the hub for a pairing code came to; the secret goes only into the transcript note.
+pub(crate) fn show_pairing(app: &mut App, pairing: crate::remote::Pairing) {
+    use crate::remote::Pairing;
+    match pairing {
+        Pairing::NoHub => app.note("Start the hub first: octet hub"),
+        Pairing::Failed(why) => app.error(why),
+        Pairing::NotPublished(reason) => app.note(reason),
+        Pairing::Ready { url, secret } => {
+            let room = crate::view::transcript_room(app.last_width, app.sidebar);
+            app.note_apart(crate::remote::pair_report(
+                &url,
+                &secret,
+                room.map(usize::from),
+            ));
+            app.hint("Pairing code shown above · it works once");
+        }
+    }
 }
 
 /// Lists what `/sessions` found, keeping it for `/resume N`.
@@ -514,7 +558,7 @@ fn queued_text(prompt: &crate::vendor::Prompt) -> String {
     cut(prompt.display().lines().next().unwrap_or(""), 60)
 }
 
-fn model_command(app: &mut App, argument: &str) -> Action {
+pub(crate) fn model_command(app: &mut App, argument: &str) -> Action {
     if argument.trim().is_empty() {
         app.show_models(1);
     } else if argument == "list" || argument.starts_with("list ") {
@@ -585,7 +629,7 @@ fn found_note(
         Found::Named | Found::Current => None,
     }
 }
-fn mode_command(app: &mut App, vendor: &dyn Vendor, argument: &str) -> Action {
+pub(crate) fn mode_command(app: &mut App, vendor: &dyn Vendor, argument: &str) -> Action {
     if argument.is_empty() {
         app.note(app.mode_details());
     } else if app.conn.mode_pending.is_some() {

@@ -1,14 +1,39 @@
 //! `octet`: parses the command line and starts the terminal interface, or
 //! runs headless (`--print`, `--rpc`).
 #![forbid(unsafe_code)]
-use args::{CliError, Parsed, Prompt, Run};
+use args::{CliError, HubAction, Parsed, Prompt, Run};
 use std::{io::IsTerminal, path::PathBuf};
 mod args;
 mod headless;
+mod hub;
+mod service;
 
 /// Where journals and goals go under the data directory. Named when the Rust
 /// port was a preview; kept so existing journals and goals are still found.
 const JOURNAL_DIR: &str = "octet/rust-preview";
+
+/// `octet hub --help`.
+fn hub_help() -> &'static str {
+    "Octet hub — your terminal sessions on your phone, over your tailnet\n\
+\n\
+Usage: octet hub [ACTION] [--journal-dir PATH] [--port N] [--owner LOGIN] [--print]\n\
+\n\
+Actions:\n\
+  serve          Run the hub on 127.0.0.1 until interrupted (the default)\n\
+  devices        List the paired phones\n\
+  revoke NAME    Unpair the phone called NAME (a running hub drops it within 2 s)\n\
+  watch          Print what every session is doing until Ctrl+C\n\
+  install        Keep the hub running: a launchd agent (macOS) or systemd user unit (Linux)\n\
+  uninstall      Stop that service and remove it\n\
+\n\
+Options:\n\
+  --port N       serve: the loopback port (default: hub.json's, else 47823)\n\
+  --owner LOGIN  serve: the tailnet login that may connect (default: this Mac's, from Tailscale)\n\
+  --print        install: show the service file without installing it\n\
+  --journal-dir PATH  Where journals and the hub's files live (install keeps it)\n\
+\n\
+Publish the hub to your tailnet with: tailscale serve --bg <port>\n"
+}
 
 /// `--help`: fixed usage and keys, then every command from the registry.
 fn help() -> String {
@@ -16,8 +41,9 @@ fn help() -> String {
         "                 [--model MODEL] [--mode MODE] [--resume VENDOR_SESSION_ID]",
         "                 [--binary PATH] [--journal-dir PATH]",
         "                 [--approval-timeout SECONDS] [--effort LEVEL]",
-        "                 [--no-plugins] [--no-plugin-hooks]",
+        "                 [--no-plugins] [--no-plugin-hooks] [--no-remote]",
         "                 [--print PROMPT|- [--output text|json] | --rpc]",
+        "       octet hub [serve|devices|revoke NAME|watch|install|uninstall] (the phone hub; octet hub --help)",
         "       octet --version | --help",
         "",
         "Headless: --print (-p) runs one prompt and writes the reply; - reads it",
@@ -29,6 +55,8 @@ fn help() -> String {
         "Defaults: Codex, current directory. Vendor CLI installation and login required.",
         "Modes: ask (default) · accept-edits · auto (vendor auto-review) · full-access",
         "Use --engine demo for an offline interactive preview.",
+        "Remote: the interface shares its session with `octet hub` over a private socket;",
+        "--no-remote turns that off.",
         "Plugins: the vendor's enabled plugins load (Claude's from its settings'",
         "enabledPlugins); --no-plugins turns them off, --no-plugin-hooks only their hooks.",
         "",
@@ -81,6 +109,33 @@ async fn main() -> std::process::ExitCode {
     };
     std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
+/// Where journals and the hub's files go: `journal_dir`, else `$XDG_DATA_HOME`, else
+/// `~/.local/share`. It is made (owner-only) if missing and resolved to its canonical absolute
+/// path, so a terminal UI, the hub and the sessions a phone starts, each with its own working
+/// directory, all name the same place.
+fn data_dir(journal_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    let directory = journal_dir
+        .or_else(|| {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|p| p.join(JOURNAL_DIR))
+        })
+        .or_else(|| octet_core::home_dir().map(|p| p.join(".local/share").join(JOURNAL_DIR)))
+        .ok_or_else(|| {
+            CliError::Usage("Set --journal-dir or HOME to choose transcript storage".into())
+        })?;
+    let resolve = || {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)?;
+        std::fs::canonicalize(&directory)
+    };
+    resolve().map_err(|e| CliError::Run(format!("Couldn't use {}: {e}", directory.display())))
+}
+
 /// Reads the options and runs; the process's exit code.
 async fn run() -> Result<i32, CliError> {
     let args = match args::parse_args(std::env::args_os().skip(1))? {
@@ -91,6 +146,21 @@ async fn run() -> Result<i32, CliError> {
         Parsed::Version => {
             println!("octet {}", env!("CARGO_PKG_VERSION"));
             return Ok(0);
+        }
+        Parsed::HubHelp => {
+            print!("{}", hub_help());
+            return Ok(0);
+        }
+        Parsed::Hub(args) => {
+            let directory = data_dir(args.journal_dir)?;
+            return match args.action {
+                HubAction::Serve => hub::serve(directory, args.port, args.owner).await,
+                HubAction::Devices => hub::devices(&directory).await,
+                HubAction::Revoke(name) => hub::revoke(&directory, &name).await,
+                HubAction::Watch => hub::watch(&directory).await,
+                HubAction::Install { print } => hub::install(directory, print).await,
+                HubAction::Uninstall => hub::uninstall(directory).await,
+            };
         }
         Parsed::Run(args) => args,
     };
@@ -117,24 +187,20 @@ async fn run() -> Result<i32, CliError> {
         None => std::env::current_dir().map_err(|e| CliError::Run(e.to_string()))?,
     };
     let config = args.config(args::workspace(&cwd)?);
-    let directory = args
-        .journal_dir
-        .clone()
-        .or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .map(|p| p.join(JOURNAL_DIR))
-        })
-        .or_else(|| octet_core::home_dir().map(|p| p.join(".local/share").join(JOURNAL_DIR)))
-        .ok_or_else(|| {
-            CliError::Usage("Set --journal-dir or HOME to choose transcript storage".into())
-        })?;
+    let directory = data_dir(args.journal_dir.clone())?;
     let result = match args.run {
-        Run::Interface => octet_tui::run(config, directory)
-            .await
-            .map(|()| 0)
-            .map_err(|e| e.to_string()),
+        Run::Interface => octet_tui::run(
+            config,
+            directory,
+            octet_tui::Options {
+                remote: args.remote,
+                tmux: args.remote_started.clone(),
+                started_by: args.remote_by.clone(),
+            },
+        )
+        .await
+        .map(|()| 0)
+        .map_err(|e| e.to_string()),
         Run::Print { prompt, json } => {
             let prompt = match prompt {
                 Prompt::Text(text) => text,
@@ -145,4 +211,27 @@ async fn run() -> Result<i32, CliError> {
         Run::Rpc => headless::rpc(config, directory).await,
     };
     result.map_err(CliError::Run)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_data_directory_becomes_absolute_and_exists() {
+        // Tests run in the crate's directory; `target` is scratch space there.
+        let relative = PathBuf::from(format!(
+            "target/../target/octet-data-dir-{}",
+            std::process::id()
+        ));
+        let resolved = data_dir(Some(relative.clone())).expect("a data directory");
+        let made = std::fs::canonicalize(&relative);
+        let _ = std::fs::remove_dir_all(&relative);
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert_eq!(
+            Some(resolved),
+            made.ok(),
+            "the same directory, made and resolved"
+        );
+    }
 }

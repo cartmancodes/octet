@@ -31,7 +31,39 @@ impl CliError {
 pub(crate) enum Parsed {
     Help,
     Version,
+    /// `octet hub --help`.
+    HubHelp,
+    /// `octet hub ...`.
+    Hub(HubArgs),
     Run(Box<Args>),
+}
+
+/// What `octet hub` does.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HubAction {
+    /// Run the hub until interrupted (the default).
+    Serve,
+    /// List the paired devices.
+    Devices,
+    /// Unpair the device with this name.
+    Revoke(String),
+    /// Print every session's activity until interrupted.
+    Watch,
+    /// Keep the hub running as a per-user service; with `print`, only show the unit.
+    Install { print: bool },
+    /// Remove that service.
+    Uninstall,
+}
+
+/// The options of `octet hub`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HubArgs {
+    pub(crate) action: HubAction,
+    pub(crate) journal_dir: Option<PathBuf>,
+    /// The loopback port to serve on; the hub's configured one when absent.
+    pub(crate) port: Option<u16>,
+    /// The tailnet owner's login; Tailscale's own answer when absent.
+    pub(crate) owner: Option<String>,
 }
 
 /// What to run.
@@ -67,6 +99,12 @@ pub(crate) struct Args {
     pub(crate) approval_timeout: Duration,
     pub(crate) effort: Option<String>,
     pub(crate) plugins: Plugins,
+    /// Whether the terminal interface shares its session with a hub.
+    pub(crate) remote: bool,
+    /// The tmux session a hub's `start` launched this interface in (the hidden `--remote-started`).
+    pub(crate) remote_started: Option<String>,
+    /// The device that asked for it (the hidden `--remote-by`).
+    pub(crate) remote_by: Option<String>,
     pub(crate) run: Run,
 }
 
@@ -128,7 +166,10 @@ fn text(args: &mut impl Iterator<Item = OsString>, name: &str) -> Result<String,
     reason = "a flat match over the options, one short arm each"
 )]
 pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, CliError> {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
+    if args.next_if(|first| first == "hub").is_some() {
+        return parse_hub(args);
+    }
     let mut engine = "codex".to_owned();
     let mut binary = None;
     let mut cwd = None;
@@ -139,6 +180,9 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
     let mut approval_timeout = octet_core::DEFAULT_APPROVAL_TIMEOUT;
     let mut effort = None;
     let mut plugins = Plugins::default();
+    let mut remote = true;
+    let mut remote_started = None;
+    let mut remote_by = None;
     let mut print = None;
     let mut output = None;
     let mut rpc = false;
@@ -160,6 +204,9 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
             "--rpc" => rpc = true,
             "--no-plugins" => plugins.load = false,
             "--no-plugin-hooks" => plugins.hooks = false,
+            "--no-remote" => remote = false,
+            "--remote-started" => remote_started = Some(text(&mut args, name)?),
+            "--remote-by" => remote_by = Some(text(&mut args, name)?),
             "--engine" => engine = text(&mut args, name)?,
             "--binary" => binary = Some(PathBuf::from(value(&mut args, name)?)),
             "--cwd" => cwd = Some(PathBuf::from(value(&mut args, name)?)),
@@ -237,8 +284,85 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
         approval_timeout,
         effort,
         plugins,
+        remote,
+        remote_started,
+        remote_by,
         run,
     })))
+}
+
+/// Parses the arguments after `hub`: an action (`serve` unless named) and its options.
+fn parse_hub(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
+    let mut args = args;
+    let (mut action, mut journal_dir, mut port, mut owner) = (None, None, None, None);
+    let mut print = false;
+    while let Some(arg) = args.next() {
+        let arg = arg.into_string().map_err(|arg| {
+            usage(format!(
+                "Unknown argument {}. Use hub --help.",
+                arg.to_string_lossy()
+            ))
+        })?;
+        let named = match arg.as_str() {
+            "--help" | "-h" => return Ok(Parsed::HubHelp),
+            "--journal-dir" => {
+                journal_dir = Some(PathBuf::from(value(&mut args, &arg)?));
+                continue;
+            }
+            "--port" => {
+                port = Some(
+                    text(&mut args, &arg)?
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|port| *port > 0)
+                        .ok_or_else(|| usage("Port must be a whole number from 1 to 65535"))?,
+                );
+                continue;
+            }
+            "--owner" => {
+                owner = Some(text(&mut args, &arg)?);
+                continue;
+            }
+            "--print" => {
+                print = true;
+                continue;
+            }
+            "serve" => HubAction::Serve,
+            "install" => HubAction::Install { print: false },
+            "uninstall" => HubAction::Uninstall,
+            "devices" => HubAction::Devices,
+            "watch" => HubAction::Watch,
+            "revoke" => {
+                let name = verbatim(&mut args, "revoke")?;
+                if name.is_empty() {
+                    return Err(usage("revoke requires a device name. Use hub --help."));
+                }
+                HubAction::Revoke(name)
+            }
+            other => {
+                return Err(usage(format!("Unknown argument {other}. Use hub --help.")));
+            }
+        };
+        if action.replace(named).is_some() {
+            return Err(usage("Name one hub action. Use hub --help."));
+        }
+    }
+    let mut action = action.unwrap_or(HubAction::Serve);
+    if !matches!(action, HubAction::Serve) && (port.is_some() || owner.is_some()) {
+        return Err(usage("--port and --owner apply to serve"));
+    }
+    if print {
+        match &mut action {
+            HubAction::Install { print } => *print = true,
+            _ => return Err(usage("--print applies to install")),
+        }
+    }
+    Ok(Parsed::Hub(HubArgs {
+        action,
+        journal_dir,
+        port,
+        owner,
+    }))
 }
 
 /// Refuses a prompt the session would refuse, before one opens.
@@ -325,6 +449,155 @@ mod tests {
         let no_hooks = args(&["--no-plugin-hooks"]).plugins;
         assert!(no_hooks.load && !no_hooks.hooks);
         assert!(!args(&["--no-plugins"]).config("/tmp".into()).plugins.load);
+    }
+    fn hub(list: &[&str]) -> HubArgs {
+        let mut full = vec!["hub"];
+        full.extend_from_slice(list);
+        match parse(&full) {
+            Ok(Parsed::Hub(args)) => args,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hub_serves_unless_told_otherwise() {
+        let plain = hub(&[]);
+        assert_eq!(plain.action, HubAction::Serve);
+        assert_eq!(
+            (plain.port, plain.owner, plain.journal_dir),
+            (None, None, None)
+        );
+        let full = hub(&[
+            "--journal-dir",
+            "/d",
+            "--port",
+            "65535",
+            "--owner",
+            "me@x",
+            "serve",
+        ]);
+        assert_eq!(full.port, Some(65535));
+        assert_eq!(full.owner.as_deref(), Some("me@x"));
+        assert_eq!(full.journal_dir, Some(PathBuf::from("/d")));
+        assert_eq!(hub(&["devices"]).action, HubAction::Devices);
+        assert_eq!(
+            hub(&["--journal-dir", "/d", "watch"]).action,
+            HubAction::Watch
+        );
+        assert_eq!(
+            hub(&["revoke", "My phone", "--journal-dir", "/d"]).action,
+            HubAction::Revoke("My phone".into())
+        );
+        assert_eq!(parse(&["hub", "--help"]), Ok(Parsed::HubHelp));
+        assert_eq!(parse(&["hub", "devices", "-h"]), Ok(Parsed::HubHelp));
+        // Only the first argument makes it a hub command.
+        assert!(matches!(
+            parse(&["--no-remote", "hub"]),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn hub_installs_and_uninstalls_the_service() {
+        assert_eq!(
+            hub(&["install"]).action,
+            HubAction::Install { print: false }
+        );
+        assert_eq!(
+            hub(&["install", "--print"]).action,
+            HubAction::Install { print: true }
+        );
+        assert_eq!(
+            hub(&["--print", "install"]).action,
+            HubAction::Install { print: true }
+        );
+        assert_eq!(hub(&["uninstall"]).action, HubAction::Uninstall);
+        let carried = hub(&["--journal-dir", "/d", "install"]);
+        assert_eq!(carried.journal_dir, Some(PathBuf::from("/d")));
+    }
+
+    #[test]
+    fn hub_usage_errors_name_the_problem() {
+        for (list, message) in [
+            (
+                &["hub", "--port", "0"][..],
+                "Port must be a whole number from 1 to 65535",
+            ),
+            (
+                &["hub", "--port", "65536"][..],
+                "Port must be a whole number from 1 to 65535",
+            ),
+            (
+                &["hub", "--port", "x"][..],
+                "Port must be a whole number from 1 to 65535",
+            ),
+            (
+                &["hub", "--port"][..],
+                "--port requires a value. Use --help.",
+            ),
+            (
+                &["hub", "revoke"][..],
+                "revoke requires a value. Use --help.",
+            ),
+            (
+                &["hub", "bogus"][..],
+                "Unknown argument bogus. Use hub --help.",
+            ),
+            (
+                &["hub", "--engine", "demo"][..],
+                "Unknown argument --engine. Use hub --help.",
+            ),
+            (
+                &["hub", "devices", "watch"][..],
+                "Name one hub action. Use hub --help.",
+            ),
+            (
+                &["hub", "watch", "--port", "5"][..],
+                "--port and --owner apply to serve",
+            ),
+            (
+                &["hub", "devices", "--owner", "x"][..],
+                "--port and --owner apply to serve",
+            ),
+            (
+                &["hub", "install", "--port", "5"][..],
+                "--port and --owner apply to serve",
+            ),
+            (
+                &["hub", "uninstall", "--print"][..],
+                "--print applies to install",
+            ),
+            (
+                &["hub", "serve", "--print"][..],
+                "--print applies to install",
+            ),
+            (&["hub", "--print"][..], "--print applies to install"),
+        ] {
+            assert_eq!(error(list), message, "{list:?}");
+        }
+    }
+
+    #[test]
+    fn remote_control_is_on_unless_turned_off() {
+        assert!(args(&[]).remote);
+        assert!(!args(&["--no-remote"]).remote);
+    }
+    #[test]
+    fn the_hidden_flags_name_the_tmux_session_and_device_a_phone_started() {
+        let desk = args(&[]);
+        assert_eq!((desk.remote_started, desk.remote_by), (None, None));
+        let phone = args(&[
+            "--remote-started",
+            "octet-abc123",
+            "--remote-by",
+            "Gemini 10",
+        ]);
+        assert_eq!(phone.remote_started.as_deref(), Some("octet-abc123"));
+        assert_eq!(phone.remote_by.as_deref(), Some("Gemini 10"));
+        assert!(matches!(
+            parse_args(["--remote-started".into()]),
+            Err(CliError::Usage(_))
+        ));
     }
     #[test]
     fn defaults_are_codex_in_ask_mode_with_the_interface() {

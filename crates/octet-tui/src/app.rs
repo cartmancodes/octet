@@ -292,6 +292,9 @@ pub(crate) struct Asked {
     pub(crate) id: u64,
     pub(crate) detail: String,
     pub(crate) summary: octet_core::ApprovalSummary,
+    /// When it arrived. A remote answer waits `APPROVAL_ARM` from here, as the desk waits from
+    /// when the dialog is drawn.
+    pub(crate) arrived: tokio::time::Instant,
 }
 /// Dialogs over the screen: help, the palette and approvals.
 pub(crate) struct Overlays {
@@ -363,6 +366,8 @@ pub(crate) struct App {
     /// Another provider's skill, picked in `/skills`: it runs once the
     /// switch to that provider is ready.
     pub(crate) pending_skill: Option<SkillRun>,
+    /// Why the bridge to a hub is off, when it could not start or broke; `/remote-control` says it.
+    pub(crate) remote_off: Option<String>,
     /// Whether the Task sidebar shows on wide terminals; F2 flips it.
     pub(crate) sidebar: bool,
     /// The terminal's width at the last frame, for F2 to say when the sidebar can show.
@@ -429,6 +434,7 @@ impl App {
             models: crate::models::Models::default(),
             pending_handoff: None,
             pending_skill: None,
+            remote_off: None,
             sidebar: true,
             last_width: 0,
         }
@@ -825,6 +831,23 @@ impl App {
         self.status(StatusKind::Plain, &text);
         self.add(Role::Notice, &text);
     }
+    /// The sequence number of the latest transcript entry, to tell later ones apart.
+    pub(crate) fn last_seq(&self) -> u64 {
+        self.chat.next_seq
+    }
+    /// Puts `prefix` before the text of every entry added after `seq`.
+    pub(crate) fn prefix_since(&mut self, seq: u64, prefix: &str) {
+        for entry in self.chat.entries.iter_mut().filter(|e| e.seq > seq) {
+            entry.text.insert_str(0, prefix);
+            entry.invalidate();
+            self.chat.bytes += prefix.len();
+        }
+        self.trim();
+    }
+    /// Adds a notice to the transcript without touching the status line, for text like a pairing secret.
+    pub(crate) fn note_apart(&mut self, text: impl Into<String>) {
+        self.add(Role::Notice, &text.into());
+    }
     /// The goal file could not be saved; `paused` when the goal was paused
     /// because of it.
     pub(crate) fn goal_save_failed(&mut self, error: impl std::fmt::Display, paused: bool) {
@@ -982,6 +1005,7 @@ impl App {
                     id,
                     detail: clean(&detail),
                     summary,
+                    arrived: tokio::time::Instant::now(),
                 });
                 if first {
                     self.overlay.front_changed();

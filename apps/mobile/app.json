@@ -1,0 +1,58 @@
+{
+  "expo": {
+    "name": "Octet",
+    "slug": "octet",
+    "scheme": "octet",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "backgroundColor": "#161113",
+    "ios": {
+      "bundleIdentifier": "dev.octet.mobile",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false
+        }
+      }
+    },
+    "android": {
+      "package": "dev.octet.mobile",
+      "backgroundColor": "#161113",
+      "blockedPermissions": [
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Octet uses Face ID before allowing an agent's action or turning on full access."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Octet uses the camera to scan the pairing code shown on your Mac.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      "expo-notifications",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#faf6f5",
+          "dark": {
+            "backgroundColor": "#161113"
+          }
+        }
+      ]
+    ]
+  }
+}

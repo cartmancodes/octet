@@ -427,6 +427,30 @@ fn help_key(app: &mut App, key: KeyEvent) {
         help.help_scroll = 0;
     }
 }
+/// Answers approval `id` (any open one, not only the front); `Err` when none is open with that id.
+pub(crate) fn answer_approval(
+    app: &mut App,
+    vendor: &dyn Vendor,
+    id: u64,
+    allow: bool,
+) -> Result<(), String> {
+    let Some(at) = app
+        .overlay
+        .approvals
+        .iter()
+        .position(|asked| asked.id == id)
+    else {
+        return Err(format!("No approval {id} is waiting"));
+    };
+    vendor
+        .send(Command::Answer { id, allow })
+        .map_err(|error| error.to_string())?;
+    app.overlay.approvals.remove(at);
+    if at == 0 {
+        app.overlay.front_changed();
+    }
+    Ok(())
+}
 async fn approval_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent, id: u64) {
     let ctrl_c = ctrl(key, 'c');
     let answer = match key.code {
@@ -438,12 +462,8 @@ async fn approval_key(app: &mut App, vendor: &dyn Vendor, key: KeyEvent, id: u64
         // Typed as the dialog opened: never an answer.
         app.hint("The approval just opened; press A or D again to answer");
     } else if let Some(allow) = answer {
-        match vendor.send(Command::Answer { id, allow }) {
-            Ok(()) => {
-                app.overlay.approvals.pop_front();
-                app.overlay.front_changed();
-            }
-            Err(error) => app.error(error.to_string()),
+        if let Err(error) = answer_approval(app, vendor, id, allow) {
+            app.error(error);
         }
     } else if key.code == KeyCode::PageDown {
         app.overlay.approval_scroll = app.overlay.approval_scroll.saturating_add(8);
@@ -582,6 +602,17 @@ async fn stop_key(app: &mut App, vendor: &dyn Vendor, stop: Stop) -> Action {
     refresh_completion(app);
     Action::Continue
 }
+/// Whether Enter runs `draft` (trimmed) as a slash command rather than sending it as a prompt.
+/// "/usr/lib is broken" is a prompt: no command name contains a slash. A phone's text is judged
+/// the same way.
+pub(crate) fn is_command_line(draft: &str) -> bool {
+    let path_like = draft
+        .split_whitespace()
+        .next()
+        .and_then(|first| first.strip_prefix('/'))
+        .is_some_and(|name| name.contains('/'));
+    draft.starts_with('/') && draft != octet_core::APPROVAL_DEMO && !path_like
+}
 /// Enter: runs a `!` line, a `/command`, or sends the draft as a prompt.
 async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
     let draft = app.composer.editor.text().trim().to_owned();
@@ -606,12 +637,6 @@ async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
         app.remember(draft);
         return Action::RunShell { command, attach };
     }
-    // "/usr/lib is broken" is a prompt: no command name contains a slash.
-    let path_like = draft
-        .split_whitespace()
-        .next()
-        .and_then(|first| first.strip_prefix('/'))
-        .is_some_and(|name| name.contains('/'));
     if draft == "/model" {
         // `/model` alone opens the picker.
         app.composer.editor.set("/model ".into());
@@ -624,7 +649,7 @@ async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
         refresh_skill_picker(app);
         return Action::Continue;
     }
-    if draft.starts_with('/') && draft != octet_core::APPROVAL_DEMO && !path_like {
+    if is_command_line(&draft) {
         return match try_command(app, vendor, &draft).await {
             Some(action) => {
                 app.composer.editor.take();
@@ -815,6 +840,11 @@ pub(crate) fn compose(app: &App, draft: &str) -> Result<Prompt, String> {
         display,
         images: app.composer.images.clone(),
     })
+}
+/// Sends or queues a remote `text` as a plain prompt, leaving the desk's own attachments, images
+/// and history alone; whether it was taken.
+pub(crate) fn send_remote_prompt(app: &mut App, vendor: &dyn Vendor, text: String) -> bool {
+    can_take_a_turn(app) && send_or_queue(app, vendor, Prompt::plain(text))
 }
 /// Sends `draft` as a prompt, or queues it behind the running turn. Its
 /// attachments go with it, and it joins the history. False, with a notice,

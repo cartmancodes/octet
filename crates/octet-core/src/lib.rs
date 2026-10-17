@@ -278,10 +278,11 @@ pub use error::{ExportError, GoalError, SelectionError, SessionError};
 pub mod catalog;
 pub mod goal;
 pub mod model;
+pub mod remote;
 pub mod sessions;
 pub mod skills;
 pub use octet_store::JournalSummary;
-pub use sessions::{RecentSession, recent_sessions};
+pub use sessions::{RecentSession, recent_sessions, recent_sessions_in};
 
 pub use octet_engine::live::{ModelInfo, SkillInfo};
 

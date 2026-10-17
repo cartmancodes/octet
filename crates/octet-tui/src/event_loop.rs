@@ -4,6 +4,7 @@
 use crate::{
     Action, Exit, Signals,
     app::{App, StatusKind},
+    bridge::{Bridge, Remote, handle_remote},
     external, files,
     input::{key_action, paste, refresh_completion},
     jobs, session_event, shell, shell_finished,
@@ -40,6 +41,8 @@ enum Wake {
     Index(Option<files::Index>),
     /// The `!` command ended.
     Shell(Result<shell::Ran, shell::ShellError>),
+    /// A hub sent a command.
+    Remote(Remote),
     /// The external editor exited.
     Editor(io::Result<ExitStatus>),
     /// A key, paste or resize; `None` once the terminal closed.
@@ -65,6 +68,8 @@ async fn maybe<F: Future + Unpin>(future: Option<&mut F>) -> F::Output {
 struct Loop<'t> {
     terminal: &'t mut Terminal<CrosstermBackend<Stdout>>,
     guard: &'t TerminalGuard,
+    /// Shares the session with hubs.
+    bridge: &'t mut Bridge,
     /// Keys; `None` while the external editor has the terminal.
     input: Option<InputReader>,
     /// The external editor, while it has the terminal.
@@ -82,10 +87,12 @@ pub(crate) async fn run_session(
     app: &mut App,
     session: &mut Session,
     signals: &mut Signals,
+    bridge: &mut Bridge,
 ) -> io::Result<Exit> {
     let mut lp = Loop {
         terminal,
         guard,
+        bridge,
         input: Some(InputReader::new()),
         editing: None,
         dirty: true,
@@ -127,6 +134,7 @@ impl Loop<'_> {
         let models = &mut app.models;
         let editing = &mut self.editing;
         let input = &mut self.input;
+        let bridge = &mut *self.bridge;
         tokio::select! {
             () = tokio::time::sleep_until(frame_due), if paint_pending => Wake::Paint,
             () = tokio::time::sleep_until(quit_deadline.unwrap_or(frame_due)),
@@ -158,6 +166,7 @@ impl Loop<'_> {
                     None => std::future::pending().await,
                 }
             } => Wake::Input(key),
+            remote = bridge.next_command() => Wake::Remote(remote),
             _ = signals.interrupt.recv() => Wake::Interrupt,
             _ = signals.term.recv() => Wake::Terminate,
             _ = signals.hup.recv() => Wake::Terminate,
@@ -203,6 +212,15 @@ impl Loop<'_> {
                 refresh_completion(app);
             }
             Wake::Shell(ran) => shell_finished(app, ran),
+            Wake::Remote(remote) => {
+                let (peer, req) = (remote.peer, remote.req);
+                let (result, action) =
+                    handle_remote(app, &session.handle, remote, self.editing.is_some()).await;
+                self.bridge.reply(peer, req, result);
+                if let Some(exit) = self.apply(action, app)? {
+                    return Ok(Some(exit));
+                }
+            }
             Wake::Editor(status) => self.finish_editor(app, &status)?,
             Wake::Input(Some(input)) => return self.input(app, session, input?).await,
             // While an editor waits in cooked mode, Ctrl+C is meant for it.
@@ -215,7 +233,15 @@ impl Loop<'_> {
             Wake::Suspend => self.suspend()?,
         }
         self.dirty = true;
+        self.share(app).await;
         Ok(None)
+    }
+
+    /// Tells the bridge what changed: the registration, then the state and catalog frames.
+    async fn share(&mut self, app: &mut App) {
+        self.bridge.refresh(app).await;
+        self.bridge.publish(app);
+        self.bridge.tell(app);
     }
 
     /// A key, paste or resize.
@@ -245,6 +271,7 @@ impl Loop<'_> {
             app.composer.files = files::Files::build(app.composer.root.clone());
         }
         self.dirty = true;
+        self.share(app).await;
         Ok(exit)
     }
 

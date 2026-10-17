@@ -20,6 +20,10 @@ and what it can't, is in [The `/remote-control` check](#the-remote-control-check
 if the phone won't connect, see [Troubleshooting](#troubleshooting). Why this
 design, and its limits: [the evaluation](rust/remote-control-ssh.md).
 
+Octet also has a hub that lets a phone app list, watch and answer your running
+sessions without a terminal: see [Phone app (hub)](#phone-app-hub). It is
+optional, and the terminal route in steps 1 to 7 works without it.
+
 ## 1. Install tmux and mosh on the Mac
 
 ```sh
@@ -335,11 +339,254 @@ phone can be attached to the same session at once. By default (tmux 3.1 and
 later) the screen takes the size of whichever of them was used last; add
 `set -g window-size smallest` to `~/.tmux.conf` to fit both instead.
 
+## Phone app (hub)
+
+The hub is a small server on the Mac that shares your running Octet sessions
+with a phone app, over your tailnet. The phone sees each session's transcript,
+sends prompts, answers approvals, changes mode and model, and can start a
+session or resume a recent one. You can still sit at the Mac and join any
+session: a session started from the phone runs in tmux (`tmux attach -t
+octet-NAME`), and one started at the desk shows up on the phone.
+
+You need the Mac side of Tailscale (step 3), and `tmux` if the phone should
+start sessions (step 1). The phone app is not in any app store: you build it
+from source and install it on your phone yourself, as
+[its README](../apps/mobile/README.md#building-the-app-for-a-phone) describes. It
+needs no SSH setup.
+
+The app is an Expo (React Native) project in
+[`apps/mobile`](../apps/mobile/README.md). Its README covers building it for
+an iPhone or an Android phone, working on it, pairing, and what to check when
+the app can't reach the Mac, says it is unpaired, or doesn't show a session
+you started.
+
+### Start the hub
+
+```sh
+octet hub
+```
+
+It listens on `127.0.0.1` port 47823 (`--port N` or `hub.json` changes it)
+and says where it is. Only the Mac itself can reach that port. The tailnet
+login that may connect is yours, read from Tailscale (`--owner LOGIN` sets
+another). Leave the hub running in its own terminal or tmux window; running
+Octet sessions carry on if it stops, and the phone just can't reach them. To have
+it start at login and come back if it stops, see [Keep the hub
+running](#keep-the-hub-running).
+
+To see what every session is doing, in another terminal:
+
+```sh
+octet hub watch
+```
+
+It prints one line per session event (tool calls, approvals, finished turns)
+until you press Ctrl+C. It shows the same thing the phone would see.
+
+### Keep the hub running
+
+To have the hub start at login and come back if it stops, install it as a
+per-user service:
+
+```sh
+octet hub install
+```
+
+On macOS that writes a launchd agent, `~/Library/LaunchAgents/dev.octet.hub.plist`.
+On Linux it writes a systemd user unit, `~/.config/systemd/user/octet-hub.service`,
+and enables it. Either way the service runs the `octet` you ran this from, as
+`octet hub --journal-dir DIR`, where DIR is the data directory this command resolved
+(from `--journal-dir`, `$XDG_DATA_HOME`, or `~/.local/share`), so the service and its log
+agree even though it doesn't see your shell's environment. Its `PATH` starts
+with the directories where `tmux`, `claude` and `codex` were found on your
+shell's `PATH` when you ran the command, then the usual system directories, so
+the hub can start sessions (and the agents in them) from a service's bare
+environment, even after a login with no tmux running. The service doesn't use
+`--port` or `--owner`; set the port in `hub.json`.
+
+- **Logs.** On macOS the hub's output goes to `hub.log` in the data directory
+  (`~/.local/share/octet/rust-preview/hub.log` unless you chose another); read it with
+  `tail -f`. On Linux use `journalctl --user -u octet-hub.service -f`.
+- **hub.log grows.** Nothing rotates it. To empty it, run
+  `: > ~/.local/share/octet/rust-preview/hub.log` (your data directory, if you
+  chose another); the running hub carries on writing to it.
+- **See the file first.** `octet hub install --print` writes the file to the
+  terminal and changes nothing.
+- **Move or upgrade `octet`.** The service holds the program's path, so run
+  `octet hub install` again after moving or reinstalling it; on Linux that also
+  restarts the running service. A file already at the service file's path that
+  isn't Octet's is never replaced.
+- **Move or install tmux, Claude or Codex.** Install records where `tmux`,
+  `claude` and `codex` were found; re-run `octet hub install` after moving or
+  installing them, or the hub won't find them.
+- **Remove it.** `octet hub uninstall` stops the service and deletes the file.
+  It says "Not installed" if there is nothing to remove.
+- **Restarts.** launchd restarts the hub whenever it stops; systemd restarts it
+  five seconds after it fails, so a failure at boot doesn't use up systemd's
+  start limit.
+- **Sessions outlive the service.** Stopping, restarting or reinstalling the
+  service stops the hub alone. The tmux server a phone's `start` forked keeps
+  running, with every session in it, yours too. The systemd unit sets
+  `KillMode=process` and the launchd agent sets `AbandonProcessGroup`.
+- **Linux without a login session.** A systemd user service stops when you log
+  out unless lingering is on: `loginctl enable-linger "$USER"`.
+
+### Push notifications
+
+When an agent needs your approval, or finishes a turn, the hub can tell a phone
+that isn't looking at the app. The phone turns this on itself (Settings in the
+app, or the step after pairing; [the app's
+README](../apps/mobile/README.md#notifications) covers the one-time setup with
+your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
+
+- **What is sent.** Exactly this and nothing else: the title `Octet`, the body
+  `Approval waiting` or `Turn finished`, and `data` holding the hub's opaque
+  session id so a tap opens that session, plus the fixed delivery fields
+  Expo needs (`to`, which is the phone's push token, and `sound`, `priority`
+  and `channelId`, which are constants). No prompt, command, file name,
+  workspace, model or reply text ever goes in a push, so the push services
+  never see what you are working on.
+- **Where it goes.** The hub posts each push to Expo's push service, `https://exp.host/--/api/v2/push/send`,
+  which hands it to Apple or Google. That request is the only thing the hub
+  sends outside your Mac and your tailnet, and it carries the phone's Expo
+  push token, which the hub keeps in `devices.json` (readable by you alone)
+  and never writes to logs, journals, the audit file or a command line.
+  Expo, Apple and Google see that a push for that token happened, and when.
+- **Which phones.** A phone gets a push only if it turned notifications on and
+  has no open connection to the hub. The app closes its connection when it goes
+  to the background, so a phone you are holding with the app open gets
+  nothing. An approval that arrived while you were looking and is still
+  waiting when the app goes to the background is pushed then, once (within the
+  same limits).
+- **How often.** One push per approval, however often it is shown again; one per
+  finished turn. Pushes to a phone collect for about two seconds and go out as
+  one (an approval wins over a finished turn), and a phone gets at most six
+  in any minute. A phone Expo reports as gone has its token cleared.
+- **curl.** The hub sends each push by running `curl` from its `PATH`, with
+  `-q` so it ignores any `~/.curlrc`. Without
+  `curl` every push fails (the hub logs `Push failed` and carries on). macOS
+  and most Linux systems have it in `/usr/bin`; the service `octet hub install`
+  writes carries a `PATH` that includes `/usr/bin`, so it finds it.
+- **Turn it off.** Switch **Notifications** off in the app's Settings (the
+  hub forgets the token at once). Unpairing the phone, or `octet hub revoke
+  "NAME"` on the Mac, removes its token as well. Stopping the hub stops
+  every push.
+
+### Put it on your tailnet
+
+The hub never listens on the network. Publish it with Tailscale, which adds
+HTTPS on the Mac's `*.ts.net` name and tells the hub which tailnet user is
+connecting:
+
+```sh
+tailscale serve --bg 47823
+```
+
+Only devices on your tailnet can open that address. Use `tailscale serve
+status` to see it, and `tailscale serve --https=443 off` to take it down.
+Never publish the hub with `tailscale funnel`: Funnel puts it on the public
+internet, and the hub is for your tailnet only.
+
+### Pair a phone
+
+In an Octet session on the Mac, type:
+
+```
+/remote-control pair
+```
+
+It shows a QR code and a link. In the phone app choose **Pair** and scan it.
+The code works once and expires after 10 minutes. If the hub isn't running,
+Octet says `Start the hub first: octet hub`; if it isn't published yet, Octet
+makes no code and says `Publish it first: tailscale serve --bg 47823`.
+Plain `/remote-control` also reports the hub: whether it is running, whether
+it is published, and how many phones are paired. The hub checks Tailscale when
+it starts and every 10 seconds after, so a `tailscale serve` you just ran can
+take that long to show.
+
+To list the paired phones, or remove one:
+
+```sh
+octet hub devices
+octet hub revoke "My iPhone"
+```
+
+A revoked phone is disconnected within two seconds and can't come back
+without pairing again. Run `octet hub devices` and `revoke` with the same
+`--journal-dir` as the hub if you gave it one. Neither reads `hub.json`, so a
+mistake there never blocks a revoke. A relative `--journal-dir` is resolved
+to an absolute path when Octet starts. The hub, the sessions at your desk and
+the sessions a phone starts then use the same directory, whatever directory
+each one runs in.
+
+### Keep a session off the phone
+
+Each Octet session shares itself with the hub through a private socket in
+`run/` beside its journals, and a file saying which engine, workspace and mode
+it uses. To keep one session private, start it with:
+
+```sh
+octet --no-remote
+```
+
+It then creates no socket and no file, and the hub and the phone never see it.
+
+### Hub security notes
+
+- The hub listens on `127.0.0.1` only. The only way in from outside is
+  `tailscale serve`, which is reachable from your tailnet and nowhere else.
+  Never expose the port any other way.
+- A connection needs your tailnet login **and** a device token. The token is
+  made when you pair; the hub keeps only its hash in `devices.json`, which is
+  readable by you alone, and the phone keeps the token in its secure storage.
+  Another tailnet device, or another program on the Mac, can't connect
+  without pairing.
+- A web page can't use your browser to connect. The hub refuses a
+  connection whose `Origin` names another site. The app sends none, or the
+  hub's own address: the one the request names, or the `*.ts.net` name
+  `tailscale serve` publishes it at.
+- Connections that stall mid-request can't keep a phone out. Each one must
+  finish connecting within 5 seconds, and once 32 are connecting at once, a new
+  one pushes out the oldest. A stalled one never counts against the 8 that may
+  wait to say hello.
+- The hub won't start if `run/` in the data directory is a symlink, isn't a
+  directory, or belongs to another user. It names the path. If `run/` is
+  readable by others, the hub makes it `0700`.
+- A lost or stolen phone: run `octet hub revoke NAME` on the Mac. Then
+  remove the phone from the tailnet in the Tailscale admin console.
+- Every action from a phone (prompt, answer, mode, start and so on) is
+  recorded with the phone's name in `hub-audit.jsonl`, without the prompt
+  text. The desk also shows a note naming the phone. Pairing (`paired`) and
+  `octet hub revoke` (`revoked`) are recorded too, with the phone's name and
+  never a token or pairing code.
+- A command that was waiting when a session's link dropped is refused with
+  `Lost the link to that session; check it before sending again`. The command
+  may have run, so look before you send it again. `The session ended` means
+  the session is gone.
+- `full-access` from a phone needs the typed confirmation `full access`, which
+  the hub checks itself, and the desk shows `⚠ Full access from NAME`. The
+  phone app adds a Face ID or fingerprint check of its own.
+- Allowing an approval from the phone allows that one request, once. The
+  phone can't add permission rules, and a denied or expired approval stays
+  denied.
+- The phone can start sessions only in workspaces that appear in your recent
+  sessions or in the `workspaces` list of `hub.json` in the data directory,
+  and at most eight phone-started sessions run at once.
+- The phone can't run slash commands, `!` shell commands or `/goal`, edit
+  files outside a session, or see sessions started with `--no-remote`.
+- Pairing codes, device tokens and push tokens are never written to logs or
+  journals.
+
+The hub's files (`devices.json`, `hub.json`, `hub-audit.jsonl`) and the
+`run/` directory live beside the journals: `$XDG_DATA_HOME/octet/rust-preview`,
+or `~/.local/share/octet/rust-preview`. `--journal-dir PATH` chooses another.
+
 ## Turn it off
 
 - Quit Octet with Ctrl+C twice, or `tmux kill-session -t octet`.
 - Turn off **Remote Login** in System Settings, or run `sudo tailscale set --ssh=false`.
 - Disconnect the Mac in the Tailscale app.
+- Stop the hub with Ctrl+C (or `octet hub uninstall`, if you installed it as a service), and take it off the tailnet with `tailscale serve --https=443 off`.
 
 ## Security notes
 

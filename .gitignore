@@ -1,6 +1,12 @@
 .DS_Store
 .vscode/
 /target/
+
+# The mobile app's installs and generated output.
+/apps/mobile/node_modules/
+/apps/mobile/.expo/
+/apps/mobile/dist/
+/apps/mobile/expo-env.d.ts
 .superpowers/
 
 # Claude Code session state, including git worktrees it manages.
