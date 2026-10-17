@@ -605,7 +605,7 @@ pub static MESSAGES: &[Message] = &[
         &[opt("token", Str), opt("start_token", Str)],
         "Say the ActivityKit tokens the phone has now, for the hub's Live Activity pushes: \
          `token`, the running activity's push token, and `start_token`, the push-to-start \
-         token, each 1 to 200 lowercase hex digits. Either may be left out, as the phone has \
+         token, each 1 to 1024 lowercase hex digits. Either may be left out, as the phone has \
          none, but not both. Each registration replaces both: a token left out is one the hub \
          no longer has.",
     ),
@@ -1441,9 +1441,14 @@ pub fn is_push_token(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Whether `token` is an `ActivityKit` token as the phone sends it: 1 to 200 lowercase hex digits.
+/// The most hex digits an `ActivityKit` token may have. Apple doesn't fix the length (iOS 26.5
+/// issues 128 bytes, 256 digits); 1024 digits is 512 bytes, far above any token seen.
+pub const ACTIVITY_TOKEN_DIGITS: usize = 1024;
+
+/// Whether `token` is an `ActivityKit` token as the phone sends it: 1 to
+/// [`ACTIVITY_TOKEN_DIGITS`] lowercase hex digits.
 pub fn is_activity_token(token: &str) -> bool {
-    (1..=200).contains(&token.len())
+    (1..=ACTIVITY_TOKEN_DIGITS).contains(&token.len())
         && token
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -1456,7 +1461,9 @@ fn activity_token(map: &Map<String, Value>, key: &str) -> Result<Option<Secret>,
         None | Some(Value::Null) => Ok(None),
         Some(value) => match value.as_str() {
             Some(token) if is_activity_token(token) => Ok(Some(Secret(token.to_owned()))),
-            _ => Err(format!("{key} must be 1 to 200 lowercase hex digits")),
+            _ => Err(format!(
+                "{key} must be 1 to {ACTIVITY_TOKEN_DIGITS} lowercase hex digits"
+            )),
         },
     }
 }
@@ -2831,9 +2838,11 @@ mod tests {
 
     #[test]
     fn register_activity_takes_lowercase_hex_tokens_and_refuses_anything_else() {
-        let long = "a".repeat(200);
+        // iOS 26.5 issues 128-byte tokens: 256 hex digits. Any up to 1024 is taken.
+        let ios = "0123456789abcdef".repeat(16);
+        let long = "a".repeat(1024);
         // Either token may be left out (or null), as long as one is there.
-        let accepted: [(String, Option<&str>, Option<&str>); 7] = [
+        let accepted: [(String, Option<&str>, Option<&str>); 8] = [
             (
                 r#""token":"0123456789abcdef""#.to_owned(),
                 Some("0123456789abcdef"),
@@ -2861,6 +2870,11 @@ mod tests {
                 Some("ab"),
             ),
             (
+                format!(r#""token":"{ios}","start_token":"{ios}""#),
+                Some(ios.as_str()),
+                Some(ios.as_str()),
+            ),
+            (
                 format!(r#""token":"{long}","start_token":"{long}""#),
                 Some(long.as_str()),
                 Some(long.as_str()),
@@ -2880,7 +2894,7 @@ mod tests {
             assert_eq!(kept.as_ref().map(Secret::expose), *token);
             assert_eq!(kept_start.as_ref().map(Secret::expose), *start);
         }
-        let too_long = "a".repeat(201);
+        let too_long = "a".repeat(1025);
         let refused = [
             String::new(),
             r#","token":null"#.to_owned(),
@@ -2917,6 +2931,9 @@ mod tests {
         assert!(is_activity_token("0123456789abcdef"));
         assert!(!is_activity_token(""));
         assert!(!is_activity_token("A"));
+        assert_eq!(ios.len(), 256);
+        assert!(is_activity_token(&ios));
+        assert!(is_activity_token(&long));
         assert!(!is_activity_token(&too_long));
     }
 

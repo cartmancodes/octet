@@ -930,7 +930,8 @@ fn push_kinds(stored: &serde_json::Value) -> PushKinds {
 }
 
 /// A device's stored `ActivityKit` tokens. A file from before them has none; a token that is not
-/// lowercase hex is dropped alone, and with neither left there are none.
+/// 1 to 1024 lowercase hex digits (`is_activity_token`) is dropped alone, and with neither left
+/// there are none.
 fn activity(stored: &serde_json::Value) -> Option<ActivityTokens> {
     let checked = |key: &str| {
         stored[key]
@@ -1547,6 +1548,36 @@ mod tests {
             start_token: start_token.map(str::to_owned),
             registered: None,
         }
+    }
+
+    #[tokio::test]
+    async fn activity_tokens_up_to_1024_digits_round_trip_and_longer_ones_are_dropped() {
+        let dir = TempDir::new("hub-activitylong");
+        let mut store = store(&dir).await;
+        let token = paired(&mut store, "Gemini 10", epoch(1)).await;
+        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        // iOS 26.5 issues 128-byte tokens: 256 hex digits.
+        let ios = "0123456789abcdef".repeat(16);
+        let longest = "c".repeat(1024);
+        let held = activity(Some(&ios), Some(&longest));
+        assert!(
+            store
+                .set_activity(&device.token_sha256, held.clone())
+                .await
+                .unwrap()
+        );
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(reopened.devices()[0].activity, Some(held));
+
+        // A file holding a token over 1024 digits keeps only the other.
+        let path = dir.path().join("devices.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace(&longest, &"c".repeat(1025))).unwrap();
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(
+            reopened.devices()[0].activity,
+            Some(activity(Some(&ios), None))
+        );
     }
 
     #[tokio::test]

@@ -669,6 +669,8 @@ activity's own start alert, which Apple requires to start one by push. That is e
 
 **Tokens.** The app gives the driving Mac its ActivityKit tokens (`register_activity`) over its own
 connection, whenever they change: the push-to-start token, and the running activity's own token.
+Each is 1 to 1024 lowercase hex digits; Apple doesn't fix the length (iOS 26.5 issues 256), and the
+app and the hub refuse anything else.
 When a new activity's token comes while the app is in the background (an activity the hub just
 started), the app hands it over at once: it opens a short background connection to that Mac, which
 registers the token and closes once the Mac answers or after 10 seconds. It does this too when iOS

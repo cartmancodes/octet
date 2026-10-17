@@ -282,7 +282,8 @@ shows no switch for it.
   when the choice moves away from it is told on its next connection, and again each time you come
   back to the app.
 - **Tokens.** The app gives the driving Mac its ActivityKit tokens (`register_activity`) over its
-  own connection, when they change, and when it is out of reach, on its next connection. A
+  own connection, when they change, and when it is out of reach, on its next connection. Each is 1
+  to 1024 lowercase hex digits (Apple doesn't fix the length; iOS 26.5 issues 256), on both sides. A
   registration or `clear_activity` the Mac turns away for now (busy, rate-limited, not saved, timed
   out) is tried once more 5 seconds later. The hub counts a token's 12 hours from its first
   registration, so the app registering it again at each launch doesn't stretch them. A token per

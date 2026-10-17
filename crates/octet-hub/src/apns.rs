@@ -846,6 +846,24 @@ mod tests {
     }
 
     #[test]
+    fn a_token_as_ios_issues_it_goes_whole_into_the_url_and_a_longer_one_is_not_sent() {
+        // iOS 26.5 issues 128-byte tokens: 256 hex digits. Any up to 1024 is sent whole.
+        for token in ["0123456789abcdef".repeat(16), "d".repeat(1024)] {
+            let request = curl_config("https://h", "j", &token, &json!({}), Priority::Normal)
+                .expect("config");
+            assert!(
+                request.starts_with(&format!("url = \"https://h/3/device/{token}\"\n")),
+                "{request}"
+            );
+        }
+        let too_long = "d".repeat(1025);
+        assert_eq!(
+            curl_config("https://h", "j", &too_long, &json!({}), Priority::Normal),
+            None
+        );
+    }
+
+    #[test]
     fn the_seam_is_loopback_only_and_debug_only() {
         let apns = config("/k".into(), false);
         let real = "https://api.push.apple.com";

@@ -114,7 +114,12 @@ describe("events from the native side", () => {
     expect(asTokenEvent({ token: null, activity: "A1B2-C3" })).toEqual({ token: null, activity: "A1B2-C3" });
     expect(asTokenEvent({ token: "0a1b2c", activity: 5 })).toEqual({ token: "0a1b2c" });
     expect(asTokenEvent({ token: "0a1b2c", activity: "x".repeat(129) })).toEqual({ token: "0a1b2c" });
-    for (const bad of [null, {}, { token: "" }, { token: "0A1B" }, { token: "xyz" }, { token: 5 }, { token: "a".repeat(201) }]) {
+    // iOS 26.5 issues 128-byte tokens (256 hex digits); any up to 1024 digits passes.
+    const ios265 = "0123456789abcdef".repeat(16);
+    expect(ios265).toHaveLength(256);
+    expect(asTokenEvent({ token: ios265, activity: "A1B2-C3" })).toEqual({ token: ios265, activity: "A1B2-C3" });
+    expect(asTokenEvent({ token: "a".repeat(1024) })).toEqual({ token: "a".repeat(1024) });
+    for (const bad of [null, {}, { token: "" }, { token: "0A1B" }, { token: "xyz" }, { token: 5 }, { token: "a".repeat(1025) }]) {
       expect(asTokenEvent(bad)).toBeNull();
     }
   });

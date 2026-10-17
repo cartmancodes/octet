@@ -88,7 +88,9 @@ export async function setEntries(entries: Record<string, WidgetEntry>): Promise<
   await native?.setEntries(JSON.stringify(entries));
 }
 
-const TOKEN = /^[0-9a-f]{1,200}$/;
+/** An ActivityKit token: 1 to 1024 lowercase hex digits, as the hub takes them (protocol.rs's
+ * `ACTIVITY_TOKEN_DIGITS`). Apple doesn't fix the length; iOS 26.5 issues 256 digits. */
+const TOKEN = /^[0-9a-f]{1,1024}$/;
 /** An activity's id is a UUID; anything longer is not one. */
 const ACTIVITY_ID_CHARS = 128;
 

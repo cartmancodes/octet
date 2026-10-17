@@ -30,7 +30,9 @@ Claude Code and Codex CLIs.
     away the Island follows that Mac, and the others still send
     notifications. A Mac that missed its `clear_activity` is told again on its
     next connection and each time you come back to the app. A registration
-    refused for now is tried once more 5 seconds later.
+    refused for now is tried once more 5 seconds later. Each token is 1 to
+    1024 lowercase hex digits (iOS 26.5 issues 256); the app and the hub
+    refuse any other.
   - **The background.** A new activity's token that comes while the app is in
     the background is handed over on a short connection whose hello says
     `background: true`. When activities appear together, only the ones seen

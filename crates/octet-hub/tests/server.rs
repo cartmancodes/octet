@@ -1395,11 +1395,35 @@ async fn register_activity_is_stored_acked_audited_and_dropped_on_revoke() {
 }
 
 #[tokio::test]
+async fn activity_tokens_as_ios_issues_them_are_registered_up_to_1024_digits() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    // iOS 26.5 issues 128-byte tokens: 256 hex digits.
+    let ios = "0123456789abcdef".repeat(16);
+    let longest = "b".repeat(1024);
+    for (req, token, start) in [(1, &ios, &longest), (2, &longest, &ios)] {
+        send(&mut phone, register_activity(req, Some(token), Some(start))).await;
+        assert_eq!(
+            recv_kind(&mut phone, "ack").await,
+            ack(req, "Activity registered")
+        );
+        assert_eq!(
+            stored_activity(&env).await,
+            [(
+                "Test phone".to_owned(),
+                Some((Some(token.clone()), Some(start.clone())))
+            )]
+        );
+    }
+}
+
+#[tokio::test]
 async fn bad_activity_tokens_are_refused_as_invalid_and_the_connection_goes_on() {
     let mut env = Env::new();
     env.start().await;
     let (mut phone, _) = env.phone("Test phone").await;
-    let too_long = "a".repeat(201);
+    let too_long = "a".repeat(1025);
     let mut extra = register_activity(7, Some(ACTIVITY), None);
     extra["extra"] = json!(1);
     for command in [
