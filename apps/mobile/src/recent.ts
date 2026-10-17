@@ -83,3 +83,31 @@ export function tmuxOfAck(ack: unknown): string | null {
   if (typeof message !== "string") return null;
   return STARTING.exec(message)?.[1] ?? null;
 }
+
+/** A recent session as Recent lists it: the Mac it is on, and that Mac's name (only drawn with
+ * several Macs). */
+export type RecentItem = RecentInfo & { mac: string; macName: string };
+
+/** A recent item's list key: its Mac, engine, workspace and id. */
+export const recentKey = (r: RecentItem): string => `${r.mac}:${r.engine}:${r.workspace}:${r.session}`;
+
+const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Every Mac's recent items as one list: newest start first, a tie by the Mac's name, then by
+ * key. An item that `before` (the last list) holds unchanged is that same object, so its row does
+ * not draw again. */
+export function mergeRecent(
+  lists: readonly { mac: string; macName: string; items: readonly RecentInfo[] }[],
+  before: readonly RecentItem[] = [],
+): RecentItem[] {
+  const had = new Map(before.map((r) => [recentKey(r), r]));
+  const all: RecentItem[] = [];
+  for (const { mac, macName, items } of lists) {
+    for (const r of items) {
+      const next: RecentItem = { ...r, mac, macName };
+      const old = had.get(recentKey(next));
+      all.push(old && old.title === next.title && old.started === next.started && old.macName === macName ? old : next);
+    }
+  }
+  return all.sort((a, b) => (b.started || 0) - (a.started || 0) || byText(a.macName, b.macName) || byText(recentKey(a), recentKey(b)));
+}

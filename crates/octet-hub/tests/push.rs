@@ -36,6 +36,8 @@ const WAIT: Duration = Duration::from_secs(5);
 /// How long a push may take: the 2 s window, the hub's 1 s sweep, and `curl`.
 const PUSH_WITHIN: Duration = Duration::from_secs(10);
 const JOURNAL: &str = "session-1-1.jsonl";
+/// The host every hub here is published at, as its pushes name it.
+const MAC: &str = "mac.tail1234.ts.net";
 
 type Phone = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -244,8 +246,14 @@ impl Env {
         }
     }
 
-    /// A phone called `name` that paired, said hello and turned on push for `token`.
-    async fn phone(&self, name: &str, token: &str) -> Phone {
+    /// A phone called `name` that paired, said hello and turned on push for `token`, with the
+    /// `kinds` it chose (the hub's defaults when none).
+    async fn phone(&self, name: &str, token: &str, kinds: Option<Value>) -> Phone {
+        self.paired_phone(name, token, kinds).await.0
+    }
+
+    /// [`phone`](Self::phone), with the device token it said hello with.
+    async fn paired_phone(&self, name: &str, token: &str, kinds: Option<Value>) -> (Phone, String) {
         let mut phone = self.connect().await;
         let secret = self
             .control(&json!({"type": "pair_secret"}))
@@ -266,15 +274,28 @@ impl Env {
         )
         .await;
         recv_kind(&mut phone, "welcome").await;
-        send(
-            &mut phone,
-            json!({"v": 1, "req": 3, "type": "register_push", "token": token}),
-        )
-        .await;
+        let mut register = json!({"v": 1, "req": 3, "type": "register_push", "token": token});
+        if let Some(kinds) = kinds {
+            register["kinds"] = kinds;
+        }
+        send(&mut phone, register).await;
         assert_eq!(
             recv_kind(&mut phone, "ack").await,
             ack(3, "Notifications on")
         );
+        (phone, device_token)
+    }
+
+    /// A background connection of the device `device`: the app handing a token over, not the
+    /// app in front.
+    async fn background_hello(&self, device: &str) -> Phone {
+        let mut phone = self.connect().await;
+        send(
+            &mut phone,
+            json!({"v": 1, "req": 2, "type": "hello", "token": device, "background": true}),
+        )
+        .await;
+        recv_kind(&mut phone, "welcome").await;
         phone
     }
 
@@ -290,6 +311,17 @@ impl Env {
             .expect("the handshake ends")
             .expect("connects");
         phone
+    }
+
+    /// Appends a record to the session's journal, as the terminal UI does.
+    fn journal(&self, seq: u64, kind: &str, data: &str) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(self.root.join(JOURNAL))
+            .expect("the journal");
+        let line = json!({"format": "octet-preview-1", "seq": seq, "type": kind, "data": data});
+        writeln!(file, "{line}").expect("a record");
     }
 
     fn devices(&self) -> String {
@@ -368,10 +400,11 @@ async fn pushes_after(fake: &Fake, token: &str, wait: Duration) -> usize {
     fake.to(token).len()
 }
 
-/// What a push looks like on the phone: exactly these keys, nothing from the session.
+/// What a push looks like on the phone: exactly these keys, nothing from the session, and the
+/// hub's own published host as `mac`.
 fn approval_message(token: &str, session: &str) -> Value {
     json!({"to": token, "title": "Octet", "body": "Approval waiting",
-        "data": {"session": session}, "sound": "default", "priority": "high",
+        "data": {"session": session, "mac": MAC}, "sound": "default", "priority": "high",
         "channelId": "approvals"})
 }
 
@@ -460,6 +493,7 @@ fn push_goes_out_content_free_to_a_phone_in_the_background() {
             approval_then_turn(&fake, root.join("a"), &url, &log),
             connected_phones_are_left_alone(&fake, root.join("b")),
             a_dead_token_is_dropped(&fake, root.join("c")),
+            a_background_connection_is_not_the_app(&fake, root.join("d")),
         );
         assert_content_free(&fake);
         // No call to curl, whoever made it, had a push token in its argv.
@@ -474,12 +508,14 @@ fn push_goes_out_content_free_to_a_phone_in_the_background() {
 }
 
 /// An approval pushes once to a phone in the background, with the message and nothing else, a
-/// finished turn pushes once, and `curl` was given neither the token nor the message.
+/// finished turn pushes once to a phone that asked for turns, an error record pushes once, and
+/// `curl` was given neither the token nor the message.
 async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     const TOKEN: &str = "ExpoPushToken[story-a-token]";
     let env = Env::start(root, 6101).await;
     let mut link = env.link().await;
-    let phone = env.phone("Story A phone", TOKEN).await;
+    let kinds = json!({"approvals": true, "errors": true, "turns": true});
+    let phone = env.phone("Story A phone", TOKEN, Some(kinds)).await;
     background(phone).await;
     // The first state seeds what the hub has seen; the approval after it is news.
     link.state("idle", &[]).await;
@@ -496,16 +532,26 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     assert_eq!(
         turn,
         json!({"to": TOKEN, "title": "Octet", "body": "Turn finished",
-            "data": {"session": env.id}, "priority": "normal", "channelId": "turns"})
+            "data": {"session": env.id, "mac": MAC}, "priority": "normal", "channelId": "turns"})
     );
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 2);
+    // An error in the session's journal: one push, which says nothing of the error.
+    env.journal(1, "error", "rm -rf /secret-dir failed");
+    env.journal(2, "error", "rm -rf /secret-dir failed again");
+    let error = fake.wait_for(TOKEN, 2).await;
+    assert_eq!(
+        error,
+        json!({"to": TOKEN, "title": "Octet", "body": "Session error",
+            "data": {"session": env.id, "mac": MAC}, "priority": "high", "channelId": "errors"})
+    );
+    assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 3);
 
     // The token and the message reached curl on stdin, never in argv: one call each.
     let calls: Vec<_> = curl_calls(log)
         .into_iter()
         .filter(|(_, stdin)| stdin.contains(TOKEN))
         .collect();
-    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls.len(), 3, "{calls:?}");
     let mut batches: Vec<Value> = calls
         .iter()
         .map(|(_, stdin)| serde_json::from_str(stdin).expect("stdin is the JSON array"))
@@ -513,7 +559,11 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     batches.sort_by_key(|batch| batch[0]["body"].as_str().map(str::to_owned));
     assert_eq!(
         batches,
-        [json!([approval_message(TOKEN, &env.id)]), json!([turn])]
+        [
+            json!([approval_message(TOKEN, &env.id)]),
+            json!([error]),
+            json!([turn])
+        ]
     );
     for (argv, _) in &calls {
         assert_eq!(
@@ -537,12 +587,13 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
 }
 
 /// A phone with the app open gets nothing. When it goes to the background, the approval it was
-/// spared and that is still open reaches it, once; then the next one does.
+/// spared and that is still open reaches it, once; then the next one does. It said no kinds, so
+/// it has the defaults: a finished turn is not pushed.
 async fn connected_phones_are_left_alone(fake: &Fake, root: PathBuf) {
     const TOKEN: &str = "ExpoPushToken[story-b-token]";
     let env = Env::start(root, 6102).await;
     let mut link = env.link().await;
-    let phone = env.phone("Story B phone", TOKEN).await;
+    let phone = env.phone("Story B phone", TOKEN, None).await;
     link.state("idle", &[]).await;
     link.state("idle", &[1]).await;
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(4)).await, 0);
@@ -555,6 +606,9 @@ async fn connected_phones_are_left_alone(fake: &Fake, root: PathBuf) {
     link.state("idle", &[1, 2]).await;
     fake.wait_for(TOKEN, 1).await;
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 2);
+    link.state("running", &[]).await;
+    link.state("idle", &[]).await;
+    assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(4)).await, 2);
 }
 
 /// Expo says the token is dead: it is cleared from `devices.json` and never tried again.
@@ -562,7 +616,7 @@ async fn a_dead_token_is_dropped(fake: &Fake, root: PathBuf) {
     const TOKEN: &str = "ExpoPushToken[story-c-gone]";
     let env = Env::start(root, 6103).await;
     let mut link = env.link().await;
-    let phone = env.phone("Story C phone", TOKEN).await;
+    let phone = env.phone("Story C phone", TOKEN, None).await;
     assert!(env.devices().contains(TOKEN));
     background(phone).await;
     link.state("idle", &[]).await;
@@ -579,4 +633,22 @@ async fn a_dead_token_is_dropped(fake: &Fake, root: PathBuf) {
     // The next approval has nowhere to go.
     link.state("idle", &[1, 2]).await;
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(4)).await, 1);
+}
+
+/// A background connection open while the phone is away (the app handing a token over) is not
+/// the app in front: the approval is pushed all the same.
+async fn a_background_connection_is_not_the_app(fake: &Fake, root: PathBuf) {
+    const TOKEN: &str = "ExpoPushToken[story-d-token]";
+    let env = Env::start(root, 6104).await;
+    let mut link = env.link().await;
+    let (phone, device) = env.paired_phone("Story D phone", TOKEN, None).await;
+    background(phone).await;
+    let wake = env.background_hello(&device).await;
+    link.state("idle", &[]).await;
+    link.state("idle", &[1]).await;
+    assert_eq!(
+        fake.wait_for(TOKEN, 0).await,
+        approval_message(TOKEN, &env.id)
+    );
+    drop(wake);
 }

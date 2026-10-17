@@ -22,4 +22,17 @@ describe("cleaning hub text", () => {
   it("still drops the overrides and isolates", () => {
     expect(sanitize("a‮b⁦c⁩", TEXT).out).toBe("abc");
   });
+
+  it("turns line and paragraph separators and lone carriage returns into newlines, and CRLF into one", () => {
+    expect(sanitize("a\u2028b\u2029c\rd\r\ne", TEXT).out).toBe("a\nb\nc\nd\ne");
+    expect(sanitize("\r\r\n", TEXT).out).toBe("\n\n");
+    expect(field(`ls${"\u2028".repeat(15)}rm -rf /`, 100)).toBe(`ls${"\n".repeat(15)}rm -rf /`);
+  });
+
+  it("keeps CRLF as one newline when a stream splits it", () => {
+    const first = sanitize("a\r", TEXT);
+    expect(first.out).toBe("a\n");
+    expect(sanitize("\nb", first.esc).out).toBe("b");
+    expect(sanitize("c", sanitize("\r", TEXT).esc).out).toBe("c");
+  });
 });

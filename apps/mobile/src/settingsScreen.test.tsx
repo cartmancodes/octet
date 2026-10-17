@@ -4,12 +4,15 @@ import * as LocalAuthentication from "expo-local-authentication";
 import * as Notifications from "expo-notifications";
 import { router } from "expo-router";
 import * as SecureStore from "expo-secure-store";
-import { Alert, type AlertButton } from "react-native";
+import { Alert, AppState, type AlertButton } from "react-native";
 
 import Settings from "../app/settings";
-import { TOKEN_KEY } from "./hub";
+import { drawerStore, closeDrawer } from "./drawer";
+import { tokenKeyOf } from "./hub";
 import { loadSettings, saveSettings } from "./persist";
+import { FakeLive } from "./liveRig";
 import { info, launch, pairedStorage } from "./screenRig";
+import { M } from "./testKeys";
 
 let mockConfig: { version?: string; extra?: { eas?: { projectId?: string } } } | null = { version: "4.5.6" };
 jest.mock("expo-constants", () => ({
@@ -31,7 +34,10 @@ beforeEach(async () => {
   auth.authenticateAsync.mockResolvedValue({ success: true });
   auth.authenticateAsync.mockClear();
 });
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => {
+  closeDrawer();
+  jest.restoreAllMocks();
+});
 
 const flush = () => act(async () => void jest.advanceTimersByTime(60));
 
@@ -55,16 +61,72 @@ describe("Settings", () => {
     expect(screen.getByText("Shubh's iPhone")).toBeTruthy();
   });
 
-  it("shows the app version from the app's config", async () => {
+  it("ends with the footer, naming the app version from the app's config", async () => {
     await open();
-    expect(screen.getByText("Version 4.5.6")).toBeTruthy();
+    expect(
+      screen.getByText("Octet v4.5.6 · talks to your Macs directly over your tailnet; nothing passes through a relay."),
+    ).toBeTruthy();
   });
 
-  it("shows no version line when the config has none", async () => {
+  it("leaves the version out of the footer when the config has none", async () => {
     mockConfig = null;
     await open();
-    expect(screen.queryByText(/^Version/)).toBeNull();
+    expect(screen.queryByText(/ v\d/)).toBeNull();
+    expect(screen.getByText("Octet · talks to your Macs directly over your tailnet; nothing passes through a relay.")).toBeTruthy();
     mockConfig = { version: "4.5.6" };
+  });
+
+  describe("the new look", () => {
+    it("has a header with ☰ and Settings, and ☰ opens the drawer", async () => {
+      await open();
+      expect(screen.getByText("Settings")).toBeTruthy();
+      expect(drawerStore.getState().open).toBe(false);
+      await fireEvent.press(screen.getByRole("button", { name: "Menu" }));
+      expect(drawerStore.getState().open).toBe(true);
+    });
+
+    it("has three notched cards: Machines, Notify me when, and Face ID to allow", async () => {
+      await open();
+      expect(screen.getByText("Machines")).toBeTruthy();
+      expect(screen.getByText("Notify me when")).toBeTruthy();
+      // The title of the Face ID card, and (separately) the switch that is named for it.
+      expect(screen.getAllByText("Face ID to allow").length).toBeGreaterThanOrEqual(1);
+      expect(screen.getByRole("switch", { name: "Face ID to allow" })).toBeTruthy();
+    });
+
+    it("lists the Mac with ● online while connected, and ○ asleep when not, with Rename and Unpair", async () => {
+      const rig = await open();
+      expect(screen.getByText("● mac")).toBeTruthy();
+      expect(screen.getByText("online")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Rename mac" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Unpair mac" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Pair another machine" })).toBeTruthy();
+      await act(async () => {
+        rig.sockets.last.drop();
+      });
+      expect(screen.getByText("○ mac")).toBeTruthy();
+      expect(screen.getByText("asleep")).toBeTruthy();
+    });
+
+    it("has three notification switches: approval, a turn finishing and a session error, none with the old note", async () => {
+      await open();
+      for (const name of ["An action needs approval", "A turn finishes", "A session hits an error"]) {
+        expect(screen.getByRole("switch", { name })).toBeTruthy();
+      }
+      expect(screen.queryByText("Coming with the next hub update")).toBeNull();
+      expect(screen.getByRole("switch", { name: "A turn finishes" }).props.accessibilityHint).toBeUndefined();
+    });
+
+    it("shows each switch from the saved kinds, and all off while notifications are off", async () => {
+      mockConfig = { extra: { eas: { projectId: "11111111-2222-3333-4444-555555555555" } } };
+      await saveSettings({ notifications: true, pushKinds: { approvals: false, errors: true, turns: true } });
+      await open();
+      expect(screen.getByRole("switch", { name: "An action needs approval" }).props.value).toBe(false);
+      expect(screen.getByRole("switch", { name: "A session hits an error" }).props.value).toBe(true);
+      expect(screen.getByRole("switch", { name: "A turn finishes" }).props.value).toBe(true);
+      expect(screen.getByRole("switch", { name: "A turn finishes" }).props.disabled).toBeFalsy();
+      mockConfig = { version: "4.5.6" };
+    });
   });
 
   it("has Face ID to allow on by default", async () => {
@@ -142,25 +204,23 @@ describe("Settings", () => {
     it("asks first, in these words, with a destructive Unpair", async () => {
       const alert = confirm();
       await open();
-      await fireEvent.press(screen.getByRole("button", { name: "Unpair" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Unpair mac" }));
       expect(alert).toHaveBeenCalledTimes(1);
-      expect(alert.mock.calls[0]?.[0]).toBe("Unpair this phone?");
-      expect(alert.mock.calls[0]?.[1]).toBe(
-        "You'll need a new pairing code from the Mac. Notifications to this phone stop. The Mac keeps listing this phone until you run `octet hub revoke <name>` there.",
-      );
+      expect(alert.mock.calls[0]?.[0]).toBe("Unpair mac?");
+      expect(alert.mock.calls[0]?.[1]).toBe("Its sessions leave this phone.");
       expect(buttons(alert).map((b) => [b.text, b.style])).toEqual([
         ["Cancel", "cancel"],
         ["Unpair", "destructive"],
       ]);
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).not.toBeNull(); // nothing yet
+      expect(await SecureStore.getItemAsync(tokenKeyOf(M))).not.toBeNull(); // nothing yet
     });
 
     it("Cancel changes nothing", async () => {
       const alert = confirm();
       const rig = await open();
-      await fireEvent.press(screen.getByRole("button", { name: "Unpair" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Unpair mac" }));
       await act(async () => buttons(alert)[0]?.onPress?.());
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).not.toBeNull();
+      expect(await SecureStore.getItemAsync(tokenKeyOf(M))).not.toBeNull();
       expect(rig.hub.snapshot().status).toBe("paired");
       expect(rig.view.getPathname()).toBe("/settings");
     });
@@ -168,17 +228,17 @@ describe("Settings", () => {
     it("Unpair clears the token, the hub address and the cursors, and shows Pair", async () => {
       const alert = confirm();
       const rig = await open();
-      await fireEvent.press(screen.getByRole("button", { name: "Unpair" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Unpair mac" }));
       await act(async () => {
         buttons(alert)[1]?.onPress?.();
       });
       await flush();
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
-      expect((await loadSettings()).hubUrl).toBeNull();
-      expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
-      expect(await screen.findByText("Pair with your Mac")).toBeTruthy();
+      expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBeNull();
+      expect((await loadSettings()).pairings).toEqual([]);
+      expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, offer: false, macs: [], notices: [] });
+      expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
       expect(rig.view.getPathname()).toBe("/pair");
-      expect(screen.queryByText("This phone was unpaired on the Mac")).toBeNull();
+      expect(screen.queryByText(/unpaired on/)).toBeNull();
     });
   });
 
@@ -193,14 +253,14 @@ describe("Settings", () => {
   it("sizes its controls for a thumb", async () => {
     await open();
     const style = (el: { props: { style?: unknown } }) => (Array.isArray(el.props.style) ? el.props.style : [el.props.style]).flat();
-    const unpair = screen.getByRole("button", { name: "Unpair" });
+    const unpair = screen.getByRole("button", { name: "Unpair mac" });
     expect(Math.max(...style(unpair).map((s: { minHeight?: number } | undefined) => s?.minHeight ?? 0))).toBeGreaterThanOrEqual(44);
   });
 
   describe("Notifications", () => {
     const PROJECT = "11111111-2222-3333-4444-555555555555";
     const NO_ID = "Notifications need this app's EAS project id. See the README.";
-    const switchOf = () => screen.getByRole("switch", { name: "Notifications" });
+    const switchOf = () => screen.getByRole("switch", { name: "An action needs approval" });
     const registered = (rig: Awaited<ReturnType<typeof open>>) => rig.sockets.last.commandsOf("register_push");
     const reply = async (rig: Awaited<ReturnType<typeof open>>, frame: object) => {
       await act(async () => {
@@ -272,9 +332,9 @@ describe("Settings", () => {
       expect(switchOf().props.value).toBe(false);
     });
 
-    it("off: sends a null token and saves it off, with no biometrics", async () => {
+    it("off, with nothing else on: sends a null token and saves it off, with no biometrics", async () => {
       mockConfig = { extra: { eas: { projectId: PROJECT } } };
-      await saveSettings({ notifications: true });
+      await saveSettings({ notifications: true, pushKinds: { approvals: true, errors: false, turns: false } });
       const rig = await open();
       await reply(rig, { type: "ack", message: "Notifications on" }); // the registration made at ready
       await flip(false);
@@ -326,6 +386,113 @@ describe("Settings", () => {
       expect((await loadSettings()).notifications).toBe(true);
     });
 
+    describe("each kind", () => {
+      const NAMES = {
+        approvals: "An action needs approval",
+        errors: "A session hits an error",
+        turns: "A turn finishes",
+      } as const;
+      const kindSwitch = (kind: keyof typeof NAMES) => screen.getByRole("switch", { name: NAMES[kind] });
+      const flipKind = async (kind: keyof typeof NAMES, on: boolean) => {
+        await fireEvent(kindSwitch(kind), "valueChange", on);
+        await flush();
+      };
+      const live = async (kinds = { approvals: true, errors: true, turns: false }) => {
+        mockConfig = { extra: { eas: { projectId: PROJECT } } };
+        await saveSettings({ notifications: true, pushKinds: kinds });
+        const rig = await open();
+        await reply(rig, { type: "ack", message: "Notifications on" }); // the registration made at ready
+        return rig;
+      };
+
+      it.each([
+        ["approvals", false, { approvals: false, errors: true, turns: false }],
+        ["errors", false, { approvals: true, errors: false, turns: false }],
+        ["turns", true, { approvals: true, errors: true, turns: true }],
+      ] as const)("%s switched to %s sends the token with all three kinds, and moves on the Mac's ack", async (kind, on, kinds) => {
+        const rig = await live();
+        await flipKind(kind, on);
+        expect(registered(rig).at(-1)).toMatchObject({ token: "ExponentPushToken[abc-123_XYZ]", kinds });
+        expect(kindSwitch(kind).props.value).toBe(!on); // not before the Mac says so
+        await reply(rig, { type: "ack", message: "Notifications on" });
+        expect(kindSwitch(kind).props.value).toBe(on);
+        expect((await loadSettings()).pushKinds).toEqual(kinds);
+        expect((await loadSettings()).notifications).toBe(true);
+      });
+
+      it("shows its working words, and every switch waits meanwhile", async () => {
+        const rig = await live();
+        await flipKind("turns", true);
+        expect(screen.getByText("Turning on…")).toBeTruthy();
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.disabled).toBe(true);
+        await reply(rig, { type: "ack", message: "Notifications on" });
+        expect(screen.queryByText("Turning on…")).toBeNull();
+        await flipKind("turns", false);
+        expect(screen.getByText("Turning off…")).toBeTruthy();
+        await reply(rig, { type: "ack", message: "Notifications on" });
+        expect(screen.queryByText("Turning off…")).toBeNull();
+      });
+
+      it("a refusal puts the switch back and shows the Mac's words", async () => {
+        const rig = await live();
+        await flipKind("turns", true);
+        await reply(rig, { type: "refused", code: "invalid", reason: "Bad kinds" });
+        expect(screen.getByText("Bad kinds")).toBeTruthy();
+        expect(kindSwitch("turns").props.value).toBe(false);
+        expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: true, turns: false });
+      });
+
+      it("offline, the switch does not move, and says so", async () => {
+        const rig = await live();
+        await act(async () => rig.sockets.last.drop());
+        await flipKind("turns", true);
+        await act(async () => {
+          rig.clock.advance(8_000);
+        });
+        await flush();
+        expect(screen.getByText("Can't reach your Mac")).toBeTruthy();
+        expect(kindSwitch("turns").props.value).toBe(false);
+        expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: true, turns: false });
+      });
+
+      it("the last one turned off sends a null token and puts every switch off", async () => {
+        const rig = await live({ approvals: true, errors: false, turns: false });
+        await flipKind("approvals", false);
+        expect(registered(rig).at(-1)).toMatchObject({ token: null });
+        await reply(rig, { type: "ack", message: "Notifications off" });
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.value).toBe(false);
+        expect((await loadSettings()).notifications).toBe(false);
+      });
+
+      it("one turned on while notifications are off turns them on, through the permission flow, with the defaults plus that kind", async () => {
+        mockConfig = { extra: { eas: { projectId: PROJECT } } };
+        const rig = await open();
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.value).toBe(false);
+        await flipKind("turns", true);
+        expect(notifications.requestPermissionsAsync).toHaveBeenCalledTimes(1);
+        expect(registered(rig)).toEqual([
+          expect.objectContaining({ token: "ExponentPushToken[abc-123_XYZ]", kinds: { approvals: true, errors: true, turns: true } }),
+        ]);
+        await reply(rig, { type: "ack", message: "Notifications on" });
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.value).toBe(true);
+        expect((await loadSettings()).notifications).toBe(true);
+      });
+
+      it("is disabled, with the project-id words, when the app has no EAS project id", async () => {
+        await open();
+        for (const kind of ["approvals", "errors", "turns"] as const) expect(kindSwitch(kind).props.disabled).toBe(true);
+        expect(screen.getByText(NO_ID)).toBeTruthy();
+      });
+
+      it("has the switch role, a label and a 44-point hit area on the new switches", async () => {
+        await live();
+        for (const kind of ["errors", "turns"] as const) {
+          const slop = kindSwitch(kind).props.hitSlop as { top: number; bottom: number; left: number; right: number };
+          expect(31 + slop.top + slop.bottom).toBeGreaterThanOrEqual(44);
+        }
+      });
+    });
+
     it("has a label, the switch role and a 44-point hit area", async () => {
       mockConfig = { extra: { eas: { projectId: PROJECT } } };
       await open();
@@ -333,5 +500,74 @@ describe("Settings", () => {
       expect(31 + slop.top + slop.bottom).toBeGreaterThanOrEqual(44);
       expect(51 + slop.left + slop.right).toBeGreaterThanOrEqual(44);
     });
+  });
+});
+
+describe("Settings › Live Activity", () => {
+  const island = () => screen.queryByRole("switch", { name: "Live Activity" });
+
+  async function openWith(api?: FakeLive) {
+    const rig = await launch("/", { settings: Settings }, [info("live")], api ? { live: api } : {});
+    await act(async () => router.push("/settings"));
+    await flush();
+    return rig;
+  }
+
+  it("is not there where Live Activities are not supported (Android, Expo Go, jest)", async () => {
+    await openWith();
+    expect(island()).toBeNull();
+    expect(screen.queryByText("Live Activity")).toBeNull();
+  });
+
+  it("is there, and on, where they are", async () => {
+    await openWith(new FakeLive());
+    expect(island()?.props.value).toBe(true);
+    const slop = island()?.props.hitSlop as { top: number; bottom: number };
+    expect(31 + slop.top + slop.bottom).toBeGreaterThanOrEqual(44);
+  });
+
+  it("follows the phone's own setting: it goes when Live Activities are turned off for Octet, and comes back", async () => {
+    let changeAppState: (state: string) => void = () => {};
+    jest.spyOn(AppState, "addEventListener").mockImplementation((_type, listener) => {
+      changeAppState = listener as (state: string) => void;
+      return { remove: jest.fn() };
+    });
+    const api = new FakeLive();
+    await openWith(api);
+    expect(island()).not.toBeNull();
+    await act(async () => changeAppState("background"));
+    api.supported = false;
+    await act(async () => changeAppState("active"));
+    await flush();
+    expect(island()).toBeNull();
+    await act(async () => changeAppState("background"));
+    api.supported = true;
+    await act(async () => changeAppState("active"));
+    await flush();
+    expect(island()).not.toBeNull();
+  });
+
+  it("off ends the activity, tells the Mac to forget the tokens and empties the widget's entries; on registers again", async () => {
+    const api = new FakeLive();
+    const rig = await openWith(api);
+    await act(async () => api.pushToStartToken("ab12"));
+    await flush();
+    const socket = rig.sockets.last;
+    expect(socket.commandsOf("register_activity")).toEqual([expect.objectContaining({ start_token: "ab12" })]);
+    await act(async () => socket.receive({ type: "ack", req: socket.commandsOf("register_activity")[0]?.req, message: "Activity registered" }));
+
+    await fireEvent(screen.getByRole("switch", { name: "Live Activity" }), "valueChange", false);
+    await flush();
+    expect(island()?.props.value).toBe(false);
+    expect((await loadSettings()).liveActivity).toBe(false);
+    expect(api.of("end")).toHaveLength(1);
+    expect(api.of("setEntries").at(-1)?.arg).toEqual({});
+    expect(socket.commandsOf("clear_activity")).toHaveLength(1);
+
+    await fireEvent(screen.getByRole("switch", { name: "Live Activity" }), "valueChange", true);
+    await flush();
+    expect(island()?.props.value).toBe(true);
+    expect((await loadSettings()).liveActivity).toBe(true);
+    expect(socket.commandsOf("register_activity")).toHaveLength(2);
   });
 });

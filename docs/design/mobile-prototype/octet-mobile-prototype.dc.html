@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="styles.css">
+<style>html,body{margin:0;background:#161113;} a{color:var(--octet-accent);} a:hover{color:var(--octet-fg);} textarea::placeholder{color:var(--octet-muted);opacity:1;} [data-om="scroll"]::-webkit-scrollbar,[data-om="list"]::-webkit-scrollbar{display:none}</style>
+</helmet>
+<div style="min-height:100vh; box-sizing:border-box; padding:20px 32px; display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:48px; background:var(--octet-bg); color:var(--octet-fg); font-family:var(--octet-font-mono); font-size:var(--octet-font-size); line-height:20px">
+
+  <div style="width:32ch; display:flex; flex-direction:column; gap:24px">
+    <div style="display:flex; flex-direction:column"><b style="color:var(--octet-accent)">Octet</b><span style="color:var(--octet-muted)">mobile prototype · iOS</span></div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm)">SCREENS</span>
+      <sc-for list="{{ jumps }}" as="j" hint-placeholder-count="7">
+        <div onClick="{{ j.run }}" style="height:36px; display:flex; align-items:center; gap:1ch; margin:0 -1ch; padding:0 1ch; border-radius:8px; cursor:pointer; background:{{ j.bg }}; color:{{ j.fg }}" style-hover="background:var(--octet-selected)"><span style="width:3ch; color:var(--octet-muted)">{{ j.num }}</span><span>{{ j.name }}</span></div>
+      </sc-for>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:8px">
+      <span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm)">TRY</span>
+      <span style="color:var(--octet-muted); text-wrap:pretty">Allow or deny straight from the inbox.</span>
+      <span style="color:var(--octet-muted); text-wrap:pretty">In a conversation, send a prompt to run a turn, or type / for commands.</span>
+      <span style="color:var(--octet-muted); text-wrap:pretty">Leave the app while a turn runs, then approve from the Dynamic Island.</span>
+    </div>
+    <div style="display:flex; gap:8px">
+      <button onClick="{{ toggleAway }}" style="font-family:var(--octet-font-mono); font-size:var(--octet-font-size); background:transparent; color:var(--octet-fg); border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:8px 2ch; cursor:pointer" style-hover="border-color:var(--octet-accent); color:var(--octet-accent)">{{ awayLabel }}</button>
+      <button onClick="{{ reset }}" style="font-family:var(--octet-font-mono); font-size:var(--octet-font-size); background:transparent; color:var(--octet-muted); border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:8px 2ch; cursor:pointer" style-hover="border-color:var(--octet-accent); color:var(--octet-accent)">Reset</button>
+    </div>
+  </div>
+
+  <div style="zoom:{{ scale }}; flex:none; width:410px; height:864px; box-sizing:border-box; padding:10px; border-radius:56px; background:var(--octet-ink); box-shadow:0 0 0 1px var(--octet-edge)">
+    <div data-screen-label="Phone" style="position:relative; width:100%; height:100%; border-radius:46px; overflow:hidden; background:var(--octet-bg); display:flex; flex-direction:column">
+      <div style="position:absolute; top:11px; left:50%; margin-left:-62px; width:124px; height:36px; border-radius:20px; background:var(--octet-ink); z-index:10"></div>
+      <div style="height:54px; flex:none; display:flex; align-items:center; justify-content:space-between; padding:0 30px 0 40px; font-family:-apple-system,system-ui,sans-serif; font-size:16px; font-weight:600; background:{{ barBg }}"><span>9:41</span><div style="width:25px; height:12px; box-sizing:border-box; border:1px solid var(--octet-muted); border-radius:4px; padding:1px"><div style="width:75%; height:100%; border-radius:2px; background:var(--octet-fg)"></div></div></div>
+
+      <sc-if value="{{ isPair }}" hint-placeholder-val="{{ false }}">
+        <div style="flex:1; min-height:0; display:flex; flex-direction:column; background:var(--octet-panel)">
+          <div style="padding:8px 24px"><span>Scan the code from <b>octet pair</b></span></div>
+          <div onClick="{{ scan }}" style="flex:1; position:relative; display:flex; align-items:center; justify-content:center; color:{{ scanColor }}; cursor:pointer">
+            <span>{{ scanText }}</span>
+            <div style="position:absolute; left:50%; top:50%; margin:-120px 0 0 -120px; width:240px; height:240px; pointer-events:none">
+              <div style="position:absolute; left:0; top:0; width:36px; height:36px; border-left:3px solid var(--octet-accent); border-top:3px solid var(--octet-accent); border-top-left-radius:12px"></div>
+              <div style="position:absolute; right:0; top:0; width:36px; height:36px; border-right:3px solid var(--octet-accent); border-top:3px solid var(--octet-accent); border-top-right-radius:12px"></div>
+              <div style="position:absolute; left:0; bottom:0; width:36px; height:36px; border-left:3px solid var(--octet-accent); border-bottom:3px solid var(--octet-accent); border-bottom-left-radius:12px"></div>
+              <div style="position:absolute; right:0; bottom:0; width:36px; height:36px; border-right:3px solid var(--octet-accent); border-bottom:3px solid var(--octet-accent); border-bottom-right-radius:12px"></div>
+            </div>
+          </div>
+          <div style="background:var(--octet-bg); border-top:1px solid var(--octet-edge); border-radius:var(--octet-radius) var(--octet-radius) 0 0; padding:16px 24px 40px; display:flex; flex-direction:column; gap:4px">
+            <span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm)">PAIRED</span>
+            <div style="height:44px; display:flex; align-items:center; justify-content:space-between; white-space:nowrap"><span><span style="color:var(--octet-accent)">●</span> studio-mac</span><span style="color:var(--octet-muted)">online</span></div>
+            <div style="height:44px; display:flex; align-items:center; justify-content:space-between; border-top:1px solid var(--octet-edge); color:var(--octet-muted); white-space:nowrap"><span>○ macbook-air</span><span>asleep</span></div>
+            <div onClick="{{ scan }}" style="height:44px; display:flex; align-items:center; color:var(--octet-accent); cursor:pointer">Enter code instead</div>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ isSessions }}" hint-placeholder-val="{{ true }}">
+        <div style="flex:1; min-height:0; display:flex; flex-direction:column">
+          <div style="display:flex; align-items:center; gap:4px; padding:0 8px 12px">
+            <span onClick="{{ openDrawer }}" style="width:44px; height:44px; display:flex; align-items:center; justify-content:center; font-size:20px; cursor:pointer">☰</span>
+            <div style="flex:1; display:flex; flex-direction:column; align-items:center"><b>Inbox</b><span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm); line-height:16px"><span style="color:var(--octet-accent)">●</span> studio-mac · online</span></div>
+            <span onClick="{{ toNew }}" style="width:44px; height:44px; display:flex; align-items:center; justify-content:center; font-size:20px; cursor:pointer" style-hover="color:var(--octet-accent)">+</span>
+          </div>
+          <div style="display:flex; gap:4px; margin:0 20px 14px; padding:3px; border:1px solid var(--octet-edge); border-radius:var(--octet-radius)">
+            <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="3">
+              <div onClick="{{ t.run }}" style="flex:1; height:40px; display:flex; align-items:center; justify-content:center; border-radius:9px; cursor:pointer; white-space:nowrap; background:{{ t.bg }}; color:{{ t.fg }}">{{ t.label }}</div>
+            </sc-for>
+          </div>
+          <div data-om="list" style="flex:1; min-height:0; overflow-y:auto; scrollbar-width:none; display:flex; flex-direction:column; gap:12px; padding:2px 20px 12px">
+            <sc-for list="{{ items }}" as="it" hint-placeholder-count="3">
+              <div onClick="{{ it.open }}" style="flex:none; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); background:{{ it.bg }}; padding:12px 14px; display:flex; flex-direction:column; gap:10px; cursor:pointer">
+                <div style="display:flex; flex-direction:column">
+                  <div style="display:flex; justify-content:space-between"><b>{{ it.id }}</b><span style="color:var(--octet-muted)">{{ it.ago }}</span></div>
+                  <span style="color:{{ it.statusColor }}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis">{{ it.status }}</span>
+                  <span style="color:var(--octet-muted); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; text-wrap:pretty">{{ it.line }}</span>
+                </div>
+                <sc-if value="{{ it.isApproval }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex; gap:8px">
+                    <div onClick="{{ it.allow }}" style="flex:1; height:44px; display:flex; align-items:center; justify-content:center; border:1px solid var(--octet-accent); border-radius:var(--octet-radius); background:var(--octet-selected); color:var(--octet-accent)">Allow once</div>
+                    <div onClick="{{ it.altRun }}" style="flex:1; height:44px; display:flex; align-items:center; justify-content:center; border:1px solid var(--octet-edge); border-radius:var(--octet-radius)" style-hover="border-color:var(--octet-muted)">{{ it.alt }}</div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ it.isQuestion }}" hint-placeholder-val="{{ false }}">
+                  <div style="height:44px; display:flex; align-items:center; padding:0 12px; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); color:var(--octet-muted)">Reply</div>
+                </sc-if>
+              </div>
+            </sc-for>
+            <sc-if value="{{ inboxEmpty }}" hint-placeholder-val="{{ false }}">
+              <div style="flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; color:var(--octet-muted)">
+                <sc-if value="{{ empty_success }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-success.svg" width="118" height="86" alt="" style="display:block; image-rendering:pixelated"></sc-if><sc-if value="{{ empty_sleeping }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-sleeping.svg" width="118" height="86" alt="" style="display:block; image-rendering:pixelated"></sc-if>
+                <span>{{ emptyText }}</span>
+              </div>
+            </sc-if>
+          </div>
+          <div style="padding:12px 20px 40px">
+            <div onClick="{{ bottomRun }}" style="height:52px; display:flex; align-items:center; justify-content:center; border:1px solid var(--octet-accent); border-radius:var(--octet-radius); color:var(--octet-accent); font-weight:var(--octet-weight-bold); cursor:pointer" style-hover="background:var(--octet-selected)">{{ bottomLabel }}</div>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ isNew }}" hint-placeholder-val="{{ false }}">
+        <div style="flex:1; min-height:0; display:flex; flex-direction:column">
+          <div style="height:48px; display:flex; align-items:center; justify-content:space-between; padding:0 12px">
+            <span onClick="{{ toSessions }}" style="height:44px; display:flex; align-items:center; padding:0 8px; color:var(--octet-muted); cursor:pointer">Cancel</span>
+            <b>New session</b>
+            <span onClick="{{ startNew }}" style="height:44px; display:flex; align-items:center; padding:0 8px; color:{{ startColor }}; font-weight:var(--octet-weight-bold); cursor:pointer">Start ↑</span>
+          </div>
+          <textarea data-om="draft" value="{{ draft }}" onChange="{{ onDraft }}" onKeyDown="{{ onDraftKey }}" spellCheck="false" placeholder="What should the agent do?" style="flex:1; margin:0; padding:16px 20px; border:0; outline:none; resize:none; background:transparent; color:var(--octet-fg); caret-color:var(--octet-accent); font-family:var(--octet-font-mono); font-size:var(--octet-font-size); line-height:20px"></textarea>
+          <div style="display:flex; flex-direction:column; gap:8px; padding:0 16px 40px">
+            <span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm); padding:0 4px">TAP TO CHANGE</span>
+            <div style="display:flex; flex-wrap:wrap; gap:6px">
+              <sc-for list="{{ chips }}" as="c" hint-placeholder-count="5">
+                <div onClick="{{ c.run }}" style="height:40px; padding:0 12px; display:flex; align-items:center; gap:6px; border:1px solid var(--octet-edge); border-radius:20px; color:{{ c.fg }}; cursor:pointer" style-hover="border-color:var(--octet-accent)"><span style="color:{{ c.dotColor }}">{{ c.dot }}</span><span>{{ c.label }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ isConvo }}" hint-placeholder-val="{{ false }}">
+        <div style="flex:1; min-height:0; display:flex; flex-direction:column">
+          <div style="height:44px; flex:none; display:flex; align-items:center; padding:0 8px">
+            <span onClick="{{ openDrawer }}" style="width:44px; height:44px; display:flex; align-items:center; justify-content:center; font-size:20px; cursor:pointer">☰</span>
+            <div onClick="{{ toggleHdr }}" style="flex:1; height:44px; display:flex; flex-direction:column; align-items:center; justify-content:center; cursor:pointer"><span style="white-space:nowrap"><b>{{ cur }}</b><span style="color:var(--octet-muted)"> {{ hdrCaret }}</span></span><span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm); line-height:14px">{{ model }} · {{ mode }}</span></div>
+            <span onClick="{{ cycleFs }}" style="width:40px; height:44px; display:flex; align-items:center; justify-content:center; color:var(--octet-accent); cursor:pointer">Aa</span>
+            <span onClick="{{ toUsage }}" style="width:40px; height:44px; display:flex; align-items:center; justify-content:center; cursor:pointer">⋯</span>
+          </div>
+          <sc-if value="{{ hdrOpen }}" hint-placeholder-val="{{ false }}">
+            <div onClick="{{ toggleHdr }}" style="position:absolute; left:0; right:0; top:98px; bottom:0; background:var(--octet-ink); opacity:0.5; z-index:6"></div>
+            <div style="position:absolute; left:12px; right:12px; top:100px; z-index:7; background:var(--octet-panel); border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:14px 14px 10px; display:flex; flex-direction:column; gap:14px">
+              <div style="display:flex; flex-direction:column; gap:4px">
+                <span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm)">MODEL · {{ engine }}</span>
+                <sc-for list="{{ hdrModels }}" as="o" hint-placeholder-count="2">
+                  <div onClick="{{ o.run }}" style="height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 10px; margin:0 -4px; border-radius:8px; cursor:pointer; background:{{ o.bg }}; color:{{ o.fg }}" style-hover="background:var(--octet-selected)"><span>{{ o.name }}</span><span>{{ o.mark }}</span></div>
+                </sc-for>
+              </div>
+              <div style="display:flex; flex-direction:column; gap:6px">
+                <span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm)">PERMISSION MODE</span>
+                <div style="display:flex; gap:4px; padding:3px; border:1px solid var(--octet-edge); border-radius:var(--octet-radius)">
+                  <sc-for list="{{ hdrModes }}" as="o" hint-placeholder-count="3">
+                    <div onClick="{{ o.run }}" style="flex:{{ o.flex }}; height:40px; display:flex; align-items:center; justify-content:center; border-radius:9px; cursor:pointer; white-space:nowrap; background:{{ o.bg }}; color:{{ o.fg }}">{{ o.name }}</div>
+                  </sc-for>
+                </div>
+                <span style="color:var(--octet-muted); text-wrap:pretty">{{ modeHelp }}</span>
+              </div>
+              <div onClick="{{ toUsage }}" style="height:44px; display:flex; align-items:center; justify-content:space-between; border-top:1px solid var(--octet-edge); cursor:pointer"><span>Session info</span><span style="color:var(--octet-muted)">{{ hash }} ›</span></div>
+            </div>
+          </sc-if>
+          <div data-om="scroll" style="flex:1; min-height:0; overflow-y:auto; scrollbar-width:none; padding:6px 14px 12px; font-size:{{ fs }}; line-height:{{ lh }}; display:flex; flex-direction:column; gap:12px">
+            <div style="flex:none; display:flex; gap:10px; align-items:center">
+              <sc-if value="{{ pose_idle }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-idle.svg" width="44" height="32" alt="" style="display:block; image-rendering:pixelated"></sc-if><sc-if value="{{ pose_thinking }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-thinking.svg" width="44" height="32" alt="" style="display:block; image-rendering:pixelated"></sc-if><sc-if value="{{ pose_searching }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-searching.svg" width="44" height="32" alt="" style="display:block; image-rendering:pixelated"></sc-if><sc-if value="{{ pose_coding }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-coding.svg" width="44" height="32" alt="" style="display:block; image-rendering:pixelated"></sc-if><sc-if value="{{ pose_success }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-success.svg" width="44" height="32" alt="" style="display:block; image-rendering:pixelated"></sc-if><sc-if value="{{ pose_approval }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-approval.svg" width="44" height="32" alt="" style="display:block; image-rendering:pixelated"></sc-if>
+              <div style="display:flex; flex-direction:column; min-width:0">
+                <span><b style="color:var(--octet-accent)">Octet</b><span style="color:var(--octet-muted)"> v0.1.0 · {{ machine }}</span></span>
+                <span><b style="color:{{ modeColor }}">{{ mode }}</b><span style="color:var(--octet-muted)"> · {{ engine }} / {{ model }}</span></span>
+                <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis"><span style="color:{{ phaseColor }}">{{ phaseWord }}</span><span style="color:var(--octet-muted)">  ·  {{ path }}</span></span>
+              </div>
+            </div>
+            <sc-for list="{{ entries }}" as="e" hint-placeholder-count="4">
+              <div onClick="{{ e.open }}" style="flex:none; display:flex; flex-direction:column; cursor:{{ e.cursor }}">
+                <b style="color:{{ e.lc }}">{{ e.label }}</b>
+                <span style="white-space:pre-wrap; overflow-wrap:anywhere; color:{{ e.tc }}">{{ e.text }}<span style="color:var(--octet-accent)">{{ e.hint }}</span></span>
+              </div>
+            </sc-for>
+            <sc-if value="{{ hasPending }}" hint-placeholder-val="{{ false }}">
+              <div style="position:relative; flex:none; margin-top:8px; border:1px solid var(--octet-amber); border-radius:var(--octet-radius); padding:16px 12px 12px; background:var(--octet-panel); font-size:var(--octet-font-size); line-height:20px; display:flex; flex-direction:column; gap:10px">
+                <span style="position:absolute; left:10px; top:-10px; padding:0 4px; background:var(--octet-bg); color:var(--octet-amber); white-space:nowrap"><b>Permission required</b> #{{ reqN }}</span>
+                <div style="display:flex; flex-direction:column; gap:2px">
+                  <div style="display:flex"><span style="width:8ch; flex:none; color:var(--octet-muted)">TOOL</span><span>{{ reqTool }}</span></div>
+                  <div style="display:flex"><span style="width:8ch; flex:none; color:var(--octet-muted)">{{ reqKind }}</span><span style="overflow-wrap:anywhere">{{ reqCmd }}</span></div>
+                  <div style="display:flex"><span style="width:8ch; flex:none; color:var(--octet-muted)">REASON</span><span style="text-wrap:pretty">{{ reqReason }}</span></div>
+                </div>
+                <div style="display:flex; gap:6px">
+                  <div onClick="{{ allowOnce }}" style="flex:1; height:44px; display:flex; align-items:center; justify-content:center; border:1px solid var(--octet-accent); border-radius:var(--octet-radius); background:var(--octet-selected); color:var(--octet-accent); cursor:pointer">Allow</div>
+                  <div onClick="{{ allowSession }}" style="flex:1.2; height:44px; display:flex; align-items:center; justify-content:center; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); cursor:pointer" style-hover="border-color:var(--octet-muted)">Session</div>
+                  <div onClick="{{ deny }}" style="flex:1; height:44px; display:flex; align-items:center; justify-content:center; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); cursor:pointer" style-hover="border-color:var(--octet-muted)">Deny</div>
+                </div>
+              </div>
+            </sc-if>
+          </div>
+          <sc-if value="{{ hasSlash }}" hint-placeholder-val="{{ false }}">
+            <div style="flex:none; margin:0 14px 8px; background:var(--octet-panel); border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:6px; display:flex; flex-direction:column">
+              <sc-for list="{{ slash }}" as="m" hint-placeholder-count="2">
+                <div onMouseDown="{{ m.run }}" style="height:44px; display:flex; align-items:center; padding:0 10px; border-radius:8px; cursor:pointer; background:{{ m.bg }}; color:{{ m.fg }}" style-hover="background:var(--octet-selected)"><span style="width:2ch">{{ m.mark }}</span><span style="width:11ch">{{ m.cmd }}</span><span style="flex:1">{{ m.desc }}</span><span style="color:var(--octet-muted)">{{ m.val }}</span></div>
+              </sc-for>
+            </div>
+          </sc-if>
+          <div style="flex:none; margin:0 14px 8px; border:1px solid {{ promptEdge }}; border-radius:10px; padding:8px 10px; display:flex; gap:1ch; font-size:{{ fs }}; line-height:{{ lh }}">
+            <span style="color:var(--octet-accent)">&gt;</span>
+            <textarea data-om="ta" value="{{ input }}" onChange="{{ onInput }}" onKeyDown="{{ onKey }}" rows="1" spellCheck="false" placeholder="{{ placeholder }}" style="flex:1; min-width:0; height:{{ lh }}; margin:0; padding:0; border:0; outline:none; resize:none; overflow:hidden; background:transparent; color:var(--octet-fg); caret-color:var(--octet-accent); font-family:var(--octet-font-mono); font-size:{{ fs }}; line-height:{{ lh }}; white-space:nowrap"></textarea>
+          </div>
+          <div style="flex:none; display:flex; gap:6px; padding:8px 8px 34px; background:var(--octet-panel); border-top:1px solid var(--octet-edge)">
+            <sc-for list="{{ keys }}" as="k" hint-placeholder-count="5">
+              <div onMouseDown="{{ k.down }}" onClick="{{ k.run }}" style="flex:{{ k.flex }}; height:44px; display:flex; align-items:center; justify-content:center; border-radius:8px; background:var(--octet-bg); color:{{ k.fg }}; cursor:pointer; user-select:none" style-active="background:var(--octet-selected)">{{ k.label }}</div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ isChanges }}" hint-placeholder-val="{{ false }}">
+        <div style="flex:1; min-height:0; display:flex; flex-direction:column">
+          <div style="height:48px; flex:none; display:flex; align-items:center; gap:4px; padding:0 8px">
+            <span onClick="{{ toConvo }}" style="width:44px; height:44px; display:flex; align-items:center; justify-content:center; font-size:22px; cursor:pointer">‹</span>
+            <div style="flex:1; display:flex; flex-direction:column; align-items:center"><b>Changes</b><span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm); line-height:16px">{{ cur }} · {{ changeSummary }}</span></div>
+            <div style="width:44px"></div>
+          </div>
+          <div data-om="list" style="flex:1; min-height:0; overflow-y:auto; scrollbar-width:none; display:flex; flex-direction:column; gap:22px; padding:16px 20px">
+            <div style="flex:none; display:flex; flex-direction:column">
+              <sc-for list="{{ files }}" as="f" hint-placeholder-count="1">
+                <div style="display:flex; flex-direction:column; border-bottom:1px solid var(--octet-edge)">
+                  <div onClick="{{ f.toggle }}" style="min-height:56px; display:flex; align-items:center; gap:12px; cursor:pointer">
+                    <span style="width:1ch; color:var(--octet-muted)">{{ f.caret }}</span>
+                    <div style="flex:1; min-width:0; display:flex; flex-direction:column"><span>{{ f.name }}</span><span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm); line-height:16px">{{ f.dir }}</span></div>
+                    <span style="color:var(--octet-muted)">+{{ f.add }} −{{ f.del }}</span>
+                    <span style="letter-spacing:1px"><span style="color:var(--octet-accent)">{{ f.bar }}</span><span style="color:var(--octet-edge)">{{ f.barRest }}</span></span>
+                  </div>
+                  <sc-if value="{{ f.expanded }}" hint-placeholder-val="{{ false }}">
+                    <div style="display:flex; flex-direction:column; margin:0 -20px 12px; font-size:var(--octet-font-size-sm); line-height:22px">
+                      <sc-for list="{{ f.lines }}" as="l" hint-placeholder-count="4">
+                        <div style="display:flex; padding:0 20px; background:{{ l.bg }}; color:{{ l.fg }}"><span style="width:2ch; flex:none; color:{{ l.sc }}">{{ l.sign }}</span><span style="white-space:pre-wrap; overflow-wrap:anywhere; text-decoration:{{ l.deco }}">{{ l.code }}</span></div>
+                      </sc-for>
+                    </div>
+                  </sc-if>
+                </div>
+              </sc-for>
+              <sc-if value="{{ noFiles }}" hint-placeholder-val="{{ false }}"><span style="color:var(--octet-muted)">No changes in this session yet.</span></sc-if>
+            </div>
+            <div style="position:relative; flex:none; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:16px 14px 10px; display:flex; flex-direction:column; gap:4px">
+              <span style="position:absolute; left:10px; top:-10px; padding:0 4px; background:var(--octet-bg); color:var(--octet-muted)">Checks</span>
+              <span><span style="color:{{ testColor }}">{{ testMark }}</span> {{ testCmd }}</span>
+              <span style="color:var(--octet-muted)">  {{ testDetail }}</span>
+            </div>
+            <div style="position:relative; flex:none; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:16px 14px 10px; display:flex; flex-direction:column">
+              <span style="position:absolute; left:10px; top:-10px; padding:0 4px; background:var(--octet-bg); color:var(--octet-muted)">Branch</span>
+              <span>{{ branch }}</span><span style="color:var(--octet-muted)">{{ branchDetail }}</span>
+            </div>
+          </div>
+          <div style="flex:none; display:flex; gap:8px; padding:12px 20px 40px">
+            <div onClick="{{ commit }}" style="flex:1; height:52px; display:flex; align-items:center; justify-content:center; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); cursor:pointer; color:{{ commitFg }}" style-hover="border-color:var(--octet-muted)">{{ commitLabel }}</div>
+            <div onClick="{{ openPr }}" style="flex:1.5; height:52px; display:flex; align-items:center; justify-content:center; border-radius:var(--octet-radius); border:1px solid var(--octet-accent); background:{{ prBg }}; color:{{ prFg }}; font-weight:var(--octet-weight-bold); cursor:pointer">{{ prLabel }}</div>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ isUsage }}" hint-placeholder-val="{{ false }}">
+        <div style="flex:1; min-height:0; display:flex; flex-direction:column">
+          <div style="height:48px; flex:none; display:flex; align-items:center; gap:4px; padding:0 8px">
+            <span onClick="{{ toConvo }}" style="width:44px; height:44px; display:flex; align-items:center; justify-content:center; font-size:22px; cursor:pointer">‹</span>
+            <div style="flex:1; display:flex; flex-direction:column; align-items:center"><b>Usage</b><span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm); line-height:16px">{{ cur }} · {{ hash }}</span></div>
+            <div style="width:44px"></div>
+          </div>
+          <div style="flex:1; display:flex; flex-direction:column; gap:24px; padding:16px 20px">
+            <div style="position:relative; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:16px 14px 12px; display:flex; flex-direction:column; gap:4px">
+              <span style="position:absolute; left:10px; top:-10px; padding:0 4px; background:var(--octet-bg); color:var(--octet-muted)">Context</span>
+              <span style="white-space:pre"><span style="color:var(--octet-accent)">{{ ctxFill }}</span><span style="color:var(--octet-edge)">{{ ctxRest }}</span>  {{ ctxPct }}</span>
+              <span style="color:var(--octet-muted)">{{ ctxDetail }}</span>
+            </div>
+            <div style="position:relative; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:16px 14px 12px; display:flex; flex-direction:column; gap:4px">
+              <span style="position:absolute; left:10px; top:-10px; padding:0 4px; background:var(--octet-bg); color:var(--octet-muted)">This session</span>
+              <div style="display:flex"><span style="width:9ch; color:var(--octet-muted)">ENGINE</span><span>{{ engine }} / {{ model }}</span></div>
+              <div style="display:flex"><span style="width:9ch; color:var(--octet-muted)">TOKENS</span><span>{{ tokens }}</span></div>
+              <div style="display:flex"><span style="width:9ch; color:var(--octet-muted)">TURNS</span><span>{{ turns }}</span></div>
+              <div style="display:flex"><span style="width:9ch; flex:none; color:var(--octet-muted)">JOURNAL</span><span style="overflow-wrap:anywhere">{{ journal }}</span></div>
+            </div>
+            <div style="position:relative; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:16px 14px 12px; display:flex; flex-direction:column; gap:4px">
+              <span style="position:absolute; left:10px; top:-10px; padding:0 4px; background:var(--octet-bg); color:var(--octet-muted)">Today</span>
+              <sc-for list="{{ today }}" as="d" hint-placeholder-count="4">
+                <div style="display:flex; white-space:pre"><span style="width:13ch">{{ d.name }}</span><span style="color:var(--octet-accent)">{{ d.bar }}</span><span style="color:var(--octet-muted)"> {{ d.t }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+          <div style="flex:none; display:flex; flex-direction:column; gap:8px; padding:12px 20px 40px">
+            <div onClick="{{ exportJ }}" style="height:52px; display:flex; align-items:center; justify-content:space-between; padding:0 16px; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); cursor:pointer" style-hover="border-color:var(--octet-muted)"><span>Export journal</span><span style="color:var(--octet-muted)">/export</span></div>
+            <div onClick="{{ fresh }}" style="height:52px; display:flex; align-items:center; justify-content:space-between; padding:0 16px; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); cursor:pointer" style-hover="border-color:var(--octet-muted)"><span>Fresh context</span><span style="color:var(--octet-muted)">/new</span></div>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ away }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; left:0; right:0; top:54px; bottom:0; background:var(--octet-panel); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; color:var(--octet-muted); z-index:3">
+          <span>another app</span>
+          <span style="font-size:var(--octet-font-size-sm)">Octet keeps working on studio-mac</span>
+        </div>
+        <sc-if value="{{ islandExpanded }}" hint-placeholder-val="{{ false }}">
+          <div style="position:absolute; top:10px; left:10px; right:10px; border-radius:44px; background:var(--octet-ink); padding:22px 22px 18px; display:flex; flex-direction:column; gap:14px; z-index:5">
+            <div onClick="{{ openFromIsland }}" style="display:flex; align-items:center; gap:12px; cursor:pointer"><img src="mascot/octet-approval.svg" width="59" height="43" alt="" style="display:block; image-rendering:pixelated"><div style="flex:1; min-width:0; display:flex; flex-direction:column"><span style="color:var(--octet-muted)">{{ iSess }}</span><b style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis">{{ iCmd }}</b></div></div>
+            <div style="display:flex; gap:8px">
+              <div onClick="{{ iDeny }}" style="flex:1; height:44px; display:flex; align-items:center; justify-content:center; border-radius:22px; background:var(--octet-bg); cursor:pointer">Deny</div>
+              <div onClick="{{ iAllow }}" style="flex:1; height:44px; display:flex; align-items:center; justify-content:center; border-radius:22px; background:var(--octet-accent); color:var(--octet-ink); font-weight:var(--octet-weight-bold); cursor:pointer">Allow</div>
+            </div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ islandCompact }}" hint-placeholder-val="{{ false }}">
+          <div onClick="{{ openFromIsland }}" style="position:absolute; top:11px; left:50%; margin-left:-100px; width:200px; height:36px; box-sizing:border-box; padding:0 14px 0 8px; border-radius:20px; background:var(--octet-ink); display:flex; align-items:center; justify-content:space-between; cursor:pointer; z-index:5"><sc-if value="{{ ipose_thinking }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-thinking.svg" width="30" height="22" alt="" style="display:block; image-rendering:pixelated"></sc-if><sc-if value="{{ ipose_searching }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-searching.svg" width="30" height="22" alt="" style="display:block; image-rendering:pixelated"></sc-if><sc-if value="{{ ipose_coding }}" hint-placeholder-val="{{ false }}"><img src="mascot/octet-coding.svg" width="30" height="22" alt="" style="display:block; image-rendering:pixelated"></sc-if><span style="color:var(--octet-accent); font-size:var(--octet-font-size-sm)">{{ timer }}</span></div>
+        </sc-if>
+      </sc-if>
+
+      <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; left:0; right:0; top:54px; bottom:0; display:flex; flex-direction:column; background:var(--octet-bg)">
+          <div style="height:44px; flex:none; display:flex; align-items:center; gap:4px; padding:0 8px">
+            <span onClick="{{ openDrawer }}" style="width:44px; height:44px; display:flex; align-items:center; justify-content:center; font-size:20px; cursor:pointer">☰</span>
+            <b style="flex:1; text-align:center">Settings</b>
+            <div style="width:44px"></div>
+          </div>
+          <div style="flex:1; display:flex; flex-direction:column; gap:24px; padding:16px 20px">
+            <div style="position:relative; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:12px 14px 4px; display:flex; flex-direction:column">
+              <span style="position:absolute; left:10px; top:-10px; padding:0 4px; background:var(--octet-bg); color:var(--octet-muted)">Machines</span>
+              <div style="height:44px; display:flex; align-items:center; justify-content:space-between; white-space:nowrap"><span><span style="color:var(--octet-accent)">●</span> studio-mac</span><span style="color:var(--octet-muted)">online · claude, codex</span></div>
+              <div style="height:44px; display:flex; align-items:center; justify-content:space-between; white-space:nowrap; border-top:1px solid var(--octet-edge); color:var(--octet-muted)"><span>○ macbook-air</span><span>asleep</span></div>
+              <div onClick="{{ toPair }}" style="height:44px; display:flex; align-items:center; border-top:1px solid var(--octet-edge); color:var(--octet-accent); cursor:pointer">+ Pair another machine</div>
+            </div>
+            <div style="position:relative; border:1px solid var(--octet-edge); border-radius:var(--octet-radius); padding:12px 14px 4px; display:flex; flex-direction:column">
+              <span style="position:absolute; left:10px; top:-10px; padding:0 4px; background:var(--octet-bg); color:var(--octet-muted)">Notify me when</span>
+              <sc-for list="{{ notifs }}" as="n" hint-placeholder-count="3">
+                <div onClick="{{ n.run }}" style="min-height:52px; display:flex; align-items:center; justify-content:space-between; gap:12px; border-top:{{ n.border }}; cursor:pointer">
+                  <span>{{ n.label }}</span>
+                  <div style="position:relative; flex:none; width:50px; height:30px; border-radius:15px; background:{{ n.track }}"><div style="position:absolute; top:3px; left:{{ n.knob }}; width:24px; height:24px; border-radius:12px; background:var(--octet-fg)"></div></div>
+                </div>
+              </sc-for>
+            </div>
+            <span style="color:var(--octet-muted); text-wrap:pretty">Octet v0.1.0 · end-to-end encrypted. The relay passes messages between devices and can't read them.</span>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ edgeOn }}" hint-placeholder-val="{{ false }}">
+        <div onPointerDown="{{ edgeDown }}" onPointerMove="{{ edgeMove }}" style="position:absolute; left:0; top:110px; bottom:120px; width:18px; z-index:2; touch-action:none"></div>
+      </sc-if>
+
+      <sc-if value="{{ drawer }}" hint-placeholder-val="{{ false }}">
+        <div onClick="{{ closeDrawer }}" style="position:absolute; left:0; right:0; top:0; bottom:0; background:var(--octet-ink); opacity:0.6; z-index:8"></div>
+        <div onPointerDown="{{ drawerDown }}" onPointerMove="{{ drawerMove }}" style="position:absolute; left:0; top:0; bottom:0; width:304px; z-index:9; background:var(--octet-panel); border-right:1px solid var(--octet-edge); display:flex; flex-direction:column; padding:62px 0 34px; box-sizing:border-box">
+          <div style="display:flex; align-items:center; padding:0 12px 12px 20px">
+            <div style="flex:1; display:flex; flex-direction:column"><b style="color:var(--octet-accent)">Octet</b><span style="color:var(--octet-muted); font-size:var(--octet-font-size-sm); line-height:16px">{{ drawerSub }}</span></div>
+            <span onClick="{{ drawerNew }}" style="width:44px; height:44px; display:flex; align-items:center; justify-content:center; border:1px solid var(--octet-edge); border-radius:22px; font-size:20px; cursor:pointer" style-hover="border-color:var(--octet-accent); color:var(--octet-accent)">+</span>
+          </div>
+          <div onClick="{{ inboxRun }}" style="height:44px; flex:none; display:flex; align-items:center; gap:12px; margin:0 8px; padding:0 12px; border-radius:10px; cursor:pointer; background:{{ inboxBg }}; color:{{ inboxFg }}" style-hover="background:var(--octet-selected)">
+            <span style="flex:1">Inbox</span>
+            <sc-if value="{{ inboxBadgeOn }}" hint-placeholder-val="{{ false }}"><span style="min-width:24px; height:24px; padding:0 6px; box-sizing:border-box; display:flex; align-items:center; justify-content:center; border-radius:12px; background:var(--octet-amber); color:var(--octet-ink); font-size:var(--octet-font-size-sm); font-weight:var(--octet-weight-bold)">{{ inboxBadge }}</span></sc-if>
+          </div>
+          <div data-om="list" style="flex:1; min-height:0; overflow-y:auto; scrollbar-width:none; display:flex; flex-direction:column; gap:18px; padding:20px 0">
+            <sc-for list="{{ machines }}" as="mc" hint-placeholder-count="2">
+              <div style="display:flex; flex-direction:column; gap:2px">
+                <span style="padding:0 20px 4px; color:var(--octet-muted); font-size:var(--octet-font-size-sm)"><span style="color:{{ mc.dotColor }}">{{ mc.dot }}</span> {{ mc.label }}</span>
+                <sc-for list="{{ mc.sessions }}" as="d" hint-placeholder-count="3">
+                  <div onClick="{{ d.run }}" style="height:44px; display:flex; align-items:center; gap:10px; margin:0 8px; padding:0 12px; border-radius:10px; cursor:pointer; white-space:nowrap; background:{{ d.bg }}; color:{{ d.fg }}" style-hover="background:var(--octet-selected)">
+                    <span style="flex:1; overflow:hidden; text-overflow:ellipsis">{{ d.name }}</span>
+                    <span style="color:{{ d.statusColor }}; font-size:var(--octet-font-size-sm)">{{ d.status }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-for>
+          </div>
+          <div style="flex:none; border-top:1px solid var(--octet-edge); padding-top:8px">
+            <div onClick="{{ toSettings }}" style="height:44px; display:flex; align-items:center; margin:0 8px; padding:0 12px; border-radius:10px; cursor:pointer; background:{{ settingsBg }}; color:{{ settingsFg }}" style-hover="background:var(--octet-selected)">Settings</div>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ hasToast }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; top:58px; left:12px; right:12px; z-index:6; background:var(--octet-panel); border:1px solid var(--octet-edge); border-radius:16px; padding:12px 14px; display:flex; align-items:center; gap:12px">
+          <span style="flex:1; text-wrap:pretty">{{ toastText }}</span>
+          <sc-if value="{{ toastHasAction }}" hint-placeholder-val="{{ false }}"><span onClick="{{ toastRun }}" style="color:var(--octet-accent); font-weight:var(--octet-weight-bold); cursor:pointer">{{ toastLabel }}</span></sc-if>
+        </div>
+      </sc-if>
+
+      <div style="position:absolute; bottom:8px; left:50%; margin-left:-67px; width:134px; height:5px; border-radius:3px; background:var(--octet-fg); opacity:0.6; z-index:10; pointer-events:none"></div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+const A = 'var(--octet-accent)', M = 'var(--octet-muted)', F = 'var(--octet-fg)', AM = 'var(--octet-amber)', SEL = 'var(--octet-selected)', EDGE = 'var(--octet-edge)';
+const KIND = { you: ['YOU', A, F], octet: ['OCTET', F, F], tool: ['TOOL', M, M], note: ['NOTE', M, M], error: ['ERROR', AM, F] };
+const E = (kind, text, x) => Object.assign({ kind, text }, x || {});
+const MODELS = { claude: ['claude-sonnet', 'claude-opus'], codex: ['gpt-5-codex', 'gpt-5'] };
+const MODES = ['ask', 'accept-edits', 'auto'];
+const FOLDERS = ['octet-site', 'my-project', 'api-gateway'];
+const CMDS = [['/model', 'Switch model'], ['/mode', 'Permissions'], ['/new', 'Fresh context'], ['/session', 'Session info'], ['/export', 'Save journal'], ['/reconnect', 'Resume vendor'], ['/help', 'List commands']];
+const PH = { idle: ['IDLE', A, 'idle'], thinking: ['THINKING', A, 'thinking'], searching: ['SEARCHING', A, 'searching'], coding: ['CODING', A, 'coding'], success: ['SUCCESS', A, 'success'], approval: ['APPROVAL', AM, 'approval'] };
+const RUN = ['thinking', 'searching', 'coding'];
+const FILES = {
+  journal: { name: 'journal.rs', dir: 'crates/octet-core/src', add: 9, del: 2, lines: [['-', 'let mut f = File::create(path)?;'], ['-', 'f.write_all(&self.to_json()?)?;'], ['+', 'let tmp = path.with_extension("json.tmp");'], ['+', 'let mut f = File::create(&tmp)?;'], ['+', 'f.write_all(&self.to_json()?)?;'], ['+', 'f.sync_all()?;'], ['+', 'fs::rename(&tmp, path)?;'], [' ', 'Ok(())']] },
+  view: { name: 'view.rs', dir: 'crates/octet-tui/src', add: 14, del: 3, lines: [['-', 'let line = truncate(&out, width);'], ['+', 'for line in wrap(&out, width - 4) {'], ['+', '    lines.push(Line::raw(line));'], ['+', '}']] },
+  upstream: { name: 'upstream.rs', dir: 'src', add: 32, del: 8, lines: [['-', 'sleep(Duration::from_millis(200));'], ['+', 'let base = 100 * 2u64.pow(attempt);'], ['+', 'let jitter = rand::random::<u64>() % base;'], ['+', 'sleep(Duration::from_millis(base + jitter));']] },
+  zsh: { name: 'prompt.zsh', dir: 'zsh', add: 41, del: 0, lines: [['+', "PROMPT='%F{red}%~%f %# '"], ['+', "RPROMPT='%F{8}%*%f'"]] },
+  lib: { name: 'lib.rs', dir: 'src', add: 6, del: 1, lines: [['-', 'pub fn run() {'], ['+', 'pub fn run() -> Result<()> {'], ['+', '    init()?;']] },
+};
+const mk = o => Object.assign({ machine: 'studio-mac', engine: 'claude', model: 'claude-sonnet', mode: 'ask', phase: 'idle', pending: null, question: null, tokens: 0, turns: 0, tests: false, files: [], allowed: [], started: 0 }, o);
+const INIT = () => [
+  mk({ id: 'my-project', path: '~/code/my-project', hash: '7f3a91', ago: 'now', tokens: 12.4, turns: 2, phase: 'approval', files: ['journal'],
+    entries: [E('you', "Make the journal save atomically so a crash can't leave a half-written file."), E('octet', "I'll find where the journal is written, then switch it to a temp file and a rename."), E('tool', '$ rg "fn save" crates/\ncrates/octet-core/src/journal.rs:48'), E('tool', 'edit crates/octet-core/src/journal.rs  +9 −2', { file: 'journal' }), E('octet', "The edit is in. I'll run the journal tests to check it.")],
+    pending: { n: 1, tool: 'Bash', kind: 'CMD', cmd: 'cargo test -p octet-core journal', reason: 'Check the atomic-save change.', ok: '$ cargo test -p octet-core journal\ntest result: ok. 6 passed; 0 failed; finished in 0.41s', after: 'Done. Journal::save writes journal.json.tmp, fsyncs it and renames it into place. 6 tests pass; export.rs needed no change.' } }),
+  mk({ id: 'octet', path: '~/code/octet', hash: 'b2c410', ago: '2m', tokens: 18.9, turns: 3, phase: 'approval', files: [],
+    entries: [E('you', 'Wrap long tool output in the transcript instead of cutting it off.'), E('octet', "The transcript truncates in view.rs. I'll wrap lines at the card width instead.")],
+    pending: { n: 2, tool: 'Edit', kind: 'FILE', cmd: 'crates/octet-tui/src/view.rs  +14 −3', reason: 'Wrap tool output at the card width.', ok: 'edit crates/octet-tui/src/view.rs  +14 −3', after: 'Done. Long tool lines now wrap inside the card. Run cargo test -p octet-tui to check it.', file: 'view' } }),
+  mk({ id: 'api-gateway', path: '~/code/api-gateway', hash: '4e81d0', engine: 'codex', model: 'gpt-5-codex', ago: '8m', tokens: 6.2, turns: 4, files: ['upstream'], tests: true,
+    entries: [E('you', 'Add retry with jitter to the upstream client.'), E('tool', 'edit src/upstream.rs  +32 −8', { file: 'upstream' }), E('octet', 'Retries now back off exponentially with jitter, capped at 5 attempts.'), E('octet', 'Keep the old --retries flag as an alias, or remove it?')],
+    question: 'Keep the old --retries flag as an alias, or remove it?' }),
+  mk({ id: 'dotfiles', path: '~/dotfiles', hash: '9d0c22', machine: 'macbook-air', ago: 'Tue', tokens: 3.1, turns: 1, files: ['zsh'],
+    entries: [E('you', 'Move the zsh prompt into its own file.'), E('tool', 'edit zsh/prompt.zsh  +41', { file: 'zsh' }), E('octet', 'Moved the prompt into zsh/prompt.zsh and sourced it from .zshrc.')] }),
+];
+const FRESH = () => ({ screen: 'pair', cur: 'my-project', away: false, tab: 0, input: '', history: [], fs: 13, toast: null, open: { journal: true }, pr: {}, committed: {}, draft: '', nf: { folder: 0, engine: 'claude', mode: 0 }, sessions: INIT(), pairing: false, drawer: false, hdr: false, notif: { approvals: true, errors: true, done: false } });
+
+class Component extends DCLogic {
+  state = Object.assign(FRESH(), { scale: 1 });
+  timers = {}; permN = 2;
+
+  componentDidMount() {
+    this.fit = () => { const s = Math.max(0.5, Math.min(1, (window.innerHeight - 40) / 864)); if (Math.abs(s - this.state.scale) > 0.001) this.setState({ scale: s }); };
+    window.addEventListener('resize', this.fit); this.fit();
+    this.tick = setInterval(() => { if (this.state.away) this.forceUpdate(); }, 1000);
+  }
+  componentWillUnmount() { window.removeEventListener('resize', this.fit); clearInterval(this.tick); this.clearAll(); clearTimeout(this.toastT); clearTimeout(this.pairT); }
+  componentDidUpdate() { const s = this.state, p = this._prev || {}; if (s.screen === 'convo' && (p.sessions !== s.sessions || p.screen !== 'convo' || p.cur !== s.cur || p.fs !== s.fs)) this.scrollBottom(); this._prev = { sessions: s.sessions, screen: s.screen, cur: s.cur, fs: s.fs }; }
+  scrollBottom() { const go = () => { const el = document.querySelector('[data-om="scroll"]'); if (el) el.scrollTop = el.scrollHeight; }; go(); requestAnimationFrame(go); }
+  focus(n) { setTimeout(() => { const t = document.querySelector('[data-om="' + n + '"]'); if (t) { t.focus(); const l = t.value.length; t.setSelectionRange(l, l); } }, 30); }
+
+  get(id) { return this.state.sessions.find(s => s.id === id); }
+  upd(id, fn) { this.setState(st => ({ sessions: st.sessions.map(s => s.id === id ? Object.assign({}, s, typeof fn === 'function' ? fn(s) : fn) : s) })); }
+  push(id, ...es) { this.upd(id, s => ({ entries: [...s.entries, ...es] })); }
+  later(id, fn, ms) { const set = this.timers[id] || (this.timers[id] = new Set()); const t = setTimeout(() => { set.delete(t); fn(); }, ms); set.add(t); }
+  clear(id) { (this.timers[id] || []).forEach(clearTimeout); this.timers[id] = new Set(); }
+  clearAll() { Object.keys(this.timers).forEach(k => this.clear(k)); }
+  toast(text, action, label) { clearTimeout(this.toastT); this.setState({ toast: { text, action, label } }); this.toastT = setTimeout(() => this.setState({ toast: null }), 3400); }
+  go(screen, extra) { this.setState(Object.assign({ screen, away: false, toast: null, drawer: false, hdr: false }, extra || {})); }
+  openS(id) { this.go('convo', { cur: id, input: '' }); this.upd(id, x => ({ ago: x.ago })); this.focus('ta'); }
+
+  startTurn(id, prompt) {
+    const s = this.get(id), fk = s.files[0] || 'lib', f = FILES[fk];
+    const kw = ((prompt.match(/[A-Za-z_][A-Za-z0-9_]{3,}/g) || ['save']).sort((a, b) => b.length - a.length)[0]).toLowerCase();
+    this.clear(id);
+    this.upd(id, x => ({ entries: [...x.entries, E('you', prompt)], phase: 'thinking', question: null, started: Date.now(), ago: 'now', files: x.files.includes(fk) ? x.files : [...x.files, fk] }));
+    this.later(id, () => {
+      this.upd(id, x => ({ phase: 'searching', entries: [...x.entries, E('tool', '$ rg -n "' + kw + '" ' + f.dir.split('/')[0] + '/\n' + f.dir + '/' + f.name + ':48')] }));
+      this.later(id, () => {
+        this.upd(id, x => ({ phase: 'coding', entries: [...x.entries, E('tool', 'edit ' + f.dir + '/' + f.name + '  +' + f.add + ' −' + f.del, { file: fk })] }));
+        this.later(id, () => this.request(id, { tool: 'Bash', kind: 'CMD', cmd: 'cargo test', reason: 'Run the tests after the change.', ok: '$ cargo test\ntest result: ok. 9 passed; 0 failed; finished in 0.52s', after: 'Done. The change is in ' + f.name + ' (+' + f.add + ' −' + f.del + ') and the tests pass.' }), 1200);
+      }, 1400);
+    }, 1000);
+  }
+  request(id, r) {
+    const s = this.get(id);
+    if (s.allowed.includes(r.tool)) { this.push(id, E('note', r.tool + ' allowed for this session: ' + r.cmd)); return this.run(id, r); }
+    const n = ++this.permN;
+    this.upd(id, { phase: 'approval', pending: Object.assign({ n }, r) });
+    const st = this.state;
+    if (!st.away && (st.screen !== 'convo' || st.cur !== id)) this.toast(id + ' needs approval · ' + r.tool, () => this.openS(id), 'View');
+  }
+  decide(id, choice) {
+    const s = this.get(id), r = s && s.pending;
+    if (!r) return;
+    if (choice === 'deny') { this.upd(id, x => ({ pending: null, phase: 'idle', entries: [...x.entries, E('note', 'Denied. No action was performed.')] })); return; }
+    this.upd(id, x => ({ pending: null, allowed: choice === 'session' ? [...x.allowed, r.tool] : x.allowed, entries: choice === 'session' ? [...x.entries, E('note', r.tool + ' requests are allowed for the rest of this session.')] : x.entries }));
+    this.run(id, r);
+  }
+  run(id, r) {
+    this.upd(id, x => ({ phase: 'coding', started: x.started || Date.now(), tests: x.tests || r.tool === 'Bash', files: r.file && !x.files.includes(r.file) ? [...x.files, r.file] : x.files, entries: [...x.entries, E('tool', r.ok, r.file ? { file: r.file } : {})] }));
+    this.later(id, () => this.stream(id, r.after, () => {
+      this.upd(id, x => ({ phase: 'success', turns: x.turns + 1, tokens: Math.round((x.tokens + 0.8 + Math.random()) * 10) / 10 }));
+      this.later(id, () => { const c = this.get(id); if (c && c.phase === 'success') this.upd(id, { phase: 'idle' }); }, 4000);
+    }), 600);
+  }
+  stream(id, text, done) {
+    this.push(id, E('octet', ''));
+    let n = 0;
+    const tick = () => {
+      n = Math.min(text.length, n + 3);
+      this.upd(id, x => { const e = x.entries.slice(); e[e.length - 1] = Object.assign({}, e[e.length - 1], { text: text.slice(0, n) }); return { entries: e }; });
+      if (n < text.length) this.later(id, tick, 18); else done();
+    };
+    tick();
+  }
+  cancel(id) {
+    const s = this.get(id);
+    if (s.pending) return this.decide(id, 'deny');
+    if (!RUN.includes(s.phase)) return;
+    this.clear(id);
+    this.upd(id, x => ({ phase: 'idle', entries: [...x.entries, E('note', 'Turn cancelled. No further changes were made.')] }));
+  }
+  cycleMode(id) { this.upd(id, x => ({ mode: MODES[(MODES.indexOf(x.mode) + 1) % 3] })); }
+  runCommand(id, c) {
+    const s = this.get(id), note = t => this.push(id, E('note', t));
+    this.push(id, E('you', c));
+    switch (c) {
+      case '/model': { const l = MODELS[s.engine], m = l[(l.indexOf(s.model) + 1) % l.length]; this.upd(id, { model: m }); return note('Model is now ' + m + '.'); }
+      case '/mode': { const m = MODES[(MODES.indexOf(s.mode) + 1) % 3]; this.upd(id, { mode: m }); return note('Permission mode: ' + m + '.'); }
+      case '/new': this.clear(id); return this.upd(id, { entries: [E('note', 'Fresh context. The previous conversation stays in the journal.')], turns: 0, tokens: 0, phase: 'idle', pending: null, question: null });
+      case '/session': return note('Session ' + s.hash + ' · ' + s.engine + ' / ' + s.model + '\n' + s.turns + ' turns · ' + s.tokens.toFixed(1) + 'k tokens\nJournal: ~/.octet/journal/' + s.hash + '.jsonl');
+      case '/export': return note('Journal saved to ' + s.path + '/octet-' + s.hash + '.md');
+      case '/reconnect': return note('Resumed ' + s.engine + ' session ' + s.hash + '.');
+      case '/help': return note(CMDS.map(x => (x[0] + '            ').slice(0, 12) + x[1]).join('\n'));
+      default: return this.push(id, E('error', 'Unknown command ' + c + '. Type /help for the list.'));
+    }
+  }
+  matches() { const q = this.state.input.trim().toLowerCase(); if (!q.startsWith('/') || q.includes(' ')) return []; return CMDS.filter(x => x[0].startsWith(q)); }
+  submit() {
+    const id = this.state.cur, s = this.get(id), v = this.state.input.trim();
+    if (!v) return;
+    const remember = () => this.setState(st => ({ input: '', history: [...st.history, v] }));
+    if (v.startsWith('/')) { const w = v.split(/\s+/)[0], hit = CMDS.find(x => x[0] === w) || this.matches()[0]; remember(); return this.runCommand(id, hit ? hit[0] : w); }
+    if (s.pending) { remember(); this.upd(id, x => ({ pending: null, phase: 'idle', entries: [...x.entries, E('note', 'Denied with instructions.')] })); return setTimeout(() => this.startTurn(id, v), 60); }
+    if (RUN.includes(s.phase)) return this.toast('A turn is running. Esc cancels it.');
+    remember(); this.startTurn(id, v);
+  }
+  startNew() {
+    const st = this.state, nf = st.nf, id = FOLDERS[nf.folder], text = st.draft.trim();
+    if (!text) { this.toast('Write a prompt first.'); return this.focus('draft'); }
+    const props = { engine: nf.engine, model: MODELS[nf.engine][0], mode: MODES[nf.mode] };
+    if (this.get(id)) this.upd(id, props);
+    else this.setState(x => ({ sessions: [mk(Object.assign({ id, path: '~/code/' + id, hash: Math.random().toString(16).slice(2, 8), ago: 'now', entries: [] }, props)), ...x.sessions] }));
+    this.setState({ draft: '', screen: 'convo', cur: id, input: '' });
+    setTimeout(() => this.startTurn(id, text), 80);
+  }
+  reset() { this.clearAll(); clearTimeout(this.pairT); this.permN = 2; this.setState(FRESH()); }
+
+  renderVals() {
+    const st = this.state, ss = st.sessions, s = this.get(st.cur) || ss[0], cur = s.id;
+    const stop = fn => e => { if (e && e.stopPropagation) e.stopPropagation(); fn(); };
+    const running = RUN.includes(s.phase), ph = s.pending ? 'approval' : s.phase, P = PH[ph];
+    const needs = ss.filter(x => x.pending || x.question), runL = ss.filter(x => !x.pending && RUN.includes(x.phase)), done = ss.filter(x => !x.pending && !x.question && !RUN.includes(x.phase));
+    const list = [needs, runL, done][st.tab], pendAll = ss.filter(x => x.pending);
+    const lastOf = (x, k) => { for (let i = x.entries.length - 1; i >= 0; i--) if (x.entries[i].kind === k && x.entries[i].text) return x.entries[i].text; return ''; };
+    const screen = st.screen, fsPx = st.fs, lhPx = st.fs + 5;
+
+    const items = list.map(x => {
+      const p = x.pending, r = RUN.includes(x.phase);
+      return {
+        id: x.id, ago: x.ago, open: () => this.openS(x.id),
+        bg: p ? 'var(--octet-panel)' : 'transparent',
+        isApproval: !!p, isQuestion: !p && !!x.question,
+        status: p ? '● ' + p.tool + ' · ' + p.cmd : x.question ? '● question' : r ? '● ' + PH[x.phase][0] + ' · ' + x.engine : x.phase === 'success' ? '● done' : x.machine + ' · ' + x.engine,
+        statusColor: p ? AM : (r || x.phase === 'success' || x.question) ? A : M,
+        line: p ? p.reason : x.question ? x.question : r ? lastOf(x, 'tool') : lastOf(x, 'octet'),
+        allow: stop(() => this.decide(x.id, 'once')),
+        alt: p && p.tool === 'Edit' ? 'Review' : 'Deny',
+        altRun: stop(() => p && p.tool === 'Edit' ? this.openS(x.id) : this.decide(x.id, 'deny')),
+      };
+    });
+    const tabs = [['Needs you', needs.length], ['Running', runL.length], ['Done', 0]].map(([l, n], i) => ({ label: n ? l + ' ' + n : l, bg: i === st.tab ? SEL : 'transparent', fg: i === st.tab ? A : F, run: () => this.setState({ tab: i }) }));
+
+    const slash = this.matches().map((c, i) => ({
+      cmd: c[0], desc: c[1], mark: i === 0 ? '▸' : ' ', bg: i === 0 ? SEL : 'transparent', fg: i === 0 ? A : F,
+      val: { '/model': s.model, '/mode': s.mode, '/session': s.hash, '/reconnect': s.engine }[c[0]] || '',
+      run: e => { if (e) e.preventDefault(); this.setState({ input: '' }); this.runCommand(cur, c[0]); this.focus('ta'); },
+    }));
+    const keep = e => e.preventDefault();
+    const keys = (s.pending
+      ? [['y', () => this.decide(cur, 'once'), 1, A], ['a', () => this.decide(cur, 'session')], ['n', () => this.decide(cur, 'deny')], ['esc', () => this.decide(cur, 'deny'), 1.2]]
+      : [['esc', () => this.cancel(cur), 1, running ? A : F], ['⇧tab', () => this.cycleMode(cur), 1.3], ['↑', () => { const h = st.history; if (h.length) this.setState({ input: h[h.length - 1] }); }], ['/', () => this.setState({ input: '/' })], ['⏎', () => this.submit(), 1.2, st.input.trim() ? A : M]]
+    ).map(([label, run, flex, fg]) => ({ label, run, flex: flex || 1, fg: fg || F, down: keep }));
+
+    const files = s.files.map(k => {
+      const f = FILES[k], n = Math.min(5, Math.max(1, Math.ceil((f.add + f.del) / 8))), open = !!st.open[k];
+      return {
+        name: f.name, dir: f.dir, add: f.add, del: f.del, bar: '■'.repeat(n), barRest: '■'.repeat(5 - n), expanded: open, caret: open ? '▾' : '▸',
+        toggle: () => this.setState(x => ({ open: Object.assign({}, x.open, { [k]: !x.open[k] }) })),
+        lines: f.lines.map(([t, c]) => ({ sign: t === '-' ? '−' : t, code: c, bg: t === '+' ? SEL : 'transparent', fg: t === '-' ? M : F, sc: t === '+' ? A : M, deco: t === '-' ? 'line-through' : 'none' })),
+      };
+    });
+    const add = s.files.reduce((a, k) => a + FILES[k].add, 0), del = s.files.reduce((a, k) => a + FILES[k].del, 0);
+    const branch = cur === 'my-project' ? 'atomic-journal' : cur + '-octet', prN = st.pr[cur], committed = st.committed[cur];
+
+    const ctx = Math.min(96, Math.max(1, Math.round(s.tokens * 3.1))), cf = Math.round(ctx / 5);
+    const maxT = Math.max(...ss.map(x => x.tokens), 1);
+
+    const pend = pendAll[0], runS = ss.find(x => RUN.includes(x.phase));
+    const el = runS ? Math.max(0, Math.floor((Date.now() - runS.started) / 1000)) : 0;
+    const toast = st.toast;
+    const JUMPS = [['pair', '01', 'Pair'], ['sessions', '02', 'Sessions'], ['new', '03', 'New session'], ['convo', '04', 'Conversation'], ['changes', '06', 'Changes'], ['usage', '09', 'Usage'], ['drawer', '10', 'Drawer'], ['settings', '11', 'Settings'], ['away', '08', 'Outside the app']];
+    const active = st.away ? 'away' : st.drawer ? 'drawer' : screen;
+
+    return {
+      ...Object.fromEntries(['idle','thinking','searching','coding','success','approval'].map(p => ['pose_' + p, P[2] === p])),
+      empty_success: st.tab === 0, empty_sleeping: st.tab !== 0,
+      ...Object.fromEntries(RUN.map(p => ['ipose_' + p, !!runS && runS.phase === p])),
+      scale: st.scale,
+      jumps: JUMPS.map(([k, num, name]) => ({ num, name, bg: k === active ? SEL : 'transparent', fg: k === active ? A : F, run: () => k === 'away' ? this.setState({ away: true, toast: null, drawer: false }) : k === 'drawer' ? this.setState({ away: false, toast: null, drawer: true, screen: screen === 'pair' || screen === 'new' ? 'sessions' : screen }) : this.go(k) })),
+      awayLabel: st.away ? 'Back to Octet' : 'Leave app',
+      toggleAway: () => this.setState(x => ({ away: !x.away, toast: null, drawer: false })),
+      drawer: st.drawer && !st.away,
+      hdrOpen: st.hdr && !st.drawer && !st.away && screen === 'convo', hdrCaret: st.hdr ? '▴' : '▾',
+      toggleHdr: () => this.setState(x => ({ hdr: !x.hdr })),
+      hdrModels: MODELS[s.engine].map(m => ({ name: m, mark: m === s.model ? '✓' : '', bg: m === s.model ? SEL : 'transparent', fg: m === s.model ? A : F,
+        run: () => { if (m !== s.model) { this.upd(cur, { model: m }); this.push(cur, E('note', 'Model is now ' + m + '.')); } this.setState({ hdr: false }); } })),
+      hdrModes: MODES.map(m => ({ name: m, flex: m === 'accept-edits' ? 1.6 : 1, bg: m === s.mode ? SEL : 'transparent', fg: m === s.mode ? A : F,
+        run: () => { if (m !== s.mode) { this.upd(cur, { mode: m }); this.push(cur, E('note', 'Permission mode: ' + m + '.')); } } })),
+      modeHelp: { ask: 'Ask before every command and edit.', 'accept-edits': 'Edit files without asking; still ask before commands.', auto: 'Run commands and edits without asking.' }[s.mode],
+      openDrawer: () => this.setState({ drawer: true, toast: null }), closeDrawer: () => this.setState({ drawer: false }),
+      drawerNew: () => { this.go('new'); this.focus('draft'); },
+      drawerSub: needs.length ? needs.length + ' need you · ' + runL.length + ' running' : runL.length + ' running',
+      inboxRun: () => this.go('sessions'), inboxBg: screen === 'sessions' ? SEL : 'transparent', inboxFg: screen === 'sessions' ? A : F,
+      inboxBadgeOn: needs.length > 0, inboxBadge: String(needs.length),
+      machines: [['studio-mac', '●', A, 'online'], ['macbook-air', '○', M, 'asleep']].map(([m, dot, dc, state]) => ({ label: m + ' · ' + state, dot, dotColor: dc,
+        sessions: ss.filter(x => x.machine === m).map(x => { const on = screen === 'convo' && x.id === cur; const r = RUN.includes(x.phase);
+          return { name: x.id, bg: on ? SEL : 'transparent', fg: on ? A : (m === 'studio-mac' ? F : M), run: () => this.openS(x.id),
+            status: x.pending ? 'approve' : r ? x.phase : x.phase === 'success' ? 'done' : x.question ? 'question' : x.ago,
+            statusColor: x.pending ? AM : (r || x.phase === 'success' || x.question) ? A : M }; }) })),
+      toSettings: () => this.go('settings'), settingsBg: screen === 'settings' ? SEL : 'transparent', settingsFg: screen === 'settings' ? A : F,
+      isSettings: !st.away && screen === 'settings', toPair: () => this.go('pair'),
+      notifs: [['approvals', 'An action needs approval'], ['errors', 'A session hits an error'], ['done', 'A turn finishes']].map(([k, label], i) => ({ label, border: i ? '1px solid var(--octet-edge)' : '0', track: st.notif[k] ? A : EDGE, knob: st.notif[k] ? '23px' : '3px', run: () => this.setState(x => ({ notif: Object.assign({}, x.notif, { [k]: !x.notif[k] }) })) })),
+      edgeOn: !st.away && !st.drawer && ['sessions', 'convo', 'settings'].includes(screen),
+      edgeDown: e => { this.sx = e.clientX; try { e.target.setPointerCapture(e.pointerId); } catch (_) {} },
+      edgeMove: e => { if (this.sx != null && e.clientX - this.sx > 30) { this.sx = null; this.setState({ drawer: true }); } },
+      drawerDown: e => { this.dx = e.clientX; },
+      drawerMove: e => { if (this.dx != null && e.buttons && this.dx - e.clientX > 40) { this.dx = null; this.setState({ drawer: false }); } },
+      reset: () => this.reset(),
+      barBg: !st.away && screen === 'pair' ? 'var(--octet-panel)' : 'transparent',
+
+      isPair: !st.away && screen === 'pair',
+      scan: () => { if (st.pairing) return; this.setState({ pairing: true }); this.pairT = setTimeout(() => { this.setState({ pairing: false }); this.go('sessions'); this.toast('Paired with studio-mac'); }, 900); },
+      scanText: st.pairing ? '● studio-mac found' : 'camera · tap to scan', scanColor: st.pairing ? A : M,
+
+      isSessions: !st.away && screen === 'sessions',
+      toNew: () => { this.go('new'); this.focus('draft'); },
+      tabs, items, inboxEmpty: items.length === 0,
+      emptyPose: st.tab === 0 ? 'success' : 'sleeping',
+      emptyText: ['Nothing needs you.', 'Nothing running.', 'No finished sessions.'][st.tab],
+      bottomLabel: pendAll.length > 1 ? 'Allow all ' + pendAll.length + ' once' : 'New session',
+      bottomRun: () => { if (pendAll.length > 1) pendAll.forEach(x => this.decide(x.id, 'once')); else { this.go('new'); this.focus('draft'); } },
+
+      isNew: !st.away && screen === 'new',
+      toSessions: () => this.go('sessions'),
+      draft: st.draft, onDraft: e => this.setState({ draft: e.target.value }),
+      onDraftKey: e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); this.startNew(); } },
+      startNew: () => this.startNew(), startColor: st.draft.trim() ? A : M,
+      chips: [
+        { dot: '●', dotColor: A, label: 'studio-mac', fg: F, run: () => this.toast('macbook-air is asleep. Sessions start on studio-mac.') },
+        { dot: '', dotColor: M, label: FOLDERS[st.nf.folder], fg: F, run: () => this.setState(x => ({ nf: Object.assign({}, x.nf, { folder: (x.nf.folder + 1) % FOLDERS.length }) })) },
+        { dot: '', dotColor: M, label: st.nf.engine + ' / ' + MODELS[st.nf.engine][0], fg: F, run: () => this.setState(x => ({ nf: Object.assign({}, x.nf, { engine: x.nf.engine === 'claude' ? 'codex' : 'claude' }) })) },
+        { dot: '', dotColor: M, label: MODES[st.nf.mode], fg: F, run: () => this.setState(x => ({ nf: Object.assign({}, x.nf, { mode: (x.nf.mode + 1) % 3 }) })) },
+        { dot: '+', dotColor: M, label: 'image', fg: M, run: () => this.toast('Images go to studio-mac and reach the agent as an @file.') },
+      ],
+
+      isConvo: !st.away && screen === 'convo',
+      cur, cols: Math.floor(362 / (fsPx * 0.6)), fs: fsPx + 'px', lh: lhPx + 'px',
+      cycleFs: () => this.setState(x => ({ fs: x.fs >= 14 ? 12 : x.fs + 1 })),
+      toUsage: () => this.go('usage'),
+      pose: P[2], machine: s.machine, mode: s.mode, modeColor: s.mode === 'ask' ? M : A, engine: s.engine, model: s.model,
+      phaseWord: P[0], phaseColor: P[1], path: s.path,
+      entries: s.entries.map(e => { const k = KIND[e.kind]; return { label: k[0], lc: k[1], tc: k[2], text: e.text, hint: e.file ? '  view ›' : '', cursor: e.file ? 'pointer' : 'default', open: e.file ? () => this.go('changes', { open: Object.assign({}, st.open, { [e.file]: true }) }) : null }; }),
+      hasPending: !!s.pending,
+      reqN: s.pending ? s.pending.n : '', reqTool: s.pending ? s.pending.tool : '', reqKind: s.pending ? s.pending.kind : '', reqCmd: s.pending ? s.pending.cmd : '', reqReason: s.pending ? s.pending.reason : '',
+      allowOnce: () => this.decide(cur, 'once'), allowSession: () => this.decide(cur, 'session'), deny: () => this.decide(cur, 'deny'),
+      hasSlash: slash.length > 0, slash,
+      promptEdge: s.pending ? EDGE : running ? EDGE : A,
+      placeholder: s.pending ? 'Or say what to do instead' : running ? 'Working… esc cancels' : s.question ? 'Answer, or describe a change' : 'Ask, describe a change, or /help',
+      input: st.input,
+      onInput: e => this.setState({ input: e.target.value.replace(/\n/g, '') }),
+      onKey: e => {
+        const m = this.matches();
+        if (e.key === 'Enter') { e.preventDefault(); this.submit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); this.cancel(cur); }
+        else if (e.key === 'Tab' && e.shiftKey) { e.preventDefault(); this.cycleMode(cur); }
+        else if (e.key === 'Tab' && m.length) { e.preventDefault(); this.setState({ input: m[0][0] }); }
+        else if (e.key === 'ArrowUp' && !st.input && st.history.length) { e.preventDefault(); this.setState({ input: st.history[st.history.length - 1] }); }
+      },
+      keys,
+
+      isChanges: !st.away && screen === 'changes',
+      toConvo: () => this.go('convo'),
+      changeSummary: s.files.length ? s.files.length + (s.files.length === 1 ? ' file' : ' files') + ' · +' + add + ' −' + del : 'no changes',
+      files, noFiles: s.files.length === 0,
+      testMark: s.tests ? '✓' : '○', testColor: s.tests ? A : M,
+      testCmd: s.tests ? 'cargo test' : 'Tests not run yet',
+      testDetail: s.tests ? 'passed in this session' : 'Octet asks before running them',
+      branch, branchDetail: committed ? (committed + (committed === 1 ? ' commit' : ' commits') + ' ahead of main') : 'uncommitted changes',
+      commitLabel: committed ? 'Committed' : 'Commit', commitFg: committed ? M : F,
+      commit: () => { if (!s.files.length) return this.toast('Nothing to commit yet.'); this.setState(x => ({ committed: Object.assign({}, x.committed, { [cur]: (x.committed[cur] || 0) + 1 }) })); this.toast('Committed to ' + branch + ' on ' + s.machine + '.'); },
+      prLabel: prN ? 'PR #' + prN + ' open' : 'Open PR', prBg: prN ? 'transparent' : A, prFg: prN ? A : 'var(--octet-ink)',
+      openPr: () => { if (prN) return this.toast('PR #' + prN + ' is open on GitHub.'); if (!s.files.length) return this.toast('Nothing to open a PR for yet.'); const n = 40 + Object.keys(st.pr).length + 2; this.setState(x => ({ pr: Object.assign({}, x.pr, { [cur]: n }), committed: Object.assign({}, x.committed, { [cur]: x.committed[cur] || 1 }) })); this.toast('Opened pull request #' + n + ' from ' + branch + '.'); },
+
+      isUsage: !st.away && screen === 'usage',
+      hash: s.hash, ctxFill: '█'.repeat(cf), ctxRest: '█'.repeat(20 - cf), ctxPct: ctx + '%',
+      ctxDetail: Math.round(ctx * 2) + 'k of 200k · /new resets it',
+      tokens: s.tokens.toFixed(1) + 'k', turns: s.turns, journal: '~/.octet/journal/' + s.hash + '.jsonl',
+      today: ss.slice().sort((a, b) => b.tokens - a.tokens).map(x => ({ name: x.id, bar: '█'.repeat(Math.max(1, Math.round(x.tokens / maxT * 8))), t: x.tokens.toFixed(1) + 'k' })),
+      exportJ: () => { this.runCommand(cur, '/export'); this.toast('Journal saved to ' + s.path + '/octet-' + s.hash + '.md'); },
+      fresh: () => { this.runCommand(cur, '/new'); this.go('convo'); },
+
+      away: st.away,
+      islandExpanded: !!pend, islandCompact: !pend && !!runS,
+      iSess: pend ? pend.id + ' · ' + pend.pending.tool : '', iCmd: pend ? pend.pending.cmd : '',
+      iAllow: () => pend && this.decide(pend.id, 'once'), iDeny: () => pend && this.decide(pend.id, 'deny'),
+      iPose: runS ? PH[runS.phase][2] : 'idle', timer: Math.floor(el / 60) + ':' + String(el % 60).padStart(2, '0'),
+      openFromIsland: () => { const t = pend || runS; if (t) this.openS(t.id); },
+
+      hasToast: !!toast, toastText: toast ? toast.text : '', toastHasAction: !!(toast && toast.action), toastLabel: toast ? toast.label : '',
+      toastRun: () => { if (toast && toast.action) toast.action(); },
+    };
+  }
+}
+</script>
+</body>
+</html>
+

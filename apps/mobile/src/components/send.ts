@@ -1,10 +1,12 @@
-// What the Composer, the Steer field and the controls share: sending one command at a time, and
-// the words for a command that did not work.
+// What the prompt line, the key bar and the other controls share: sending one command at a time,
+// the limits on what is sent, and the words for a command that did not work.
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Refusal, type RequestBody } from "../client/HubClient";
-import { useHubClient } from "../hub";
-import { lightTap } from "../haptics";
+import { useLinks } from "../hub";
+import { sendTo, sendVia } from "../sendVia";
+
+export { CHOOSE_MAC, UNREACHABLE, sendTo, sendVia } from "../sendVia";
 
 /** Sends a command to the Mac; resolves on its ack, rejects with a `Refusal`. */
 export type Send = (body: RequestBody) => Promise<unknown>;
@@ -34,14 +36,19 @@ export function failure(error: unknown): Failure {
   return { text: "Something went wrong. Try again.", retry: false };
 }
 
-/** A `Send` over the app's one connection; with none (not paired yet) every command is unsent.
- * Stable while the connection is. */
-export function useSend(): Send {
-  const client = useHubClient();
-  return useCallback<Send>(
-    (body) => (client ? client.request(body) : Promise.reject(new Refusal("unsent", "Can't reach your Mac"))),
-    [client],
-  );
+/** A `Send` to the Mac of `key` (or of each body's session; with neither, the only Mac): see
+ * `sendVia`. With no Mac connected (not paired yet) every command is unsent. Stable while the
+ * links are. */
+export function useSend(key?: string): Send {
+  const links = useLinks();
+  return useCallback<Send>((body) => sendVia(links, key, body), [links, key]);
+}
+
+/** A `Send` to Mac `mac` (see `sendTo`); with none, `useSend()`. Stable while the links and the
+ * Mac are. */
+export function useSendTo(mac: string | undefined): Send {
+  const links = useLinks();
+  return useCallback<Send>((body) => sendTo(links, mac, body), [links, mac]);
 }
 
 const isLow = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
@@ -91,8 +98,9 @@ export function useAlive(): () => boolean {
 export interface Action {
   busy: boolean;
   failed: Failure | null;
-  /** Sends `body` unless a send is out; `onAck` runs, with the Mac's answer, when it acks. */
-  run: (body: RequestBody, onAck?: (ack: unknown) => void) => void;
+  /** Sends `body` unless a send is out; `onAck` runs, with the Mac's answer, when it acks. True
+   * if it sent. */
+  run: (body: RequestBody, onAck?: (ack: unknown) => void) => boolean;
   fail: (failed: Failure | null) => void;
 }
 
@@ -104,7 +112,7 @@ export function useAction(send: Send): Action {
   const alive = useAlive();
   const run = useCallback(
     (body: RequestBody, onAck?: (ack: unknown) => void) => {
-      if (out.current) return;
+      if (out.current) return false;
       out.current = true;
       setBusy(true);
       setFailed(null);
@@ -122,56 +130,9 @@ export function useAction(send: Send): Action {
           setFailed(failure(error));
         },
       );
+      return true;
     },
     [send, alive],
   );
   return { busy, failed, run, fail: setFailed };
-}
-
-export interface TextSender {
-  text: string;
-  setText: (text: string) => void;
-  busy: boolean;
-  failed: Failure | null;
-  slash: boolean;
-  canSend: boolean;
-  /** Sends the text as the command. It clears only after the ack. */
-  submit: () => void;
-}
-
-/** A text box that sends its text as a `prompt` or a `steer` for `session`. `offline`: the Mac
- * can't be reached, so nothing is sent; the text stays for when it is back. */
-export function useTextSender(
-  send: Send,
-  session: string,
-  kind: "prompt" | "steer",
-  onSent?: () => void,
-  offline = false,
-): TextSender {
-  const [text, setTextState] = useState("");
-  const { busy, failed, run, fail } = useAction(send);
-  const slash = isSlash(text);
-  const canSend = !busy && !offline && text.trim() !== "" && !slash;
-  const setText = useCallback(
-    (next: string) => {
-      setTextState(next);
-      fail(null);
-    },
-    [fail],
-  );
-  const submit = useCallback(() => {
-    if (!canSend) return;
-    if (utf8Bytes(text) > PROMPT_LIMIT) {
-      fail({ text: TOO_LONG, retry: false });
-      return;
-    }
-    lightTap();
-    const sent = text;
-    run({ type: kind, session, text: sent }, () => {
-      // Words typed while it was out are the user's: only an unchanged box is cleared.
-      setTextState((current) => (current === sent ? "" : current));
-      onSent?.();
-    });
-  }, [canSend, text, kind, session, run, fail, onSent]);
-  return { text, setText, busy, failed, slash, canSend, submit };
 }

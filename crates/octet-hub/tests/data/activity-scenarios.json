@@ -1,0 +1,86 @@
+{
+  "_about": "What the Live Activity shows, step by step: the cases of activity.rs the_lead_and_since_follow_the_rulings. The hub's test the_scenarios_fixture_is_the_rulings and the app's model test (apps/mobile/src/activity.test.ts) both run every scenario. Each scenario seeds `sessions` idle at 0 s. A step at `at` seconds looks at `rows` when it has them (a row's `phase` null is a session without state; `approvals` are the ids open, oldest first), then checks the fields `expect` names: `since` in seconds from the seed, and `session` the leading session's id, empty for none.",
+  "scenarios": [
+    {
+      "name": "the lead and since follow the rulings",
+      "sessions": ["s1", "s2", "s3"],
+      "steps": [
+        {
+          "at": 1,
+          "rows": [
+            { "id": "s1", "phase": "idle", "approvals": [1] },
+            { "id": "s2", "phase": "idle", "approvals": [] },
+            { "id": "s3", "phase": "idle", "approvals": [] }
+          ]
+        },
+        {
+          "at": 2,
+          "rows": [
+            { "id": "s1", "phase": "idle", "approvals": [1] },
+            { "id": "s2", "phase": "running", "approvals": [5, 6] },
+            { "id": "s3", "phase": "idle", "approvals": [] }
+          ],
+          "expect": { "kind": "approval", "session": "s1", "since": 1, "approvals": 3 }
+        },
+        {
+          "at": 3,
+          "rows": [
+            { "id": "s1", "phase": "idle", "approvals": [2] },
+            { "id": "s2", "phase": "running", "approvals": [5, 6] },
+            { "id": "s3", "phase": "idle", "approvals": [] }
+          ],
+          "expect": { "session": "s2", "since": 2 }
+        },
+        {
+          "at": 4,
+          "rows": [
+            { "id": "s1", "phase": "idle", "approvals": [] },
+            { "id": "s2", "phase": "running", "approvals": [] },
+            { "id": "s3", "phase": "running", "approvals": [] }
+          ],
+          "expect": { "kind": "running", "session": "s3", "since": 4, "approvals": 0 }
+        },
+        {
+          "at": 5,
+          "rows": [
+            { "id": "s1", "phase": "idle", "approvals": [] },
+            { "id": "s2", "phase": "running", "approvals": [] },
+            { "id": "s3", "phase": "idle", "approvals": [] }
+          ],
+          "expect": { "session": "s2", "since": 4 }
+        },
+        {
+          "at": 7,
+          "rows": [
+            { "id": "s1", "phase": "idle", "approvals": [] },
+            { "id": "s2", "phase": "idle", "approvals": [] },
+            { "id": "s3", "phase": "idle", "approvals": [] }
+          ],
+          "expect": { "kind": "done", "session": "s2", "since": 7 }
+        },
+        {
+          "at": 8,
+          "rows": [
+            { "id": "s1", "phase": "running", "approvals": [9] },
+            { "id": "s2", "phase": "idle", "approvals": [] },
+            { "id": "s3", "phase": "idle", "approvals": [] }
+          ]
+        },
+        {
+          "at": 9,
+          "rows": [
+            { "id": "s1", "phase": null, "approvals": [] },
+            { "id": "s2", "phase": "idle", "approvals": [] },
+            { "id": "s3", "phase": "idle", "approvals": [] }
+          ],
+          "expect": { "kind": "done", "session": "s1", "approvals": 0 }
+        }
+      ]
+    },
+    {
+      "name": "sessions that never ran lead nothing",
+      "sessions": ["s1"],
+      "steps": [{ "at": 5, "expect": { "kind": "done", "session": "", "since": 0 } }]
+    }
+  ]
+}

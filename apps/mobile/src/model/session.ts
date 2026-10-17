@@ -32,6 +32,17 @@ export type SessionState = Omit<StateInfo, "approvals">;
  * a completed turn finished, an interrupted one stopped, anything else (or an error) failed. */
 export type TurnEnd = "finished" | "failed" | "stopped";
 
+/** A fresh start (/new) the Mac took, as the journal boundary it falls on. */
+export interface FreshStart {
+  /** The divider's words. */
+  text: string;
+  /** The journals the session had when it was asked: the fresh conversation is the first one
+   * that is not among them. */
+  known: readonly string[];
+  /** That journal, once a record came from it; null before. */
+  journal: string | null;
+}
+
 export interface SessionView {
   transcript: Transcript;
   state: SessionState | null;
@@ -64,6 +75,15 @@ export interface SessionView {
   epoch: number;
   /** How the last turn ended; null before one ends and while the next runs. */
   turn: TurnEnd | null;
+  /** The `finished` records seen since the last replay from the start: the turns taken. Counted
+   * here, not from the entries, which the view bounds and drops from the top. */
+  turns: number;
+  /** The last fresh start: its divider goes before the first record of its journal, and again
+   * there on each replay from the start. Null for none. */
+  fresh: FreshStart | null;
+  /** The fresh start's divider is in the transcript as it is now (since the last replay from the
+   * start). */
+  freshShown: boolean;
 }
 
 export const EMPTY_VIEW: SessionView = {
@@ -83,6 +103,9 @@ export const EMPTY_VIEW: SessionView = {
   held: null,
   epoch: 0,
   turn: null,
+  turns: 0,
+  fresh: null,
+  freshShown: false,
 };
 
 /** One change to a session's view, in the order the hub sent it. */
@@ -97,7 +120,10 @@ export type Op =
   | { op: "state"; state: StateInfo }
   | { op: "catalog"; catalog: CatalogInfo }
   | { op: "failed"; reason: string | null }
-  | { op: "ended"; ended: boolean };
+  | { op: "ended"; ended: boolean }
+  /** The Mac took a fresh start: its divider goes in the transcript before the first record of
+   * the next journal. */
+  | { op: "note"; text: string };
 
 /** Approvals waiting, at most. */
 export const MAX_APPROVALS = 32;
@@ -122,16 +148,20 @@ const optStr = (x: unknown, limit: number): string | null | undefined =>
  * command to 4 KiB and ends it with this (`clip`, crates/octet-tui/src/bridge.rs). */
 const HUB_CLIP_MARK = "…";
 
-/** A summary cleaned and bounded, and whether its command is not whole. */
+/** The bridge's reduced summary of an edit lists no file, only how many there were: `+N more`. */
+const ONLY_MORE_FILES = /^\+\d+ more$/;
+
+/** A summary cleaned and bounded, and whether its command is not whole, or its files are not
+ * shown at all (the bridge's reduced edit: `["+N more"]`). */
 function cleanSummary(raw: unknown): { summary: ApprovalSummary; cut: boolean } {
   const s = isObj(raw) ? raw : {};
   const files = Array.isArray(s.files) ? s.files.slice(0, MAX_FILES).map((f) => str(f, SHORT_CHARS * 4)) : [];
   const out: ApprovalSummary = { action: str(s.action, TEXT_CHARS), files, scope: str(s.scope, SHORT_CHARS) };
-  let cut = false;
+  let cut = files.length === 1 && ONLY_MORE_FILES.test(files[0] ?? "");
   if (typeof s.command === "string") {
     const command = fieldCut(s.command, DETAIL_CHARS);
     out.command = command.text;
-    cut = command.cut || command.text.endsWith(HUB_CLIP_MARK);
+    cut = cut || command.cut || command.text.endsWith(HUB_CLIP_MARK);
   } else if (s.command !== undefined) out.command = null;
   const cwd = optStr(s.cwd, SHORT_CHARS * 4);
   if (cwd !== undefined) out.cwd = cwd;
@@ -154,6 +184,13 @@ function cleanApprovals(raw: unknown, known: readonly PendingApproval[], closed:
     out.push({ id, summary, detail: had?.detail ?? "", cut });
   }
   return out;
+}
+
+/** One approval of a `sessions` row (the session's front one), cleaned as a state frame's are;
+ * null when it is not an approval. */
+export function cleanFrontApproval(raw: unknown): ApprovalInfo | null {
+  const [approval] = cleanApprovals([raw], [], []);
+  return approval ? { id: approval.id, summary: approval.summary } : null;
 }
 
 function cleanGoal(raw: unknown): GoalInfo | null {
@@ -242,6 +279,19 @@ function approve(approvals: PendingApproval[], data: unknown): PendingApproval[]
   return approvals.length >= MAX_APPROVALS ? approvals : [...approvals, made];
 }
 
+/** Before a record from `journal`: the fresh start's divider goes in when this is the first
+ * record of its journal (the first journal the session did not have when it was asked). */
+function freshBefore(v: SessionView, journal: string, own: () => TranscriptDraft): void {
+  const fresh = v.fresh;
+  if (fresh === null || v.freshShown) return;
+  if (fresh.journal === null) {
+    if (fresh.known.includes(journal)) return;
+    v.fresh = { ...fresh, journal };
+  } else if (fresh.journal !== journal) return;
+  own().addLocalNote(fresh.text);
+  v.freshShown = true;
+}
+
 /**
  * The view after `ops`, in order. Returns `view` itself when nothing changed, and keeps the
  * identity of every part that did not: the transcript's entries, an unchanged state or catalog.
@@ -263,6 +313,8 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         draft = new TranscriptDraft(EMPTY_TRANSCRIPT);
         v.epoch += 1;
         v.turn = null;
+        v.turns = 0; // the replay brings every finished record again
+        v.freshShown = false; // the replay brings its journal's first record again
         // What the latest state frame listed is still waiting; the replay fills it in or closes it.
         if (!alike(v.approvals, v.stated)) v.approvals = v.stated;
         if (v.closed.length > 0) v.closed = [];
@@ -282,6 +334,14 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         break;
       case "ended":
         v.ended = op.ended;
+        break;
+      case "note":
+        // Not at the end of what is there: the old journal may still have records to come (its
+        // last words, or the rest of a replay). The divider waits for the new journal's first.
+        // A repeated ack, while the same start waits for its journal, is the same start.
+        if (v.fresh !== null && v.fresh.journal === null && v.fresh.text === op.text) break;
+        v.fresh = { text: op.text, known: v.journals, journal: null };
+        v.freshShown = false;
         break;
       case "failed":
         v.failed = op.reason;
@@ -303,6 +363,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
         const ev = op.ev;
         if (op.journal !== undefined) {
           const journal = str(op.journal, SHORT_CHARS);
+          freshBefore(v, journal, own);
           if (!v.journals.includes(journal)) setJournals(v, [...v.journals, journal]); // one the hub did not list yet
         }
         if (v.replaying) {
@@ -344,6 +405,7 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
             own().apply(ev);
             break;
           case "finished":
+            v.turns += 1;
             v.turn = ev.data === "completed" ? "finished" : ev.data === "interrupted" ? "stopped" : "failed";
             own().apply(ev);
             break;
@@ -376,6 +438,9 @@ export function reduceView(view: SessionView, ops: readonly Op[]): SessionView {
     v.replaying === view.replaying &&
     v.held === view.held &&
     v.epoch === view.epoch &&
-    v.turn === view.turn;
+    v.turn === view.turn &&
+    v.turns === view.turns &&
+    v.fresh === view.fresh &&
+    v.freshShown === view.freshShown;
   return same ? view : v;
 }

@@ -4,7 +4,7 @@
 use crate::{
     Action, Exit, Signals,
     app::{App, StatusKind},
-    bridge::{Bridge, Remote, handle_remote},
+    bridge::{Bridge, Remote, answer_job, handle_remote},
     external, files,
     input::{key_action, paste, refresh_completion},
     jobs, session_event, shell, shell_finished,
@@ -199,8 +199,14 @@ impl Loop<'_> {
                 app.event(Event::Stopped);
             }
             Wake::Job(ended) => {
-                app.job = None;
-                jobs::apply(app, ended);
+                // A job a phone asked for (its `/export`) is answered now that it is done.
+                match app.job.take().and_then(jobs::Running::into_asker) {
+                    Some(asker) => {
+                        let reply = answer_job(app, ended, &asker);
+                        self.bridge.reply(asker.peer, asker.req, reply);
+                    }
+                    None => jobs::apply(app, ended),
+                }
             }
             Wake::Probed(probed) => {
                 if let Some(note) = app.models.probed(probed, std::time::SystemTime::now()) {
@@ -216,7 +222,10 @@ impl Loop<'_> {
                 let (peer, req) = (remote.peer, remote.req);
                 let (result, action) =
                     handle_remote(app, &session.handle, remote, self.editing.is_some()).await;
-                self.bridge.reply(peer, req, result);
+                // A command that started a job is answered when the job ends.
+                if let Some(result) = result {
+                    self.bridge.reply(peer, req, result);
+                }
                 if let Some(exit) = self.apply(action, app)? {
                     return Ok(Some(exit));
                 }

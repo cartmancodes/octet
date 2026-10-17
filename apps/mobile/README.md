@@ -1,8 +1,8 @@
 # Octet for your phone
 
 An Expo app (React Native, SDK 57) that lists the Octet sessions running on your Mac, shows each
-transcript, sends prompts, answers approvals, changes mode and model, and starts or resumes a
-session. It talks to `octet hub` on your Mac over your tailnet; it holds no vendor credentials and
+transcript, sends prompts, answers approvals, changes mode and model, shows and commits what a
+session changed, and starts or resumes a session. It talks to `octet hub` on your Mac over your tailnet; it holds no vendor credentials and
 no SSH keys. Why the hub is built the way it is, and how to set up the Mac side, is in
 [docs/remote-control.md](../../docs/remote-control.md#phone-app-hub).
 
@@ -41,12 +41,21 @@ build. Never pair a development build with the Mac you use every day: see
 `npm run contract` (or `make mobile-contract`) starts `target/debug/octet hub` on a free port with
 a fake session (a Unix socket, a registration and a journal in a temp directory), pairs, and drives
 `HubClient` through hello, sessions, subscribe, replay, a live event, a prompt, an approval
-answer, a dropped connection with a cursor (no duplicates), a ping, notifications on (a push to a
-local fake, never to Expo, with the exact content-free body), notifications off, and a revoke. It builds nothing:
+answer, a dropped connection with a cursor (no duplicates), a ping, a desk command, the
+workspace's changes, a diff of a listed file (and the refusal of one not listed), a commit and
+then "Nothing to commit", notifications on (a push to a local fake, never to Expo, with the exact
+content-free body), notifications off, and a revoke. The fake session's workspace is a git
+repository the test makes in its temp directory, with its own `user.name`, `user.email` and
+`commit.gpgsign=false` (the hub takes every `GIT_*` variable out of git's environment), so the
+test needs `git` on the `PATH`. It builds nothing:
 run `scripts/rust-env.sh cargo build -p octet` first. Without that binary it skips. It never
 touches Tailscale: the hub is given a stand-in `tailscale` on its `PATH`, and the test's socket
 adds the `Tailscale-User-Login` header that `tailscale serve` adds in real life. The app never
-sends that header. The hub posts push with `curl`, so `curl` must be on the `PATH`. CI runs this
+sends that header. The hub posts push with `curl`, so `curl` must be on the `PATH`. Its pushes name
+the stand-in's host as `mac`. A second part runs two hubs at once, as two Macs (each with its own
+temp directory, port, stand-in `tailscale` and fake session, the same session id on both), feeds
+one store from both clients and checks that both are listed apart, that an answer reaches only its
+own Mac's session, and that the other Mac keeps streaming after one is unpaired. CI runs this
 test in its own `contract` job.
 
 ## Building the app for a phone
@@ -115,25 +124,95 @@ run:android`. The same rule applies: never pair that build with your everyday Ma
 
 1. On the Mac, start the hub and publish it (see [the guide](../../docs/remote-control.md#phone-app-hub)).
 2. In an Octet session on the Mac, type `/remote-control pair`. It shows a QR code and a link.
-3. Open the app. Until it is paired it shows **Pair with your Mac**. Scan the code with the
-   camera, or paste the link into **Paste link**. Once the link is valid the app says `Pair with
-   <the hub's address>?` and the **Pair** button turns on (it is dimmed until then). Give the phone a
-   name under **Device name** (the Mac lists it in `octet hub devices`) and tap **Pair**. The code
-   works once and expires after 10 minutes.
+3. Open the app. Until it is paired it shows **Scan the code from /remote-control pair**: point the camera at
+   the code, inside the four corner brackets. Or tap **Enter code instead** and paste the link into
+   **Paste link** (with the camera off, those fields show at once). Once the link is valid the app
+   says `Pair with <the hub's address>?` and the **Pair** button turns on (it is dimmed until then).
+   Give the phone a name under **Device name** (the Mac lists it in `octet hub devices`) and tap
+   **Pair**. A toast says `Paired with <the Mac>`. The code works once and expires after 10 minutes.
 
 The app keeps the device token in the iOS Keychain / Android Keystore (`expo-secure-store`), never
-in plain storage. **Settings** shows where you are paired, turns the Face ID check on allowing an
-approval on or off (full access always asks), and unpairs.
+in plain storage.
+
+### More than one Mac
+
+The app pairs with up to 4 Macs. To add one, open **Settings › Machines › + Pair another machine**
+(off at 4: `4 Macs is the most`) and scan that Mac's code. Every Mac stays connected while the app is
+open; the Inbox and the drawer show all their sessions, each named by its Mac, and a Mac that can't
+be reached shows "asleep" (back in the app, "connecting…" until its first try is over) and greys
+only its own sessions. New session keeps the Mac you chose: if it drops while you type, its chip
+says so and Start waits for it. In **Machines**, **Rename** gives a Mac a
+name of 1 to 40 characters on this phone, and **Unpair** asks `Unpair <name>? Its sessions leave
+this phone.` and drops only that Mac (a screen showing one of its sessions goes back to the Inbox).
+
+A push names the Mac it came from (`data.mac`, the hub's published host), and a tap opens that
+Mac's session. A host none of your pairings has, no host with several Macs paired, or a session that
+has ended opens the Inbox. A Mac you unpair while it can't be reached doesn't hear "notifications
+off": it keeps pushing until you run `octet hub revoke <device>` on it, because the phone's push
+token is shared with your other Macs (a tap on one finds no pairing for its host and opens the
+Inbox). A pairing whose token the
+phone can't read shows `offline` in Machines, and on Pair (with Unpair) when it is the only kind
+left, so it can always be cleared.
+
+## Screens
+
+Every screen is drawn in the terminal's look: one monospace face, the TUI's colours, 1 px bordered
+cards with their titles notched into the border, and touch targets of at least 44 pt. ☰ opens the
+side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Settings.
+
+- **Pair.** A panel with the camera in four accent corner brackets and a bottom sheet: `PAIRED`
+  (the Macs this phone is paired with, each with **Unpair** while none of them has a working pairing on this phone) and
+  **Enter code instead**, which shows the paste and name fields. Opened from **+ Pair another
+  machine**, it reads **Pair another machine**, with Cancel. A scanned code only fills the field; you confirm the Mac it
+  names and tap **Pair**. After pairing, one offer to turn on notifications.
+- **Inbox.** The live sessions in three tabs (Needs you, Running, Done). An approval is answered
+  right on its card; **Allow all N once** answers the ones still open and fully shown.
+- **New session / Resume.** Tap the chips for the Mac, folder, engine and model, and mode, write
+  the prompt and start; or resume a recent session.
+- **Conversation.** The transcript, the model and mode menu, the permission card, the prompt line
+  with its slash menu, and a key bar for the terminal's keys.
+- **Changes.** What the session's workspace changed since the last commit, opened from **view ›**
+  beside a tool entry that edited a file, or **Changes ›** in Usage or Session info. Each file shows
+  its status, `+added −removed` and a bar, and a tap opens its diff; **Checks** shows the last test
+  command with ✓ or ✗, and **Branch** the branch and how far ahead it is. Pull down to ask again.
+  - **Commit** opens a sheet with the message, prefilled with the session's first prompt as one
+    line of at most 72 characters; edit it (up to 2,000 characters) and tap **Commit**. Face ID is
+    asked every time, whatever **Face ID to allow** says, and a failed or cancelled check sends
+    nothing. The Mac commits everything in the workspace (`git add -A`, then `git commit`), and
+    its hooks run. A toast says `Committed <hash> on <branch>`, and the list refreshes. A refusal
+    (a turn running, a merge under way, nothing to commit, a hook that failed) shows the Mac's
+    words in the sheet and keeps the message. If the answer is lost, the sheet says so and the
+    list is asked for again, which shows whether it committed. **Commit** is off while the Mac
+    can't be reached or an approval waits.
+  - **Open PR on the desk** shows `gh pr create` to run at the Mac, and sends nothing. The phone
+    can't push, open a pull request or commit only some files.
+- **Settings.** Three cards. **Machines**: each Mac with ● or ○, its own state (`online`,
+  `connecting…`, `asleep` or `offline`), its host, **Rename** and **Unpair**; this phone's name; and
+  **+ Pair another machine**. **Notify me when**: three switches, **An action needs approval**, **A turn
+  finishes** and **A session hits an error**, one per kind of push. A switch moves only when the
+  Mac acknowledges (a refusal or an unreachable Mac is said below them). Turning one on while
+  notifications are off asks the phone's permission and turns on approvals and errors with it;
+  turning the last one off turns notifications off. A phone paired now starts with approvals and
+  errors on and finished turns off; an app updated from before the switches, with notifications
+  on, shows all three on, which is what the Mac was sending it.
+  **Face ID to allow**: turns the Face ID check on allowing an approval on or off (turning it off
+  asks for Face ID; full access always asks). **Live Activity** (only on an iPhone that has Live
+  Activities: iOS 17.2 or later): on by default; see [Live Activity](#live-activity-dynamic-island).
+  The footer names the app version.
+- **Toasts.** One line at the top of a screen, under its header (over the drawer too). When an
+  approval newly arrives for a session other than the one you are in (and you are not on the
+  Inbox), `<name> needs approval` appears with **View**, which opens it.
 
 ## Notifications
 
-The app can notify you when an agent needs approval or finishes a turn, while the app is closed.
+The app can notify you when an agent needs approval, hits an error, or finishes a turn, while the
+app is closed.
 The Mac's hub sends the pushes through Expo's push service, only to a phone that has no open
 connection to it, and shows nothing while the app is open. Push tokens belong to an EAS project, so
 notifications need the app's **EAS project id**: it is not in this repository (it is yours). `eas
 init` (see [Building the app for a phone](#building-the-app-for-a-phone)) writes it to `app.json`
-as `extra.eas.projectId`; build again after that. Without it the **Notifications** switch in
-Settings is off and says so, and pairing skips the notifications step. On iOS, EAS also sets up the
+as `extra.eas.projectId`; build again after that. Without it the **Notify me when** switches in
+Settings are off and say so, and pairing skips the notifications step. On iOS, EAS also sets up the
 Apple push credentials for the build; on Android, push needs a Firebase (FCM) credential added to
 the EAS project. Neither is in this repository.
 
@@ -165,8 +244,100 @@ unpair the Mac doesn't hear (it is out of reach) drops the phone's push registra
 the Mac's next push bounces and it forgets the token. Taking the permission away in the phone's
 settings also tells the Mac to stop, on the next connection; give it back and the app registers
 again. Tapping a notification opens that session, and opening the app clears its notifications
-from the tray. A push says only `Octet` and `Approval waiting` or `Turn
-finished`; what the hub sends, where, and when is in [the guide](../../docs/remote-control.md#push-notifications).
+from the tray. A push says only `Octet` and one of `Approval waiting`, `Session error` or `Turn
+finished`. On Android each goes to its own channel (**Approvals**, **Session errors**, **Finished
+turns**), which the phone's settings can silence one by one; approvals and errors sound, finished
+turns don't. What the hub sends, where, and when is in [the guide](../../docs/remote-control.md#push-notifications).
+
+## Live Activity (Dynamic Island)
+
+On iOS 17.2 and later a Live Activity shows, in the Dynamic Island and on the Lock Screen, whether a
+session is running, waiting for approval or done, with the time since; the expanded view names the
+waiting approval's session and command, with **Deny** and **Allow**. The app itself runs on iOS 16.4
+and later; below 17.2 (and on Android, and in Expo Go) there is no Live Activity, and **Settings**
+shows no switch for it.
+
+- **One activity, two drivers.** While the app is open (on any screen) the app drives the activity:
+  it starts it while a session runs or an approval waits, changes it at most once a second, and ends
+  it 5 minutes after every session went idle. It reads what to show from the same lists as the
+  Inbox, with the hub's rules (one scenario fixture, `crates/octet-hub/tests/data/activity-scenarios.json`,
+  is run by both sides' tests), so the activity looks the same whoever drives it. An activity that is
+  already there (the hub started it while you were away) is taken over as soon as ActivityKit hands
+  its token to the app, even with every session idle: it is updated, and ended 5 minutes after they
+  went idle. When a new activity appears, the native module ends the ones it saw before it, so they
+  don't stack; one it already saw, or one already over, ends nothing, so one activity always stays.
+- **While it isn't**, one Mac's hub starts, updates and ends that same activity through APNs, with
+  content-free pushes (the state, the hub's own session id, its host, two times and a count; no
+  names or commands), each start and update stale 15 minutes on: the widget then dims it and shows a
+  muted **Stale**. It updates it through the activity
+  token the phone registered, so only once that token has reached the hub. That needs your APNs key
+  in the hub's `hub.json`: the setup, and exactly what is sent, are in [the
+  guide](../../docs/remote-control.md#live-activity-dynamic-island). Coming back to the app ends
+  nothing: the app takes the activity over.
+- **One Mac drives the Island.** The phone gives its ActivityKit tokens to one Mac at a time: the
+  Mac of the lead session while the app is in front (else the one it chose before, which it
+  remembers, else the first paired Mac). Every other Mac is told `clear_activity`, so two hubs never
+  fight over one activity. The choice moves only while the app is in front. While you are away the
+  Island follows that Mac; the other Macs still send their push notifications. A Mac out of reach
+  when the choice moves away from it is told on its next connection, and again each time you come
+  back to the app.
+- **Tokens.** The app gives the driving Mac its ActivityKit tokens (`register_activity`) over its
+  own connection, when they change, and when it is out of reach, on its next connection. Each is 1
+  to 1024 lowercase hex digits (Apple doesn't fix the length; iOS 26.5 issues 256), on both sides. A
+  registration or `clear_activity` the Mac turns away for now (busy, rate-limited, not saved, timed
+  out) is tried once more 5 seconds later. The hub counts a token's 12 hours from its first
+  registration, so the app registering it again at each launch doesn't stretch them. A token per
+  activity is kept, so one activity's end never takes back another's token. A new activity token
+  that comes while the app is in the background (an activity the hub just started) is handed over at
+  once, over a short background connection to that Mac (its hello says `background: true`, so the
+  hub doesn't take it for the app in front), which registers and closes on the answer or after 10
+  seconds; a closed app that iOS launches in the background for the token hands it over once it has
+  read its settings and pairings. This needs iOS to give the app time in the background when the
+  token arrives, and the phone unlocked: each Mac's device token is in the keychain readable only
+  while unlocked (`WHEN_UNLOCKED_THIS_DEVICE_ONLY`).
+- **What a locked phone costs.** Without the hand-over (a locked phone, or no background time), the
+  Mac never gets the token of the activity it started: it can neither update nor end it until you
+  unlock and open the app. That activity keeps what it started with, shows as stale (dimmed, marked
+  **Stale**) 15 minutes on, and the Mac starts no second one for up to 8 hours while it waits for
+  the token. Opening the app takes it over and brings it up to date; opened with no activity left to
+  take over (you dismissed it), the Mac's hold ends at once, and the next approval while you are
+  away starts one again. Unpairing a Mac stops any background send to it, then
+  tells it `clear_activity` as well as "notifications off".
+- **The names and commands** the widget shows come from the phone only: the app writes each waiting
+  approval's session name (at most 80 characters) and command (folded like the Permission card, at
+  most 200) to the App Group `group.dev.octet.mobile`, at most 64 of them, newest first, whenever the
+  approvals change, keyed by the host (lowercased) and the session. Both are marked
+  privacy-sensitive, so iOS hides them on a locked phone when set to. Unpairing a Mac removes its
+  entries.
+- **Deny** answers no to that approval, on the Mac that owns it, without Face ID (it allows
+  nothing). With the app in front it goes over that Mac's connection; in the background, at once over
+  a short background connection to that Mac (closed on the answer or after 10 seconds). The button
+  waits, at most 9 seconds, for the app's word that the send is done (`denied.<uuid>` in the App
+  Group), and the module holds iOS background time from the tap until JavaScript says so
+  (`denySettled`, at most 10 seconds); a token handed over in the background is held the same way
+  (`handOverSettled`). On a locked
+  phone that connection can't be made, so the Deny waits for you to unlock and open the app. One that
+  couldn't go is sent on the Mac's next connection, within 10 minutes. Each Deny is sent once.
+- **Allow** opens `octet://approve/<host>/<session>/<approval>`. The app opens that approval's
+  session, where Allow asks for Face ID (if **Face ID to allow** is on) and waits out the 400 ms arm,
+  as anywhere else: the link alone never allows. It opens the session only while the approval is
+  the session's front one, the one its Permission card shows. A malformed link, one for a Mac that
+  isn't paired, a session that ended, an approval already answered or one waiting behind another
+  opens the Inbox and sends nothing. It is judged by the Mac's first list after the app comes back
+  (or the link is up again), never the one held from before; the Inbox shows while it waits, up to
+  8 seconds, then stays.
+- **Two alerts for one approval** that starts the activity while you are away: the push notification
+  and the activity's start alert (Apple requires one to start an activity by push).
+- **Turning it off** in **Settings › Live Activity** ends the activity, tells every Mac to forget
+  this phone's tokens (`clear_activity`) and empties the App Group. Turning it on registers again.
+  The app asks the phone again at each foreground whether Live Activities are on for it: turned off
+  in the phone's settings, it acts as the switch off (and hides it); turned back on, it registers
+  again, and the switch in Settings comes and goes with it. A dismissed activity is not started
+  again by opening the app, only by a change. One that lands while the switch is off is ended.
+- **Not built yet.** The Swift (`modules/octet-live` and `targets/octet-live`) can't be built here
+  (no iOS SDK): it is checked as text by its tests, parsed with `swiftc -parse`, and type-checked
+  against the Mac Catalyst SDK's ActivityKit and WidgetKit, and is unverified until the first device
+  build. The device pass below starts with it.
 
 ## Device pass
 
@@ -180,7 +351,13 @@ workspace. Tick each one on each phone.
 - [ ] Tap that push: the app opens on that session (from locked, from the background, and from a
       closed app).
 - [ ] Allow behind biometrics: the approval needs Face ID or the fingerprint, and the turn goes on.
-- [ ] A finished turn on a locked phone pushes `Turn finished`; with the app open, nothing does.
+- [ ] With **A turn finishes** on, a finished turn on a locked phone pushes `Turn finished`; with
+      the app open, nothing does. With it off, nothing is pushed for it.
+- [ ] A session error on a locked phone (an `error` record in its journal: a turn that fails) pushes
+      `Session error`, on the iPhone and on Android (where it arrives on the **Session errors**
+      channel, with sound). With **A session hits an error** off, nothing is pushed for it.
+- [ ] Each switch in **Notify me when** moves only after the Mac acknowledges, and survives a
+      restart of the app.
 - [ ] An approval that arrives with the app open, still waiting when you leave the app: one push.
 - [ ] With `octet hub install`, after a fresh login and no tmux running, start a Claude session
       from the phone.
@@ -189,19 +366,55 @@ workspace. Tick each one on each phone.
 - [ ] Change the model and the mode; full access asks for the typed confirmation.
 - [ ] Resume a recent session and start a new one, then join it from the desk with `tmux attach`.
 - [ ] Return to the app after a long background: it reconnects at once, without a pull to refresh.
-- [ ] Notifications off in Settings: no more pushes. Revoke the phone on the Mac
+- [ ] All three switches off in Settings: no more pushes. Revoke the phone on the Mac
       (`octet hub revoke`): the app says it is unpaired.
+- [ ] Pair a second Mac from **+ Pair another machine**: both Macs' sessions show in the Inbox,
+      each named. A push from each Mac, tapped, opens that Mac's session.
+- [ ] Rename a Mac; unpair it while its conversation is open: the app goes back to the Inbox and
+      the other Mac keeps working.
+- [ ] Live Activity (iPhone, iOS 17.2 or later): `npx expo prebuild` and the device build succeed
+      with the widget target (the Swift has never been compiled before this). On iOS 16.4–17.1 the
+      app installs and runs with no Live Activity and no switch.
+- [ ] With the app open, start a turn: the Island shows the coding mascot and the time; an approval
+      shows the approval pose, the session's name and its command; the activity ends 5 minutes after
+      every session is idle.
+- [ ] With your APNs key in `hub.json` (`sandbox` matching the build), lock the phone and start a
+      turn that needs approval: the activity starts by push (with its alert, and the push
+      notification beside it), and nothing in it names the session beyond what the App Group holds.
+- [ ] **Deny** on the Island, with the app in the background and the phone unlocked: the approval
+      is denied on the desk within seconds, the app never opened. With the phone locked: the Deny
+      goes once you unlock and open the app. **Allow**: the app opens on that session, asks for Face
+      ID, and allows only after it.
+- [ ] Background hand-over, with the phone **unlocked**: with the app in the background, and again
+      with it closed (swiped away), and the activity started by push, check in `hub-audit.jsonl`
+      that an `activity registered` line follows the start within seconds (iOS gave the app
+      background time for the token), and that the activity then updates as the session changes.
+      With the phone **locked** expect no such line: the keychain can't be read while locked, so
+      the Mac can neither update nor end that activity; it shows as stale (dimmed, marked **Stale**)
+      15 minutes on, no second one starts, and opening the app takes it over. If no line comes even
+      unlocked, iOS gave no background time.
+- [ ] Two Macs, one idle, the phone away for more than 5 minutes while the other runs a turn: the
+      activity is not ended, and follows the busy Mac (the lead's when you left). The idle Mac's
+      `hub-audit.jsonl` shows `activity cleared` for this phone.
+- [ ] The app open on the **Inbox** when an approval arrives: exactly one activity, and no
+      push-start alert. A push-started activity while the app was away, then the app started one:
+      only one stays.
+- [ ] Open a session while the hub's activity shows: the same activity goes on, now driven by the
+      app (no second activity, no blink). Unpair the Mac: no activity starts again from it.
+- [ ] Turn **Settings › Live Activity** off: the activity ends and no push starts one again; on
+      again: the next approval while away starts it.
 
 ## Performance notes
 
 - Every list over a few items is a FlashList (v2, which measures rows itself: no
-  `estimatedItemSize`). Sessions and Recent use `keyExtractor` and `extraData` for the one flag
-  that changes how rows draw. The transcript adds `getItemType` (one type per entry kind, so
+  `estimatedItemSize`). The Inbox, the drawer, Recent and Changes use `keyExtractor`, and
+  `extraData` for what changes how their rows draw. The transcript adds `getItemType` (one type per entry kind, so
   recycled rows are like for like), `maintainVisibleContentPosition={{ startRenderingFromBottom:
   true }}` (it opens at the end and keeps its place when rows change), and `scrollEventThrottle`
   32 for the follow-the-output logic.
-- Rows (`TranscriptRow`, `SessionCard`, `RecentRow`) are `React.memo` with stable callbacks and no
-  inline object or function props.
+- Rows (`TranscriptRow`, `InboxCard`, the drawer's rows, `RecentRow`) are `React.memo` with stable
+  callbacks and no inline object or function props. An Inbox card draws again only when what it
+  shows changed (`sameItem`).
 - A reply is Markdown, whether it is streaming or done. A streaming reply keeps the blocks before
   its last whole one and parses only what came since, so a chunk costs the same however long the
   reply is. A finished reply is parsed once per text, in a cache of at most 2 MB that unpairing
@@ -209,9 +422,14 @@ workspace. Tick each one on each phone.
 - A reply draws its newest 400 blocks, under "N earlier blocks of this reply are on the Mac".
 - A tool call costs a fixed 256 bytes toward the memory limits, even when its strings are empty.
   A tools entry holds 500 calls, then "N more calls on the Mac". An end finds its call by id.
-- The client delivers frames in one batch at most every 50 ms; the store applies a batch in one
-  `set`, and every part a batch did not change keeps its identity, so a screen that selects
-  narrowly does not draw for another session's output.
+- The client delivers frames in one batch at most every 50 ms, and every Mac's batches go into one
+  store commit at most every 50 ms; the store applies them in one `set`, and every part a batch did
+  not change keeps its identity, so a screen that selects narrowly does not draw for another
+  session's output.
+- Each Mac's sessions list is whole, at most 200 rows in 96 KiB, at most four a second (see [what
+  the phone is sent](../../docs/remote-control.md#what-the-phone-is-sent)). The store cleans only
+  the last list of a Mac's batch, and a row the hub left a field out of keeps the approval's gist
+  it had while the count says it still waits.
 - The phone keeps the transcripts of the 4 sessions you looked at last. Opening another one
   replays it from the Mac.
 - Budgets that tests hold, with room for a busy machine:
@@ -225,10 +443,17 @@ workspace. Tick each one on each phone.
       never another session's transcript or a card;
     - 10 chunks into a streaming reply of 16,000 paragraphs in under 500 ms;
     - a finished reply of 16,000 code fences with fewer than 1,000 text nodes.
+  - `src/perf.scale.test.tsx`, at several Macs' scale: 4 Macs of 200 sessions each, each sending
+    three lists every 50 ms, with the whole shell up (the Inbox, the drawer open, the Live Activity
+    controller and the toasts):
+    - each store commit in under 50 ms on average (about 4 ms alone);
+    - at most one commit per 50 ms, and one list cleaned per Mac per commit;
+    - the Inbox's cards drawn only when what they show changed, and its lists made once a commit;
+    - no toast, no App Group write, and the Island changed at most once a second.
 
 ## Troubleshooting
 
-**The Sessions list shows "Can't reach your Mac".** The phone must be on the tailnet:
+**The Inbox shows "Can't reach your Mac".** The phone must be on the tailnet:
 open the Tailscale app, check it is connected and signed in to the same tailnet as the Mac, and
 that the Mac itself is online there. The hub is reachable only through your tailnet; there is no
 other route. Check that `octet hub` is still running on the Mac.
@@ -239,24 +464,24 @@ your Tailscale configuration), as described in
 [docs/remote-control.md](../../docs/remote-control.md#put-it-on-your-tailnet). The hub looks again
 every 10 seconds, so it can take that long to notice.
 
-**The app is back on "Pair with your Mac", saying "This phone was unpaired on the Mac".** The Mac
+**The app is back on the pairing screen ("Scan the code from /remote-control pair"), saying "This phone was unpaired on the Mac".** The Mac
 removed this phone (`octet hub revoke NAME`), so the hub no longer knows its token. Pair again with
 `/remote-control pair`. `octet hub devices` lists the phones the Mac knows.
 
 **Allow says "Face ID isn't set up on this phone. Turn it off in Settings to allow from here."**
 Allowing an approval asks the phone's biometrics first. If Face ID or a fingerprint isn't set up on
 the phone (or none is enrolled), the app can't ask and sends nothing. Enrol one in the phone's own
-settings, or turn off **Face ID to allow** in the app's Settings (the gear on the Sessions screen).
+settings, or turn off **Face ID to allow** in the app's Settings (☰, then Settings).
 Deny never needs it.
 
 **A session I started doesn't appear.** Phone-started sessions run in tmux on the Mac. Check
 `tmux ls` for an `octet-...` session (`tmux attach -t octet-NAME` shows what it says): tmux must
 be installed, the workspace must be one the hub allows (a folder from your recent sessions, or in
 `hub.json`'s `workspaces`), and at most eight phone-started sessions run at once. Pull down on the
-Sessions list to refresh it; after a Start the app says "NAME hasn't appeared yet. Check tmux on the Mac." when the session is late.
+Inbox to refresh it; after a Start the app says "NAME hasn't appeared yet. Check tmux on the Mac." when the session is late.
 
 **Pairing says the code is invalid or expired.** Codes work once and last 10 minutes. Run
 `/remote-control pair` again for a new one.
 
 **The camera is off.** The pairing screen says "Camera access is off — paste the link instead": paste the
-link into **Paste link**.
+link into **Paste link** (the fields show at once).

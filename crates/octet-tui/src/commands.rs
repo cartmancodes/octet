@@ -72,17 +72,7 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
         Cmd::Mode => return Some(mode_command(app, vendor, argument)),
         Cmd::New => return Some(Action::Exit(Exit::New)),
         Cmd::Reconnect => return Some(Action::Exit(Exit::Reconnect)),
-        Cmd::Session => app.note(format!(
-            "{}\nSession: {}\nJournal: {}\nWorkspace: {}",
-            app.model_details(),
-            if app.conn.session.is_empty() {
-                "not assigned"
-            } else {
-                &app.conn.session
-            },
-            app.conn.journal.display(),
-            app.conn.workspace
-        )),
+        Cmd::Session => app.note(session_text(app)),
         Cmd::Goal => goal_command(app, vendor, argument).await,
         Cmd::RemoteControl => match argument {
             "" | "status" => return start_job(app, Job::remote(data_directory(app))),
@@ -389,10 +379,30 @@ pub(crate) fn path_in(
 /// How many sessions `/sessions` lists.
 const SESSIONS_LISTED: usize = 20;
 
+/// What `/session` says: the model, the session id, the journal and the workspace.
+pub(crate) fn session_text(app: &App) -> String {
+    format!(
+        "{}\nSession: {}\nJournal: {}\nWorkspace: {}",
+        app.model_details(),
+        if app.conn.session.is_empty() {
+            "not assigned"
+        } else {
+            &app.conn.session
+        },
+        app.conn.journal.display(),
+        app.conn.workspace
+    )
+}
+
+/// Why a command that starts a job waits: the running job's label.
+pub(crate) fn wait_for(running: &crate::jobs::Running) -> String {
+    format!("Wait for: {}", running.label)
+}
+
 /// Starts `job`, unless one is running: then the draft stays for later.
 fn start_job(app: &mut App, job: Job) -> Option<Action> {
     if let Some(running) = &app.job {
-        app.hint(format!("Wait for: {}", running.label));
+        app.hint(wait_for(running));
         return None;
     }
     Some(Action::Job(job))
@@ -698,16 +708,20 @@ async fn goal_command(app: &mut App, vendor: &dyn Vendor, argument: &str) {
         },
     }
 }
-fn export_job(app: &App, argument: &str) -> Job {
+/// Where `/export` writes: the argument against the workspace, or with none the workspace and
+/// the journal's file name.
+pub(crate) fn export_path(app: &App, argument: &str) -> std::path::PathBuf {
     // The workspace, not Octet's own directory: `--cwd` is where the user is.
-    let path = if argument.trim().is_empty() {
+    if argument.trim().is_empty() {
         app.composer
             .root
             .join(app.conn.journal.file_name().unwrap_or_default())
     } else {
         resolve_path(&app.composer.root, argument.trim())
-    };
-    Job::export(app.conn.journal.clone(), path)
+    }
+}
+fn export_job(app: &App, argument: &str) -> Job {
+    Job::export(app.conn.journal.clone(), export_path(app, argument))
 }
 pub(crate) async fn command(app: &mut App, vendor: &dyn Vendor, input: &str) -> Action {
     try_command(app, vendor, input)

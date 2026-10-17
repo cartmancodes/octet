@@ -1,6 +1,7 @@
 import type {
   AckFrame,
   Cursor,
+  DiffFrame,
   FromPhone,
   RecentFrame,
   RefusalCode,
@@ -9,6 +10,7 @@ import type {
 } from "../protocol";
 import { PROTOCOL_VERSION } from "../protocol";
 import { SHORT_CHARS, field } from "../model/text";
+import { cleanChanges, cleanDiff, type ChangesAnswer } from "./answers";
 import { Backoff } from "./backoff";
 import { Cursors } from "./cursors";
 import { parseFrame } from "./frames";
@@ -35,8 +37,9 @@ export interface ReplayedMark {
 /** What a batch carries: the hub's frames, in order, and the client's replayed marks among them. */
 export type BatchItem = ToPhone | ReplayedMark;
 
-/** What answers a request: `ack`, or `recent` for the `recent` command. */
-export type Ack = AckFrame | RecentFrame;
+/** What answers a request: `ack`, or the frame of the same name for `recent`, `changes` and
+ * `diff` (the last two cleaned, answers.ts). */
+export type Ack = AckFrame | RecentFrame | ChangesAnswer | DiffFrame;
 
 /**
  * A command that was not done. `code` is the hub's, or one of two the phone makes up:
@@ -84,6 +87,10 @@ export interface HubClientOptions {
   /** A session's cursor moved (or, null, was cleared): the store saves it. Called after the
    * frames up to that cursor were handed to the batch listeners, at most once per session per batch. */
   onCursor?: (session: string, cursor: Cursor | null) => void;
+  /** A connection the app makes from the background (to hand a Live Activity token over, or to
+   * send a Deny): its hello says `background: true`, so the hub doesn't take it for the app in
+   * front. Any other client sends no such field. */
+  background?: boolean;
 }
 
 /** A `rate_limited` or `timeout` refusal of a subscribe is retried this many times, this far apart. */
@@ -106,6 +113,8 @@ interface Pending {
   resolve: (ack: Ack) => void;
   reject: (error: Refusal) => void;
   cancel: () => void;
+  /** The most characters of a refusal's words kept. */
+  words: number;
 }
 
 const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
@@ -113,8 +122,13 @@ const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
   return () => clearTimeout(id);
 };
 
-/** A refusal's words, as the user will read them: the hub's, cleaned and clipped. */
-const refusalOf = (frame: RefusedFrame): Refusal => new Refusal(frame.code ?? "invalid", field(frame.reason, SHORT_CHARS));
+/** The most UTF-16 units kept of a commit's refusal: git's own words, which the hub clips to the
+ * last 2,000 characters (`GIT_WORDS`, crates/octet-hub/src/git.rs, counted in Unicode scalars),
+ * where a hook puts its summary. A scalar is at most two units, so the hub's words come whole. */
+export const COMMIT_WORDS_CHARS = 4_000;
+
+/** A refusal's words, as the user will read them: the hub's, cleaned and clipped to `limit`. */
+const refusalOf = (frame: RefusedFrame, limit = SHORT_CHARS): Refusal => new Refusal(frame.code ?? "invalid", field(frame.reason, limit));
 
 const isUnpaired = (code: RefusalCode | null | undefined): boolean =>
   code === "unpaired" || code === "revoked";
@@ -137,17 +151,21 @@ const isUnpaired = (code: RefusalCode | null | undefined): boolean =>
  * caller's request rides on them.
  */
 export class HubClient {
-  private readonly url: string;
+  /** The hub's address, wss://... */
+  readonly url: string;
   private tokenValue: string | null;
   private readonly factory: SocketFactory;
   private readonly now: () => number;
   private readonly schedule: (fn: () => void, ms: number) => () => void;
   private readonly onCursor?: (session: string, cursor: Cursor | null) => void;
+  private readonly background: boolean;
   private readonly backoff: Backoff;
   private readonly cursors: Cursors;
 
   private stateValue: HubState;
   private running = false;
+  /** How many times `start()` has started the client. */
+  private started = 0;
   private socket: Socket | null = null;
   private nextReq = 1;
   private cancelReconnect: (() => void) | null = null;
@@ -190,6 +208,7 @@ export class HubClient {
   constructor(opts: HubClientOptions) {
     this.url = opts.url;
     this.tokenValue = opts.token;
+    this.background = opts.background === true;
     this.factory = opts.factory;
     this.now = opts.now ?? Date.now;
     this.schedule = opts.schedule ?? defaultSchedule;
@@ -201,6 +220,12 @@ export class HubClient {
 
   get state(): HubState {
     return this.stateValue;
+  }
+
+  /** Which run the client is in: a new number at each `start()` that connects, and null while it
+   * is stopped (by `stop()`, or the hub refusing the token). Every attempt to connect is of a run. */
+  get run(): number | null {
+    return this.running ? this.started : null;
   }
 
   /** The device token; null before pairing and after the hub unpaired this phone. */
@@ -272,6 +297,7 @@ export class HubClient {
   start(): void {
     if (this.running || this.tokenValue === null) return;
     this.running = true;
+    this.started += 1;
     this.backoff.reset();
     this.connect();
   }
@@ -302,12 +328,13 @@ export class HubClient {
     this.connect();
   }
 
-  /** Sends a command and resolves with its `ack` (or `recent`) frame. Rejects with a
-   * `Refusal`: the hub's code and words, `lost` after 45 s, or `unsent` when not ready. The hub
-   * answers a command it gave up on (30 s, swept every second) with its own `timeout`, so the
-   * phone waits longer than that. A request with no answer in 45 s on a link that has also been
-   * silent for 10 s takes the link for dead: the socket is closed and the client reconnects with
-   * its backoff, resuming every session from its cursor. A link that is still talking is kept. */
+  /** Sends a command and resolves with its `ack` (or `recent`, `changes` or `diff`) frame.
+   * Rejects with a `Refusal`: the hub's code and words, `lost` after 45 s, or `unsent` when not
+   * ready. The hub answers a command it gave up on (30 s, swept every second) with its own
+   * `timeout`, so the phone waits longer than that. A request with no answer in 45 s on a link
+   * that has also been silent for 10 s takes the link for dead: the socket is closed and the
+   * client reconnects with its backoff, resuming every session from its cursor. A link that is
+   * still talking is kept. */
   request(cmd: RequestBody): Promise<Ack> {
     const socket = this.socket;
     if (this.stateValue !== "ready" || !socket) {
@@ -322,7 +349,8 @@ export class HubClient {
         // looks open, and is silent. Its late answers die with it. One that spoke lately is alive.
         if (this.socket === socket && this.now() - this.lastHeard >= QUIET_MS) this.lost();
       }, REQUEST_TIMEOUT_MS);
-      this.pending.set(req, { resolve, reject, cancel });
+      const words = cmd.type === "commit" ? COMMIT_WORDS_CHARS : SHORT_CHARS;
+      this.pending.set(req, { resolve, reject, cancel, words });
       try {
         socket.send(JSON.stringify({ ...cmd, v: PROTOCOL_VERSION, req }));
       } catch {
@@ -405,7 +433,13 @@ export class HubClient {
       if (this.socket !== socket || this.tokenValue === null) return;
       this.setState("authenticating");
       socket.send(
-        JSON.stringify({ v: PROTOCOL_VERSION, type: "hello", req: this.nextReq++, token: this.tokenValue }),
+        JSON.stringify({
+          v: PROTOCOL_VERSION,
+          type: "hello",
+          req: this.nextReq++,
+          token: this.tokenValue,
+          ...(this.background ? { background: true } : {}),
+        }),
       );
     };
     socket.onmessage = (text) => {
@@ -563,6 +597,17 @@ export class HubClient {
         }
         return;
       }
+      case "changes":
+      case "diff": {
+        // Only ever an answer to a request: a late one (it timed out) is dropped.
+        if (this.pinged(frame.req)) return;
+        const entry = this.pending.get(frame.req);
+        if (!entry) return;
+        this.pending.delete(frame.req);
+        entry.cancel();
+        entry.resolve(frame.type === "changes" ? cleanChanges(frame) : cleanDiff(frame));
+        return;
+      }
       case "refused":
         this.refused(frame);
         return;
@@ -594,7 +639,7 @@ export class HubClient {
     if (entry) {
       this.pending.delete(frame.req);
       entry.cancel();
-      entry.reject(refusalOf(frame));
+      entry.reject(refusalOf(frame, entry.words));
     } else if (session !== undefined) {
       this.subscribeReqs.delete(frame.req);
       this.live.delete(session);

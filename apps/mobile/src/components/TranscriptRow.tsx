@@ -3,8 +3,10 @@ import { StyleSheet, Text, View } from "react-native";
 
 import { Markdown } from "../markdown/Markdown";
 import type { Entry } from "../model/transcript";
+import { DEFAULT_SETTINGS, type TextSize } from "../persist";
+import { sizedStyles, transcriptText } from "../sizedStyles";
 import { rowRole } from "../session";
-import { dark, light, spacing, type, useTheme, type Theme } from "../theme";
+import { spacing, useTheme, type Theme } from "../theme";
 import { ToolRun } from "./ToolRun";
 
 interface TranscriptRowProps {
@@ -13,46 +15,46 @@ interface TranscriptRowProps {
   open: boolean;
   /** Called with a tools entry's key. Must be stable. */
   onToggle: (key: string) => void;
+  /** The transcript's text size (`Aa`); 13 when not given. */
+  size?: TextSize;
+  /** A file-edit tool entry's "view ›" (ToolRun). Must be stable. */
+  onView?: (file: string) => void;
 }
 
-function makeStyles(theme: Theme) {
+function makeStyles(theme: Theme, size: TextSize) {
+  const text = transcriptText(size);
+  const label = { ...text, fontWeight: "700" as const };
   return StyleSheet.create({
-    row: { paddingHorizontal: spacing.lg, paddingVertical: spacing.sm, gap: spacing.xs },
-    label: { ...type.caption, fontWeight: "700", letterSpacing: 0.5 },
-    accent: { color: theme.accent },
-    fg: { color: theme.fg },
-    muted: { color: theme.muted },
-    amber: { color: theme.amber },
-    text: { ...type.body, color: theme.fg },
-    note: { ...type.body, color: theme.muted },
-    error: { ...type.body, color: theme.amber },
+    row: { paddingHorizontal: spacing.lg, paddingVertical: spacing.sm },
+    accent: { ...label, color: theme.accent },
+    fg: { ...label, color: theme.fg },
+    muted: { ...label, color: theme.muted },
+    amber: { ...label, color: theme.amber },
+    text: { ...text, color: theme.fg },
+    note: { ...text, color: theme.muted },
+    error: { ...text, color: theme.amber },
   });
 }
-const DARK = makeStyles(dark);
-const LIGHT = makeStyles(light);
+const stylesFor = sizedStyles(makeStyles);
 
 /**
- * One transcript entry, labelled as the terminal UI labels it (YOU, OCTET, NOTE, ERROR). A reply
- * is Markdown, streaming or done; a streaming one parses only what came since its last whole
- * block, so a chunk costs the same however long the reply has grown. Memoised on the entry,
- * which the store replaces only when it changes: while a reply streams, only its row draws again.
+ * One transcript entry under its bold label, as the terminal UI labels it (YOU, OCTET, TOOL, NOTE,
+ * ERROR). A reply is Markdown, streaming or done; a streaming one parses only what came since its
+ * last whole block, so a chunk costs the same however long the reply has grown. Memoised on the
+ * entry, which the store replaces only when it changes: while a reply streams, only its row draws
+ * again. A new text size draws every row again.
  */
-export const TranscriptRow = memo(function TranscriptRow({ entry, open, onToggle }: TranscriptRowProps) {
+export const TranscriptRow = memo(function TranscriptRow({ entry, open, onToggle, size = DEFAULT_SETTINGS.textSize, onView }: TranscriptRowProps) {
   const theme = useTheme();
-  const s = theme === light ? LIGHT : DARK;
+  const s = stylesFor(theme, size);
   const role = rowRole(entry);
-  if (entry.kind === "tools") {
-    return (
-      <View style={s.row}>
-        <ToolRun entry={entry} open={open} onToggle={onToggle} />
-      </View>
-    );
-  }
   return (
     <View style={s.row}>
-      <Text style={[s.label, s[role.tone]]}>{role.label}</Text>
-      {entry.kind === "reply" ? (
-        <Markdown text={entry.text} streaming={!entry.done} />
+      <Text style={s[role.tone]}>{role.label}</Text>
+      {entry.kind === "tools" ? (
+        <ToolRun entry={entry} open={open} onToggle={onToggle} size={size} onView={onView} />
+      ) : entry.kind === "reply" ? (
+        <Markdown text={entry.text} streaming={!entry.done} size={size} />
       ) : (
         <Text style={entry.kind === "error" ? s.error : entry.kind === "note" ? s.note : s.text}>{entry.text}</Text>
       )}

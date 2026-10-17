@@ -36,6 +36,7 @@
     "zustand": "5.0.15"
   },
   "devDependencies": {
+    "@bacons/apple-targets": "5.0.0",
     "@testing-library/react-native": "14.1.0",
     "@types/jest": "29.5.14",
     "@types/node": "26.6.5",
@@ -51,6 +52,7 @@
   },
   "jest": {
     "preset": "jest-expo",
+    "testTimeout": 15000,
     "setupFilesAfterEnv": [
       "<rootDir>/jest.setup.ts"
     ],
@@ -58,5 +60,12 @@
       "/node_modules/",
       "<rootDir>/contract/"
     ]
+  },
+  "expo": {
+    "autolinking": {
+      "exclude": [
+        "@bacons/apple-targets"
+      ]
+    }
   }
 }

@@ -1,0 +1,412 @@
+// Swift can't be compiled on this machine (no iOS SDK), so these read the native sources and configs
+// as text and hold the cross-file contracts in place: the type push-to-start matches on, the content
+// state's fields, the App Group, the Deny hand-off, and the iOS 17.2 floor.
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
+import appJson from "../../app.json";
+import { ACTIVITY_ATTRIBUTES_TYPE, ACTIVITY_STATE_FIELDS, APP_GROUP } from "./index";
+
+const app = path.resolve(__dirname, "..", "..");
+const read = (...parts: string[]): string => readFileSync(path.join(app, ...parts), "utf8");
+
+const moduleAttributes = read("modules", "octet-live", "ios", "OctetActivityAttributes.swift");
+const widgetAttributes = read("targets", "octet-live", "OctetActivityAttributes.swift");
+const moduleSwift = read("modules", "octet-live", "ios", "OctetLiveModule.swift");
+const widgetSwift = read("targets", "octet-live", "OctetLiveWidget.swift");
+const denySwift = read("targets", "octet-live", "_shared", "DenyIntent.swift");
+const podspec = read("modules", "octet-live", "ios", "OctetLive.podspec");
+
+/** The `let name: Type` lines inside `struct ContentState`. */
+function contentStateFields(swift: string): Record<string, string> {
+  const body = /struct ContentState\b[^{]*\{([\s\S]*?)\n\s*\}/.exec(swift)?.[1] ?? "";
+  const fields: Record<string, string> = {};
+  for (const m of body.matchAll(/^\s*(?:public\s+)?(?:let|var)\s+(\w+)\s*:\s*(\w+)/gm)) {
+    fields[m[1] as string] = m[2] as string;
+  }
+  return fields;
+}
+
+/** The brace-balanced body that follows the first match of `start` (a declaration or a call). */
+function block(swift: string, start: RegExp): string {
+  const at = start.exec(swift);
+  if (!at) return "";
+  const open = swift.indexOf("{", at.index + at[0].length - 1);
+  let depth = 0;
+  for (let i = open; i < swift.length; i++) {
+    if (swift[i] === "{") depth++;
+    else if (swift[i] === "}" && --depth === 0) return swift.slice(open, i + 1);
+  }
+  return "";
+}
+
+describe("the ActivityAttributes type", () => {
+  it("is named exactly as the hub's attributes-type, with no attributes of its own", () => {
+    expect(moduleAttributes).toMatch(new RegExp(`struct ${ACTIVITY_ATTRIBUTES_TYPE}\\s*:\\s*ActivityAttributes\\b`));
+    const outside = moduleAttributes.replace(/struct ContentState\b[^{]*\{[\s\S]*?\n\s*\}/, "");
+    expect(outside).not.toMatch(/^\s*(?:public\s+)?(?:let|var)\s+\w+\s*:/m);
+  });
+
+  it("is the same file in the module and in the widget, so both decode one shape", () => {
+    expect(widgetAttributes).toBe(moduleAttributes);
+  });
+
+  it("declares the hub's content-state fields, with matching Swift types", () => {
+    const swiftType: Record<string, string> = { String: "string", Int: "number", Double: "number" };
+    const fields = contentStateFields(moduleAttributes);
+    expect(Object.keys(fields).sort()).toEqual(Object.keys(ACTIVITY_STATE_FIELDS).sort());
+    for (const [name, type] of Object.entries(fields)) {
+      expect([name, swiftType[type]]).toEqual([name, ACTIVITY_STATE_FIELDS[name as keyof typeof ACTIVITY_STATE_FIELDS]]);
+    }
+  });
+});
+
+describe("the Expo module", () => {
+  it("is linked on iOS only, under the name the wrapper asks for", () => {
+    const config = JSON.parse(read("modules", "octet-live", "expo-module.config.json")) as {
+      platforms: string[];
+      apple?: { modules?: string[] };
+      android?: unknown;
+    };
+    expect(config.platforms).toEqual(["apple"]);
+    expect(config.apple?.modules).toEqual(["OctetLiveModule"]);
+    expect(config.android).toBeUndefined();
+    expect(moduleSwift).toMatch(/class OctetLiveModule\s*:\s*Module\b/);
+    expect(moduleSwift).toMatch(/Name\("OctetLive"\)/);
+    expect(read("modules", "octet-live", "src", "OctetLiveModule.ts")).toMatch(
+      /requireOptionalNativeModule<[^>]+>\("OctetLive"\)/,
+    );
+  });
+
+  it("sends the three events the wrapper listens for", () => {
+    expect(moduleSwift).toMatch(/Events\("pushToken",\s*"pushToStartToken",\s*"deny"\)/);
+  });
+
+  it("installs where the app does: Expo's own iOS floor, not the Island's", () => {
+    const expoCore = readFileSync(path.join(app, "node_modules", "expo-modules-core", "ExpoModulesCore.podspec"), "utf8");
+    const floor = /:ios\s*=>\s*'([\d.]+)'/.exec(expoCore)?.[1];
+    expect(floor).toBe("16.4");
+    expect(/:ios\s*=>\s*'([\d.]+)'/.exec(podspec)?.[1]).toBe(floor);
+  });
+
+  it("keeps the activity type behind iOS 17.2, so the compiler guards every ActivityKit call", () => {
+    for (const swift of [moduleAttributes, widgetAttributes]) {
+      expect(swift).toMatch(/@available\(iOS 17\.2, \*\)\s*\nstruct OctetActivity\b/);
+    }
+    expect(denySwift).toMatch(/@available\(iOS 17\.2, \*\)\s*\nstruct DenyIntent\b/);
+  });
+
+  it("is unsupported below iOS 17.2", () => {
+    expect(moduleSwift).toMatch(
+      /Function\("isSupported"\) \{ \(\) -> Bool in\s*if #available\(iOS 17\.2, \*\) \{\s*return ActivityAuthorizationInfo\(\)\.areActivitiesEnabled\s*\}\s*return false/,
+    );
+  });
+});
+
+describe("the widget target", () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const target = require("../../targets/octet-live/expo-target.config.js") as {
+    type: string;
+    name?: string;
+    deploymentTarget?: string;
+    entitlements?: Record<string, unknown>;
+  };
+
+  it("is a widget for iOS 17.2 in the App Group", () => {
+    expect(target.type).toBe("widget");
+    expect(target.deploymentTarget).toBe("17.2");
+    expect(target.entitlements?.["com.apple.security.application-groups"]).toEqual([APP_GROUP]);
+  });
+
+  it("draws the activity configured for the attributes type", () => {
+    expect(widgetSwift).toMatch(new RegExp(`ActivityConfiguration\\(for: ${ACTIVITY_ATTRIBUTES_TYPE}\\.self\\)`));
+    expect(widgetSwift).toMatch(/DynamicIsland\s*\{/);
+    for (const region of ["compactLeading", "compactTrailing", "minimal"]) {
+      expect(widgetSwift).toContain(`${region}:`);
+    }
+  });
+
+  it("shows the mascot pose for each kind from the target's assets", () => {
+    for (const pose of ["coding", "approval", "success"]) {
+      expect(widgetSwift).toContain(`"mascot-${pose}"`);
+    }
+  });
+
+  it("opens Allow as an approve link, and Deny through the intent", () => {
+    expect(widgetSwift).toContain('"octet://approve/');
+    expect(widgetSwift).toContain("DenyIntent(mac: state.mac, session: state.session, approval:");
+    expect(widgetSwift).toMatch(/Button\(intent: deny\)/);
+    expect(denySwift).toMatch(/struct DenyIntent\s*:\s*LiveActivityIntent\b/);
+  });
+});
+
+describe("the App Group contract", () => {
+  it("is the group in app.json, the module, the widget and the intent", () => {
+    expect(appJson.expo.ios.entitlements["com.apple.security.application-groups"]).toEqual([APP_GROUP]);
+    for (const swift of [moduleSwift, widgetSwift, denySwift]) {
+      expect(swift).toContain(`"${APP_GROUP}"`);
+    }
+  });
+
+  it("keeps the entries under one key the module writes and the widget reads", () => {
+    expect(moduleSwift).toContain('"entries"');
+    expect(widgetSwift).toContain('"entries"');
+  });
+
+  it("hands each deny over under its own deny.<uuid> key, pinged by one Darwin notification", () => {
+    for (const swift of [moduleSwift, denySwift]) {
+      expect(swift).toContain('"deny."');
+      expect(swift).toContain('"dev.octet.mobile.deny"');
+      // No shared list that a read-modify-write could lose a deny from.
+      expect(swift).not.toMatch(/array\(forKey:/);
+      expect(swift).not.toContain('"denies"');
+    }
+    expect(denySwift).toContain("UUID().uuidString");
+    expect(moduleSwift).toMatch(/hasPrefix\(denyPrefix\)/);
+    expect(moduleSwift).toMatch(/removeObject\(forKey: key\)/);
+  });
+});
+
+describe("what the native side keeps, and how", () => {
+  it("refuses entries over 64 KiB, or that aren't an object of at most 64 objects of strings", () => {
+    expect(moduleSwift).toMatch(/private let entriesByteLimit = 64 \* 1024\b/);
+    expect(moduleSwift).toMatch(/private let entriesLimit = 64\b/);
+    const setEntries = block(moduleSwift, /AsyncFunction\("setEntries"\)/);
+    expect(setEntries).toMatch(/json\.utf8\.count <= entriesByteLimit/);
+    expect(setEntries).toMatch(/as\? \[String: Any\]/);
+    expect(setEntries).toMatch(/\.count <= entriesLimit/);
+    expect(setEntries).toMatch(/is String/);
+    expect(setEntries).toMatch(/throw InvalidEntriesException\(\)/);
+    expect(moduleSwift).toMatch(/final class InvalidEntriesException\s*:\s*Exception\b/);
+  });
+
+  it("has the widget skip an oversized store and read only its own entry, so one bad entry hides no other", () => {
+    expect(widgetSwift).toMatch(/private let entriesByteLimit = 64 \* 1024\b/);
+    const entry = block(widgetSwift, /static func entry\(forKey key: String\) -> Entry\?/);
+    expect(entry).toMatch(/json\.utf8\.count <= entriesByteLimit/);
+    expect(entry).toMatch(/\[key\] as\? \[String: Any\]/);
+    expect(widgetSwift).not.toMatch(/decode\(\[String: Entry\]/);
+  });
+
+  it("starts and updates only an activity that is active or stale, never one that ended", () => {
+    const live = block(moduleSwift, /func liveActivities\(\)/);
+    expect(live).toMatch(/\.activityState == \.active \|\| \$0\.activityState == \.stale/);
+    expect(block(moduleSwift, /AsyncFunction\("start"\)/)).toMatch(/liveActivities\(\)\.first/);
+    expect(block(moduleSwift, /AsyncFunction\("update"\)/)).toMatch(/in liveActivities\(\)/);
+    expect(moduleSwift).not.toMatch(/\.activities\.first/);
+  });
+
+  it("keeps at most 16 waiting denies, each stamped, and drops any older than 10 minutes", () => {
+    const perform = block(denySwift, /func perform\(\)/);
+    expect(perform).toMatch(/hasPrefix\("deny\."\)/);
+    expect(perform).toMatch(/>= 16/);
+    expect(perform).toMatch(/"at": Date\(\)\.timeIntervalSince1970/);
+    expect(perform.indexOf(">= 16")).toBeLessThan(perform.indexOf("defaults.set("));
+    expect(moduleSwift).toMatch(/private let denyMaxAge: TimeInterval = 10 \* 60\b/);
+    expect(block(moduleSwift, /private func drainDenies\(\)/)).toMatch(/denyMaxAge/);
+  });
+
+  it("prunes expired and malformed denies before it counts toward the 16, so old taps can't block a new one", () => {
+    const perform = block(denySwift, /func perform\(\)/);
+    const prune = perform.indexOf("removeObject(forKey:");
+    expect(prune).toBeGreaterThan(-1);
+    expect(perform).toMatch(/10 \* 60/);
+    expect(prune).toBeLessThan(perform.indexOf(">= 16"));
+  });
+
+  it("ends the older activities when a new one appears, keeping the newest, deciding under the lock", () => {
+    const updates = block(moduleSwift, /for await activity in Activity<OctetActivity>\.activityUpdates/);
+    expect(updates).toMatch(/self\?\.keepOnly\(activity\)/);
+    // An activity the app starts is the newest too.
+    expect(block(moduleSwift, /AsyncFunction\("start"\)/)).toMatch(/keepOnly\(/);
+    const keep = block(moduleSwift, /private func keepOnly\(_ newest: Activity<OctetActivity>\)/);
+    expect(keep).toMatch(/lock\.lock\(\)/);
+    expect(keep).toMatch(/newestId = newest\.id/);
+    expect(keep).toMatch(/\.end\(nil, dismissalPolicy: \.immediate\)/);
+    // Never the newest itself: only those seen before it (the next test).
+    expect(keep).toMatch(/guard self\?\.isNewest\(id\) == true else \{ return \}/);
+  });
+
+  it("never lets two arrivals end each other: an id already seen, or one not live, is ignored, and only earlier arrivals are ended", () => {
+    const keep = block(moduleSwift, /private func keepOnly\(_ newest: Activity<OctetActivity>\)/);
+    // An activity that is over can't be the one kept.
+    expect(keep).toMatch(/guard newest\.activityState == \.active \|\| newest\.activityState == \.stale else \{ return \}/);
+    // `activityUpdates` yielding an activity again (or the app's own start, then its update) changes nothing.
+    expect(keep).toMatch(/if seen\.contains\(id\) \{/);
+    // First-seen order decides: what is ended is what was seen before this one, never a later arrival,
+    // so the last one seen is never ended by anyone.
+    expect(keep).toMatch(/let earlier = Set\(seen\)/);
+    expect(keep).toMatch(/for activity in liveActivities\(\) where earlier\.contains\(activity\.id\)/);
+    expect(keep).toMatch(/remember\(id\)/);
+    expect(block(moduleSwift, /private func remember\(_ id: String\)/)).toMatch(/seen\.append\(id\)/);
+    // The activities already there when the app starts listening come first in that order.
+    const listening = block(moduleSwift, /OnStartObserving\("pushToken"\)/);
+    expect(listening).toMatch(/self\.see\(activity\)/);
+    // The order is kept under the lock, and bounded.
+    const see = block(moduleSwift, /private func see\(_ activity: Activity<OctetActivity>\)/);
+    expect(see).toMatch(/lock\.lock\(\)/);
+    expect(moduleSwift).toMatch(/private let seenLimit = \d+/);
+  });
+
+  it("drains on one serial queue, so no key is emitted twice", () => {
+    expect(moduleSwift).toMatch(/private let denyQueue = DispatchQueue\(label: "dev\.octet\.mobile\.deny"\)/);
+    // drainDenies runs only from the queue.
+    const calls = [...moduleSwift.matchAll(/drainDenies\(\)/g)].length;
+    const queued = [...moduleSwift.matchAll(/denyQueue\.async \{ \[weak self\] in self\?\.drainDenies\(\) \}/g)].length;
+    expect(queued).toBe(1);
+    expect(calls).toBe(2); // the declaration and the one queued call
+    expect(moduleSwift).toMatch(/scheduleDrain\(\)/);
+  });
+
+  it("adds and removes the Darwin observer while holding the lock", () => {
+    const hear = block(moduleSwift, /private func hearDenies\(_ on: Bool\)/);
+    expect(hear).toMatch(/lock\.lock\(\)\s*\n\s*defer \{ lock\.unlock\(\) \}/);
+    expect(hear).toContain("CFNotificationCenterAddObserver");
+    expect(hear).toContain("CFNotificationCenterRemoveObserver");
+    expect(hear).not.toContain("lock.unlock()\n");
+  });
+
+  it("names the activity in every pushToken event, so an old activity's end never clears the live one's token", () => {
+    const sends = [...moduleSwift.matchAll(/sendEvent\("pushToken", (\[[^\]]*\])\)/g)].map((m) => m[1]);
+    expect(sends.length).toBe(3);
+    for (const payload of sends) expect(payload).toMatch(/"activity": activity\.id\]$/);
+  });
+
+  it("watches only a live activity, stops on cancel, and forgets each task when its loop ends", () => {
+    const watch = block(moduleSwift, /private func watch\(_ activity: Activity<OctetActivity>\)/);
+    expect(watch).toMatch(/guard activity\.activityState == \.active \|\| activity\.activityState == \.stale else \{\s*sendEvent\("pushToken", \["token": nil, "activity": activity\.id\]\)/);
+    for (const loop of moduleSwift.matchAll(/for await [^\n]*\{\n([^\n]*)/g)) {
+      expect(loop[1]).toMatch(/if Task\.isCancelled \{ break \}/);
+    }
+    expect([...moduleSwift.matchAll(/for await /g)].length).toBe(4);
+    expect([...moduleSwift.matchAll(/self\?\.forget\(key, id\)/g)].length).toBe(4);
+  });
+});
+
+describe("the widget's buttons and links", () => {
+  it("percent-encodes every part of the Allow link with the RFC 3986 unreserved set", () => {
+    expect(widgetSwift).toContain(
+      'CharacterSet(\n  charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")',
+    );
+    expect(block(widgetSwift, /private func linkPart\(_ text: String\) -> String/)).toContain(
+      "addingPercentEncoding(withAllowedCharacters: unreserved)",
+    );
+    expect(widgetSwift).toMatch(
+      /"octet:\/\/approve\/"\s*\+ \[state\.mac, state\.session, approval\]\.map\(linkPart\)\.joined\(separator: "\/"\)/,
+    );
+    // The link is built in that one place.
+    expect([...widgetSwift.matchAll(/octet:\/\/approve/g)].length).toBe(1);
+  });
+
+  it("looks an entry up by the host lowercased, without a trailing dot, as the app writes it", () => {
+    expect(widgetSwift).toMatch(/Shown\.entry\(forKey: hostKey\(state\.mac\) \+ "\/" \+ state\.session\)/);
+    const key = block(widgetSwift, /private func hostKey\(_ host: String\) -> String/);
+    expect(key).toMatch(/lowercased\(\)/);
+    expect(key).toMatch(/hasSuffix\("\."\)/);
+  });
+
+  it("marks the session's name and command privacy-sensitive, so iOS can redact them on a locked phone", () => {
+    const particulars = block(widgetSwift, /private struct Particulars: View/);
+    expect([...particulars.matchAll(/\.privacySensitive\(\)/g)].length).toBe(2);
+  });
+
+  it("gives the whole Deny label its tap area", () => {
+    expect(block(block(widgetSwift, /private struct Actions: View/), /Button\(intent: deny\)/)).toMatch(/\.contentShape\(Rectangle\(\)\)/);
+  });
+
+  it("dims a stale activity and labels it Stale, muted, on the Lock Screen and in the Island", () => {
+    // ActivityKit marks the activity stale past the stale-date the hub (and the app) set.
+    expect([...widgetSwift.matchAll(/Shown\(context\.state, stale: context\.isStale\)/g)].length).toBe(2);
+    const shown = block(widgetSwift, /private struct Shown \{/);
+    expect(shown).toMatch(/let stale: Bool/);
+    const label = block(widgetSwift, /private struct StaleLabel: View/);
+    expect(label).toContain('Text("Stale")');
+    expect(label).toMatch(/\.foregroundStyle\(\.secondary\)/);
+    expect(label).toMatch(/if shown\.stale/);
+    // The content dims: one opacity, used wherever the content is drawn.
+    expect(widgetSwift).toMatch(/private let staleOpacity = 0\.\d+/);
+    expect([...widgetSwift.matchAll(/\.opacity\(shown\.stale \? staleOpacity : 1\)/g)].length).toBeGreaterThanOrEqual(3);
+    expect(block(widgetSwift, /private struct LockScreen: View/)).toMatch(/StaleLabel\(shown: shown\)/);
+    expect(block(widgetSwift, /DynamicIslandExpandedRegion\(\.center\)/)).toMatch(/StaleLabel\(shown: shown\)/);
+  });
+
+  it("gives Allow and Deny a full-width hit area, 44 points tall on the Lock Screen and 32 in the Island", () => {
+    // The expanded Island is capped at 160 points: there the buttons are 32 points and the command
+    // takes one line, so neither is clipped. The Lock Screen keeps 44 points and two lines.
+    const place = block(widgetSwift, /private enum Place/);
+    expect(place).toMatch(/var buttonHeight: CGFloat \{ self == \.island \? 32 : 44 \}/);
+    expect(place).toMatch(/var commandLines: Int \{ self == \.island \? 1 : 2 \}/);
+    const actions = block(widgetSwift, /private struct Actions: View/);
+    expect(actions).toMatch(/let place: Place/);
+    for (const label of [/Button\(intent: deny\)/, /Link\(destination: shown\.allowURL\)/]) {
+      const button = block(actions, label);
+      expect(button).toMatch(/\.frame\(maxWidth: \.infinity, minHeight: place\.buttonHeight\)/);
+      expect(button).toMatch(/\.contentShape\(Rectangle\(\)\)/);
+    }
+    expect(actions).not.toMatch(/minHeight: \d/);
+    // No system button padding: Deny is drawn as plainly as Allow, a capsule of its own, so it is
+    // exactly the height asked for (the system style padded it to 50 points).
+    expect(actions).toMatch(/Button\(intent: deny\) \{[\s\S]*?\n {8}\}\n {8}\.buttonStyle\(\.plain\)/);
+    expect(block(actions, /Button\(intent: deny\)/)).toMatch(/\.background\(Capsule\(\)\.fill\(Color\.red\.opacity\(0\.35\)\)\)/);
+    expect(block(actions, /Link\(destination: shown\.allowURL\)/)).toMatch(/\.background\(Capsule\(\)\.fill\(Color\.green\.opacity\(0\.35\)\)\)/);
+    expect(block(widgetSwift, /private struct Particulars: View/)).toMatch(/\.lineLimit\(place\.commandLines\)/);
+    // The Lock Screen draws them at .lockScreen; the Island's bottom region at .island.
+    const lock = block(widgetSwift, /private struct LockScreen: View/);
+    expect(lock).toMatch(/Actions\(shown: shown, place: \.lockScreen\)/);
+    expect(block(widgetSwift, /private struct Details: View/)).toMatch(/Particulars\(shown: shown, place: \.lockScreen\)/);
+    const bottom = block(widgetSwift, /DynamicIslandExpandedRegion\(\.bottom\)/);
+    // Name, one line of command and the buttons, 4 points apart, inside the 160.
+    expect(bottom).toMatch(/VStack\(alignment: \.leading, spacing: 4\)/);
+    expect(bottom).toMatch(/Particulars\(shown: shown, place: \.island\)/);
+    expect(bottom).toMatch(/Actions\(shown: shown, place: \.island\)/);
+    expect([...widgetSwift.matchAll(/Actions\(shown: shown, place: \.\w+\)/g)].length).toBe(2);
+    expect([...widgetSwift.matchAll(/Particulars\(shown: shown, place: \.\w+\)/g)].length).toBe(2);
+  });
+});
+
+describe("the app keeps running until a Deny or a hand-over is sent", () => {
+  it("DenyIntent waits, at most 9 s, for the app's ack of its own request, polling every 100 ms", () => {
+    const perform = block(denySwift, /func perform\(\)/);
+    expect(perform).toMatch(/let id = UUID\(\)\.uuidString/);
+    expect(perform).toMatch(/defaults\.set\(deny, forKey: "deny\." \+ id\)/);
+    expect(perform).toMatch(/let ack = "denied\." \+ id/);
+    expect(perform).toMatch(/Date\(\)\.addingTimeInterval\(9\)/);
+    expect(perform).toMatch(/Task\.sleep\(nanoseconds: 100_000_000\)/);
+    expect(perform).toMatch(/defaults\.removeObject\(forKey: ack\)/);
+    // The wait comes after the request is written and the app pinged.
+    expect(perform.indexOf("CFNotificationCenterPostNotification")).toBeLessThan(perform.indexOf("addingTimeInterval(9)"));
+    // An ack left behind (the wait gave up first) is pruned with the expired denies.
+    expect(perform).toMatch(/hasPrefix\("denied\."\)/);
+  });
+
+  it("holds a background task from each deny it emits until JavaScript says it settled, and acks it to DenyIntent", () => {
+    expect(moduleSwift).toMatch(/private let deniedPrefix = "denied\."/);
+    expect(moduleSwift).toMatch(/private let holdLimit: TimeInterval = 10\b/);
+    const drain = block(moduleSwift, /private func drainDenies\(\)/);
+    expect(drain).toMatch(/hold\("deny:" \+ id, away: false\)/);
+    expect(drain.indexOf('hold("deny:"')).toBeLessThan(drain.indexOf('sendEvent("deny"'));
+    expect(drain).toMatch(/sendEvent\("deny", \["mac": mac, "session": session, "approval": approval, "id": id\]\)/);
+    const settled = block(moduleSwift, /Function\("denySettled"\)/);
+    expect(settled).toMatch(/UUID\(uuidString: id\) != nil/);
+    expect(settled).toMatch(/release\("deny:" \+ id\)/);
+    expect(settled).toMatch(/forKey: deniedPrefix \+ id/);
+  });
+
+  it("holds one for a token emitted in the background until JavaScript says the hand-over settled", () => {
+    const watch = block(moduleSwift, /private func watch\(_ activity: Activity<OctetActivity>\)/);
+    expect(watch).toMatch(/self\?\.hold\("handOver", away: true\)\n\s*self\?\.sendEvent\("pushToken", \["token": hex\(data\), "activity": activity\.id\]\)/);
+    expect(block(moduleSwift, /Function\("handOverSettled"\)/)).toMatch(/release\("handOver"\)/);
+  });
+
+  it("begins and ends the task on the main queue, and ends it itself after 10 s, or when iOS says time is up", () => {
+    const hold = block(moduleSwift, /private func hold\(_ key: String, away: Bool\)/);
+    expect(hold).toMatch(/DispatchQueue\.main\.async/);
+    expect(hold).toMatch(/UIApplication\.shared\.applicationState/);
+    expect(hold).toMatch(/UIApplication\.shared\.beginBackgroundTask\(withName:/);
+    expect(hold).toMatch(/self\?\.end\(key, only: id\)/); // the expiry, and the fallback
+    expect(hold).toMatch(/DispatchQueue\.main\.asyncAfter\(deadline: \.now\(\) \+ holdLimit\)/);
+    expect(hold).toMatch(/UIApplication\.shared\.endBackgroundTask\(old\.task\)/);
+    expect(block(moduleSwift, /private func end\(_ key: String, only id: UUID\? = nil\)/)).toMatch(/UIApplication\.shared\.endBackgroundTask\(held\.task\)/);
+    expect(block(moduleSwift, /private func release\(_ key: String\)/)).toMatch(/DispatchQueue\.main\.async/);
+  });
+});

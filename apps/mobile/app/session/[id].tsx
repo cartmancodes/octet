@@ -1,24 +1,24 @@
 import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
-import { Stack, useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
-import { useCallback, useMemo, useRef, useState } from "react";
-import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { useFocusEffect, useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View, type LayoutChangeEvent } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { ApprovalSheet } from "../../src/components/ApprovalSheet";
-import { Composer } from "../../src/components/Composer";
+import { ConvoControls } from "../../src/components/ConvoControls";
+import { ConvoHeader } from "../../src/components/ConvoHeader";
 import { useFollow } from "../../src/components/follow";
 import { HubBanner } from "../../src/components/HubBanner";
-import { ModeModelSheet } from "../../src/components/ModeModelSheet";
 import { useSend } from "../../src/components/send";
-import { SessionControls } from "../../src/components/SessionControls";
 import { TaskStrip } from "../../src/components/TaskStrip";
+import { TranscriptHeader } from "../../src/components/TranscriptHeader";
 import { TranscriptRow } from "../../src/components/TranscriptRow";
-import { useHubClient } from "../../src/hub";
-import { Mascot } from "../../src/mascot/Mascot";
-import type { PoseName } from "../../src/mascot/poses";
+import { useInboxWhenUnpaired } from "../../src/components/unpair";
+import { clearEdgeBottom, setEdgeBottom, useDrawerOpen } from "../../src/drawer";
+import { useClient, useLinks, useMac } from "../../src/hub";
+import { macOfKey } from "../../src/macs";
 import type { Entry } from "../../src/model/transcript";
-import { nowLine, queueWords } from "../../src/session";
-import { poseOf, sessionName } from "../../src/sessions";
+import { engineModel, headEngine, headMode, headModel, nowLine, type SessionHead } from "../../src/session";
+import { poseOf } from "../../src/sessions";
 import {
   octetStore,
   releaseSession,
@@ -35,6 +35,7 @@ import {
   useTaskOpen,
   watch,
 } from "../../src/store";
+import { loadTextSize, useTextSize } from "../../src/textSize";
 import { radius, spacing, type, useTheme } from "../../src/theme";
 
 const keyOf = (entry: Entry): string => entry.key;
@@ -47,8 +48,8 @@ const NO_OPEN: ReadonlySet<string> = new Set();
 export const WAITING = "Waiting for your Mac…";
 
 /**
- * One session: its Task strip and transcript. Shown, it streams the session (`watch`); left, it
- * stops (`unwatch`) and lets an ended session go (`releaseSession`). It reads only this
+ * One session: its header, Task strip and transcript. Shown, it streams the session (`watch`);
+ * left, it stops (`unwatch`) and lets an ended session go (`releaseSession`). It reads only this
  * session's part of the store, so other sessions' output never draws it again.
  */
 export default function Session() {
@@ -56,14 +57,21 @@ export default function Session() {
   const id = typeof params.id === "string" ? params.id : "";
   const theme = useTheme();
   const router = useRouter();
-  const client = useHubClient();
+  // The key names the Mac the session is on: its link, its list and its commands.
+  const macId = macOfKey(id);
+  const links = useLinks();
+  const client = useClient(macId);
+  // Its Mac unpaired: back to the Inbox.
+  useInboxWhenUnpaired(id);
   const focused = useIsFocused();
   const info = useSessionInfo(id);
   const entries = useEntries(id);
   const state = useSessionState(id);
   const status = useSessionStatus(id);
-  const listed = useListed();
-  const hub = useHub();
+  // A route id that is not a key names no session on any Mac: the screen shows it gone, and has
+  // no link of its own to show (it never borrows another Mac's).
+  const listed = useListed(macId ?? "");
+  const hub = useHub(macId ?? "");
   const taskOpen = useTaskOpen();
   const approvals = useApprovals(id);
   const catalog = useCatalog(id);
@@ -71,22 +79,34 @@ export default function Session() {
   const insets = useSafeAreaInsets();
   const setTaskOpen = octetStore.getState().setTaskOpen;
 
+  // Usage or Changes is opening over this screen: an ended session's view is not let go of
+  // meanwhile (they show what it left), and each way there pushes once however fast it is tapped.
+  const toOwn = useRef(false);
   useFocusEffect(
     useCallback(() => {
-      if (!client || id === "") return;
+      toOwn.current = false; // in front again
+      // Only with the Mac's link as it is now: a client this effect read before the Mac was paired
+      // again would leave a hold on the new link that its cleanup never gives back.
+      if (!client || id === "" || macId === null || links.client(macId) !== client) return;
       // An ended session's view is what it left behind: there is nothing more to stream.
-      if (!octetStore.getState().bySession.get(id)?.ended) watch(octetStore, client, id);
+      if (!octetStore.getState().bySession.get(id)?.ended) watch(octetStore, links, id);
       return () => {
-        unwatch(client, id);
-        releaseSession(octetStore, client, id);
+        // Its Mac went, or paired again: what the old client held went with it (the store forgot
+        // that Mac), and a new client is not this effect's to let go of.
+        if (macId === null || links.client(macId) !== client) return;
+        unwatch(links, id);
+        if (!toOwn.current) releaseSession(octetStore, links, id);
       };
-    }, [client, id]),
+    }, [client, links, macId, id]),
   );
 
-  // The title outlives the session's place in the list.
+  // The workspace outlives the session's place in the list.
   const [workspace, setWorkspace] = useState(info?.workspace);
   if (info && info.workspace !== workspace) setWorkspace(info.workspace);
-  const title = sessionName(workspace);
+
+  // The transcript's text size, which the header's Aa cycles; the saved one is read once.
+  const size = useTextSize();
+  useEffect(() => void loadTextSize(), []);
 
   // Tools entries the user opened, by key: kept here, not in the row, which FlashList recycles.
   const [open, setOpen] = useState<ReadonlySet<string>>(NO_OPEN);
@@ -103,10 +123,25 @@ export default function Session() {
       return next;
     });
   }, []);
-  const renderItem = useCallback<ListRenderItem<Entry>>(
-    ({ item }) => <TranscriptRow entry={item} open={open.has(item.key)} onToggle={toggle} />,
-    [open, toggle],
+  // A file-edit tool entry's "view ›": Changes, with that file open. It reads the focus from a
+  // ref, so that a change of focus does not draw every row again.
+  const inFront = useRef(focused);
+  useEffect(() => {
+    inFront.current = focused;
+  }, [focused]);
+  const viewChanges = useCallback(
+    (file: string) => {
+      if (!inFront.current || toOwn.current) return;
+      toOwn.current = true;
+      router.push({ pathname: "/changes", params: { id, file } });
+    },
+    [router, id],
   );
+  const renderItem = useCallback<ListRenderItem<Entry>>(
+    ({ item }) => <TranscriptRow entry={item} open={open.has(item.key)} onToggle={toggle} size={size} onView={viewChanges} />,
+    [open, toggle, size, viewChanges],
+  );
+  const extra = useMemo(() => ({ open, size }), [open, size]);
 
   const list = useRef<FlashListRef<Entry>>(null);
   const follow = useFollow(list, entries[entries.length - 1]);
@@ -116,35 +151,85 @@ export default function Session() {
     else router.replace("/");
   }, [router]);
 
+  // ⋯: this session's Usage, once (a second tap while it opens would stack a second copy).
+  const usage = useCallback(() => {
+    if (!focused || toOwn.current) return;
+    toOwn.current = true;
+    router.push({ pathname: "/usage", params: { id, workspace: workspace ?? "" } });
+  }, [focused, router, id, workspace]);
+  // Session info's "Changes ›".
+  const changes = useCallback(() => {
+    if (!focused || toOwn.current) return;
+    toOwn.current = true;
+    router.push({ pathname: "/changes", params: { id } });
+  }, [focused, router, id]);
+
   // Not listed, and nothing to show: never heard of (once the list came), or refused with no
   // transcript (a deep link to an id the Mac does not have).
-  const gone = info === undefined && ((listed && !status.known) || (status.failed !== null && entries.length === 0));
+  const gone =
+    macId === null || (info === undefined && ((listed && !status.known) || (status.failed !== null && entries.length === 0)));
   const now = nowLine(state, info);
 
-  // Commands go to the Mac through the one client; with none (not paired yet) they are unsent.
-  const send = useSend();
+  // Commands go to the session's Mac; with no link to it (not paired yet) they are unsent.
+  const send = useSend(id);
   // Only a live session takes commands: not an ended one, one the hub refused, or one that is gone.
   const live = !gone && !status.ended && status.failed === null;
   // While the Mac can't be reached the screen shows its last state, greyed, and takes no command
   // until the link is back. Nothing unmounts, so typed words outlive a brief `connecting`.
   const offline = hub !== "ready";
   const phase = state?.phase ?? info?.phase ?? "idle";
-  const queued = queueWords(state).count;
-  // The mascot in the header: this session's state, by the same map as the Sessions list's.
+  // The mascot over the transcript: this session's state, by the same map as the Inbox's.
   const pose = poseOf({ approvals: approvals.length, phase, now: state?.now ?? info?.now, turn });
-  const header = useMemo(() => ({ title, headerRight: () => <HeaderMascot pose={pose} /> }), [title, pose]);
-  // The home indicator's room is only needed under the composer; the keyboard covers it.
+  // The Mac as the pairing names it (renamed in Settings, or as it was kept when paired again).
+  const mac = useMac(macId ?? "")?.macName ?? "Mac";
+  const head: SessionHead = { workspace, engine: info?.engine, model: info?.model ?? undefined, mode: info?.mode };
+  const mode = headMode(catalog, head);
+  const line = engineModel(catalog, head);
+  const engine = headEngine(catalog, head);
+  const model = headModel(catalog, head);
+  const modes = catalog?.modes ?? null;
+  const transcriptHeader = useMemo(
+    () => <TranscriptHeader pose={pose} mode={mode} engineModel={line} workspace={workspace ?? ""} mac={mac} size={size} />,
+    [pose, mode, line, workspace, mac, size],
+  );
+  // Where the screen's body starts in the window: the keyboard's offset, and the prompt line's.
   const [offset, setOffset] = useState(0);
-  // The Mode and model sheet covers the approval sheet: it waits until the sheet is gone.
+  // The header's menu or Session info covers the Permission card: it waits until they are gone.
   const [sheetOpen, setSheetOpen] = useState(false);
+  // The side drawer covers it too, and so does another screen over this one: a tap that closes
+  // the drawer, or the first after coming back, must not answer.
+  const drawerOpen = useDrawerOpen();
   const root = useRef<View>(null);
   const measure = useCallback(() => root.current?.measureInWindow((_x, y) => setOffset(y)), []);
+
+  // The drawer's edge strip ends where the prompt line and key bar begin, wherever the keyboard
+  // has put them; only the screen in front says so, and it takes the bound away when it goes.
+  const [edgeOwner] = useState(() => ({}));
+  const [promptTop, setPromptTop] = useState<number | null>(null);
+  const onPromptLayout = useCallback((event: LayoutChangeEvent) => setPromptTop(event.nativeEvent.layout.y), []);
+  useEffect(() => {
+    if (!focused || !live || promptTop === null) return;
+    setEdgeBottom(edgeOwner, offset + promptTop);
+    return () => clearEdgeBottom(edgeOwner);
+  }, [focused, live, promptTop, offset, edgeOwner]);
 
   return (
     <View ref={root} onLayout={measure} style={[styles.screen, { backgroundColor: theme.bg }]}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={offset} style={styles.screen}>
-        <Stack.Screen options={header} />
-        <HubBanner state={hub} announce={focused} />
+        <ConvoHeader
+          session={id}
+          send={send}
+          top={insets.top}
+          live={live}
+          offline={offline}
+          approval={approvals.length > 0}
+          phase={phase}
+          focused={focused}
+          onCovered={setSheetOpen}
+          onUsage={usage}
+          onChanges={changes}
+        />
+        {macId !== null ? <HubBanner state={hub} announce={focused} /> : null}
         {gone ? (
           <View style={styles.gone}>
             <Text style={[type.body, styles.center, { color: theme.muted }]}>
@@ -152,11 +237,11 @@ export default function Session() {
             </Text>
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel="Back to sessions"
+              accessibilityLabel="Back to the Inbox"
               onPress={back}
               style={[styles.button, { borderColor: theme.accent }]}
             >
-              <Text style={[type.body, { color: theme.accent }]}>Back to sessions</Text>
+              <Text style={[type.body, { color: theme.accent }]}>Back to the Inbox</Text>
             </Pressable>
           </View>
         ) : (
@@ -169,8 +254,9 @@ export default function Session() {
                 ref={list}
                 testID="transcript"
                 data={entries}
-                extraData={open}
+                extraData={extra}
                 renderItem={renderItem}
+                ListHeaderComponent={transcriptHeader}
                 keyExtractor={keyOf}
                 getItemType={typeOf}
                 maintainVisibleContentPosition={KEEP_POSITION}
@@ -197,42 +283,26 @@ export default function Session() {
             {live ? (
               <>
                 {offline ? <Text style={[type.caption, styles.waiting, { color: theme.muted }]}>{WAITING}</Text> : null}
-                <ApprovalSheet session={id} approvals={approvals} send={send} offline={offline} covered={sheetOpen} />
-                <SessionControls
+                <ConvoControls
                   session={id}
                   phase={phase}
-                  engine={info?.engine ?? "claude"}
+                  engine={engine}
+                  mode={mode}
+                  modes={modes}
+                  model={model}
+                  approvals={approvals}
                   send={send}
                   offline={offline}
+                  question={info?.question === true}
+                  covered={sheetOpen || drawerOpen || !focused}
+                  bottom={insets.bottom}
+                  onPromptLayout={onPromptLayout}
                 />
-                <ModeModelSheet
-                  session={id}
-                  catalog={catalog}
-                  send={send}
-                  offline={offline}
-                  approval={approvals.length > 0}
-                  onVisible={setSheetOpen}
-                />
-                <View style={{ paddingBottom: Math.max(insets.bottom, spacing.sm) }}>
-                  <Composer session={id} phase={phase} queued={queued} send={send} offline={offline} />
-                </View>
               </>
             ) : null}
           </>
         )}
       </KeyboardAvoidingView>
-    </View>
-  );
-}
-
-/** The mascot drawn at its smallest crisp size, 59 points (one whole multiple of its width). */
-const MASCOT = 59;
-
-/** The header's mascot. */
-function HeaderMascot({ pose }: { pose: PoseName }) {
-  return (
-    <View testID="session-mascot">
-      <Mascot pose={pose} size={MASCOT} />
     </View>
   );
 }

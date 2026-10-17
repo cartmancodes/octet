@@ -6,13 +6,14 @@
 use crate::{
     Action, Exit,
     app::{APPROVAL_ARM, App, CANCELLING, ConnPhase, StatusKind},
-    commands::{mode_command, model_command, steer_with},
+    commands::{export_path, mode_command, model_command, session_text, steer_with, wait_for},
     input::{answer_approval, cancel_turn, send_remote_prompt},
+    jobs::{Asker, Done, EXPORT_FAILED, Ended, Job, export_failure},
     registry::TURN_OPEN,
     vendor::Vendor,
 };
 use octet_core::remote::{
-    protocol::{self, BridgeCommand, Code, MAX_BRIDGE_LINE, MAX_MESSAGE},
+    protocol::{self, BridgeCommand, Code, CommandName, MAX_BRIDGE_LINE, MAX_MESSAGE},
     run::{Registration, run_dir},
 };
 use octet_core::{Config, Mode};
@@ -255,13 +256,15 @@ async fn accept(
 
 /// Runs one remote command as the matching key or slash command would; the reply's text, or the
 /// refusal, and what the interface then does. `editing` says the desk's external editor has the
-/// terminal.
+/// terminal. A command that starts a job (an `/export`) is answered when the job ends
+/// ([`answer_job`]), not now: the reply is then `None`, and the job, in the action, carries who
+/// asked.
 pub(crate) async fn handle_remote(
     app: &mut App,
     vendor: &dyn Vendor,
     remote: Remote,
     editing: bool,
-) -> (Result<String, String>, Action) {
+) -> (Option<Result<String, String>>, Action) {
     let mut action = Action::Continue;
     // Ending or reconnecting would kill the editor or the `!` command, and lose its work.
     let desk = if editing {
@@ -273,8 +276,16 @@ pub(crate) async fn handle_remote(
     };
     let (seq, status) = (app.last_seq(), app.status_line.clone());
     let done = run_remote(app, vendor, remote.command, desk, &mut action).await;
+    if let (Ok(_), Action::Job(job)) = (&done, &mut action) {
+        job.asker = Some(Asker {
+            peer: remote.peer,
+            req: remote.req,
+            by: remote.by,
+        });
+        return (None, action);
+    }
     let by = device_name(&remote.by);
-    match done {
+    let (reply, action) = match done {
         Ok((what, reply)) => {
             app.note(format!("{what} from {by}"));
             // The note must not hide that a cancel is under way.
@@ -293,6 +304,38 @@ pub(crate) async fn handle_remote(
                 app.status(kind, &format!("{refused}{}", app.status_line));
             }
             (Err(reason), Action::Continue)
+        }
+    };
+    (Some(reply), action)
+}
+
+/// The answer to `asker`, the phone whose `/export` job just ended as `ended`, and the desk's
+/// note of it, in the words the desk's own export uses.
+pub(crate) fn answer_job(app: &mut App, ended: Ended, asker: &Asker) -> Result<String, String> {
+    let by = device_name(&asker.by);
+    let exported = match ended {
+        Ended::Done(Done::Exported { path, result }) => result
+            .map(|()| path)
+            .map_err(|error| export_failure(&error)),
+        Ended::Done(other) => {
+            // Only an export is a phone's; anything else is shown as the desk's own.
+            crate::jobs::apply(app, Ended::Done(other));
+            return Err("That job was not an export".into());
+        }
+        Ended::Failed(error) => Err(format!("{EXPORT_FAILED}{error}")),
+        Ended::Stopped(label) => Err(format!("{EXPORT_FAILED}{label} did not finish in time")),
+    };
+    match exported {
+        Ok(path) => {
+            app.note(format!("Exported the journal from {by}"));
+            Ok(format!("Exported the journal to {}", path.display()))
+        }
+        Err(reason) => {
+            app.note(format!(
+                "Export from {by} failed: {}",
+                &reason[EXPORT_FAILED.len()..]
+            ));
+            Err(reason)
         }
     }
 }
@@ -329,6 +372,7 @@ fn refusal_code(reason: &str) -> Code {
         || reason == APPROVAL_OPENING
         || reason.starts_with("The queue is full")
         || reason.starts_with("Mode change pending")
+        || reason.starts_with("Wait for: ")
     {
         Code::Busy
     } else if reason.starts_with("Full access needs confirm") {
@@ -432,18 +476,66 @@ async fn run_remote(
             remote_mode(app, vendor, &mode, confirm.as_deref(), desk, action)
         }
         BridgeCommand::SetModel { selection } => remote_model(app, &selection, desk, action),
+        BridgeCommand::Command { name } => remote_command(app, name, desk, action),
         BridgeCommand::End => {
-            if let Some(busy) = desk {
-                return Err(busy.into());
-            }
+            ends_cleanly(app, desk)?;
+            *action = Action::Exit(Exit::Quit);
+            Ok(("Ended".into(), "Ending".into()))
+        }
+    }
+}
+
+/// Why the desk's session may not be ended now: the editor or a `!` command (`desk`), a turn, or
+/// a draft.
+fn ends_cleanly(app: &App, desk: Option<&'static str>) -> Result<(), String> {
+    if let Some(busy) = desk {
+        return Err(busy.into());
+    }
+    if app.turn_open() {
+        return Err(TURN_OPEN.into());
+    }
+    if desk_has_draft(app) {
+        return Err(DESK_DRAFT.into());
+    }
+    Ok(())
+}
+
+/// What `help` answers a phone with.
+const PHONE_HELP: &str = "Commands from the phone: /model · /mode · /new · /session · /export · \
+                          /help. Everything else runs at the desk.";
+
+/// A remote `command`, run by the desk's own handler: `/new`, `/session`, `/help` or `/export`.
+/// None takes an argument, so nothing from the phone reaches a path.
+fn remote_command(
+    app: &App,
+    name: CommandName,
+    desk: Option<&'static str>,
+    action: &mut Action,
+) -> Result<(String, String), String> {
+    match name {
+        CommandName::New => {
+            ends_cleanly(app, desk)?;
+            *action = Action::Exit(Exit::New);
+            Ok((
+                "New conversation".into(),
+                "Starting a fresh conversation".into(),
+            ))
+        }
+        CommandName::Session => Ok(("Session".into(), session_text(app))),
+        CommandName::Help => Ok(("Help".into(), PHONE_HELP.into())),
+        CommandName::Export => {
+            // `/export` with no argument: refused during a turn or while another job runs, else
+            // the workspace and the journal's file name. The copy is the desk's own export job,
+            // so the desk goes on meanwhile; the phone is told how it went when it is done.
             if app.turn_open() {
                 return Err(TURN_OPEN.into());
             }
-            if desk_has_draft(app) {
-                return Err(DESK_DRAFT.into());
+            if let Some(running) = &app.job {
+                return Err(wait_for(running));
             }
-            *action = Action::Exit(Exit::Quit);
-            Ok(("Ended".into(), "Ending".into()))
+            let path = export_path(app, "");
+            *action = Action::Job(Job::export(app.conn.journal.clone(), path));
+            Ok(("Export".into(), String::new()))
         }
     }
 }
@@ -935,9 +1027,37 @@ fn clipped_files(files: &[String]) -> Vec<String> {
     shown
 }
 
+/// How many files a summary's clipped `files` stood for: each listed file, plus the count its
+/// closing "+N more" gives.
+fn files_count(files: &[Value]) -> usize {
+    let more: Option<usize> = files
+        .last()
+        .and_then(Value::as_str)
+        .and_then(|last| last.strip_prefix('+')?.strip_suffix(" more")?.parse().ok());
+    match more {
+        Some(more) if files.len() > FILES_SHOWN => FILES_SHOWN + more,
+        _ => files.len(),
+    }
+}
+
+/// `summary` reduced to its action and scope, marking what it removed: a command becomes "…"
+/// and files become "+N more", so a phone never shows a reduced approval as an empty one.
+fn reduced_summary(summary: &Value) -> Value {
+    let mut reduced = json!({"action": summary["action"], "files": [], "scope": summary["scope"]});
+    if summary["command"].is_string() {
+        reduced["command"] = json!("…");
+    }
+    let files = summary["files"].as_array().map_or(0, |f| files_count(f));
+    if files > 0 {
+        reduced["files"] = json!([format!("+{files} more")]);
+    }
+    reduced
+}
+
 /// The `state` frame line for `state`. One that would not fit in a message is rebuilt without
-/// the queue, with each approval reduced to its action and scope, and without the goal if
-/// that is still too much, so a hub always accepts it and the approval ids still get through.
+/// the queue, with each approval reduced to its action and scope (marking the command and files
+/// it removed), and without the goal if that is still too much, so a hub always accepts it and
+/// the approval ids still get through.
 fn state_line(state: &Value) -> String {
     let line = frame_line(&protocol::bridge_state_frame(state));
     if line.len() <= MAX_MESSAGE {
@@ -947,9 +1067,7 @@ fn state_line(state: &Value) -> String {
     reduced["queue"] = json!([]);
     if let Some(approvals) = reduced["approvals"].as_array_mut() {
         for approval in approvals {
-            let summary = &approval["summary"];
-            approval["summary"] =
-                json!({"action": summary["action"], "files": [], "scope": summary["scope"]});
+            approval["summary"] = reduced_summary(&approval["summary"]);
         }
     }
     let mut line = frame_line(&protocol::bridge_state_frame(&reduced));
@@ -1249,6 +1367,7 @@ mod tests {
                 "Message too large; the limit is 99328 bytes",
                 Code::TooLarge,
             ),
+            ("Wait for: Exporting the journal…", Code::Busy),
             ("No approval 9 is waiting", Code::Invalid),
             ("Slash commands run on the desk", Code::Invalid),
         ] {
@@ -1753,9 +1872,59 @@ mod tests {
         let approvals = reduced["state"]["approvals"].as_array().unwrap();
         assert_eq!(approvals.len(), 40);
         assert_eq!(approvals[3]["summary"]["action"], "Run a shell command");
-        assert!(approvals[3]["summary"].get("command").is_none());
+        assert_eq!(approvals[3]["summary"]["command"], "…");
+        assert_eq!(approvals[3]["summary"]["files"], json!([]));
         conforms("StateInfo", &reduced["state"]);
         conforms("ApprovalSummary", &approvals[3]["summary"]);
+    }
+
+    #[test]
+    fn a_reduced_state_marks_what_it_removed() {
+        let (mut app, _) = demo();
+        crate::test_support::idle(&mut app);
+        let event = |id, summary| octet_core::Event::Approval {
+            id,
+            detail: String::new(),
+            summary,
+        };
+        for id in 0..30 {
+            app.event(event(
+                id,
+                octet_core::ApprovalSummary {
+                    command: Some("c".repeat(4_000)),
+                    ..octet_core::ApprovalSummary::new("Run a shell command")
+                },
+            ));
+        }
+        app.event(event(
+            30,
+            octet_core::ApprovalSummary {
+                files: (0..25).map(|n| format!("{n}.rs")).collect(),
+                ..octet_core::ApprovalSummary::new("Edit 25 files")
+            },
+        ));
+        app.event(event(
+            31,
+            octet_core::ApprovalSummary {
+                files: vec!["a.rs".into(), "b.rs".into()],
+                ..octet_core::ApprovalSummary::new("Edit 2 files")
+            },
+        ));
+        app.event(event(32, octet_core::ApprovalSummary::new("Fetch a page")));
+        let state = state_json(&app);
+        assert!(frame_line(&protocol::bridge_state_frame(&state)).len() > MAX_MESSAGE);
+        let reduced: Value = serde_json::from_str(&state_line(&state)).unwrap();
+        let summary = |id: usize| reduced["state"]["approvals"][id]["summary"].clone();
+        assert_eq!(summary(0)["command"], "…");
+        assert_eq!(summary(0)["files"], json!([]));
+        assert!(summary(30).get("command").is_none());
+        assert_eq!(summary(30)["files"], json!(["+25 more"]));
+        assert_eq!(summary(31)["files"], json!(["+2 more"]));
+        assert!(summary(32).get("command").is_none());
+        assert_eq!(summary(32)["files"], json!([]));
+        for id in [0, 30, 31, 32] {
+            conforms("ApprovalSummary", &summary(id));
+        }
     }
 
     #[tokio::test]

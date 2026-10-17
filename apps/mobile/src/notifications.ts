@@ -1,10 +1,17 @@
 // Push notifications: the permission, the Expo push token, the Android channels, the foreground
 // rule and what a tap names. The Mac's hub sends the pushes (title "Octet", body "Approval
-// waiting" or "Turn finished", `data.session`, a channel); this file only prepares the phone for
-// them. Registering the token with the hub is `HubController`'s job (src/hub.ts).
+// waiting", "Session error" or "Turn finished", `data.session`, `data.mac` (the host it is
+// published at) when it knows it, and the channel "approvals", "errors" or "turns"); this file
+// only prepares the phone for them. Registering the token with each Mac's hub is the Fleet's job
+// (`MacLink`, src/fleet/macLink.ts), and finding the Mac a tap is for is the Fleet's
+// (`Fleet.tapKey`, src/fleet/fleet.ts).
 import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
+
+import { isHostName, isSessionId, type Tap } from "./macs";
+
+export type { Tap };
 
 export const NO_PROJECT_ID = "Notifications need this app's EAS project id. See the README.";
 export const DENIED = "Notifications are off for Octet in the phone's settings.";
@@ -12,10 +19,6 @@ const FAILED = "Couldn't turn on notifications. Try again.";
 
 /** What Expo's push service hands out; the hub accepts the same shape and no other. */
 const PUSH_TOKEN = /^Expo(nent)?PushToken\[[A-Za-z0-9_-]{1,200}\]$/;
-/** The hub's session ids are `{pid}-{started}`, both numbers. */
-const SESSION_ID = /^[0-9]+-[0-9]+$/;
-/** No id the hub makes is longer; a tap's data comes from outside the app. */
-const SESSION_ID_CHARS = 128;
 /** How long a push token fetch may take. It can hang (no network to Expo, or to Apple or
  * Google), and push work runs one job at a time, so a hung fetch would hold every later one. */
 const TOKEN_WAIT_MS = 15_000;
@@ -31,9 +34,21 @@ export function projectId(): string | null {
 export function sessionFromData(data: unknown): string | null {
   if (typeof data !== "object" || data === null) return null;
   const session = (data as { session?: unknown }).session;
-  return typeof session === "string" && session.length <= SESSION_ID_CHARS && SESSION_ID.test(session)
-    ? session
-    : null;
+  return typeof session === "string" && isSessionId(session) ? session : null;
+}
+
+/** The host a notification names as its Mac (`data.mac`), or null for data that is not a DNS
+ * name (`isHostName`). */
+function hostFromData(data: unknown): string | null {
+  if (typeof data !== "object" || data === null) return null;
+  const mac = (data as { mac?: unknown }).mac;
+  return typeof mac === "string" && isHostName(mac) ? mac : null;
+}
+
+/** What a notification's data names: the session, and the host of the Mac that sent it. Each is
+ * null when the data names none that is valid. */
+export function tapFromData(data: unknown): Tap {
+  return { host: hostFromData(data), session: sessionFromData(data) };
 }
 
 /** Start-up, once: nothing shows while the app is open (the screen is already live), and on
@@ -52,6 +67,11 @@ export async function configureNotifications(): Promise<void> {
   try {
     await Notifications.setNotificationChannelAsync("approvals", {
       name: "Approvals",
+      importance: Notifications.AndroidImportance.HIGH,
+      sound: "default",
+    });
+    await Notifications.setNotificationChannelAsync("errors", {
+      name: "Session errors",
       importance: Notifications.AndroidImportance.HIGH,
       sound: "default",
     });
@@ -139,11 +159,11 @@ export function onTokenChange(fn: () => void): () => void {
 
 /**
  * Taps on notifications: a tap while the app runs (the listener) and the tap that launched it
- * (the last response). `fn` gets the session the tap names, or null when the data names none that
- * is valid. A tap is handed over once, however many ways it is reported, and the native side is
- * told it was taken, so that no later mount of the shell opens it again. Returns the stop.
+ * (the last response). `fn` gets what the tap names (`tapFromData`). A tap is handed over once,
+ * however many ways it is reported, and the native side is told it was taken, so that no later
+ * mount of the shell opens it again. Returns the stop.
  */
-export function watchTaps(fn: (session: string | null) => void): () => void {
+export function watchTaps(fn: (tap: Tap) => void): () => void {
   let live = true;
   let last: string | null = null;
   const take = (response: Notifications.NotificationResponse | null): void => {
@@ -151,7 +171,7 @@ export function watchTaps(fn: (session: string | null) => void): () => void {
     const id = response.notification.request.identifier;
     if (id === last) return;
     last = id;
-    fn(sessionFromData(response.notification.request.content.data));
+    fn(tapFromData(response.notification.request.content.data));
     try {
       Notifications.clearLastNotificationResponse();
     } catch {

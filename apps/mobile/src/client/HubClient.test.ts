@@ -1,5 +1,6 @@
-import type { Cursor } from "../protocol";
+import { MAX_MESSAGE, MAX_SESSION_ROWS, type Cursor } from "../protocol";
 import { FakeClock, Sockets } from "./fakes";
+import { MAX_FRAME_BYTES, utf8Length } from "./frames";
 import { HubClient, PING_INTERVAL_MS, PING_TIMEOUT_MS, REQUEST_TIMEOUT_MS, Refusal, type BatchItem, type HubState } from "./HubClient";
 
 const URL = "wss://mac.tail1234.ts.net/";
@@ -14,7 +15,7 @@ interface Rig {
   cursors: [string, Cursor | null][];
 }
 
-function rig(opts: { token?: string | null; cursors?: Record<string, Cursor>; random?: () => number } = {}): Rig {
+function rig(opts: { token?: string | null; cursors?: Record<string, Cursor>; random?: () => number; background?: boolean } = {}): Rig {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const cursors: [string, Cursor | null][] = [];
@@ -27,6 +28,7 @@ function rig(opts: { token?: string | null; cursors?: Record<string, Cursor>; ra
     random: opts.random ?? (() => 1),
     cursors: opts.cursors,
     onCursor: (session, cursor) => cursors.push([session, cursor]),
+    ...(opts.background === undefined ? {} : { background: opts.background }),
   });
   const states: HubState[] = [];
   const batches: BatchItem[][] = [];
@@ -206,6 +208,27 @@ describe("requests", () => {
     expect(pairRefusal.message.length).toBe(512);
   });
 
+  it("a commit's refusal keeps the hub's 2,000 characters whole, emoji too: a hook's words, as the hub clipped them", async () => {
+    const r = rig();
+    ready(r);
+    // The hub keeps the last 2,000 characters (scalars) behind "…": 3,996 UTF-16 units here.
+    const words = `…${"🙂".repeat(1_996)}END`;
+    expect(Array.from(words)).toHaveLength(2_000);
+    const pending = r.client.request({ type: "commit", session: "s", message: "Fix it" });
+    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("commit")[0]?.req, code: "not_allowed", reason: words });
+    const refusal = (await pending.catch((e: unknown) => e)) as Refusal;
+    expect(refusal.message).toBe(words);
+    // Past what the hub sends, it is still clipped.
+    const longer = r.client.request({ type: "commit", session: "s", message: "Fix it" });
+    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("commit")[1]?.req, code: "not_allowed", reason: "x".repeat(9_000) });
+    expect(((await longer.catch((e: unknown) => e)) as Refusal).message.length).toBe(4_000);
+    // Any other command's refusal is still a short one.
+    const other = r.client.request({ type: "diff", session: "s", path: "a" });
+    r.sockets.last.receive({ type: "refused", req: r.sockets.last.commandsOf("diff")[0]?.req, code: "unavailable", reason: words });
+    // 512 units at most, an emoji never cut in two.
+    expect(((await other.catch((e: unknown) => e)) as Refusal).message).toBe(`…${"🙂".repeat(255)}`);
+  });
+
   it("a recent frame answers its request", async () => {
     const r = rig();
     ready(r);
@@ -213,6 +236,137 @@ describe("requests", () => {
     const req = r.sockets.last.commandsOf("recent")[0]?.req;
     r.sockets.last.receive({ type: "recent", req, items: [] });
     await expect(pending).resolves.toMatchObject({ type: "recent", items: [] });
+  });
+
+  const OSC_PATH = "src/\u001b]8;;https://evil.test\u0007a.ts\u001b]8;;\u0007";
+  it("a changes frame answers its request, its strings cleaned and its numbers whole", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "changes", session: "s" });
+    const req = r.sockets.last.commandsOf("changes")[0]?.req;
+    expect(r.sockets.last.commandsOf("changes")[0]).toEqual({ v: 1, type: "changes", req, session: "s" });
+    r.sockets.last.receive({
+      type: "changes",
+      req,
+      branch: "feat\u001b[31m/x‮",
+      upstream: "origin/\u0007feat",
+      ahead: 2.7,
+      behind: -3,
+      more: "9",
+      files: [
+        { path: OSC_PATH, add: 3, del: 1, binary: false, status: "M" },
+        { path: "b\u200fc.png", add: -1, del: Number.MAX_VALUE, binary: true, status: "A" },
+        { path: "weird", add: 1, del: 0, binary: "yes", status: "Z" },
+        { path: 7, add: 1, del: 0, binary: false, status: "M" },
+        "not a file",
+      ],
+    });
+    await expect(pending).resolves.toEqual({
+      v: 1,
+      type: "changes",
+      req,
+      branch: "feat/x",
+      upstream: "origin/feat",
+      ahead: 2,
+      behind: 0,
+      more: 0,
+      files: [
+        // The hub's own path is kept beside the cleaned one, exactly, to ask for its diff by.
+        { path: "src/a.ts", raw: OSC_PATH, add: 3, del: 1, binary: false, status: "M" },
+        { path: "bc.png", raw: "b\u200fc.png", add: 0, del: Number.MAX_SAFE_INTEGER, binary: true, status: "A" },
+        { path: "weird", raw: "weird", add: 1, del: 0, binary: false, status: "?" },
+      ],
+    });
+  });
+
+  it("a changes frame keeps a raw path up to the hub's 4,096 characters, and drops a longer one", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "changes", session: "s" });
+    const req = r.sockets.last.commandsOf("changes")[0]?.req;
+    const longest = `\u200b${"a".repeat(4_095)}`;
+    r.sockets.last.receive({
+      type: "changes",
+      req,
+      ahead: 0,
+      behind: 0,
+      more: 0,
+      files: [
+        { path: longest, add: 1, del: 0, binary: false, status: "M" },
+        { path: "b".repeat(4_097), add: 1, del: 0, binary: false, status: "M" },
+      ],
+    });
+    const frame = (await pending) as { files: { path: string; raw: string }[] };
+    expect(frame.files).toHaveLength(1);
+    expect(frame.files[0]?.raw).toBe(longest);
+    expect(frame.files[0]?.path).toBe("a".repeat(4_095));
+  });
+
+  it("a changes frame with no branch says so", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "changes", session: "s" });
+    const req = r.sockets.last.commandsOf("changes")[0]?.req;
+    r.sockets.last.receive({ type: "changes", req, ahead: 0, behind: 0, files: [], more: 0 });
+    await expect(pending).resolves.toMatchObject({ type: "changes", branch: null, upstream: null, files: [] });
+  });
+
+  it("a diff frame answers its request, its text cleaned with its newlines kept", async () => {
+    const r = rig();
+    ready(r);
+    const pending = r.client.request({ type: "diff", session: "s", path: "src/a.ts" });
+    const req = r.sockets.last.commandsOf("diff")[0]?.req;
+    expect(r.sockets.last.commandsOf("diff")[0]).toEqual({ v: 1, type: "diff", req, session: "s", path: "src/a.ts" });
+    r.sockets.last.receive({
+      type: "diff",
+      req,
+      path: "src/\u001b[2Ja.ts",
+      text: "@@ -1 +1 @@\r\n-old\u001b]0;title\u0007\n+new‮\tx\n",
+      clipped: true,
+      binary: 1,
+    });
+    await expect(pending).resolves.toEqual({
+      v: 1,
+      type: "diff",
+      req,
+      path: "src/a.ts",
+      text: "@@ -1 +1 @@\n-old\n+new    x\n",
+      clipped: true,
+      binary: false,
+    });
+  });
+
+  it("a changes or diff frame of the wrong shape is not an answer", async () => {
+    const r = rig();
+    ready(r);
+    let outcome: unknown = "pending";
+    void r.client.request({ type: "changes", session: "s" }).then((x) => (outcome = x));
+    const req = r.sockets.last.commandsOf("changes")[0]?.req;
+    r.sockets.last.receive({ type: "changes", req, files: "none" });
+    r.sockets.last.receive({ type: "diff", req, path: "a", text: 5 });
+    await Promise.resolve();
+    expect(outcome).toBe("pending");
+    r.sockets.last.receive({ type: "changes", req, ahead: 0, behind: 0, files: [], more: 0 });
+    await Promise.resolve();
+    expect(outcome).toMatchObject({ type: "changes" });
+  });
+
+  it("a late changes or diff answer is dropped, not delivered", async () => {
+    const r = rig();
+    ready(r);
+    const changes = r.client.request({ type: "changes", session: "s" }).catch((e: unknown) => e);
+    const diff = r.client.request({ type: "diff", session: "s", path: "a" }).catch((e: unknown) => e);
+    chatter(r, REQUEST_TIMEOUT_MS);
+    await expect(changes).resolves.toMatchObject({ code: "lost" });
+    await expect(diff).resolves.toMatchObject({ code: "lost" });
+    const changesReq = r.sockets.last.commandsOf("changes")[0]?.req;
+    const diffReq = r.sockets.last.commandsOf("diff")[0]?.req;
+    r.sockets.last.receive({ type: "changes", req: changesReq, ahead: 0, behind: 0, files: [], more: 0 });
+    r.sockets.last.receive({ type: "diff", req: diffReq, path: "a", text: "", clipped: false, binary: false });
+    // An answer to nothing asked is dropped too.
+    r.sockets.last.receive({ type: "changes", req: 9_999, ahead: 0, behind: 0, files: [], more: 0 });
+    flush(r);
+    expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
   });
 
   it("a refusal without a code is invalid", async () => {
@@ -1158,6 +1312,34 @@ describe("hostile input", () => {
     expect(r.client.garbageFrames).toBe(garbage.length);
   });
 
+  it("takes whole the largest sessions frame the hub sends: MAX_SESSION_ROWS rows of 3-byte text, within MAX_MESSAGE", () => {
+    // The hub's bound (crates/octet-hub/src/sessions.rs `frame`) sits well under the phone's.
+    expect(MAX_MESSAGE).toBeLessThan(MAX_FRAME_BYTES);
+    const r = rig();
+    ready(r);
+    const row = (i: number, goal: string) => ({
+      id: `${100 + i}-1790000000`,
+      engine: "claude",
+      workspace: `/w/${i}`,
+      mode: "ask",
+      phase: "idle",
+      approvals: 0,
+      from_phone: false,
+      goal,
+    });
+    const frame = (goal: string) => JSON.stringify({ v: 1, type: "sessions", sessions: Array.from({ length: MAX_SESSION_ROWS }, (_, i) => row(i, goal)) });
+    // As much CJK as a goal can take while the frame still fits the hub's bound.
+    let chars = 0;
+    while (utf8Length(frame("目".repeat(chars + 1))) <= MAX_MESSAGE) chars += 1;
+    const text = frame("目".repeat(chars));
+    expect(utf8Length(text)).toBeGreaterThan(MAX_MESSAGE - 3 * MAX_SESSION_ROWS);
+    r.sockets.last.receive(text);
+    flush(r);
+    const sessions = delivered(r).filter((f) => f.type === "sessions").at(-1);
+    expect(sessions?.type === "sessions" ? sessions.sessions.length : -1).toBe(MAX_SESSION_ROWS);
+    expect(r.client.garbageFrames).toBe(0);
+  });
+
   it("a frame of exactly 256 KB is accepted", () => {
     const r = rig();
     ready(r);
@@ -1245,5 +1427,25 @@ describe("batching", () => {
     ready(r);
     flush(r);
     expect(seen).toEqual([]);
+  });
+});
+
+describe("a background connection", () => {
+  it("says so in its hello, and is otherwise the same client", () => {
+    const r = rig({ background: true });
+    r.client.start();
+    r.sockets.last.open();
+    expect(r.sockets.last.commands()).toEqual([{ v: 1, type: "hello", req: expect.any(Number), token: TOKEN, background: true }]);
+    r.sockets.last.receive({ type: "welcome", device: "iPhone" });
+    expect(r.client.state).toBe("ready");
+  });
+
+  it("a client that is not one sends no background field at all", () => {
+    for (const background of [undefined, false]) {
+      const r = rig(background === undefined ? {} : { background });
+      r.client.start();
+      r.sockets.last.open();
+      expect(r.sockets.last.commandsOf("hello")[0]).not.toHaveProperty("background");
+    }
   });
 });

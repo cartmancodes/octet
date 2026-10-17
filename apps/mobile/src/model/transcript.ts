@@ -225,6 +225,15 @@ export class TranscriptDraft {
     }
   }
 
+  /** A note of the phone's own (not a journal record), unless the newest entry is already that
+   * very note: a repeated one adds no second divider. */
+  addLocalNote(raw: string): void {
+    const { text, bytes } = clip(raw, BLOCK_BYTES);
+    const last = this.entries[this.entries.length - 1];
+    if (last?.kind === "note" && last.text === text) return;
+    this.push({ kind: "note", key: this.key(), text }, bytes);
+  }
+
   // The array is copied once, on the first write.
   private own(): Entry[] {
     if (!this.owned) {

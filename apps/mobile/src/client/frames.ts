@@ -1,6 +1,8 @@
 import { PROTOCOL_VERSION, type ToPhone } from "../protocol";
 
-/** The largest frame taken, in bytes of UTF-8. The hub bounds what it sends well below this. */
+/** The largest frame taken, in bytes of UTF-8; a larger one parses to null. The hub keeps its
+ * `sessions`, `changes` and `diff` frames within `MAX_MESSAGE` (96 KiB, protocol.ts), well under
+ * this. */
 export const MAX_FRAME_BYTES = 256 * 1024;
 
 type Obj = Record<string, unknown>;
@@ -72,6 +74,11 @@ export function parseFrame(text: string): ToPhone | null {
         return isStr(value.session) && isObj(value.catalog);
       case "recent":
         return isUint(value.req) && Array.isArray(value.items);
+      // Their strings and numbers are cleaned before the request resolves (answers.ts).
+      case "changes":
+        return isUint(value.req) && Array.isArray(value.files);
+      case "diff":
+        return isUint(value.req) && isStr(value.path) && isStr(value.text);
       case "ack":
         return isUint(value.req) && isStr(value.message);
       case "refused":

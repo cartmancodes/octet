@@ -1,71 +1,159 @@
-import { Stack, useRouter } from "expo-router";
+import { Stack, useNavigationContainerRef, usePathname, useRouter } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import * as SystemUI from "expo-system-ui";
-import { useEffect, useRef } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { AppState, View } from "react-native";
 
-import { useHubController, useHubSnapshot } from "../src/hub";
-import { clearDelivered, configureNotifications, watchTaps } from "../src/notifications";
+import { LiveActivity, LiveActivityContext, LiveApiContext } from "../src/activity";
+import { ApprovalToasts } from "../src/components/ApprovalToasts";
+import { Drawer, DrawerHost } from "../src/components/Drawer";
+import { closeDrawer, drawerScreen, setDrawerEnabled } from "../src/drawer";
+import { useFleetStatus, useHubController, useOffer } from "../src/hub";
+import { openSession, parseApproveLink, watchApproveLinks } from "../src/navigation";
+import { clearDelivered, configureNotifications, watchTaps, type Tap } from "../src/notifications";
 import { useTheme } from "../src/theme";
+import { ToastHost } from "../src/ui";
 
 // The native splash stays up until the app knows whether it is paired; app.json paints it in the
 // theme's colours, so there is no flash between it and the first screen.
 SplashScreen.preventAutoHideAsync().catch(() => undefined);
 
+/** The drawer owns the left edge on the Inbox, a Conversation and Settings, so those screens give
+ * up the system's back-swipe (a swipe from the edge, or from anywhere). Their header buttons and
+ * Android back still go back. */
+const OWN_EDGE = { gestureEnabled: false, fullScreenGestureEnabled: false } as const;
+
 /**
- * The shell. The app makes one hub connection (`hub` in src/hub.ts, the context's default).
- * Without a token the user can reach only Pair (`Stack.Protected` redirects), and a token the
- * Mac revoked sends them back there. Put every other screen inside the paired group below.
+ * The shell. The app's Fleet (`hub` in src/hub.ts, the context's default) connects to every
+ * paired Mac. With no pairing the user can reach only Pair (`Stack.Protected` redirects), and the
+ * last Mac revoking the phone sends them back there. Pair stays reachable while paired, to pair
+ * another machine (`/pair?add=1`). Put every other screen inside the paired group below.
  */
 export default function RootLayout() {
   const theme = useTheme();
   const hub = useHubController();
   const router = useRouter();
-  const { status, offer } = useHubSnapshot();
+  const nav = useNavigationContainerRef();
+  // Two primitives, not the snapshot: a link's state changing does not render the shell.
+  const status = useFleetStatus();
+  const offer = useOffer();
+  const pathname = usePathname();
+  // The Live Activity, driven from the same store and Macs as the screens (src/activity.ts).
+  const liveApi = useContext(LiveApiContext);
+  const live = useMemo(() => new LiveActivity({ api: liveApi, fleet: hub, store: hub.store }), [liveApi, hub]);
+  useEffect(() => {
+    live.start();
+    return () => live.stop();
+  }, [live]);
+
+  // The drawer belongs to the Inbox, a Conversation and Settings of a paired phone: anywhere else
+  // (Pair, New session) it is closed and disabled. A layout effect, so no frame shows it open there.
+  const drawerHere = status === "paired" && !offer && drawerScreen(pathname);
+  useLayoutEffect(() => {
+    setDrawerEnabled(drawerHere);
+    return () => setDrawerEnabled(false);
+  }, [drawerHere]);
+  // Any navigation (a notification tap, a link, a tap on a drawer row) leaves the drawer shut.
+  useEffect(() => closeDrawer(), [pathname]);
 
   useEffect(() => {
-    // The socket and its timers live only while the app is in the foreground. `inactive` is a
+    // The sockets and their timers live only while the app is in the foreground. `inactive` is a
     // pause (a Face ID prompt, the app switcher), not the background. A launch that reports no
     // state yet counts as foreground. Back in the app, the notifications in the tray are old
     // news: the screens show the live state.
-    hub.setForeground(AppState.currentState !== "background");
+    const foreground = AppState.currentState !== "background";
+    hub.setForeground(foreground);
+    live.setForeground(foreground);
     const subscription = AppState.addEventListener("change", (state) => {
       if (state === "active") {
         hub.setForeground(true);
+        live.setForeground(true);
         void clearDelivered();
-      } else if (state === "background") hub.setForeground(false);
+      } else if (state === "background") {
+        hub.setForeground(false);
+        live.setForeground(false);
+      }
     });
     void hub.init();
     return () => subscription.remove();
-  }, [hub]);
+  }, [hub, live]);
 
-  // A tap opens the session it names; unpaired, the phone can only pair; a tap that names no
-  // valid session lands on Sessions. (The Session screen already handles a session that is gone.)
-  const open = (session: string | null) => {
-    if (status === "unpaired") router.replace("/pair");
-    else if (session === null) router.replace("/");
-    else router.push({ pathname: "/session/[id]", params: { id: session } });
+  // A tap opens the session it names on the Mac it names (`Fleet.tapKey`: the pairing of the
+  // push's host, or the only one when it names none), as the drawer does (back to it when it is in
+  // the stack); unpaired, the phone can only pair. A tap for no valid session, a host no pairing
+  // has, no host with several Macs, or a session that Mac has ended lands on the Inbox, and
+  // nothing is sent. (The Session screen handles a session found gone once its Mac lists.)
+  const open = (tap: Tap) => {
+    if (status === "unpaired") {
+      router.replace("/pair");
+      return;
+    }
+    const key = hub.tapKey(tap);
+    if (key === null) router.replace("/");
+    else openSession(router, nav.getRootState(), pathname, key);
   };
-  // The latest of these, for the listener below, which is set up once.
-  const route = useRef({ status, offer, open });
-  const waiting = useRef<{ session: string | null } | null>(null);
+  // The Island's Allow (`octet://approve/<host>/<raw>/<approval>`, src/navigation.ts): for a known
+  // Mac (`Fleet.approveNow`, through `keyFor`), a session it lists as live and that approval
+  // waiting there, the session opens as from a tap, and its Permission card asks for Face ID and
+  // waits out the arm as everywhere. Anything else, a forged, stale or unknown link, opens the
+  // Inbox. The link sends nothing. Before that Mac has listed (just after a cold start) the Inbox
+  // shows while it waits, and the session opens over it only if the user is still there and no
+  // newer link came.
+  const approve = (url: string) => {
+    if (status === "unpaired") {
+      router.replace("/pair");
+      return;
+    }
+    const link = parseApproveLink(url);
+    const now = link === null ? null : hub.approveNow(link);
+    links.current += 1;
+    if (typeof now === "string") {
+      openSession(router, nav.getRootState(), pathname, now);
+      return;
+    }
+    router.replace("/");
+    if (link === null || now === null) return;
+    const seq = links.current;
+    void hub.approveKey(link).then((key) => {
+      if (key === null || links.current !== seq || route.current.pathname !== "/") return;
+      openSession(router, nav.getRootState(), "/", key);
+    });
+  };
+  const links = useRef(0);
+  // The latest of these, for the listeners below, which are set up once.
+  const route = useRef({ status, offer, open, approve, pathname });
+  const waiting = useRef<Tap | null>(null);
+  const waitingLink = useRef<string | null>(null);
   useEffect(() => {
-    route.current = { status, offer, open };
-    if (status === "loading" || offer || waiting.current === null) return;
-    // A tap that arrived before the saved pairing was read, or during the notifications step.
-    const { session } = waiting.current;
+    route.current = { status, offer, open, approve, pathname };
+    if (status === "loading" || offer) return;
+    // A tap or a link that arrived before the saved pairings were read, or during the
+    // notifications step.
+    const tap = waiting.current;
+    const url = waitingLink.current;
     waiting.current = null;
-    open(session);
+    waitingLink.current = null;
+    if (tap !== null) open(tap);
+    if (url !== null) approve(url);
   });
+
+  useEffect(
+    () =>
+      watchApproveLinks((url) => {
+        if (route.current.status === "loading" || route.current.offer) waitingLink.current = url;
+        else route.current.approve(url);
+      }),
+    [],
+  );
 
   // Nothing shows while the app is open; Android gets its channels. Then taps on notifications,
   // the one that launched the app included.
   useEffect(() => {
     void configureNotifications();
-    return watchTaps((session) => {
-      if (route.current.status === "loading" || route.current.offer) waiting.current = { session };
-      else route.current.open(session);
+    return watchTaps((tap) => {
+      if (route.current.status === "loading" || route.current.offer) waiting.current = tap;
+      else route.current.open(tap);
     });
   }, []);
 
@@ -84,26 +172,34 @@ export default function RootLayout() {
 
   const paired = status === "paired";
   return (
-    <>
+    <LiveActivityContext.Provider value={live}>
       <StatusBar style="auto" />
-      <Stack
-        screenOptions={{
-          headerStyle: { backgroundColor: theme.panel },
-          headerTintColor: theme.fg,
-          headerShadowVisible: false,
-          contentStyle: { backgroundColor: theme.bg },
-        }}
-      >
-        <Stack.Protected guard={paired && !offer}>
-          <Stack.Screen name="index" options={{ title: "Sessions" }} />
-          <Stack.Screen name="session/[id]" options={{ title: "Session" }} />
-          <Stack.Screen name="recent" options={{ title: "Recent and new" }} />
-          <Stack.Screen name="settings" options={{ title: "Settings" }} />
-        </Stack.Protected>
-        <Stack.Protected guard={!paired || offer}>
+      <DrawerHost>
+        <Stack
+          screenOptions={{
+            headerStyle: { backgroundColor: theme.panel },
+            headerTintColor: theme.fg,
+            headerShadowVisible: false,
+            contentStyle: { backgroundColor: theme.bg },
+          }}
+        >
+          <Stack.Protected guard={paired && !offer}>
+            <Stack.Screen name="index" options={{ title: "Inbox", headerShown: false, ...OWN_EDGE }} />
+            <Stack.Screen name="session/[id]" options={{ title: "Session", headerShown: false, ...OWN_EDGE }} />
+            <Stack.Screen name="new" options={{ title: "New session", headerShown: false }} />
+            <Stack.Screen name="recent" options={{ title: "Resume a session" }} />
+            <Stack.Screen name="settings" options={{ title: "Settings", headerShown: false, ...OWN_EDGE }} />
+            <Stack.Screen name="usage" options={{ title: "Usage", headerShown: false }} />
+            <Stack.Screen name="changes" options={{ title: "Changes", headerShown: false }} />
+          </Stack.Protected>
+          {/* Unguarded: the only screen of a phone with no Mac, and how a paired one adds another. */}
           <Stack.Screen name="pair" options={{ title: "Pair", headerShown: false }} />
-        </Stack.Protected>
-      </Stack>
-    </>
+        </Stack>
+      </DrawerHost>
+      {paired && !offer ? <ApprovalToasts /> : null}
+      {paired && !offer ? <Drawer /> : null}
+      {/* Last, so a toast draws over the drawer and its scrim: its action still works there. */}
+      <ToastHost />
+    </LiveActivityContext.Provider>
   );
 }

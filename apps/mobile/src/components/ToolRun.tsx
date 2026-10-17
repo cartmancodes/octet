@@ -1,9 +1,12 @@
 import { memo, useCallback, useMemo } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
+import { editedFile, splitPath } from "../changes";
 import type { Entry } from "../model/transcript";
 import { callRows, moreCalls, moreLines, summary, toolRows, type ToolRow } from "../model/summary";
-import { dark, light, spacing, type, useTheme, type Theme } from "../theme";
+import { DEFAULT_SETTINGS, type TextSize } from "../persist";
+import { sizedStyles, transcriptText } from "../sizedStyles";
+import { spacing, useTheme, type Theme } from "../theme";
 
 export type ToolsEntry = Extract<Entry, { kind: "tools" }>;
 
@@ -13,19 +16,29 @@ interface ToolRunProps {
   open: boolean;
   /** Called with the entry's key. Must be stable, or every row re-renders with the list. */
   onToggle: (key: string) => void;
+  /** The transcript's text size. */
+  size?: TextSize;
+  /** Given, an entry that edited a file ends in "view ›", which calls it with that file (the
+   * first, of several). Must be stable. */
+  onView?: (file: string) => void;
 }
 
-function makeStyles(theme: Theme) {
+function makeStyles(theme: Theme, size: TextSize) {
+  const mono = transcriptText(size);
   return StyleSheet.create({
     run: { minHeight: 44, justifyContent: "center", gap: spacing.xs, paddingVertical: spacing.xs },
-    head: { ...type.mono, color: theme.muted },
-    failed: { ...type.mono, color: theme.amber },
-    detail: { ...type.mono, color: theme.muted, paddingLeft: spacing.lg },
+    /** The run beside its "view ›". */
+    line: { flexDirection: "row", alignItems: "flex-start" },
+    grow: { flex: 1, minHeight: 44, justifyContent: "center", gap: spacing.xs, paddingVertical: spacing.xs },
+    view: { minWidth: 44, minHeight: 44, paddingLeft: spacing.sm, paddingVertical: spacing.xs, alignItems: "flex-end" },
+    link: { ...mono, color: theme.accent },
+    head: { ...mono, color: theme.muted },
+    failed: { ...mono, color: theme.amber },
+    detail: { ...mono, color: theme.muted, paddingLeft: spacing.lg },
   });
 }
 type Styles = ReturnType<typeof makeStyles>;
-const DARK = makeStyles(dark);
-const LIGHT = makeStyles(light);
+const stylesFor = sizedStyles(makeStyles);
 
 const EXPANDED = { expanded: true } as const;
 const COLLAPSED = { expanded: false } as const;
@@ -60,26 +73,40 @@ function spoken(entry: ToolsEntry, open: boolean): string {
  * command" for the calls done, "… Bash cargo test" per call running, and each failure open in
  * amber with its last lines. A tap lists every call with its whole detail.
  */
-export const ToolRun = memo(function ToolRun({ entry, open, onToggle }: ToolRunProps) {
+export const ToolRun = memo(function ToolRun({ entry, open, onToggle, size = DEFAULT_SETTINGS.textSize, onView }: ToolRunProps) {
   const theme = useTheme();
-  const s = theme === light ? LIGHT : DARK;
+  const s = stylesFor(theme, size);
   const rows = useMemo(() => {
     if (!open) return toolRows(entry.calls, entry.over);
     const head: ToolRow = { kind: "summary", head: summary(entry.calls), lines: [], more: 0 };
     return [{ ...head, head: `▾ ${head.head}`, kind: "done" as const }, ...callRows(entry.calls, entry.over)];
   }, [entry, open]);
   const toggle = useCallback(() => onToggle(entry.key), [onToggle, entry.key]);
+  const edited = useMemo(() => (onView ? editedFile(entry) : null), [entry, onView]);
+  const view = useCallback(() => {
+    if (edited !== null) onView?.(edited);
+  }, [edited, onView]);
   if (entry.calls.length === 0) return null;
-  return (
+  const run = (
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={spoken(entry, open)}
       accessibilityState={open ? EXPANDED : COLLAPSED}
       onPress={toggle}
-      style={s.run}
+      style={edited === null ? s.run : s.grow}
     >
       <Rows rows={rows} s={s} />
       {(entry.more ?? 0) > 0 ? <Text style={s.head}>{moreCalls(entry.more ?? 0)}</Text> : null}
     </Pressable>
+  );
+  if (edited === null) return run;
+  // Beside the run, not in it: a screen reader reaches each control on its own.
+  return (
+    <View style={s.line}>
+      {run}
+      <Pressable accessibilityRole="button" accessibilityLabel={`View changes to ${splitPath(edited).name}`} onPress={view} style={s.view}>
+        <Text style={s.link}>view ›</Text>
+      </Pressable>
+    </View>
   );
 });

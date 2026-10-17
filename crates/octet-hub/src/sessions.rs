@@ -17,17 +17,32 @@
 //! or below what it has of that event's journal. Everything the tail emits after the
 //! subscription is either in the replay or delivered live, so nothing is lost and nothing
 //! repeats.
+//!
+//! # Facts
+//!
+//! The records a session's tails read also keep its [`Facts`]: the latest usage line, how many
+//! error records came since the hub first saw it (for the error push), and whether the last
+//! finished turn's reply ended on a question. When the hub first sees a session they are seeded
+//! from at most the last [`SEED_BYTES`] of its newest journal (errors aside: those were before the
+//! hub looked). A journal the session moved on from keeps every fact while it is drained before
+//! the newest starts; what it gets later, read beside the newest, only counts errors. Moving on
+//! to a fresh journal drops the question, which was the old journal's. A change to
+//! them is a [`SessionUpdate::Changed`] after the records' events.
 use crate::{
     push::Snapshot,
     tail::{Tail, event_of, file_name},
 };
 use octet_core::remote::{
-    protocol::{BridgeCommand, Code, MAX_BRIDGE_LINE, VERSION, bridge_command_json},
+    protocol::{
+        BridgeCommand, Code, MAX_BRIDGE_LINE, MAX_MESSAGE, MAX_SESSION_ROWS, VERSION,
+        bridge_command_json, sessions_frame,
+    },
     run::Registration,
 };
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
+    io::SeekFrom,
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
@@ -57,10 +72,19 @@ const INBOUND_QUEUE: usize = 256;
 const LINE_LIMIT: u64 = MAX_BRIDGE_LINE as u64 + 1;
 /// The largest registration file read.
 const REGISTRATION_LIMIT: u64 = 1024 * 1024;
-/// The longest `goal` in a `sessions` row, in characters.
+/// The longest `goal` and `now` in a `sessions` row, in characters.
 const GOAL_CHARS: usize = 200;
+/// The optional row fields a `sessions` frame over [`MAX_MESSAGE`] drops, in this order: each
+/// from every row, least recently active first, before the next. The approval keeps its count.
+const SHED: [&str; 4] = ["approval", "usage", "now", "goal"];
 /// How long a journal the session has moved on from is still read for its last records.
 const FOLLOW_PREVIOUS: Duration = Duration::from_secs(10);
+/// The most of a reply kept to tell whether it ended on a question, in characters.
+const REPLY_CHARS: usize = 256;
+/// The most of the newest journal read to seed a session's facts when the hub first sees it.
+const SEED_BYTES: u64 = 256 * 1024;
+/// Seeds read at once when the hub finds many sessions (at start, say).
+const SEEDS_AT_ONCE: usize = 8;
 
 /// What changed in the sessions since the last call to [`Sessions::next`].
 #[derive(Debug, PartialEq)]
@@ -135,6 +159,215 @@ struct Previous {
     until: Instant,
 }
 
+/// Most characters of a gist's text, and files in it.
+const GIST_CHARS: usize = 200;
+const GIST_FILES: usize = 3;
+
+/// `text` cut to `GIST_CHARS` characters (on a character boundary), with "…" when it was cut.
+fn clip(text: &str) -> String {
+    match text.char_indices().nth(GIST_CHARS) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
+}
+
+/// A command's first line, clipped; "…" also marks the lines left out.
+fn clip_command(command: &str) -> String {
+    let command = command.trim_start();
+    let (first, rest) = command.split_once('\n').unwrap_or((command, ""));
+    let mut line = clip(first.trim_end());
+    if !rest.trim().is_empty() && !line.ends_with('…') {
+        line.push('…');
+    }
+    line
+}
+
+/// An approval of the bridge's state as the `sessions` row carries it: just its gist, so a row
+/// stays small whatever the summary holds. The session's own state frame has the whole summary.
+/// None when the entry has no numeric id or no object summary.
+fn gist(approval: &Value) -> Option<Value> {
+    let id = approval.get("id")?.as_u64()?;
+    let summary = approval.get("summary")?.as_object()?;
+    let text = |key: &str| summary.get(key)?.as_str();
+    let mut out = serde_json::Map::new();
+    for key in ["action", "scope", "cwd"] {
+        if let Some(value) = text(key) {
+            out.insert(key.into(), json!(clip(value)));
+        }
+    }
+    if let Some(command) = text("command") {
+        out.insert("command".into(), json!(clip_command(command)));
+    }
+    if let Some(files) = summary.get("files").and_then(Value::as_array) {
+        let mut shown: Vec<String> = files
+            .iter()
+            .filter_map(Value::as_str)
+            .take(GIST_FILES)
+            .map(clip)
+            .collect();
+        if files.len() > GIST_FILES {
+            shown.push(format!("+{} more", files.len() - GIST_FILES));
+        }
+        out.insert("files".into(), json!(shown));
+    }
+    Some(json!({"id": id, "summary": out}))
+}
+
+/// What a session's journal records have said that its row and the pusher show.
+#[derive(Debug, Default)]
+struct Facts {
+    /// The latest `usage` record's text, clipped to [`GOAL_CHARS`].
+    usage: Option<String>,
+    /// `error` records read since the hub first saw the session.
+    errors: u64,
+    /// The last [`REPLY_CHARS`] characters of the reply text since the last `user` record.
+    reply: String,
+    /// The last finished turn completed and its reply, trimmed, ended on `?`; cleared by the next
+    /// `user` record, or when the session moves on to a fresh journal. A heuristic: the reply
+    /// may ask in other words, or quote a question.
+    question: bool,
+}
+
+impl Facts {
+    /// Takes one record of `kind` with `data`; whether the row or the pusher sees a change. A
+    /// reply's chunk costs at most [`REPLY_CHARS`] characters of work, however long it or the
+    /// reply is.
+    fn take(&mut self, kind: &str, data: &Value) -> bool {
+        match kind {
+            "usage" => {
+                let Some(text) = data.as_str() else {
+                    return false;
+                };
+                let usage: String = text.chars().take(GOAL_CHARS).collect();
+                if self.usage.as_ref() == Some(&usage) {
+                    return false;
+                }
+                self.usage = Some(usage);
+                true
+            }
+            "error" => {
+                self.errors = self.errors.saturating_add(1);
+                true
+            }
+            "text" => {
+                if let Some(chunk) = data.as_str() {
+                    self.hear(chunk);
+                }
+                false
+            }
+            "user" => {
+                self.reply.clear();
+                std::mem::replace(&mut self.question, false)
+            }
+            "finished" => {
+                // Only a turn that completed asked: an interrupted or failed one was cut short.
+                let asked =
+                    data.as_str() == Some("completed") && self.reply.trim_end().ends_with('?');
+                asked != std::mem::replace(&mut self.question, asked)
+            }
+            _ => false,
+        }
+    }
+
+    /// Takes one record of `kind` from a journal the session moved on from, read after the
+    /// newest began ([`Heard::Late`]): only an error counts, since the usage, reply and question
+    /// are the newest journal's now. Whether the pusher sees a change.
+    fn take_late(&mut self, kind: &str) -> bool {
+        kind == "error" && self.take(kind, &Value::Null)
+    }
+
+    /// Adds a chunk of the reply, keeping its last [`REPLY_CHARS`] characters.
+    fn hear(&mut self, chunk: &str) {
+        self.reply.push_str(last_chars(chunk, REPLY_CHARS));
+        // At most twice the limit here, so counting is bounded too.
+        let extra = self.reply.chars().count().saturating_sub(REPLY_CHARS);
+        if extra > 0 {
+            let cut = self
+                .reply
+                .char_indices()
+                .nth(extra)
+                .map_or(self.reply.len(), |(at, _)| at);
+            self.reply.drain(..cut);
+        }
+    }
+}
+
+/// The last `count` characters of `text` (all of it when shorter), found from its end.
+fn last_chars(text: &str, count: usize) -> &str {
+    match count.checked_sub(1) {
+        None => "",
+        Some(back) => text
+            .char_indices()
+            .rev()
+            .nth(back)
+            .map_or(text, |(at, _)| &text[at..]),
+    }
+}
+
+/// The record kinds a seed parses, as a journal line spells them; any other line is passed over
+/// without being parsed.
+const SEEDED: [&[u8]; 5] = [
+    br#""type":"usage""#,
+    br#""type":"error""#,
+    br#""type":"text""#,
+    br#""type":"user""#,
+    br#""type":"finished""#,
+];
+
+/// [`seed_now`] off the async threads.
+#[cfg(test)]
+async fn seed(journal: &Path, end: u64) -> (Facts, u64) {
+    let journal = journal.to_owned();
+    tokio::task::spawn_blocking(move || seed_now(&journal, end))
+        .await
+        .unwrap_or_default()
+}
+
+/// The facts the last [`SEED_BYTES`] before `end` of `journal` hold, and the bytes read. One
+/// bounded read, of the window and the byte before it: when the window starts past the
+/// journal's beginning, everything through the first newline read is the end of an earlier line
+/// and is passed over, so a line that starts the window exactly is kept whole. It blocks: the
+/// hub runs it off the async threads ([`Sessions::seed_all`]). Errors are not counted: they
+/// were before the hub looked. A journal that cannot be read seeds nothing.
+fn seed_now(journal: &Path, end: u64) -> (Facts, u64) {
+    use std::io::{Read, Seek};
+    let start = end.saturating_sub(SEED_BYTES);
+    let from = start.saturating_sub(1);
+    let read = || {
+        let mut file = std::fs::File::open(journal)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        file.seek(SeekFrom::Start(from))?;
+        let mut bytes = Vec::new();
+        file.take(end - from).read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let mut facts = Facts::default();
+    let Ok(bytes) = read() else {
+        return (facts, 0);
+    };
+    let mut lines = bytes.split(|&byte| byte == b'\n');
+    if start > 0 {
+        lines.next();
+    }
+    let seeded = |line: &[u8]| {
+        SEEDED
+            .iter()
+            .any(|kind| line.windows(kind.len()).any(|at| at == *kind))
+    };
+    for line in lines.filter(|line| seeded(line)) {
+        let Ok(record) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if let Some(kind) = record.get("type").and_then(Value::as_str) {
+            facts.take(kind, record.get("data").unwrap_or(&Value::Null));
+        }
+    }
+    facts.errors = 0;
+    (facts, bytes.len() as u64)
+}
+
 /// One session: its registration, bridge link, journal tails and what the bridge last said.
 #[derive(Debug)]
 struct Live {
@@ -146,6 +379,7 @@ struct Live {
     state: Option<Value>,
     catalog: Option<Value>,
     last_activity: Option<u64>,
+    facts: Facts,
 }
 
 impl Live {
@@ -169,6 +403,9 @@ impl Live {
         let approvals = state
             .and_then(|s| s.get("approvals")?.as_array())
             .map_or(0, Vec::len);
+        let front = state
+            .and_then(|s| s.get("approvals")?.as_array()?.first())
+            .and_then(gist);
         let mut row = json!({
             "id": registration.id,
             "engine": registration.engine,
@@ -185,8 +422,14 @@ impl Live {
             ),
             ("last_activity", self.last_activity.map(|t| json!(t))),
             ("goal", goal.map(|g| json!(g))),
-            ("now", text("now").map(|now| json!(now))),
+            (
+                "now",
+                text("now").map(|now| json!(now.chars().take(GOAL_CHARS).collect::<String>())),
+            ),
             ("tmux", registration.tmux.as_ref().map(|t| json!(t))),
+            ("approval", front),
+            ("usage", self.facts.usage.as_ref().map(|u| json!(u))),
+            ("question", self.facts.question.then_some(json!(true))),
         ];
         for (key, value) in optional {
             if let Some(value) = value {
@@ -195,6 +438,17 @@ impl Live {
         }
         row
     }
+}
+
+/// Where a session runs and where its turn is, for git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Place {
+    /// The workspace its registration names.
+    pub(crate) workspace: PathBuf,
+    /// The phase its bridge last said; none while it has no link, or before it said one.
+    pub(crate) phase: Option<String>,
+    /// The approvals waiting.
+    pub(crate) approvals: usize,
 }
 
 /// Every session the hub can reach.
@@ -207,6 +461,34 @@ pub(crate) struct Sessions {
     sender: mpsc::Sender<Inbound>,
     tick: Option<Interval>,
     links: u64,
+    /// How many seeds run at once, for tests.
+    #[cfg(test)]
+    seeding: std::sync::Arc<Gauge>,
+}
+
+/// How many of something run at once, and the most that ever did.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Gauge {
+    now: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Gauge {
+    /// One more runs until the guard drops.
+    fn hold(self: &std::sync::Arc<Self>) -> impl Drop + use<> {
+        use std::sync::atomic::Ordering::SeqCst;
+        struct Held(std::sync::Arc<Gauge>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.now.fetch_sub(1, SeqCst);
+            }
+        }
+        let now = self.now.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(now, SeqCst);
+        Held(std::sync::Arc::clone(self))
+    }
 }
 
 impl Sessions {
@@ -221,6 +503,8 @@ impl Sessions {
             sender,
             tick: None,
             links: 0,
+            #[cfg(test)]
+            seeding: std::sync::Arc::default(),
         }
     }
 
@@ -239,7 +523,16 @@ impl Sessions {
     pub(crate) async fn refresh(&mut self) {
         let home = tokio::fs::canonicalize(&self.run).await.ok();
         let mut changed = false;
-        let mut present = Vec::new();
+        let mut present = HashSet::new();
+        // Where each session the hub had before this pass is; new ones go after them.
+        let known: HashMap<String, usize> = self
+            .live
+            .iter()
+            .enumerate()
+            .map(|(at, live)| (live.registration.id.clone(), at))
+            .collect();
+        // New sessions' facts, seeded once the pass has found them all.
+        let mut unseeded = Vec::new();
         for (file, registration) in scan(&self.run).await {
             if !vetted(home.as_deref(), &file, &registration).await {
                 let _ = tokio::fs::remove_file(&file).await;
@@ -258,21 +551,14 @@ impl Sessions {
                 }
                 Journals::Missing => {
                     // Not trusted yet, but not wrong either: a session already known stays.
-                    if self
-                        .live
-                        .iter()
-                        .any(|l| l.registration.id == registration.id)
-                    {
-                        present.push(registration.id.clone());
+                    if known.contains_key(&registration.id) {
+                        present.insert(registration.id.clone());
                     }
                     continue;
                 }
             }
-            let known = self
-                .live
-                .iter()
-                .position(|l| l.registration.id == registration.id);
-            let link = if known.is_none_or(|at| self.live[at].link.is_none()) {
+            let at = known.get(&registration.id).copied();
+            let link = if at.is_none_or(|at| self.live[at].link.is_none()) {
                 let Some(link) = self.connect(&registration).await else {
                     let _ = tokio::fs::remove_file(&file).await;
                     let _ = tokio::fs::remove_file(&registration.socket).await;
@@ -282,14 +568,20 @@ impl Sessions {
             } else {
                 None
             };
-            present.push(registration.id.clone());
-            match known {
+            if !present.insert(registration.id.clone()) {
+                // Two registration files naming one session: the first stands.
+                continue;
+            }
+            match at {
                 None => {
                     let tail = match registration.journals.last() {
                         Some(newest) => Some(Tail::at_end(newest.clone()).await),
                         None => None,
                     };
                     let last_activity = activity(&registration.journals).await;
+                    if let Some(tail) = &tail {
+                        unseeded.push((self.live.len(), tail.path().to_owned(), tail.offset()));
+                    }
                     self.live.push(Live {
                         registration,
                         link,
@@ -298,6 +590,7 @@ impl Sessions {
                         state: None,
                         catalog: None,
                         last_activity,
+                        facts: Facts::default(),
                     });
                     changed = true;
                 }
@@ -308,13 +601,14 @@ impl Sessions {
                     }
                     changed |= shows_differently(&live.registration, &registration);
                     if live.registration.journals != registration.journals {
-                        follow(live, &registration.journals, &mut self.pending).await;
+                        changed |= follow(live, &registration.journals, &mut self.pending).await;
                     }
                     live.registration = registration;
                     live.last_activity = activity(&live.registration.journals).await;
                 }
             }
         }
+        self.seed_all(unseeded).await;
         let before = self.live.len();
         self.live.retain(|l| present.contains(&l.registration.id));
         if changed || self.live.len() != before {
@@ -322,9 +616,94 @@ impl Sessions {
         }
     }
 
-    /// The `sessions` frame's rows, oldest session first.
+    /// Seeds the facts of the new sessions `unseeded` names (where each is in `live`, its newest
+    /// journal and where its tail starts), [`SEEDS_AT_ONCE`] at a time, off the async threads:
+    /// a hub that finds two hundred sessions does not read them one by one.
+    async fn seed_all(&mut self, unseeded: Vec<(usize, PathBuf, u64)>) {
+        let mut running = tokio::task::JoinSet::new();
+        let mut unseeded = unseeded.into_iter();
+        loop {
+            while running.len() < SEEDS_AT_ONCE
+                && let Some((at, journal, end)) = unseeded.next()
+            {
+                #[cfg(test)]
+                let gauge = std::sync::Arc::clone(&self.seeding);
+                running.spawn_blocking(move || {
+                    #[cfg(test)]
+                    let _held = gauge.hold();
+                    (at, seed_now(&journal, end).0)
+                });
+            }
+            let Some(seeded) = running.join_next().await else {
+                return;
+            };
+            if let Ok((at, facts)) = seeded
+                && let Some(live) = self.live.get_mut(at)
+            {
+                live.facts = facts;
+            }
+        }
+    }
+
+    /// The rows of the `sessions` frame (see [`frame`](Self::frame)).
+    #[cfg(test)]
     pub(crate) fn list(&self) -> Vec<Value> {
-        self.live.iter().map(Live::row).collect()
+        self.bounded().into_iter().map(|(row, _)| row).collect()
+    }
+
+    /// The `sessions` frame, as the text that goes to phones: at most [`MAX_SESSION_ROWS`] rows,
+    /// oldest session first, the most recently active kept; never over [`MAX_MESSAGE`], however
+    /// much the sessions hold, since past it the rows lose their optional fields as [`SHED`]
+    /// says, then the least recently active rows go, until it fits. Each row is written once.
+    pub(crate) fn frame(&self) -> String {
+        let rows: Vec<String> = self.bounded().into_iter().map(|(_, text)| text).collect();
+        frame_text(&rows)
+    }
+
+    /// [`frame`](Self::frame)'s rows, each with its text.
+    fn bounded(&self) -> Vec<(Value, String)> {
+        // Least recently active first: the order rows give way in.
+        let mut order: Vec<usize> = (0..self.live.len()).collect();
+        order.sort_by_key(|&i| (self.live[i].last_activity, i));
+        let over = order.len().saturating_sub(MAX_SESSION_ROWS);
+        let (gone, order) = order.split_at(over);
+        let mut rows: Vec<Option<(Value, String)>> = self
+            .live
+            .iter()
+            .map(|live| {
+                let row = live.row();
+                let text = row.to_string();
+                Some((row, text))
+            })
+            .collect();
+        for &i in gone {
+            rows[i] = None;
+        }
+        let mut size = FrameSize::of(rows.iter().flatten().map(|(_, text)| text.len()));
+        for key in SHED {
+            for &i in order {
+                if size.fits() {
+                    break;
+                }
+                if let Some((row, text)) = rows[i].as_mut()
+                    && let Some(fields) = row.as_object_mut()
+                    && fields.remove(key).is_some()
+                {
+                    let shorter = row.to_string();
+                    size.replace(text.len(), shorter.len());
+                    *text = shorter;
+                }
+            }
+        }
+        for &i in order {
+            if size.fits() {
+                break;
+            }
+            if let Some((_, text)) = rows[i].take() {
+                size.remove(text.len());
+            }
+        }
+        rows.into_iter().flatten().collect()
     }
 
     /// What each session looks like to the pusher: its journals, phase and open approval ids.
@@ -343,6 +722,7 @@ impl Sessions {
                         .and_then(|s| s.get("approvals")?.as_array())
                         .map(|list| list.iter().filter_map(|a| a.get("id")?.as_u64()).collect())
                         .unwrap_or_default(),
+                    errors: live.facts.errors,
                 }
             })
             .collect()
@@ -415,6 +795,22 @@ impl Sessions {
         Err(failed)
     }
 
+    /// Where session `id` runs, from its registration, and where its turn is, from what its
+    /// bridge last said; none for a session the hub does not have.
+    pub(crate) fn place(&self, id: &str) -> Option<Place> {
+        let live = self.find(id)?;
+        let state = live.state.as_ref();
+        Some(Place {
+            workspace: live.registration.workspace.clone(),
+            phase: state
+                .and_then(|s| s.get("phase")?.as_str())
+                .map(str::to_owned),
+            approvals: state
+                .and_then(|s| s.get("approvals")?.as_array())
+                .map_or(0, Vec::len),
+        })
+    }
+
     /// Whether session `id` is there and its bridge linked.
     pub(crate) fn linked(&self, id: &str) -> bool {
         self.find(id).is_some_and(|live| live.link.is_some())
@@ -443,9 +839,7 @@ impl Sessions {
     }
 
     fn push_changed(&mut self) {
-        if self.pending.back() != Some(&SessionUpdate::Changed) {
-            self.pending.push_back(SessionUpdate::Changed);
-        }
+        push_changed(&mut self.pending);
     }
 
     /// Applies a frame from a bridge; one from a link that has since been replaced is ignored.
@@ -491,7 +885,9 @@ impl Sessions {
     }
 
     /// Reads every session's journals for records written since the last pass: the journals
-    /// it moved on from first, each let go once it stops or its time is up, then the newest.
+    /// it moved on from first, each let go once it stops or its time is up, then the newest. A
+    /// change to a session's facts is a `Changed` queued right after that journal's events, so
+    /// a pass the hub loop drops halfway loses none.
     async fn poll_tails(&mut self) {
         let now = Instant::now();
         for at in 0..self.live.len() {
@@ -503,10 +899,19 @@ impl Sessions {
             while index < live.previous.len() {
                 let tail = &mut live.previous[index].tail;
                 let found = match tail.read().await {
-                    Ok(records) => emit(&mut self.pending, id, &file_name(tail.path()), &records),
+                    Ok(records) => emit(
+                        &mut self.pending,
+                        (&mut live.facts, Heard::Late),
+                        id,
+                        &file_name(tail.path()),
+                        &records,
+                    ),
                     Err(_) => Emitted::default(),
                 };
                 wrote |= found.any;
+                if found.changed {
+                    push_changed(&mut self.pending);
+                }
                 if found.stopped {
                     live.previous.remove(index);
                 } else {
@@ -516,7 +921,17 @@ impl Sessions {
             if let Some(tail) = live.tail.as_mut()
                 && let Ok(records) = tail.read().await
             {
-                wrote |= emit(&mut self.pending, id, &file_name(tail.path()), &records).any;
+                let found = emit(
+                    &mut self.pending,
+                    (&mut live.facts, Heard::Whole),
+                    id,
+                    &file_name(tail.path()),
+                    &records,
+                );
+                wrote |= found.any;
+                if found.changed {
+                    push_changed(&mut self.pending);
+                }
             }
             if wrote {
                 live.last_activity = activity(&live.registration.journals).await;
@@ -553,6 +968,83 @@ impl Sessions {
     }
 }
 
+/// The bytes of a `sessions` frame around its rows, and between them.
+#[derive(Debug, Clone, Copy)]
+struct FrameSize {
+    /// The bytes of the frame without rows.
+    bare: usize,
+    /// The rows' bytes.
+    rows: usize,
+    /// How many rows there are.
+    count: usize,
+}
+
+impl FrameSize {
+    /// The size of a frame of rows `lengths` bytes long.
+    fn of(lengths: impl Iterator<Item = usize>) -> Self {
+        let bare = frame_text(&[]).len();
+        lengths.fold(
+            Self {
+                bare,
+                rows: 0,
+                count: 0,
+            },
+            |size, len| Self {
+                rows: size.rows + len,
+                count: size.count + 1,
+                ..size
+            },
+        )
+    }
+
+    /// The whole frame's bytes: the frame without rows, the rows and a comma between each two.
+    fn bytes(self) -> usize {
+        self.bare + self.rows + self.count.saturating_sub(1)
+    }
+
+    fn fits(self) -> bool {
+        self.bytes() <= MAX_MESSAGE
+    }
+
+    /// A row of `old` bytes is now `new` bytes long.
+    fn replace(&mut self, old: usize, new: usize) {
+        self.rows = self.rows - old + new;
+    }
+
+    /// A row of `len` bytes is gone.
+    fn remove(&mut self, len: usize) {
+        self.rows -= len;
+        self.count -= 1;
+    }
+}
+
+/// The text of the `sessions` frame whose rows' texts are `rows`, as
+/// [`sessions_frame`](octet_core::remote::protocol::sessions_frame) writes it.
+fn frame_text(rows: &[String]) -> String {
+    let empty = sessions_frame(&[]).to_string();
+    let (head, tail) = empty.split_once("[]").unwrap_or((&empty, ""));
+    let mut text =
+        String::with_capacity(empty.len() + rows.iter().map(|r| r.len() + 1).sum::<usize>());
+    text.push_str(head);
+    text.push('[');
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str(row);
+    }
+    text.push(']');
+    text.push_str(tail);
+    text
+}
+
+/// Queues a `Changed`, unless one is already the last thing queued.
+fn push_changed(pending: &mut VecDeque<SessionUpdate>) {
+    if pending.back() != Some(&SessionUpdate::Changed) {
+        pending.push_back(SessionUpdate::Changed);
+    }
+}
+
 /// Whether two registrations of one session differ in what a `sessions` row shows.
 fn shows_differently(old: &Registration, new: &Registration) -> bool {
     (
@@ -579,11 +1071,24 @@ struct Emitted {
     any: bool,
     /// A `stopped` record: the journal's session has ended.
     stopped: bool,
+    /// A record changed the session's [`Facts`].
+    changed: bool,
 }
 
-/// Queues an event for each record `records` holds.
+/// How the records a tail reads reach the session's [`Facts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heard {
+    /// In the session's order: the newest journal, or one drained before the newest starts.
+    Whole,
+    /// From a journal the session moved on from, read after the newest began: errors only.
+    Late,
+}
+
+/// Queues an event for each record `records` holds, and keeps `facts` up to date with them as
+/// `heard` says.
 fn emit(
     pending: &mut VecDeque<SessionUpdate>,
+    (facts, heard): (&mut Facts, Heard),
     id: &str,
     journal: &str,
     records: &[Value],
@@ -592,6 +1097,12 @@ fn emit(
     for (seq, record) in records.iter().filter_map(event_of) {
         emitted.any = true;
         emitted.stopped |= record["type"] == "stopped";
+        if let Some(kind) = record["type"].as_str() {
+            emitted.changed |= match heard {
+                Heard::Whole => facts.take(kind, &record["data"]),
+                Heard::Late => facts.take_late(kind),
+            };
+        }
         pending.push_back(SessionUpdate::Event {
             id: id.to_owned(),
             journal: journal.to_owned(),
@@ -605,14 +1116,20 @@ fn emit(
 /// Moves `live`'s tail to the newest of `journals`. What the old journal has left is emitted
 /// first, then every journal between whole (every earlier one when it had no tail or its journal
 /// left the list), and the tail starts the newest from its first byte. Each journal it moves on
-/// from without a `stopped` record is kept in `previous`, to be read for a while longer.
-async fn follow(live: &mut Live, journals: &[PathBuf], pending: &mut VecDeque<SessionUpdate>) {
+/// from without a `stopped` record is kept in `previous`, to be read for a while longer. Once they
+/// are drained the question and the reply so far are dropped: a fresh journal (`/new`, or a
+/// `/reconnect`) has asked nothing yet. Whether the session's facts changed.
+async fn follow(
+    live: &mut Live,
+    journals: &[PathBuf],
+    pending: &mut VecDeque<SessionUpdate>,
+) -> bool {
     let Some(newest) = journals.last() else {
-        return;
+        return false;
     };
     let current = live.tail.as_ref().map(|t| t.path().to_owned());
     if current.as_ref() == Some(newest) {
-        return;
+        return false;
     }
     let id = live.registration.id.clone();
     let until = Instant::now() + FOLLOW_PREVIOUS;
@@ -624,26 +1141,44 @@ async fn follow(live: &mut Live, journals: &[PathBuf], pending: &mut VecDeque<Se
         .map_or(0, |at| at + 1);
     let between = journals.get(start..journals.len() - 1).unwrap_or_default();
     passed.extend(between.iter().map(|path| Tail::new(path.clone())));
+    let mut changed = false;
     for mut tail in passed {
-        if !drain(&mut tail, &id, pending).await {
+        // What these journals have left comes before the newest's first record, in the
+        // session's own order, so it is the session's history and keeps every fact. Only what
+        // they get later, read beside the newest (`previous`), is late and counts errors alone.
+        let drained = drain(&mut tail, &mut live.facts, &id, pending).await;
+        changed |= drained.changed;
+        if !drained.stopped {
             live.previous.push(Previous { tail, until });
         }
     }
+    live.facts.reply.clear();
+    changed |= std::mem::replace(&mut live.facts.question, false);
     live.tail = Some(Tail::new(newest.clone()));
+    changed
 }
 
-/// Queues the events of everything `tail` has left to read; whether one was a `stopped` record.
-async fn drain(tail: &mut Tail, id: &str, pending: &mut VecDeque<SessionUpdate>) -> bool {
+/// Queues the events of everything `tail` has left to read, keeping `facts` up to date; whether
+/// one was a `stopped` record, and whether the facts changed.
+async fn drain(
+    tail: &mut Tail,
+    facts: &mut Facts,
+    id: &str,
+    pending: &mut VecDeque<SessionUpdate>,
+) -> Emitted {
     let journal = file_name(tail.path());
-    let mut stopped = false;
+    let mut drained = Emitted::default();
     loop {
         let before = tail.offset();
         let Ok(records) = tail.read().await else {
-            return stopped;
+            return drained;
         };
-        stopped |= emit(pending, id, &journal, &records).stopped;
+        let found = emit(pending, (facts, Heard::Whole), id, &journal, &records);
+        drained.any |= found.any;
+        drained.stopped |= found.stopped;
+        drained.changed |= found.changed;
         if tail.offset() <= before {
-            return stopped;
+            return drained;
         }
     }
 }
@@ -935,6 +1470,17 @@ mod tests {
                     json!({"format": "octet-preview-1", "seq": seq, "type": "t", "data": name});
                 writeln!(file, "{line}").unwrap();
             }
+        }
+
+        /// Appends one record of `kind` with `data` to the journal `name`, making it if need be.
+        fn write(&self, name: &str, seq: u64, kind: &str, data: &Value) {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.root.join(name))
+                .unwrap();
+            let line = json!({"format": "octet-preview-1", "seq": seq, "type": kind, "data": data});
+            writeln!(file, "{line}").unwrap();
         }
 
         /// Appends one record of `kind` to the journal `name`.
@@ -1273,7 +1819,8 @@ mod tests {
         let (read, mut write) = stream.into_split();
         let state = json!({"phase": "running", "queue": [], "queued": 0, "mode": "ask",
             "goal": {"objective": "ship it\nplease", "status": "active", "turns": 1, "max": 9},
-            "approvals": [{"id": 1, "summary": {}}, {"id": 2, "summary": {}}]});
+            "approvals": [{"id": 1, "summary": {"action": "Run Bash", "command": "ls",
+                "files": [], "scope": "this call"}}, {"id": 2, "summary": {"action": "Edit"}}]});
         let lines = [
             bridge_state_frame(&state),
             bridge_catalog_frame(&json!({"modes": ["ask"]})),
@@ -1323,7 +1870,9 @@ mod tests {
             rows[0],
             json!({"id": id, "engine": "claude", "model": "opus", "workspace": "/work",
                 "mode": "ask", "phase": "running", "approvals": 2, "last_activity": mtime,
-                "goal": "ship it", "from_phone": false})
+                "goal": "ship it", "from_phone": false,
+                "approval": {"id": 1, "summary": {"action": "Run Bash", "command": "ls",
+                    "files": [], "scope": "this call"}}})
         );
         // The hub's commands reach the bridge as parsable lines.
         let command = BridgeCommand::Prompt {
@@ -1364,6 +1913,739 @@ mod tests {
         let id = "4011-1790000000".to_owned();
         assert_eq!(next(&mut sessions).await, SessionUpdate::State { id });
         assert_eq!(sessions.list()[0]["now"], "Running Bash cargo test");
+    }
+
+    /// The worst summary the bridge's clip lets through: a 4 KiB command, 20 files of 512 bytes,
+    /// and long action, scope and cwd.
+    fn worst_summary() -> Value {
+        json!({"action": "A".repeat(2000), "command": "é".repeat(4096), "scope": "S".repeat(2000),
+            "cwd": "/w".repeat(1000),
+            "files": (0..20).map(|i| format!("{i}{}", "f".repeat(511))).collect::<Vec<_>>()})
+    }
+
+    fn live_with(env: &Env, pid: u32, state: Value) -> Live {
+        Live {
+            registration: env.registration(pid, &[]),
+            link: None,
+            tail: None,
+            previous: Vec::new(),
+            state: Some(state),
+            catalog: None,
+            last_activity: None,
+            facts: Facts::default(),
+        }
+    }
+
+    /// The updates up to and including the next `Changed`.
+    async fn until_changed(sessions: &mut Sessions) -> Vec<SessionUpdate> {
+        let mut got = Vec::new();
+        loop {
+            let update = next(sessions).await;
+            let changed = update == SessionUpdate::Changed;
+            got.push(update);
+            if changed {
+                return got;
+            }
+        }
+    }
+
+    #[test]
+    fn question_tail_is_bounded() {
+        let mut facts = Facts::default();
+        facts.take("user", &json!("go on"));
+        // A reply of 10,000 chunks of 2 KiB: the tail never holds more than 256 characters, and
+        // each chunk costs the same however long the reply has grown.
+        let chunk = json!(format!("{} ", "é".repeat(1023)));
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            facts.take("text", &chunk);
+            assert!(facts.reply.chars().count() <= REPLY_CHARS);
+            assert!(facts.reply.len() <= REPLY_CHARS * 4);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // One huge chunk is read from its end only.
+        facts.take(
+            "text",
+            &json!(format!("{} Shall I go on?\n", "é".repeat(1_000_000))),
+        );
+        assert!(facts.reply.chars().count() <= REPLY_CHARS);
+        assert!(facts.reply.ends_with("Shall I go on?\n"), "{}", facts.reply);
+        facts.take("finished", &json!("completed"));
+        assert!(facts.question);
+    }
+
+    #[test]
+    fn a_reply_ending_in_a_question_asks_until_the_next_user_record() {
+        let env = Env::new();
+        let mut live = live_with(&env, 4091, json!({"phase": "idle", "approvals": []}));
+        assert!(!live.facts.take("user", &json!("Fix the build")));
+        live.facts.take("text", &json!("Fixed it. Shall I"));
+        live.facts.take("text", &json!(" push too?  \n\n"));
+        // Not before the turn is over.
+        assert!(live.row().get("question").is_none());
+        assert!(live.facts.take("finished", &json!("completed")));
+        assert_eq!(live.row()["question"], true);
+        // The answer clears it.
+        assert!(live.facts.take("user", &json!("yes")));
+        assert!(live.row().get("question").is_none());
+        // A question mark that is not the reply's last word is no question.
+        live.facts
+            .take("text", &json!("Why? Because it was stale."));
+        assert!(!live.facts.take("finished", &json!("completed")));
+        assert!(live.row().get("question").is_none());
+        // Nor is a reply from before the last user record.
+        live.facts.take("text", &json!("Want more?"));
+        live.facts.take("user", &json!("next"));
+        live.facts.take("text", &json!("Done."));
+        live.facts.take("finished", &json!("completed"));
+        assert!(!live.facts.question);
+    }
+
+    #[test]
+    fn a_turn_that_did_not_complete_asks_nothing() {
+        let mut facts = Facts::default();
+        for outcome in ["interrupted", "failed", "something new"] {
+            facts.take("user", &json!("go"));
+            facts.take("text", &json!("Shall I go on?"));
+            assert!(!facts.take("finished", &json!(outcome)), "{outcome}");
+            assert!(!facts.question, "{outcome}");
+        }
+        assert!(!facts.take("finished", &Value::Null));
+        assert!(facts.take("finished", &json!("completed")));
+        assert!(facts.question);
+        // A turn that ends otherwise after one that asked: the question is no longer open.
+        facts.take("text", &json!(" Or not?"));
+        assert!(facts.take("finished", &json!("interrupted")));
+        assert!(!facts.question);
+    }
+
+    #[test]
+    fn usage_is_latest_wins_and_clipped() {
+        let env = Env::new();
+        let mut live = live_with(&env, 4092, json!({"phase": "idle", "approvals": []}));
+        assert!(live.row().get("usage").is_none());
+        assert!(live.facts.take("usage", &json!("5h 10% · week 2%")));
+        assert_eq!(live.row()["usage"], "5h 10% · week 2%");
+        assert!(!live.facts.take("usage", &json!("5h 10% · week 2%")));
+        assert!(live.facts.take("usage", &json!("é".repeat(500))));
+        assert_eq!(live.row()["usage"], "é".repeat(200));
+        // A record that is not text changes nothing.
+        assert!(!live.facts.take("usage", &json!(7)));
+        assert_eq!(live.row()["usage"], "é".repeat(200));
+        // Errors are counted, for the pusher; the row does not show them.
+        assert!(live.facts.take("error", &json!("boom")));
+        assert!(live.facts.take("error", &Value::Null));
+        assert_eq!(live.facts.errors, 2);
+        assert!(live.row().get("errors").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_seed_reads_at_most_256_kib() {
+        let env = Env::new();
+        let name = "session-1-1.jsonl";
+        let path = env.root.join(name);
+        let size = || std::fs::metadata(&path).unwrap().len();
+        env.write(name, 0, "usage", &json!("old 1%"));
+        env.write(name, 1, "user", &json!("first"));
+        env.write(name, 2, "text", &json!("An old question?"));
+        env.write(name, 3, "finished", &json!("completed"));
+        // Over 256 KiB after them: what came before is not read.
+        for seq in 4..304 {
+            env.write(name, seq, "notice", &json!("n".repeat(1000)));
+        }
+        assert!(size() > SEED_BYTES + 1024);
+        let (facts, read) = seed(&path, size()).await;
+        // The window, and the byte before it that says whether its first line is whole.
+        assert!(read <= SEED_BYTES + 1, "{read}");
+        assert_eq!((facts.usage, facts.question), (None, false));
+        // What is inside the window seeds, but its errors are from before the hub looked.
+        env.write(name, 304, "usage", &json!("new 2%"));
+        env.write(name, 305, "user", &json!("again"));
+        env.write(name, 306, "error", &json!("boom"));
+        env.write(name, 307, "text", &json!("Ready to ship?"));
+        env.write(name, 308, "finished", &json!("completed"));
+        let (facts, read) = seed(&path, size()).await;
+        assert!(read <= SEED_BYTES + 1, "{read}");
+        assert_eq!(facts.usage.as_deref(), Some("new 2%"));
+        assert!(facts.question);
+        // A session the hub first sees gets its row from the seed.
+        let registration = env.registration(4093, &[name]);
+        let _bridge = Env::listen(&registration);
+        registration.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        let row = &sessions.list()[0];
+        assert_eq!(
+            (&row["usage"], &row["question"]),
+            (&json!("new 2%"), &json!(true))
+        );
+        assert_eq!(sessions.snapshots()[0].errors, 0);
+        // A journal too small to fill the window is read whole.
+        let small = env.root.join("session-2-1.jsonl");
+        env.write("session-2-1.jsonl", 0, "usage", &json!("tiny"));
+        let (facts, read) = seed(&small, std::fs::metadata(&small).unwrap().len()).await;
+        assert_eq!(facts.usage.as_deref(), Some("tiny"));
+        assert_eq!(read, std::fs::metadata(&small).unwrap().len());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn many_new_sessions_are_seeded_a_few_at_a_time() {
+        let env = Env::new();
+        let mut bridges = Vec::new();
+        for i in 0..40u32 {
+            let name = format!("session-{}-1.jsonl", i + 1);
+            for seq in 0..200 {
+                env.write(&name, seq, "notice", &json!("n".repeat(1000)));
+            }
+            env.write(&name, 200, "usage", &json!(format!("5h {i}%")));
+            let registration = env.registration(4400 + i, &[name.as_str()]);
+            bridges.push(Env::listen(&registration));
+            registration.write(&env.run).await.unwrap();
+        }
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        let most = sessions.seeding.most.load(Ordering::SeqCst);
+        assert!(most > 1 && most <= SEEDS_AT_ONCE, "{most} at once");
+        // Each session got its own facts.
+        let rows = sessions.list();
+        assert_eq!(rows.len(), 40);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row["usage"], format!("5h {i}%"), "{row}");
+        }
+        drop(bridges);
+    }
+
+    #[tokio::test]
+    async fn the_seed_keeps_a_line_that_starts_its_window() {
+        let env = Env::new();
+        let line = |seq: u64, kind: &str, data: &Value| {
+            let record =
+                json!({"format": "octet-preview-1", "seq": seq, "type": kind, "data": data});
+            u64::try_from(record.to_string().len()).unwrap() + 1
+        };
+        // The usage line starts exactly where the window does, then one byte before it.
+        for (name, before) in [("session-1-1.jsonl", 0), ("session-2-1.jsonl", 1)] {
+            env.write(name, 0, "notice", &json!("before"));
+            let usage = json!("5h 4%");
+            env.write(name, 1, "usage", &usage);
+            let pad =
+                SEED_BYTES - line(1, "usage", &usage) - line(2, "notice", &json!("")) + before;
+            let pad = "n".repeat(usize::try_from(pad).unwrap());
+            env.write(name, 2, "notice", &json!(pad));
+            let path = env.root.join(name);
+            let size = std::fs::metadata(&path).unwrap().len();
+            let (facts, read) = seed(&path, size).await;
+            // The window and the byte before it, which says whether its first line is whole.
+            assert_eq!(read, SEED_BYTES + 1, "{name}");
+            let kept = (before == 0).then_some("5h 4%");
+            assert_eq!(facts.usage.as_deref(), kept, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn late_records_of_the_previous_journal_only_count_errors() {
+        let (old, new) = ("session-1-1.jsonl", "session-2-1.jsonl");
+        let env = Env::new();
+        env.write(old, 0, "usage", &json!("5h 1%"));
+        let one = env.registration(4095, &[old]);
+        let _bridge = Env::listen(&one);
+        one.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        env.write(new, 0, "user", &json!("next"));
+        env.registration(4095, &[old, new])
+            .write(&env.run)
+            .await
+            .unwrap();
+        sessions.refresh().await;
+        assert_eq!(event(&next(&mut sessions).await), (new, 0));
+        // The old vendor process's last words: still sent, but only the error is a fact.
+        env.write(old, 1, "usage", &json!("late 9%"));
+        env.write(old, 2, "text", &json!("Late question?"));
+        env.write(old, 3, "finished", &json!("completed"));
+        env.write(old, 4, "error", &json!("late crash"));
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 5, "{got:?}");
+        assert_eq!(event(&got[3]), (old, 4));
+        let row = &sessions.list()[0];
+        assert_eq!(row["usage"], "5h 1%");
+        assert!(row.get("question").is_none(), "{row}");
+        assert_eq!(sessions.snapshots()[0].errors, 1);
+        // The late text did not reach the newest journal's reply either.
+        env.write(new, 1, "finished", &json!("completed"));
+        assert_eq!(event(&next(&mut sessions).await), (new, 1));
+        assert!(sessions.list()[0].get("question").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_journal_drops_the_old_question() {
+        let (old, new) = ("session-1-1.jsonl", "session-2-1.jsonl");
+        let env = Env::new();
+        env.write(old, 0, "user", &json!("Fix it"));
+        let one = env.registration(4096, &[old]);
+        let _bridge = Env::listen(&one);
+        one.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        env.write(old, 1, "text", &json!("Fixed. Shall I"));
+        until_events(&mut sessions, 1).await;
+        env.write(old, 2, "text", &json!(" push?"));
+        env.write(old, 3, "finished", &json!("completed"));
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(sessions.list()[0]["question"], true);
+        // `/new`: the old journal's last words are drained, then the question is gone.
+        env.write(old, 4, "notice", &json!("bye"));
+        env.write(new, 0, "notice", &json!("fresh"));
+        env.registration(4096, &[old, new])
+            .write(&env.run)
+            .await
+            .unwrap();
+        sessions.refresh().await;
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(event(&got[0]), (old, 4));
+        assert!(sessions.list()[0].get("question").is_none());
+        // Nor does the old reply's tail reach the fresh journal's first turn.
+        env.write(new, 1, "text", &json!("Done"));
+        env.write(new, 2, "finished", &json!("completed"));
+        until_events(&mut sessions, 3).await;
+        assert!(sessions.list()[0].get("question").is_none());
+        assert!(sessions.live[0].facts.reply.ends_with("Done"));
+        assert!(!sessions.live[0].facts.reply.contains("Shall"));
+    }
+
+    /// Waits for `count` events.
+    async fn until_events(sessions: &mut Sessions, count: usize) {
+        let mut seen = 0;
+        while seen < count {
+            if matches!(next(sessions).await, SessionUpdate::Event { .. }) {
+                seen += 1;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tail_keeps_usage_errors_and_the_question() {
+        let env = Env::new();
+        let name = "session-1-1.jsonl";
+        env.write(name, 0, "error", &json!("from before"));
+        let registration = env.registration(4094, &[name]);
+        let _bridge = Env::listen(&registration);
+        registration.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        assert_eq!(sessions.snapshots()[0].errors, 0);
+        env.write(name, 1, "user", &json!("Fix it"));
+        env.write(name, 2, "text", &json!("Fixed. Shall I push?"));
+        env.write(name, 3, "usage", &json!("5h 3%"));
+        env.write(name, 4, "error", &json!("rate limited"));
+        env.write(name, 5, "finished", &json!("completed"));
+        // The records go out as events, then the row is said to have changed.
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 6, "{got:?}");
+        assert_eq!(event(&got[4]), (name, 5));
+        let row = &sessions.list()[0];
+        assert_eq!(
+            (&row["usage"], &row["question"]),
+            (&json!("5h 3%"), &json!(true))
+        );
+        assert_eq!(sessions.snapshots()[0].errors, 1);
+        // Text alone changes nothing the row shows, so it is not a change.
+        env.write(name, 6, "text", &json!("more"));
+        assert_eq!(event(&next(&mut sessions).await), (name, 6));
+        let quiet = timeout(Duration::from_millis(300), sessions.next()).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+        env.write(name, 7, "user", &json!("yes"));
+        let got = until_changed(&mut sessions).await;
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(sessions.list()[0].get("question").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pass_dropped_midway_still_says_the_facts_changed() {
+        let env = Env::new();
+        let mut bridges = Vec::new();
+        for i in 0..60u32 {
+            let name = format!("session-{}-1.jsonl", i + 1);
+            env.write(&name, 0, "notice", &json!("start"));
+            let registration = env.registration(4300 + i, &[name.as_str()]);
+            bridges.push(Env::listen(&registration));
+            registration.write(&env.run).await.unwrap();
+        }
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        let quiet = timeout(Duration::from_millis(300), sessions.next()).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+        // The first session the pass reads gets an error: a fact the pusher acts on.
+        env.write("session-1-1.jsonl", 1, "error", &json!("boom"));
+        tokio::time::sleep(TAIL_EVERY + Duration::from_millis(50)).await;
+        {
+            // The hub loop drops `next` when another branch fires: here, a few reads into the
+            // pass, each read given time to finish so every poll moves it on by one.
+            let mut pass = std::pin::pin!(sessions.next());
+            for poll in 0..20 {
+                let polled =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(pass.as_mut().poll(cx))).await;
+                assert!(polled.is_pending(), "the pass ended by poll {poll}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(sessions.snapshots()[0].errors, 1, "the error was read");
+        // The change is not lost with the pass: it comes after the record's event.
+        let got = timeout(Duration::from_secs(1), until_changed(&mut sessions))
+            .await
+            .expect("the change still comes");
+        assert_eq!(event(&got[0]), ("session-1-1.jsonl", 1));
+        drop(bridges);
+    }
+
+    #[test]
+    fn the_rows_approval_is_a_gist_of_the_summary() {
+        let env = Env::new();
+        let state = json!({"phase": "waiting", "approvals": [
+            {"id": 3, "summary": worst_summary()}]});
+        let row = live_with(&env, 4030, state).row();
+        let approval = &row["approval"];
+        assert_eq!(approval["id"], 3);
+        let summary = &approval["summary"];
+        let cut = |c: &str| format!("{}…", c.repeat(200));
+        assert_eq!(summary["action"], cut("A"));
+        assert_eq!(summary["command"], cut("é"));
+        assert_eq!(summary["scope"], cut("S"));
+        assert_eq!(summary["cwd"], format!("{}…", "/w".repeat(100)));
+        let files = summary["files"].as_array().unwrap();
+        assert_eq!(files.len(), 4);
+        for (i, file) in files.iter().take(3).enumerate() {
+            assert_eq!(*file, json!(format!("{i}{}…", "f".repeat(199))));
+        }
+        assert_eq!(files[3], "+17 more");
+    }
+
+    #[test]
+    fn the_gist_keeps_a_commands_first_line_and_short_text_whole() {
+        let env = Env::new();
+        let summary = json!({"action": "Run Bash", "command": "\n\nls -la\nrm -rf /", "files": ["a", "b", "c"],
+            "scope": "once"});
+        let state = json!({"approvals": [{"id": 1, "summary": summary}]});
+        let row = live_with(&env, 4031, state).row();
+        assert_eq!(
+            row["approval"]["summary"],
+            json!({"action": "Run Bash", "command": "ls -la…", "files": ["a", "b", "c"],
+                "scope": "once"})
+        );
+        let one = json!({"approvals": [{"id": 1, "summary": {"command": "ls\n"}}]});
+        assert_eq!(
+            live_with(&env, 4032, one).row()["approval"]["summary"]["command"],
+            "ls"
+        );
+    }
+
+    #[test]
+    fn a_front_approval_without_an_object_summary_is_left_out() {
+        let env = Env::new();
+        for approval in [
+            json!({"id": 1}),
+            json!({"id": 1, "summary": "rm"}),
+            json!({"id": 1, "summary": null}),
+            json!({"id": "1", "summary": {}}),
+            json!({"summary": {}}),
+        ] {
+            let row = live_with(&env, 4033, json!({"approvals": [approval]})).row();
+            assert!(row.get("approval").is_none(), "{row}");
+            assert_eq!(row["approvals"], 1);
+        }
+    }
+
+    /// A row's facts at their largest: the longest usage line, and a question.
+    fn worst_facts(live: &mut Live) {
+        live.facts.take("usage", &json!("é".repeat(5000)));
+        live.facts.take("text", &json!("?"));
+        live.facts.take("finished", &json!("completed"));
+    }
+
+    #[test]
+    fn sixteen_worst_case_rows_fit_one_sessions_frame() {
+        let env = Env::new();
+        let rows: Vec<Value> = (0..16)
+            .map(|i| {
+                let state = json!({"phase": "waiting", "now": "n".repeat(300),
+                    "goal": {"objective": "g".repeat(5000)},
+                    "approvals": [{"id": i, "summary": worst_summary()}]});
+                let mut live = live_with(&env, 4100 + i, state);
+                worst_facts(&mut live);
+                live.row()
+            })
+            .collect();
+        let frame = json!({"v": 1, "type": "sessions", "sessions": rows}).to_string();
+        assert!(
+            frame.len() < octet_core::remote::protocol::MAX_MESSAGE,
+            "{} bytes",
+            frame.len()
+        );
+    }
+
+    #[test]
+    fn the_rows_now_is_clipped_like_the_goal() {
+        let env = Env::new();
+        let state = json!({"phase": "running", "now": "é".repeat(5000), "approvals": []});
+        let row = live_with(&env, 4040, state).row();
+        assert_eq!(row["now"], "é".repeat(200));
+        let short = json!({"phase": "running", "now": "Running Bash ls", "approvals": []});
+        assert_eq!(live_with(&env, 4041, short).row()["now"], "Running Bash ls");
+    }
+
+    #[test]
+    fn sixty_worst_case_rows_fit_and_the_most_recent_keep_their_gists() {
+        let env = Env::new();
+        let mut sessions = Sessions::new(env.run.clone());
+        for i in 0..60u32 {
+            let state = json!({"phase": "waiting", "now": "é".repeat(300),
+                "goal": {"objective": "é".repeat(5000)},
+                "approvals": [{"id": i, "summary": worst_summary()}]});
+            let mut live = live_with(&env, 4200 + i, state);
+            // The newest activity is in the middle of the list, the oldest at its ends.
+            live.last_activity = Some(1_790_000_000 + u64::from(30 - i.abs_diff(30)));
+            sessions.live.push(live);
+        }
+        let rows = sessions.list();
+        assert_eq!(rows.len(), 60);
+        let frame = json!({"v": 1, "type": "sessions", "sessions": rows}).to_string();
+        assert!(
+            frame.len() < octet_core::remote::protocol::MAX_MESSAGE,
+            "{} bytes",
+            frame.len()
+        );
+        assert!(rows.iter().all(|row| row["approvals"] == 1));
+        assert!(
+            rows[30].get("approval").is_some(),
+            "the newest keeps its gist"
+        );
+        assert!(
+            rows[0].get("approval").is_none(),
+            "the oldest loses its gist"
+        );
+        let kept = rows
+            .iter()
+            .filter(|row| row.get("approval").is_some())
+            .count();
+        assert!(kept > 0 && kept < 60, "{kept}");
+        // Every row that kept its gist is at least as recent as every row that lost one.
+        let recency = |row: &Value| row["last_activity"].as_u64().unwrap();
+        let newest_lost = rows
+            .iter()
+            .filter(|row| row.get("approval").is_none())
+            .map(recency)
+            .max()
+            .unwrap();
+        let oldest_kept = rows
+            .iter()
+            .filter(|row| row.get("approval").is_some())
+            .map(recency)
+            .min()
+            .unwrap();
+        assert!(oldest_kept >= newest_lost);
+        // Every row's facts at their largest too: the gists give way, and the frame still fits.
+        for live in &mut sessions.live {
+            worst_facts(live);
+        }
+        let rows = sessions.list();
+        let frame = json!({"v": 1, "type": "sessions", "sessions": rows}).to_string();
+        assert!(
+            frame.len() < octet_core::remote::protocol::MAX_MESSAGE,
+            "{} bytes",
+            frame.len()
+        );
+        assert!(rows.iter().all(|row| row["question"] == true));
+        // A few rows are under the budget and keep every gist.
+        sessions.live.truncate(4);
+        assert!(
+            sessions
+                .list()
+                .iter()
+                .all(|row| row.get("approval").is_some())
+        );
+    }
+
+    /// `count` sessions of `state`, each with its facts at their largest, active one second
+    /// apart (the first least recently).
+    fn fleet(env: &Env, count: u32, state: &dyn Fn(u32) -> Value) -> Sessions {
+        let mut sessions = Sessions::new(env.run.clone());
+        for i in 0..count {
+            let mut live = live_with(env, 5000 + i, state(i));
+            worst_facts(&mut live);
+            live.last_activity = Some(1_790_000_000 + u64::from(i));
+            sessions.live.push(live);
+        }
+        sessions
+    }
+
+    /// The frame `sessions` sends, its rows, and a check that it is what they make.
+    fn sent(sessions: &Sessions) -> (String, Vec<Value>) {
+        let (frame, rows) = (sessions.frame(), sessions.list());
+        assert_eq!(
+            frame,
+            octet_core::remote::protocol::sessions_frame(&rows).to_string()
+        );
+        (frame, rows)
+    }
+
+    /// The least recent activity among `rows` that have `key`, and the most recent among those
+    /// that lost it.
+    fn kept_and_lost(rows: &[Value], key: &str) -> (Option<u64>, Option<u64>) {
+        let recency = |row: &Value| row["last_activity"].as_u64().unwrap();
+        let oldest_kept = rows
+            .iter()
+            .filter(|r| r.get(key).is_some())
+            .map(recency)
+            .min();
+        let newest_lost = rows
+            .iter()
+            .filter(|r| r.get(key).is_none())
+            .map(recency)
+            .max();
+        (oldest_kept, newest_lost)
+    }
+
+    #[test]
+    fn two_hundred_rows_of_two_byte_text_fit_one_message() {
+        let env = Env::new();
+        let sessions = fleet(&env, 200, &|i| {
+            json!({"phase": "waiting", "now": "é".repeat(300),
+                "goal": {"objective": "é".repeat(5000)},
+                "approvals": [{"id": i, "summary": worst_summary()}]})
+        });
+        let (frame, rows) = sent(&sessions);
+        assert!(frame.len() <= MAX_MESSAGE, "{} bytes", frame.len());
+        // Every session is still listed, with its count of approvals.
+        assert_eq!(rows.len(), 200);
+        assert!(rows.iter().all(|row| row["approvals"] == 1));
+        // The optional fields went in order: every gist, usage and NOW line, then the goals of
+        // the least recently active rows.
+        for key in ["approval", "usage", "now"] {
+            assert!(rows.iter().all(|row| row.get(key).is_none()), "{key}");
+        }
+        let (oldest_kept, newest_lost) = kept_and_lost(&rows, "goal");
+        assert!(
+            oldest_kept >= newest_lost,
+            "{oldest_kept:?} {newest_lost:?}"
+        );
+        assert!(rows[199].get("goal").is_some(), "the newest keeps its goal");
+        assert!(rows[0].get("goal").is_none(), "the oldest loses its goal");
+        assert!(rows.iter().all(|row| row["question"] == true));
+    }
+
+    #[test]
+    fn two_hundred_realistic_rows_fit_one_message_and_lose_little() {
+        let env = Env::new();
+        let goal = "Refactor the hub's sessions list so a fleet of two hundred stays fast; ";
+        let mut sessions = fleet(&env, 200, &|_| {
+            json!({"phase": "running", "now": "Running Bash cargo test -p octet-hub",
+                "goal": {"objective": goal.repeat(4)}, "approvals": []})
+        });
+        for (i, live) in sessions.live.iter_mut().enumerate() {
+            live.facts
+                .take("usage", &json!("5h 41% · week 12% · resets 18:00"));
+            live.registration.workspace = format!("/Users/someone/Projects/octet-{i}").into();
+        }
+        let (frame, rows) = sent(&sessions);
+        assert!(frame.len() <= MAX_MESSAGE, "{} bytes", frame.len());
+        assert_eq!(rows.len(), 200);
+        // Only usage lines give way, the least recently active first; goals and NOW lines stay.
+        assert!(rows.iter().all(|row| row.get("goal").is_some()));
+        assert!(rows.iter().all(|row| row.get("now").is_some()));
+        let (oldest_kept, newest_lost) = kept_and_lost(&rows, "usage");
+        assert!(
+            oldest_kept >= newest_lost,
+            "{oldest_kept:?} {newest_lost:?}"
+        );
+        assert!(rows[199].get("usage").is_some());
+    }
+
+    #[test]
+    fn past_two_hundred_or_past_a_message_the_oldest_rows_go() {
+        let env = Env::new();
+        // More sessions than a frame lists: the most recently active 200, in their order.
+        let sessions = fleet(&env, 230, &|_| json!({"phase": "idle", "approvals": []}));
+        let (frame, rows) = sent(&sessions);
+        assert!(frame.len() <= MAX_MESSAGE, "{} bytes", frame.len());
+        assert_eq!(rows.len(), MAX_SESSION_ROWS);
+        assert_eq!(rows[0]["id"], "5030-1790000000");
+        assert_eq!(rows[199]["id"], "5229-1790000000");
+        // Rows too big even bare (a very long workspace): the least recently active go too.
+        let mut sessions = fleet(&env, 200, &|_| json!({"phase": "idle", "approvals": []}));
+        for live in &mut sessions.live {
+            live.registration.workspace = format!("/{}", "w".repeat(1000)).into();
+        }
+        let (frame, rows) = sent(&sessions);
+        assert!(frame.len() <= MAX_MESSAGE, "{} bytes", frame.len());
+        assert!(rows.len() < 200 && rows.len() > 50, "{}", rows.len());
+        assert_eq!(rows.last().unwrap()["id"], "5199-1790000000");
+        let ids: Vec<u64> = rows
+            .iter()
+            .map(|row| row["last_activity"].as_u64().unwrap())
+            .collect();
+        assert!(
+            ids.windows(2).all(|w| w[0] + 1 == w[1]),
+            "the newest, in order"
+        );
+        // No sessions: an empty list.
+        let (frame, rows) = sent(&Sessions::new(env.run.clone()));
+        assert!(rows.is_empty());
+        assert!(frame.len() < 64, "{frame}");
+    }
+
+    #[tokio::test]
+    async fn a_row_carries_the_first_approval_while_one_waits() {
+        let env = Env::new();
+        let registration = env.registration(4012, &[]);
+        let bridge = Env::listen(&registration);
+        registration.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        let (stream, _) = bridge.accept().await.unwrap();
+        let (_read, mut write) = stream.into_split();
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        assert!(sessions.list()[0].get("approval").is_none());
+        let id = "4012-1790000000".to_owned();
+        let summary = |action: &str| {
+            json!({"action": action, "command": "rm -rf build", "files": [], "cwd": "/work",
+                "scope": "this call"})
+        };
+        let mut state = json!({"phase": "waiting", "queue": [], "queued": 0, "mode": "ask",
+            "approvals": [{"id": 7, "summary": summary("Run Bash")},
+                {"id": 8, "summary": summary("Edit")}]});
+        write
+            .write_all(format!("{}\n", bridge_state_frame(&state)).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            next(&mut sessions).await,
+            SessionUpdate::State { id: id.clone() }
+        );
+        let row = &sessions.list()[0];
+        assert_eq!(row["approvals"], 2);
+        assert_eq!(
+            row["approval"],
+            json!({"id": 7, "summary": summary("Run Bash")})
+        );
+        state["approvals"] = json!([]);
+        write
+            .write_all(format!("{}\n", bridge_state_frame(&state)).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(next(&mut sessions).await, SessionUpdate::State { id });
+        let row = &sessions.list()[0];
+        assert_eq!(row["approvals"], 0);
+        assert!(row.get("approval").is_none(), "{row}");
     }
 
     #[tokio::test]

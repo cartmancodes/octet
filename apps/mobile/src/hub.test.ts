@@ -5,9 +5,10 @@ import * as Notifications from "expo-notifications";
 import { Alert } from "react-native";
 
 import { FakeClock, Sockets } from "./client/fakes";
-import { HubController, TOKEN_KEY, UNPAIRED_NOTICE, UNPAIR_FAILED_NOTICE } from "./hub";
+import { Fleet, TOKEN_KEY, UNPAIR_FAILED_NOTICE, tokenKeyOf, unpairedNotice } from "./hub";
 import { loadSettings, saveSettings } from "./persist";
 import { createOctetStore } from "./store";
+import { M, newM } from "./testKeys";
 
 let mockProject: string | undefined = "11111111-2222-3333-4444-555555555555";
 jest.mock("expo-constants", () => ({
@@ -22,16 +23,20 @@ jest.mock("expo-constants", () => ({
 const SECRET = "ab".repeat(32);
 const LINK = `https://mac.tail1234.ts.net/#pair=${SECRET}`;
 const TOKEN = "cd".repeat(32);
+/** The one pairing's keychain entry; `TOKEN_KEY` is where an older version kept its token. */
+const KEY = tokenKeyOf(M);
+const UNPAIRED_NOTICE = unpairedNotice("mac");
 
 function rig() {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const store = createOctetStore();
-  const hub = new HubController({
+  const hub = new Fleet({
     factory: sockets.factory,
     store,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
+    newId: newM,
   });
   return { sockets, clock, store, hub };
 }
@@ -59,6 +64,7 @@ beforeEach(async () => {
   mockProject = "11111111-2222-3333-4444-555555555555";
   await AsyncStorage.clear();
   await SecureStore.deleteItemAsync(TOKEN_KEY);
+  await SecureStore.deleteItemAsync(KEY);
   jest.clearAllMocks();
 });
 
@@ -67,7 +73,8 @@ describe("starting", () => {
     const r = rig();
     expect(r.hub.snapshot().status).toBe("loading");
     await r.hub.init();
-    expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null, client: null });
+    expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null });
+    expect(r.hub.links.macs()).toEqual([]);
   });
 
   it("is unpaired, and drops the token, with a token but no hub address", async () => {
@@ -148,8 +155,8 @@ describe("starting", () => {
       const pending = r.hub.pair(LINK, "iPhone");
       accept(r);
       expect([junk, await pending]).toEqual([junk, { ok: true }]);
-      expect((await loadSettings()).hubUrl).toBe("wss://mac.tail1234.ts.net/");
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+      expect((await loadSettings()).pairings.map((p) => p.hubUrl)).toEqual(["wss://mac.tail1234.ts.net/"]);
+      expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
       r.hub.setForeground(false);
     }
   });
@@ -171,9 +178,9 @@ describe("pairing", () => {
     accept(r);
     expect(await pending).toEqual({ ok: true });
     expect(r.sockets.last.closed).toBe(true); // the pairing socket is done
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+    expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
     const settings = await loadSettings();
-    expect(settings.hubUrl).toBe("wss://mac.tail1234.ts.net/");
+    expect(settings.pairings).toEqual([{ id: M, hubUrl: "wss://mac.tail1234.ts.net/", deviceName: "Shubho's iPhone", macName: "mac" }]);
     expect(settings.deviceName).toBe("Shubho's iPhone");
     // The token is nowhere else on disk.
     expect(JSON.stringify(await AsyncStorage.getAllKeys())).not.toContain(TOKEN);
@@ -209,7 +216,7 @@ describe("pairing", () => {
     const result = await r.hub.pair("https://example.com/", "iPhone");
     expect(result).toEqual({ ok: false, message: "That isn't an Octet pairing link", clear: false });
     expect(r.sockets.all).toHaveLength(0);
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(await SecureStore.getItemAsync(KEY)).toBeNull();
   });
 
   it("refuses a pair link to a host that is not a .ts.net name, without opening a socket", async () => {
@@ -230,7 +237,7 @@ describe("pairing", () => {
     socket.receive({ type: "refused", req: command?.req, reason: "A device with that name is already paired", code: "invalid" });
     // The Mac kept its code: only a spent or expired one (`unpaired`) is no good any more.
     expect(await pending).toEqual({ ok: false, message: "A device with that name is already paired", clear: false });
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(await SecureStore.getItemAsync(KEY)).toBeNull();
     expect(r.hub.snapshot().status).toBe("unpaired");
   });
 
@@ -271,13 +278,14 @@ describe("pairing", () => {
     const pending = r.hub.pair(LINK, "iPhone");
     accept(r);
     await pending;
-    expect(SecureStore.setItemAsync).toHaveBeenCalledWith(TOKEN_KEY, TOKEN, only);
+    expect(SecureStore.setItemAsync).toHaveBeenCalledWith(KEY, TOKEN, only);
     // Read and delete name the same options, so they reach the same keychain item.
-    expect(SecureStore.getItemAsync).toHaveBeenCalledWith(TOKEN_KEY, only);
+    await rig().hub.init(); // the next launch reads it
+    expect(SecureStore.getItemAsync).toHaveBeenCalledWith(KEY, only);
     r.sockets.last.open();
     r.sockets.last.receive({ type: "refused", req: 0, reason: "revoked", code: "revoked" });
     await new Promise((done) => setImmediate(done));
-    expect(SecureStore.deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY, only);
+    expect(SecureStore.deleteItemAsync).toHaveBeenCalledWith(KEY, only);
   });
 
   it("clears and retries the keychain write once", async () => {
@@ -288,8 +296,8 @@ describe("pairing", () => {
     accept(r);
     expect(await pending).toEqual({ ok: true });
     expect(SecureStore.setItemAsync).toHaveBeenCalledTimes(2);
-    expect(SecureStore.deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY, expect.anything());
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+    expect(SecureStore.deleteItemAsync).toHaveBeenCalledWith(KEY, expect.anything());
+    expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
     expect(r.hub.snapshot().status).toBe("paired");
   });
 
@@ -307,7 +315,7 @@ describe("pairing", () => {
     });
     expect(SecureStore.setItemAsync).toHaveBeenCalledTimes(2);
     expect(r.hub.snapshot().status).toBe("unpaired");
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(await SecureStore.getItemAsync(KEY)).toBeNull();
   });
 
   it("treats a hub address that cannot be saved like a keychain failure", async () => {
@@ -323,7 +331,7 @@ describe("pairing", () => {
         "This phone paired but couldn't save it. On the Mac run `octet hub revoke iPhone`, then pair again with a new code.",
       clear: true,
     });
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(await SecureStore.getItemAsync(KEY)).toBeNull();
     expect(r.hub.snapshot().status).toBe("unpaired");
   });
 
@@ -340,7 +348,7 @@ describe("pairing", () => {
   it("names the default device by platform", () => {
     const r = rig();
     expect(r.hub.defaultName()).toBe("iPhone");
-    const android = new HubController({
+    const android = new Fleet({
       factory: r.sockets.factory,
       store: createOctetStore(),
       platform: "android",
@@ -355,12 +363,13 @@ describe("unpaired by the Mac", () => {
       const r = rig();
       r.hub.setForeground(true);
       await paired(r);
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+      expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
       r.sockets.last.receive({ type: "refused", req: 0, reason: "This device was revoked", code });
       await new Promise((done) => setImmediate(done));
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
-      expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: UNPAIRED_NOTICE, client: null });
-      expect(UNPAIRED_NOTICE).toBe("This phone was unpaired on the Mac");
+      expect(await SecureStore.getItemAsync(KEY)).toBeNull();
+      expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: UNPAIRED_NOTICE });
+      expect(r.hub.links.macs()).toEqual([]);
+      expect(UNPAIRED_NOTICE).toBe("This phone was unpaired on mac");
     }
   });
 
@@ -374,7 +383,7 @@ describe("unpaired by the Mac", () => {
     const [hello] = r.sockets.last.commandsOf("hello");
     r.sockets.last.receive({ type: "refused", req: hello?.req, reason: "Unknown device", code: "unpaired" });
     await new Promise((done) => setImmediate(done));
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(await SecureStore.getItemAsync(KEY)).toBeNull();
     expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: UNPAIRED_NOTICE });
   });
 
@@ -403,9 +412,9 @@ describe("unpaired by the Mac", () => {
     r.clock.advance(60_000);
     r.sockets.last.drop();
     await new Promise((done) => setImmediate(done));
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+    expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
     expect(r.hub.snapshot()).toMatchObject({ status: "paired", notice: null });
-    expect(SecureStore.deleteItemAsync).not.toHaveBeenCalledWith(TOKEN_KEY);
+    expect(SecureStore.deleteItemAsync).not.toHaveBeenCalledWith(KEY);
   });
 
   it("clears the notice when pairing starts again", async () => {
@@ -418,7 +427,7 @@ describe("unpaired by the Mac", () => {
     expect(r.hub.snapshot().notice).toBeNull();
     accept(r, "ef".repeat(32));
     await pending;
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe("ef".repeat(32));
+    expect(await SecureStore.getItemAsync(KEY)).toBe("ef".repeat(32));
   });
 });
 
@@ -492,7 +501,7 @@ describe("unpair", () => {
     const r = rig();
     r.hub.setForeground(true);
     await paired(r);
-    const client = r.hub.snapshot().client;
+    const client = r.hub.links.client(r.hub.links.macs()[0] ?? "");
     r.sockets.last.receive({
       type: "sessions",
       sessions: [
@@ -503,10 +512,10 @@ describe("unpair", () => {
     expect(r.store.getState().sessions).toHaveLength(1);
     const socket = r.sockets.last;
     await r.hub.unpair();
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
-    expect((await loadSettings()).hubUrl).toBeNull();
+    expect(await SecureStore.getItemAsync(KEY)).toBeNull();
+    expect((await loadSettings()).pairings).toEqual([]);
     expect((await loadSettings()).deviceName).toBe("iPhone"); // kept to prefill the next pairing
-    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, offer: false, macs: [], notices: [] });
     expect(r.store.getState().sessions).toHaveLength(0);
     // The connection stays open just long enough for the Mac to hear "notifications off".
     expect(socket.commandsOf("register_push")).toEqual([expect.objectContaining({ token: null })]);
@@ -534,8 +543,8 @@ describe("unpair", () => {
     await paired(r);
     (SecureStore.deleteItemAsync as jest.Mock).mockRejectedValueOnce(new Error("locked"));
     await r.hub.unpair();
-    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, offer: false, macs: [], notices: [] });
+    expect(await SecureStore.getItemAsync(KEY)).toBeNull();
   });
 
   it("says so when the keychain will not clear: Pair shows a notice, and the next start drops the token", async () => {
@@ -547,8 +556,8 @@ describe("unpair", () => {
       .mockRejectedValueOnce(new Error("locked"));
     await r.hub.unpair();
     expect(UNPAIR_FAILED_NOTICE).toBe("This phone couldn't delete its pairing. Pair again to replace it.");
-    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, client: null, offer: false, pushNotice: null });
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN); // still there...
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, offer: false, macs: [], notices: [] });
+    expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN); // still there...
     const again = rig();
     await again.hub.init(); // ...but with no hub address it is dropped
     expect(again.hub.snapshot().status).toBe("unpaired");
@@ -560,7 +569,7 @@ describe("unpair", () => {
     await paired(r);
     jest.spyOn(AsyncStorage, "setItem").mockRejectedValueOnce(new Error("disk full"));
     await r.hub.unpair();
-    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, client: null, offer: false, pushNotice: null });
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, offer: false, macs: [], notices: [] });
   });
 
   it("a foreground event while unpairing does not start the old client again", async () => {
@@ -583,7 +592,7 @@ describe("unpair", () => {
     r.hub.setForeground(true);
     await paired(r);
     const pending = r.hub.unpair();
-    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, client: null, offer: false, pushNotice: null });
+    expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: null, offer: false, macs: [], notices: [] });
     expect(await r.hub.pair(LINK, "iPhone")).toMatchObject({ ok: false, clear: false });
     await pending;
     r.clock.advance(2_000); // the Mac never answered the goodbye
@@ -637,7 +646,7 @@ describe("registering for push", () => {
     answer(r);
     await settle();
     expect(registrations(r)).toHaveLength(1);
-    expect(r.hub.snapshot().pushNotice).toBeNull();
+    expect(r.hub.snapshot().notices).toEqual([]);
   });
 
   it("registers nothing when notifications are off", async () => {
@@ -688,7 +697,7 @@ describe("registering for push", () => {
     expect(n.getExpoPushTokenAsync).not.toHaveBeenCalled();
     answer(r, "Notifications off");
     await settle();
-    expect(r.hub.snapshot().pushNotice).toBe("Notifications are off for Octet in the phone's settings.");
+    expect(r.hub.snapshot().notices).toEqual(["Notifications are off for Octet in the phone's settings."]);
     // The setting stays on, so that a permission given back registers again on the next ready.
     expect((await loadSettings()).notifications).toBe(true);
     r.sockets.last.drop();
@@ -699,7 +708,7 @@ describe("registering for push", () => {
     expect(registrations(r).map((c) => c.token)).toEqual([null, PUSH]);
     answer(r);
     await settle();
-    expect(r.hub.snapshot().pushNotice).toBeNull();
+    expect(r.hub.snapshot().notices).toEqual([]);
   });
 
   it("with the permission revoked and the Mac refusing the stop, still says why on Settings", async () => {
@@ -707,7 +716,7 @@ describe("registering for push", () => {
     const r = await readyWithPush();
     r.sockets.last.receive({ type: "refused", req: registrations(r)[0]?.req, code: "invalid", reason: "No" });
     await settle();
-    expect(r.hub.snapshot().pushNotice).toBe("Notifications are off for Octet in the phone's settings.");
+    expect(r.hub.snapshot().notices).toEqual(["Notifications are off for Octet in the phone's settings."]);
   });
 
   it("shows the hub's refusal on Settings only: never a modal", async () => {
@@ -716,7 +725,7 @@ describe("registering for push", () => {
     const last = registrations(r).at(-1);
     r.sockets.last.receive({ type: "refused", req: last?.req, code: "invalid", reason: "That is not a push token" });
     await settle();
-    expect(r.hub.snapshot().pushNotice).toBe("That is not a push token");
+    expect(r.hub.snapshot().notices).toEqual(["That is not a push token"]);
     expect(alert).not.toHaveBeenCalled();
     expect(r.hub.snapshot().status).toBe("paired");
     alert.mockRestore();
@@ -726,7 +735,7 @@ describe("registering for push", () => {
     const r = await readyWithPush();
     r.sockets.last.receive({ type: "refused", req: registrations(r)[0]?.req, code: "invalid", reason: "No" });
     await settle();
-    expect(r.hub.snapshot().pushNotice).toBe("No");
+    expect(r.hub.snapshot().notices).toEqual(["No"]);
     r.sockets.last.drop();
     r.clock.advance(500);
     r.sockets.last.open();
@@ -734,7 +743,7 @@ describe("registering for push", () => {
     await settle();
     answer(r);
     await settle();
-    expect(r.hub.snapshot().pushNotice).toBeNull();
+    expect(r.hub.snapshot().notices).toEqual([]);
   });
 });
 
@@ -821,7 +830,7 @@ describe("turning notifications on and off", () => {
     answer(r, "Notifications off");
     await expect(done).resolves.toEqual({ ok: true });
     expect((await loadSettings()).notifications).toBe(false);
-    expect(r.hub.snapshot().pushNotice).toBeNull();
+    expect(r.hub.snapshot().notices).toEqual([]);
   });
 
   it("off never asks for biometrics", async () => {
@@ -852,6 +861,168 @@ describe("turning notifications on and off", () => {
     await r.hub.init();
     await expect(r.hub.turnOnNotifications()).resolves.toEqual({ ok: false, message: "Can't reach your Mac" });
     await expect(r.hub.turnOffNotifications()).resolves.toEqual({ ok: false, message: "Can't reach your Mac" });
+  });
+});
+
+describe("per-kind notifications", () => {
+  const KINDS = { approvals: true, errors: true, turns: false };
+  /** Ready, with the master switch on and `kinds` saved; the registration made at ready is answered. */
+  const on = async (kinds = KINDS) => {
+    await saveSettings({ pushKinds: kinds });
+    const r = await readyWithPush(true);
+    answer(r);
+    await settle();
+    return r;
+  };
+  const last = (r: Rig) => registrations(r).at(-1);
+
+  it("turning a kind on sends the token with all three kinds, and saves them after the ack", async () => {
+    const r = await on();
+    const done = r.hub.setPushKind("turns", true);
+    await settle();
+    expect(last(r)).toMatchObject({ type: "register_push", token: PUSH, kinds: { approvals: true, errors: true, turns: true } });
+    expect((await loadSettings()).pushKinds).toEqual(KINDS); // not before the Mac says so
+    answer(r);
+    await expect(done).resolves.toEqual({ ok: true });
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: true, turns: true });
+    expect((await loadSettings()).notifications).toBe(true);
+  });
+
+  it("turning a kind off sends the rest as they are and keeps notifications on", async () => {
+    const r = await on();
+    const done = r.hub.setPushKind("errors", false);
+    await settle();
+    expect(last(r)).toMatchObject({ token: PUSH, kinds: { approvals: true, errors: false, turns: false } });
+    answer(r);
+    await expect(done).resolves.toEqual({ ok: true });
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: false, turns: false });
+    expect((await loadSettings()).notifications).toBe(true);
+  });
+
+  it("turning the last kind off sends a null token: notifications are off", async () => {
+    const r = await on({ approvals: false, errors: true, turns: false });
+    const done = r.hub.setPushKind("errors", false);
+    await settle();
+    expect(last(r)).toMatchObject({ type: "register_push", token: null });
+    answer(r, "Notifications off");
+    await expect(done).resolves.toEqual({ ok: true });
+    const saved = await loadSettings();
+    expect(saved.notifications).toBe(false);
+    expect(saved.pushKinds).toEqual({ approvals: false, errors: false, turns: false });
+  });
+
+  it("turning a kind on while notifications are off asks permission, turns them on, and sends the defaults plus that kind", async () => {
+    const r = await readyWithPush(false);
+    const done = r.hub.setPushKind("turns", true);
+    await settle();
+    expect(n.requestPermissionsAsync).toHaveBeenCalledTimes(1);
+    expect(registrations(r)).toEqual([expect.objectContaining({ token: PUSH, kinds: { approvals: true, errors: true, turns: true } })]);
+    expect((await loadSettings()).notifications).toBe(false);
+    answer(r);
+    await expect(done).resolves.toEqual({ ok: true });
+    const saved = await loadSettings();
+    expect(saved.notifications).toBe(true);
+    expect(saved.pushKinds).toEqual({ approvals: true, errors: true, turns: true });
+  });
+
+  it("the defaults, not the kinds kept from before, are what a first kind brings when notifications are off", async () => {
+    await saveSettings({ pushKinds: { approvals: false, errors: false, turns: false } });
+    const r = await readyWithPush(false);
+    const done = r.hub.setPushKind("approvals", true);
+    await settle();
+    expect(registrations(r)).toEqual([expect.objectContaining({ kinds: { approvals: true, errors: true, turns: false } })]);
+    answer(r);
+    await done;
+  });
+
+  it("with notifications off and the permission denied, sends nothing and changes nothing", async () => {
+    n.requestPermissionsAsync.mockResolvedValueOnce({ granted: false, canAskAgain: false, status: "denied" } as never);
+    const r = await readyWithPush(false);
+    await expect(r.hub.setPushKind("turns", true)).resolves.toEqual({
+      ok: false,
+      message: "Notifications are off for Octet in the phone's settings.",
+    });
+    expect(registrations(r)).toHaveLength(0);
+    expect((await loadSettings()).notifications).toBe(false);
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+  });
+
+  it("with notifications on and the permission taken away, never prompts, sends nothing, and changes nothing", async () => {
+    const r = await on();
+    n.getPermissionsAsync.mockResolvedValueOnce({ granted: false, canAskAgain: false, status: "denied" } as never);
+    await expect(r.hub.setPushKind("turns", true)).resolves.toMatchObject({ ok: false });
+    expect(n.requestPermissionsAsync).not.toHaveBeenCalled();
+    expect(registrations(r)).toHaveLength(1);
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+  });
+
+  it("the Mac refusing it leaves the kinds as they were and says the Mac's words", async () => {
+    const r = await on();
+    const done = r.hub.setPushKind("turns", true);
+    await settle();
+    r.sockets.last.receive({ type: "refused", req: last(r)?.req, code: "invalid", reason: "Bad kinds" });
+    await expect(done).resolves.toEqual({ ok: false, message: "Bad kinds" });
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+  });
+
+  it("with the Mac out of reach waits a few seconds, then leaves the kinds as they were", async () => {
+    const r = await on();
+    r.sockets.last.drop();
+    const done = r.hub.setPushKind("turns", true);
+    await settle();
+    r.clock.advance(8_000);
+    await expect(done).resolves.toEqual({ ok: false, message: "Can't reach your Mac" });
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+    expect((await loadSettings()).notifications).toBe(true);
+  });
+
+  it("with no connection fails the same way", async () => {
+    const r = rig();
+    await r.hub.init();
+    await expect(r.hub.setPushKind("turns", true)).resolves.toEqual({ ok: false, message: "Can't reach your Mac" });
+  });
+
+  it("two at once go one after the other, each from what the one before saved", async () => {
+    const r = await on();
+    const a = r.hub.setPushKind("turns", true);
+    const b = r.hub.setPushKind("errors", false);
+    await settle();
+    expect(registrations(r)).toHaveLength(2); // the one at ready, and the first
+    answer(r);
+    await expect(a).resolves.toEqual({ ok: true });
+    await settle();
+    expect(last(r)).toMatchObject({ kinds: { approvals: true, errors: false, turns: true } });
+    answer(r);
+    await expect(b).resolves.toEqual({ ok: true });
+    expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: false, turns: true });
+  });
+
+  it("the registration made at ready carries the saved kinds", async () => {
+    await saveSettings({ pushKinds: { approvals: false, errors: true, turns: true } });
+    const r = await readyWithPush(true);
+    expect(registrations(r)).toEqual([expect.objectContaining({ token: PUSH, kinds: { approvals: false, errors: true, turns: true } })]);
+  });
+
+  it("turning notifications on (the step after pairing) sends the saved kinds, or the defaults when none is on", async () => {
+    const r = await readyWithPush(false);
+    const done = r.hub.turnOnNotifications();
+    await settle();
+    expect(last(r)).toMatchObject({ token: PUSH, kinds: KINDS });
+    answer(r);
+    await done;
+    await saveSettings({ notifications: false, pushKinds: { approvals: false, errors: false, turns: false } });
+    const again = r.hub.turnOnNotifications();
+    await settle();
+    expect(last(r)).toMatchObject({ token: PUSH, kinds: KINDS });
+    answer(r);
+    await again;
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
+  });
+
+  it("unpairing puts the kinds back to the defaults: a new pairing starts there on the Mac", async () => {
+    const r = await on({ approvals: false, errors: false, turns: true });
+    await r.hub.unpair();
+    expect((await loadSettings()).pushKinds).toEqual(KINDS);
   });
 });
 
@@ -911,6 +1082,24 @@ describe("unpair and push", () => {
     expect(n.unregisterForNotificationsAsync).not.toHaveBeenCalled();
   });
 
+  it("tells the Mac to forget the Live Activity's tokens too, first, so the hub has it before the goodbye's answer", async () => {
+    const r = await readyWithPush();
+    answer(r);
+    const socket = r.sockets.last;
+    await r.hub.unpair();
+    const types = socket.commands().map((c) => c.type);
+    const clear = types.lastIndexOf("clear_activity");
+    expect(clear).toBeGreaterThanOrEqual(0);
+    expect(clear).toBeLessThan(types.lastIndexOf("register_push"));
+    // Its answer, or a refusal, changes nothing: the goodbye ends on register_push's.
+    const sent = socket.commandsOf("clear_activity")[0];
+    socket.receive({ type: "refused", req: sent?.req, code: "invalid", reason: "no" });
+    answer(r, "Notifications off");
+    await settle();
+    expect(socket.closed).toBe(true);
+    expect(n.unregisterForNotificationsAsync).not.toHaveBeenCalled();
+  });
+
   it("closes the connection after 2 s if the Mac never answers, and drops the push registration", async () => {
     const r = await readyWithPush();
     answer(r);
@@ -936,7 +1125,7 @@ describe("unpair and push", () => {
     await settle();
     expect(r.sockets.last.closed).toBe(true);
     expect(r.hub.snapshot()).toMatchObject({ status: "unpaired", notice: null });
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(await SecureStore.getItemAsync(KEY)).toBeNull();
     expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
   });
 
@@ -948,6 +1137,7 @@ describe("unpair and push", () => {
     await r.hub.unpair();
     await settle();
     expect(socket.commandsOf("register_push").filter((c) => c.token === null)).toHaveLength(0);
+    expect(socket.commandsOf("clear_activity")).toHaveLength(0);
     expect(r.hub.snapshot().status).toBe("unpaired");
     expect(n.unregisterForNotificationsAsync).toHaveBeenCalledTimes(1);
   });

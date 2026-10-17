@@ -10,14 +10,25 @@ import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
 import Sessions from "../app/index";
 import Session from "../app/session/[id]";
+import Usage from "../app/usage";
 import { FakeClock, Sockets } from "./client/fakes";
-import { HubContext, HubController, TOKEN_KEY } from "./hub";
+import { HubContext, Fleet, TOKEN_KEY } from "./hub";
+import { DRAWER_MS } from "./components/Drawer";
+import { MENU_DISMISS_MS } from "./components/ModelModeMenu";
+import { closeDrawer, openDrawer } from "./drawer";
 import { saveSettings } from "./persist";
 import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol";
 import * as words from "./session";
-import * as cardWords from "./sessions";
+import * as cardWords from "./inbox";
 import { octetStore } from "./store";
+import { applyM, k, newM, sessionPath } from "./testKeys";
+import { resetTextSize } from "./textSizeRig";
 import { dark, light } from "./theme";
+
+jest.mock("expo-constants", () => ({
+  __esModule: true,
+  default: { expoConfig: { version: "4.5.6" } },
+}));
 
 jest.mock("expo-camera", () => ({
   CameraView: () => null,
@@ -42,9 +53,13 @@ beforeEach(async () => {
   await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
   await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
   octetStore.getState().reset();
+  resetTextSize();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
 });
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => {
+  closeDrawer();
+  jest.restoreAllMocks();
+});
 
 let seq = 0;
 
@@ -53,11 +68,12 @@ async function launch(list: SessionInfo[], at?: string) {
   seq = 0;
   const sockets = new Sockets();
   const clock = new FakeClock();
-  const hub = new HubController({
+  const hub = new Fleet({
     factory: sockets.factory,
     store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
+    newId: newM,
   });
   const Layout = () => (
     <HubContext.Provider value={hub}>
@@ -65,7 +81,7 @@ async function launch(list: SessionInfo[], at?: string) {
     </HubContext.Provider>
   );
   const view = renderRouter(
-    { _layout: Layout, index: Sessions, pair: Pair, "session/[id]": Session, recent: () => null, settings: () => null },
+    { _layout: Layout, index: Sessions, pair: Pair, "session/[id]": Session, recent: () => null, new: () => null, settings: () => null, usage: Usage, changes: () => null },
     at ? { initialUrl: at } : undefined,
   );
   await view;
@@ -97,14 +113,41 @@ const stateFrame = (state: Partial<StateInfo>, session = "a") => ({
   state: { phase: "running", queue: [], queued: 0, mode: "ask", approvals: [], ...state },
 });
 
-/** Taps the card of `id` on Sessions and waits for its screen. */
+/** Session info of session "a", by way of the ▾ menu and once its Modal has gone. */
+async function openInfo() {
+  await fireEvent.press(screen.getByRole("button", { name: /^a, / }));
+  await fireEvent.press(screen.getByRole("button", { name: "Session info, a" }));
+  await act(async () => void jest.advanceTimersByTime(MENU_DISMISS_MS + 50));
+}
+
+/** Taps the card of `id` on the Inbox, on whichever tab it is, and waits for its screen. */
 async function open(rig: Rig, id: string) {
-  await fireEvent.press(screen.getByRole("button", { name: new RegExp(`^${id}, `) }));
+  const name = new RegExp(`^${id}, `);
+  for (const tab of [/^Needs you/, /^Running/, /^Done/]) {
+    if (screen.queryByRole("button", { name })) break;
+    await fireEvent.press(screen.getByRole("tab", { name: tab }));
+  }
+  await fireEvent.press(screen.getByRole("button", { name }));
   await screen.findByTestId("transcript");
 }
 
 const color = (node: { props: { style?: unknown } }): unknown =>
   (StyleSheet.flatten(node.props.style as never) as { color?: unknown } | undefined)?.color;
+
+
+type Fiber = { memoizedProps?: Record<string, unknown> | null; return: Fiber | null; type: unknown } | null | undefined;
+
+/** The `onPress` a press of `element` runs, found as RNTL's `fireEvent` finds it: on the element's
+ * fiber or the components above it, up to the next host element. */
+function pressHandler(element: { unstable_fiber?: unknown }): (() => void) | undefined {
+  for (let fiber = element.unstable_fiber as Fiber; fiber; fiber = fiber.return) {
+    const onPress = fiber.memoizedProps?.onPress;
+    if (typeof onPress === "function") return onPress as () => void;
+    const parent = fiber.return;
+    if (!parent || typeof parent.type === "string") return undefined;
+  }
+  return undefined;
+}
 
 describe("the Session screen", () => {
   it("streams the session while shown, and stops when the user leaves", async () => {
@@ -323,12 +366,12 @@ describe("the Session screen", () => {
     const mascot = () => within(screen.getByTestId("session-mascot")).getByLabelText(/^Octet, /);
     const approvalEvent = (id: number, action: string) =>
       ev({ type: "approval", data: { id, detail: "", summary: { action, command: null, files: [], cwd: null, scope: "once" } } });
-    it("shows the session's state in the header: running, idle, and how the turn ended", async () => {
+    it("shows the session's state over the transcript: running, idle, and how the turn ended", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
       expect(mascot().props.accessibilityLabel).toBe("Octet, idle");
-      expect(mascot().props.width).toBe(59);
+      expect(mascot().props.width).toBe(44);
       await feed(rig, ev({ type: "started", data: null }), stateFrame({ phase: "running", now: "Running Edit src/main.rs" }));
       expect(mascot().props.accessibilityLabel).toBe("Octet, coding");
       await feed(rig, stateFrame({ phase: "running", now: "Thinking" }));
@@ -344,6 +387,153 @@ describe("the Session screen", () => {
       await open(rig, "a");
       await feed(rig, subscribed(), ev({ type: "error", data: "The model is overloaded" }), stateFrame({ phase: "idle" }));
       expect(mascot().props.accessibilityLabel).toBe("Octet, error");
+    });
+  });
+
+  describe("the header and the transcript header", () => {
+    const catalogFrame = (current_mode: string, session = "a") => ({
+      type: "catalog",
+      session,
+      catalog: {
+        modes: ["ask", "accept-edits", "auto", "full-access"],
+        current_mode,
+        models: [
+          { engine: "claude", selection: "sonnet", name: "Sonnet", id: "claude-sonnet-5" },
+          { engine: "claude", selection: "opus", name: "Opus", id: "claude-opus-5" },
+        ],
+        current: { engine: "claude", selection: "opus" },
+      },
+    });
+    const head = () => within(screen.getByTestId("transcript-header"));
+
+    it("the header has ☰, the session's name ▾ with model · mode, Aa and ⋯; ☰ opens the drawer", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), catalogFrame("auto"));
+      expect(screen.getByRole("button", { name: "a, Opus · auto" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Text size" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Usage" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Session info" })).toBeNull();
+      await fireEvent.press(screen.getByRole("button", { name: "Menu" }));
+      expect(screen.getByRole("button", { name: "Close menu" })).toBeTruthy();
+    });
+
+    it("⋯ opens Usage for this session, and back returns to the conversation", async () => {
+      const rig = await launch([info("a", { usage: "5h 12%" })]);
+      await open(rig, "a");
+      await fireEvent.press(screen.getByRole("button", { name: "Usage" }));
+      expect(rig.view.getPathname()).toBe("/usage");
+      expect(screen.getByText("a · a")).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Back" }));
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
+    });
+
+    it("⋯ pressed twice in one frame opens Usage once", async () => {
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      const more = screen.getByRole("button", { name: "Usage" });
+      // Two presses in one frame: the handler runs twice inside one act, with no render between
+      // them (two `fireEvent.press` calls would each open an act of their own, overlapping).
+      const press = pressHandler(more);
+      expect(typeof press).toBe("function");
+      await act(async () => {
+        press?.();
+        press?.();
+      });
+      expect(rig.view.getPathname()).toBe("/usage");
+      await fireEvent.press(screen.getByRole("button", { name: "Back" }));
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
+    });
+
+    it("⋯ passes the workspace on, and the conversation keeps streaming under Usage", async () => {
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), ev({ type: "usage", data: "5h 1%" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Usage" }));
+      expect(rig.view.getSearchParams()).toMatchObject({ id: k("a"), workspace: "/Users/me/Projects/a" });
+      // The Conversation let go as it left the front and Usage asks for the session: the Mac acks
+      // the unsubscribe, and the subscribe that was waiting for it goes out and resumes.
+      const handOver = async () => {
+        const unsubscribes = rig.sockets.last.commandsOf("unsubscribe");
+        await feed(rig, { type: "ack", req: unsubscribes[unsubscribes.length - 1]?.req, message: "ok" });
+        await feed(rig, { type: "subscribed", session: "a", from: "cursor", journals: ["j1"] });
+      };
+      await handOver();
+      expect(rig.sockets.last.commandsOf("subscribe")).toHaveLength(2);
+      await feed(rig, ev({ type: "usage", data: "5h 2%" }), ev({ type: "finished", data: "completed" }));
+      expect(within(screen.getByTestId("this-session")).getByText("5h 2%")).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Back" }));
+      await handOver();
+      expect(rig.sockets.last.commandsOf("subscribe")).toHaveLength(3);
+      await feed(rig, ev({ type: "user", data: "still live" }));
+      expect(screen.getByText("still live")).toBeTruthy();
+    });
+
+    it("an ended session keeps what it left while Usage is open over it", async () => {
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), ev({ type: "usage", data: "5h 9%" }));
+      await feed(rig, { type: "sessions", sessions: [info("b")] });
+      await fireEvent.press(screen.getByRole("button", { name: "Usage" }));
+      expect(within(screen.getByTestId("this-session")).getByText("5h 9%")).toBeTruthy();
+      expect(octetStore.getState().bySession.has(k("a"))).toBe(true);
+      expect(within(screen.getByTestId("this-session")).getByText("a")).toBeTruthy();
+    });
+
+    it("says Octet's version and Mac, the mode · engine / model, and the phase · workspace", async () => {
+      const rig = await launch([info("a", { phase: "idle", workspace: "/Users/me/Projects/a" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), catalogFrame("auto"));
+      expect([dark.accent, light.accent]).toContain(color(head().getByText("Octet")));
+      expect(head().getByText("v4.5.6 · mac")).toBeTruthy();
+      expect([dark.accent, light.accent]).toContain(color(head().getByText("auto")));
+      expect(head().getByText("· claude / Opus")).toBeTruthy();
+      expect([dark.accent, light.accent]).toContain(color(head().getByText("IDLE")));
+      expect(head().getByText("· ~/Projects/a")).toBeTruthy();
+      // Ask is muted; an approval waiting is amber.
+      await feed(
+        rig,
+        catalogFrame("ask"),
+        ev({ type: "approval", data: { id: 1, detail: "", summary: { action: "Run tests", command: null, files: [], cwd: null, scope: "once" } } }),
+      );
+      expect([dark.muted, light.muted]).toContain(color(head().getByText("ask")));
+      expect([dark.amber, light.amber]).toContain(color(head().getByText("APPROVAL")));
+    });
+
+    it("Aa cycles the transcript's text size, and the next screen opens at it", async () => {
+      const rig = await launch([info("a", { phase: "idle" }), info("b", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }), ev({ type: "user", data: "Fix the hub" }));
+      const size = () => StyleSheet.flatten(screen.getByText("Fix the hub").props.style).fontSize;
+      expect(size()).toBe(13);
+      await fireEvent.press(screen.getByRole("button", { name: "Text size" }));
+      expect(size()).toBe(14);
+      await fireEvent.press(screen.getByRole("button", { name: "Text size" }));
+      expect(size()).toBe(12);
+      expect(StyleSheet.flatten(head().getByText("IDLE").props.style).fontSize).toBe(12);
+    });
+
+    it("opens at the saved text size", async () => {
+      await saveSettings({ textSize: 14 });
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), ev({ type: "user", data: "Fix the hub" }));
+      expect(StyleSheet.flatten(screen.getByText("Fix the hub").props.style).fontSize).toBe(14);
+    });
+
+    it("dropdown_without_catalog: a session opened from the drawer before its catalog says it is waiting", async () => {
+      const rig = await launch([info("a", { phase: "idle" }), info("b", { phase: "idle" })]);
+      await open(rig, "a");
+      await act(async () => openDrawer());
+      await act(async () => void jest.advanceTimersByTime(DRAWER_MS + 20)); // renderRouter runs on fake timers
+      await fireEvent.press(screen.getByTestId(`drawer-row-${k("b")}`));
+      expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
+      await act(async () => void jest.advanceTimersByTime(DRAWER_MS + 20));
+      await feed(rig, subscribed("b"));
+      await fireEvent.press(screen.getByRole("button", { name: /^b, / }));
+      expect(screen.getByText("Waiting for the Mac…")).toBeTruthy();
+      expect(screen.queryByText(/^MODEL · /)).toBeNull();
+      expect(screen.queryAllByRole("tab", { name: /^(ask|auto|accept-edits)$/ })).toHaveLength(0);
     });
   });
 
@@ -418,9 +608,9 @@ describe("the Session screen", () => {
       await feed(rig, { type: "sessions", sessions: [info("b")] });
       expect(screen.getByText("This session ended")).toBeTruthy();
       expect(screen.getByText("Fix the hub")).toBeTruthy();
-      expect(octetStore.getState().bySession.has("a")).toBe(true);
+      expect(octetStore.getState().bySession.has(k("a"))).toBe(true);
       await act(async () => router.back());
-      expect(octetStore.getState().bySession.has("a")).toBe(false);
+      expect(octetStore.getState().bySession.has(k("a"))).toBe(false);
     });
 
     it("a session the hub refused to stream shows the reason", async () => {
@@ -432,23 +622,24 @@ describe("the Session screen", () => {
     });
 
     it("a session the phone knows nothing of and the Mac does not list is gone, with a way back", async () => {
-      const rig = await launch([info("a")], "/session/zzz");
+      const rig = await launch([info("a")], sessionPath("zzz"));
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();
-      await fireEvent.press(screen.getByRole("button", { name: "Back to sessions" }));
+      expect(screen.getByText("Back to the Inbox")).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Back to the Inbox" }));
       expect(rig.view.getPathname()).toBe("/");
     });
 
     it("a deep-linked session the hub refuses is gone too, with a way back, and its view is dropped on leaving", async () => {
-      const rig = await launch([info("a")], "/session/zzz");
+      const rig = await launch([info("a")], sessionPath("zzz"));
       const [command] = rig.sockets.last.commandsOf("subscribe");
       expect(command).toMatchObject({ session: "zzz" });
       await feed(rig, { type: "refused", req: command?.req, reason: "No such session", code: "invalid" });
-      expect(octetStore.getState().bySession.get("zzz")?.failed).toBe("No such session");
+      expect(octetStore.getState().bySession.get(k("zzz"))?.failed).toBe("No such session");
       expect(screen.getByText("This session isn't running anymore")).toBeTruthy();
       expect(screen.queryByTestId("transcript")).toBeNull();
-      await fireEvent.press(screen.getByRole("button", { name: "Back to sessions" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Back to the Inbox" }));
       expect(rig.view.getPathname()).toBe("/");
-      expect(octetStore.getState().bySession.has("zzz")).toBe(false);
+      expect(octetStore.getState().bySession.has(k("zzz"))).toBe(false);
     });
 
     it("offline, the transcript stays under a banner", async () => {
@@ -474,7 +665,7 @@ describe("the Session screen", () => {
     });
   });
 
-  it("100 text deltas re-render only the streaming row, once per batch, and no Sessions card", async () => {
+  it("100 text deltas re-render only the streaming row, once per batch, and no Inbox card", async () => {
     const rig = await launch([info("a"), info("b"), info("c")]);
     await open(rig, "a");
     await feed(
@@ -486,7 +677,7 @@ describe("the Session screen", () => {
       ev({ type: "text", data: "start" }),
     );
     const rows = jest.spyOn(words, "rowRole");
-    const cards = jest.spyOn(cardWords, "engineLine");
+    const cards = jest.spyOn(cardWords, "cardLabel");
     const batches = 10;
     for (let b = 0; b < batches; b++) {
       await act(async () => {
@@ -501,11 +692,11 @@ describe("the Session screen", () => {
     // Another session's output, straight into the store: nothing on this screen draws again.
     rows.mockClear();
     await act(async () => {
-      octetStore.getState().applyBatch(
+      applyM(octetStore, 
         Array.from({ length: 50 }, (_, i) => ({ v: 1, ...ev({ type: "text", data: `b${i}` }, "b") }) as never),
       );
     });
-    expect(octetStore.getState().bySession.get("b")?.transcript.entries).toHaveLength(1);
+    expect(octetStore.getState().bySession.get(k("b"))?.transcript.entries).toHaveLength(1);
     expect(rows).not.toHaveBeenCalled();
   });
 
@@ -516,16 +707,64 @@ describe("the Session screen", () => {
     // renderRouter runs on fake timers.
     const wait = (ms: number) => act(async () => void jest.advanceTimersByTime(ms));
 
-    it("a live session has the composer and, idle, End; a running one has Cancel", async () => {
+    it("a live session has the prompt line and the key bar; idle, End is in Session info; running, esc cancels", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
       expect(screen.getByLabelText("Message")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Cancel (esc)" }).props.accessibilityState?.disabled).toBe(true);
+      await openInfo();
       expect(screen.getByRole("button", { name: "End session" })).toBeTruthy();
-      expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+      await fireEvent.press(screen.getByRole("button", { name: "Close" }));
       await feed(rig, stateFrame({ phase: "running", queued: 2 }));
-      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
-      expect(screen.getByText("Queue · 2 queued")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Cancel (esc)" }).props.accessibilityState?.disabled).toBe(false);
+      expect(screen.getByRole("button", { name: "Queue (⏎)" })).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Cancel (esc)" }));
+      expect(lastCommand(rig, "cancel")).toMatchObject({ session: "a" });
+    });
+
+    it("ends the session from Session info over the wire, after asking", async () => {
+      const rig = await launch([info("a", { phase: "idle" })]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+      await openInfo();
+      await fireEvent.press(screen.getByRole("button", { name: "End session" }));
+      expect(rig.sockets.last.commandsOf("end")).toEqual([]);
+      await fireEvent.press(screen.getByRole("button", { name: "Yes, end it" }));
+      expect(lastCommand(rig, "end")).toMatchObject({ session: "a" });
+    });
+
+    it("keys_follow_state_and_never_double_send: esc with an approval waiting denies exactly the front one, once", async () => {
+      await saveSettings({ faceId: false });
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"), approvalEvent(2, "Edit config"));
+      await wait(450);
+      await fireEvent.press(screen.getByRole("button", { name: "Deny (esc)" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Deny (esc)" }));
+      await act(async () => {});
+      expect(rig.sockets.last.commandsOf("answer")).toEqual([expect.objectContaining({ session: "a", approval: 1, allow: false })]);
+      await feed(rig, { type: "ack", req: lastCommand(rig, "answer")?.req, message: "ok" });
+      expect(screen.getByText("Edit config")).toBeTruthy();
+      await fireEvent.press(screen.getByRole("button", { name: "Deny (esc)" }));
+      await act(async () => {});
+      expect(rig.sockets.last.commandsOf("answer")).toHaveLength(1); // the next one arms first
+    });
+
+    it("text sent while an approval waits denies it, then goes as a prompt after the deny's ack", async () => {
+      await saveSettings({ faceId: false });
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"));
+      await wait(450);
+      await fireEvent.changeText(screen.getByLabelText("Message"), "use the staging config");
+      await fireEvent(screen.getByLabelText("Message"), "submitEditing");
+      await act(async () => {});
+      const answer = lastCommand(rig, "answer");
+      expect(answer).toMatchObject({ approval: 1, allow: false });
+      expect(rig.sockets.last.commandsOf("prompt")).toEqual([]);
+      await feed(rig, { type: "ack", req: answer?.req, message: "ok" });
+      expect(lastCommand(rig, "prompt")).toMatchObject({ session: "a", text: "use the staging config" });
     });
 
     it("sends a prompt over the wire and clears the box when the Mac acks", async () => {
@@ -533,12 +772,77 @@ describe("the Session screen", () => {
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
       await fireEvent.changeText(screen.getByLabelText("Message"), "fix the hub");
-      await fireEvent.press(screen.getByRole("button", { name: "Send" }));
+      await fireEvent.press(screen.getByRole("button", { name: "Send (⏎)" }));
       const sent = lastCommand(rig, "prompt");
       expect(sent).toMatchObject({ session: "a", text: "fix the hub" });
       expect(screen.getByLabelText("Message").props.value).toBe("fix the hub");
       await feed(rig, { type: "ack", req: sent?.req, message: "sent" });
       expect(screen.getByLabelText("Message").props.value).toBe("");
+    });
+
+    describe("a session that ended on a question", () => {
+      const asking = (extra: Partial<SessionInfo> = {}) => info("a", { phase: "idle", question: true, ...extra });
+      const field = () => screen.getByLabelText("Message");
+
+      it("asks for an answer in the prompt's placeholder, and says the usual words otherwise", async () => {
+        const rig = await launch([asking()]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        expect(field().props.placeholder).toBe("Answer, or describe a change");
+        await feed(rig, { type: "sessions", sessions: [info("a", { phase: "idle" })] });
+        expect(field().props.placeholder).toBe("Ask, describe a change, or /help");
+      });
+
+      it("a running turn or an approval keeps its own placeholder", async () => {
+        const rig = await launch([asking({ phase: "running" })]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "running" }));
+        expect(field().props.placeholder).toBe("Working… esc cancels");
+      });
+
+      it("clears locally once the user sends anything, though the Mac's row still says question, until a row without it", async () => {
+        const rig = await launch([asking()]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        await fireEvent.changeText(field(), "yes, go ahead");
+        await fireEvent.press(screen.getByRole("button", { name: "Send (⏎)" }));
+        expect(field().props.placeholder).toBe("Answer, or describe a change"); // not before the Mac takes it
+        await feed(rig, { type: "ack", req: lastCommand(rig, "prompt")?.req, message: "sent" });
+        expect(field().props.placeholder).toBe("Ask, describe a change, or /help");
+        // A row from before the Mac saw the answer still says question: the phone does not ask again.
+        await feed(rig, { type: "sessions", sessions: [asking({ last_activity: 9 })] });
+        expect(field().props.placeholder).toBe("Ask, describe a change, or /help");
+        // The Mac caught up; the next question is a new one.
+        await feed(rig, { type: "sessions", sessions: [info("a", { phase: "idle" })] });
+        await feed(rig, { type: "sessions", sessions: [asking({ last_activity: 12 })] });
+        expect(field().props.placeholder).toBe("Answer, or describe a change");
+      });
+
+      it("a prompt the Mac refuses leaves the question", async () => {
+        const rig = await launch([asking()]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        await fireEvent.changeText(field(), "yes");
+        await fireEvent.press(screen.getByRole("button", { name: "Send (⏎)" }));
+        await feed(rig, { type: "refused", req: lastCommand(rig, "prompt")?.req, code: "invalid", reason: "No" });
+        expect(field().props.placeholder).toBe("Answer, or describe a change");
+      });
+
+      it("Reply from the Inbox focuses the prompt when the conversation opens", async () => {
+        const rig = await launch([asking()]);
+        await fireEvent.press(screen.getByRole("button", { name: "Reply to a" }));
+        await screen.findByTestId("transcript");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        expect(field().props.autoFocus).toBe(true);
+        expect(octetStore.getState().replyTo).toBeNull(); // used
+      });
+
+      it("a plain open does not focus the prompt", async () => {
+        const rig = await launch([asking()]);
+        await open(rig, "a");
+        await feed(rig, subscribed(), stateFrame({ phase: "idle" }));
+        expect(field().props.autoFocus).toBeFalsy();
+      });
     });
 
     it("shows an approval, answers it over the wire, and drops one closed elsewhere", async () => {
@@ -547,7 +851,7 @@ describe("the Session screen", () => {
       await open(rig, "a");
       await feed(rig, subscribed(), approvalEvent(1, "Run tests"), approvalEvent(2, "Edit config"));
       expect(screen.getByText("Run tests")).toBeTruthy();
-      expect(screen.getByText("$ make test")).toBeTruthy();
+      expect(screen.getByText("make test")).toBeTruthy();
       await wait(450);
       await fireEvent.press(screen.getByRole("button", { name: "Allow" }));
       await act(async () => {});
@@ -568,10 +872,16 @@ describe("the Session screen", () => {
       await feed(rig, { type: "sessions", sessions: [info("b")] });
       expect(screen.getByText("This session ended")).toBeTruthy();
       expect(screen.queryByLabelText("Message")).toBeNull();
-      expect(screen.queryByRole("button", { name: "End session" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Cancel (esc)" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Allow (y)" })).toBeNull();
       expect(screen.queryByText("Run tests")).toBeNull();
       expect(screen.queryByRole("button", { name: "Allow" })).toBeNull();
+      // An ended session takes no commands: no ▾ menu, so no End; ⋯ is still Usage.
+      expect(screen.getByRole("button", { name: "Usage" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "End session" })).toBeNull();
     });
+
+    const titled = (name = "a") => screen.getByRole("button", { name: new RegExp(`^${name}, `) });
 
     it("changes the mode over the wire, and the catalog moves the current mark", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
@@ -581,24 +891,25 @@ describe("the Session screen", () => {
         session: "a",
         catalog: { modes: ["ask", "auto"], current_mode, models: [], current: null },
       });
-      expect(screen.queryByRole("button", { name: "Mode and model" })).toBeNull();
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }), catalog("ask"));
-      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
-      await fireEvent.press(screen.getByRole("button", { name: "Auto" }));
+      await fireEvent.press(titled());
+      await fireEvent.press(screen.getByRole("tab", { name: "auto" }));
       await act(async () => {});
       const sent = lastCommand(rig, "set_mode");
       expect(sent).toMatchObject({ session: "a", mode: "auto" });
       await feed(rig, { type: "ack", req: sent?.req, message: "ok" });
-      expect(screen.queryByRole("button", { name: "Auto" })).toBeNull(); // the sheet closed
       await feed(rig, catalog("auto"));
-      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
-      expect(screen.getByRole("button", { name: "Auto, current" })).toBeTruthy();
-      // An ended session takes no commands: the button goes with the controls.
+      expect(screen.getByRole("tab", { name: "auto" }).props.accessibilityState.selected).toBe(true);
+      expect(titled().props.accessibilityLabel).toBe("a, auto");
+      await fireEvent.press(screen.getByTestId("menu-scrim"));
+      expect(screen.queryByTestId("menu")).toBeNull();
+      // An ended session takes no commands: the menu goes with the controls.
       await feed(rig, { type: "sessions", sessions: [] });
-      expect(screen.queryByRole("button", { name: "Mode and model" })).toBeNull();
+      await fireEvent.press(titled());
+      expect(screen.queryByTestId("menu")).toBeNull();
     });
 
-    it("an approval that comes while the mode sheet is open is pointed out there", async () => {
+    it("an approval that comes while the menu is open is pointed out there", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }), {
@@ -606,13 +917,13 @@ describe("the Session screen", () => {
         session: "a",
         catalog: { modes: ["ask", "auto"], current_mode: "ask", models: [], current: null },
       });
-      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
+      await fireEvent.press(titled());
       expect(screen.queryByText("An approval is waiting \u2014 close this to answer it.")).toBeNull();
       await feed(rig, approvalEvent(1, "Run tests"));
       expect(screen.getByText("An approval is waiting \u2014 close this to answer it.")).toBeTruthy();
     });
 
-    it("an approval that came under the mode sheet arms 400 ms after the sheet closes", async () => {
+    it("an approval that came under the menu arms 400 ms after the menu closes", async () => {
       const rig = await launch([info("a", { phase: "idle" })]);
       await open(rig, "a");
       await feed(rig, subscribed(), stateFrame({ phase: "idle" }), {
@@ -620,23 +931,69 @@ describe("the Session screen", () => {
         session: "a",
         catalog: { modes: ["ask", "auto"], current_mode: "ask", models: [], current: null },
       });
-      await fireEvent.press(screen.getByRole("button", { name: "Mode and model" }));
+      await fireEvent.press(titled());
       await feed(rig, approvalEvent(1, "Run tests"));
       await wait(1_000);
-      await fireEvent.press(screen.getByTestId("scrim"));
+      await fireEvent.press(screen.getByTestId("menu-scrim"));
       const deny = () => screen.getByRole("button", { name: "Deny" });
       expect(deny().props.accessibilityState?.disabled).toBe(true);
       await wait(400);
       expect(deny().props.accessibilityState?.disabled).toBe(false);
     });
 
+    it("an approval under the drawer: a tap that closes the drawer answers nothing, and it arms 400 ms later", async () => {
+      await saveSettings({ faceId: false });
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"));
+      await wait(450);
+      const hid = { hidden: true } as const; // the drawer is modal: what is under it is hidden from queries
+      const off = (name: string) => screen.getByRole("button", { name, ...hid }).props.accessibilityState?.disabled === true;
+      expect(off("Allow")).toBe(false);
+      await act(async () => openDrawer());
+      expect(off("Allow")).toBe(true);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow", ...hid }));
+      await fireEvent.press(screen.getByRole("button", { name: "Close menu" }));
+      expect(off("Allow")).toBe(true);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow", ...hid }));
+      await fireEvent.press(screen.getByRole("button", { name: "Deny", ...hid }));
+      await act(async () => {});
+      expect(rig.sockets.last.commandsOf("answer")).toEqual([]);
+      await wait(400);
+      expect(off("Allow")).toBe(false);
+    });
+
+    it("an approval out of sight behind another screen arms again 400 ms after coming back", async () => {
+      await saveSettings({ faceId: false });
+      const rig = await launch([info("a")]);
+      await open(rig, "a");
+      await feed(rig, subscribed(), approvalEvent(1, "Run tests"));
+      await wait(450);
+      const off = (name: string) => screen.getByRole("button", { name }).props.accessibilityState?.disabled === true;
+      expect(off("Allow")).toBe(false);
+      await act(async () => router.push("/settings"));
+      await wait(1_000);
+      await act(async () => router.back());
+      expect(rig.view.getPathname()).toBe(`/session/${k("a")}`);
+      expect(off("Allow")).toBe(true);
+      expect(off("Deny")).toBe(true);
+      await fireEvent.press(screen.getByRole("button", { name: "Allow" }));
+      await act(async () => {});
+      expect(rig.sockets.last.commandsOf("answer")).toEqual([]);
+      await wait(399);
+      expect(off("Allow")).toBe(true);
+      await wait(1);
+      expect(off("Allow")).toBe(false);
+    });
+
     it("has none of them for a session that is gone", async () => {
-      await launch([info("a")], "/session/zzz");
+      await launch([info("a")], sessionPath("zzz"));
       expect(await screen.findByText("This session isn't running anymore")).toBeTruthy();
       expect(screen.queryByLabelText("Message")).toBeNull();
     });
 
     describe("while the Mac can't be reached", () => {
+      const KEYS = ["Allow", "Deny", "Allow (y)", "Deny (n)", "Deny (esc)"];
       const isOff = (name: string) =>
         screen.getByRole("button", { name }).props.accessibilityState?.disabled === true;
 
@@ -663,9 +1020,10 @@ describe("the Session screen", () => {
         expect(StyleSheet.flatten(screen.getByTestId("transcript-area").props.style).opacity).toBe(0.6);
         expect(screen.getByText("Fix the hub")).toBeTruthy();
         expect(screen.getByText("Run tests")).toBeTruthy();
-        for (const name of ["Allow", "Deny", "Send", "End session", "Mode and model"]) expect(isOff(name)).toBe(true);
-        await fireEvent.press(screen.getByRole("button", { name: "Send" }));
+        for (const name of KEYS) expect(isOff(name)).toBe(true);
+        await fireEvent(screen.getByLabelText("Message"), "submitEditing");
         await fireEvent.press(screen.getByRole("button", { name: "Deny" }));
+        await fireEvent.press(screen.getByRole("button", { name: "Deny (esc)" }));
         // A brief `connecting` keeps the typed words.
         await act(async () => {
           rig.clock.advance(500);
@@ -682,7 +1040,7 @@ describe("the Session screen", () => {
         // The approval arms 400 ms after the link is back, as after it first came.
         expect(isOff("Deny")).toBe(true);
         await wait(400);
-        for (const name of ["Allow", "Deny", "Send", "End session", "Mode and model"]) expect(isOff(name)).toBe(false);
+        for (const name of KEYS) expect(isOff(name)).toBe(false);
         expect(rig.sockets.all.flatMap((s) => s.commandsOf("prompt").concat(s.commandsOf("answer")))).toEqual([]);
       });
 

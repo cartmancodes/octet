@@ -1,5 +1,6 @@
 import type { ApprovalSummary, CatalogInfo, KnownJournalEvent, StateInfo } from "../protocol";
 import { EMPTY_VIEW, reduceView, type Op, type SessionView } from "./session";
+import { entrySize } from "./transcript";
 
 const ev = (event: KnownJournalEvent): Op => ({ op: "event", ev: event });
 const summary = (action: string, extra: Partial<ApprovalSummary> = {}): ApprovalSummary => ({
@@ -176,6 +177,124 @@ describe("the other records", () => {
   it("put transcript records in the transcript", () => {
     const v = view([ev({ type: "user", data: "hi" }), ev({ type: "text", data: "hello" })]);
     expect(v.transcript.entries).toMatchObject([{ kind: "user" }, { kind: "reply", text: "hello" }]);
+  });
+});
+
+describe("turns", () => {
+  const finished = ev({ type: "finished", data: "completed" });
+
+  it("count the finished records, whatever else they ended with", () => {
+    const v = view([finished, ev({ type: "finished", data: "interrupted" }), ev({ type: "finished", data: "failed" })]);
+    expect(v.turns).toBe(3);
+    expect(view([finished], v).turns).toBe(4);
+  });
+
+  it("are not counted from other records, and the view keeps its identity", () => {
+    const v = view([finished]);
+    expect(view([ev({ type: "text", data: "x" }), ev({ type: "started", data: null } as never)], v).turns).toBe(1);
+    expect(view([], v)).toBe(v);
+  });
+
+  it("start over at a replay from the start, which brings them all again", () => {
+    const old = view([finished, finished, finished]);
+    const after = view([{ op: "reset" }, finished], old);
+    expect(after.turns).toBe(1);
+  });
+
+  it("are counted in the reducer: they outlast the entries the view drops", () => {
+    const many = Array.from({ length: 2_500 }, () => [ev({ type: "user", data: "q" }), finished]).flat();
+    expect(view(many).turns).toBe(2_500);
+  });
+});
+
+describe("a fresh start's divider", () => {
+  const NOTE = "Fresh conversation — the earlier one is above.";
+  const note = (text = NOTE): Op => ({ op: "note", text });
+  const at = (journal: string, event: KnownJournalEvent): Op => ({ op: "event", ev: event, journal });
+  const lines = (v: SessionView) => v.transcript.entries.map((e) => [e.kind, "text" in e ? e.text : ""]);
+  const OLD = [
+    { op: "journals", journals: ["j1"] } as Op,
+    at("j1", { type: "user", data: "old" }),
+    at("j1", { type: "text", data: "old reply" }),
+    at("j1", { type: "finished", data: "completed" }),
+  ];
+
+  it("goes before the first record of a journal the session had not heard of: the old journal's last words stay above it", () => {
+    let v = view([...OLD, note()]);
+    // Nothing yet: the old journal may still be draining.
+    expect(v.transcript.entries.some((e) => e.kind === "note")).toBe(false);
+    v = view([at("j1", { type: "error", data: "late crash" }), at("j2", { type: "user", data: "new" }), at("j2", { type: "text", data: "new reply" })], v);
+    expect(lines(v)).toEqual([
+      ["user", "old"],
+      ["reply", "old reply"],
+      ["error", "late crash"],
+      ["note", NOTE],
+      ["user", "new"],
+      ["reply", "new reply"],
+    ]);
+  });
+
+  it("a resubscribe that lists the new journal before its first record still puts it there", () => {
+    let v = view([...OLD, note(), { op: "journals", journals: ["j1", "j2"] }]);
+    v = view([at("j2", { type: "user", data: "new" })], v);
+    expect(lines(v)).toEqual([
+      ["user", "old"],
+      ["reply", "old reply"],
+      ["note", NOTE],
+      ["user", "new"],
+    ]);
+  });
+
+  it("survives a held replay: asked while a replay from the start holds the old entries, it lands at the boundary", () => {
+    const old = view(OLD);
+    let v = view([{ op: "reset" }, { op: "journals", journals: ["j1"] }, note()], old);
+    expect(v.held).not.toBeNull();
+    v = view([at("j1", { type: "user", data: "old" }), at("j1", { type: "text", data: "old reply" }), { op: "replayed" }], v);
+    expect(lines(v)).toEqual([
+      ["user", "old"],
+      ["reply", "old reply"],
+    ]);
+    v = view([at("j2", { type: "user", data: "new" })], v);
+    expect(lines(v)).toEqual([
+      ["user", "old"],
+      ["reply", "old reply"],
+      ["note", NOTE],
+      ["user", "new"],
+    ]);
+  });
+
+  it("is made again at the same boundary on each replay from the start, however the pages fall", () => {
+    let v = view([...OLD, note(), at("j2", { type: "user", data: "new" }), at("j2", { type: "text", data: "new reply" })]);
+    const placed = lines(v);
+    for (const pages of [
+      [[at("j1", { type: "user", data: "old" }), at("j1", { type: "text", data: "old reply" }), at("j1", { type: "finished", data: "completed" }), at("j2", { type: "user", data: "new" }), at("j2", { type: "text", data: "new reply" })]],
+      [[at("j1", { type: "user", data: "old" }), at("j1", { type: "text", data: "old reply" })], [at("j1", { type: "finished", data: "completed" })], [at("j2", { type: "user", data: "new" }), at("j2", { type: "text", data: "new reply" })]],
+    ]) {
+      v = view([{ op: "reset" }, { op: "journals", journals: ["j1", "j2"] }], v);
+      for (const page of pages) v = view(page, v);
+      v = view([{ op: "replayed" }], v);
+      expect(lines(v)).toEqual(placed);
+    }
+  });
+
+  it("a repeated ack while it waits changes nothing, and once placed, the same note straight after it adds none", () => {
+    const waiting = view([...OLD, note()]);
+    expect(view([note()], waiting)).toBe(waiting);
+    const placed = view([at("j2", { type: "ready", data: "" }), note()], waiting);
+    expect(placed.transcript.entries.filter((e) => e.kind === "note")).toHaveLength(1);
+  });
+
+  it("stays inside the transcript bounds", () => {
+    const many = view([{ op: "journals", journals: ["j1"] }, ...Array.from({ length: 1_000 }, (_, i) => at("j1", { type: "user", data: `q${i}` })), note()]);
+    const after = view([at("j2", { type: "user", data: "new" })], many);
+    expect(after.transcript.entries).toHaveLength(1_000);
+    expect(after.transcript.entries[998]).toMatchObject({ kind: "note" });
+    expect(after.transcript.bytes).toBe(after.transcript.entries.reduce((n, e) => n + entrySize(e), 0));
+  });
+
+  it("is cleaned like any hub text", () => {
+    const v = view([{ op: "journals", journals: ["j1"] }, { op: "note", text: "a\u001b[31mb\u0007" }, at("j2", { type: "user", data: "new" })]);
+    expect(v.transcript.entries[0]).toMatchObject({ kind: "note", text: "ab" });
   });
 });
 

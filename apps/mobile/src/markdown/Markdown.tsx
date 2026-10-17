@@ -3,21 +3,25 @@
 import { memo, useMemo, type ReactNode } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
-import { dark, light, radius, spacing, type, useTheme, type Theme } from "../theme";
+import { DEFAULT_SETTINGS, type TextSize } from "../persist";
+import { sizedStyles, transcriptText } from "../sizedStyles";
+import { radius, spacing, type, useTheme, type Theme } from "../theme";
 import { doneBlocks, streamBlocks } from "./blocks";
 import type { Block, Span } from "./parse";
 
-function makeStyles(theme: Theme) {
+/** The transcript's text at `size` (`Aa`): monospace, 5 points of leading. */
+function makeStyles(theme: Theme, size: TextSize) {
+  const body = transcriptText(size);
   return StyleSheet.create({
     root: { gap: spacing.sm },
-    text: { ...type.body, color: theme.fg },
+    text: { ...body, color: theme.fg },
     bold: { fontWeight: "700" },
     italic: { fontStyle: "italic" },
-    code: { ...type.mono, color: theme.fg, backgroundColor: theme.panel },
+    code: { ...body, color: theme.fg, backgroundColor: theme.panel },
     url: { color: theme.muted },
     h1: { ...type.title, color: theme.accent },
     h2: { fontSize: 18, lineHeight: 24, fontWeight: "700", color: theme.accent },
-    h3: { ...type.body, fontWeight: "700", color: theme.accent },
+    h3: { ...body, fontWeight: "700", color: theme.accent },
     block: {
       backgroundColor: theme.panel,
       borderColor: theme.edge,
@@ -25,19 +29,18 @@ function makeStyles(theme: Theme) {
       borderRadius: radius.sm,
       padding: spacing.sm,
     },
-    codeText: { ...type.mono, color: theme.fg },
+    codeText: { ...body, color: theme.fg },
     item: { flexDirection: "row", gap: spacing.sm },
-    marker: { ...type.body, color: theme.muted, minWidth: 16 },
-    itemText: { ...type.body, color: theme.fg, flex: 1 },
+    marker: { ...body, color: theme.muted, minWidth: 16 },
+    itemText: { ...body, color: theme.fg, flex: 1 },
     quote: { borderLeftWidth: 3, borderLeftColor: theme.edge, paddingLeft: spacing.md },
-    quoteText: { ...type.body, color: theme.muted },
+    quoteText: { ...body, color: theme.muted },
     rest: { ...type.caption, color: theme.muted },
   });
 }
 
 type Styles = ReturnType<typeof makeStyles>;
-const DARK = makeStyles(dark);
-const LIGHT = makeStyles(light);
+const stylesFor = sizedStyles(makeStyles);
 
 /** What a reply says, at its top, in place of the earlier blocks it does not draw. */
 export const earlierBlocks = (n: number): string => `${n} earlier blocks of this reply are on the Mac`;
@@ -109,9 +112,18 @@ const Blocks = memo(function Blocks({ blocks, first, s }: { blocks: Block[]; fir
  * many earlier ones are on the Mac. A finished reply is parsed once per text; one `streaming` parses only
  * what came since its last whole block, so a chunk costs the same however long the reply is.
  */
-export const Markdown = memo(function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
+export const Markdown = memo(function Markdown({
+  text,
+  streaming = false,
+  size = DEFAULT_SETTINGS.textSize,
+}: {
+  text: string;
+  streaming?: boolean;
+  /** The transcript's text size. */
+  size?: TextSize;
+}) {
   const theme = useTheme();
-  const s = theme === light ? LIGHT : DARK;
+  const s = stylesFor(theme, size);
   const shown = useMemo(() => (streaming ? streamBlocks(text) : doneBlocks(text)), [text, streaming]);
   return (
     <View style={s.root}>

@@ -44,6 +44,42 @@ describe("app.json", () => {
   });
 });
 
+describe("the Live Activity", () => {
+  const config = expo as typeof expo & {
+    ios: {
+      deploymentTarget?: string;
+      entitlements?: Record<string, unknown>;
+      infoPlist?: { NSSupportsLiveActivities?: boolean; NSSupportsLiveActivitiesFrequentUpdates?: boolean };
+    };
+  };
+
+  it("adds the widget target through @bacons/apple-targets, pinned exactly as a dev dependency", () => {
+    const plugins = expo.plugins as (string | [string, object])[];
+    expect(plugins.map((p) => (typeof p === "string" ? p : p[0]))).toContain("@bacons/apple-targets");
+    const dev = packageJson.devDependencies as Record<string, string>;
+    expect(dev["@bacons/apple-targets"]).toMatch(/^\d+\.\d+\.\d+$/);
+    expect((packageJson.dependencies as Record<string, string>)["@bacons/apple-targets"]).toBeUndefined();
+  });
+
+  it("shares the App Group with the widget", () => {
+    expect(config.ios.entitlements?.["com.apple.security.application-groups"]).toEqual(["group.dev.octet.mobile"]);
+  });
+
+  it("supports Live Activities, without frequent updates", () => {
+    expect(config.ios.infoPlist?.NSSupportsLiveActivities).toBe(true);
+    expect(config.ios.infoPlist?.NSSupportsLiveActivitiesFrequentUpdates).toBe(false);
+  });
+
+  it("doesn't raise the app's iOS floor: only the widget needs iOS 17.2", () => {
+    expect(config.ios.deploymentTarget).toBeUndefined();
+  });
+
+  it("doesn't link apple-targets' own ExtensionStorage module into the app", () => {
+    const autolinking = (packageJson as { expo?: { autolinking?: { exclude?: string[] } } }).expo?.autolinking;
+    expect(autolinking?.exclude).toEqual(["@bacons/apple-targets"]);
+  });
+});
+
 describe("eas.json", () => {
   // Read from disk: a missing file fails here by name rather than as a module error.
   const read = (): Record<string, unknown> => {

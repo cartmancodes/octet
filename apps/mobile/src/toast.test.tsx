@@ -1,0 +1,232 @@
+// The approval toast: "<name> needs approval · View" when an approval newly arrives for a session
+// that is not the one on screen, never while the Inbox is up.
+import { act, fireEvent, screen } from "@testing-library/react-native";
+import { router } from "expo-router";
+import { Text } from "react-native";
+
+import { freshApprovals } from "./components/ApprovalToasts";
+import { closeDrawer } from "./drawer";
+import type { ApprovalInfo, SessionInfo } from "./protocol";
+import { hear, info, launch, pairedStorage, type Rig } from "./screenRig";
+import { hideToast, toastStore } from "./toast";
+import { k, sessionPath } from "./testKeys";
+import { keyOf } from "./macs";
+import { octetStore } from "./store";
+
+const gist = (id: number): ApprovalInfo => ({
+  id,
+  summary: { action: "Bash", command: `make test-${id}`, files: [], scope: "this command once", cwd: "/w" },
+});
+const waiting = (id: string, approvalId: number, extra: Partial<SessionInfo> = {}): SessionInfo =>
+  info(id, { approvals: 1, phase: "running", approval: gist(approvalId), ...extra });
+
+/** The first of `freshApprovals`, or null. */
+const newApproval = (before: readonly SessionInfo[], next: readonly SessionInfo[], toasted?: ReadonlyMap<string, number>): SessionInfo | null =>
+  freshApprovals(before, next, toasted)[0] ?? null;
+
+const ROUTES = {
+  settings: () => <Text>Settings screen</Text>,
+  recent: () => <Text>Recent screen</Text>,
+  new: () => <Text>New session screen</Text>,
+};
+
+beforeEach(async () => {
+  await pairedStorage();
+  closeDrawer();
+  hideToast();
+});
+afterEach(() => {
+  closeDrawer();
+  hideToast();
+  jest.restoreAllMocks();
+});
+
+const flush = () => act(async () => {});
+const toastText = () => toastStore.getState().toast?.text ?? null;
+/** Opens the app on the Inbox, then moves to `path`. */
+async function openAt(path: string, list: SessionInfo[]): Promise<Rig> {
+  const rig = await launch("/", ROUTES, list);
+  if (path !== "/") {
+    await act(async () => router.push(path as never));
+    await flush();
+  }
+  return rig;
+}
+
+describe("newApproval", () => {
+  const row = (id: string, approvals: number, front?: number) => info(id, { approvals, ...(front === undefined ? {} : { approval: gist(front) }) });
+
+  it("finds a session whose count rose or whose front approval changed", () => {
+    expect(newApproval([row("a", 0)], [row("a", 1, 1)])?.id).toBe("a");
+    expect(newApproval([row("a", 1, 1)], [row("a", 2, 1)])?.id).toBe("a");
+    expect(newApproval([row("a", 1, 1)], [row("a", 1, 2)])?.id).toBe("a");
+    expect(newApproval([], [row("a", 1, 1)])?.id).toBe("a");
+  });
+
+  it("finds nothing when a count falls or holds, and nothing for no approvals", () => {
+    expect(newApproval([row("a", 2, 1)], [row("a", 1, 1)])).toBeNull();
+    expect(newApproval([row("a", 1, 1)], [row("a", 1, 1)])).toBeNull();
+    expect(newApproval([row("a", 1, 1)], [row("a", 0)])).toBeNull();
+    expect(newApproval([row("a", 0)], [row("a", 0)])).toBeNull();
+  });
+
+  it("a front approval that goes missing for a moment and returns is not announced again", () => {
+    const toasted = new Map([["a", 1]]);
+    expect(newApproval([row("a", 1, 1)], [row("a", 1)], toasted)).toBeNull(); // the front is gone
+    expect(newApproval([row("a", 1)], [row("a", 1, 1)], toasted)).toBeNull(); // and back
+    // The same, from nothing waiting, for a front already announced.
+    expect(newApproval([], [row("a", 1, 1)], toasted)).toBeNull();
+    // Another approval is news.
+    expect(newApproval([row("a", 1)], [row("a", 1, 2)], toasted)?.id).toBe("a");
+  });
+
+  it("a count that falls, with the next approval now at the front, is not news", () => {
+    expect(newApproval([row("a", 2, 1)], [row("a", 1, 2)])).toBeNull();
+  });
+
+  it("takes the first of several, in the list's order", () => {
+    expect(newApproval([row("a", 0), row("b", 0)], [row("a", 1, 1), row("b", 1, 1)])?.id).toBe("a");
+  });
+});
+
+describe("the approval toast", () => {
+  it("shows '<name> needs approval' with View when a session off screen gets an approval", async () => {
+    const rig = await openAt("/settings", [info("b")]);
+    expect(toastText()).toBeNull();
+    await hear(rig, [waiting("b", 1)]);
+    expect(screen.getByText("b needs approval")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "View" })).toBeTruthy();
+  });
+
+  it("View opens that session, and the toast goes", async () => {
+    const rig = await openAt("/settings", [info("b")]);
+    await hear(rig, [waiting("b", 1)]);
+    await fireEvent.press(screen.getByRole("button", { name: "View" }));
+    await flush();
+    expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
+    expect(screen.getByTestId("opened").props.children).toBe(k("b"));
+    expect(toastText()).toBeNull();
+  });
+
+  it("View for a session already in the stack goes back to it: no second copy", async () => {
+    const rig = await openAt(sessionPath("b"), [info("b")]);
+    await act(async () => router.push("/settings"));
+    await hear(rig, [waiting("b", 1)]);
+    await fireEvent.press(screen.getByRole("button", { name: "View" }));
+    await flush();
+    expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
+    await act(async () => router.back());
+    expect(rig.view.getPathname()).toBe("/");
+    expect(router.canGoBack()).toBe(false);
+  });
+
+  it("View from one session to another replaces it: back goes to the Inbox", async () => {
+    const rig = await openAt(sessionPath("a"), [info("a"), info("b")]);
+    await hear(rig, [info("a"), waiting("b", 1)]);
+    await fireEvent.press(screen.getByRole("button", { name: "View" }));
+    await flush();
+    expect(rig.view.getPathname()).toBe(`/session/${k("b")}`);
+    await act(async () => router.back());
+    expect(rig.view.getPathname()).toBe("/");
+  });
+
+  it("shows when the count rises or the front approval changes, and not otherwise", async () => {
+    const rig = await openAt("/settings", [waiting("b", 1)]);
+    expect(toastText()).toBeNull(); // already waiting when the screen opened
+    await hear(rig, [waiting("b", 1, { last_activity: 5 })]);
+    expect(toastText()).toBeNull(); // the same approval
+    await hear(rig, [waiting("b", 2)]);
+    expect(toastText()).toBe("b needs approval"); // its front approval changed
+    await act(async () => hideToast());
+    await hear(rig, [waiting("b", 2, { approvals: 2 })]);
+    expect(toastText()).toBe("b needs approval"); // one more waiting
+    await act(async () => hideToast());
+    await hear(rig, [waiting("b", 2, { approvals: 1 })]);
+    expect(toastText()).toBeNull(); // fewer waiting
+  });
+
+  it("announces each approval once: not when its front goes missing and returns, nor when one is answered and the next fronts", async () => {
+    const rig = await openAt("/settings", [info("b")]);
+    await hear(rig, [waiting("b", 1, { approvals: 2 })]);
+    expect(toastText()).toBe("b needs approval");
+    await act(async () => hideToast());
+    await hear(rig, [waiting("b", 2, { approvals: 1 })]); // the Mac answered 1; 2 is at the front
+    expect(toastText()).toBeNull();
+    await hear(rig, [info("b", { approvals: 1, phase: "running" })]); // the front is missing a moment
+    expect(toastText()).toBeNull();
+    await hear(rig, [waiting("b", 2)]); // and back
+    expect(toastText()).toBeNull();
+    await hear(rig, [waiting("b", 3)]); // another approval
+    expect(toastText()).toBe("b needs approval");
+  });
+
+  it("stays quiet for the approvals already waiting when the phone connects", async () => {
+    await openAt("/settings", [waiting("b", 1), waiting("c", 4)]);
+    expect(toastText()).toBeNull();
+  });
+
+  it("never shows while the Inbox is the current screen", async () => {
+    const rig = await openAt("/", [info("b")]);
+    await hear(rig, [waiting("b", 1)]);
+    expect(toastText()).toBeNull();
+  });
+
+  it("does not show for the session on screen, but does for another", async () => {
+    const rig = await openAt(sessionPath("a"), [info("a"), info("b")]);
+    await hear(rig, [waiting("a", 1), info("b")]);
+    expect(toastText()).toBeNull();
+    await hear(rig, [waiting("a", 1), waiting("b", 7)]);
+    expect(toastText()).toBe("b needs approval");
+  });
+
+  it("shows from the New session and Recent screens too", async () => {
+    const rig = await openAt("/new", [info("b")]);
+    await hear(rig, [waiting("b", 1)]);
+    expect(toastText()).toBe("b needs approval");
+  });
+
+  it("shows hub text as plain text, never as a link", async () => {
+    const rig = await openAt("/settings", [info("b")]);
+    await hear(rig, [waiting("b", 1, { workspace: "/w/<b>[go](evil.test)" })]);
+    const shown = screen.getByText("<b>[go](evil.test) needs approval");
+    expect(shown.props.onPress).toBeUndefined();
+  });
+
+  describe("a second Mac (the baseline is per Mac)", () => {
+    const OTHER = "m0000000b";
+    /** The other Mac's list, keyed as its feed keys it. */
+    const listOther = (rows: SessionInfo[]) =>
+      act(async () => {
+        octetStore.getState().applyBatch(OTHER, [{ v: 1, type: "sessions", sessions: rows.map((r) => ({ ...r, id: keyOf(OTHER, r.id) })) }]);
+      });
+
+    it("its first list is its own baseline: an approval already waiting there is not news", async () => {
+      await openAt("/settings", [info("b")]);
+      await listOther([waiting("x", 1)]);
+      expect(toastText()).toBeNull();
+      await listOther([waiting("x", 2)]);
+      expect(toastText()).toBe("x needs approval");
+    });
+
+    it("a Mac paired again starts a new baseline", async () => {
+      await openAt("/settings", [info("b")]);
+      await listOther([info("x")]);
+      await act(async () => octetStore.getState().reset(OTHER));
+      await listOther([waiting("x", 1)]);
+      expect(toastText()).toBeNull();
+    });
+
+    it("its reset takes its toast down, and leaves another Mac's", async () => {
+      const rig = await openAt("/settings", [info("b")]);
+      await listOther([info("x")]);
+      await listOther([waiting("x", 1)]);
+      expect(toastText()).toBe("x needs approval");
+      await act(async () => octetStore.getState().reset(OTHER));
+      expect(toastText()).toBeNull();
+      await hear(rig, [waiting("b", 1)]);
+      expect(toastText()).toBe("b needs approval");
+      await act(async () => octetStore.getState().reset(OTHER));
+      expect(toastText()).toBe("b needs approval");
+    });
+  });
+});

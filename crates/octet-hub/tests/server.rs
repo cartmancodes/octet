@@ -13,13 +13,13 @@ use std::{
     future::Future,
     io::Write as _,
     os::unix::fs::PermissionsExt as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -177,6 +177,23 @@ impl Env {
         seqs: std::ops::Range<u64>,
         from_phone: bool,
     ) -> Bridge {
+        self.bridge_with(pid, seqs, from_phone, "/work".into())
+            .await
+    }
+
+    /// A fake bridge for `pid` registered as running in `workspace`.
+    async fn bridge_in(&self, pid: u32, workspace: &Path) -> Bridge {
+        self.bridge_with(pid, 0..1, false, workspace.to_owned())
+            .await
+    }
+
+    async fn bridge_with(
+        &self,
+        pid: u32,
+        seqs: std::ops::Range<u64>,
+        from_phone: bool,
+        workspace: PathBuf,
+    ) -> Bridge {
         self.journal(JOURNAL, seqs);
         let registration = Registration {
             id: format!("{pid}-1790000000"),
@@ -184,7 +201,7 @@ impl Env {
             started: 1_790_000_000,
             socket: self.run.join(format!("{pid}.sock")),
             engine: "claude".into(),
-            workspace: "/work".into(),
+            workspace,
             model: "opus".into(),
             mode: "ask".into(),
             vendor_session: String::new(),
@@ -986,6 +1003,13 @@ async fn state_and_catalog_follow_subscriptions() {
     bridge_write(&mut write, bridge_state_frame(&state("idle"))).await;
     let update = recv_kind(&mut phone, "state").await;
     assert_eq!(update["state"], state("idle"));
+    // The row follows too, within a quarter second of the last list.
+    loop {
+        let sessions = recv_kind(&mut phone, "sessions").await;
+        if sessions["sessions"][0]["phase"] == "idle" {
+            break;
+        }
+    }
     bridge_write(&mut write, bridge_catalog_frame(&catalog("auto"))).await;
     let update = recv_kind(&mut phone, "catalog").await;
     assert_eq!(update["catalog"], catalog("auto"));
@@ -1244,6 +1268,489 @@ async fn push_commands_before_hello_are_refused_as_unpaired() {
     }
 }
 
+const ACTIVITY: &str = "5ec7e7aaaa0123456789abcdef";
+const START: &str = "5ec7e7bbbb0123456789abcdef";
+
+fn register_activity(req: u64, token: Option<&str>, start_token: Option<&str>) -> Value {
+    let mut message = json!({"v": 1, "req": req, "type": "register_activity"});
+    if let Some(token) = token {
+        message["token"] = json!(token);
+    }
+    if let Some(start_token) = start_token {
+        message["start_token"] = json!(start_token);
+    }
+    message
+}
+
+/// Each device's stored activity tokens, by name, as a fresh store reads them.
+async fn stored_activity(env: &Env) -> Vec<(String, Option<(Option<String>, Option<String>)>)> {
+    Store::open(&env.root)
+        .await
+        .expect("the store")
+        .devices()
+        .iter()
+        .map(|d| {
+            (
+                d.name.clone(),
+                d.activity
+                    .as_ref()
+                    .map(|a| (a.token.clone(), a.start_token.clone())),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn register_activity_is_stored_acked_audited_and_dropped_on_revoke() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let (_other, _) = env.phone("Other phone").await;
+
+    send(
+        &mut phone,
+        register_activity(7, Some(ACTIVITY), Some(START)),
+    )
+    .await;
+    assert_eq!(
+        recv_kind(&mut phone, "ack").await,
+        ack(7, "Activity registered")
+    );
+    assert_eq!(
+        stored_activity(&env).await,
+        [
+            (
+                "Test phone".to_owned(),
+                Some((Some(ACTIVITY.to_owned()), Some(START.to_owned())))
+            ),
+            ("Other phone".to_owned(), None),
+        ]
+    );
+
+    // A later registration replaces both; leaving out the start token clears it.
+    let newer = "0123456789abcdef5ec7e7cccc";
+    send(&mut phone, register_activity(8, Some(newer), None)).await;
+    assert_eq!(
+        recv_kind(&mut phone, "ack").await,
+        ack(8, "Activity registered")
+    );
+    assert_eq!(
+        stored_activity(&env).await[0],
+        (
+            "Test phone".to_owned(),
+            Some((Some(newer.to_owned()), None))
+        )
+    );
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(!text.contains(ACTIVITY) && !text.contains(START), "{text}");
+
+    // With no activity running, the phone has only a push-to-start token, and says so.
+    send(&mut phone, register_activity(9, None, Some(START))).await;
+    assert_eq!(
+        recv_kind(&mut phone, "ack").await,
+        ack(9, "Activity registered")
+    );
+    assert_eq!(
+        stored_activity(&env).await[0],
+        (
+            "Test phone".to_owned(),
+            Some((None, Some(START.to_owned())))
+        )
+    );
+
+    // The audit names the device and the action, never a token.
+    let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
+    let lines: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect();
+    let registered: Vec<_> = lines
+        .iter()
+        .filter(|l| l["what"] == "activity registered")
+        .collect();
+    assert_eq!(registered.len(), 3, "{audit}");
+    assert!(
+        registered
+            .iter()
+            .all(|l| l["device"] == "Test phone" && l["session"] == ""),
+        "{audit}"
+    );
+    assert!(
+        !audit.contains("5ec7e7") && !audit.contains("0123456789abcdef"),
+        "{audit}"
+    );
+
+    // Revoking the device drops its tokens with it.
+    let mut cli = Store::open(&env.root).await.expect("the store");
+    assert!(cli.revoke("Test phone").await);
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(
+        !text.contains(START) && !text.contains("\"activity\""),
+        "{text}"
+    );
+    assert_eq!(
+        stored_activity(&env).await,
+        [("Other phone".to_owned(), None)]
+    );
+}
+
+#[tokio::test]
+async fn activity_tokens_as_ios_issues_them_are_registered_up_to_1024_digits() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    // iOS 26.5 issues 128-byte tokens: 256 hex digits.
+    let ios = "0123456789abcdef".repeat(16);
+    let longest = "b".repeat(1024);
+    for (req, token, start) in [(1, &ios, &longest), (2, &longest, &ios)] {
+        send(&mut phone, register_activity(req, Some(token), Some(start))).await;
+        assert_eq!(
+            recv_kind(&mut phone, "ack").await,
+            ack(req, "Activity registered")
+        );
+        assert_eq!(
+            stored_activity(&env).await,
+            [(
+                "Test phone".to_owned(),
+                Some((Some(token.clone()), Some(start.clone())))
+            )]
+        );
+    }
+}
+
+#[tokio::test]
+async fn bad_activity_tokens_are_refused_as_invalid_and_the_connection_goes_on() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let too_long = "a".repeat(1025);
+    let mut extra = register_activity(7, Some(ACTIVITY), None);
+    extra["extra"] = json!(1);
+    for command in [
+        register_activity(1, Some("ABCDEF"), None),
+        register_activity(2, Some("not-hex"), None),
+        register_activity(3, Some(""), None),
+        register_activity(4, Some(&too_long), None),
+        register_activity(5, Some(ACTIVITY), Some("ABCDEF")),
+        json!({"v": 1, "req": 6, "type": "register_activity"}),
+        register_activity(8, None, Some("NOT-HEX")),
+        extra,
+    ] {
+        let req = command["req"].as_u64();
+        send(&mut phone, command).await;
+        let refusal = recv_kind(&mut phone, "refused").await;
+        assert_eq!(
+            (refusal["req"].as_u64(), refusal["code"].as_str()),
+            (req, Some("invalid")),
+            "{refusal}"
+        );
+        assert!(
+            !refusal.to_string().contains("5ec7e7"),
+            "the refusal repeats a token: {refusal}"
+        );
+    }
+    send(&mut phone, json!({"v": 1, "req": 9, "type": "ping"})).await;
+    assert_eq!(recv_kind(&mut phone, "ack").await["message"], "pong");
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(!text.contains("\"activity\""), "{text}");
+}
+
+fn clear_activity(req: u64) -> Value {
+    json!({"v": 1, "req": req, "type": "clear_activity"})
+}
+
+#[tokio::test]
+async fn clear_activity_removes_the_tokens_and_is_acked_and_audited() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let (mut other, _) = env.phone("Other phone").await;
+    let theirs = "0123456789abcdef5ec7e7dddd";
+    send(
+        &mut phone,
+        register_activity(1, Some(ACTIVITY), Some(START)),
+    )
+    .await;
+    recv_kind(&mut phone, "ack").await;
+    send(&mut other, register_activity(1, Some(theirs), None)).await;
+    recv_kind(&mut other, "ack").await;
+
+    send(&mut phone, clear_activity(2)).await;
+    assert_eq!(
+        recv_kind(&mut phone, "ack").await,
+        ack(2, "Activity cleared")
+    );
+    assert_eq!(
+        stored_activity(&env).await,
+        [
+            ("Test phone".to_owned(), None),
+            (
+                "Other phone".to_owned(),
+                Some((Some(theirs.to_owned()), None))
+            ),
+        ]
+    );
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(!text.contains(ACTIVITY) && !text.contains(START), "{text}");
+    // Clearing again is still acked: there is nothing left to start one.
+    send(&mut phone, clear_activity(3)).await;
+    assert_eq!(
+        recv_kind(&mut phone, "ack").await,
+        ack(3, "Activity cleared")
+    );
+    // An extra field is refused, and the connection goes on.
+    let mut extra = clear_activity(4);
+    extra["token"] = json!(ACTIVITY);
+    send(&mut phone, extra).await;
+    let refusal = recv_kind(&mut phone, "refused").await;
+    assert_eq!(
+        (refusal["req"].as_u64(), refusal["code"].as_str()),
+        (Some(4), Some("invalid")),
+        "{refusal}"
+    );
+    send(&mut phone, json!({"v": 1, "req": 5, "type": "ping"})).await;
+    assert_eq!(recv_kind(&mut phone, "ack").await["message"], "pong");
+
+    let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
+    let lines: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect();
+    let cleared: Vec<_> = lines
+        .iter()
+        .filter(|l| l["what"] == "activity cleared")
+        .collect();
+    assert_eq!(cleared.len(), 2, "{audit}");
+    assert!(
+        cleared
+            .iter()
+            .all(|l| l["device"] == "Test phone" && l["session"] == ""),
+        "{audit}"
+    );
+    assert!(!audit.contains("5ec7e7"), "{audit}");
+}
+
+#[tokio::test]
+async fn a_failed_activity_write_is_refused_in_words_that_fit() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(
+        &mut phone,
+        register_activity(1, Some(ACTIVITY), Some(START)),
+    )
+    .await;
+    recv_kind(&mut phone, "ack").await;
+    std::fs::set_permissions(&env.root, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    // Root (a container) writes into a read-only directory, so there is nothing to test.
+    if std::fs::write(env.root.join("probe"), b"x").is_ok() {
+        std::fs::set_permissions(&env.root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        return;
+    }
+    send(&mut phone, clear_activity(2)).await;
+    let cleared = recv_kind(&mut phone, "refused").await;
+    send(&mut phone, register_activity(3, Some(START), None)).await;
+    let registered = recv_kind(&mut phone, "refused").await;
+    std::fs::set_permissions(&env.root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(
+        cleared,
+        refused(
+            2,
+            Code::Unavailable,
+            "Could not update the Live Activity; try again"
+        )
+    );
+    assert_eq!(
+        registered,
+        refused(
+            3,
+            Code::Unavailable,
+            "Could not save the Live Activity; try again"
+        )
+    );
+    assert_eq!(
+        stored_activity(&env).await[0],
+        (
+            "Test phone".to_owned(),
+            Some((Some(ACTIVITY.to_owned()), Some(START.to_owned())))
+        )
+    );
+}
+
+#[tokio::test]
+async fn activity_tokens_follow_the_newest_phone_to_register_them() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut old, _) = env.phone("Old pairing").await;
+    let (mut new, _) = env.phone("New pairing").await;
+    send(&mut old, register_activity(1, Some(ACTIVITY), Some(START))).await;
+    recv_kind(&mut old, "ack").await;
+    send(&mut new, register_activity(1, Some(ACTIVITY), Some(START))).await;
+    recv_kind(&mut new, "ack").await;
+    assert_eq!(
+        stored_activity(&env).await,
+        [
+            ("Old pairing".to_owned(), None),
+            (
+                "New pairing".to_owned(),
+                Some((Some(ACTIVITY.to_owned()), Some(START.to_owned())))
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn activity_commands_before_hello_are_refused_as_unpaired() {
+    let mut env = Env::new();
+    env.start().await;
+    for command in [
+        register_activity(44, Some(ACTIVITY), Some(START)),
+        clear_activity(45),
+    ] {
+        let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
+        let req = command["req"].clone();
+        send(&mut stranger, command).await;
+        let refusal = recv(&mut stranger).await;
+        assert_eq!(refusal["type"], "refused", "{refusal}");
+        assert_eq!(refusal["req"], req);
+        assert_eq!(refusal["code"], "unpaired");
+        assert!(closes(&mut stranger).await);
+    }
+    let devices = env.root.join("devices.json");
+    if let Ok(text) = std::fs::read_to_string(devices) {
+        assert!(!text.contains(ACTIVITY), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn register_activity_spends_the_rate_limit_like_any_command() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut spender, _) = env.phone("Spender").await;
+    for req in 1..=BURST as u64 {
+        send(&mut spender, json!({"v": 1, "req": req, "type": "ping"})).await;
+    }
+    send(
+        &mut spender,
+        register_activity(1_000, Some(ACTIVITY), Some(START)),
+    )
+    .await;
+    let frame = loop {
+        let frame = recv(&mut spender).await;
+        if frame["req"] == 1_000 {
+            break frame;
+        }
+    };
+    assert_eq!(
+        (frame["type"].as_str(), frame["code"].as_str()),
+        (Some("refused"), Some("rate_limited"))
+    );
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(!text.contains(ACTIVITY), "{text}");
+}
+
+#[tokio::test]
+async fn clear_activity_spends_the_rate_limit_like_any_command() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut spender, _) = env.phone("Spender").await;
+    send(
+        &mut spender,
+        register_activity(1, Some(ACTIVITY), Some(START)),
+    )
+    .await;
+    recv_kind(&mut spender, "ack").await;
+    // A few past the burst, so a refill while they are sent still leaves none.
+    for req in 2..=BURST as u64 + 4 {
+        send(&mut spender, json!({"v": 1, "req": req, "type": "ping"})).await;
+    }
+    send(&mut spender, clear_activity(1_000)).await;
+    let frame = loop {
+        let frame = recv(&mut spender).await;
+        if frame["req"] == 1_000 {
+            break frame;
+        }
+    };
+    assert_eq!(
+        (frame["type"].as_str(), frame["code"].as_str()),
+        (Some("refused"), Some("rate_limited"))
+    );
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(text.contains(ACTIVITY), "{text}");
+}
+
+#[tokio::test]
+async fn a_typed_command_needs_hello_names_its_session_and_is_audited() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5013, 0..1).await;
+    env.start().await;
+    let (mut read, mut write) = bridge.accept().await;
+    let command = |req: u64, session: &str, name: &str| json!({"v": 1, "req": req, "type": "command", "session": session, "name": name});
+    // Before hello it is refused as unpaired, and the connection closes.
+    let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
+    send(&mut stranger, command(1, &bridge.id, "new")).await;
+    let refusal = recv(&mut stranger).await;
+    assert_eq!(
+        (refusal["type"].clone(), refusal["code"].clone()),
+        (json!("refused"), json!("unpaired"))
+    );
+    assert!(closes(&mut stranger).await);
+    assert!(bridge_quiet(&mut read).await, "the bridge receives nothing");
+
+    let (mut phone, _) = env.phone("Test phone").await;
+    // An unknown session is unavailable, and an unknown name or a path is invalid.
+    send(&mut phone, command(2, "nobody", "help")).await;
+    assert_eq!(
+        recv(&mut phone).await,
+        refused(2, Code::Unavailable, "No such session")
+    );
+    for (req, name) in [(3, "model"), (4, "export /tmp/x")] {
+        send(&mut phone, command(req, &bridge.id, name)).await;
+        let refusal = recv(&mut phone).await;
+        assert_eq!(refusal["code"], "invalid", "{refusal}");
+    }
+    assert!(bridge_quiet(&mut read).await, "the bridge receives nothing");
+
+    // A known one reaches the bridge as a typed command, and is audited with the device.
+    for (req, name) in [(5, "new"), (6, "session"), (7, "help"), (8, "export")] {
+        send(&mut phone, command(req, &bridge.id, name)).await;
+        let line = bridge_line(&mut read).await;
+        assert_eq!(
+            (
+                line["type"].clone(),
+                line["name"].clone(),
+                line["by"].clone()
+            ),
+            (json!("command"), json!(name), json!("Test phone"))
+        );
+        let asked = line["req"].as_u64().expect("a req");
+        bridge_write(&mut write, ack(asked, "done")).await;
+        assert_eq!(recv_kind(&mut phone, "ack").await["message"], "done");
+    }
+    let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
+    let lines: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .filter(|line: &Value| line["what"] != "paired")
+        .collect();
+    let what: Vec<&str> = lines.iter().map(|l| l["what"].as_str().unwrap()).collect();
+    assert_eq!(
+        what,
+        [
+            "command new",
+            "command session",
+            "command help",
+            "command export"
+        ]
+    );
+    for line in &lines {
+        assert_eq!(
+            (&line["device"], &line["session"]),
+            (&json!("Test phone"), &json!(bridge.id))
+        );
+    }
+}
+
 /// How many commands a device may send at once before the hub rate limits it: the hub's
 /// `COMMANDS_PER_MINUTE` in `server.rs` (the flood test above spells it 60 too).
 const BURST: usize = 60;
@@ -1366,26 +1873,84 @@ async fn a_long_replay_hands_over_to_live_without_gaps_or_repeats() {
 }
 
 #[tokio::test]
-async fn connections_that_never_say_hello_are_capped() {
+async fn silent_connections_cannot_lock_a_phone_out() {
     let mut env = Env::new();
     env.start().await;
+    let token = env.pair("Test phone").await;
+    // Thirty-two upgraded sockets that never say hello fill the waiting room.
     let mut waiting = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..32 {
         waiting.push(connect(env.port, Some(OWNER)).await.expect("connects"));
     }
+    // While they are all younger than 2 seconds, a newcomer is turned away, and comes back.
+    match connect(env.port, Some(OWNER)).await {
+        Err(tungstenite::Error::Http(response)) => assert_eq!(response.status(), 503),
+        other => panic!("a full room of young sockets let one in: {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    // Then a paired phone comes in at once and says hello: the oldest silent socket makes room.
+    let began = std::time::Instant::now();
+    // (The helper waits for `welcome`, then the session list.)
+    let (_phone, sessions) = hello(env.port, &token).await;
+    assert_eq!(sessions["type"], "sessions");
     assert!(
-        connect(env.port, Some(OWNER)).await.is_err(),
-        "a ninth silent connection is turned away"
+        began.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        began.elapsed()
     );
-    // One that pairs and says hello leaves the waiting room, and another can come in.
-    let token = env.pair_on(&mut waiting[0], "Test phone").await;
+    assert!(
+        closes(&mut waiting[0]).await,
+        "the oldest silent socket was let go"
+    );
+    // The phone left the waiting room; another silent socket fills it again, and the next
+    // phone still comes in, letting the oldest silent one go: it is never the phone that waits.
+    waiting.push(connect(env.port, Some(OWNER)).await.expect("connects"));
+    let (_again, sessions) = hello(env.port, &token).await;
+    assert_eq!(sessions["type"], "sessions");
+    assert!(closes(&mut waiting[1]).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_storm_of_reconnects_cannot_push_out_a_phone_slow_to_say_hello() {
+    let mut env = Env::new();
+    env.start().await;
+    let token = env.pair("Test phone").await;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Eight loops, each upgrading a socket, waiting 50 ms and closing it, again and again.
+    let storms: Vec<_> = (0..8)
+        .map(|_| {
+            let (stop, port) = (std::sync::Arc::clone(&stop), env.port);
+            tokio::spawn(async move {
+                let mut upgrades = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(mut socket) = connect(port, Some(OWNER)).await {
+                        upgrades += 1;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        let _ = socket.close(None).await;
+                    }
+                }
+                upgrades
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A phone on a slow link: upgraded mid-storm, it takes a second to say hello.
+    let mut phone = connect(env.port, Some(OWNER)).await.expect("connects");
+    tokio::time::sleep(Duration::from_secs(1)).await;
     send(
-        &mut waiting[0],
+        &mut phone,
         json!({"v": 1, "req": 2, "type": "hello", "token": token}),
     )
     .await;
-    assert_eq!(recv(&mut waiting[0]).await["type"], "welcome");
-    assert!(connect(env.port, Some(OWNER)).await.is_ok());
+    let welcome = recv(&mut phone).await;
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(welcome["type"], "welcome", "{welcome}");
+    assert_eq!(recv(&mut phone).await["type"], "sessions");
+    let mut upgrades = 0;
+    for storm in storms {
+        upgrades += storm.await.expect("a storm loop");
+    }
+    assert!(upgrades >= 80, "the storm upgraded {upgrades} sockets");
 }
 
 /// A journal in `env`'s data directory for a Claude session `session` in `cwd`.
@@ -1809,4 +2374,460 @@ async fn no_replayed_event_follows_the_unsubscribe_ack() {
         assert_eq!(recv(&mut phone).await["seq"], seq);
     }
     assert_eq!(recv(&mut phone).await, ack(5, "Subscribed"));
+}
+
+/// Runs git in `dir` as the person at the desk would.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A git repository at `dir` with one commit of `tracked.txt`; its own config names who
+/// commits, so the hub's git needs nothing from the machine.
+fn git_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("repo directory");
+    git_in(dir, &["init", "-q"]);
+    for (key, value) in [
+        ("user.name", "Test"),
+        ("user.email", "test@example.com"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git_in(dir, &["config", key, value]);
+    }
+    std::fs::write(dir.join("tracked.txt"), "one\n").expect("write");
+    git_in(dir, &["add", "-A"]);
+    git_in(dir, &["commit", "-q", "-m", "First"]);
+}
+
+/// The bridge's state: `phase`, with `approvals` waiting.
+fn turn_state(phase: &str, approvals: u64) -> Value {
+    let approvals: Vec<Value> = (1..=approvals)
+        .map(|id| {
+            json!({"id": id, "summary": {"action": "Run a shell command", "files": [],
+            "scope": "This request only, once"}})
+        })
+        .collect();
+    json!({"phase": phase, "queue": [], "queued": 0, "mode": "ask", "approvals": approvals})
+}
+
+/// Waits until the hub lists session `id` in `phase` with `approvals` waiting.
+async fn listed_as(phone: &mut Phone, id: &str, phase: &str, approvals: u64) {
+    timeout(WAIT, async {
+        loop {
+            let frame = recv_kind(phone, "sessions").await;
+            let rows = frame["sessions"].as_array().cloned().unwrap_or_default();
+            if rows.iter().any(|row| {
+                row["id"] == id && row["phase"] == phase && row["approvals"] == approvals
+            }) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the session is listed in that phase");
+}
+
+#[tokio::test]
+async fn changes_and_diffs_work_on_the_sessions_workspace() {
+    let mut env = Env::new();
+    let workspace = env.root.join("ws");
+    git_repo(&workspace);
+    std::fs::write(workspace.join("tracked.txt"), "one\ntwo\n").expect("write");
+    std::fs::write(workspace.join("new.txt"), "fresh\n").expect("write");
+    let bridge = env.bridge_in(5050, &workspace).await;
+    env.start().await;
+    let (_read, _write) = bridge.accept().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let changes = |req: u64| json!({"v": 1, "req": req, "type": "changes", "session": bridge.id});
+    let diff = |req: u64, path: &str| json!({"v": 1, "req": req, "type": "diff", "session": bridge.id, "path": path});
+
+    // A diff before any listing is refused.
+    send(&mut phone, diff(1, "tracked.txt")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(1, Code::Invalid, "Ask for the changes first")
+    );
+
+    send(&mut phone, changes(2)).await;
+    let listed = recv_kind(&mut phone, "changes").await;
+    assert_eq!(listed["req"], 2, "{listed}");
+    assert_eq!(listed["more"], 0);
+    let files = listed["files"].as_array().expect("files");
+    let tracked = files.iter().find(|f| f["path"] == "tracked.txt");
+    assert_eq!(
+        tracked,
+        Some(
+            &json!({"path": "tracked.txt", "add": 1, "del": 0, "binary": false,
+            "status": "M"})
+        )
+    );
+    let fresh = files.iter().find(|f| f["path"] == "new.txt");
+    assert_eq!(fresh.map(|f| f["status"].clone()), Some(json!("?")));
+
+    send(&mut phone, diff(3, "tracked.txt")).await;
+    let shown = recv_kind(&mut phone, "diff").await;
+    assert_eq!(shown["req"], 3);
+    assert_eq!(shown["path"], "tracked.txt");
+    assert_eq!(shown["clipped"], false);
+    assert_eq!(shown["binary"], false);
+    assert!(
+        shown["text"].as_str().is_some_and(|t| t.contains("+two\n")),
+        "{shown}"
+    );
+
+    // A path the listing did not have is refused, and works after a fresh listing.
+    std::fs::write(workspace.join("later.txt"), "later\n").expect("write");
+    for path in ["later.txt", "../outside", "/etc/passwd", "--output=x"] {
+        send(&mut phone, diff(4, path)).await;
+        assert_eq!(
+            recv_kind(&mut phone, "refused").await,
+            refused(4, Code::Invalid, "Ask for the changes first"),
+            "{path}"
+        );
+    }
+    send(&mut phone, changes(5)).await;
+    recv_kind(&mut phone, "changes").await;
+    send(&mut phone, diff(6, "later.txt")).await;
+    let shown = recv_kind(&mut phone, "diff").await;
+    assert!(
+        shown["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("+later\n")),
+        "{shown}"
+    );
+
+    // Another connection has a listing of its own.
+    let token = env.pair("Other phone").await;
+    let (mut other, _) = hello(env.port, &token).await;
+    send(&mut other, diff(7, "later.txt")).await;
+    assert_eq!(
+        recv_kind(&mut other, "refused").await,
+        refused(7, Code::Invalid, "Ask for the changes first")
+    );
+}
+
+#[tokio::test]
+async fn a_commit_waits_for_the_turn_and_is_audited_without_its_message() {
+    let mut env = Env::new();
+    let workspace = env.root.join("ws");
+    git_repo(&workspace);
+    std::fs::write(workspace.join("tracked.txt"), "one\ntwo\n").expect("write");
+    let bridge = env.bridge_in(5052, &workspace).await;
+    env.start().await;
+    let (_read, mut write) = bridge.accept().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    let commit = |req: u64, message: &str| json!({"v": 1, "req": req, "type": "commit", "session": bridge.id, "message": message});
+
+    // No commit while the session's turn is unknown, running, or waiting on an approval.
+    send(&mut phone, commit(8, "Too early")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(8, Code::NotConnected, "The session is not connected")
+    );
+    bridge_write(&mut write, bridge_state_frame(&turn_state("running", 0))).await;
+    listed_as(&mut phone, &bridge.id, "running", 0).await;
+    send(&mut phone, commit(9, "During a turn")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(9, Code::TurnOpen, "Finish or cancel the current turn first")
+    );
+    bridge_write(&mut write, bridge_state_frame(&turn_state("idle", 1))).await;
+    listed_as(&mut phone, &bridge.id, "idle", 1).await;
+    send(&mut phone, commit(10, "With an approval waiting")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(
+            10,
+            Code::TurnOpen,
+            "Finish or cancel the current turn first"
+        )
+    );
+    bridge_write(&mut write, bridge_state_frame(&turn_state("idle", 0))).await;
+    listed_as(&mut phone, &bridge.id, "idle", 0).await;
+    send(&mut phone, commit(11, "")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(11, Code::Invalid, "Write a commit message")
+    );
+
+    // A hook that refuses gives git's words; git staged first, so the audit says it failed.
+    let hook = workspace.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(hook.parent().expect("hooks")).expect("hooks directory");
+    std::fs::write(&hook, "#!/bin/sh\necho 'tests failed' >&2\nexit 1\n").expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    send(&mut phone, commit(14, "Secret plans, refused")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(14, Code::NotAllowed, "tests failed")
+    );
+    std::fs::remove_file(&hook).expect("unhook");
+
+    send(&mut phone, commit(12, "Secret plans for the phone")).await;
+    let done = recv_kind(&mut phone, "ack").await;
+    let hash = git_in(&workspace, &["rev-parse", "--short", "HEAD"]);
+    assert_eq!(done, ack(12, &format!("Committed {}", hash.trim())));
+    assert_eq!(
+        git_in(&workspace, &["log", "-1", "--format=%s"]).trim(),
+        "Secret plans for the phone"
+    );
+    send(&mut phone, commit(13, "Again")).await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(13, Code::Invalid, "Nothing to commit")
+    );
+
+    // The audit names the device and the session, never the message.
+    let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
+    let commits: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .filter(|line: &Value| line["what"] == "commit")
+        .collect();
+    assert_eq!(commits.len(), 1, "{audit}");
+    assert_eq!(commits[0]["device"], "Test phone");
+    assert_eq!(commits[0]["session"], bridge.id);
+    // Only the refusal after git staged is a failed commit; the earlier refusals ran no git.
+    let failed = audit
+        .lines()
+        .filter(|l| l.contains("\"commit failed\""))
+        .count();
+    assert_eq!(failed, 1, "{audit}");
+    assert!(!audit.contains("Secret plans"), "{audit}");
+}
+
+#[tokio::test]
+async fn git_on_a_folder_that_is_not_a_repository_is_refused_and_the_hub_goes_on() {
+    let mut env = Env::new();
+    let workspace = env.root.join("plain");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let bridge = env.bridge_in(5051, &workspace).await;
+    env.start().await;
+    let (_read, _write) = bridge.accept().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 1, "type": "changes", "session": bridge.id}),
+    )
+    .await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(1, Code::Unavailable, "This folder isn't a git repository")
+    );
+    send(
+        &mut phone,
+        json!({"v": 1, "req": 2, "type": "changes", "session": "9-9"}),
+    )
+    .await;
+    assert_eq!(
+        recv_kind(&mut phone, "refused").await,
+        refused(2, Code::Unavailable, "No such session")
+    );
+    send(&mut phone, json!({"v": 1, "req": 3, "type": "ping"})).await;
+    assert_eq!(recv_kind(&mut phone, "ack").await, ack(3, "pong"));
+}
+
+/// Raises this process's soft limit on open files to `wanted` (at most the hard limit), for a
+/// test that holds hundreds of sockets: a shell's default can be 256.
+fn raise_open_files(wanted: u64) {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limit = getrlimit(Resource::Nofile);
+    if limit.current.is_none_or(|current| current >= wanted) {
+        return;
+    }
+    let current = Some(limit.maximum.map_or(wanted, |most| most.min(wanted)));
+    let _ = setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current,
+            maximum: limit.maximum,
+        },
+    );
+}
+
+/// The `sessions` frames `phone` gets until `until`, each with when it came.
+async fn sessions_until(phone: &mut Phone, until: tokio::time::Instant) -> Vec<(Instant, Value)> {
+    let mut got = Vec::new();
+    while let Ok(frame) = tokio::time::timeout_at(until, recv(phone)).await {
+        if frame["type"] == "sessions" {
+            got.push((Instant::now(), frame));
+        }
+    }
+    got
+}
+
+/// The most `sessions` frames a phone may get in `elapsed`: four a second, and the one a hello
+/// or the first change after a quiet spell sends at once.
+fn most_lists(elapsed: Duration) -> usize {
+    usize::try_from(elapsed.as_millis().div_ceil(250)).unwrap_or(usize::MAX) + 2
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_storm_of_state_changes_sends_at_most_four_lists_a_second() {
+    raise_open_files(4096);
+    let mut env = Env::new();
+    let mut bridges = Vec::new();
+    for pid in 6000..6200 {
+        bridges.push(env.bridge(pid, 0..1).await);
+    }
+    env.start().await;
+    let mut links = Vec::new();
+    for bridge in &bridges {
+        links.push(bridge.accept().await);
+    }
+    let mut phones = Vec::new();
+    for n in 0..4 {
+        let (phone, sessions) = env.phone(&format!("Phone {n}")).await;
+        assert_eq!(sessions["sessions"].as_array().map(Vec::len), Some(200));
+        phones.push(phone);
+    }
+    // A fifth phone reads nothing while the storm lasts.
+    let (mut slow, _) = env.phone("Slow phone").await;
+    let (rounds, every) = (10, Duration::from_millis(200));
+    let storm = every * rounds;
+    let began = Instant::now();
+    let settle = tokio::time::Instant::now() + storm + Duration::from_millis(1500);
+    let readers: Vec<_> = phones
+        .into_iter()
+        .map(|mut phone| tokio::spawn(async move { sessions_until(&mut phone, settle).await }))
+        .collect();
+    // Every session changes its NOW line five times a second: 1,000 state frames a second. The
+    // first one's approval comes halfway, and stays.
+    let state = |round: u32, approval: bool| {
+        let approvals = if approval {
+            json!([{"id": 1, "summary": {"action": "Run Bash", "command": "ls", "files": [],
+                "scope": "this call"}}])
+        } else {
+            json!([])
+        };
+        json!({"phase": "running", "queue": [], "queued": 0, "mode": "ask",
+            "now": format!("Step {round}"), "approvals": approvals})
+    };
+    let mut asked = None;
+    for round in 0..rounds {
+        for (i, (_read, write)) in links.iter_mut().enumerate() {
+            let approval = i == 0 && round >= rounds / 2;
+            bridge_write(write, bridge_state_frame(&state(round, approval))).await;
+        }
+        if round == rounds / 2 {
+            asked = Some(Instant::now());
+        }
+        tokio::time::sleep(every).await;
+    }
+    let asked = asked.expect("the approval was sent");
+    let last = format!("Step {}", rounds - 1);
+    for reader in readers {
+        let got = reader.await.expect("the phone's reader");
+        let elapsed = began.elapsed();
+        assert!(
+            got.len() <= most_lists(elapsed),
+            "{} lists in {elapsed:?}",
+            got.len()
+        );
+        // The lists keep up: the approval shows within the coalescing window and some, and the
+        // last list is the storm's end.
+        let shown = got
+            .iter()
+            .find(|(_, frame)| frame["sessions"][0]["approvals"] == 1)
+            .map(|(at, _)| at.saturating_duration_since(asked))
+            .expect("the approval is listed");
+        assert!(
+            shown < Duration::from_secs(1),
+            "the approval took {shown:?}"
+        );
+        let (_, final_list) = got.last().expect("lists came");
+        let rows = final_list["sessions"].as_array().expect("rows");
+        assert_eq!(rows.len(), 200);
+        assert!(
+            rows.iter().all(|row| row["now"] == last.as_str()),
+            "stale rows"
+        );
+    }
+    // The phone that read nothing was kept, with at most one list waiting in its queue: it now
+    // gets a handful, the newest last, not one per change.
+    let mut lists = 0;
+    loop {
+        let frame = recv(&mut slow).await;
+        if frame["type"] != "sessions" {
+            continue;
+        }
+        lists += 1;
+        if frame["sessions"][199]["now"] == last.as_str() {
+            break;
+        }
+    }
+    assert!(lists <= most_lists(began.elapsed()), "{lists} lists");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_devices_write_never_stalls_the_hub() {
+    let mut env = Env::new();
+    env.start().await;
+    let (mut writer, _) = env.phone("Writer phone").await;
+    let (mut other, _) = env.phone("Other phone").await;
+    // Another process (an `octet hub revoke`, say) holds the devices file's lock.
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(env.root.join("devices.lock"))
+        .expect("the lock file");
+    lock.lock().expect("the lock");
+    send(&mut writer, register(7, Some(PUSH))).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The hub goes on meanwhile: another phone's ping is answered at once.
+    let began = Instant::now();
+    send(&mut other, json!({"v": 1, "req": 3, "type": "ping"})).await;
+    assert_eq!(recv(&mut other).await, ack(3, "pong"));
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
+    // The registration is acked only once it is saved, after the lock is let go.
+    let early = timeout(Duration::from_millis(300), recv(&mut writer)).await;
+    assert!(early.is_err(), "acked before it was saved: {early:?}");
+    drop(lock);
+    let acked = recv_kind(&mut writer, "ack").await;
+    assert_eq!(
+        (acked["req"].as_u64(), acked["message"].as_str()),
+        (Some(7), Some("Notifications on"))
+    );
+    let text = std::fs::read_to_string(env.root.join("devices.json")).expect("file");
+    assert!(text.contains(PUSH), "{text}");
+}
+
+#[tokio::test]
+async fn a_phone_that_says_hello_mid_window_is_not_left_with_a_passing_list() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5060, 0..1).await;
+    env.start().await;
+    let (_read, mut write) = bridge.accept().await;
+    let token = env.pair("Test phone").await;
+    let state = |phase: &str| json!({"phase": phase, "queue": [], "queued": 0, "mode": "ask", "approvals": []});
+    // A quiet spell, then `running` goes out at once and opens a quarter-second window.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    bridge_write(&mut write, bridge_state_frame(&state("running"))).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Within the window the session goes idle, and a phone says hello: its list shows `idle`.
+    bridge_write(&mut write, bridge_state_frame(&state("idle"))).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let (mut phone, sessions) = hello(env.port, &token).await;
+    assert_eq!(sessions["sessions"][0]["phase"], "idle", "{sessions}");
+    // Then, still within the window, it runs again: the list the others last got. The phone,
+    // which last got `idle`, must hear of it.
+    bridge_write(&mut write, bridge_state_frame(&state("running"))).await;
+    listed_as(&mut phone, &bridge.id, "running", 0).await;
 }

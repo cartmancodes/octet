@@ -2,23 +2,43 @@
 use super::*;
 use crate::bridge::Remote;
 use crate::test_support::{approval, idle};
-use octet_core::{Mode, remote::protocol::BridgeCommand};
+use octet_core::{
+    Mode,
+    remote::protocol::{BridgeCommand, CommandName},
+};
 
 const CONFIRM: &str = "Full access needs confirm: \"full access\"";
 
-/// Runs `command` as the device "iPhone 15" sent it.
+/// `command` as the device "iPhone 15" sent it.
+fn from_phone(command: BridgeCommand) -> Remote {
+    Remote {
+        peer: 1,
+        req: 5,
+        by: "iPhone 15".into(),
+        command,
+    }
+}
+
+/// Runs `command` as the device "iPhone 15" sent it, and its reply. A command answered when the
+/// job it started ends (an export) has that job run to its end, as the event loop does.
 async fn run(
     app: &mut App,
     vendor: &RecordingVendor,
     command: BridgeCommand,
 ) -> (Result<String, String>, Action) {
-    let remote = Remote {
-        peer: 1,
-        req: 5,
-        by: "iPhone 15".into(),
-        command,
-    };
-    crate::bridge::handle_remote(app, vendor, remote, false).await
+    match crate::bridge::handle_remote(app, vendor, from_phone(command), false).await {
+        (Some(reply), action) => (reply, action),
+        (None, Action::Job(job)) => {
+            let mut running = crate::jobs::Running::spawn(job);
+            let ended = running.wait().await;
+            let asker = running.into_asker().expect("the phone that asked");
+            (
+                crate::bridge::answer_job(app, ended, &asker),
+                Action::Continue,
+            )
+        }
+        (None, _) => panic!("no reply and no job"),
+    }
 }
 
 fn prompt(text: &str) -> BridgeCommand {
@@ -578,13 +598,9 @@ async fn run_editing(
     vendor: &RecordingVendor,
     command: BridgeCommand,
 ) -> (Result<String, String>, Action) {
-    let remote = Remote {
-        peer: 1,
-        req: 5,
-        by: "iPhone 15".into(),
-        command,
-    };
-    crate::bridge::handle_remote(app, vendor, remote, true).await
+    let (reply, action) =
+        crate::bridge::handle_remote(app, vendor, from_phone(command), true).await;
+    (reply.expect("answered at once"), action)
 }
 
 #[tokio::test]
@@ -646,4 +662,290 @@ async fn a_remote_model_may_not_look_like_an_option() {
     let (result, action) = run(&mut app, &vendor, select).await;
     assert_eq!(result, Err("Name one model, without spaces".into()));
     assert!(matches!(action, Action::Continue));
+}
+
+fn typed(name: CommandName) -> BridgeCommand {
+    BridgeCommand::Command { name }
+}
+
+#[tokio::test]
+async fn new_is_refused_like_the_desk() {
+    const EDITING: &str = "The desk is editing a prompt";
+    const SHELL: &str = "A ! command is running at the desk";
+    const DRAFT: &str = "The desk has an unsent draft";
+    let vendor = RecordingVendor::default();
+    let mut app = app();
+    idle(&mut app);
+    // The external editor.
+    let (result, action) = run_editing(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(EDITING.into()));
+    assert!(matches!(action, Action::Continue));
+    // A `!` command.
+    app.shell = Some(crate::test_support::running_shell(false));
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(SHELL.into()));
+    assert!(matches!(action, Action::Continue));
+    app.shell = None;
+    // A draft: typed text, `!` output, or images.
+    app.composer.editor.set("a long desk draft".into());
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(DRAFT.into()));
+    assert!(matches!(action, Action::Continue));
+    assert_eq!(app.composer.editor.text(), "a long desk draft");
+    app.composer.editor.take();
+    app.attach(crate::shell::Ran {
+        command: "ls".into(),
+        status: crate::shell::Status::Exited(0),
+        output: "file\n".into(),
+    });
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(DRAFT.into()));
+    assert!(matches!(action, Action::Continue));
+    app.composer.attachments.clear();
+    // A turn.
+    app.conn.start_turn();
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Err(TURN_OPEN.into()));
+    assert!(matches!(action, Action::Continue));
+    // Idle, it starts afresh, as `/new` does at the desk.
+    let mut app = self::app();
+    idle(&mut app);
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::New)).await;
+    assert_eq!(result, Ok("Starting a fresh conversation".into()));
+    assert!(matches!(action, Action::Exit(Exit::New)));
+    assert!(
+        vendor.sent.take().is_empty(),
+        "nothing was sent to the vendor"
+    );
+}
+
+#[tokio::test]
+async fn the_session_text_is_the_desks_own() {
+    let vendor = RecordingVendor::default();
+    let mut remote = app();
+    idle(&mut remote);
+    let (result, action) = run(&mut remote, &vendor, typed(CommandName::Session)).await;
+    let reply = result.expect("the text");
+    assert!(matches!(action, Action::Continue));
+    assert_eq!(reply, commands::session_text(&remote));
+    assert!(reply.contains("Session: thread-1"), "{reply}");
+    assert!(reply.contains("Journal: journal"), "{reply}");
+    assert!(reply.contains("Workspace: "), "{reply}");
+    // The desk's `/session` puts those words in the transcript.
+    let mut desk = app();
+    idle(&mut desk);
+    command(&mut desk, "/session").await;
+    assert!(
+        desk.entries_text().contains(&reply),
+        "{}",
+        desk.entries_text()
+    );
+}
+
+#[tokio::test]
+async fn the_help_text_names_what_the_phone_can_run() {
+    let vendor = RecordingVendor::default();
+    let mut app = app();
+    idle(&mut app);
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::Help)).await;
+    assert_eq!(
+        result,
+        Ok(
+            "Commands from the phone: /model · /mode · /new · /session · /export · /help. \
+            Everything else runs at the desk."
+                .into()
+        )
+    );
+    assert!(matches!(action, Action::Continue));
+}
+
+/// An idle app whose journal is a real file in a data directory, and whose workspace is another.
+fn exportable(name: &str) -> (App, octet_testkit::TempDir, octet_testkit::TempDir) {
+    let workspace = octet_testkit::TempDir::new(&format!("octet-remote-{name}"));
+    let data = octet_testkit::TempDir::new(&format!("octet-remote-{name}-data"));
+    std::fs::create_dir_all(workspace.path()).unwrap();
+    std::fs::create_dir_all(data.path()).unwrap();
+    let journal = data.path().join("session-7.jsonl");
+    std::fs::write(&journal, b"{}\n").unwrap();
+    let mut app = app();
+    idle(&mut app);
+    app.composer.root = workspace.path().to_path_buf();
+    app.conn.journal = journal;
+    (app, workspace, data)
+}
+
+#[tokio::test]
+async fn export_answers_with_the_desk_words() {
+    let (mut app, workspace, _data) = exportable("export");
+    let vendor = RecordingVendor::default();
+    // Always the desk's default: the workspace and the journal's file name.
+    let target = workspace.path().join("session-7.jsonl");
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    assert_eq!(
+        result,
+        Ok(format!("Exported the journal to {}", target.display()))
+    );
+    // Once its job is done, the file is there.
+    assert!(matches!(action, Action::Continue));
+    assert!(app.job.is_none());
+    let before = std::fs::read(&target).unwrap();
+    assert_eq!(before, b"{}\n");
+    assert!(
+        app.entries_text()
+            .contains("Exported the journal from iPhone 15"),
+        "{}",
+        app.entries_text()
+    );
+    // A file of that name is already there: the desk's export refuses to overwrite, in its words.
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    let Err(reason) = result else {
+        panic!("overwrote an export")
+    };
+    assert!(
+        reason.starts_with("Export failed: Cannot create ") && reason.contains("exist"),
+        "{reason}"
+    );
+    assert!(matches!(action, Action::Continue));
+    let text = app.entries_text();
+    assert!(
+        text.contains("Export from iPhone 15 failed: Cannot create "),
+        "{text}"
+    );
+    assert!(!text.contains("Refused from"), "{text}");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        before,
+        "the first export is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_phone_export_is_the_desks_own_job_and_is_answered_when_it_is_done() {
+    let (mut app, workspace, _data) = exportable("export-job");
+    let vendor = RecordingVendor::default();
+    let target = workspace.path().join("session-7.jsonl");
+    let (reply, action) = crate::bridge::handle_remote(
+        &mut app,
+        &vendor,
+        from_phone(typed(CommandName::Export)),
+        false,
+    )
+    .await;
+    // Nothing is copied while the command is handled, so the desk does not wait for it: the copy
+    // is a job, like the desk's own `/export`, and the phone hears when it is done.
+    assert_eq!(reply, None);
+    assert!(!target.exists(), "copied while the desk waited");
+    let Action::Job(job) = action else {
+        panic!("no export job")
+    };
+    assert_eq!(
+        (job.label, job.must_finish),
+        ("Exporting the journal…", true)
+    );
+    let asker = crate::jobs::Asker {
+        peer: 1,
+        req: 5,
+        by: "iPhone 15".into(),
+    };
+    assert_eq!(job.asker.as_ref(), Some(&asker));
+    // The desk goes on meanwhile, and another export waits for this one, in the desk's words.
+    app.job = Some(crate::jobs::Running::spawn(job));
+    let (busy, _) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    assert_eq!(busy, Err("Wait for: Exporting the journal…".into()));
+    let (prompt, _) = run(&mut app, &vendor, prompt("meanwhile")).await;
+    assert_eq!(prompt, Ok("Sent".into()));
+    // When the job ends, the event loop answers the phone that asked.
+    let mut running = app.job.take().expect("the export runs");
+    let ended = running.wait().await;
+    assert_eq!(running.into_asker(), Some(asker.clone()));
+    let answer = crate::bridge::answer_job(&mut app, ended, &asker);
+    assert_eq!(
+        answer,
+        Ok(format!("Exported the journal to {}", target.display()))
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"{}\n");
+    assert!(
+        app.entries_text()
+            .contains("Exported the journal from iPhone 15"),
+        "{}",
+        app.entries_text()
+    );
+}
+
+#[tokio::test]
+async fn an_export_that_cannot_be_written_or_read_fails_in_the_desk_words() {
+    let vendor = RecordingVendor::default();
+    // A workspace that is not there to write in.
+    let (mut app, _workspace, _data) = exportable("export-unwritable");
+    app.composer.root = "/nonexistent-octet-workspace/inner".into();
+    let (result, action) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    let Err(reason) = result else {
+        panic!("exported nowhere")
+    };
+    assert!(
+        reason.starts_with("Export failed: Cannot create "),
+        "{reason}"
+    );
+    assert!(matches!(action, Action::Continue));
+    assert!(
+        app.entries_text()
+            .contains("Export from iPhone 15 failed: Cannot create "),
+        "{}",
+        app.entries_text()
+    );
+    // A journal that is not there to read.
+    let (mut app, workspace, _data) = exportable("export-unreadable");
+    app.conn.journal = workspace.path().join("missing.jsonl");
+    let (result, _) = run(&mut app, &vendor, typed(CommandName::Export)).await;
+    let Err(reason) = result else {
+        panic!("exported nothing")
+    };
+    assert!(
+        reason.starts_with("Export failed: Cannot read journal "),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn export_waits_for_a_job_and_for_a_turn_like_the_desk() {
+    let vendor = RecordingVendor::default();
+    // A job already running: the desk's `Wait for` words, nothing written.
+    let (mut busy, workspace, _data) = exportable("export-busy");
+    busy.job = Some(crate::jobs::Running::spawn(crate::jobs::Job {
+        label: "Reading recent sessions…",
+        must_finish: false,
+        asker: None,
+        work: Box::pin(std::future::pending()),
+    }));
+    let (result, action) = run(&mut busy, &vendor, typed(CommandName::Export)).await;
+    assert_eq!(result, Err("Wait for: Reading recent sessions…".into()));
+    assert!(matches!(action, Action::Continue));
+    assert!(!workspace.path().join("session-7.jsonl").exists());
+    // A turn: `/export` is refused then too.
+    let (mut turn, workspace, _data) = exportable("export-turn");
+    turn.conn.start_turn();
+    let (result, action) = run(&mut turn, &vendor, typed(CommandName::Export)).await;
+    assert_eq!(result, Err(TURN_OPEN.into()));
+    assert!(matches!(action, Action::Continue));
+    assert!(!workspace.path().join("session-7.jsonl").exists());
+}
+
+#[tokio::test]
+async fn each_typed_command_leaves_a_desk_note_naming_the_device() {
+    let vendor = RecordingVendor::default();
+    for (name, wanted) in [
+        (CommandName::New, "New conversation from iPhone 15"),
+        (CommandName::Session, "Session from iPhone 15"),
+        (CommandName::Help, "Help from iPhone 15"),
+        (CommandName::Export, "Exported the journal from iPhone 15"),
+    ] {
+        let (mut app, _workspace, _data) = exportable("note");
+        let (result, _) = run(&mut app, &vendor, typed(name)).await;
+        assert!(result.is_ok(), "{name:?}: {result:?}");
+        assert!(
+            app.entries_text().contains(wanted),
+            "{name:?}: {}",
+            app.entries_text()
+        );
+    }
 }

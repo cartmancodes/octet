@@ -1,20 +1,61 @@
-// The only things the phone keeps on disk: non-secret settings. The device token is in
-// expo-secure-store (wired in the pairing task); cursors are in memory and transcripts are never
-// saved, so a cold start subscribes fresh.
+// The only things the phone keeps on disk: non-secret settings. Each pairing's device token is in
+// expo-secure-store (src/hub.ts); cursors are in memory and transcripts are never saved, so a cold
+// start subscribes fresh.
 import AsyncStorage from "@react-native-async-storage/async-storage";
+
+import { MAC_ID, MAX_MACS, cleanMacName, macNameOf, type Pairing } from "./macs";
+import type { PushKinds } from "./protocol";
 
 export interface Settings {
   /** The name this phone pairs under; null until chosen. */
   deviceName: string | null;
   /** Allow asks for Face ID or the fingerprint. On unless the user turned it off. */
   faceId: boolean;
-  /** The hub's address, wss://...; null until paired. */
+  /** The hub address of the one pairing settings held before there could be several: read only
+   * to move it into `pairings` (src/hub.ts), then saved as null. */
   hubUrl: string | null;
-  /** Push notifications are on: the Mac has this phone's token. Off unless the user turned it on. */
+  /** The Macs this phone is paired with, in the order paired: at most `MAX_MACS`, each id once. */
+  pairings: Pairing[];
+  /** Ids of pairings that went whose keychain entries could not be deleted yet: the next launch
+   * deletes them. */
+  forget: string[];
+  /** Push notifications are on: every Mac has this phone's token. One choice for every Mac. Off
+   * unless the user turned it on. */
   notifications: boolean;
+  /** What every Mac pushes this phone while notifications are on. Missing is the Mac's own default
+   * for a new pairing (approvals and errors on, finished turns off), except in settings saved
+   * before kinds existed with notifications on: the Mac was pushing all three, so all three. */
+  pushKinds: PushKinds;
+  /** The transcript's text size in points, which `Aa` cycles. */
+  textSize: TextSize;
+  /** The Live Activity (the Dynamic Island and the Lock Screen) is on, where the phone has it. On
+   * unless the user turned it off. */
+  liveActivity: boolean;
+  /** The Mac that drives the Live Activity while the phone is away (one Mac at a time: the one of
+   * the lead session when the app was last in front); null for none chosen yet. */
+  liveActivityMac: string | null;
 }
 
-export const DEFAULT_SETTINGS: Settings = { deviceName: null, faceId: true, hubUrl: null, notifications: false };
+export const TEXT_SIZES = [12, 13, 14] as const;
+export type TextSize = (typeof TEXT_SIZES)[number];
+
+/** What the hub sends a newly paired device, which is what an app with nothing saved shows. */
+export const DEFAULT_PUSH_KINDS: PushKinds = { approvals: true, errors: true, turns: false };
+/** What a Mac from before kinds existed pushed: everything. */
+const ALL_PUSH_KINDS: PushKinds = { approvals: true, errors: true, turns: true };
+
+export const DEFAULT_SETTINGS: Settings = {
+  deviceName: null,
+  faceId: true,
+  hubUrl: null,
+  pairings: [],
+  forget: [],
+  notifications: false,
+  pushKinds: DEFAULT_PUSH_KINDS,
+  textSize: 13,
+  liveActivity: true,
+  liveActivityMac: null,
+};
 export const SETTINGS_KEY = "octet.settings.v1";
 /** What to tell the user when a settings write failed. */
 export const NOT_SAVED = "Couldn't save that setting";
@@ -24,6 +65,41 @@ const MAX_CHARS = 2_048;
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 const text = (x: unknown): string | null => (typeof x === "string" && x.length <= MAX_CHARS ? x : null);
+/** Each kind that is missing or not a boolean is the default's. */
+function pushKinds(x: unknown): PushKinds {
+  if (!isObj(x)) return DEFAULT_PUSH_KINDS;
+  const kind = (k: keyof PushKinds): boolean => {
+    const v = x[k];
+    return typeof v === "boolean" ? v : DEFAULT_PUSH_KINDS[k];
+  };
+  return { approvals: kind("approvals"), errors: kind("errors"), turns: kind("turns") };
+}
+/** The saved pairings that are whole: an id of the phone's making, an address and a device name;
+ * a missing or blank Mac name is the host's. The first of an id is kept; at most `MAX_MACS`. */
+function pairings(x: unknown): Pairing[] {
+  if (!Array.isArray(x)) return [];
+  const out: Pairing[] = [];
+  const ids = new Set<string>();
+  for (const item of x as unknown[]) {
+    if (out.length >= MAX_MACS) break;
+    if (!isObj(item)) continue;
+    const id = typeof item.id === "string" && MAC_ID.test(item.id) ? item.id : null;
+    const hubUrl = text(item.hubUrl);
+    const deviceName = text(item.deviceName);
+    if (id === null || ids.has(id) || !hubUrl || deviceName === null) continue;
+    ids.add(id);
+    out.push({ id, hubUrl, deviceName, macName: cleanMacName(item.macName) ?? macNameOf(hubUrl) });
+  }
+  return out;
+}
+/** The ids still to forget: Mac ids only, each once, at most a few. */
+const FORGET_MAX = 16;
+function forget(x: unknown): string[] {
+  if (!Array.isArray(x)) return [];
+  const ids = (x as unknown[]).filter((id): id is string => typeof id === "string" && MAC_ID.test(id));
+  return [...new Set(ids)].slice(-FORGET_MAX);
+}
+const textSize = (x: unknown): TextSize => (TEXT_SIZES as readonly unknown[]).includes(x) ? (x as TextSize) : DEFAULT_SETTINGS.textSize;
 
 /** The saved settings; each field that is missing or not the right type is its default. None
  * saved, or garbage saved, is the defaults: a save then writes over it. `ok: false` only when
@@ -39,13 +115,24 @@ export async function readSettings(): Promise<{ ok: true; settings: Settings } |
   try {
     const value: unknown = JSON.parse(raw);
     if (!isObj(value)) return { ok: true, settings: DEFAULT_SETTINGS };
+    const notifications =
+      typeof value.notifications === "boolean" ? value.notifications : DEFAULT_SETTINGS.notifications;
+    // Saved before kinds existed, with notifications on: keep what the Mac was pushing, rather
+    // than turn finished turns off behind the user's back on the next register.
+    const upgraded = notifications && !("pushKinds" in value);
     return {
       ok: true,
       settings: {
         deviceName: text(value.deviceName),
         faceId: typeof value.faceId === "boolean" ? value.faceId : DEFAULT_SETTINGS.faceId,
         hubUrl: text(value.hubUrl),
-        notifications: typeof value.notifications === "boolean" ? value.notifications : DEFAULT_SETTINGS.notifications,
+        pairings: pairings(value.pairings),
+        forget: forget(value.forget),
+        notifications,
+        pushKinds: upgraded ? ALL_PUSH_KINDS : pushKinds(value.pushKinds),
+        textSize: textSize(value.textSize),
+        liveActivity: typeof value.liveActivity === "boolean" ? value.liveActivity : DEFAULT_SETTINGS.liveActivity,
+        liveActivityMac: typeof value.liveActivityMac === "string" && MAC_ID.test(value.liveActivityMac) ? value.liveActivityMac : null,
       },
     };
   } catch {
@@ -65,23 +152,35 @@ let saving: Promise<boolean> = Promise.resolve(true);
 /** Saves `patch` over what is saved. A failed write is dropped (settings are a convenience) and
  * reported as false, for the few callers that cannot go on without it. */
 export function saveSettings(patch: Partial<Settings>): Promise<boolean> {
-  saving = saving.then(() => write(patch));
+  return updateSettings(() => patch);
+}
+
+/** `saveSettings` with the patch made from what is saved, in the same turn: for a change to a
+ * list (the pairings) that must not lose another change made just before it. */
+export function updateSettings(change: (saved: Settings) => Partial<Settings>): Promise<boolean> {
+  saving = saving.then(() => write(change));
   return saving;
 }
 
-async function write(patch: Partial<Settings>): Promise<boolean> {
+async function write(change: (saved: Settings) => Partial<Settings>): Promise<boolean> {
   try {
-    // A read that failed would write the defaults over what is saved (the hub address too).
+    // A read that failed would write the defaults over what is saved (the pairings too).
     const read = await readSettings();
     if (!read.ok) return false;
-    const next: Settings = { ...read.settings, ...patch };
+    const next: Settings = { ...read.settings, ...change(read.settings) };
     await AsyncStorage.setItem(
       SETTINGS_KEY,
       JSON.stringify({
         deviceName: next.deviceName,
         faceId: next.faceId,
         hubUrl: next.hubUrl,
+        pairings: next.pairings,
+        forget: next.forget,
         notifications: next.notifications,
+        pushKinds: next.pushKinds,
+        textSize: next.textSize,
+        liveActivity: next.liveActivity,
+        liveActivityMac: next.liveActivityMac,
       }),
     );
     return true;
