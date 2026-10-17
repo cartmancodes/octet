@@ -37,6 +37,10 @@ export interface LiveApi {
   addPushTokenListener(listener: (event: TokenEvent) => void): Subscription;
   addPushToStartTokenListener(listener: (event: TokenEvent) => void): Subscription;
   addDenyListener(listener: (event: DenyEvent) => void): Subscription;
+  /** The send for Deny request `id` settled: the native side lets the app be suspended. */
+  denySettled(id: string): void;
+  /** The background hand-over settled: the native side lets the app be suspended. */
+  handOverSettled(): void;
 }
 
 /** The app's native module: a no-op wherever there is none. */
@@ -49,6 +53,8 @@ export const nativeLive: LiveApi = {
   addPushTokenListener: octetLive.addPushTokenListener,
   addPushToStartTokenListener: octetLive.addPushToStartTokenListener,
   addDenyListener: octetLive.addDenyListener,
+  denySettled: octetLive.denySettled,
+  handOverSettled: octetLive.handOverSettled,
 };
 
 /** What the controller needs of the Fleet (src/hub.ts). */
@@ -140,6 +146,8 @@ export class LiveActivity {
   private retried = new WeakMap<HubClient, string>();
   /** The second try waiting, by Mac. */
   private readonly retries = new Map<string, () => void>();
+  /** Background hand-overs on their way: until none is, the native side keeps the app running. */
+  private handing = 0;
 
   /** The App Group's entries as last written; null when they are to be written again. */
   private entries: string | null = null;
@@ -161,7 +169,7 @@ export class LiveActivity {
         return () => clearTimeout(id);
       });
     this.supportedNow = api.isSupported();
-    this.denies = new IslandDenies({ fleet, store, now: this.now, inFront: () => this.foreground });
+    this.denies = new IslandDenies({ fleet, store, now: this.now, inFront: () => this.foreground, settled: (id) => this.api.denySettled(id) });
   }
 
   /** For Settings: told when `supported` changes. */
@@ -224,7 +232,10 @@ export class LiveActivity {
       this.writeEntries();
       this.drive(true);
       // Launched in the background for a token (iOS woke a closed app): it came before the setting.
-      if (!this.foreground) this.handOver();
+      if (!this.foreground) {
+        this.handOver();
+        this.handOverSettled();
+      }
     });
   }
 
@@ -466,7 +477,10 @@ export class LiveActivity {
       this.drive();
     }
     // Launched in the background for a token: it came before the pairings were read.
-    if (snapshot.status !== "loading" && !this.foreground) this.handOver();
+    if (snapshot.status !== "loading" && !this.foreground) {
+      this.handOver();
+      this.handOverSettled();
+    }
   }
 
   private deny(event: DenyEvent): void {
@@ -526,10 +540,21 @@ export class LiveActivity {
       }
     }
     const newest = [...this.activities.values()].at(-1) ?? null;
-    if (newest === this.tokens.token) return;
-    this.tokens = { ...this.tokens, token: newest };
-    this.syncAll();
-    if (newest !== null && !this.foreground) this.handOver();
+    if (newest !== this.tokens.token) {
+      this.tokens = { ...this.tokens, token: newest };
+      this.syncAll();
+      if (newest !== null && !this.foreground) this.handOver();
+    }
+    if (token !== null && !this.foreground) this.handOverSettled();
+  }
+
+  /** Tells the native side, which holds background time from a token's event in the background,
+   * that there is nothing more to hand over: once no hand-over is on its way, and the setting and
+   * the pairings are read (until then one may still come). Its 10 s bound ends it otherwise. */
+  private handOverSettled(): void {
+    if (this.handing > 0 || this.foreground || this.stopped) return;
+    if (this.on === null || this.fleet.snapshot().status === "loading") return;
+    this.api.handOverSettled();
   }
 
   /** An activity that is not wanted (it landed with the switch off): every one is ended. */
@@ -561,15 +586,22 @@ export class LiveActivity {
       this.telling.set(client, said);
       this.handedOver.set(client, said);
     }
-    void this.fleet.sendInBackground(macs, body).then((acked) => {
-      for (const mac of macs) {
-        const client = this.fleet.links.client(mac);
-        if (!client || this.telling.get(client) !== said) continue;
-        this.telling.delete(client);
-        if (acked.includes(mac)) this.told.set(client, said);
-        else this.sync(mac); // back in the foreground meanwhile: over the link
-      }
-    });
+    this.handing += 1;
+    void this.fleet
+      .sendInBackground(macs, body)
+      .then((acked) => {
+        for (const mac of macs) {
+          const client = this.fleet.links.client(mac);
+          if (!client || this.telling.get(client) !== said) continue;
+          this.telling.delete(client);
+          if (acked.includes(mac)) this.told.set(client, said);
+          else this.sync(mac); // back in the foreground meanwhile: over the link
+        }
+      })
+      .finally(() => {
+        this.handing -= 1;
+        this.handOverSettled();
+      });
   }
 
   private syncAll(): void {

@@ -23,6 +23,10 @@ declare class OctetLiveNative extends NativeModule<OctetLiveEvents> {
   end(): Promise<void>;
   /** Replaces the App Group's entries with this JSON object. */
   setEntries(json: string): Promise<void>;
+  /** The app's send for Deny request `id` settled: ends its background task and acks it. */
+  denySettled(id: string): void;
+  /** The token hand-over in the background settled: ends its background task. */
+  handOverSettled(): void;
 }
 
 /**

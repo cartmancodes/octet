@@ -33,6 +33,12 @@ export class FakeLive implements LiveApi {
   addPushTokenListener = (fn: (e: TokenEvent) => void): Subscription => add(this.tokens, fn);
   addPushToStartTokenListener = (fn: (e: TokenEvent) => void): Subscription => add(this.starts, fn);
   addDenyListener = (fn: (e: DenyEvent) => void): Subscription => add(this.denies, fn);
+  /** The Deny ids told settled, in order. */
+  settledDenies: string[] = [];
+  denySettled = (id: string): void => void this.settledDenies.push(id);
+  /** How many times a background hand-over was told settled. */
+  handOversSettled = 0;
+  handOverSettled = (): void => void (this.handOversSettled += 1);
 
   /** ActivityKit hands over a running activity's token, or says it ended (null); `activity` is
    * its id, which the native module names. */

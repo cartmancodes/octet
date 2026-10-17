@@ -311,7 +311,11 @@ shows no switch for it.
   entries.
 - **Deny** answers no to that approval, on the Mac that owns it, without Face ID (it allows
   nothing). With the app in front it goes over that Mac's connection; in the background, at once over
-  a short background connection to that Mac (closed on the answer or after 10 seconds). On a locked
+  a short background connection to that Mac (closed on the answer or after 10 seconds). The button
+  waits, at most 9 seconds, for the app's word that the send is done (`denied.<uuid>` in the App
+  Group), and the module holds iOS background time from the tap until JavaScript says so
+  (`denySettled`, at most 10 seconds); a token handed over in the background is held the same way
+  (`handOverSettled`). On a locked
   phone that connection can't be made, so the Deny waits for you to unlock and open the app. One that
   couldn't go is sent on the Mac's next connection, within 10 minutes. Each Deny is sent once.
 - **Allow** opens `octet://approve/<host>/<session>/<approval>`. The app opens that approval's

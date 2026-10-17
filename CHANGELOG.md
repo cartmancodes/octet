@@ -38,7 +38,9 @@ Claude Code and Codex CLIs.
     `background: true`. When activities appear together, only the ones seen
     earlier are ended, so one always stays.
   - **Deny and Allow.** **Deny** on the Island answers no on the Mac that owns
-    the approval, from the background too, over such a connection. **Allow**
+    the approval, from the background too, over such a connection: the button
+    waits up to 9 s for the app's ack, and the app holds iOS background time
+    for the send (and for a token's hand-over) up to 10 s. **Allow**
     opens `octet://approve/...`, the approval's session, behind Face ID and
     the arm; a forged or stale link opens the Inbox.
   - **Settings › Live Activity** (on by default) turns it all off, and follows

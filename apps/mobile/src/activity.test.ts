@@ -781,6 +781,173 @@ describe("the activity that is already there (one activity, two drivers)", () =>
   });
 });
 
+describe("the app is kept running until a background send settles", () => {
+  const background = async (r: Awaited<ReturnType<typeof rig>>) => {
+    r.fleet.setForeground(false);
+    r.live.setForeground(false);
+    await settle();
+  };
+  const ID = "6F9619FF-8B86-D011-B42D-00C04FC964FF";
+  const id = (n: number) => ID.slice(0, -2) + String(n).padStart(2, "0");
+  /** The newest background connection: it says welcome, and answers its one request with `reply`. */
+  const answer = async (r: Awaited<ReturnType<typeof rig>>, type: string, reply: (req: unknown) => object) => {
+    const socket = r.sockets.all.at(-1);
+    socket?.open();
+    socket?.receive({ type: "welcome", device: "iPhone" });
+    await settle();
+    expect(r.api.settledDenies.length + r.api.handOversSettled).toBe(0); // not before the answer
+    const req = socket?.commandsOf(type)[0]?.req;
+    socket?.receive(reply(req));
+    await settle();
+  };
+
+  it.each([
+    ["acked", (req: unknown) => ({ type: "ack", req, message: "answered" })],
+    ["refused", (req: unknown) => ({ type: "refused", req, code: "not_allowed", reason: "No such approval" })],
+  ])("a background Deny the Mac %s is settled once", async (_what, reply) => {
+    const r = await rig();
+    await background(r);
+    r.api.deny({ mac: MINI_HOST, session: A, approval: "5", id: id(1) });
+    await settle();
+    await answer(r, "answer", reply);
+    expect(r.api.settledDenies).toEqual([id(1)]);
+    await r.advance(HAND_OVER_MS);
+    expect(r.api.settledDenies).toEqual([id(1)]);
+  });
+
+  it("a background Deny that is lost (no answer in 10 s) is settled once, and not again when it goes later", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    await background(r);
+    r.api.deny({ mac: STUDIO_HOST, session: A, approval: "5", id: id(2) });
+    await settle();
+    expect(r.api.settledDenies).toEqual([]);
+    await r.advance(HAND_OVER_MS);
+    expect(r.api.settledDenies).toEqual([id(2)]);
+    r.fleet.setForeground(true);
+    r.live.setForeground(true);
+    await settle();
+    await r.ready(STUDIO_HOST);
+    expect(r.socketOf(STUDIO_HOST).commandsOf("answer")).toHaveLength(1);
+    expect(r.api.settledDenies).toEqual([id(2)]);
+  });
+
+  it("a Deny that sends nothing, or goes over the link, or waits for it, is settled once", async () => {
+    const r = await rig();
+    await r.list(STUDIO_HOST, [info(A, { approvals: 1, approval: approval(3) }), info(B)]);
+    r.api.deny({ mac: STUDIO_HOST, session: A, approval: "3", id: id(3) }); // over the link
+    r.api.deny({ mac: STUDIO_HOST, session: A, approval: "3", id: id(4) }); // the same again
+    r.api.deny({ mac: "evil.example.com", session: A, approval: "3", id: id(5) }); // no such Mac
+    r.api.deny({ mac: STUDIO_HOST, session: A, approval: "3x", id: id(6) }); // no approval id
+    r.api.deny({ mac: STUDIO_HOST, session: B, approval: "7", id: id(7) }); // nothing waits there
+    await settle();
+    expect(r.api.settledDenies.sort()).toEqual([id(4), id(5), id(6), id(7)].sort());
+    const [sent] = r.socketOf(STUDIO_HOST).commandsOf("answer");
+    r.socketOf(STUDIO_HOST).receive({ type: "ack", req: sent?.req, message: "answered" });
+    await settle();
+    expect(r.api.settledDenies.filter((d) => d === id(3))).toHaveLength(1);
+    // Out of reach in front: held for the link, and settled now.
+    r.socketOf(MINI_HOST).drop();
+    await settle();
+    r.api.deny({ mac: MINI_HOST, session: A, approval: "4", id: id(8) });
+    await settle();
+    expect(r.api.settledDenies.filter((d) => d === id(8))).toHaveLength(1);
+    await r.advance(60_000);
+    await r.ready(MINI_HOST);
+    expect(r.socketOf(MINI_HOST).commandsOf("answer")).toHaveLength(1);
+    expect(r.api.settledDenies).toHaveLength(6);
+  });
+
+  it("a Deny handed over before the pairings are read is settled once it is sent", async () => {
+    await SecureStore.setItemAsync(tokenKeyOf(STUDIO), TOKEN);
+    await saveSettings({ pairings: [{ id: STUDIO, hubUrl: urlOf(STUDIO_HOST), deviceName: "iPhone", macName: "studio" }] });
+    const sockets = new Sockets();
+    const clock = new FakeClock();
+    const store = createOctetStore();
+    const fleet = new Fleet({ factory: sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
+    const api = new FakeLive(clock.now);
+    const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
+    live.start();
+    fleet.setForeground(false);
+    live.setForeground(false);
+    api.deny({ mac: STUDIO_HOST, session: A, approval: "6", id: id(9) });
+    expect(api.settledDenies).toEqual([]);
+    await fleet.init();
+    await settle();
+    const socket = sockets.last;
+    socket.open();
+    socket.receive({ type: "welcome", device: "iPhone" });
+    await settle();
+    expect(api.settledDenies).toEqual([]);
+    socket.receive({ type: "ack", req: socket.commandsOf("answer")[0]?.req, message: "answered" });
+    await settle();
+    expect(api.settledDenies).toEqual([id(9)]);
+    live.stop();
+  });
+
+  it.each([
+    ["acked", (req: unknown) => ({ type: "ack", req, message: "Activity registered" })],
+    ["refused", (req: unknown) => ({ type: "refused", req, code: "invalid", reason: "No" })],
+  ])("a hand-over the owner %s is settled once", async (_what, reply) => {
+    const r = await rig();
+    await background(r);
+    r.api.pushToken("cd34", "hub-started");
+    r.api.pushToken("cd34", "hub-started"); // said twice: one hand-over
+    await settle();
+    await answer(r, "register_activity", reply);
+    expect(r.api.handOversSettled).toBe(1);
+    await r.advance(HAND_OVER_MS);
+    expect(r.api.handOversSettled).toBe(1);
+  });
+
+  it("a hand-over that is lost (no answer in 10 s) is settled once", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    await background(r);
+    r.api.pushToken("cd34", "a");
+    await settle();
+    expect(r.api.handOversSettled).toBe(0);
+    await r.advance(HAND_OVER_MS);
+    expect(r.api.handOversSettled).toBe(1);
+  });
+
+  it("a token in the background with nothing to hand over is settled at once", async () => {
+    const r = await rig({ macs: [STUDIO_HOST] });
+    r.api.pushToken("cd34", "a");
+    await settle();
+    await r.ack(STUDIO_HOST, "register_activity");
+    await background(r);
+    r.api.pushToken("cd34", "a"); // the owner has it already
+    await settle();
+    expect(r.api.handOversSettled).toBe(1);
+  });
+
+  it("a cold launch in the background for a token is settled only after the hand-over it waited for", async () => {
+    await SecureStore.setItemAsync(tokenKeyOf(STUDIO), TOKEN);
+    await saveSettings({ deviceName: "iPhone", pairings: [{ id: STUDIO, hubUrl: urlOf(STUDIO_HOST), deviceName: "iPhone", macName: "studio" }] });
+    const sockets = new Sockets();
+    const clock = new FakeClock();
+    const store = createOctetStore();
+    const fleet = new Fleet({ factory: sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
+    const api = new FakeLive(clock.now);
+    const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
+    fleet.setForeground(false);
+    live.start();
+    live.setForeground(false);
+    api.pushToken("cd34", "hub-started"); // before the settings or the pairings are read
+    expect(api.handOversSettled).toBe(0);
+    await fleet.init();
+    await settle();
+    expect(api.handOversSettled).toBe(0);
+    const [socket] = sockets.all;
+    socket?.open();
+    socket?.receive({ type: "welcome", device: "iPhone" });
+    await settle();
+    socket?.receive({ type: "ack", req: socket.commandsOf("register_activity")[0]?.req, message: "Activity registered" });
+    await settle();
+    expect(api.handOversSettled).toBe(1);
+    live.stop();
+  });
+});
+
 describe("the hand-over in the background", () => {
   /** The app goes to the background, as the shell does it: every link closes. */
   const background = async (r: Awaited<ReturnType<typeof rig>>) => {

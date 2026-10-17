@@ -705,7 +705,9 @@ revoke` and when you unpair that Mac in the app.
 - **Deny** answers that approval no, to the Mac that owns it, without opening the app and without
   Face ID, since it allows nothing. With the app in front it goes over that Mac's connection. With
   the app in the background, it goes at once over a short background connection to that Mac (closed
-  on the answer, or after 10 seconds). On a locked phone that connection can't be made (the keychain
+  on the answer, or after 10 seconds). The button waits, at most 9 seconds, for the app to say that
+  send is done, and the app asks iOS for the background time to finish it (at most 10 seconds); the
+  same holds for a token the app hands over in the background. On a locked phone that connection can't be made (the keychain
   again), so the Deny waits until you unlock and open the app. A Deny that couldn't go, or for a Mac
   out of reach, is sent on that Mac's next connection, within 10 minutes; after that it is dropped.
   Each Deny is sent once. A Deny that names no paired Mac sends nothing.

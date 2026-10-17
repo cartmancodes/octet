@@ -1,6 +1,7 @@
 import ActivityKit
 import ExpoModulesCore
 import Foundation
+import UIKit
 
 // The App Group the widget shares, and the keys both sides use. Tests hold these strings equal in
 // this file, targets/octet-live/OctetLiveWidget.swift and targets/octet-live/_shared/DenyIntent.swift.
@@ -12,6 +13,11 @@ private let entriesLimit = 64
 /// Each Deny tapped in the widget waits under its own `deny.<uuid>` key.
 private let denyPrefix = "deny."
 private let denyNotification = "dev.octet.mobile.deny"
+/// The app's ack of each Deny, `denied.<uuid>`, written once JavaScript says its send settled:
+/// DenyIntent waits for it before it returns (and iOS suspends the app).
+private let deniedPrefix = "denied."
+/// The longest the app holds background time for one send, if JavaScript never says it settled.
+private let holdLimit: TimeInterval = 10
 /// A Deny older than this is dropped, not sent: its approval has long moved on.
 private let denyMaxAge: TimeInterval = 10 * 60
 /// The activity ids remembered in the order first seen; past this many the oldest are forgotten.
@@ -59,8 +65,8 @@ private func hex(_ data: Data) -> String {
 /// The app runs on iOS 16.4, but the activity needs 17.2 (push-to-start tokens). `OctetActivity` is
 /// marked `@available(iOS 17.2, *)`, so every ActivityKit call here sits behind `#available`; below
 /// 17.2 isSupported() is false and every function resolves without doing anything.
-// @unchecked Sendable: its only mutable state, `tasks`, `hearingDenies`, `newestId` and `seen`, is
-// behind `lock`.
+// @unchecked Sendable: its mutable state, `tasks`, `hearingDenies`, `newestId` and `seen`, is
+// behind `lock`, and `holds` is touched on the main queue only.
 public final class OctetLiveModule: Module, @unchecked Sendable {
   /// Guards `tasks`, `hearingDenies`, `newestId` and `seen`.
   private let lock = NSLock()
@@ -73,6 +79,9 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
   private var seen: [String] = []
   /// Drains run one at a time, so a key is emitted once before it is removed.
   private let denyQueue = DispatchQueue(label: "dev.octet.mobile.deny")
+  /// The background time held, by what it is for ("deny:<uuid>", or "handOver"), each with an id
+  /// so a late end can't end a newer hold. Touched on the main queue only.
+  private var holds: [String: (id: UUID, task: UIBackgroundTaskIdentifier)] = [:]
 
   public func definition() -> ModuleDefinition {
     Name("OctetLive")
@@ -127,6 +136,19 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
       }
       let defaults = UserDefaults(suiteName: appGroup)
       defaults?.set(json, forKey: entriesKey)
+    }
+
+    // JavaScript's send for Deny request `id` settled (sent, refused, lost, held or not sent): the
+    // background time held for it ends, and DenyIntent, waiting on its ack, returns.
+    Function("denySettled") { (id: String) in
+      guard UUID(uuidString: id) != nil else { return }
+      self.release("deny:" + id)
+      UserDefaults(suiteName: appGroup)?.set(Date().timeIntervalSince1970, forKey: deniedPrefix + id)
+    }
+
+    // The token hand-over in the background settled (or there was none to make).
+    Function("handOverSettled") { () in
+      self.release("handOver")
     }
 
     OnStartObserving("pushToStartToken") {
@@ -195,6 +217,9 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
       Task { [weak self] in
         for await data in activity.pushTokenUpdates {
           if Task.isCancelled { break }
+          // In the background JavaScript hands the token over a connection of its own: iOS is
+          // asked for the time to do it.
+          self?.hold("handOver", away: true)
           self?.sendEvent("pushToken", ["token": hex(data), "activity": activity.id])
         }
         self?.forget(key, id)
@@ -339,9 +364,47 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
         let at = deny["at"] as? Double,
         abs(now - at) <= denyMaxAge
       {
-        sendEvent("deny", ["mac": mac, "session": session, "approval": approval])
+        // The app keeps running until JavaScript says this one's send settled (`denySettled`).
+        let id = String(key.dropFirst(denyPrefix.count))
+        hold("deny:" + id, away: false)
+        sendEvent("deny", ["mac": mac, "session": session, "approval": approval, "id": id])
       }
       defaults.removeObject(forKey: key)
     }
+  }
+
+  /// Asks iOS for background time for `key` (only while the app is in the background, when `away`),
+  /// until `release(key)`, iOS's own expiry or `holdLimit`, whichever comes first. A newer hold for
+  /// the same key replaces the older one. On the main queue, so begins and ends keep their order.
+  private func hold(_ key: String, away: Bool) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      if away && UIApplication.shared.applicationState == .active { return }
+      let id = UUID()
+      let task = UIApplication.shared.beginBackgroundTask(withName: "octet." + key) { [weak self] in
+        self?.end(key, only: id)
+      }
+      guard task != .invalid else { return }
+      if let old = self.holds[key] {
+        UIApplication.shared.endBackgroundTask(old.task)
+      }
+      self.holds[key] = (id, task)
+      DispatchQueue.main.asyncAfter(deadline: .now() + holdLimit) { [weak self] in
+        self?.end(key, only: id)
+      }
+    }
+  }
+
+  /// Ends the hold for `key`, if there is one, from any thread.
+  private func release(_ key: String) {
+    DispatchQueue.main.async { [weak self] in self?.end(key) }
+  }
+
+  /// Ends the hold for `key` (only the one `id` names, when given). On the main queue.
+  @MainActor
+  private func end(_ key: String, only id: UUID? = nil) {
+    guard let held = holds[key], id == nil || held.id == id else { return }
+    holds[key] = nil
+    UIApplication.shared.endBackgroundTask(held.task)
   }
 }

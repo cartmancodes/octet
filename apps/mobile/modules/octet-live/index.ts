@@ -19,11 +19,14 @@ export interface ActivityState {
   approvals: number;
 }
 
-/** A Deny tapped in the widget: the host and raw session it showed, and the approval's id. */
+/** A Deny tapped in the widget: the host and raw session it showed, and the approval's id. `id`
+ * names the tap's own request (a UUID): the app says when its send for it settled
+ * (`denySettled`), which lets the widget's Deny return and iOS suspend the app. */
 export interface DenyEvent {
   mac: string;
   session: string;
   approval: string;
+  id?: string;
 }
 
 /** An ActivityKit token as lowercase hex, or null when the running activity's token is gone.
@@ -103,13 +106,36 @@ export function asTokenEvent(raw: unknown): TokenEvent | null {
   return typeof token === "string" && TOKEN.test(token) ? { token, ...named } : null;
 }
 
+/** A Deny's request id as DenyIntent makes it: `UUID().uuidString`. */
+const DENY_ID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+
+/** The request id of a deny event from native, or null if it names none. */
+export function denyIdOf(raw: unknown): string | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const { id } = raw as { id?: unknown };
+  return typeof id === "string" && DENY_ID.test(id) ? id : null;
+}
+
 /** A deny event from native, or null if it isn't one. */
 export function asDenyEvent(raw: unknown): DenyEvent | null {
   if (typeof raw !== "object" || raw === null) return null;
   const { mac, session, approval } = raw as Record<string, unknown>;
   if (typeof mac !== "string" || typeof session !== "string" || typeof approval !== "string") return null;
   if (session === "" || approval === "") return null;
-  return { mac, session, approval };
+  const id = denyIdOf(raw);
+  return id === null ? { mac, session, approval } : { mac, session, approval, id };
+}
+
+/** The app's send for Deny request `id` settled (acked, refused, lost or not sent): the native side
+ * ends the background time it held for it and acks it to the widget's Deny. */
+export function denySettled(id: string): void {
+  native?.denySettled(id);
+}
+
+/** A token's hand-over in the background settled (or there was none to make): the native side
+ * ends the background time it held from the token's event. */
+export function handOverSettled(): void {
+  native?.handOverSettled();
 }
 
 /** Each running activity's push token, and null when it ends. */
@@ -138,6 +164,11 @@ export function addDenyListener(listener: (event: DenyEvent) => void): Subscript
     native?.addListener("deny", (raw) => {
       const event = asDenyEvent(raw);
       if (event) listener(event);
+      else {
+        // Nothing to send: settled at once.
+        const id = denyIdOf(raw);
+        if (id !== null) denySettled(id);
+      }
     }) ?? nothing
   );
 }

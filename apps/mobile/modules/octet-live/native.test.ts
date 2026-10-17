@@ -363,3 +363,50 @@ describe("the widget's buttons and links", () => {
     expect([...widgetSwift.matchAll(/Particulars\(shown: shown, place: \.\w+\)/g)].length).toBe(2);
   });
 });
+
+describe("the app keeps running until a Deny or a hand-over is sent", () => {
+  it("DenyIntent waits, at most 9 s, for the app's ack of its own request, polling every 100 ms", () => {
+    const perform = block(denySwift, /func perform\(\)/);
+    expect(perform).toMatch(/let id = UUID\(\)\.uuidString/);
+    expect(perform).toMatch(/defaults\.set\(deny, forKey: "deny\." \+ id\)/);
+    expect(perform).toMatch(/let ack = "denied\." \+ id/);
+    expect(perform).toMatch(/Date\(\)\.addingTimeInterval\(9\)/);
+    expect(perform).toMatch(/Task\.sleep\(nanoseconds: 100_000_000\)/);
+    expect(perform).toMatch(/defaults\.removeObject\(forKey: ack\)/);
+    // The wait comes after the request is written and the app pinged.
+    expect(perform.indexOf("CFNotificationCenterPostNotification")).toBeLessThan(perform.indexOf("addingTimeInterval(9)"));
+    // An ack left behind (the wait gave up first) is pruned with the expired denies.
+    expect(perform).toMatch(/hasPrefix\("denied\."\)/);
+  });
+
+  it("holds a background task from each deny it emits until JavaScript says it settled, and acks it to DenyIntent", () => {
+    expect(moduleSwift).toMatch(/private let deniedPrefix = "denied\."/);
+    expect(moduleSwift).toMatch(/private let holdLimit: TimeInterval = 10\b/);
+    const drain = block(moduleSwift, /private func drainDenies\(\)/);
+    expect(drain).toMatch(/hold\("deny:" \+ id, away: false\)/);
+    expect(drain.indexOf('hold("deny:"')).toBeLessThan(drain.indexOf('sendEvent("deny"'));
+    expect(drain).toMatch(/sendEvent\("deny", \["mac": mac, "session": session, "approval": approval, "id": id\]\)/);
+    const settled = block(moduleSwift, /Function\("denySettled"\)/);
+    expect(settled).toMatch(/UUID\(uuidString: id\) != nil/);
+    expect(settled).toMatch(/release\("deny:" \+ id\)/);
+    expect(settled).toMatch(/forKey: deniedPrefix \+ id/);
+  });
+
+  it("holds one for a token emitted in the background until JavaScript says the hand-over settled", () => {
+    const watch = block(moduleSwift, /private func watch\(_ activity: Activity<OctetActivity>\)/);
+    expect(watch).toMatch(/self\?\.hold\("handOver", away: true\)\n\s*self\?\.sendEvent\("pushToken", \["token": hex\(data\), "activity": activity\.id\]\)/);
+    expect(block(moduleSwift, /Function\("handOverSettled"\)/)).toMatch(/release\("handOver"\)/);
+  });
+
+  it("begins and ends the task on the main queue, and ends it itself after 10 s, or when iOS says time is up", () => {
+    const hold = block(moduleSwift, /private func hold\(_ key: String, away: Bool\)/);
+    expect(hold).toMatch(/DispatchQueue\.main\.async/);
+    expect(hold).toMatch(/UIApplication\.shared\.applicationState/);
+    expect(hold).toMatch(/UIApplication\.shared\.beginBackgroundTask\(withName:/);
+    expect(hold).toMatch(/self\?\.end\(key, only: id\)/); // the expiry, and the fallback
+    expect(hold).toMatch(/DispatchQueue\.main\.asyncAfter\(deadline: \.now\(\) \+ holdLimit\)/);
+    expect(hold).toMatch(/UIApplication\.shared\.endBackgroundTask\(old\.task\)/);
+    expect(block(moduleSwift, /private func end\(_ key: String, only id: UUID\? = nil\)/)).toMatch(/UIApplication\.shared\.endBackgroundTask\(held\.task\)/);
+    expect(block(moduleSwift, /private func release\(_ key: String\)/)).toMatch(/DispatchQueue\.main\.async/);
+  });
+});

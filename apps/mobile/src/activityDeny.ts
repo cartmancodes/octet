@@ -31,6 +31,9 @@ export interface DenyOptions {
   now: () => number;
   /** Whether the app is in front (its links are up, or coming). */
   inFront: () => boolean;
+  /** The send for a tap's request `id` settled: whatever came of it (sent, refused, lost, held for
+   * the link, or nothing to send), the native side may let iOS suspend the app. Once per tap. */
+  settled: (id: string) => void;
 }
 
 /** A Deny waiting for its Mac to be reached. */
@@ -47,7 +50,8 @@ interface HeldDeny {
  * closed, it goes at once over a background connection to that Mac (hello `background: true`, the
  * answer, closed on the ack or after 10 s); if that gets no ack it waits for the link. At most 16
  * wait, for at most 10 minutes. Not sent for a session its Mac has listed as over, or as waiting on
- * nothing.
+ * nothing. Each tap is settled once (`settled`) whatever came of it, so the native side can let the
+ * widget's Deny return and iOS suspend the app.
  */
 export class IslandDenies {
   private readonly denied: string[] = [];
@@ -61,17 +65,36 @@ export class IslandDenies {
   /** A tap, as the native side reports it. */
   deny(event: DenyEvent): void {
     if (this.o.fleet.snapshot().status === "loading") {
-      this.early = [...this.early, event].slice(-DENIES_HELD);
+      const early = [...this.early, event];
+      this.early = early.slice(-DENIES_HELD);
+      for (const dropped of early.slice(0, -DENIES_HELD)) this.settle(dropped.id);
       return;
     }
+    const done = this.once(event.id);
     const approval = parseApprovalId(event.approval);
-    if (approval === null) return;
+    if (approval === null) return done();
     const mark = `${hostKey(event.mac)}\n${event.session}\n${approval}`;
-    if (this.denied.includes(mark)) return;
+    if (this.denied.includes(mark)) return done();
     this.denied.push(mark);
     if (this.denied.length > DENIES_SEEN) this.denied.shift();
     const key = this.o.fleet.keyFor(event.mac === "" ? null : event.mac, event.session);
-    if (key !== null) this.send({ key, approval, at: this.o.now() });
+    if (key === null) return done();
+    this.send({ key, approval, at: this.o.now() }, done);
+  }
+
+  /** Settles request `id` (none for a tap the native side named no id for). */
+  private settle(id: string | undefined): void {
+    if (id !== undefined) this.o.settled(id);
+  }
+
+  /** A settle for request `id` that runs at most once, however many ways it ends. */
+  private once(id: string | undefined): () => void {
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      this.settle(id);
+    };
   }
 
   /** The Fleet changed: once the pairings are read, the taps that came before are resolved. */
@@ -88,34 +111,41 @@ export class IslandDenies {
     const mine = this.held.filter((h) => macOfKey(h.key) === mac);
     if (mine.length === 0) return;
     this.held = this.held.filter((h) => macOfKey(h.key) !== mac);
-    for (const held of mine) if (now - held.at <= DENY_MAX_AGE_MS) this.send(held);
+    // Each of these settled when it was first held.
+    for (const held of mine) if (now - held.at <= DENY_MAX_AGE_MS) this.send(held, () => undefined);
   }
 
-  private send(held: HeldDeny): void {
+  /** Sends `held`, then calls `done` once it settled: answered, refused, lost, or held. */
+  private send(held: HeldDeny, done: () => void): void {
     const mac = macOfKey(held.key);
     const raw = splitKey(held.key)?.raw;
-    if (mac === null || raw === undefined) return;
+    if (mac === null || raw === undefined) return done();
     const state = this.o.store.getState();
     if (state.listed.has(mac)) {
-      if (hasEnded(state, held.key)) return;
+      if (hasEnded(state, held.key)) return done();
       const row = state.sessions.find((s) => s.id === held.key);
-      if (row && row.approvals === 0) return;
+      if (row && row.approvals === 0) return done();
     }
     if (!this.o.inFront()) {
       const body: RequestBody = { type: "answer", session: raw, approval: held.approval, allow: false };
-      void this.o.fleet.sendInBackground([mac], body).then((acked) => {
-        if (!acked.includes(mac)) this.hold(held);
-      });
+      void this.o.fleet
+        .sendInBackground([mac], body)
+        .then((acked) => {
+          if (!acked.includes(mac)) this.hold(held);
+        })
+        .finally(done);
       return;
     }
     const client = this.o.fleet.links.client(mac);
     if (client?.state !== "ready") {
       this.hold(held);
-      return;
+      return done();
     }
-    sendVia(this.o.fleet.links, held.key, { type: "answer", session: held.key, approval: held.approval, allow: false }).catch((error: unknown) => {
-      if (error instanceof Refusal && error.code === "unsent") this.hold(held);
-    });
+    sendVia(this.o.fleet.links, held.key, { type: "answer", session: held.key, approval: held.approval, allow: false })
+      .catch((error: unknown) => {
+        if (error instanceof Refusal && error.code === "unsent") this.hold(held);
+      })
+      .finally(done);
   }
 
   private hold(held: HeldDeny): void {

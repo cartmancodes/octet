@@ -12,6 +12,7 @@ import {
   addPushToStartTokenListener,
   addPushTokenListener,
   asDenyEvent,
+  denyIdOf,
   asTokenEvent,
   end,
   entryKey,
@@ -88,6 +89,16 @@ describe("events from the native side", () => {
     const deny: DenyEvent = { mac: "mac.tail1234.ts.net", session: "6101-1790000000", approval: "a1" };
     expect(asDenyEvent({ ...deny })).toEqual(deny);
     expect(asDenyEvent({ ...deny, mac: "" })).toEqual({ ...deny, mac: "" });
+  });
+
+  it("passes the request's id, which the app settles it by, only when it is a UUID", () => {
+    const deny: DenyEvent = { mac: "m", session: "s", approval: "a1" };
+    const id = "6F9619FF-8B86-D011-B42D-00C04FC964FF";
+    expect(asDenyEvent({ ...deny, id })).toEqual({ ...deny, id });
+    for (const bad of [5, "", "not-a-uuid", `${id}0`, `${id}\n`]) expect(asDenyEvent({ ...deny, id: bad })).toEqual(deny);
+    expect(denyIdOf({ id })).toBe(id);
+    expect(denyIdOf({ id: "x" })).toBeNull();
+    expect(denyIdOf(null)).toBeNull();
   });
 
   it("drops a deny that is malformed or names no session or approval", () => {
