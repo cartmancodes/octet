@@ -330,11 +330,11 @@ describe("the widget's buttons and links", () => {
     expect(block(widgetSwift, /DynamicIslandExpandedRegion\(\.center\)/)).toMatch(/StaleLabel\(shown: shown\)/);
   });
 
-  it("gives Allow and Deny a full-width hit area, 44 points tall on the Lock Screen and 36 in the Island", () => {
-    // The expanded Island is capped at 160 points: there the buttons are 36 points and the command
+  it("gives Allow and Deny a full-width hit area, 44 points tall on the Lock Screen and 32 in the Island", () => {
+    // The expanded Island is capped at 160 points: there the buttons are 32 points and the command
     // takes one line, so neither is clipped. The Lock Screen keeps 44 points and two lines.
     const place = block(widgetSwift, /private enum Place/);
-    expect(place).toMatch(/var buttonHeight: CGFloat \{ self == \.island \? 36 : 44 \}/);
+    expect(place).toMatch(/var buttonHeight: CGFloat \{ self == \.island \? 32 : 44 \}/);
     expect(place).toMatch(/var commandLines: Int \{ self == \.island \? 1 : 2 \}/);
     const actions = block(widgetSwift, /private struct Actions: View/);
     expect(actions).toMatch(/let place: Place/);
@@ -344,12 +344,19 @@ describe("the widget's buttons and links", () => {
       expect(button).toMatch(/\.contentShape\(Rectangle\(\)\)/);
     }
     expect(actions).not.toMatch(/minHeight: \d/);
+    // No system button padding: Deny is drawn as plainly as Allow, a capsule of its own, so it is
+    // exactly the height asked for (the system style padded it to 50 points).
+    expect(actions).toMatch(/Button\(intent: deny\) \{[\s\S]*?\n {8}\}\n {8}\.buttonStyle\(\.plain\)/);
+    expect(block(actions, /Button\(intent: deny\)/)).toMatch(/\.background\(Capsule\(\)\.fill\(Color\.red\.opacity\(0\.35\)\)\)/);
+    expect(block(actions, /Link\(destination: shown\.allowURL\)/)).toMatch(/\.background\(Capsule\(\)\.fill\(Color\.green\.opacity\(0\.35\)\)\)/);
     expect(block(widgetSwift, /private struct Particulars: View/)).toMatch(/\.lineLimit\(place\.commandLines\)/);
     // The Lock Screen draws them at .lockScreen; the Island's bottom region at .island.
     const lock = block(widgetSwift, /private struct LockScreen: View/);
     expect(lock).toMatch(/Actions\(shown: shown, place: \.lockScreen\)/);
     expect(block(widgetSwift, /private struct Details: View/)).toMatch(/Particulars\(shown: shown, place: \.lockScreen\)/);
     const bottom = block(widgetSwift, /DynamicIslandExpandedRegion\(\.bottom\)/);
+    // Name, one line of command and the buttons, 4 points apart, inside the 160.
+    expect(bottom).toMatch(/VStack\(alignment: \.leading, spacing: 4\)/);
     expect(bottom).toMatch(/Particulars\(shown: shown, place: \.island\)/);
     expect(bottom).toMatch(/Actions\(shown: shown, place: \.island\)/);
     expect([...widgetSwift.matchAll(/Actions\(shown: shown, place: \.\w+\)/g)].length).toBe(2);

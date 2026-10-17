@@ -15,13 +15,13 @@ private let entriesByteLimit = 64 * 1024
 private let staleOpacity = 0.45
 
 /// Where the particulars and the buttons are drawn. iOS caps the expanded Island at 160 points, so
-/// there the command takes one line and Deny and Allow are 36 points tall; the Lock Screen has room
+/// there the command takes one line and Deny and Allow are 32 points tall; the Lock Screen has room
 /// for two lines and 44-point buttons.
 private enum Place {
   case lockScreen, island
 
   var commandLines: Int { self == .island ? 1 : 2 }
-  var buttonHeight: CGFloat { self == .island ? 36 : 44 }
+  var buttonHeight: CGFloat { self == .island ? 32 : 44 }
 }
 
 /// One session's waiting approval, as the app wrote it.
@@ -208,11 +208,15 @@ private struct Actions: View {
   var body: some View {
     HStack(spacing: 8) {
       if let deny = shown.deny {
+        // Plain, with a capsule of its own as Allow has: the system style pads a button past the
+        // height asked for (to 50 points), which the Island has no room for.
         Button(intent: deny) {
           Text("Deny")
             .frame(maxWidth: .infinity, minHeight: place.buttonHeight)
+            .background(Capsule().fill(Color.red.opacity(0.35)))
             .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .tint(.red)
         .accessibilityLabel("Deny this approval")
       }
@@ -295,7 +299,7 @@ struct OctetLiveWidget: Widget {
           }
         }
         DynamicIslandExpandedRegion(.bottom) {
-          VStack(alignment: .leading, spacing: 6) {
+          VStack(alignment: .leading, spacing: 4) {
             Particulars(shown: shown, place: .island)
             if shown.isApproval {
               Actions(shown: shown, place: .island)
