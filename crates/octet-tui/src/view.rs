@@ -34,13 +34,17 @@ fn card(title: &str) -> Block<'_> {
         .title(Span::styled(title, Style::default().fg(MUTED)))
 }
 fn mode_chip(app: &App) -> Span<'static> {
-    let color = match app.conn.mode {
+    let active = app.conn.mode_for_turn.unwrap_or(app.conn.mode);
+    let color = match active {
         octet_core::Mode::Ask => MUTED,
         octet_core::Mode::AcceptEdits | octet_core::Mode::Auto => ACCENT,
         octet_core::Mode::FullAccess => AMBER,
     };
     let text = match app.conn.mode_pending {
         Some(pending) => format!("{}…", pending.label()),
+        None if active != app.conn.mode => {
+            format!("{} → {} next", active.label(), app.conn.mode.label())
+        }
         None => app.conn.mode.label().to_owned(),
     };
     Span::styled(text, Style::default().fg(color).bold())

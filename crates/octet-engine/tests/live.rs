@@ -432,6 +432,40 @@ async fn claude_live_switch_uses_set_permission_mode() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn codex_switch_while_steering_reaches_the_first_new_turn_and_stays() {
+    let (handle, mut events, task) = spawn(config());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::Prompt(scenario::HOLD_MARKED.into()))
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Text(t) if t == "named")).await;
+    handle.send(Command::SetMode(Mode::Auto)).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Auto))).await;
+    let notice = next(&mut events).await;
+    assert!(
+        matches!(notice, Event::Notice(t) if t.contains("steering keep their previous permissions"))
+    );
+    for text in ["first follow-up", "second follow-up"] {
+        handle.send(Command::Steer(text.into())).unwrap();
+        wait_for(
+            &mut events,
+            |e| matches!(e, Event::Text(t) if t == &format!("steered:{text}")),
+        )
+        .await;
+    }
+    handle.interrupt();
+    wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    for _ in 0..2 {
+        handle
+            .send(Command::Prompt(scenario::PARAMS.into()))
+            .unwrap();
+        let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+        assert_eq!(echo["turn"]["approvalPolicy"], "on-request");
+        assert_eq!(echo["turn"]["approvalsReviewer"], "auto_review");
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn claude_refusal_keeps_the_previous_mode() {
     let mut c = claude();
     c.model = Some(scenario::REJECT_MODE.into());

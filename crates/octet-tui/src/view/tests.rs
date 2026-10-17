@@ -270,6 +270,62 @@ fn permission_mode_stays_visible_on_narrow_headers() {
     }
 }
 #[test]
+fn codex_header_distinguishes_running_permissions_from_next_turn() {
+    use octet_core::{Engine, Mode, Outcome};
+    for width in [120, 80, 40, 38] {
+        let mut app = crate::test_support::app_for(Engine::CODEX);
+        crate::test_support::idle(&mut app);
+        app.event(Event::Started);
+        app.event(Event::ModeChanged(Mode::Auto));
+        assert_eq!(mode_chip(&app).content, "ask → auto next");
+        assert_eq!(mode_chip(&app).style.fg, Some(MUTED));
+        assert!(app.mode_details().contains("running turn still uses ask"));
+        let rows = screen(width, 24, &mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("ask → auto next")),
+            "{rows:?}"
+        );
+        // Steering and another mode selection do not update the running turn.
+        app.event(Event::User("keep going".into()));
+        app.event(Event::ModeChanged(Mode::AcceptEdits));
+        assert_eq!(mode_chip(&app).content, "ask → accept-edits next");
+        app.event(Event::ModeChanged(Mode::Ask));
+        assert_eq!(mode_chip(&app).content, "ask");
+        app.event(Event::ModeChanged(Mode::Auto));
+        app.event(Event::Finished {
+            outcome: Outcome::Completed,
+        });
+        app.event(Event::Started);
+        assert_eq!(mode_chip(&app).content, "auto");
+        app.event(Event::ModeChanged(Mode::Ask));
+        assert_eq!(mode_chip(&app).content, "auto → ask next");
+        app.event(Event::Stopped);
+        assert_eq!(mode_chip(&app).content, "ask");
+    }
+}
+
+#[test]
+fn claude_mode_confirmation_updates_the_running_turn() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CLAUDE);
+    crate::test_support::idle(&mut app);
+    app.event(Event::Started);
+    app.event(Event::ModeChanged(octet_core::Mode::Auto));
+    assert_eq!(mode_chip(&app).content, "auto");
+    assert_eq!(app.conn.mode_for_turn, None);
+}
+
+#[test]
+fn codex_mode_confirmed_before_started_applies_to_the_new_turn() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CODEX);
+    crate::test_support::idle(&mut app);
+    // The UI marks a submitted prompt running before driver events arrive.
+    app.conn.start_turn();
+    app.event(Event::ModeChanged(octet_core::Mode::Auto));
+    app.event(Event::Started);
+    assert_eq!(mode_chip(&app).content, "auto");
+    assert_eq!(app.conn.mode_for_turn, None);
+}
+#[test]
 fn status_shows_in_full_on_narrow_terminals() {
     let config = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp");
     for width in [59, 50, 40] {

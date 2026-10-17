@@ -304,7 +304,8 @@ latest output.
 `--mode MODE` at launch, `/mode MODE` at runtime, Shift+Tab to cycle. The default
 is `ask`; the mode is not remembered between launches but is kept across
 `/model`, `/new` and `/reconnect`. `/mode` alone shows the table for the current
-provider. The header shows the mode the vendor confirmed.
+provider. The header shows the selected mode; during a Codex turn it also
+shows the running mode when a change is waiting for the next turn.
 
 | Mode | Claude | Codex (sandbox · approval · reviewer) |
 | --- | --- | --- |
@@ -319,7 +320,11 @@ answers a vendor approval by itself. Codex has no edits-only mode, so
 workspace-write, and the model asks only to escalate.
 
 `ask`, `accept-edits` and `auto` switch live. Claude applies the change
-immediately, even mid-turn; Codex applies it from the next turn. A change Claude
+immediately, even mid-turn; Codex applies it from the next turn. For example,
+`ask → auto next` means the running Codex turn still uses `ask`. Steering
+messages continue that same turn and do not apply the change. Wait for the turn
+to finish, or press Esc and then send a new prompt to use the selected mode.
+An already-open approval still needs your answer. A change Claude
 refuses (for example, auto mode unavailable for the account) leaves the previous
 mode in place with a notice; one Claude does not confirm within 10 seconds is
 reported as unconfirmed, and a late confirmation is still applied. At connect

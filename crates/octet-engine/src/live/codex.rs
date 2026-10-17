@@ -567,7 +567,9 @@ fn adopt_mode_now(core: &mut Core, target: Mode) -> Result<(), DriverError> {
     core.mode = target;
     core.emit(Event::ModeChanged(core.mode))?;
     if core.phase.is_running() {
-        core.emit(Event::Notice("Mode applies from the next turn".into()))?;
+        core.emit(Event::Notice(
+            "Mode applies from the next turn. The running turn and steering keep their previous permissions; wait for it to finish, or interrupt it and send a new prompt".into(),
+        ))?;
     }
     Ok(())
 }

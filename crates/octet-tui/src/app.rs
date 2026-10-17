@@ -121,6 +121,8 @@ pub(crate) struct Connection {
     pub(crate) engine: octet_core::Engine,
     pub(crate) mode: octet_core::Mode,
     pub(crate) mode_pending: Option<octet_core::Mode>,
+    /// Codex keeps the running turn's permissions when the next mode changes.
+    pub(crate) mode_for_turn: Option<octet_core::Mode>,
     pub(crate) workspace: String,
     pub(crate) model: String,
     pub(crate) requested_model: Option<String>,
@@ -162,6 +164,7 @@ impl Connection {
             engine: config.engine,
             mode: config.mode,
             mode_pending: None,
+            mode_for_turn: None,
             workspace: clean(&config.cwd.display().to_string()),
             model: "awaiting model metadata".into(),
             requested_model: config.model.clone(),
@@ -211,6 +214,7 @@ impl Connection {
     }
     /// The running turn ended.
     pub(crate) fn end_turn(&mut self) {
+        self.mode_for_turn = None;
         if self.is_running() {
             self.phase = ConnPhase::Idle;
         }
@@ -538,6 +542,17 @@ impl App {
     }
     pub(crate) fn mode_details(&self) -> String {
         let mut text = format!("Permission mode: {}", self.conn.mode.label());
+        if let Some(active) = self
+            .conn
+            .mode_for_turn
+            .filter(|mode| *mode != self.conn.mode)
+        {
+            let _ = write!(
+                text,
+                " (next turn; running turn still uses {}). Steering does not start a new turn",
+                active.label()
+            );
+        }
         if let Some(pending) = self.conn.mode_pending {
             let _ = write!(text, " (switching to {})", pending.label());
         }
@@ -913,6 +928,9 @@ impl App {
                 self.refresh_model_label();
             }
             Event::ModeChanged(mode) => {
+                if self.conn.engine == octet_core::Engine::CODEX && self.conn.is_running() {
+                    self.conn.mode_for_turn.get_or_insert(self.conn.mode);
+                }
                 self.conn.mode = mode;
                 self.conn.mode_pending = None;
             }
@@ -946,6 +964,10 @@ impl App {
                 self.chat.unseen = false;
             }
             Event::Started => {
+                // This is the driver's turn boundary, unlike the optimistic
+                // start when a prompt is queued locally. Earlier mode events
+                // already apply to this new turn.
+                self.conn.mode_for_turn = None;
                 self.conn.start_turn();
                 self.conn.activity = State::Thinking;
                 self.conn.status = "working".into();
@@ -1078,6 +1100,7 @@ impl App {
                 }
                 self.conn.mode_pending = None;
                 self.conn.phase = ConnPhase::Stopped;
+                self.conn.mode_for_turn = None;
                 if let Some(from) = self.conn.forking_from.take() {
                     self.note(format!(
                         "The fork from {from} did not open; /reconnect tries again"

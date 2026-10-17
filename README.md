@@ -84,6 +84,8 @@ running across turns, and pick the session up from your phone.
 - Four permission modes, mapped onto each vendor's own settings: `ask`,
   `accept-edits`, `auto` (the vendor's reviewer decides) and `full-access`.
   Shift+Tab cycles the first three live; `full-access` has to be typed.
+  Codex applies changes on the next turn; its header distinguishes the running
+  mode from the next mode while work is still in progress.
 - The approval dialog leads with the action, the command, the files and the
   directory, then shows the whole request: allow once or deny. Expired,
   cancelled, oversized and unknown requests are denied, and so is any

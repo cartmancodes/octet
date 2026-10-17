@@ -324,6 +324,10 @@ Claude Code and Codex CLIs.
 
 ### Fixed
 
+- A mid-turn Codex permission change now shows both the running and next mode
+  in the terminal header and `/mode` details. The notice explains that steering
+  keeps the old permissions until a new turn starts.
+
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.
 - After a Lock Screen start that never handed its token over, the Island

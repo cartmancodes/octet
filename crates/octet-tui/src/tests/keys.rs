@@ -869,6 +869,42 @@ async fn the_skills_picker_filters_and_tab_inserts() {
     assert!(vendor.sent.borrow().is_empty());
 }
 #[tokio::test]
+async fn a_codex_skill_picked_from_claude_only_prepares_a_draft() {
+    let mut app = crate::test_support::app_for(Engine::CLAUDE);
+    crate::test_support::idle(&mut app);
+    let ws = app.workspace().to_path_buf();
+    app.models.skill_catalogs.set(
+        Engine::CODEX,
+        &ws,
+        vec![skill(
+            "documents:documents",
+            &[],
+            Some("/s/documents/SKILL.md"),
+        )],
+        std::time::SystemTime::now(),
+    );
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills documents:documents").await;
+    let picker = app.composer.completion.as_ref().expect("skill picker open");
+    assert_eq!(picker.kind, composer::Kind::Skill);
+    assert_eq!(picker.items, ["documents:documents · codex"]);
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    assert_eq!(app.composer.editor.text(), "/documents:documents ");
+    assert_eq!(app.composer.chosen_skill.as_ref().unwrap().0, Engine::CODEX);
+    assert!(app.pending_skill.is_none());
+    assert!(
+        vendor.sent.borrow().is_empty(),
+        "picking never runs a skill"
+    );
+    assert_eq!(
+        view::composer_hint(&app, 100),
+        (
+            "Enter switches to codex, then runs /documents:documents".into(),
+            view::AMBER
+        )
+    );
+}
+#[tokio::test]
 async fn another_providers_skill_is_prepared_then_switches_with_its_arguments() {
     let mut app = skills_app();
     let vendor = RecordingVendor::default();
@@ -1094,6 +1130,15 @@ async fn typing_filters_the_palette_and_enter_runs_the_match() {
     key_action(&mut app, &vendor, key(KeyCode::Backspace)).await;
     assert_eq!(app.overlay.palette_query, "edi");
     assert_eq!(app.overlay.selection, 0, "a change selects the first match");
+}
+#[test]
+fn the_palette_filter_finds_model_and_mode_from_mod() {
+    let names: Vec<&str> = view::palette_matches("mod")
+        .into_iter()
+        .map(|i| view::palette_entries().nth(i).unwrap().0)
+        .collect();
+    assert!(names.contains(&"/model"), "{names:?}");
+    assert!(names.contains(&"/mode"), "{names:?}");
 }
 #[tokio::test]
 async fn opening_the_palette_starts_unfiltered() {
