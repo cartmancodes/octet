@@ -14,6 +14,16 @@ private let entriesByteLimit = 64 * 1024
 /// How much of a stale activity's content shows: dimmed, so it reads as old at a glance.
 private let staleOpacity = 0.45
 
+/// Where the particulars and the buttons are drawn. iOS caps the expanded Island at 160 points, so
+/// there the command takes one line and Deny and Allow are 36 points tall; the Lock Screen has room
+/// for two lines and 44-point buttons.
+private enum Place {
+  case lockScreen, island
+
+  var commandLines: Int { self == .island ? 1 : 2 }
+  var buttonHeight: CGFloat { self == .island ? 36 : 44 }
+}
+
 /// One session's waiting approval, as the app wrote it.
 private struct Entry {
   let name: String
@@ -143,6 +153,7 @@ private struct Elapsed: View {
 /// The session's name and the command waiting, when the app shared them.
 private struct Particulars: View {
   let shown: Shown
+  let place: Place
 
   var body: some View {
     // Both are the user's work: iOS may redact them on a locked phone, as the user sets it.
@@ -156,7 +167,7 @@ private struct Particulars: View {
       Text(command)
         .font(.caption.monospaced())
         .foregroundStyle(.secondary)
-        .lineLimit(2)
+        .lineLimit(place.commandLines)
         .privacySensitive()
     }
   }
@@ -185,20 +196,21 @@ private struct Details: View {
       Text(shown.title)
         .font(.headline)
         .lineLimit(1)
-      Particulars(shown: shown)
+      Particulars(shown: shown, place: .lockScreen)
     }
   }
 }
 
 private struct Actions: View {
   let shown: Shown
+  let place: Place
 
   var body: some View {
     HStack(spacing: 8) {
       if let deny = shown.deny {
         Button(intent: deny) {
           Text("Deny")
-            .frame(maxWidth: .infinity, minHeight: 44)
+            .frame(maxWidth: .infinity, minHeight: place.buttonHeight)
             .contentShape(Rectangle())
         }
         .tint(.red)
@@ -207,8 +219,9 @@ private struct Actions: View {
       Link(destination: shown.allowURL) {
         Text(shown.deny == nil ? "Open Octet" : "Allow")
           .font(.body.weight(.semibold))
-          .frame(maxWidth: .infinity, minHeight: 44)
+          .frame(maxWidth: .infinity, minHeight: place.buttonHeight)
           .background(Capsule().fill(Color.green.opacity(0.35)))
+          .contentShape(Rectangle())
       }
       .accessibilityLabel(shown.deny == nil ? "Open the Inbox" : "Allow, in Octet")
     }
@@ -230,7 +243,7 @@ private struct LockScreen: View {
       }
       .opacity(shown.stale ? staleOpacity : 1)
       if shown.isApproval {
-        Actions(shown: shown)
+        Actions(shown: shown, place: .lockScreen)
           .opacity(shown.stale ? staleOpacity : 1)
       }
       StaleLabel(shown: shown)
@@ -283,9 +296,9 @@ struct OctetLiveWidget: Widget {
         }
         DynamicIslandExpandedRegion(.bottom) {
           VStack(alignment: .leading, spacing: 6) {
-            Particulars(shown: shown)
+            Particulars(shown: shown, place: .island)
             if shown.isApproval {
-              Actions(shown: shown)
+              Actions(shown: shown, place: .island)
             }
           }
           .opacity(shown.stale ? staleOpacity : 1)

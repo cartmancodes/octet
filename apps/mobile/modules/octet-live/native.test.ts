@@ -330,10 +330,29 @@ describe("the widget's buttons and links", () => {
     expect(block(widgetSwift, /DynamicIslandExpandedRegion\(\.center\)/)).toMatch(/StaleLabel\(shown: shown\)/);
   });
 
-  it("gives Allow and Deny a hit area at least 44 points tall", () => {
+  it("gives Allow and Deny a full-width hit area, 44 points tall on the Lock Screen and 36 in the Island", () => {
+    // The expanded Island is capped at 160 points: there the buttons are 36 points and the command
+    // takes one line, so neither is clipped. The Lock Screen keeps 44 points and two lines.
+    const place = block(widgetSwift, /private enum Place/);
+    expect(place).toMatch(/var buttonHeight: CGFloat \{ self == \.island \? 36 : 44 \}/);
+    expect(place).toMatch(/var commandLines: Int \{ self == \.island \? 1 : 2 \}/);
     const actions = block(widgetSwift, /private struct Actions: View/);
-    expect([...actions.matchAll(/minHeight: 44\b/g)].length).toBe(2);
-    expect(block(actions, /Button\(intent: deny\)/)).toMatch(/minHeight: 44\b/);
-    expect(block(actions, /Link\(destination: shown\.allowURL\)/)).toMatch(/minHeight: 44\b/);
+    expect(actions).toMatch(/let place: Place/);
+    for (const label of [/Button\(intent: deny\)/, /Link\(destination: shown\.allowURL\)/]) {
+      const button = block(actions, label);
+      expect(button).toMatch(/\.frame\(maxWidth: \.infinity, minHeight: place\.buttonHeight\)/);
+      expect(button).toMatch(/\.contentShape\(Rectangle\(\)\)/);
+    }
+    expect(actions).not.toMatch(/minHeight: \d/);
+    expect(block(widgetSwift, /private struct Particulars: View/)).toMatch(/\.lineLimit\(place\.commandLines\)/);
+    // The Lock Screen draws them at .lockScreen; the Island's bottom region at .island.
+    const lock = block(widgetSwift, /private struct LockScreen: View/);
+    expect(lock).toMatch(/Actions\(shown: shown, place: \.lockScreen\)/);
+    expect(block(widgetSwift, /private struct Details: View/)).toMatch(/Particulars\(shown: shown, place: \.lockScreen\)/);
+    const bottom = block(widgetSwift, /DynamicIslandExpandedRegion\(\.bottom\)/);
+    expect(bottom).toMatch(/Particulars\(shown: shown, place: \.island\)/);
+    expect(bottom).toMatch(/Actions\(shown: shown, place: \.island\)/);
+    expect([...widgetSwift.matchAll(/Actions\(shown: shown, place: \.\w+\)/g)].length).toBe(2);
+    expect([...widgetSwift.matchAll(/Particulars\(shown: shown, place: \.\w+\)/g)].length).toBe(2);
   });
 });
