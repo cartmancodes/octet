@@ -554,6 +554,32 @@ describe("listed", () => {
   });
 });
 
+describe("current", () => {
+  it("holds a Mac only for a list heard over a ready link, since it was last ready", () => {
+    const current = () => store.getState().current.has(M);
+    applyM([sessions(info("a"))]);
+    expect(current()).toBe(false); // no link yet: a list, but not one heard while ready
+    store.getState().setHub(M, "ready");
+    expect(current()).toBe(false);
+    applyM([sessions(info("a"))]);
+    expect(current()).toBe(true);
+    // The app goes to the background: the list stays, but it is from before.
+    store.getState().setHub(M, "offline");
+    expect(current()).toBe(false);
+    expect(store.getState().listed.has(M)).toBe(true);
+    applyM([sessions(info("a"))]); // flushed as the link stopped
+    expect(current()).toBe(false);
+    store.getState().setHub(M, "ready");
+    expect(current()).toBe(false);
+    applyM([user("a", "x")]);
+    expect(current()).toBe(false); // only a list counts
+    applyM([sessions()]);
+    expect(current()).toBe(true);
+    store.getState().reset(M);
+    expect(current()).toBe(false);
+  });
+});
+
 describe("hasEnded", () => {
   it("is false before the Mac has listed: not told yet is not ended", () => {
     expect(hasEnded(store.getState(), k("a"))).toBe(false);

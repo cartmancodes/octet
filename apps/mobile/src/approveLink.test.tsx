@@ -284,6 +284,63 @@ describe("approve_link_never_allows_alone", () => {
     expect(rig.view.getPathname()).toBe("/");
   });
 
+  describe("back from the background, the list from before is not judged", () => {
+    /** The app goes away and comes back: a new socket opens, still to say welcome. */
+    async function away(rig: Rig) {
+      await act(async () => {
+        rig.hub.setForeground(false);
+        rig.hub.setForeground(true);
+      });
+      await act(async () => rig.sockets.last.open());
+    }
+    const relist = async (rig: Rig, list: SessionInfo[]) => {
+      await feed(rig, { type: "welcome", device: "iPhone" });
+      await feed(rig, { type: "sessions", sessions: list });
+    };
+
+    it("a link opened at once, for an approval answered while away, opens the Inbox once the fresh list comes", async () => {
+      const rig = await launch([waiting(S, 7)]);
+      await away(rig);
+      await open(link(HOST, S, 7));
+      expect(rig.view.getPathname()).toBe("/");
+      // The fresh list: 7 was answered at the desk, and 8 waits now.
+      await relist(rig, [waiting(S, 8)]);
+      await wait(10_000);
+      expect(rig.view.getPathname()).toBe("/");
+      expect(answers(rig)).toEqual([]);
+    });
+
+    it("a link opened once the link is ready again, before its list, waits for that list", async () => {
+      const rig = await launch([waiting(S, 7)]);
+      await away(rig);
+      await feed(rig, { type: "welcome", device: "iPhone" });
+      await open(link(HOST, S, 7));
+      expect(rig.view.getPathname()).toBe("/");
+      await feed(rig, { type: "sessions", sessions: [waiting(S, 8)] });
+      await wait(10_000);
+      expect(rig.view.getPathname()).toBe("/");
+    });
+
+    it("a link for the approval still waiting opens it once the fresh list comes", async () => {
+      const rig = await launch([waiting(S, 7)]);
+      await away(rig);
+      await open(link(HOST, S, 7));
+      expect(rig.view.getPathname()).toBe("/");
+      await relist(rig, [waiting(S, 7)]);
+      expect(rig.view.getPathname()).toBe(`/session/${k(S)}`);
+      expect(answers(rig)).toEqual([]);
+    });
+
+    it("with no fresh list within the wait, the Inbox, and nothing opens later", async () => {
+      const rig = await launch([waiting(S, 7)]);
+      await away(rig);
+      await open(link(HOST, S, 7));
+      await act(async () => rig.clock.advance(APPROVE_WAIT_MS + 1_000));
+      await relist(rig, [waiting(S, 7)]);
+      expect(rig.view.getPathname()).toBe("/");
+    });
+  });
+
   it("a Mac that never lists: the Inbox, and nothing opens later", async () => {
     const rig = await launch(null);
     await open(link(HOST, S, 3));

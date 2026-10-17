@@ -588,24 +588,26 @@ export class Fleet {
    * The key of the session whose approval an approve link (the Island's Allow) names, now: the
    * link's session on its Mac, by `keyFor`, only while that Mac lists it as live with that approval
    * at the front of its waiting ones; null for the Inbox; undefined while that
-   * Mac has not listed yet (see `approveKey`). Nothing is sent either way: the session's screen
-   * answers it, behind Face ID and the arm.
+   * Mac has not listed since its link was last ready (see `approveKey`): a list from before the
+   * app went to the background, or the link dropped, may hold an approval answered since, so it
+   * is not judged. Nothing is sent either way: the session's screen answers it, behind Face ID
+   * and the arm.
    */
   approveNow(link: ApproveLink): string | null | undefined {
     const key = this.keyFor(link.host, link.raw);
     const mac = key === null ? null : macOfKey(key);
     if (key === null || mac === null) return null;
     const state = this.store.getState();
+    if (!state.current.has(mac)) return undefined; // not told yet, or not since the link was back
     if (hasEnded(state, key)) return null;
-    if (!state.listed.has(mac)) return undefined; // not told yet
     const row = state.sessions.find((s) => s.id === key);
     // Only the session's front approval: that is the one its Permission card shows, so the screen
     // the link opens is the approval it names. One waiting behind it is the Inbox's.
     return row && row.approvals > 0 && row.approval?.id === link.approval ? key : null;
   }
 
-  /** `approveNow`, waiting for the Mac's list when it has not come yet, at most `APPROVE_WAIT_MS`
-   * (then null). */
+  /** `approveNow`, waiting for the Mac's list when it has not come since its link was last ready,
+   * at most `APPROVE_WAIT_MS` (then null). */
   approveKey(link: ApproveLink): Promise<string | null> {
     const now = this.approveNow(link);
     if (now !== undefined) return Promise.resolve(now);

@@ -714,7 +714,9 @@ revoke` and when you unpair that Mac in the app.
   nothing by itself. It opens the session only while the approval it names is the one at the front
   of that session's waiting approvals (the one its Permission card shows). A link for a Mac that
   isn't paired, a session that ended, an approval that was already answered or that waits behind
-  another, or one that is malformed, opens the Inbox and sends nothing.
+  another, or one that is malformed, opens the Inbox and sends nothing. It is judged by the Mac's
+  first list after the app comes back (or the link is up again), never the one from before, which
+  may hold an approval answered since; the Inbox shows while it waits, up to 8 seconds, then stays.
 
 **On the phone.** The widget shows a session's name (at most 80 characters) and the command it
 asks to run (at most 200) from the app's shared storage on the phone (the App Group

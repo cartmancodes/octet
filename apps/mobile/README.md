@@ -319,7 +319,9 @@ shows no switch for it.
   as anywhere else: the link alone never allows. It opens the session only while the approval is
   the session's front one, the one its Permission card shows. A malformed link, one for a Mac that
   isn't paired, a session that ended, an approval already answered or one waiting behind another
-  opens the Inbox and sends nothing.
+  opens the Inbox and sends nothing. It is judged by the Mac's first list after the app comes back
+  (or the link is up again), never the one held from before; the Inbox shows while it waits, up to
+  8 seconds, then stays.
 - **Two alerts for one approval** that starts the activity while you are away: the push notification
   and the activity's start alert (Apple requires one to start an activity by push).
 - **Turning it off** in **Settings › Live Activity** ends the activity, tells every Mac to forget

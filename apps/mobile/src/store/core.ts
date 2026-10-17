@@ -29,6 +29,10 @@ export interface OctetState {
   /** The Macs whose sessions frame came since the store began or was reset: until a Mac's comes,
    * its having no rows means "not told yet", not "none". */
   listed: ReadonlySet<string>;
+  /** The Macs whose sessions frame came while their link was ready, since it last became ready.
+   * A Mac's list from before (its link dropped, or the app was in the background) stays in
+   * `sessions` but is not current until the next one comes: an approve link waits for it. */
+  current: ReadonlySet<string>;
   /** Applies one Mac's frames, their sessions already keyed by it, in order, in one commit. Each
    * sessions frame is the Mac's whole list, so only the last in the batch is reconciled. Returns the sessions that just ended (they were listed before and are not now): their views
    * stay, marked `ended`, until the caller releases them. A frame naming another Mac's session
@@ -161,6 +165,7 @@ export function createOctetStore(): OctetStore {
     hubs: new Map(),
     tried: NO_TRIED,
     listed: NO_LISTED,
+    current: NO_LISTED,
     taskOpen: false,
     drafts: new Map(),
     sent: new Map(),
@@ -181,6 +186,7 @@ export function createOctetStore(): OctetStore {
           hubs: new Map(),
           tried: NO_TRIED,
           listed: NO_LISTED,
+          current: NO_LISTED,
           taskOpen: false,
           drafts: new Map(),
           sent: new Map(),
@@ -195,6 +201,7 @@ export function createOctetStore(): OctetStore {
       slices.delete(mac);
       const listed = new Set(st.listed);
       listed.delete(mac);
+      const current = st.current.has(mac) ? new Set([...st.current].filter((m) => m !== mac)) : st.current;
       const hubs = new Map(st.hubs);
       hubs.delete(mac);
       const tried = st.tried.has(mac) ? new Set([...st.tried].filter((m) => m !== mac)) : st.tried;
@@ -205,6 +212,7 @@ export function createOctetStore(): OctetStore {
         hubs,
         tried,
         listed,
+        current,
         drafts: without(st.drafts, mine),
         sent: without(st.sent, mine),
         answered: new Set([...st.answered].filter((id) => !mine(id))),
@@ -276,6 +284,7 @@ export function createOctetStore(): OctetStore {
       let slices = st.slices;
       let answered = st.answered;
       let listed = st.listed;
+      let current = st.current;
       let views: Map<string, SessionView> | null = null;
       const ended: (string[] | null)[] = [];
 
@@ -328,6 +337,8 @@ export function createOctetStore(): OctetStore {
           }
         }
         if (heard && !listed.has(mac)) listed = new Set(listed).add(mac);
+        // Only a list heard over a ready link is the Mac's now (one flushed as the link stopped is not).
+        if (heard && st.hubs.get(mac) === "ready" && !current.has(mac)) current = new Set(current).add(mac);
         // The first list of a Mac places it among the others, rows or none.
         if (rows !== before || (heard && !slices.has(mac))) slices = new Map(slices).set(mac, rows);
 
@@ -360,13 +371,13 @@ export function createOctetStore(): OctetStore {
       };
 
       for (const { mac, frames } of batches) {
-        const saved = { slices, answered, listed };
+        const saved = { slices, answered, listed, current };
         const changed = new Map<string, SessionView>();
         try {
           ended.push(step(mac, frames, changed));
         } catch (error) {
           // A fault in the store, not the Mac: this batch costs only itself.
-          ({ slices, answered, listed } = saved);
+          ({ slices, answered, listed, current } = saved);
           console.error(`octet: a batch of ${mac} could not be applied; it was left out`, error);
           ended.push(null);
           continue;
@@ -376,11 +387,12 @@ export function createOctetStore(): OctetStore {
           for (const [session, view] of changed) views.set(session, view);
         }
       }
-      if (views === null && slices === st.slices && listed === st.listed && answered === st.answered) return ended;
+      if (views === null && slices === st.slices && listed === st.listed && current === st.current && answered === st.answered) return ended;
       set({
         ...(slices !== st.slices ? { slices, sessions: merged(slices) } : {}),
         ...(views ? { bySession: views } : {}),
         ...(listed !== st.listed ? { listed } : {}),
+        ...(current !== st.current ? { current } : {}),
         ...(answered !== st.answered ? { answered } : {}),
       });
       return ended;
@@ -411,15 +423,18 @@ export function createOctetStore(): OctetStore {
         return;
       }
       const hubs = new Map(st.hubs).set(mac, hub);
+      // Whichever way the link went, the list held is from before it: current again only when
+      // the next list comes over a ready link.
+      const current = st.current.has(mac) ? new Set([...st.current].filter((m) => m !== mac)) : st.current;
       // A link ready again brings a fresh list, which is the truth: an answer the Mac never heard
       // (the link went down first) must not hide its question.
       if (hub !== "ready") {
-        set({ hubs, tried });
+        set({ hubs, tried, current });
         return;
       }
       const mine = ofMac(mac);
       const answered = [...st.answered].some(mine) ? new Set([...st.answered].filter((id) => !mine(id))) : st.answered;
-      set({ hubs, tried, answered: answered.size === 0 ? NO_ANSWERED : answered });
+      set({ hubs, tried, current, answered: answered.size === 0 ? NO_ANSWERED : answered });
     },
 
     evict(session) {
