@@ -97,12 +97,15 @@ The fake vendor and the protocol gate should record the exact shape of
 4. A clash is **the same model through different providers**. When there is
    one, the display adds the provider name in brackets.
 5. **`auto` means what it means for Claude and Codex: the vendor decides on
-   its own.** opencode has no AI reviewer, so in `auto` Octet applies no
-   permission override and no lockdown (`ask`/`accept-edits` lockdown below
-   does not apply): the user's own opencode configuration decides. The user
-   accepted that, with opencode's default configuration, this lets everything
-   through. The `/mode` description must say so plainly, for example "opencode's
-   own permission settings decide (its defaults ask for nothing)".
+   its own.** opencode has no AI reviewer, so in `auto` Octet sets no permission
+   rules: the session uses opencode's `build` agent, under the user's own global
+   opencode permission settings. The user accepted that, with opencode's default
+   configuration, this lets everything through. The `/mode` description must say
+   so plainly: "opencode's own permission settings decide (its defaults ask for
+   nothing)". *Amended 2026-10-21:* the launch-wide lockdown (no project config;
+   plugins only as `--no-plugins` allows) applies in every mode, `auto` included,
+   as Claude's `--setting-sources=` does. One process serves every mode once
+   switches are live (decision 9).
 6. **The bracket display** is as proposed (see decision 12 for the rule):
 
    ```
@@ -142,16 +145,23 @@ The fake vendor and the protocol gate should record the exact shape of
      `websearch`…);
    - plugins with permission hooks.
 
-   So the override uses a `"*": "ask"` wildcard (with `edit: "allow"` for
-   `accept-edits`), applies the same to every agent, and turns off whatever
-   project config, MCP and plugin loading opencode allows to be turned off.
+   So each Octet agent's permission block starts from a `"*": "ask"` wildcard
+   (with `edit: "allow"` for `accept-edits`), leaving read-only tools allowed.
+   The launch turns off project config (`OPENCODE_DISABLE_PROJECT_CONFIG`) and,
+   as `--no-plugins` says, plugins (`OPENCODE_PURE`). MCP tools fall under the
+   wildcard, so they ask too.
    `--no-plugins` maps to `--pure`. A gate scenario proves each of these
    cannot bypass `ask`. Anything opencode does not let Octet turn off is
    reported to the user, not silently accepted.
-9. **Mode switches reconnect.** opencode reads its permission settings at
-   launch, so `/mode` and Shift+Tab end the process and start a new one that
-   resumes the same session. The user sees a short pause, not an instant
-   switch. The `/mode` descriptions say so.
+9. **Mode switches are live** (amended 2026-10-21, after planning recon;
+   replaces "mode switches reconnect"). Octet defines three opencode agents in
+   `OPENCODE_CONFIG_CONTENT` (`octet-ask`, `octet-accept-edits`,
+   `octet-full-access`), each with its own permission block. ACP lists agents as
+   the session's `mode` option, so a switch is `session/set_config_option
+   {configId: "mode", value: <agent>}`, and opencode's reply confirms it. `auto`
+   is opencode's own `build` agent. Verified against opencode 1.18.25: after
+   switching to an `accept-edits`-style agent, a write went ahead and `echo ok`
+   asked.
 10. **What a model is to Octet.** `ModelInfo.selection` and `ModelInfo.id`
    are the full opencode value (`opencode/glm-5.3-flash-free`), and `name`
    is opencode's name. The model is set with `session/set_config_option` after
@@ -228,7 +238,7 @@ The fake vendor and the protocol gate should record the exact shape of
 
 - The fake vendor (`crates/octet-testkit/src/bin/protocol-child/`) learns
   enough ACP for the scenarios in the guide: connect, a turn, an approval
-  allowed, denied and timed out, a cancel, a mode switch (here a reconnect),
+  allowed, denied and timed out, a cancel, a live mode switch,
   and a vendor error. Add live tests in `crates/octet-engine/tests/live.rs`.
 - Unit tests for the clash display, and for the resolution of
   `opencode/X`, `openai/X`, `opencode openai/X` and a bare suffix.
@@ -245,8 +255,8 @@ The fake vendor and the protocol gate should record the exact shape of
 - The exact `session/request_permission` reply for allow and deny: which
   `optionId` (`once` versus `always`; Octet never picks "always"), read from
   the request's `options`.
-- How a resume after a mode switch is done (`session/resume` or
-  `session/load`), and what replayed history, if any, is ignored.
+- `session/resume` replays the old conversation as `session/update`s before
+  any turn: these are ignored (verified 2026-10-21).
 - Mapping `tool_call` kinds and titles to Octet's `ToolCall` name and
   target, and `usage_update` to `Event::Usage`.
 - Effort: whether opencode's `--variant` can reach an ACP session (the
