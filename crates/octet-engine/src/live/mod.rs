@@ -120,6 +120,9 @@ pub struct Provider {
     pub lists_models: bool,
     /// The vendor CLI's arguments for `config` (none for the demo).
     pub(crate) launch_args: fn(&Config) -> Vec<OsString>,
+    /// The environment variables the vendor CLI is launched with, on top of
+    /// the inherited ones (none for Codex, Claude and the demo).
+    pub(crate) launch_env: fn(&Config) -> Vec<(OsString, OsString)>,
     /// Runs one session until it stops.
     pub(crate) start: StartFn,
 }
@@ -148,17 +151,31 @@ pub fn launch_args(config: &Config) -> Vec<OsString> {
     (config.engine.provider().launch_args)(config)
 }
 
+/// The environment variables Octet launches `config`'s vendor CLI with, on
+/// top of the inherited ones; the driver and the protocol gate share it with
+/// [`launch_args`].
+pub fn launch_env(config: &Config) -> Vec<(OsString, OsString)> {
+    (config.engine.provider().launch_env)(config)
+}
+
+/// A provider that needs no environment variables of its own.
+pub(super) fn no_env(_: &Config) -> Vec<(OsString, OsString)> {
+    Vec::new()
+}
+
 /// How Octet runs `engine`'s CLI: its limits on frames, queued output and
 /// stderr, and its shutdown graces. The protocol gate uses the same.
 pub fn vendor_process(
     engine: Engine,
     executable: PathBuf,
     args: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
     cwd: PathBuf,
 ) -> ProcessConfig {
     ProcessConfig {
         executable,
         args,
+        env,
         cwd: Some(cwd),
         max_frame_bytes: 8 * 1024 * 1024,
         queue_bytes: 16 * 1024 * 1024,
@@ -1038,7 +1055,8 @@ mod tests {
     }
     #[test]
     fn claude_has_time_to_exit_on_its_own() {
-        let process = |engine| vendor_process(engine, "cli".into(), Vec::new(), ".".into());
+        let process =
+            |engine| vendor_process(engine, "cli".into(), Vec::new(), Vec::new(), ".".into());
         // Claude Code takes about 0.9 s to exit once its input closes.
         assert_eq!(
             process(Engine::CLAUDE).shutdown_grace,

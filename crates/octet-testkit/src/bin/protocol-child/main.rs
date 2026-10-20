@@ -37,6 +37,7 @@ fn main() {
             stdout.write_all(&vec![b'x'; 8192]).unwrap();
             stdout.write_all(b"\"}\n").unwrap();
         }
+        "env" => emit(&json!({"env": env::var("OCTET_TEST_ENV").ok()})),
         "malformed" => println!("{{invalid\n{{\"valid\":true}}"),
         "blank-lines" => print!("{{\"a\":1}}\n\n  \r\n{{\"b\":2}}\n"),
         "valid-then-invalid" => print!("{{\"a\":1}}\n{{\"b\":2}}\nnot json\n{{\"c\":3}}\n"),

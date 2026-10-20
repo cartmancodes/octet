@@ -36,6 +36,7 @@ pub(super) const PROVIDER: Provider = Provider {
     shutdown_grace: Duration::from_millis(150),
     lists_models: true,
     launch_args: <CodexProtocol as Protocol>::launch_args,
+    launch_env: super::no_env,
     start,
 };
 

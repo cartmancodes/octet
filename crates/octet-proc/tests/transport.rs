@@ -19,6 +19,7 @@ fn config(mode: &str) -> ProcessConfig {
     ProcessConfig {
         executable: child_binary(),
         args: vec![mode.into()],
+        env: Vec::new(),
         cwd: None,
         max_frame_bytes: 1024,
         queue_bytes: 2048,
@@ -26,6 +27,19 @@ fn config(mode: &str) -> ProcessConfig {
         shutdown_grace: Duration::from_millis(80),
         term_grace: Duration::from_millis(150),
     }
+}
+
+#[tokio::test]
+async fn child_receives_the_configured_environment() {
+    let mut process = Process::spawn(&ProcessConfig {
+        env: vec![("OCTET_TEST_ENV".into(), "set".into())],
+        ..config("env")
+    })
+    .unwrap();
+    assert_eq!(
+        next_within(&mut process).await.unwrap(),
+        Some(json!({"env":"set"}))
+    );
 }
 
 #[tokio::test]

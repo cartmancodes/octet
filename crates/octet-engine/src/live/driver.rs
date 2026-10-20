@@ -3,7 +3,7 @@
 //! approvals and commands, and calls the protocol for the rest.
 use super::{
     BUSY, Channels, Command, Config, DriverError, Engine, Event, FULL_ACCESS_RECONNECTS, HEADROOM,
-    ImageAttachment, Limits, Mode, NO_TURN, Outcome, TurnGate, deadline_after,
+    ImageAttachment, Limits, Mode, NO_TURN, Outcome, TurnGate, deadline_after, launch_env,
     protocol::{Core, Phase, Protocol},
     vendor_process,
 };
@@ -40,6 +40,7 @@ pub(super) async fn run<P: Protocol>(
         engine,
         config.binary.clone(),
         P::launch_args(&config),
+        launch_env(&config),
         config.cwd.clone(),
     ))
     .map_err(|e| format!("Cannot start {engine}: {e}. Install the CLI and sign in first."))?;

@@ -39,6 +39,7 @@ pub(super) const PROVIDER: Provider = Provider {
     shutdown_grace: Duration::from_millis(1500),
     lists_models: true,
     launch_args: <ClaudeProtocol as Protocol>::launch_args,
+    launch_env: super::no_env,
     start,
 };
 

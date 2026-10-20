@@ -28,6 +28,8 @@ pub struct ProcessConfig {
     pub executable: PathBuf,
     /// Its arguments.
     pub args: Vec<OsString>,
+    /// Extra environment variables for the child, on top of the inherited ones.
+    pub env: Vec<(OsString, OsString)>,
     /// Its working directory; `None` keeps the caller's.
     pub cwd: Option<PathBuf>,
     /// Maximum number of bytes in one JSON payload, excluding LF.
@@ -217,6 +219,7 @@ impl Process {
         }
         let mut command = Command::new(&config.executable);
         command.args(&config.args);
+        command.envs(config.env.iter().map(|(key, value)| (key, value)));
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }

@@ -103,11 +103,12 @@ impl GateProcess {
         engine: octet_engine::live::Engine,
         executable: PathBuf,
         args: Vec<OsString>,
+        env: Vec<(OsString, OsString)>,
         cwd: PathBuf,
         deadline: Instant,
     ) -> Result<Self, GateError> {
         let process = Process::spawn(&octet_engine::live::vendor_process(
-            engine, executable, args, cwd,
+            engine, executable, args, env, cwd,
         ))?;
         let sender = process.sender();
         Ok(Self {

@@ -26,6 +26,7 @@ pub(super) const PROVIDER: Provider = Provider {
     shutdown_grace: Duration::ZERO,
     lists_models: false,
     launch_args: |_| Vec::new(),
+    launch_env: super::no_env,
     start,
 };
 

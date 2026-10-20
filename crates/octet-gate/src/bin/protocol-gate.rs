@@ -3,7 +3,9 @@
 //! does (`octet_engine::live::launch_args`), adding only what a scenario
 //! needs, so it checks the contract Octet ships.
 #![forbid(unsafe_code)]
-use octet_engine::live::{Config, Engine, claude_stray_reply, codex_stray_reply, launch_args};
+use octet_engine::live::{
+    Config, Engine, claude_stray_reply, codex_stray_reply, launch_args, launch_env,
+};
 use octet_gate::{
     Evidence, GateError, GateProcess, claude_fixture_allow, claude_fixture_hook_response,
     claude_fixture_mcp_response, claude_fixture_mcp_tool_allow, codex_fixture_allow,
@@ -144,15 +146,21 @@ async fn version(binary: &Path) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// Octet's own arguments for this engine, plus what the scenario needs:
-/// Claude's tool list and, for `mcp`, the fixture server.
-fn vendor_args(opt: &Opt, cwd: &Path, resume: Option<&str>) -> Vec<OsString> {
+/// Octet's own arguments and environment for this engine, plus what the
+/// scenario needs in the arguments: Claude's tool list and, for `mcp`, the
+/// fixture server.
+fn vendor_launch(
+    opt: &Opt,
+    cwd: &Path,
+    resume: Option<&str>,
+) -> (Vec<OsString>, Vec<(OsString, OsString)>) {
     let mut config = Config::new(opt.engine, &opt.binary, cwd);
     if let Some(session) = resume {
         config.resume = Some(session.to_owned());
         config.fork = opt.scenario == "fork";
     }
     let mut args = launch_args(&config);
+    let env = launch_env(&config);
     if opt.engine == Engine::CLAUDE {
         let tools = match opt.scenario.as_str() {
             s if s.starts_with("approval-") => "Bash",
@@ -168,7 +176,7 @@ fn vendor_args(opt: &Opt, cwd: &Path, resume: Option<&str>) -> Vec<OsString> {
             ]);
         }
     }
-    args
+    (args, env)
 }
 
 /// Answers a request the scenario does not handle, as Octet would.
@@ -726,10 +734,12 @@ async fn claude_request(
 /// Runs the scenario once, and for Claude's `resume` and `fork` again in a
 /// second process. The status, the evidence and whether every child stopped.
 async fn run_scenario(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evidence, bool) {
+    let (args, env) = vendor_launch(opt, cwd, None);
     let mut gate = match GateProcess::spawn(
         opt.engine,
         opt.binary.clone(),
-        vendor_args(opt, cwd, None),
+        args,
+        env,
         cwd.to_owned(),
         deadline,
     ) {
@@ -758,10 +768,12 @@ async fn run_scenario(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evid
     let Some(first) = evidence.session_id.clone() else {
         return ("failed: first session id missing".into(), evidence, cleaned);
     };
+    let (args, env) = vendor_launch(opt, cwd, Some(&first));
     let mut second = match GateProcess::spawn(
         opt.engine,
         opt.binary.clone(),
-        vendor_args(opt, cwd, Some(&first)),
+        args,
+        env,
         cwd.to_owned(),
         deadline,
     ) {
