@@ -3696,12 +3696,9 @@ async fn opencode_probe_settles_for_the_models_when_no_commands_come() {
         started.elapsed()
     );
 }
-#[tokio::test]
-async fn opencode_probe_that_gives_up_still_deletes_its_session() {
-    let (dir, config) = opencode_without_commands();
-    // The probe gives up before its two-second wait for the commands ends.
-    let error = probe(config, Duration::from_secs(1)).await.unwrap_err();
-    assert_eq!(error, "opencode did not list its models within 1 s");
+/// Waits up to five seconds for the probe vendor in `dir` to have been
+/// asked to delete session `s1`.
+async fn probe_session_deleted(dir: &octet_testkit::TempDir) {
     let marker = dir.path().join("deleted-s1");
     timeout(Duration::from_secs(5), async {
         while !marker.exists() {
@@ -3710,6 +3707,44 @@ async fn opencode_probe_that_gives_up_still_deletes_its_session() {
     })
     .await
     .expect("the probe's session was not deleted");
+}
+#[tokio::test]
+async fn opencode_probe_that_gives_up_still_deletes_its_session() {
+    let (dir, config) = opencode_without_commands();
+    // Run the new script once first: its first start can take seconds
+    // while macOS scans it, and the probe must have opened its session
+    // before it gives up.
+    let warm = std::process::Command::new(&config.binary)
+        .args(["session", "delete", "warm"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(warm.success());
+    // The probe gives up shortly before its two-second wait for the
+    // commands would end; the session opened well before that.
+    let error = probe(config, Duration::from_millis(1900))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "opencode did not list its models within 1 s");
+    probe_session_deleted(&dir).await;
+}
+#[tokio::test]
+async fn opencode_probe_that_fails_still_deletes_its_session() {
+    use serde_json::json;
+    // opencode opens the session, then exits before listing anything.
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
+    ];
+    let mut body = String::from("if [ \"$1\" = session ]; then touch \"deleted-$3\"; exit 0; fi\n");
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    let (dir, vendor) = script_vendor("octet-live-opencode-probe-fails", &body);
+    let config = Config::new(Engine::OPENCODE, vendor, dir.path());
+    let error = probe(config, PROBE_LIMIT).await.unwrap_err();
+    assert!(error.starts_with("Vendor disconnected"), "{error}");
+    probe_session_deleted(&dir).await;
 }
 #[tokio::test]
 async fn opencode_compact_without_the_command_fails_the_turn() {
