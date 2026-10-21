@@ -2464,37 +2464,80 @@ async fn opencode_handshake_out_of_order_is_an_error() {
     }
     ended(task).await;
 }
-#[tokio::test]
-async fn opencode_agent_refused_at_connect_shows_the_agent_it_kept() {
-    // opencode opens the session in `build` and refuses `octet-ask`: the
-    // header must not claim `ask`.
-    let (_dir, vendor) = script_vendor(
-        "octet-live-opencode-agent-refused",
-        "read line\n\
-         echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n\
-         read line\n\
-         echo '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"s1\",\"configOptions\":[{\"id\":\"mode\",\"currentValue\":\"build\"}]}}'\n\
-         read line\n\
-         echo '{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32602,\"message\":\"unknown agent\"}}'\n\
-         exec sleep 30\n",
-    );
-    let (handle, mut events, task) =
+/// What an `ask` session stops with when opencode opens it with the mode
+/// option `opened` and answers the handshake's agent switch with `reply`
+/// (the reply's `result` or `error` member). The header must never have
+/// claimed `ask` first.
+async fn opencode_agent_refusal(opened: serde_json::Value, reply: serde_json::Value) -> String {
+    use serde_json::json;
+    let mut third = json!({"jsonrpc": "2.0", "id": 3});
+    third
+        .as_object_mut()
+        .unwrap()
+        .extend(reply.as_object().unwrap().clone());
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": [opened]}}),
+        third,
+    ];
+    let mut body = String::new();
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    body.push_str("exec sleep 30\n");
+    let (_dir, vendor) = script_vendor("octet-live-opencode-agent-refused", &body);
+    let (_handle, mut events, task) =
         spawn(Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()));
-    let mut notices = Vec::new();
-    let mode = loop {
+    let error = loop {
         match next(&mut events).await {
-            Event::Notice(notice) => notices.push(notice),
-            Event::ModeChanged(mode) => break mode,
-            Event::Error(error) => panic!("{error}"),
+            Event::Error(error) => break error,
+            Event::ModeChanged(Mode::Ask) => panic!("the header claimed ask"),
+            Event::Stopped => panic!("stopped without an error"),
             _ => {}
         }
     };
-    assert_eq!(mode, Mode::Auto, "{notices:?}");
-    assert!(
-        notices
-            .iter()
-            .any(|n| n == "opencode did not switch to ask: unknown agent"),
-        "{notices:?}"
+    ended(task).await;
+    error
+}
+/// The error that stops a session whose agent opencode would not switch to.
+fn agent_refused(reason: &str) -> String {
+    format!(
+        "opencode would not switch to agent octet-ask ({reason}); Octet stopped the session so opencode never acts outside the mode you chose"
+    )
+}
+#[tokio::test]
+async fn opencode_refused_agent_stops_the_session_though_build_is_kept() {
+    let opened = serde_json::json!({"id": "mode", "currentValue": "build"});
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    assert_eq!(
+        opencode_agent_refusal(opened, refused).await,
+        agent_refused("unknown agent")
     );
-    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_refused_agent_stops_the_session_when_no_agent_was_reported() {
+    let opened = serde_json::json!({"id": "model", "currentValue": "a/b"});
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    assert_eq!(
+        opencode_agent_refusal(opened, refused).await,
+        agent_refused("unknown agent")
+    );
+}
+#[tokio::test]
+async fn opencode_refused_agent_stops_the_session_when_an_unmapped_agent_is_kept() {
+    let opened = serde_json::json!({"id": "mode", "currentValue": "plan"});
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    assert_eq!(
+        opencode_agent_refusal(opened, refused).await,
+        agent_refused("unknown agent")
+    );
+}
+#[tokio::test]
+async fn opencode_switch_reporting_another_agent_stops_the_session() {
+    let opened = serde_json::json!({"id": "mode", "currentValue": "build"});
+    let other = serde_json::json!({"result": {"configOptions": [opened.clone()]}});
+    assert_eq!(
+        opencode_agent_refusal(opened, other).await,
+        agent_refused("opencode reported agent build instead of octet-ask")
+    );
 }

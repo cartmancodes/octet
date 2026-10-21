@@ -377,25 +377,36 @@ impl OpencodeProtocol {
     }
 
     /// The agent's reply ends the handshake: ready, with the model and the
-    /// mode opencode reports. When opencode refused the agent, the mode is
-    /// the agent the session already had, so the header never shows a
-    /// stricter mode than opencode is in.
+    /// mode. An agent opencode refuses, or a reply naming another agent,
+    /// stops the session: whatever agent it kept may ask for less than the
+    /// mode the user chose, so it must never act under it.
     fn mode_set(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
-        if let Some(error) = v.get("error") {
-            core.emit(Event::Notice(format!(
-                "opencode did not switch to {}: {}",
-                target.label(),
-                error_text(error)
-            )))?;
-        } else {
-            // A reply without the options still confirms the request.
-            self.agent = Some(agent(target).to_owned());
-            self.note_options(&v["result"]["configOptions"]);
-        }
         // Live switches, which reply once the session is ready, are not sent yet.
         if core.phase.is_ready() {
             return Ok(());
         }
+        let wanted = agent(target);
+        let refusal = if let Some(error) = v.get("error") {
+            Some(error_text(error))
+        } else {
+            let options = &v["result"]["configOptions"];
+            self.note_options(options);
+            // A reply without the options still confirms the request.
+            let reported = &option(options, "mode")["currentValue"];
+            (!reported.is_null() && reported.as_str() != Some(wanted)).then(|| {
+                let shown = reported
+                    .as_str()
+                    .map_or_else(|| short(&reported.to_string()), short);
+                format!("opencode reported agent {shown} instead of {wanted}")
+            })
+        };
+        if let Some(reason) = refusal {
+            return Err(format!(
+                "opencode would not switch to agent {wanted} ({reason}); Octet stopped the session so opencode never acts outside the mode you chose"
+            )
+            .into());
+        }
+        self.agent = Some(wanted.to_owned());
         core.phase = Phase::Idle;
         core.emit(Event::Ready {
             session: core.session.clone(),
@@ -403,11 +414,7 @@ impl OpencodeProtocol {
         if let Some(model) = &self.model {
             core.emit(Event::ModelSelected(model.clone()))?;
         }
-        let reported = self
-            .agent
-            .as_deref()
-            .map(|agent| (mode_of(agent), limited(agent)));
-        core.adopt_mode(reported)
+        core.adopt_mode(Some((mode_of(wanted), wanted.to_owned())))
     }
 
     /// Records the model and agent `config_options` reports as current.
