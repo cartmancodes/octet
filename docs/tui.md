@@ -1,7 +1,7 @@
 # Octet terminal UI
 
-A native terminal application now runs against the official Codex and Claude
-CLIs. The harness uses Rust only: no browser, HTTP server or Python runtime.
+A native terminal application now runs against the official Codex, Claude and
+opencode CLIs. The harness uses Rust only: no browser, HTTP server or Python runtime.
 This is an interactive vertical slice, not the completed feature-parity release.
 
 ## Run
@@ -13,6 +13,7 @@ make rust-build
 ./target/release/octet --engine demo
 ./target/release/octet --engine codex --cwd /path/to/project
 ./target/release/octet --engine claude --cwd /path/to/project
+./target/release/octet --engine opencode --cwd /path/to/project
 ```
 
 `make tui-demo` builds and opens the offline demo. `make tui` opens Codex.
@@ -246,7 +247,8 @@ turn running, `/steer` sends the text as a prompt.
 `/effort` alone shows it and `/effort default` returns to the vendor's
 default. Claude takes `low`, `medium`, `high`, `xhigh` and `max`, and Octet
 refuses other levels for it. Codex's levels depend on the model, so any
-word is passed on and Codex decides. A `/model` switch to a provider that
+word is passed on and Codex decides. opencode has no effort setting, so
+`/effort` says so and changes nothing. A `/model` switch to a provider that
 does not take the level falls back to its default, with a notice.
 Codex takes it with each turn, so a change applies from the next turn.
 Claude takes it at launch, so a change reconnects to the same session. The
@@ -307,12 +309,12 @@ is `ask`; the mode is not remembered between launches but is kept across
 provider. The header shows the selected mode; during a Codex turn it also
 shows the running mode when a change is waiting for the next turn.
 
-| Mode | Claude | Codex (sandbox · approval · reviewer) |
-| --- | --- | --- |
-| `ask` | `default` | workspace-write · untrusted · user |
-| `accept-edits` | `acceptEdits` | workspace-write · on-request · user |
-| `auto` | `auto` (Claude's classifier) | workspace-write · on-request · `auto_review` |
-| `full-access` | `bypassPermissions` | danger-full-access · never · user |
+| Mode | Claude | Codex (sandbox · approval · reviewer) | opencode (agent) |
+| --- | --- | --- | --- |
+| `ask` | `default` | workspace-write · untrusted · user | `octet-ask` |
+| `accept-edits` | `acceptEdits` | workspace-write · on-request · user | `octet-accept-edits` |
+| `auto` | `auto` (Claude's classifier) | workspace-write · on-request · `auto_review` | `build` (opencode's own permission settings) |
+| `full-access` | `bypassPermissions` | danger-full-access · never · user | `octet-full-access` |
 
 `auto` hands approval decisions to the vendor's own reviewer; Octet never
 answers a vendor approval by itself. Codex has no edits-only mode, so

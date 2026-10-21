@@ -41,6 +41,7 @@ pub(super) const PROVIDER: Provider = Provider {
     shutdown_grace: Duration::from_millis(150),
     lists_models: false,            // true if the CLI can list its models without opening a session
     launch_args: <GeminiProtocol as Protocol>::launch_args, // shared with the protocol gate
+    launch_env: super::no_env,      // extra env vars for the CLI, on top of the inherited ones
     start,
 };
 
@@ -51,6 +52,15 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
 
 Write `start` for the concrete type, as shown. That lets the compiler prove
 the session can move between threads.
+
+Three fields change how the rest of Octet treats the vendor.
+`takes_effort: false` makes `/effort` say the vendor takes no level and change
+nothing (opencode has none). `ids_carry_name: true` is for a vendor whose model
+IDs are `provider/model` and can start with the vendor's own name (opencode
+has an `opencode` provider): `/model opencode/big-pickle` keeps
+`opencode/big-pickle` whole as the model, where other vendors have the leading
+`NAME/` stripped as Octet's own prefix. `launch_env` is the environment the CLI
+starts with on top of the inherited one (see the table below).
 
 **The protocol and its state.** Keep only this vendor's state here; the
 shared state is in `Core`.
@@ -79,8 +89,8 @@ format, built on `model_catalog_with`.
 ### 2. Add the row to the table
 
 ```rust
-pub const ALL: &'static [Engine] = &[Engine::CODEX, Engine::CLAUDE, Engine::DEMO,
-    Engine(&gemini::PROVIDER)];
+pub const ALL: &'static [Engine] = &[Engine::CODEX, Engine::CLAUDE, Engine::OPENCODE,
+    Engine::DEMO, Engine(&gemini::PROVIDER)];
 ```
 
 `ALL` lives in the same module as `Engine`, so it can build the row
@@ -115,6 +125,7 @@ scenarios are per vendor.
 | `launch_args` | The CLI's arguments for `config`: model, resume ID, the permission mode at launch. |
 | `initialize` | Send the handshake. When its reply arrives (in `on_frame`): set `core.phase = Phase::Idle`, emit `Event::Ready` with the session ID, and pass the mode the vendor reports to `core.adopt_mode`, which notes a mismatch and emits `Event::ModeChanged`. A two-step handshake passes through `Phase::Handshaken`. **Only move the phase forward**: ignore a repeated reply, and treat a step that arrives early as a protocol error, as Codex and Claude do. |
 | `launch_args` (more) | Also: `config.effort` when the vendor takes effort at launch, and `config.fork` (open `resume` as a new session). |
+| `launch_env` (the row's function, not a method) | The environment variables the CLI starts with, on top of the inherited ones. `super::no_env` for a vendor that needs none; opencode passes its agents and permission rules this way (`OPENCODE_CONFIG_CONTENT`). The driver and the protocol gate both call it, so the gate checks what ships. |
 | `send_prompt` | Send the user's text, then its images (`ImageAttachment`: path, media type, name; `read_base64` reads the bytes). The driver has already set `Phase::InTurn` and emitted `User` and `Started`. If an image cannot be read, fail the turn with `core.finish_turn(Outcome::Failed, Some(message))`. |
 | `compact` | Ask the vendor to compact its context, as a turn: the driver has set `Phase::InTurn` and emitted `User("/compact")` and `Started`. |
 | `steer` | Add text to the running turn; `Ok(false)` (the default) means the vendor cannot, and the interface queues the text instead. Set the row's `steer` to match. |

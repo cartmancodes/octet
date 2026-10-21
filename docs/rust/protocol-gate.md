@@ -1,9 +1,9 @@
 # The protocol gate
 
-`protocol-gate` runs one scenario against a real vendor CLI (`claude` or
-`codex`) and prints what happened as JSON evidence. It is how Octet checks
-that a vendor's wire protocol still behaves the way the drivers expect,
-before a CLI update reaches users. It launches the CLI with Octet's own
+`protocol-gate` runs one scenario against a real vendor CLI (`claude`,
+`codex` or `opencode`) and prints what happened as JSON evidence. It is how
+Octet checks that a vendor's wire protocol still behaves the way the drivers
+expect, before a CLI update reaches users. It launches the CLI with Octet's own
 arguments and process limits (`octet_engine::live::launch_args` and
 `vendor_process`), adding only what a scenario needs (Claude's `--tools`,
 and the fixture MCP server), so it checks the contract Octet ships.
@@ -34,22 +34,23 @@ scripts/rust-env.sh cargo run --locked -p octet-gate --bin protocol-gate -- \
 
 ## Scenarios
 
-| Scenario | Checks | Claude | Codex |
-| --- | --- | --- | --- |
-| `initialize` | The handshake | yes | yes |
-| `simple` | One turn to completion | yes | yes |
-| `interrupt` | Cancelling a running turn | yes | yes |
-| `approval-allow` | An approval allowed; the fixture file is written | yes | yes |
-| `approval-deny` | An approval denied | yes | yes |
-| `approval-interrupt` | Cancelling while an approval waits | yes | yes |
-| `resume` | Reopening a session | yes | yes |
-| `fork` | Forking a session | yes | yes |
-| `compact` | Compacting a session's context | yes | yes |
-| `mcp` | An MCP tool call | yes | no |
-| `hook` | A hook callback | yes | no |
-| `user-input` | A request for user input | no | yes |
-| `tool-only` | A turn that only runs a tool | no | yes |
-| `failure` | A turn the vendor fails | no | yes |
+| Scenario | Checks | Claude | Codex | opencode |
+| --- | --- | --- | --- | --- |
+| `initialize` | The handshake | yes | yes | yes |
+| `simple` | One turn to completion | yes | yes | yes |
+| `interrupt` | Cancelling a running turn | yes | yes | yes |
+| `approval-allow` | An approval allowed; the fixture file is written | yes | yes | yes |
+| `approval-deny` | An approval denied | yes | yes | yes |
+| `approval-interrupt` | Cancelling while an approval waits | yes | yes | no |
+| `resume` | Reopening a session | yes | yes | yes |
+| `fork` | Forking a session | yes | yes | yes |
+| `compact` | Compacting a session's context | yes | yes | no |
+| `mcp` | An MCP tool call | yes | no | no |
+| `hook` | A hook callback | yes | no | no |
+| `user-input` | A request for user input | no | yes | no |
+| `tool-only` | A turn that only runs a tool | no | yes | no |
+| `failure` | A turn the vendor fails | no | yes | no |
+| `lockdown` | A project config and a user rule cannot bypass `ask` | no | no | yes |
 
 ## Result
 
