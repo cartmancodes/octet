@@ -131,6 +131,12 @@ fn claude_checks_result_and_accepts_terminal_before_interrupt_ack() {
     );
 }
 
+/// How long a `probe_in` run may take. Its scripts end the scenario
+/// themselves (a pass, or a failure the gate detects on the wire), so the
+/// budget is only a backstop: generous, so a slow launch on a loaded machine
+/// is never reported as "deadline exceeded" instead of the real outcome.
+const PROBE_IN_SECONDS: &str = "60";
+
 /// Runs the gate against `frames` with its temporary workspace under `tmp`;
 /// the gate's exit code and its parsed evidence, if it printed any.
 fn probe_in(
@@ -143,7 +149,7 @@ fn probe_in(
     let output = Command::new(env!("CARGO_BIN_EXE_protocol-gate"))
         .args(["--engine", engine, "--scenario", scenario, "--binary"])
         .arg(&executable)
-        .args(["--timeout", "5"])
+        .args(["--timeout", PROBE_IN_SECONDS])
         .env("TMPDIR", tmp)
         .output()
         .unwrap();
