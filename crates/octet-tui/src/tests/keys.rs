@@ -1263,3 +1263,37 @@ async fn tab_on_a_name_two_providers_list_shows_the_bracketed_row() {
     key_action(&mut app, &vendor, key(KeyCode::Char(' '))).await;
     assert!(app.composer.completion.is_none());
 }
+#[tokio::test]
+async fn a_tab_line_in_the_provider_form_never_names_the_provider_twice() {
+    // Codex and opencode both list shared-x, so the name alone is
+    // ambiguous from Claude; the draft already names Codex.
+    let mut app = crate::test_support::app_for(Engine::CLAUDE);
+    crate::test_support::idle(&mut app);
+    let m = |s: &str| octet_core::ModelInfo {
+        selection: s.into(),
+        id: Some(s.into()),
+        name: s.into(),
+        description: String::new(),
+    };
+    app.event(octet_core::Event::Models(vec![m("opus")]));
+    let now = std::time::SystemTime::now();
+    app.models
+        .catalogs
+        .set(Engine::CODEX, vec![m("shared-x"), m("shared-y")], now);
+    app.models
+        .catalogs
+        .set(Engine::OPENCODE, vec![m("shared-x")], now);
+    let vendor = RecordingVendor::default();
+    app.insert_or_warn("/model codex shared-");
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    assert_eq!(
+        app.composer
+            .completion
+            .as_ref()
+            .expect("Tab offers names")
+            .items,
+        ["shared-x (codex)", "shared-y · codex"]
+    );
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    assert_eq!(app.composer.editor.text(), "/model codex shared-x ");
+}

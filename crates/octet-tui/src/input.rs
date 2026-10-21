@@ -349,10 +349,17 @@ pub(crate) fn accept_completion(app: &mut App) {
 }
 /// What Tab puts in the draft for a model line (`name · provider …` or the
 /// clash form `name (provider)`): the name, or `provider name` when the name
-/// alone would go to another provider.
+/// alone would go to another provider, unless the draft already names the
+/// provider (`/model PROVIDER <word>`).
 fn model_text(app: &App, item: &str) -> String {
     let (name, line_provider) = crate::clash::row_route(item);
-    let line_provider = line_provider.filter(|engine| engine.is_vendor());
+    let named = composer::provider_argument_query(
+        app.composer.editor.text(),
+        app.composer.editor.cursor(),
+        "/model",
+    )
+    .is_some();
+    let line_provider = line_provider.filter(|engine| engine.is_vendor() && !named);
     let resolves_there = |provider| {
         octet_core::model::Selection::resolve(name, app.conn.engine, &app.models.catalogs)
             .is_ok_and(|resolved| resolved.selection.provider == provider)
