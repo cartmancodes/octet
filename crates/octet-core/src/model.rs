@@ -178,7 +178,13 @@ impl Selection {
         } else if let suffixed @ [_, ..] = suffixed.as_slice() {
             let mut owners: Vec<Engine> = suffixed.iter().map(|(engine, _)| *engine).collect();
             owners.dedup();
-            return Err(ambiguous(bare, &owners));
+            // `/model <provider> NAME` cannot pick between two IDs in one
+            // list: name the IDs to type instead.
+            return Err(if owners.len() < suffixed.len() {
+                ambiguous_ids(bare, suffixed)
+            } else {
+                ambiguous(bare, &owners)
+            });
         } else {
             (current, Found::Current)
         };
@@ -200,6 +206,32 @@ fn ambiguous(name: &str, owners: &[Engine]) -> SelectionError {
             .map(|engine| engine.as_str())
             .collect::<Vec<_>>()
             .join(" and "),
+    }
+}
+
+/// The refusal for a name that is the `sub/NAME` of several IDs, some in
+/// the same provider's list: each list's IDs, grouped as `suffixed` is
+/// (by provider), and the first ID as the one to type.
+fn ambiguous_ids(name: &str, suffixed: &[(Engine, String)]) -> SelectionError {
+    let mut groups: Vec<(Engine, Vec<&str>)> = Vec::new();
+    for (engine, id) in suffixed {
+        match groups.last_mut() {
+            Some((last, ids)) if last == engine => ids.push(id),
+            _ => groups.push((*engine, vec![id])),
+        }
+    }
+    let listed = groups
+        .iter()
+        .map(|(engine, ids)| format!("{engine}'s list as {}", ids.join(" and ")))
+        .collect::<Vec<_>>()
+        .join(", and in ");
+    SelectionError::AmbiguousIds {
+        name: name.to_owned(),
+        listed,
+        first: suffixed
+            .first()
+            .map(|(_, id)| id.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -632,6 +664,43 @@ mod tests {
                 name: "shared-fixture".into(),
                 providers: "codex and opencode".into(),
             })
+        );
+    }
+
+    #[test]
+    fn several_ids_in_one_list_are_named_in_full() {
+        let mut catalogs = with_opencode(&["opencode/gpt-5-nano", "openai/gpt-5-nano"]);
+        // No Codex list to claim the `gpt` prefix.
+        catalogs.set(Engine::CODEX, Vec::new(), std::time::SystemTime::now());
+        for current in [Engine::CLAUDE, Engine::OPENCODE] {
+            let error = Selection::resolve("gpt-5-nano", current, &catalogs).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "gpt-5-nano is in opencode's list as opencode/gpt-5-nano and openai/gpt-5-nano; \
+                 choose one: /model opencode/gpt-5-nano",
+                "from {current}"
+            );
+        }
+        // What the hint says to type resolves, and so does the other ID.
+        for id in ["opencode/gpt-5-nano", "openai/gpt-5-nano"] {
+            let r = Selection::resolve(id, Engine::CLAUDE, &catalogs).unwrap();
+            assert_eq!(r.selection.provider, Engine::OPENCODE, "{id}");
+            assert_eq!(r.selection.model.as_deref(), Some(id));
+        }
+        // Across providers, each list's IDs are named.
+        let model = crate::ModelInfo {
+            selection: "vendor/gpt-5-nano".into(),
+            id: None,
+            name: String::new(),
+            description: String::new(),
+        };
+        catalogs.set(Engine::CODEX, vec![model], std::time::SystemTime::now());
+        assert_eq!(
+            Selection::resolve("gpt-5-nano", Engine::CLAUDE, &catalogs)
+                .unwrap_err()
+                .to_string(),
+            "gpt-5-nano is in codex's list as vendor/gpt-5-nano, and in opencode's list as \
+             opencode/gpt-5-nano and openai/gpt-5-nano; choose one: /model vendor/gpt-5-nano"
         );
     }
 

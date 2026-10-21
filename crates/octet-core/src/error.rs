@@ -81,6 +81,18 @@ pub enum SelectionError {
         /// The providers listing it, "claude and codex".
         providers: String,
     },
+    /// The name is the last part of several listed IDs, more than one of
+    /// them in the same provider's list, so naming the provider does not
+    /// choose; the full ID does.
+    #[error("{name} is in {listed}; choose one: /model {first}")]
+    AmbiguousIds {
+        /// The model name.
+        name: String,
+        /// Where it is listed: "opencode's list as opencode/x and openai/x".
+        listed: String,
+        /// The first of those IDs, as an example to type.
+        first: String,
+    },
 }
 
 /// A session's journal could not be started.
