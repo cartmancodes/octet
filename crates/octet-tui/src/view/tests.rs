@@ -370,6 +370,27 @@ fn opencode_switch_sent_mid_turn_waits_for_the_next_turn() {
 }
 
 #[test]
+fn a_late_confirmation_does_not_reuse_an_answered_switchs_turn_state() {
+    use octet_core::{Engine, Mode};
+    let vendor = crate::vendor::RecordingVendor::default();
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    // Switch A is reported unconfirmed: the header goes back to ask, and
+    // what was recorded for A is spent.
+    crate::commands::switch_mode(&mut app, &vendor, Mode::AcceptEdits);
+    app.event(Event::ModeChanged(Mode::Ask));
+    assert_eq!(app.conn.mode_sent_mid_turn, None);
+    // Switch B is sent while idle, and a prompt follows it.
+    crate::commands::switch_mode(&mut app, &vendor, Mode::Auto);
+    app.conn.start_turn();
+    // A's late confirmation arrives: no "next turn" display.
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+    assert_eq!(app.conn.mode_for_turn, None);
+    assert_eq!(app.conn.mode_sent_mid_turn, None);
+}
+
+#[test]
 fn every_provider_says_whether_a_mode_waits_for_the_next_turn() {
     use octet_core::Engine;
     let next_turn = |engine: Engine| engine.provider().mode_applies_next_turn;
