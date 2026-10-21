@@ -384,7 +384,9 @@ pub struct Listing {
 
 /// What Octet says when a provider whose mode applies from the next turn
 /// confirms a switch while a turn runs.
-pub(super) const MODE_NEXT_TURN_NOTICE: &str = "Mode applies from the next turn. The running turn and steering keep their previous permissions; wait for it to finish, or interrupt it and send a new prompt";
+pub(super) const MODE_NEXT_TURN_NOTICE: &str = "Mode applies from the next turn. \
+    The running turn and steering keep their previous permissions; \
+    wait for it to finish, or interrupt it and send a new prompt";
 
 /// The most skills one list keeps, live or cached.
 pub const MAX_SKILLS: usize = 512;
@@ -1280,6 +1282,13 @@ mod tests {
         binaries.insert(Engine::CODEX, "a");
         assert_eq!(binaries.get(&copy), Some(&"a"));
         assert_eq!(format!("{:?}", Engine::CLAUDE), "claude");
+    }
+    #[test]
+    fn the_next_turn_mode_notice_reads_as_one_sentence_pair() {
+        assert_eq!(
+            MODE_NEXT_TURN_NOTICE,
+            "Mode applies from the next turn. The running turn and steering keep their previous permissions; wait for it to finish, or interrupt it and send a new prompt"
+        );
     }
     #[test]
     fn effort_levels_are_checked_where_the_provider_lists_them() {

@@ -1343,8 +1343,9 @@ fn merged_content(user: Option<&str>) -> (String, Option<String>) {
 /// modes, as JSON text. Reads are allowed everywhere, since they change
 /// nothing, except `.env` files, which ask as opencode's own defaults do.
 /// `question`, `plan_enter` and `plan_exit` stay denied, as opencode denies
-/// them by default; the catch-all would make them ask. Each permission map starts with `"*"`: rules are last-match-wins,
-/// so the entries after it refine it. The asking agents deny `task`: opencode
+/// them by default; the catch-all would make them ask. Each permission map
+/// starts with `"*"`: rules are last-match-wins, so the entries after it
+/// refine it. The asking agents deny `task`: opencode
 /// builds a subagent's permissions from the parent session's deny rules, not
 /// from the agent's `"*":"ask"`, so a subagent would act without asking.
 const OCTET_AGENTS: &[(&str, &str)] = &[
