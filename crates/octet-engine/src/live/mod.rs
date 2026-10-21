@@ -112,6 +112,11 @@ pub struct Provider {
     /// Reasoning effort changes take effect from the next turn; otherwise
     /// they need a reconnect (the CLI takes effort at launch).
     pub effort_live: bool,
+    /// The vendor has a reasoning effort setting at all (opencode has none).
+    pub takes_effort: bool,
+    /// Its model IDs can start with its own name, so `NAME/X` keeps the
+    /// whole string as the model.
+    pub ids_carry_name: bool,
     /// The reasoning effort levels the vendor takes; empty passes any word
     /// on (Codex's levels depend on the model).
     pub efforts: &'static [&'static str],
@@ -238,9 +243,15 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Names the levels the provider takes, when it lists them and `level`
-    /// is not one.
+    /// Says so when the provider takes no effort level at all; else names
+    /// the levels it takes, when it lists them and `level` is not one.
     pub fn check_effort(self, level: &str) -> Result<(), String> {
+        if !self.0.takes_effort {
+            return Err(format!(
+                "{} does not take a reasoning effort level",
+                self.0.title
+            ));
+        }
         let levels = self.0.efforts;
         match levels.split_last() {
             Some((last, rest)) if !levels.contains(&level) => Err(format!(

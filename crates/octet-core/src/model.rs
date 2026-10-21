@@ -11,7 +11,9 @@ pub struct Selection {
 }
 impl Selection {
     /// Parses a `/model` argument; a bare model name keeps the `current`
-    /// provider.
+    /// provider. `PROVIDER/NAME` is the provider and `NAME`, except for a
+    /// provider whose IDs carry its own name (opencode's
+    /// `opencode/glm-5.3-flash-free`), which keeps the whole string.
     ///
     /// ```
     /// use octet_core::{model::Selection, Engine};
@@ -33,7 +35,13 @@ impl Selection {
                 Some(engine) => (engine, "default"),
                 None => name
                     .split_once('/')
-                    .and_then(|(prefix, model)| Some((vendor(prefix)?, model)))
+                    .and_then(|(prefix, model)| {
+                        let engine = vendor(prefix)?;
+                        // A provider whose IDs start with its own name keeps
+                        // the whole string (an empty model still fails below).
+                        let keeps = engine.provider().ids_carry_name && !model.is_empty();
+                        Some((engine, if keeps { *name } else { model }))
+                    })
                     .unwrap_or((current, *name)),
             },
             [name, model] => match vendor(name) {
@@ -148,6 +156,7 @@ impl Selection {
             }
         };
         let owners = catalogs.owners(bare);
+        let suffixed = catalogs.suffix_owners(bare);
         let (provider, found) = if bare == "default" {
             (current, Found::Current)
         } else if owners.contains(&current) {
@@ -155,6 +164,16 @@ impl Selection {
         } else if let [owner] = owners.as_slice() {
             (*owner, Found::Listed)
         } else if !owners.is_empty() {
+            return Err(ambiguous(bare, &owners));
+        } else if let [(owner, id)] = suffixed.as_slice() {
+            let selection = Self::parse(&format!("{owner} {id}"), current)?;
+            return Ok(Resolved {
+                selection,
+                found: Found::Listed,
+            });
+        } else if let suffixed @ [_, ..] = suffixed.as_slice() {
+            let mut owners: Vec<Engine> = suffixed.iter().map(|(engine, _)| *engine).collect();
+            owners.dedup();
             return Err(ambiguous(bare, &owners));
         } else if let [owner] = catalogs.prefix_owners(bare).as_slice() {
             let word = bare.split_once('-').map_or("", |(word, _)| word);
@@ -479,5 +498,132 @@ mod tests {
         }
         // A model a provider lists is that provider's, from the demo too.
         assert_eq!(resolved("opus", Engine::DEMO).0, Engine::CLAUDE);
+    }
+
+    /// `lists()` plus an opencode list of `ids`.
+    fn with_opencode(ids: &[&str]) -> crate::catalog::Catalogs {
+        let mut c = lists();
+        let models = ids
+            .iter()
+            .map(|s| crate::ModelInfo {
+                selection: (*s).into(),
+                id: Some((*s).into()),
+                name: (*s).into(),
+                description: String::new(),
+            })
+            .collect();
+        c.set(Engine::OPENCODE, models, std::time::SystemTime::now());
+        c
+    }
+
+    #[test]
+    fn opencode_slash_form_keeps_the_whole_id() {
+        for input in [
+            "opencode/glm-5.3-flash-free",
+            "opencode opencode/glm-5.3-flash-free",
+        ] {
+            let selection = Selection::parse(input, Engine::CLAUDE).unwrap();
+            assert_eq!(selection.provider, Engine::OPENCODE, "{input}");
+            assert_eq!(
+                selection.model.as_deref(),
+                Some("opencode/glm-5.3-flash-free"),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            Selection::parse("opencode/", Engine::CLAUDE),
+            Err(SelectionError::InvalidModel)
+        );
+        assert_eq!(
+            Selection::parse("opencode", Engine::CLAUDE).unwrap().model,
+            None
+        );
+        assert_eq!(
+            Selection::parse("opencode openai/gpt-5.5", Engine::CLAUDE)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("openai/gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn claude_slash_form_is_unchanged() {
+        let selection = Selection::parse("claude/sonnet", Engine::OPENCODE).unwrap();
+        assert_eq!(selection.provider, Engine::CLAUDE);
+        assert_eq!(selection.model.as_deref(), Some("sonnet"));
+        let selection = Selection::parse("codex/gpt-x", Engine::CLAUDE).unwrap();
+        assert_eq!(selection.model.as_deref(), Some("gpt-x"));
+    }
+
+    #[test]
+    fn a_bare_sub_provider_id_goes_to_opencode() {
+        let catalogs = with_opencode(&["openai/gpt-fixture"]);
+        let r = Selection::resolve("openai/gpt-fixture", Engine::CLAUDE, &catalogs).unwrap();
+        assert_eq!(r.selection.provider, Engine::OPENCODE);
+        assert_eq!(r.selection.model.as_deref(), Some("openai/gpt-fixture"));
+        assert_eq!(r.found, Found::Listed);
+    }
+
+    #[test]
+    fn an_exact_owner_beats_a_suffix_match() {
+        let mut catalogs = with_opencode(&["openai/gpt-5.5"]);
+        let model = crate::ModelInfo {
+            selection: "gpt-5.5".into(),
+            id: Some("gpt-5.5".into()),
+            name: "gpt-5.5".into(),
+            description: String::new(),
+        };
+        catalogs.set(Engine::CODEX, vec![model], std::time::SystemTime::now());
+        let r = Selection::resolve("gpt-5.5", Engine::CLAUDE, &catalogs).unwrap();
+        assert_eq!(r.selection.provider, Engine::CODEX);
+        assert_eq!(r.selection.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(r.found, Found::Listed);
+    }
+
+    #[test]
+    fn a_unique_suffix_resolves_to_the_full_id() {
+        let catalogs = with_opencode(&["opencode/glm-5.3-flash-free", "openai/gpt-5.5"]);
+        let r = Selection::resolve("glm-5.3-flash-free", Engine::CLAUDE, &catalogs).unwrap();
+        assert_eq!(r.selection.provider, Engine::OPENCODE);
+        assert_eq!(
+            r.selection.model.as_deref(),
+            Some("opencode/glm-5.3-flash-free")
+        );
+        assert_eq!(r.found, Found::Listed);
+    }
+
+    #[test]
+    fn two_suffix_owners_are_ambiguous() {
+        let mut catalogs = with_opencode(&["openai/shared-fixture"]);
+        let model = crate::ModelInfo {
+            selection: "vendor/shared-fixture".into(),
+            id: None,
+            name: String::new(),
+            description: String::new(),
+        };
+        catalogs.set(Engine::CODEX, vec![model], std::time::SystemTime::now());
+        assert_eq!(
+            Selection::resolve("shared-fixture", Engine::CLAUDE, &catalogs),
+            Err(SelectionError::Ambiguous {
+                name: "shared-fixture".into(),
+                providers: "codex and opencode".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_takes_no_effort() {
+        assert_eq!(
+            Engine::OPENCODE.check_effort("high"),
+            Err("opencode does not take a reasoning effort level".to_owned())
+        );
+        let mut current = Config::new(Engine::CODEX, "codex", "/tmp");
+        current.effort = Some("high".into());
+        let opencode = Selection {
+            provider: Engine::OPENCODE,
+            model: None,
+        };
+        assert_eq!(opencode.configure(&current, "t-1", None).effort, None);
     }
 }

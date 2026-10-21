@@ -36,6 +36,8 @@ pub(super) const PROVIDER: Provider = Provider {
     steer: false,
     inline_images: true,
     effort_live: false,
+    takes_effort: false,
+    ids_carry_name: true,
     efforts: &[],
     // A placeholder until it is timed against the real CLI.
     shutdown_grace: Duration::from_millis(500),

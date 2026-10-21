@@ -172,8 +172,15 @@ fn skill_command(app: &mut App, vendor: &dyn Vendor, name: &str, argument: &str)
     }
 }
 /// `/effort`: show the reasoning effort, or change it. Codex takes it per
-/// turn; Claude takes it at launch, so a change reconnects there.
+/// turn; Claude takes it at launch, so a change reconnects there; a provider
+/// with no effort setting (opencode) says so and changes nothing.
 fn effort_command(app: &mut App, vendor: &dyn Vendor, argument: &str) -> Action {
+    if !app.conn.engine.provider().takes_effort {
+        if let Err(error) = app.conn.engine.check_effort(argument) {
+            app.note(error);
+        }
+        return Action::Continue;
+    }
     if argument.is_empty() {
         let current = app.conn.effort.as_deref().unwrap_or("vendor default");
         let levels = match app.conn.engine.provider().efforts {

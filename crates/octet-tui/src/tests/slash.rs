@@ -632,6 +632,25 @@ async fn effort_refuses_a_level_claude_does_not_take() {
     );
 }
 #[tokio::test]
+async fn effort_says_opencode_takes_none() {
+    let mut opencode = crate::test_support::app_for(octet_core::Engine::OPENCODE);
+    crate::test_support::idle(&mut opencode);
+    for line in ["/effort", "/effort high", "/effort default"] {
+        assert!(matches!(
+            command(&mut opencode, line).await,
+            Action::Continue
+        ));
+    }
+    assert_eq!(
+        opencode
+            .entries_text()
+            .matches("opencode does not take a reasoning effort level")
+            .count(),
+        3
+    );
+    assert_eq!(opencode.conn.effort, None);
+}
+#[tokio::test]
 async fn every_command_needing_no_open_turn_refuses_the_same_way() {
     let guarded: Vec<&Spec> = COMMANDS
         .iter()

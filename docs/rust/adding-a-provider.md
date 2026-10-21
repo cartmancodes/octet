@@ -33,6 +33,8 @@ pub(super) const PROVIDER: Provider = Provider {
     steer: false,                   // true if a running turn takes more input
     inline_images: false,           // true if images go in the prompt as base64
     effort_live: false,             // true if effort is sent per turn, not at launch
+    takes_effort: true,             // false if the vendor has no reasoning effort setting
+    ids_carry_name: false,          // true if model IDs can start with the provider's own name (opencode/X)
     efforts: &[],                   // the effort levels it takes; empty passes any word
     // How long the CLI may take to exit once its input closes, before
     // SIGTERM: time how long it really takes and allow some margin.

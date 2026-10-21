@@ -32,6 +32,8 @@ pub(super) const PROVIDER: Provider = Provider {
     steer: true,
     inline_images: false,
     effort_live: true,
+    takes_effort: true,
+    ids_carry_name: false,
     efforts: &[],
     shutdown_grace: Duration::from_millis(150),
     lists_models: true,

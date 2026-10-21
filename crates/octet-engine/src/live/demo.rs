@@ -21,6 +21,8 @@ pub(super) const PROVIDER: Provider = Provider {
     steer: false,
     inline_images: false,
     effort_live: false,
+    takes_effort: true,
+    ids_carry_name: false,
     efforts: &[],
     // No process to stop.
     shutdown_grace: Duration::ZERO,

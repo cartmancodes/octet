@@ -34,6 +34,8 @@ pub(super) const PROVIDER: Provider = Provider {
     steer: false,
     inline_images: true,
     effort_live: false,
+    takes_effort: true,
+    ids_carry_name: false,
     efforts: &["low", "medium", "high", "xhigh", "max"],
     // It takes about 0.9 s to exit, saving its session; a kill could cut that.
     shutdown_grace: Duration::from_millis(1500),
