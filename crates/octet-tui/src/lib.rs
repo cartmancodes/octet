@@ -2,6 +2,7 @@
 //! `!` commands and the screen.
 mod app;
 mod bridge;
+mod clash;
 mod clipboard;
 mod commands;
 mod composer;

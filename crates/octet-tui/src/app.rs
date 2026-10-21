@@ -695,14 +695,19 @@ impl App {
                 counts.join(" · ")
             ));
             // Page the list so large lists do not evict current details from scrollback.
+            let labels = crate::clash::labels(&entries);
             let shown: Vec<String> = entries
                 .iter()
+                .zip(&labels)
                 .skip((page - 1) * CATALOG_PAGE)
                 .take(CATALOG_PAGE)
-                .map(|(engine, model)| {
+                .map(|((engine, model), label)| {
+                    // A model another provider also lists is named with its provider in brackets.
+                    let title = label
+                        .clone()
+                        .unwrap_or_else(|| format!("{} · {engine}", model.name));
                     format!(
-                        "{} · {engine}\nModel ID: {}\n{}\nSelect: {}",
-                        model.name,
+                        "{title}\nModel ID: {}\n{}\nSelect: {}",
                         model.id.as_deref().unwrap_or("unresolved alias"),
                         model.description,
                         self.select_line(*engine, &model.selection)

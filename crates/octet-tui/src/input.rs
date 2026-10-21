@@ -16,6 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use octet_core::Command;
 use std::fmt::Write as _;
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -284,10 +285,8 @@ fn typed_a_model(app: &App) -> bool {
 /// The command a picked model line sends: the explicit form, so the line's
 /// provider is the one used.
 fn picked(item: &str) -> Option<String> {
-    let mut parts = item.split(" · ");
-    let selection = parts.next()?;
-    let provider = parts.next()?;
-    Some(format!("/model {provider} {selection}"))
+    let (selection, provider) = crate::clash::row_route(item);
+    Some(format!("/model {} {selection}", provider?))
 }
 /// Puts the selected suggestion into the draft and closes the popup.
 pub(crate) fn accept_completion(app: &mut App) {
@@ -310,15 +309,12 @@ pub(crate) fn accept_completion(app: &mut App) {
     };
     app.replace_or_warn(completion.start, &text);
 }
-/// What Tab puts in the draft for a model line (`name · provider …`): the
-/// name, or `provider name` when the name alone would go to another provider.
+/// What Tab puts in the draft for a model line (`name · provider …` or the
+/// clash form `name (provider)`): the name, or `provider name` when the name
+/// alone would go to another provider.
 fn model_text(app: &App, item: &str) -> String {
-    let mut parts = item.split(" · ");
-    let name = parts.next().unwrap_or(item);
-    let line_provider = parts
-        .next()
-        .and_then(octet_core::Engine::parse)
-        .filter(|engine| engine.is_vendor());
+    let (name, line_provider) = crate::clash::row_route(item);
+    let line_provider = line_provider.filter(|engine| engine.is_vendor());
     let resolves_there = |provider| {
         octet_core::model::Selection::resolve(name, app.conn.engine, &app.models.catalogs)
             .is_ok_and(|resolved| resolved.selection.provider == provider)
@@ -667,11 +663,20 @@ async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
 /// Tab: completes a path or a command, off the loop.
 async fn tab_key(app: &mut App) {
     let names = app.models.names(app.conn.engine);
+    let entries = app.model_entries();
+    let clashing: HashSet<String> = entries
+        .iter()
+        .zip(crate::clash::labels(&entries))
+        .filter(|(_, label)| label.is_some())
+        .flat_map(|((_, model), _)| [Some(model.selection.clone()), model.id.clone()])
+        .flatten()
+        .collect();
     if let Some(tab) = composer::model_tab(
         app.composer.editor.text(),
         app.composer.editor.cursor(),
         &names,
         app.conn.engine,
+        &clashing,
     ) {
         apply_tab(app, tab);
         return;

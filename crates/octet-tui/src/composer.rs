@@ -1,5 +1,6 @@
 //! The prompt box's attachment and completion logic, free of terminal I/O.
 use crate::shell::{CUT, Ran};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -174,25 +175,31 @@ pub(crate) fn picker_items(
 ) -> (Vec<String>, usize) {
     let lower = query.to_lowercase();
     let mut selected = 0;
+    let labels = crate::clash::labels(entries);
     let items = entries
         .iter()
-        .filter(|(_, m)| {
+        .zip(&labels)
+        .filter(|((_, m), _)| {
             m.selection.starts_with(query)
                 || m.id.as_deref().is_some_and(|id| id.starts_with(query))
                 || m.name.to_lowercase().contains(&lower)
         })
         .enumerate()
-        .map(|(index, (engine, m))| {
+        .map(|(index, ((engine, m), label))| {
             let here = current == Some((*engine, m.selection.as_str()));
             if here && query.is_empty() {
                 selected = index;
             }
-            format!(
-                "{} · {engine} · {}{}",
-                m.selection,
-                crate::text::clean(&m.name),
-                if here { " ●" } else { "" }
-            )
+            let mark = if here { " ●" } else { "" };
+            match label {
+                // The same model through another provider: the label names this one.
+                Some(label) => format!("{} · {label}{mark}", m.selection),
+                None => format!(
+                    "{} · {engine} · {}{mark}",
+                    m.selection,
+                    crate::text::clean(&m.name)
+                ),
+            }
         })
         .collect();
     (items, selected)
@@ -200,12 +207,14 @@ pub(crate) fn picker_items(
 
 /// Tab after `/model `: completes a model name from every provider's list
 /// (`names`, the current provider's first). `None` when the draft is not a
-/// `/model` argument.
+/// `/model` argument. A name in `clashing` (the selections and IDs another
+/// provider also lists) shows as `name (provider)` in the popup.
 pub(crate) fn model_tab(
     text: &str,
     cursor: usize,
     names: &[(String, octet_core::Engine)],
     active: octet_core::Engine,
+    clashing: &HashSet<String>,
 ) -> Option<Tab> {
     // Only a word the cursor ends: completing inside one would mangle it.
     if text[cursor..]
@@ -251,7 +260,13 @@ pub(crate) fn model_tab(
                 items: matches
                     .iter()
                     .take(crate::files::SHOWN)
-                    .map(|(name, engine)| format!("{name} · {engine}"))
+                    .map(|(name, engine)| {
+                        if clashing.contains(name) {
+                            format!("{name} ({engine})")
+                        } else {
+                            format!("{name} · {engine}")
+                        }
+                    })
                     .collect(),
                 selected: 0,
                 start,
@@ -505,7 +520,15 @@ mod tests {
             ("gpt-6-astra".to_owned(), octet_core::Engine::CODEX),
             ("gpt-5.6-sol".to_owned(), octet_core::Engine::CODEX),
         ];
-        let tab = |text: &str| model_tab(text, text.len(), &names, octet_core::Engine::CLAUDE);
+        let tab = |text: &str| {
+            model_tab(
+                text,
+                text.len(),
+                &names,
+                octet_core::Engine::CLAUDE,
+                &HashSet::new(),
+            )
+        };
         assert!(matches!(
             tab("/model op"),
             Some(Tab::Replace { start: 7, ref text, popup: None }) if text == "opus "
@@ -525,6 +548,58 @@ mod tests {
         ));
     }
     #[test]
+    fn a_clash_row_in_the_picker_carries_the_label_and_the_current_marker() {
+        let model = |selection: &str, name: &str| octet_core::ModelInfo {
+            selection: selection.into(),
+            id: Some(selection.into()),
+            name: name.into(),
+            description: String::new(),
+        };
+        let entries = [
+            (octet_core::Engine::CODEX, model("gpt-5.5", "GPT-5.5")),
+            (octet_core::Engine::CODEX, model("gpt-5.4", "GPT-5.4")),
+            (
+                octet_core::Engine::OPENCODE,
+                model("openai/gpt-5.5", "OpenAI/GPT-5.5"),
+            ),
+        ];
+        let current = Some((octet_core::Engine::CODEX, "gpt-5.5"));
+        let (items, selected) = picker_items(&entries, current, "");
+        assert_eq!(
+            items,
+            [
+                "gpt-5.5 · GPT-5.5 (codex) ●",
+                "gpt-5.4 · codex · GPT-5.4",
+                "openai/gpt-5.5 · GPT-5.5 (opencode · openai)"
+            ]
+        );
+        assert_eq!(selected, 0);
+    }
+    #[test]
+    fn a_clash_row_in_the_popup_names_its_provider_in_brackets() {
+        let names = vec![
+            ("gpt-5.5".to_owned(), octet_core::Engine::CODEX),
+            ("gpt-5.4".to_owned(), octet_core::Engine::CODEX),
+            ("openai/gpt-5.5".to_owned(), octet_core::Engine::OPENCODE),
+        ];
+        let clashing: HashSet<String> = ["gpt-5.5", "openai/gpt-5.5"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let tab = model_tab(
+            "/model gpt",
+            10,
+            &names,
+            octet_core::Engine::CODEX,
+            &clashing,
+        );
+        assert!(matches!(
+            tab,
+            Some(Tab::Replace { popup: Some(Completion { ref items, .. }), .. })
+                if items == &["gpt-5.5 (codex)", "gpt-5.4 · codex"]
+        ));
+    }
+    #[test]
     fn model_tab_uses_the_active_provider_and_the_named_one() {
         let names = vec![
             ("gpt-6-astra".to_owned(), octet_core::Engine::CODEX),
@@ -533,8 +608,15 @@ mod tests {
         ];
         // Claude is active but listed nothing first: `/model ` + Tab offers
         // Claude's names only, not Codex's.
-        let tab =
-            |text: &str, cursor: usize| model_tab(text, cursor, &names, octet_core::Engine::CLAUDE);
+        let tab = |text: &str, cursor: usize| {
+            model_tab(
+                text,
+                cursor,
+                &names,
+                octet_core::Engine::CLAUDE,
+                &HashSet::new(),
+            )
+        };
         assert!(matches!(
             tab("/model ", 7),
             Some(Tab::Replace { ref text, .. }) if text == "gpt-claude-x "
