@@ -8,7 +8,7 @@ use super::{
     activity::one_line,
     check_inline, deadline_after, limited,
     protocol::{Core, Phase, Protocol},
-    push_bounded, short, valid_identifier,
+    short, valid_identifier,
 };
 use serde_json::{Value, json, value::RawValue};
 use std::{
@@ -313,8 +313,16 @@ impl Protocol for OpencodeProtocol {
     }
 
     /// Sets the agent that carries `target`. The mode changes only when
-    /// opencode confirms it.
+    /// opencode confirms it. While [`MAX_LATE_SWITCHES`] earlier switches
+    /// wait unconfirmed, another is refused: a late reply to it could not
+    /// be matched, and the header must follow the agent opencode is in.
     async fn set_mode(&mut self, core: &mut Core, target: Mode) -> Result<(), DriverError> {
+        if self.late_modes.len() >= MAX_LATE_SWITCHES {
+            core.emit(Event::Notice(format!(
+                "opencode has not confirmed {MAX_LATE_SWITCHES} earlier mode switches; wait or reconnect"
+            )))?;
+            return core.emit(Event::ModeChanged(core.mode));
+        }
         let switch = Switch {
             target,
             mid_turn: core.phase.is_running(),
@@ -864,10 +872,9 @@ impl OpencodeProtocol {
         else {
             return Ok(());
         };
-        // Kept bounded: a vendor that never answers cannot grow either list.
-        if let Some(dropped) = push_bounded(&mut self.late_modes, request.id, MAX_LATE_SWITCHES) {
-            self.requests.remove(&dropped);
-        }
+        // Kept bounded: `set_mode` refuses a switch while the list is full,
+        // so a vendor that never answers cannot grow it or `requests`.
+        self.late_modes.push_back(request.id);
         core.emit(Event::Notice(format!(
             "opencode has not confirmed the switch to {}",
             request.target.label()

@@ -3395,6 +3395,49 @@ async fn opencode_unconfirmed_switch_times_out_then_applies_a_late_confirmation(
     );
 }
 #[tokio::test]
+async fn opencode_refuses_a_switch_while_eight_wait_for_confirmation() {
+    use serde_json::json;
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+    ];
+    // opencode answers nothing after the handshake.
+    let (dir, c) = opencode_logging("octet-live-opencode-late-switches", &frames);
+    let limits = Limits {
+        mode_confirm: Duration::from_millis(100),
+        ..Limits::default()
+    };
+    let (handle, mut events, task) = spawn_with_limits(c, limits);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    for _ in 0..8 {
+        handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+        wait_for(
+            &mut events,
+            |e| matches!(e, Event::Notice(t) if t.contains("has not confirmed")),
+        )
+        .await;
+        wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    }
+    // A late reply to a ninth could no longer be matched: it is not sent.
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let notice = next(&mut events).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode has not confirmed 8 earlier mode switches; wait or reconnect"),
+        "{notice:?}"
+    );
+    let mode = next(&mut events).await;
+    assert!(matches!(mode, Event::ModeChanged(Mode::Ask)), "{mode:?}");
+    let switches = requests_sent(&dir)
+        .await
+        .iter()
+        .filter(|frame| frame["params"]["configId"] == "mode")
+        .count();
+    // The handshake's agent and the eight live switches.
+    assert_eq!(switches, 9);
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_switch_reporting_another_agent_stops_or_keeps_the_mode() {
     // opencode ignored the switch: it still reports the agent in force.
     let ignored = serde_json::json!({"result": {"configOptions": [
