@@ -4,7 +4,7 @@ import { FIELD_CHARS, field } from "./model/text";
 import type { CatalogInfo, Engine, ModelInfo, RecentInfo, SessionInfo } from "./protocol";
 import { folderName } from "./sessions";
 
-const ENGINES: readonly string[] = ["claude", "codex", "demo"];
+const ENGINES: readonly string[] = ["claude", "codex", "demo", "opencode"];
 
 const isItem = (r: unknown): r is RecentInfo =>
   typeof r === "object" &&

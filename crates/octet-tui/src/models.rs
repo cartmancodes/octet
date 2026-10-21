@@ -370,9 +370,12 @@ mod tests {
         // Codex skills yet.
         models.probe_stale(Engine::CLAUDE, now);
         assert!(models.probing.contains(&Engine::CODEX));
-        let probed = models.next().await;
-        models.probed(probed, SystemTime::now());
-        // Both fresh now: no probe.
+        // opencode, with no list at all, is probed too.
+        while !models.probing.is_empty() {
+            let probed = models.next().await;
+            models.probed(probed, SystemTime::now());
+        }
+        // All fresh now: no probe.
         models.probe_stale(Engine::CLAUDE, SystemTime::now());
         assert!(models.probing.is_empty());
     }
@@ -435,9 +438,15 @@ mod tests {
         models.probe_stale(Engine::CLAUDE, SystemTime::now());
         // A second request while one runs starts nothing.
         assert!(models.refresh(Engine::CLAUDE).started.is_empty());
-        let probed = models.next().await;
-        assert_eq!(probed.engine, Engine::CODEX);
-        assert!(models.probed(probed, SystemTime::now()).is_none());
+        // Every other vendor is probed once, in whichever order they finish.
+        let mut engines = Vec::new();
+        while !models.probing.is_empty() {
+            let probed = models.next().await;
+            engines.push(probed.engine.as_str());
+            assert!(models.probed(probed, SystemTime::now()).is_none());
+        }
+        engines.sort_unstable();
+        assert_eq!(engines, ["codex", "opencode"]);
         let cached = Catalogs::load(&dir.path().join(octet_core::catalog::FILE));
         assert!(
             cached
@@ -470,7 +479,7 @@ mod tests {
         models.probe_stale(Engine::CLAUDE, SystemTime::now());
         let refreshed = models.refresh(Engine::CLAUDE);
         assert!(refreshed.started.is_empty());
-        assert_eq!(refreshed.running, [Engine::CODEX]);
+        assert_eq!(refreshed.running, [Engine::CODEX, Engine::OPENCODE]);
     }
 
     #[test]

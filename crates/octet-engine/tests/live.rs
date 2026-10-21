@@ -24,6 +24,12 @@ fn claude() -> Config {
     c.engine = Engine::CLAUDE;
     c
 }
+/// The fake opencode, otherwise as `config()`.
+fn opencode() -> Config {
+    let mut c = config();
+    c.engine = Engine::OPENCODE;
+    c
+}
 /// Shuts the session down and waits for it, failing instead of hanging.
 async fn stop(handle: &octet_engine::live::Handle, task: tokio::task::JoinHandle<()>) {
     handle.shutdown();
@@ -2281,4 +2287,214 @@ async fn a_codex_skill_is_sent_as_a_skill_item_with_its_context() {
             {"type":"text","text":"EARLIER\n\ngo"}
         ])
     );
+}
+
+#[tokio::test]
+async fn opencode_connects_lists_models_and_skills() {
+    let (handle, mut events, task) = spawn(opencode());
+    let (mut ready, mut models, mut skills, mut mode) = (None, None, None, None);
+    while ready.is_none() || models.is_none() || skills.is_none() || mode.is_none() {
+        match next(&mut events).await {
+            Event::Ready { session } => ready = Some(session),
+            Event::Models(list) => models = Some(list),
+            Event::Skills(list) => skills = Some(list),
+            Event::ModeChanged(changed) => mode = Some(changed),
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(ready.as_deref(), Some("fixture-ses"));
+    let models = models.unwrap();
+    let free = models
+        .iter()
+        .find(|m| m.selection == "opencode/fixture-free")
+        .unwrap_or_else(|| panic!("{models:?}"));
+    assert_eq!(free.name, "OpenCode/Fixture Free");
+    assert_eq!(free.id.as_deref(), Some("opencode/fixture-free"));
+    assert!(free.description.is_empty());
+    let skills = skills.unwrap();
+    assert!(
+        skills.iter().any(|s| s.name == scenario::OPENCODE_SKILL),
+        "{skills:?}"
+    );
+    assert_eq!(mode, Some(Mode::Ask));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_turn_streams_text_and_usage() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    for _ in 0..2 {
+        handle.send(Command::Prompt("hello".into())).unwrap();
+        let (mut text, mut usage) = (String::new(), Vec::new());
+        loop {
+            match next(&mut events).await {
+                Event::Text(t) => text.push_str(&t),
+                Event::Usage(u) => usage.push(u),
+                Event::Finished { outcome } => {
+                    assert_eq!(outcome, Outcome::Completed);
+                    break;
+                }
+                Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(text, scenario::OPENCODE_REPLY);
+        assert_eq!(usage, ["42 tokens"]);
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_launches_acp_with_octet_agents() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    assert_eq!(echo["argv"][0], "acp", "{echo}");
+    let content = echo["env"]["OPENCODE_CONFIG_CONTENT"].as_str().unwrap();
+    assert!(content.contains("octet-ask"), "{content}");
+    assert_eq!(echo["modes"], serde_json::json!(["octet-ask"]));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_requested_model_is_set_and_confirmed() {
+    let mut c = opencode();
+    c.model = Some("openai/gpt-fixture".into());
+    let (handle, mut events, task) = spawn(c);
+    let selected = wait_for(&mut events, |e| matches!(e, Event::ModelSelected(_))).await;
+    assert!(
+        matches!(&selected, Event::ModelSelected(model) if model == "openai/gpt-fixture"),
+        "{selected:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_resume_ignores_the_replayed_history() {
+    let mut c = opencode();
+    c.resume = Some("ses-old".into());
+    let (handle, mut events, task) = spawn(c);
+    let mut before = Vec::new();
+    let session = loop {
+        match next(&mut events).await {
+            Event::Ready { session } => break session,
+            Event::Error(error) => panic!("{error}"),
+            event => before.push(event),
+        }
+    };
+    assert_eq!(session, "ses-old");
+    // The rest of the handshake, then the turn.
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    loop {
+        match next(&mut events).await {
+            Event::Started => break,
+            Event::Error(error) => panic!("{error}"),
+            event => before.push(event),
+        }
+    }
+    for event in &before {
+        assert!(
+            !matches!(event, Event::Tool(_) | Event::Text(_)),
+            "replayed: {event:?}"
+        );
+    }
+    let text = turn_text(&mut events).await;
+    assert_eq!(text, scenario::OPENCODE_REPLY);
+    assert!(!text.contains("REPLAYED"));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_fork_opens_a_new_session() {
+    let mut c = opencode();
+    c.resume = Some("ses-old".into());
+    c.fork = true;
+    let (handle, mut events, task) = spawn(c);
+    let ready = wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    assert!(
+        matches!(&ready, Event::Ready { session } if session == "fixture-fork"),
+        "{ready:?}"
+    );
+    stop(&handle, task).await;
+}
+/// A 1×1 PNG.
+const PIXEL_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+#[tokio::test]
+async fn opencode_image_goes_inline() {
+    let dir = octet_testkit::TempDir::new("octet-image-opencode");
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let (command, _) = image_prompt(&dir, PIXEL_PNG);
+    handle.send(command).unwrap();
+    let length = octet_engine::live::encoded_len(PIXEL_PNG.len() as u64);
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("image image/png {length}")
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_handshake_out_of_order_is_an_error() {
+    // opencode answers session/new (id 2) before initialize (id 1).
+    let (_dir, vendor) = script_vendor(
+        "octet-live-opencode-out-of-order",
+        "read line\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"s1\",\"configOptions\":[]}}'\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n\
+         exec sleep 30\n",
+    );
+    let (_handle, mut events, task) =
+        spawn(Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()));
+    loop {
+        match next(&mut events).await {
+            Event::Error(error) => {
+                assert_eq!(error, "Unexpected protocol initialization order");
+                break;
+            }
+            Event::Ready { session } => panic!("a session opened: {session}"),
+            _ => {}
+        }
+    }
+    ended(task).await;
+}
+#[tokio::test]
+async fn opencode_agent_refused_at_connect_shows_the_agent_it_kept() {
+    // opencode opens the session in `build` and refuses `octet-ask`: the
+    // header must not claim `ask`.
+    let (_dir, vendor) = script_vendor(
+        "octet-live-opencode-agent-refused",
+        "read line\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n\
+         read line\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"s1\",\"configOptions\":[{\"id\":\"mode\",\"currentValue\":\"build\"}]}}'\n\
+         read line\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32602,\"message\":\"unknown agent\"}}'\n\
+         exec sleep 30\n",
+    );
+    let (handle, mut events, task) =
+        spawn(Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()));
+    let mut notices = Vec::new();
+    let mode = loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => notices.push(notice),
+            Event::ModeChanged(mode) => break mode,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert_eq!(mode, Mode::Auto, "{notices:?}");
+    assert!(
+        notices
+            .iter()
+            .any(|n| n == "opencode did not switch to ask: unknown agent"),
+        "{notices:?}"
+    );
+    stop(&handle, task).await;
 }

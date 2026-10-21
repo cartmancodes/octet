@@ -8,7 +8,7 @@ export const MAX_MESSAGE = 98304;
 export const MAX_SESSION_ROWS = 200;
 
 /** A provider. */
-export type Engine = "claude" | "codex" | "demo";
+export type Engine = "claude" | "codex" | "demo" | "opencode";
 
 /** A permission mode. */
 export type Mode = "ask" | "accept-edits" | "auto" | "full-access";

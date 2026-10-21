@@ -185,15 +185,15 @@ mod tests {
             ),
             (
                 SelectionError::Empty.to_string(),
-                "Use /model <name>, /model codex <name>, /model claude <name>, or /model <provider> default",
+                "Use /model <name>, /model codex <name>, /model claude <name>, /model opencode <name>, or /model <provider> default",
             ),
             (
                 SelectionError::Syntax.to_string(),
-                "Use /model <name> or /model <codex|claude> <name>",
+                "Use /model <name> or /model <codex|claude|opencode> <name>",
             ),
             (
                 SelectionError::Demo.to_string(),
-                "Choose a real provider: /model codex or /model claude. Demo has no model.",
+                "Choose a real provider: /model codex, /model claude or /model opencode. Demo has no model.",
             ),
             (
                 SelectionError::InvalidModel.to_string(),

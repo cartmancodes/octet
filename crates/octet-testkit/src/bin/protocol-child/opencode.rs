@@ -123,7 +123,8 @@ impl OpencodeFixture {
         ])
     }
 
-    /// Opens, resumes or forks the session. A resume replays its history first.
+    /// Opens, resumes or forks the session. A resume replays its history
+    /// after its reply, before any prompt, as opencode 1.18.25 does.
     fn open(&mut self, method: &str, v: &Value) {
         method.clone_into(&mut self.opened);
         self.session = match method {
@@ -135,6 +136,10 @@ impl OpencodeFixture {
             _ => "fixture-ses".to_owned(),
         };
         let sid = &self.session;
+        emit(&acp_result(
+            &v["id"],
+            &json!({"sessionId":sid,"configOptions":self.config_options()}),
+        ));
         if method == "session/resume" {
             emit(&acp_update(
                 sid,
@@ -143,10 +148,6 @@ impl OpencodeFixture {
             emit(&acp_text(sid, "REPLAYED"));
             emit(&tool_call(sid, "replayed-call"));
         }
-        emit(&acp_result(
-            &v["id"],
-            &json!({"sessionId":sid,"configOptions":self.config_options()}),
-        ));
         emit(&acp_update(
             sid,
             &json!({"sessionUpdate":"available_commands_update","availableCommands":[

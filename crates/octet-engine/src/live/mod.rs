@@ -25,6 +25,7 @@ pub use image::{
     IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment, ImageError, check_inline, encoded_len,
 };
 pub use mode::Mode;
+pub use opencode::opencode_stray_reply;
 
 /// The longest prompt, in bytes, a user may type (or a command may send as
 /// its displayed text).
@@ -195,12 +196,19 @@ impl Engine {
     pub const CODEX: Engine = Engine(&codex::PROVIDER);
     /// Claude Code, over its stream-json protocol.
     pub const CLAUDE: Engine = Engine(&claude::PROVIDER);
+    /// opencode, over the Agent Client Protocol (`opencode acp`).
+    pub const OPENCODE: Engine = Engine(&opencode::PROVIDER);
     /// The offline preview; no vendor process.
     pub const DEMO: Engine = Engine(&demo::PROVIDER);
     /// Every provider, in the order help lists them: the provider table.
-    pub const ALL: &'static [Engine] = &[Engine::CODEX, Engine::CLAUDE, Engine::DEMO];
-    /// The engine named `value` (`codex`, `claude` or `demo`), exactly as
-    /// spelled.
+    pub const ALL: &'static [Engine] = &[
+        Engine::CODEX,
+        Engine::CLAUDE,
+        Engine::OPENCODE,
+        Engine::DEMO,
+    ];
+    /// The engine named `value` (`codex`, `claude`, `opencode` or `demo`),
+    /// exactly as spelled.
     ///
     /// ```
     /// use octet_engine::live::Engine;
@@ -1262,8 +1270,8 @@ mod tests {
     #[test]
     fn the_table_is_complete_and_unambiguous() {
         let names: Vec<&str> = Engine::ALL.iter().map(|e| e.as_str()).collect();
-        // New rows go after these three; their order is what help shows.
-        assert_eq!(names[..3], ["codex", "claude", "demo"]);
+        // Vendors first, then the demo; this order is what help shows.
+        assert_eq!(names, ["codex", "claude", "opencode", "demo"]);
         for engine in Engine::ALL {
             assert_eq!(Engine::parse(engine.as_str()), Some(*engine));
             assert!(engine.provider().modes.iter().all(|m| !m.is_empty()));

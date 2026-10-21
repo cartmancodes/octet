@@ -1,9 +1,625 @@
-//! opencode launch configuration: its arguments, the agents that carry
-//! Octet's permission modes, and the environment that starts it.
-#![expect(dead_code, reason = "used by the protocol in the next task")]
-use super::{Config, Mode};
-use serde_json::{Value, value::RawValue};
-use std::ffi::OsString;
+//! opencode over the Agent Client Protocol (`opencode acp`): its row, the
+//! launch configuration (its arguments, the agents that carry Octet's
+//! permission modes, and the environment that starts it), the handshake, the
+//! model catalog and turns.
+use super::{
+    BoxFuture, Channels, Config, DriverError, Event, ImageAttachment, Limits, Mode, ModelInfo,
+    Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
+    activity::one_line,
+    check_inline, limited,
+    protocol::{Core, Phase, Protocol},
+    short, valid_identifier,
+};
+use serde_json::{Value, json, value::RawValue};
+use std::{collections::HashMap, ffi::OsString, future::Future, path::Path, time::Duration};
+
+/// opencode's row in the provider table.
+pub(super) const PROVIDER: Provider = Provider {
+    name: "opencode",
+    title: "opencode",
+    default_binary: "opencode",
+    offline: false,
+    modes: [
+        "opencode asks before edits, commands and other actions (agent octet-ask)",
+        "Edits proceed; commands and other actions ask (agent octet-accept-edits)",
+        "opencode's own permission settings decide (agent build; its defaults ask for nothing)",
+        "No permission checks at all (agent octet-full-access)",
+    ],
+    steer: false,
+    inline_images: true,
+    effort_live: false,
+    efforts: &[],
+    // A placeholder until it is timed against the real CLI.
+    shutdown_grace: Duration::from_millis(500),
+    lists_models: true,
+    launch_args: <OpencodeProtocol as Protocol>::launch_args,
+    launch_env,
+    start,
+};
+
+fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result<(), String>> {
+    Box::pin(async move { super::driver::run::<OpencodeProtocol>(config, limits, channels).await })
+}
+
+/// The most tool calls one turn remembers the names of.
+const MAX_TOOLS: usize = 256;
+/// The most models one catalog keeps.
+const MAX_MODELS: usize = 256;
+
+/// What a reply from opencode answers: one of Octet's own requests.
+enum Outstanding {
+    Initialize,
+    /// `session/new`, `session/resume` or `session/fork`, with the session a
+    /// resume names, which its reply need not repeat.
+    Open(Option<String>),
+    /// The model the user asked for, set after the session opens.
+    SetModel,
+    /// The agent that carries this mode, set as the handshake's last step.
+    SetMode(Mode),
+    /// `session/prompt`: its reply ends the turn.
+    Prompt,
+}
+
+/// opencode's per-connection state: Octet's requests awaiting replies, the
+/// session's model and agent as opencode last reported them, and the turn's
+/// tool calls.
+#[derive(Default)]
+pub(super) struct OpencodeProtocol {
+    /// Octet's last wire request ID.
+    next_id: u64,
+    requests: HashMap<u64, Outstanding>,
+    /// A `session/cancel` was sent this turn. opencode ends a cancelled
+    /// prompt with `end_turn`, so this is what makes it an interruption.
+    cancel_sent: bool,
+    /// The session's model (`currentValue` of its `model` option).
+    model: Option<String>,
+    /// The session's agent (`currentValue` of its `mode` option).
+    agent: Option<String>,
+    /// Each tool call's name and target from its first frame, this turn.
+    tools: HashMap<String, (String, String)>,
+}
+
+impl Protocol for OpencodeProtocol {
+    fn launch_args(config: &Config) -> Vec<OsString> {
+        launch_args(config)
+    }
+
+    fn answer(wire: &Value, allow: bool) -> Value {
+        answer_wire(wire, allow)
+    }
+
+    /// Only frames for this session count: another session's chatter is
+    /// not progress.
+    fn is_progress(&self, core: &Core, frame: &Value) -> bool {
+        frame
+            .pointer("/params/sessionId")
+            .and_then(Value::as_str)
+            .is_none_or(|id| id == core.session)
+    }
+
+    fn turn_started(&mut self) {
+        self.cancel_sent = false;
+        self.tools.clear();
+    }
+
+    /// Says when the user's `OPENCODE_CONFIG_CONTENT` had to be replaced,
+    /// then sends `initialize`, offering no client capabilities.
+    async fn initialize(&mut self, core: &mut Core) -> Result<(), DriverError> {
+        let user = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+        if let Some(notice) = launch_env_from(&core.config, user.as_deref()).1 {
+            core.emit(Event::Notice(notice))?;
+        }
+        let params = json!({"protocolVersion": 1, "clientCapabilities": {}});
+        self.request(core, Outstanding::Initialize, "initialize", params)
+            .await
+    }
+
+    /// Images go inline as base64 blocks after the text, read now; an image
+    /// that cannot be read fails the turn.
+    async fn send_prompt(
+        &mut self,
+        core: &mut Core,
+        text: &str,
+        images: &[ImageAttachment],
+    ) -> Result<(), DriverError> {
+        let mut prompt = vec![json!({"type": "text", "text": text})];
+        let mut encoded = Vec::with_capacity(images.len());
+        for image in images {
+            // A file swapped for a FIFO, or on a stalled mount, must not hold
+            // the session: cancel and stop wait while this runs.
+            match tokio::time::timeout(core.limits.image_read, image.read_base64()).await {
+                Ok(Ok(data)) => encoded.push((image, data)),
+                Ok(Err(error)) => return fail_turn(core, error.to_string()),
+                Err(_) => {
+                    return fail_turn(
+                        core,
+                        format!(
+                            "Reading {} took longer than {}; the prompt was not sent",
+                            image.name,
+                            super::driver::seconds(core.limits.image_read)
+                        ),
+                    );
+                }
+            }
+        }
+        // Files can change after they were attached; check what is sent.
+        let sizes = encoded
+            .iter()
+            .map(|(image, data)| (image.name.as_str(), data.len() as u64));
+        if let Err(error) = check_inline(PROVIDER.title, sizes) {
+            return fail_turn(core, error.to_string());
+        }
+        for (image, data) in encoded {
+            prompt.push(json!({"type": "image", "mimeType": image.media_type, "data": data}));
+        }
+        let params = json!({"sessionId": core.session, "prompt": prompt});
+        self.request(core, Outstanding::Prompt, "session/prompt", params)
+            .await
+    }
+
+    /// Not offered yet: the turn ends at once, failed, saying so.
+    fn send_skill(
+        &mut self,
+        core: &mut Core,
+        _name: &str,
+        _path: Option<&Path>,
+        _args: &str,
+        _context: Option<&str>,
+    ) -> impl Future<Output = Result<(), DriverError>> + Send {
+        std::future::ready(fail_turn(
+            core,
+            "Octet cannot run opencode skills yet".to_owned(),
+        ))
+    }
+
+    /// Not offered yet: the turn ends at once, failed, saying so.
+    fn compact(&mut self, core: &mut Core) -> impl Future<Output = Result<(), DriverError>> + Send {
+        std::future::ready(fail_turn(
+            core,
+            "Octet cannot compact an opencode session yet".to_owned(),
+        ))
+    }
+
+    /// Sends the `session/cancel` notification. opencode then ends the
+    /// prompt with `end_turn`, which this turn reads as interrupted.
+    async fn interrupt(&mut self, core: &mut Core) -> Result<(), DriverError> {
+        self.cancel_sent = true;
+        core.send(json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": core.session},
+        }))
+        .await
+    }
+
+    /// Live switches are not offered yet: the mode stays as it is, and the
+    /// interface is told so. Nothing is sent, so the work is done at once.
+    fn set_mode(
+        &mut self,
+        core: &mut Core,
+        _target: Mode,
+    ) -> impl Future<Output = Result<(), DriverError>> + Send {
+        let refused = core
+            .emit(Event::Notice(format!(
+                "Octet cannot switch opencode's mode in a running session yet; it stays {}",
+                core.mode.label()
+            )))
+            .and_then(|()| core.emit(Event::ModeChanged(core.mode)));
+        std::future::ready(refused)
+    }
+
+    async fn on_frame(&mut self, core: &mut Core, v: Value) -> Result<(), DriverError> {
+        let method = v["method"].as_str().unwrap_or("");
+        if method.is_empty() {
+            return self.response(core, &v).await;
+        }
+        if v.get("id").is_some() {
+            return server_request(core, &v).await;
+        }
+        let this_session = !core.session.is_empty()
+            && v.pointer("/params/sessionId").and_then(Value::as_str)
+                == Some(core.session.as_str());
+        if method != "session/update" || !this_session {
+            return Ok(());
+        }
+        let update = &v["params"]["update"];
+        match update["sessionUpdate"].as_str().unwrap_or("") {
+            "available_commands_update" => {
+                core.emit(Event::Skills(commands(&update["availableCommands"])))
+            }
+            // A resume replays the session's history before any prompt: it
+            // is not this turn's output.
+            _ if !core.phase.is_running() => Ok(()),
+            "agent_message_chunk" => match update["content"]["text"].as_str() {
+                Some(text) if update["content"]["type"] == "text" => {
+                    core.emit(Event::Text(text.into()))
+                }
+                _ => Ok(()),
+            },
+            "tool_call" | "tool_call_update" => self.tool(core, update),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl OpencodeProtocol {
+    /// Sends one of Octet's requests and records what its reply answers.
+    async fn request(
+        &mut self,
+        core: &Core,
+        kind: Outstanding,
+        method: &str,
+        params: Value,
+    ) -> Result<(), DriverError> {
+        self.next_id += 1;
+        self.requests.insert(self.next_id, kind);
+        core.send(json!({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params}))
+            .await
+    }
+
+    /// Sets the session's `option` to `value`.
+    async fn set_option(
+        &mut self,
+        core: &Core,
+        kind: Outstanding,
+        option: &str,
+        value: &str,
+    ) -> Result<(), DriverError> {
+        let params = json!({"sessionId": core.session, "configId": option, "value": value});
+        self.request(core, kind, "session/set_config_option", params)
+            .await
+    }
+
+    /// Replies to Octet's own requests, matched by the request they answer.
+    async fn response(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
+        let id = v["id"].as_u64();
+        let Some(kind) = id.and_then(|id| self.requests.remove(&id)) else {
+            // A reply to a request not yet sent, while connecting, means the
+            // handshake is out of order; a repeated reply is ignored.
+            if !core.phase.is_ready() && id.is_some_and(|id| id > self.next_id) {
+                return Err("Unexpected protocol initialization order".into());
+            }
+            return Ok(());
+        };
+        match kind {
+            Outstanding::Initialize => self.handshaken(core, v).await,
+            Outstanding::Open(resumed) => self.opened(core, v, resumed).await,
+            Outstanding::SetModel => self.model_set(core, v).await,
+            Outstanding::SetMode(target) => self.mode_set(core, v, target),
+            Outstanding::Prompt => self.prompt_ended(core, v),
+        }
+    }
+
+    /// The handshake's reply: open, resume or fork the session. A probe
+    /// opens a new one, since it only reads the catalog.
+    async fn handshaken(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
+        if let Some(error) = v.get("error") {
+            return Err(format!("opencode initialization failed: {}", error_text(error)).into());
+        }
+        core.phase = Phase::Handshaken;
+        let config = &core.config;
+        let mut params = json!({"cwd": config.cwd, "mcpServers": []});
+        let (method, resumed) = match &config.resume {
+            Some(id) if !config.catalog_only => {
+                params["sessionId"] = json!(id);
+                if config.fork {
+                    ("session/fork", None)
+                } else {
+                    ("session/resume", Some(id.clone()))
+                }
+            }
+            _ => ("session/new", None),
+        };
+        self.request(core, Outstanding::Open(resumed), method, params)
+            .await
+    }
+
+    /// The session is open: its catalog goes out, then the model the user
+    /// asked for (when it is not already current) and the mode's agent.
+    async fn opened(
+        &mut self,
+        core: &mut Core,
+        v: &Value,
+        resumed: Option<String>,
+    ) -> Result<(), DriverError> {
+        if let Some(error) = v.get("error") {
+            return Err(
+                format!("opencode could not open the session: {}", error_text(error)).into(),
+            );
+        }
+        let result = &v["result"];
+        core.session = result["sessionId"]
+            .as_str()
+            .filter(|id| valid_identifier(id))
+            .map(str::to_owned)
+            .or(resumed)
+            .ok_or("opencode could not open the session")?;
+        self.note_options(&result["configOptions"]);
+        core.emit(Event::Models(catalog(&result["configOptions"])))?;
+        if core.config.catalog_only {
+            // A probe takes the models now.
+            return core.emit(Event::Ready {
+                session: String::new(),
+            });
+        }
+        match core.config.model.clone() {
+            Some(model) if self.model.as_deref() != Some(model.as_str()) => {
+                self.set_option(core, Outstanding::SetModel, "model", &model)
+                    .await
+            }
+            _ => self.set_agent(core).await,
+        }
+    }
+
+    /// The handshake's last step: the agent that carries the session's mode.
+    async fn set_agent(&mut self, core: &Core) -> Result<(), DriverError> {
+        let target = core.mode;
+        self.set_option(core, Outstanding::SetMode(target), "mode", agent(target))
+            .await
+    }
+
+    /// The model's reply. A refusal is reported and the session keeps
+    /// opencode's model; either way the agent is set next.
+    async fn model_set(&mut self, core: &Core, v: &Value) -> Result<(), DriverError> {
+        let requested = core.config.model.clone().unwrap_or_default();
+        if let Some(error) = v.get("error") {
+            core.emit(Event::Notice(format!(
+                "opencode did not switch to model {}: {}",
+                short(&requested),
+                error_text(error)
+            )))?;
+        } else {
+            // A reply without the options still confirms the request.
+            self.model = Some(requested).filter(|model| valid_identifier(model));
+            self.note_options(&v["result"]["configOptions"]);
+        }
+        self.set_agent(core).await
+    }
+
+    /// The agent's reply ends the handshake: ready, with the model and the
+    /// mode opencode reports. When opencode refused the agent, the mode is
+    /// the agent the session already had, so the header never shows a
+    /// stricter mode than opencode is in.
+    fn mode_set(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
+        if let Some(error) = v.get("error") {
+            core.emit(Event::Notice(format!(
+                "opencode did not switch to {}: {}",
+                target.label(),
+                error_text(error)
+            )))?;
+        } else {
+            // A reply without the options still confirms the request.
+            self.agent = Some(agent(target).to_owned());
+            self.note_options(&v["result"]["configOptions"]);
+        }
+        // Live switches, which reply once the session is ready, are not sent yet.
+        if core.phase.is_ready() {
+            return Ok(());
+        }
+        core.phase = Phase::Idle;
+        core.emit(Event::Ready {
+            session: core.session.clone(),
+        })?;
+        if let Some(model) = &self.model {
+            core.emit(Event::ModelSelected(model.clone()))?;
+        }
+        let reported = self
+            .agent
+            .as_deref()
+            .map(|agent| (mode_of(agent), limited(agent)));
+        core.adopt_mode(reported)
+    }
+
+    /// Records the model and agent `config_options` reports as current.
+    fn note_options(&mut self, config_options: &Value) {
+        if let Some(model) = current(config_options, "model") {
+            self.model = Some(model.to_owned());
+        }
+        if let Some(agent) = current(config_options, "mode") {
+            self.agent = Some(agent.to_owned());
+        }
+    }
+
+    /// The prompt's reply ends the turn, with its token count when it has one.
+    fn prompt_ended(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
+        if !core.phase.is_running() {
+            return Ok(());
+        }
+        self.tools.clear();
+        if let Some(error) = v.get("error") {
+            return core.finish_turn(Outcome::Failed, Some(error_text(error)));
+        }
+        let result = &v["result"];
+        if let Some(total) = result.pointer("/usage/totalTokens").and_then(Value::as_u64) {
+            core.emit(Event::Usage(format!("{total} tokens")))?;
+        }
+        let outcome = match result["stopReason"].as_str().unwrap_or("unknown") {
+            "end_turn" if self.cancel_sent => Outcome::Interrupted,
+            "end_turn" => Outcome::Completed,
+            "cancelled" => Outcome::Interrupted,
+            other => Outcome::Other(short(other)),
+        };
+        core.finish_turn(outcome, None)
+    }
+
+    /// A `tool_call` or `tool_call_update`: the call as it now stands. Its
+    /// name is the title of its first frame; its target is the first path it
+    /// touches, else its command.
+    fn tool(&mut self, core: &Core, update: &Value) -> Result<(), DriverError> {
+        let id = one_line(update["toolCallId"].as_str().unwrap_or_default());
+        let target = update
+            .pointer("/locations/0/path")
+            .and_then(Value::as_str)
+            .or_else(|| update.pointer("/rawInput/command").and_then(Value::as_str))
+            .map(one_line)
+            .filter(|target| !target.is_empty());
+        let (name, target) = if let Some((name, known)) = self.tools.get(&id) {
+            (name.clone(), target.unwrap_or_else(|| known.clone()))
+        } else {
+            let name = update["title"]
+                .as_str()
+                .map(one_line)
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| "tool".to_owned());
+            let target = target.unwrap_or_default();
+            if !id.is_empty() && self.tools.len() < MAX_TOOLS {
+                self.tools
+                    .insert(id.clone(), (name.clone(), target.clone()));
+            }
+            (name, target)
+        };
+        let phase = match update["status"].as_str() {
+            Some("completed") => ToolPhase::Done,
+            Some("failed") => ToolPhase::Failed,
+            _ => ToolPhase::Running,
+        };
+        core.emit(Event::Tool(ToolCall {
+            id,
+            name,
+            target,
+            phase,
+            detail: content_text(&update["content"]),
+        }))
+    }
+}
+
+/// A request from opencode. Approvals are not shown yet, so every request
+/// gets the stray reply: a permission is rejected, anything else refused.
+async fn server_request(core: &Core, v: &Value) -> Result<(), DriverError> {
+    if let Some(reply) = opencode_stray_reply(v) {
+        core.send(reply).await?;
+        let method = v["method"].as_str().unwrap_or_default();
+        core.emit(Event::Notice(format!(
+            "Request declined: {}",
+            short(method)
+        )))?;
+    }
+    Ok(())
+}
+
+/// The reply to a `session/request_permission`: the request's own
+/// `allow_once` or `reject_once` option, never one that allows for longer.
+fn answer_wire(wire: &Value, allow: bool) -> Value {
+    let (kind, fallback) = if allow {
+        ("allow_once", "once")
+    } else {
+        ("reject_once", "reject")
+    };
+    let option = wire
+        .pointer("/params/options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|option| option["kind"] == kind)
+        .and_then(|option| option["optionId"].as_str())
+        .unwrap_or(fallback);
+    json!({
+        "jsonrpc": "2.0",
+        "id": wire["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": option}},
+    })
+}
+
+/// opencode counterpart of `codex_stray_reply`: the reply to a request Octet
+/// will not put in front of the user. A permission request is rejected with
+/// its `reject_once` option; anything else (`fs/*` and `terminal/*`
+/// included, which Octet does not offer) is an unsupported method. A frame
+/// that is not a request gets none.
+pub fn opencode_stray_reply(value: &Value) -> Option<Value> {
+    let id = value.get("id")?;
+    let method = value.get("method")?.as_str()?;
+    Some(if method == "session/request_permission" {
+        answer_wire(value, false)
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32601, "message": format!("Octet does not support {}", short(method))},
+        })
+    })
+}
+
+/// Ends a turn that could not be sent, keeping the session.
+fn fail_turn(core: &mut Core, message: String) -> Result<(), DriverError> {
+    core.finish_turn(Outcome::Failed, Some(message))
+}
+
+/// An ACP error as a person should read it: its message, else the error
+/// itself, bounded.
+fn error_text(error: &Value) -> String {
+    match error["message"].as_str() {
+        Some(message) => limited(message),
+        None => limited(&error.to_string()),
+    }
+}
+
+/// The session option `id` in `config_options`, or `Null`.
+fn option<'a>(config_options: &'a Value, id: &str) -> &'a Value {
+    config_options
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|option| option["id"] == id)
+        .unwrap_or(&Value::Null)
+}
+
+/// The current value of the option `id`, when it is one Octet can use.
+fn current<'a>(config_options: &'a Value, id: &str) -> Option<&'a str> {
+    option(config_options, id)["currentValue"]
+        .as_str()
+        .filter(|value| valid_identifier(value))
+}
+
+/// The `model` option's choices as the catalog: each `value` is both what
+/// selects the model and its ID, and `name` is opencode's display name.
+/// Values Octet cannot use are dropped, and the list is bounded.
+fn catalog(config_options: &Value) -> Vec<ModelInfo> {
+    option(config_options, "model")["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|choice| {
+            let value = choice["value"].as_str().filter(|v| valid_identifier(v))?;
+            let name = choice["name"]
+                .as_str()
+                .filter(|name| !name.is_empty() && name.len() <= 512)
+                .unwrap_or(value);
+            Some(ModelInfo {
+                selection: value.to_owned(),
+                id: Some(value.to_owned()),
+                name: name.to_owned(),
+                description: String::new(),
+            })
+        })
+        .take(MAX_MODELS)
+        .collect()
+}
+
+/// `availableCommands` as skills: each with a usable name and its
+/// description, bounded.
+fn commands(list: &Value) -> Vec<SkillInfo> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|command| {
+            SkillInfo::from_json(
+                &json!({"name": command["name"], "description": command["description"]}),
+            )
+        })
+        .take(super::MAX_SKILLS)
+        .collect()
+}
+
+/// A tool call's `content` as text: the text of each of its blocks.
+fn content_text(content: &Value) -> String {
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block.pointer("/content/text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// What Octet says when `OPENCODE_CONFIG_CONTENT` is not a JSON object and
 /// has to be replaced.
@@ -199,7 +815,7 @@ mod tests {
 
     /// A configuration in `/w` with the default switches.
     fn config() -> Config {
-        Config::new(Engine::CLAUDE, "opencode", "/w")
+        Config::new(Engine::OPENCODE, "opencode", "/w")
     }
 
     /// The value of `name` in `env`, if it is set.
@@ -207,6 +823,112 @@ mod tests {
         env.iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.to_string_lossy().into_owned())
+    }
+
+    /// `configOptions` whose `model` option offers `choices`.
+    fn model_options(choices: &Value) -> Value {
+        json!([
+            {"id": "mode", "currentValue": "build", "options": [{"value": "build", "name": "build"}]},
+            {"id": "model", "currentValue": "a/b", "options": choices},
+        ])
+    }
+
+    #[test]
+    fn the_catalog_is_the_model_options_values_and_names() {
+        let models = catalog(&model_options(&json!([
+            {"value": "opencode/free", "name": "OpenCode/Free"},
+            {"value": "bad\u{1b}id", "name": "Bad"},
+            {"value": "x".repeat(257), "name": "Long"},
+            {"value": "openai/gpt", "name": ""},
+            {"name": "No value"},
+        ])));
+        assert_eq!(
+            models,
+            [
+                ModelInfo {
+                    selection: "opencode/free".into(),
+                    id: Some("opencode/free".into()),
+                    name: "OpenCode/Free".into(),
+                    description: String::new(),
+                },
+                ModelInfo {
+                    selection: "openai/gpt".into(),
+                    id: Some("openai/gpt".into()),
+                    name: "openai/gpt".into(),
+                    description: String::new(),
+                },
+            ]
+        );
+        let many: Vec<Value> = (0..300)
+            .map(|n| json!({"value": format!("p/m{n}"), "name": "M"}))
+            .collect();
+        assert_eq!(catalog(&model_options(&Value::Array(many))).len(), 256);
+        assert!(catalog(&json!([{"id": "mode", "options": []}])).is_empty());
+        assert!(catalog(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn current_values_are_read_from_their_option() {
+        let options = model_options(&json!([]));
+        assert_eq!(current(&options, "model"), Some("a/b"));
+        assert_eq!(current(&options, "mode"), Some("build"));
+        assert_eq!(current(&options, "effort"), None);
+    }
+
+    #[test]
+    fn opencode_stray_requests_are_refused() {
+        for method in ["fs/read_text_file", "terminal/create", "x/unknown"] {
+            let reply =
+                opencode_stray_reply(&json!({"jsonrpc":"2.0","id":4,"method":method})).unwrap();
+            assert_eq!(reply["jsonrpc"], "2.0");
+            assert_eq!(reply["id"], 4);
+            assert_eq!(reply["error"]["code"], -32601);
+            assert_eq!(
+                reply["error"]["message"],
+                format!("Octet does not support {method}")
+            );
+        }
+        let options = json!([
+            {"optionId": "yes", "kind": "allow_once"},
+            {"optionId": "ever", "kind": "allow_always"},
+            {"optionId": "no", "kind": "reject_once"},
+        ]);
+        let permission = json!({"jsonrpc":"2.0","id":5,"method":"session/request_permission",
+            "params":{"sessionId":"s","options":options}});
+        let reply = opencode_stray_reply(&permission).unwrap();
+        assert_eq!(
+            reply,
+            json!({"jsonrpc":"2.0","id":5,"result":{"outcome":{"outcome":"selected","optionId":"no"}}})
+        );
+        // Notifications and replies are not requests: they get no reply.
+        assert_eq!(
+            opencode_stray_reply(&json!({"method":"session/update"})),
+            None
+        );
+        assert_eq!(opencode_stray_reply(&json!({"id":1,"result":{}})), None);
+    }
+
+    #[test]
+    fn an_answer_picks_the_requests_once_option_never_always() {
+        let options = json!([
+            {"optionId": "ever", "kind": "allow_always"},
+            {"optionId": "yes", "kind": "allow_once"},
+            {"optionId": "no", "kind": "reject_once"},
+        ]);
+        let wire = json!({"id": 9, "params": {"options": options}});
+        let chosen = |allow| answer_wire(&wire, allow)["result"]["outcome"]["optionId"].clone();
+        assert_eq!(chosen(true), "yes");
+        assert_eq!(chosen(false), "no");
+        // A request without options gets opencode's usual IDs.
+        let bare = json!({"id": 9, "params": {}});
+        assert_eq!(
+            answer_wire(&bare, true)["result"]["outcome"]["optionId"],
+            "once"
+        );
+        assert_eq!(
+            answer_wire(&bare, false)["result"]["outcome"]["optionId"],
+            "reject"
+        );
     }
 
     #[test]

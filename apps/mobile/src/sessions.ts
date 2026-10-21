@@ -25,7 +25,7 @@ export function clipLabel(text: string, max = 120): string {
   return `${text.slice(0, end >= 0xd800 && end <= 0xdbff ? max - 2 : max - 1)}…`;
 }
 
-const ENGINE_NAMES = { claude: "Claude", codex: "Codex", demo: "Demo" } as const;
+const ENGINE_NAMES = { claude: "Claude", codex: "Codex", demo: "Demo", opencode: "opencode" } as const;
 
 /** An engine as the app names it. */
 export const engineName = (engine: Engine): string => ENGINE_NAMES[engine];
