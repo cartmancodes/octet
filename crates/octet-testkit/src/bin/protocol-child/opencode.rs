@@ -100,6 +100,19 @@ pub(crate) fn session_command() {
     }
 }
 
+/// `OPENCODE_GATED`'s gate: says the request for `option` came, then waits
+/// (at most ten seconds) for the test to release it.
+fn gate(option: &str) {
+    fs::write(format!("asked-{option}"), "").unwrap();
+    let release = format!("release-{option}");
+    for _ in 0..1000 {
+        if fs::exists(&release).unwrap_or(false) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A `tool_call` update for the pending `echo fixture` command `call`.
 fn tool_call(sid: &str, call: &str) -> Value {
     acp_update(
@@ -184,11 +197,17 @@ impl OpencodeFixture {
     /// except the one right after it.
     fn set_config_option(&mut self, v: &Value) {
         let value = v["params"]["value"].as_str().unwrap_or("");
+        if let Some(option @ ("effort" | "mode")) = v["params"]["configId"].as_str()
+            && self.model == scenario::OPENCODE_GATED
+        {
+            gate(option);
+        }
         match v["params"]["configId"].as_str() {
             Some("model") => {
                 value.clone_into(&mut self.model);
                 // A model's effort starts at its default, as in opencode.
-                self.effort = (value == MODEL_FREE).then(|| FREE_EFFORTS[0].to_owned());
+                self.effort = (value == MODEL_FREE || value == scenario::OPENCODE_GATED)
+                    .then(|| FREE_EFFORTS[0].to_owned());
                 if value == scenario::OPENCODE_REJECT_MODE && !self.rejects_modes {
                     self.rejects_modes = true;
                     self.free_mode_switch = true;

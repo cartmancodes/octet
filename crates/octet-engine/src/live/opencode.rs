@@ -101,6 +101,12 @@ struct EffortRequest {
     handshake: bool,
 }
 
+/// An effort level asked for while the session connects.
+struct Wanted {
+    /// The level; `None` is the model's default.
+    level: Option<String>,
+}
+
 /// What Octet knows of the current model's effort levels.
 #[derive(Default)]
 enum Efforts {
@@ -188,6 +194,13 @@ pub(super) struct OpencodeProtocol {
     probe_wait: Option<Instant>,
     /// The last command list holds `compact`.
     compact_offered: bool,
+    /// The handshake's effort step has run: a level asked for before the
+    /// session is ready no longer reaches it.
+    effort_stepped: bool,
+    /// The newest level asked for after the effort step and before the
+    /// session is ready. It is set through the live path once the
+    /// handshake ends, and no handshake confirmation is shown over it.
+    effort_wanted: Option<Wanted>,
 }
 
 impl Protocol for OpencodeProtocol {
@@ -326,8 +339,13 @@ impl Protocol for OpencodeProtocol {
         effort: Option<String>,
     ) -> Result<bool, DriverError> {
         if !core.phase.is_ready() {
-            // The handshake's effort step takes it.
-            core.config.effort = effort;
+            if self.effort_stepped {
+                // Set once the handshake ends; the newest request wins.
+                self.effort_wanted = Some(Wanted { level: effort });
+            } else {
+                // The handshake's effort step takes it.
+                core.config.effort = effort;
+            }
             return Ok(true);
         }
         let option = self.effort.listed();
@@ -483,6 +501,7 @@ impl OpencodeProtocol {
     /// does not take is dropped with a notice; effort is not a safety
     /// property, so the session carries on either way.
     async fn effort_step(&mut self, core: &mut Core) -> Result<(), DriverError> {
+        self.effort_stepped = true;
         if let Some(level) = core.config.effort.clone() {
             let current = self
                 .effort
@@ -517,7 +536,8 @@ impl OpencodeProtocol {
 
     /// An effort reply. A confirmation records the level and tells the
     /// interface; a refusal is reported and the interface goes back to the
-    /// level in force. The handshake then sets the agent.
+    /// level in force. The handshake then sets the agent; while a newer
+    /// level waits for the handshake's end, the interface keeps showing it.
     async fn effort_set(
         &mut self,
         core: &mut Core,
@@ -533,11 +553,15 @@ impl OpencodeProtocol {
             if request.handshake {
                 core.config.effort = None;
             }
-            core.emit(Event::Effort(core.config.effort.clone()))?;
+            if !request.handshake || self.effort_wanted.is_none() {
+                core.emit(Event::Effort(core.config.effort.clone()))?;
+            }
         } else {
             self.note_options(&v["result"]["configOptions"]);
             core.config.effort.clone_from(&request.level);
-            core.emit(Event::Effort(request.level.clone()))?;
+            if !request.handshake || self.effort_wanted.is_none() {
+                core.emit(Event::Effort(request.level.clone()))?;
+            }
             if !request.handshake {
                 core.emit(Event::Notice(super::driver::effort_notice(
                     request.level.as_deref(),
@@ -594,7 +618,7 @@ impl OpencodeProtocol {
             Outstanding::Initialize => self.handshaken(core, v).await,
             Outstanding::Open(resumed) => self.opened(core, v, resumed).await,
             Outstanding::SetModel => self.model_set(core, v).await,
-            Outstanding::SetMode(target) => self.mode_set(core, v, target),
+            Outstanding::SetMode(target) => self.mode_set(core, v, target).await,
             Outstanding::Switch(switch) => self.switched(core, v, switch),
             Outstanding::SetEffort(request) => self.effort_set(core, v, request).await,
             Outstanding::Prompt => self.prompt_ended(core, v),
@@ -691,10 +715,17 @@ impl OpencodeProtocol {
     }
 
     /// The agent's reply ends the handshake: ready, with the model and the
-    /// mode. An agent opencode refuses, or a reply naming another agent,
-    /// stops the session: whatever agent it kept may ask for less than the
-    /// mode the user chose, so it must never act under it.
-    fn mode_set(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
+    /// mode, after setting a level the user asked for meanwhile (when it is
+    /// not the one opencode confirmed). An agent opencode refuses, or a reply
+    /// naming another agent, stops the session: whatever agent it kept may
+    /// ask for less than the mode the user chose, so it must never act
+    /// under it.
+    async fn mode_set(
+        &mut self,
+        core: &mut Core,
+        v: &Value,
+        target: Mode,
+    ) -> Result<(), DriverError> {
         let wanted = agent(target);
         let refusal = self.agent_refusal(v, target).map(|refusal| match refusal {
             Refusal::Error(message) => message,
@@ -710,6 +741,11 @@ impl OpencodeProtocol {
         }
         self.agent = Some(wanted.to_owned());
         core.phase = Phase::Idle;
+        if let Some(Wanted { level }) = self.effort_wanted.take()
+            && level != core.config.effort
+        {
+            <Self as Protocol>::set_effort(self, core, level).await?;
+        }
         core.emit(Event::Ready {
             session: core.session.clone(),
         })?;

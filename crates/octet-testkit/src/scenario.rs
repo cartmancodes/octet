@@ -94,6 +94,11 @@ pub const OPENCODE_REPLY: &str = "Hello opencode";
 /// opencode model value: once set, every later mode switch is refused with
 /// "unknown agent" (the first one, right after the model, still succeeds).
 pub const OPENCODE_REJECT_MODE: &str = "reject-mode";
+/// opencode model value: offers the same effort levels as the free model,
+/// and each `effort` or `mode` request writes `asked-<option>` in the
+/// working directory, then waits for `release-<option>` there before its
+/// reply, so a test can act while the request is in flight.
+pub const OPENCODE_GATED: &str = "gated-options";
 /// opencode: the name of the skill the fake lists as a slash command.
 pub const OPENCODE_SKILL: &str = "fixture-opencode-skill";
 

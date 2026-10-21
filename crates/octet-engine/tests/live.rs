@@ -2899,6 +2899,93 @@ async fn opencode_effort_changes_live() {
     assert_eq!(echo["effort"], "low", "{echo}");
     stop(&handle, task).await;
 }
+/// Waits up to five seconds for `path` to exist.
+async fn wait_for_file(path: &std::path::Path) {
+    timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} did not appear", path.display()));
+}
+/// An opencode session on the gated model (see `scenario::OPENCODE_GATED`)
+/// asking for effort `high` at launch, in a fresh directory.
+fn opencode_gated(name: &str) -> (octet_testkit::TempDir, Config) {
+    let dir = octet_testkit::TempDir::new(name);
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    c.model = Some(scenario::OPENCODE_GATED.into());
+    c.effort = Some("high".into());
+    (dir, c)
+}
+/// The effort levels shown up to the session's first `ModeChanged`, which
+/// ends the handshake, and then up to the next `Effort` event.
+async fn efforts_shown(events: &mut mpsc::Receiver<Event>) -> Vec<Option<String>> {
+    let mut shown = Vec::new();
+    loop {
+        match next(events).await {
+            Event::Effort(level) => shown.push(level),
+            Event::ModeChanged(_) => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let Event::Effort(level) = wait_for(events, |e| matches!(e, Event::Effort(_))).await else {
+        unreachable!()
+    };
+    shown.push(level);
+    shown
+}
+#[tokio::test]
+async fn opencode_effort_asked_while_the_handshake_sets_one_wins() {
+    let (dir, c) = opencode_gated("octet-live-opencode-effort-in-flight");
+    let (handle, mut events, task) = spawn(c);
+    // The handshake's `high` is in flight when the user asks for `max`.
+    wait_for_file(&dir.path().join("asked-effort")).await;
+    handle.send(Command::SetEffort(Some("max".into()))).unwrap();
+    std::fs::write(dir.path().join("release-effort"), "").unwrap();
+    std::fs::write(dir.path().join("release-mode"), "").unwrap();
+    // Its confirmation of `high` never shows over the newer `max`.
+    assert_eq!(efforts_shown(&mut events).await, [Some("max".to_owned())]);
+    let notice = next(&mut events).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "Reasoning effort: max (from now on)"),
+        "{notice:?}"
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(
+        echo["efforts"],
+        serde_json::json!(["high", "max"]),
+        "{echo}"
+    );
+    assert_eq!(echo["effort"], "max", "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_asked_after_the_handshake_set_one_is_still_sent() {
+    let (dir, c) = opencode_gated("octet-live-opencode-effort-after-step");
+    let (handle, mut events, task) = spawn(c);
+    // The handshake has set `high` and waits on the agent.
+    wait_for_file(&dir.path().join("asked-effort")).await;
+    std::fs::write(dir.path().join("release-effort"), "").unwrap();
+    wait_for_file(&dir.path().join("asked-mode")).await;
+    handle.send(Command::SetEffort(Some("max".into()))).unwrap();
+    std::fs::write(dir.path().join("release-mode"), "").unwrap();
+    assert_eq!(
+        efforts_shown(&mut events).await,
+        [Some("high".to_owned()), Some("max".to_owned())]
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(
+        echo["efforts"],
+        serde_json::json!(["high", "max"]),
+        "{echo}"
+    );
+    assert_eq!(echo["effort"], "max", "{echo}");
+    stop(&handle, task).await;
+}
 #[tokio::test]
 async fn opencode_effort_the_model_does_not_list_is_not_sent() {
     let mut c = opencode();
