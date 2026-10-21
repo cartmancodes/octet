@@ -22,8 +22,8 @@ struct Driver<P> {
     /// Turn commands the user cancelled before they started.
     gate: TurnGate,
     /// A turn command that arrived, while idle, with a mode switch waiting
-    /// for the vendor: it starts once the switch is confirmed, refused or
-    /// reported unconfirmed, so a switch sent while idle lands before the
+    /// for the vendor (see `must_hold`): it starts once the switch is
+    /// confirmed or refused, so a switch sent while idle lands before the
     /// next prompt. While one is held no other command is read, so the
     /// command queue's own bound (and its `Busy` refusal) still applies.
     held: Option<Held>,
@@ -155,10 +155,14 @@ impl<P: Protocol> Driver<P> {
 
     /// Whether `command` waits for the pending mode switch: a turn the
     /// session could start now, sent while the vendor has not answered a
-    /// switch. A busy session refuses it at once, as it would anyway.
+    /// switch, on a provider whose switch reaches only the next turn
+    /// (opencode applies it at the next prompt). Claude reads its input in
+    /// order, so its switch is applied before a prompt sent after it. A busy
+    /// session refuses the turn at once, as it would anyway.
     fn must_hold(&self, command: &Command) -> bool {
         command.starts_turn()
             && self.core.phase == Phase::Idle
+            && self.core.config.engine.provider().mode_applies_next_turn
             && self.protocol.mode_change_pending()
     }
 

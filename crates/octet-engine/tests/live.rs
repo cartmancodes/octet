@@ -638,6 +638,23 @@ async fn unconfirmed_claude_switch_times_out_then_applies_a_late_confirmation() 
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn a_claude_prompt_right_after_a_switch_is_not_held() {
+    // Claude reads its input in order, so the switch reaches it before the
+    // prompt: nothing waits for the (here 2.5 s late) confirmation.
+    let mut c = claude();
+    c.model = Some(scenario::LATE_MODE.into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::Auto)).unwrap();
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let first = wait_for(&mut events, |e| {
+        matches!(e, Event::Started | Event::ModeChanged(_) | Event::Notice(_))
+    })
+    .await;
+    assert!(matches!(first, Event::Started), "{first:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn demo_mode_switch_during_approval_keeps_the_dialog_open() {
     let mut c = config();
     c.engine = Engine::DEMO;

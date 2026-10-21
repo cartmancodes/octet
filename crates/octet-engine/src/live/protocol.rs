@@ -275,8 +275,9 @@ pub(crate) trait Protocol: Default + Send {
         true
     }
     /// A mode change is waiting for the vendor to confirm it. The driver
-    /// then refuses another switch and holds a turn sent while idle until
-    /// this is false, so the turn runs under the mode the header shows.
+    /// then refuses another switch and, for a provider whose mode applies
+    /// from the next turn, holds a turn sent while idle until this is false,
+    /// so the turn runs under the mode the header shows.
     fn mode_change_pending(&self) -> bool {
         false
     }
