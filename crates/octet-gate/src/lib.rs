@@ -1,6 +1,7 @@
 //! The protocol gate: drives a real vendor CLI through fixed scenarios and
 //! records contract evidence. Default replies are Octet's own
-//! (`octet_engine::live::{codex_stray_reply, claude_stray_reply}`).
+//! (`octet_engine::live::{codex_stray_reply, claude_stray_reply,
+//! opencode_stray_reply}`).
 #![forbid(unsafe_code)]
 
 use octet_proc::{Process, ProcessError, ProcessSender, ShutdownReport};
@@ -43,6 +44,11 @@ pub struct Evidence {
     pub failure_kind: Option<&'static str>,
     /// The vendor session ID, once reported.
     pub session_id: Option<String>,
+    /// Every opencode session the run opened, first to last, so the gate can
+    /// delete them from the user's history.
+    pub sessions: Vec<String>,
+    /// How each opencode prompt ended (its `stopReason`), first to last.
+    pub stop_reasons: Vec<String>,
     /// Context compactions the vendor reported.
     pub compact_boundaries: u64,
     /// Completed assistant messages.
@@ -59,6 +65,13 @@ impl Evidence {
         self.events += resumed.events;
         self.approval_requests += resumed.approval_requests;
         self.compact_boundaries += resumed.compact_boundaries;
+        self.stop_reasons
+            .extend(resumed.stop_reasons.iter().cloned());
+        for id in &resumed.sessions {
+            if !self.sessions.contains(id) {
+                self.sessions.push(id.clone());
+            }
+        }
     }
 }
 
@@ -141,6 +154,19 @@ impl GateProcess {
     pub fn record_user_question(&mut self) {
         self.evidence.user_questions += 1;
     }
+    /// Records a session the vendor opened: now the run's session.
+    pub fn record_session(&mut self, id: &str) {
+        self.evidence.session_id = Some(id.to_owned());
+        self.evidence.sessions.push(id.to_owned());
+    }
+    /// Records how an opencode prompt ended; the first few are kept.
+    pub fn record_stop_reason(&mut self, reason: &str) {
+        if self.evidence.stop_reasons.len() < 8 {
+            self.evidence
+                .stop_reasons
+                .push(reason.chars().take(64).collect());
+        }
+    }
     /// Records how the vendor failed the turn.
     pub fn record_failure(&mut self, kind: &'static str) {
         self.evidence.failure_kind = Some(kind);
@@ -178,12 +204,15 @@ impl GateProcess {
         self.count(&value);
         if self.trace {
             eprintln!(
-                "event id={:?} method={:?} type={:?} control={:?} status={:?}",
+                "event id={:?} method={:?} type={:?} control={:?} status={:?} update={:?}",
                 value.get("id"),
                 value.get("method").and_then(Value::as_str),
                 value.get("type").and_then(Value::as_str),
                 value.pointer("/request/subtype").and_then(Value::as_str),
-                value.pointer("/params/turn/status").and_then(Value::as_str)
+                value.pointer("/params/turn/status").and_then(Value::as_str),
+                value
+                    .pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
             );
         }
         Ok(value)
@@ -253,6 +282,44 @@ pub fn codex_fixture_allow(value: &Value, expected_cwd: &std::path::Path) -> Opt
         return None;
     }
     Some(json!({"id":value.get("id")?,"result":{"decision":"accept"}}))
+}
+
+/// The fixture write opencode asks to run, as its permission request
+/// shows it; `None` for any other request.
+fn opencode_fixture_command(value: &Value) -> Option<&str> {
+    if value.get("method")?.as_str()? != "session/request_permission" {
+        return None;
+    }
+    let call = value.pointer("/params/toolCall")?;
+    if call.get("kind")?.as_str()? != "execute" {
+        return None;
+    }
+    let command = call.pointer("/rawInput/command")?.as_str()?;
+    matches!(
+        command,
+        "printf READY > probe.out" | "printf 'READY' > probe.out"
+    )
+    .then_some(command)
+}
+
+/// Allows only the fixture write, with the request's own `allow_once`
+/// option, as Octet's allow does.
+pub fn opencode_fixture_allow(value: &Value) -> Option<Value> {
+    opencode_fixture_command(value)?;
+    let option = value
+        .pointer("/params/options")?
+        .as_array()?
+        .iter()
+        .find(|option| option["kind"] == "allow_once")?
+        .get("optionId")?;
+    Some(
+        json!({"jsonrpc":"2.0","id":value.get("id")?,"result":{"outcome":{"outcome":"selected","optionId":option}}}),
+    )
+}
+
+/// Whether `value` asks permission for the fixture write.
+pub fn opencode_is_fixture_request(value: &Value) -> bool {
+    opencode_fixture_command(value).is_some()
 }
 
 /// Answers a Codex question with each question's first option.

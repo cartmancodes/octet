@@ -5,14 +5,16 @@
 #![forbid(unsafe_code)]
 use octet_engine::live::{
     Config, Engine, claude_stray_reply, codex_stray_reply, launch_args, launch_env,
+    opencode_stray_reply,
 };
 use octet_gate::{
     Evidence, GateError, GateProcess, claude_fixture_allow, claude_fixture_hook_response,
     claude_fixture_mcp_response, claude_fixture_mcp_tool_allow, codex_fixture_allow,
-    codex_fixture_user_input,
+    codex_fixture_user_input, opencode_fixture_allow, opencode_is_fixture_request,
 };
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     env,
     ffi::OsString,
     fs,
@@ -22,7 +24,7 @@ use std::{
 use tokio::time::Instant;
 
 /// Every scenario the gate runs.
-const SCENARIOS: [&str; 14] = [
+const SCENARIOS: [&str; 15] = [
     "initialize",
     "simple",
     "interrupt",
@@ -37,6 +39,18 @@ const SCENARIOS: [&str; 14] = [
     "user-input",
     "tool-only",
     "failure",
+    "lockdown",
+];
+/// The scenarios opencode runs; `lockdown` is its alone.
+const OPENCODE_SCENARIOS: [&str; 8] = [
+    "initialize",
+    "simple",
+    "interrupt",
+    "approval-allow",
+    "approval-deny",
+    "resume",
+    "fork",
+    "lockdown",
 ];
 
 struct Opt {
@@ -82,9 +96,14 @@ fn options() -> Result<Opt, &'static str> {
     }
     let codex_only = ["user-input", "tool-only", "failure"];
     let claude_only = ["mcp", "hook"];
-    if engine == Engine::CODEX && claude_only.contains(&scenario.as_str())
-        || engine == Engine::CLAUDE && codex_only.contains(&scenario.as_str())
-    {
+    let supported = if engine == Engine::OPENCODE {
+        OPENCODE_SCENARIOS.contains(&scenario.as_str())
+    } else if engine == Engine::CODEX {
+        !claude_only.contains(&scenario.as_str()) && scenario != "lockdown"
+    } else {
+        !codex_only.contains(&scenario.as_str()) && scenario != "lockdown"
+    };
+    if !supported {
         return Err("scenario is unsupported by selected engine");
     }
     let binary = binary.unwrap_or_else(|| PathBuf::from(&name));
@@ -147,8 +166,9 @@ async fn version(binary: &Path) -> String {
 }
 
 /// Octet's own arguments and environment for this engine, plus what the
-/// scenario needs in the arguments: Claude's tool list and, for `mcp`, the
-/// fixture server.
+/// scenario needs: Claude's tool list and, for `mcp`, the fixture server;
+/// for opencode's `lockdown`, the user configuration file that allows the
+/// fixture command.
 fn vendor_launch(
     opt: &Opt,
     cwd: &Path,
@@ -160,7 +180,13 @@ fn vendor_launch(
         config.fork = opt.scenario == "fork";
     }
     let mut args = launch_args(&config);
-    let env = launch_env(&config);
+    let mut env = launch_env(&config);
+    if opt.engine == Engine::OPENCODE && opt.scenario == "lockdown" {
+        env.push((
+            "OPENCODE_CONFIG".into(),
+            cwd.join(LOCKDOWN_USER_CONFIG).into_os_string(),
+        ));
+    }
     if opt.engine == Engine::CLAUDE {
         let tools = match opt.scenario.as_str() {
             s if s.starts_with("approval-") => "Bash",
@@ -731,6 +757,478 @@ async fn claude_request(
     gate.send(&reply).await
 }
 
+/// The free model every opencode scenario runs on: a turn costs nothing.
+const OPENCODE_MODEL: &str = "opencode/deepseek-v4.1-flash-free";
+/// The agent Octet runs opencode's `ask` mode in, its default.
+const OPENCODE_ASK: &str = "octet-ask";
+/// The most reply text an opencode scenario keeps.
+const OPENCODE_TEXT_LIMIT: usize = 64 * 1024;
+/// The most tool calls an opencode turn tracks.
+const OPENCODE_TOOL_LIMIT: usize = 256;
+/// `lockdown`'s project configuration: it would allow everything, in
+/// Octet's own `ask` agent too, if opencode read it.
+const LOCKDOWN_PROJECT_CONFIG: &str =
+    r#"{"permission":"allow","agent":{"octet-ask":{"permission":{"*":"allow"}}}}"#;
+/// `lockdown`'s user rule, read through `OPENCODE_CONFIG`: it allows the
+/// command the scenario asks for.
+const LOCKDOWN_USER_RULE: &str = r#"{"permission":{"bash":{"echo *":"allow"}}}"#;
+/// Where in the workspace `lockdown` keeps its user rule.
+const LOCKDOWN_USER_CONFIG: &str = "user-config.json";
+/// How long one `opencode session` command may run.
+const OPENCODE_SESSION_LIMIT: Duration = Duration::from_secs(15);
+
+/// What one opencode prompt did, as its session updates showed it.
+#[derive(Default)]
+struct OpencodeTurn {
+    /// The reply text, bounded.
+    text: String,
+    /// `session/cancel` was sent.
+    cancel_sent: bool,
+    /// The tool calls opencode asked permission for.
+    asked: HashSet<String>,
+    /// Each tool call's kind, from its first frame.
+    kinds: Vec<(String, String)>,
+    /// Calls that changed something without a permission request.
+    unasked: u64,
+}
+
+impl OpencodeTurn {
+    /// Records a `tool_call` or `tool_call_update`: a call that edits or
+    /// runs something and completes without having asked is counted.
+    fn tool(&mut self, update: &Value) {
+        let id = update["toolCallId"].as_str().unwrap_or_default().to_owned();
+        if let Some(kind) = update["kind"].as_str()
+            && !self.kinds.iter().any(|(known, _)| *known == id)
+            && self.kinds.len() < OPENCODE_TOOL_LIMIT
+        {
+            self.kinds.push((id.clone(), kind.to_owned()));
+        }
+        let kind = self
+            .kinds
+            .iter()
+            .find(|(known, _)| *known == id)
+            .map(|(_, kind)| kind.as_str());
+        let acts = matches!(kind, Some("execute" | "edit" | "delete" | "move"));
+        if acts && update["status"] == "completed" && !self.asked.contains(&id) {
+            self.unasked += 1;
+        }
+    }
+}
+
+/// One opencode connection under a scenario: Octet's last request ID, the
+/// open session and the running prompt.
+struct Opencode<'a> {
+    gate: &'a mut GateProcess,
+    scenario: &'a str,
+    next_id: u64,
+    session: String,
+    turn: Option<OpencodeTurn>,
+    /// Updates for the session before its first prompt: a resume's replay.
+    replayed: u64,
+}
+
+impl<'a> Opencode<'a> {
+    /// A connection on `gate` with no session yet.
+    fn new(gate: &'a mut GateProcess, scenario: &'a str) -> Self {
+        Self {
+            gate,
+            scenario,
+            next_id: 0,
+            session: String::new(),
+            turn: None,
+            replayed: 0,
+        }
+    }
+
+    /// Sends `method` and waits for its reply, handling what comes before.
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, GateError> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.gate
+            .send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            .await?;
+        loop {
+            let v = self.gate.receive().await?;
+            if is_reply_to(&v, id) {
+                return Ok(v);
+            }
+            self.other(&v).await?;
+        }
+    }
+
+    /// A frame that is not the awaited reply: a request is answered, an
+    /// update for this session counted.
+    async fn other(&mut self, v: &Value) -> Result<(), GateError> {
+        let this_session = !self.session.is_empty()
+            && v.pointer("/params/sessionId").and_then(Value::as_str)
+                == Some(self.session.as_str());
+        if v.get("id").is_some() && method(v).is_some() {
+            if method(v) == Some("session/request_permission") && this_session {
+                return self.permission(v).await;
+            }
+            if let Some(reply) = opencode_stray_reply(v) {
+                self.gate.send(&reply).await?;
+            }
+            return Ok(());
+        }
+        if method(v) != Some("session/update") || !this_session {
+            return Ok(());
+        }
+        let update = &v["params"]["update"];
+        let Some(turn) = self.turn.as_mut() else {
+            if update["sessionUpdate"] != "available_commands_update" {
+                self.replayed += 1;
+            }
+            return Ok(());
+        };
+        match update["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") => {
+                if let Some(text) = update.pointer("/content/text").and_then(Value::as_str)
+                    && turn.text.len() + text.len() <= OPENCODE_TEXT_LIMIT
+                {
+                    turn.text.push_str(text);
+                }
+                if self.scenario == "interrupt" && !turn.cancel_sent {
+                    turn.cancel_sent = true;
+                    let cancel = json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":self.session}});
+                    self.gate.send(&cancel).await?;
+                }
+            }
+            Some("tool_call" | "tool_call_update") => turn.tool(update),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A permission request for this session, answered as the scenario
+    /// says: the fixture write allowed in `approval-allow`, everything else
+    /// rejected with Octet's own reply.
+    async fn permission(&mut self, v: &Value) -> Result<(), GateError> {
+        if env::var_os("OCTET_GATE_TRACE").is_some() {
+            let shown: String = v.to_string().chars().take(2000).collect();
+            eprintln!("permission {shown}");
+        }
+        let fixture = opencode_is_fixture_request(v);
+        let counted = match self.scenario {
+            "approval-allow" | "approval-deny" => fixture,
+            "lockdown" => true,
+            _ => false,
+        };
+        if counted {
+            self.gate.record_approval();
+        }
+        if let (Some(turn), Some(id)) = (
+            self.turn.as_mut(),
+            v.pointer("/params/toolCall/toolCallId")
+                .and_then(Value::as_str),
+        ) && turn.asked.len() < OPENCODE_TOOL_LIMIT
+        {
+            turn.asked.insert(id.to_owned());
+        }
+        let reply = match opencode_fixture_allow(v) {
+            Some(allow) if self.scenario == "approval-allow" => allow,
+            _ => opencode_stray_reply(v)
+                .ok_or(GateError::Protocol("permission request without id"))?,
+        };
+        self.gate.send(&reply).await
+    }
+
+    /// The handshake: `initialize`, which must report a protocol version.
+    async fn initialize(&mut self) -> Result<(), GateError> {
+        let reply = self
+            .request(
+                "initialize",
+                json!({"protocolVersion":1,"clientCapabilities":{}}),
+            )
+            .await?;
+        if reply.get("error").is_some()
+            || !reply
+                .pointer("/result/protocolVersion")
+                .is_some_and(Value::is_u64)
+        {
+            return Err(GateError::Protocol("initialize error"));
+        }
+        Ok(())
+    }
+
+    /// Opens a new session, or resumes or forks `from`, as Octet does.
+    async fn open(&mut self, cwd: &Path, from: Option<&str>) -> Result<(), GateError> {
+        let mut params = json!({"cwd":cwd,"mcpServers":[]});
+        let method = match from {
+            Some(id) => {
+                params["sessionId"] = json!(id);
+                if self.scenario == "fork" {
+                    "session/fork"
+                } else {
+                    "session/resume"
+                }
+            }
+            None => "session/new",
+        };
+        let reply = self.request(method, params).await?;
+        if reply.get("error").is_some() {
+            return Err(GateError::Protocol("session open error"));
+        }
+        let reported = reply.pointer("/result/sessionId").and_then(Value::as_str);
+        let session = match (method, reported) {
+            ("session/resume", Some(id)) if Some(id) != from => {
+                return Err(GateError::Protocol("resume id mismatch"));
+            }
+            ("session/resume", _) => from.unwrap_or_default(),
+            ("session/fork", Some(id)) if Some(id) != from => id,
+            ("session/fork", _) => return Err(GateError::Protocol("fork id missing or unchanged")),
+            (_, Some(id)) => id,
+            (_, None) => return Err(GateError::Protocol("missing session id")),
+        }
+        .to_owned();
+        self.gate.record_session(&session);
+        self.session = session;
+        Ok(())
+    }
+
+    /// Sets the session's option `id` to `value`; the reply must confirm it.
+    async fn set(&mut self, id: &str, value: &str) -> Result<(), GateError> {
+        let params = json!({"sessionId":self.session,"configId":id,"value":value});
+        let reply = self.request("session/set_config_option", params).await?;
+        if reply.get("error").is_some() {
+            return Err(GateError::Protocol("set_config_option error"));
+        }
+        let reported = reply
+            .pointer("/result/configOptions")
+            .and_then(Value::as_array)
+            .and_then(|options| options.iter().find(|option| option["id"] == id))
+            .map(|option| &option["currentValue"]);
+        if reported.is_some_and(|current| current != value) {
+            return Err(GateError::Protocol("set_config_option not confirmed"));
+        }
+        Ok(())
+    }
+
+    /// Runs one prompt to its reply; the reply's stop reason and the turn.
+    async fn prompt(&mut self, text: &str) -> Result<(String, OpencodeTurn), GateError> {
+        self.turn = Some(OpencodeTurn::default());
+        let params = json!({"sessionId":self.session,"prompt":[{"type":"text","text":text}]});
+        let reply = self.request("session/prompt", params).await?;
+        let turn = self.turn.take().unwrap_or_default();
+        if reply.get("error").is_some() {
+            return Err(GateError::Protocol("prompt error"));
+        }
+        let stop = reply
+            .pointer("/result/stopReason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.gate.record_stop_reason(&stop);
+        Ok((stop, turn))
+    }
+}
+
+fn opencode_prompt(scenario: &str) -> &'static str {
+    match scenario {
+        s if s.starts_with("approval-") => {
+            "Use the bash tool to run exactly `printf READY > probe.out` in the current directory, once, with no other commands. If permission is denied, stop and say denied."
+        }
+        "lockdown" => {
+            "Use the bash tool to run exactly `echo fixture`, once, with no other commands. If permission is denied, stop and say denied."
+        }
+        "interrupt" => "Count from 1 to 1000, one number per line. Do not call tools.",
+        _ => "Reply with READY. Do not call tools.",
+    }
+}
+
+/// Runs the scenario's first connection: a session in Octet's `ask` agent
+/// on the free model, and its one prompt, checked.
+async fn opencode(gate: &mut GateProcess, scenario: &str, cwd: &Path) -> Result<(), GateError> {
+    let mut acp = Opencode::new(gate, scenario);
+    acp.initialize().await?;
+    if scenario == "initialize" {
+        return Ok(());
+    }
+    acp.open(cwd, None).await?;
+    acp.set("model", OPENCODE_MODEL).await?;
+    acp.set("mode", OPENCODE_ASK).await?;
+    let (stop, turn) = acp.prompt(opencode_prompt(scenario)).await?;
+    // opencode ends a cancelled prompt with `end_turn`.
+    let stopped = stop == "end_turn" || scenario == "interrupt" && stop == "cancelled";
+    if !stopped {
+        return Err(GateError::Protocol(
+            "prompt ended with an unexpected stop reason",
+        ));
+    }
+    if turn.unasked > 0 {
+        return Err(GateError::Protocol(
+            "a tool changed something without a permission request",
+        ));
+    }
+    let asked = acp.gate.evidence().approval_requests > 0;
+    match scenario {
+        "simple" | "resume" | "fork" if turn.text.trim() != "READY" => {
+            Err(GateError::Protocol("unexpected simple reply"))
+        }
+        "interrupt" if !turn.cancel_sent => Err(GateError::Protocol("no reply text to cancel")),
+        "interrupt" if turn.text.contains("1000") => {
+            Err(GateError::Protocol("the cancelled turn ran to its end"))
+        }
+        s if s.starts_with("approval-") && !asked => {
+            Err(GateError::Protocol("no approval request observed"))
+        }
+        // A command that ran unasked failed the run above.
+        "lockdown" if !asked => Err(GateError::Protocol(
+            "the model ran no command, so lockdown is unproven",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Reopens the first connection's session `first` in a new process, as
+/// `--resume` (and a fork) does: the session, or its fork, must remember
+/// the first reply.
+async fn opencode_reopen(
+    gate: &mut GateProcess,
+    scenario: &str,
+    cwd: &Path,
+    first: &str,
+) -> Result<u64, GateError> {
+    let mut acp = Opencode::new(gate, scenario);
+    acp.initialize().await?;
+    acp.open(cwd, Some(first)).await?;
+    acp.set("model", OPENCODE_MODEL).await?;
+    acp.set("mode", OPENCODE_ASK).await?;
+    let replayed = acp.replayed;
+    let (stop, turn) = acp
+        .prompt("Which word did you reply with earlier in this conversation? Reply with that word only. Do not call tools.")
+        .await?;
+    if stop != "end_turn" {
+        return Err(GateError::Protocol(
+            "prompt ended with an unexpected stop reason",
+        ));
+    }
+    if !turn.text.contains("READY") {
+        return Err(GateError::Protocol(
+            "the reopened session lost the conversation",
+        ));
+    }
+    Ok(replayed)
+}
+
+/// Runs an opencode scenario: one connection, and for `resume` and `fork` a
+/// second, in a new process. The status, the evidence, the updates a resume
+/// replayed, and whether every child stopped.
+async fn run_opencode(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evidence, u64, bool) {
+    let spawn = |resume: Option<&str>| {
+        let (args, env) = vendor_launch(opt, cwd, resume);
+        GateProcess::spawn(
+            opt.engine,
+            opt.binary.clone(),
+            args,
+            env,
+            cwd.to_owned(),
+            deadline,
+        )
+    };
+    let mut gate = match spawn(None) {
+        Ok(gate) => gate,
+        Err(error) => return (format!("failed: {error}"), Evidence::default(), 0, false),
+    };
+    let result = opencode(&mut gate, &opt.scenario, cwd).await;
+    let mut evidence = gate.evidence().clone();
+    let report = gate.shutdown().await;
+    let mut cleaned = report.reaped && report.descendants_stopped;
+    let outcome = match result {
+        Ok(()) if cleaned => "passed".to_owned(),
+        Ok(()) => "failed: child cleanup".to_owned(),
+        Err(error) => format!("failed: {error}"),
+    };
+    if outcome != "passed" || !matches!(opt.scenario.as_str(), "resume" | "fork") {
+        return (outcome, evidence, 0, cleaned);
+    }
+    let Some(first) = evidence.session_id.clone() else {
+        return (
+            "failed: first session id missing".into(),
+            evidence,
+            0,
+            cleaned,
+        );
+    };
+    let mut second = match spawn(Some(&first)) {
+        Ok(second) => second,
+        Err(error) => return (format!("failed: {error}"), evidence, 0, cleaned),
+    };
+    let result = opencode_reopen(&mut second, &opt.scenario, cwd, &first).await;
+    evidence.add_resumed(second.evidence());
+    let report = second.shutdown().await;
+    cleaned &= report.reaped && report.descendants_stopped;
+    match result {
+        Ok(_) if !cleaned => ("failed: resumed child cleanup".into(), evidence, 0, cleaned),
+        Ok(replayed) => ("passed".into(), evidence, replayed, cleaned),
+        Err(error) => (format!("failed: {error}"), evidence, 0, cleaned),
+    }
+}
+
+/// Runs `opencode session ARGS` as Octet's launch would, in `cwd`; its
+/// output, or `None` when it fails or overruns.
+async fn opencode_session(opt: &Opt, cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let config = Config::new(opt.engine, &opt.binary, cwd);
+    let mut command = tokio::process::Command::new(&opt.binary);
+    command
+        .arg("session")
+        .args(args)
+        .envs(launch_env(&config))
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(OPENCODE_SESSION_LIMIT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// Deletes the sessions an opencode run opened, once its processes are
+/// gone, so the user's history keeps none of them. The ones still listed
+/// afterwards, or `None` when the list cannot be read.
+async fn opencode_cleanup(opt: &Opt, cwd: &Path, sessions: &[String]) -> Option<Vec<String>> {
+    if sessions.is_empty() {
+        return Some(Vec::new());
+    }
+    for id in sessions {
+        if valid_session_id(id) {
+            let _ = opencode_session(opt, cwd, &["delete", id]).await;
+        }
+    }
+    let listed = opencode_session(opt, cwd, &["list", "--format", "json"]).await?;
+    // An empty history lists nothing at all.
+    let listed: Value = if listed.trim_ascii().is_empty() {
+        json!([])
+    } else {
+        serde_json::from_slice(&listed).ok()?
+    };
+    let listed: HashSet<&str> = listed
+        .as_array()?
+        .iter()
+        .filter_map(|session| session["id"].as_str())
+        .collect();
+    Some(
+        sessions
+            .iter()
+            .filter(|id| listed.contains(id.as_str()))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Whether `id` may be passed to `opencode session delete`: no option, no
+/// control characters, bounded.
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Runs the scenario once, and for Claude's `resume` and `fork` again in a
 /// second process. The status, the evidence and whether every child stopped.
 async fn run_scenario(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evidence, bool) {
@@ -829,8 +1327,35 @@ async fn run() -> i32 {
         }
     };
     let cwd = workspace.path.clone();
+    let opencode = opt.engine == Engine::OPENCODE;
+    if opencode && opt.scenario == "lockdown" {
+        let written = fs::write(cwd.join("opencode.json"), LOCKDOWN_PROJECT_CONFIG)
+            .and_then(|()| fs::write(cwd.join(LOCKDOWN_USER_CONFIG), LOCKDOWN_USER_RULE));
+        if written.is_err() {
+            eprintln!("cannot write the lockdown configuration");
+            return 2;
+        }
+    }
     let started = Instant::now();
-    let (mut status, evidence, cleaned) = run_scenario(&opt, &cwd, started + opt.timeout).await;
+    let deadline = started + opt.timeout;
+    let (mut status, evidence, replayed, cleaned) = if opencode {
+        run_opencode(&opt, &cwd, deadline).await
+    } else {
+        let (status, evidence, cleaned) = run_scenario(&opt, &cwd, deadline).await;
+        (status, evidence, 0, cleaned)
+    };
+    let sessions_left = if opencode {
+        opencode_cleanup(&opt, &cwd, &evidence.sessions).await
+    } else {
+        Some(Vec::new())
+    };
+    match &sessions_left {
+        None if status == "passed" => status = "failed: cannot list opencode sessions".into(),
+        Some(left) if status == "passed" && !left.is_empty() => {
+            status = "failed: sessions left in opencode history".into();
+        }
+        _ => {}
+    }
     let fixture_write = fixture_written(&cwd);
     if status == "passed" && opt.scenario == "approval-allow" && !fixture_write {
         status = "failed: approved fixture write not observed".into();
@@ -841,7 +1366,13 @@ async fn run() -> i32 {
     {
         status = "failed: denied or interrupted fixture write occurred".into();
     }
-    let record = json!({"engine":opt.engine.as_str(),"scenario":opt.scenario,"version":version(&opt.binary).await,"host":env::consts::OS,"arch":env::consts::ARCH,"status":status,"events":evidence.events,"approval_requests":evidence.approval_requests,"mcp_calls":evidence.mcp_calls,"hook_calls":evidence.hook_calls,"compact_boundaries":evidence.compact_boundaries,"agent_messages":evidence.agent_messages,"late_usage_turns":evidence.late_usage_turns,"tool_only_turns":evidence.tool_only_turns,"user_questions":evidence.user_questions,"failure_kind":evidence.failure_kind,"fixture_write":fixture_write,"child_cleanup":cleaned,"elapsed_ms":started.elapsed().as_millis()});
+    let mut record = json!({"engine":opt.engine.as_str(),"scenario":opt.scenario,"version":version(&opt.binary).await,"host":env::consts::OS,"arch":env::consts::ARCH,"status":status,"events":evidence.events,"approval_requests":evidence.approval_requests,"mcp_calls":evidence.mcp_calls,"hook_calls":evidence.hook_calls,"compact_boundaries":evidence.compact_boundaries,"agent_messages":evidence.agent_messages,"late_usage_turns":evidence.late_usage_turns,"tool_only_turns":evidence.tool_only_turns,"user_questions":evidence.user_questions,"failure_kind":evidence.failure_kind,"fixture_write":fixture_write,"child_cleanup":cleaned,"elapsed_ms":started.elapsed().as_millis()});
+    if opencode {
+        record["sessions"] = json!(evidence.sessions);
+        record["sessions_left"] = json!(sessions_left);
+        record["stop_reasons"] = json!(evidence.stop_reasons);
+        record["replayed_updates"] = json!(replayed);
+    }
     let serialized = record.to_string();
     let serialized = serde_json::to_string_pretty(&record).unwrap_or(serialized);
     if let Some(path) = &opt.output

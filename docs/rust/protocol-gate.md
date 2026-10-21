@@ -11,6 +11,12 @@ and the fixture MCP server), so it checks the contract Octet ships.
 It talks to the real vendor, so each run uses your login and your quota.
 Keep runs few and small.
 
+opencode scenarios run on the free model `opencode/deepseek-v4.1-flash-free`
+in Octet's `ask` agent (`octet-ask`), so a turn costs nothing. Each
+opencode session a run opens is deleted afterwards
+(`opencode session delete`), whatever the outcome, so your opencode history
+keeps none of them.
+
 ## Run it
 
 ```sh
@@ -25,7 +31,8 @@ scripts/rust-env.sh cargo run --locked -p octet-gate --bin protocol-gate -- \
   [--binary PATH] [--workdir NEW_DIR] [--output FILE] [--timeout SECONDS]
 ```
 
-- **`--binary`:** the CLI to run; the engine's name on `PATH` by default.
+- **`--binary`:** the CLI to run; the engine's name on `PATH` by default
+  (opencode installs to `~/.opencode/bin`).
 - **`--workdir`:** a fixture workspace to create, and keep; by default a
   temporary one, removed when the run ends, whatever its outcome. It must
   not exist yet.
@@ -52,10 +59,25 @@ scripts/rust-env.sh cargo run --locked -p octet-gate --bin protocol-gate -- \
 | `failure` | A turn the vendor fails | no | yes | no |
 | `lockdown` | A project config and a user rule cannot bypass `ask` | no | no | yes |
 
+opencode's `resume` and `fork` reopen the session in a second process, as
+`--resume` does, and ask which word it replied with: the reopened session,
+or its fork, must remember. `lockdown` runs in a workspace whose
+`opencode.json` would allow everything, Octet's `octet-ask` agent included
+(`{"permission":"allow","agent":{"octet-ask":{"permission":{"*":"allow"}}}}`),
+with `OPENCODE_CONFIG` naming a user file that allows the command
+(`{"permission":{"bash":{"echo *":"allow"}}}`). It asks for `echo fixture`
+and passes only if opencode asks permission first; a command that runs
+unasked fails it. The gate rejects the request, as Octet does when a
+request has no one to answer it.
+
 ## Result
 
 The evidence goes to stdout as one JSON object; its `status` starts with
-`passed` when the vendor behaved as the drivers expect.
+`passed` when the vendor behaved as the drivers expect. For opencode it
+also lists the sessions the run opened (`sessions`), any still in
+opencode's history after the cleanup (`sessions_left`; a run that leaves one
+fails), each prompt's `stopReason` (`stop_reasons`) and the updates a resume
+replayed before its first prompt (`replayed_updates`).
 
 | Exit | Meaning |
 | --- | --- |

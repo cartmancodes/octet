@@ -229,3 +229,190 @@ fn the_workspace_is_removed_on_failure() {
         .collect();
     assert!(left.is_empty(), "{left:?}");
 }
+
+/// A scripted `opencode`: `acp` writes `frames`, then keeps what the gate
+/// sent in `stdin`; `session delete ID` appends ID to `deleted`, and
+/// `session list` prints `listed`.
+fn opencode_script(frames: &[Value], listed: &str) -> String {
+    let wire = frames
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "dir=\"$(dirname \"$0\")\"\n\
+         case \"$1\" in\n\
+         --version) echo 1.18.25; exit ;;\n\
+         session) if [ \"$2\" = delete ]; then echo \"$3\" >> \"$dir/deleted\"; else echo '{listed}'; fi; exit ;;\n\
+         esac\n\
+         cat <<'WIRE'\n{wire}\nWIRE\ncat > \"$dir/stdin\""
+    )
+}
+
+/// opencode's handshake for session `ses_a`, then `events` and the prompt's
+/// `end_turn` reply.
+fn opencode_frames(mut events: Vec<Value>) -> Vec<Value> {
+    let mut frames = vec![
+        json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}),
+        json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_a"}}),
+        json!({"jsonrpc":"2.0","id":3,"result":{}}),
+        json!({"jsonrpc":"2.0","id":4,"result":{}}),
+    ];
+    frames.append(&mut events);
+    frames.push(json!({"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}));
+    frames
+}
+
+fn opencode_update(update: &Value) -> Value {
+    json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_a","update":update}})
+}
+
+#[test]
+fn an_opencode_run_deletes_its_session_afterwards() {
+    let root = octet_testkit::TempDir::new("octet-gate-opencode");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let reply = opencode_update(
+        &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"READY"}}),
+    );
+    let script = opencode_script(&opencode_frames(vec![reply]), "[]");
+    let (code, evidence) = probe_in(root.path(), "opencode", "simple", &script);
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(0), "{evidence}");
+    assert_eq!(evidence["status"], "passed");
+    assert_eq!(evidence["sessions"], json!(["ses_a"]));
+    assert_eq!(evidence["sessions_left"], json!([]));
+    assert_eq!(evidence["stop_reasons"], json!(["end_turn"]));
+    let deleted = std::fs::read_to_string(root.path().join("deleted")).unwrap();
+    assert_eq!(deleted, "ses_a\n");
+    // Every frame the gate sent is JSON-RPC 2.0, with the free model and
+    // Octet's ask agent set before the prompt.
+    let sent = std::fs::read_to_string(root.path().join("stdin")).unwrap();
+    let sent: Vec<Value> = sent
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        sent.iter().all(|frame| frame["jsonrpc"] == "2.0"),
+        "{sent:?}"
+    );
+    let methods: Vec<&str> = sent.iter().filter_map(|f| f["method"].as_str()).collect();
+    assert_eq!(
+        methods,
+        [
+            "initialize",
+            "session/new",
+            "session/set_config_option",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+    assert_eq!(
+        sent[2]["params"]["value"],
+        "opencode/deepseek-v4.1-flash-free"
+    );
+    assert_eq!(sent[3]["params"]["value"], "octet-ask");
+}
+
+#[test]
+fn an_opencode_session_still_listed_fails_the_run() {
+    let root = octet_testkit::TempDir::new("octet-gate-opencode-left");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let reply = opencode_update(
+        &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"READY"}}),
+    );
+    let script = opencode_script(&opencode_frames(vec![reply]), r#"[{"id":"ses_a"}]"#);
+    let (code, evidence) = probe_in(root.path(), "opencode", "simple", &script);
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        evidence["status"],
+        "failed: sessions left in opencode history"
+    );
+    assert_eq!(evidence["sessions_left"], json!(["ses_a"]));
+}
+
+#[test]
+fn lockdown_passes_only_when_opencode_asks() {
+    let call = json!({"toolCallId":"c1","title":"echo fixture","kind":"execute","rawInput":{"command":"echo fixture"}});
+    let mut ran = call.clone();
+    ran["sessionUpdate"] = json!("tool_call");
+    let mut done =
+        json!({"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed"});
+    // The command ran without a permission request: a bypass.
+    let root = octet_testkit::TempDir::new("octet-gate-lockdown-bypass");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let frames = opencode_frames(vec![opencode_update(&ran), opencode_update(&done)]);
+    let (code, evidence) = probe_in(
+        root.path(),
+        "opencode",
+        "lockdown",
+        &opencode_script(&frames, "[]"),
+    );
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        evidence["status"],
+        "failed: protocol: a tool changed something without a permission request"
+    );
+    // opencode asked: the gate rejects, as Octet's stray reply does.
+    let root = octet_testkit::TempDir::new("octet-gate-lockdown-asks");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let options = json!([
+        {"optionId":"once","kind":"allow_once"},
+        {"optionId":"always","kind":"allow_always"},
+        {"optionId":"reject","kind":"reject_once"},
+    ]);
+    let ask = json!({"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"ses_a","toolCall":call,"options":options}});
+    done["status"] = json!("failed");
+    let frames = opencode_frames(vec![opencode_update(&ran), ask, opencode_update(&done)]);
+    let (code, evidence) = probe_in(
+        root.path(),
+        "opencode",
+        "lockdown",
+        &opencode_script(&frames, "[]"),
+    );
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(0), "{evidence}");
+    assert_eq!(evidence["approval_requests"], 1);
+    let sent = std::fs::read_to_string(root.path().join("stdin")).unwrap();
+    let answer: Value = sent
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|frame| frame["id"] == 0 && frame.get("method").is_none())
+        .unwrap();
+    assert_eq!(
+        answer,
+        json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"reject"}}})
+    );
+}
+
+#[test]
+fn each_engine_runs_only_its_own_scenarios() {
+    let refused = |engine: &str, scenario: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_protocol-gate"))
+            .args([
+                "--engine",
+                engine,
+                "--scenario",
+                scenario,
+                "--binary",
+                "/nonexistent",
+            ])
+            .output()
+            .unwrap();
+        output.status.code() == Some(2)
+            && String::from_utf8_lossy(&output.stderr).contains("unsupported by selected engine")
+    };
+    for scenario in [
+        "mcp",
+        "hook",
+        "compact",
+        "approval-interrupt",
+        "user-input",
+        "failure",
+    ] {
+        assert!(refused("opencode", scenario), "{scenario}");
+    }
+    assert!(refused("codex", "lockdown"));
+    assert!(refused("claude", "lockdown"));
+}

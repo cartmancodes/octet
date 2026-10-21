@@ -3,6 +3,7 @@
 use octet_gate::{
     claude_fixture_allow, claude_fixture_hook_response, claude_fixture_mcp_response,
     claude_fixture_mcp_tool_allow, codex_fixture_allow, codex_fixture_user_input,
+    opencode_fixture_allow, opencode_is_fixture_request,
 };
 use serde_json::json;
 use std::path::Path;
@@ -114,5 +115,34 @@ fn permissions_denial_is_an_empty_profile_not_an_array() {
     assert_eq!(
         reply,
         json!({"id":91,"result":{"permissions":{},"scope":"turn"}})
+    );
+}
+
+#[test]
+fn opencode_allows_only_the_fixture_write_and_only_once() {
+    let options = json!([
+        {"optionId":"always","kind":"allow_always"},
+        {"optionId":"once","kind":"allow_once"},
+        {"optionId":"reject","kind":"reject_once"},
+    ]);
+    let request = |kind: &str, command: &str| json!({"jsonrpc":"2.0","id":3,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"kind":kind,"rawInput":{"command":command}},"options":options}});
+    let fixture = request("execute", "printf READY > probe.out");
+    assert!(opencode_is_fixture_request(&fixture));
+    assert_eq!(
+        opencode_fixture_allow(&fixture).unwrap(),
+        json!({"jsonrpc":"2.0","id":3,"result":{"outcome":{"outcome":"selected","optionId":"once"}}})
+    );
+    for other in [
+        request("execute", "printf READY > probe.out; rm -rf ~"),
+        request("edit", "printf READY > probe.out"),
+        json!({"jsonrpc":"2.0","id":3,"method":"fs/write_text_file","params":{}}),
+    ] {
+        assert!(!opencode_is_fixture_request(&other), "{other}");
+        assert!(opencode_fixture_allow(&other).is_none(), "{other}");
+    }
+    // Octet's own reply to the same request rejects it once.
+    assert_eq!(
+        octet_engine::live::opencode_stray_reply(&fixture).unwrap()["result"]["outcome"]["optionId"],
+        "reject"
     );
 }
