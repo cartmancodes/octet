@@ -1255,6 +1255,11 @@ async fn tab_on_a_name_two_providers_list_shows_the_bracketed_row() {
     key_action(&mut app, &vendor, key(KeyCode::Char('5'))).await;
     let popup = app.composer.completion.as_ref().expect("still open");
     assert_eq!(popup.items, ["gpt-5.5 (codex)"]);
+    // Backspace widens it again, from the provider's whole list.
+    key_action(&mut app, &vendor, key(KeyCode::Backspace)).await;
+    let popup = app.composer.completion.as_ref().expect("still open");
+    assert_eq!(popup.items, ["gpt-5.5 (codex)", "gpt-5.4 · codex"]);
+    key_action(&mut app, &vendor, key(KeyCode::Char('5'))).await;
     key_action(&mut app, &vendor, key(KeyCode::Char(' '))).await;
     assert!(app.composer.completion.is_none());
 }

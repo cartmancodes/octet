@@ -282,13 +282,7 @@ pub(crate) fn model_tab(
                 items: matches
                     .iter()
                     .take(crate::files::SHOWN)
-                    .map(|(name, engine)| {
-                        if clashing.contains(name) {
-                            format!("{name} ({engine})")
-                        } else {
-                            format!("{name} · {engine}")
-                        }
-                    })
+                    .map(|(name, engine)| model_item(name, *engine, clashing))
                     .collect(),
                 selected: 0,
                 start,
@@ -304,6 +298,37 @@ pub(crate) fn model_tab(
             }
         }
     })
+}
+
+/// Tab's popup line for the model `name` of `engine`: `name (engine)` for
+/// a name in `clashing`, else `name · engine`.
+fn model_item(name: &str, engine: octet_core::Engine, clashing: &HashSet<String>) -> String {
+    if clashing.contains(name) {
+        format!("{name} ({engine})")
+    } else {
+        format!("{name} · {engine}")
+    }
+}
+
+/// Tab's popup lines for `/model PROVIDER <word>` as the draft now is:
+/// where the word starts, and that provider's names in `names` that start
+/// with it, from the whole list each time. `None` for any other draft.
+pub(crate) fn provider_model_items(
+    text: &str,
+    cursor: usize,
+    names: &[(String, octet_core::Engine)],
+    clashing: &HashSet<String>,
+) -> Option<(usize, Vec<String>)> {
+    let (start, word) = provider_argument_query(text, cursor, "/model")?;
+    let provider = text[..start].trim_end().strip_prefix("/model ")?.trim();
+    let provider = octet_core::Engine::parse(provider)?;
+    let items = names
+        .iter()
+        .filter(|(name, engine)| *engine == provider && name.starts_with(word))
+        .take(crate::files::SHOWN)
+        .map(|(name, engine)| model_item(name, *engine, clashing))
+        .collect();
+    Some((start, items))
 }
 
 /// One candidate fills in; several fill their common prefix and open the

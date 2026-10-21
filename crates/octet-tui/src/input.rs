@@ -127,7 +127,7 @@ fn refresh_picker(
     ) else {
         // Tab's popup of one provider's names (`/model PROVIDER <word>`)
         // stays, narrowed as the word grows; any other draft closes it.
-        let narrowed = kind == composer::Kind::Model && narrow_provider_popup(app, command);
+        let narrowed = kind == composer::Kind::Model && narrow_provider_popup(app);
         if !narrowed
             && app
                 .composer
@@ -156,25 +156,37 @@ fn refresh_picker(
         start,
     });
 }
-/// Narrows the open popup to the names that still start with the word of
-/// `command PROVIDER <word>`; whether one is left to show.
-fn narrow_provider_popup(app: &mut App, command: &str) -> bool {
-    let Some((start, word)) = composer::provider_argument_query(
+/// Refills the open popup with the names that start with the word of
+/// `/model PROVIDER <word>`, from that provider's whole list, so it narrows
+/// as the word grows and widens again on Backspace; whether one is left.
+fn narrow_provider_popup(app: &mut App) -> bool {
+    let (text, cursor) = (app.composer.editor.text(), app.composer.editor.cursor());
+    let open = app
+        .composer
+        .completion
+        .as_ref()
+        .filter(|popup| popup.kind == composer::Kind::Model)
+        .map(|popup| popup.start);
+    // Only Tab's own popup on this form is kept; checked before the lists
+    // are built, since this runs after every key.
+    if open.is_none()
+        || composer::provider_argument_query(text, cursor, "/model").map(|q| q.0) != open
+    {
+        return false;
+    }
+    let (names, clashing) = tab_names(app);
+    let Some((_, items)) = composer::provider_model_items(
         app.composer.editor.text(),
         app.composer.editor.cursor(),
-        command,
+        &names,
+        &clashing,
     ) else {
         return false;
     };
     let Some(popup) = app.composer.completion.as_mut() else {
         return false;
     };
-    if popup.start != start {
-        return false;
-    }
-    popup
-        .items
-        .retain(|item| crate::clash::row_route(item).0.starts_with(word));
+    popup.items = items;
     popup.selected = popup.selected.min(popup.items.len().saturating_sub(1));
     !popup.items.is_empty()
 }
@@ -686,8 +698,9 @@ async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
     refresh_completion(app);
     Action::Continue
 }
-/// Tab: completes a path or a command, off the loop.
-async fn tab_key(app: &mut App) {
+/// The model names Tab completes (the current provider's first), and the
+/// selections and IDs another provider also lists.
+fn tab_names(app: &App) -> (Vec<(String, octet_core::Engine)>, HashSet<String>) {
     let names = app.models.names(app.conn.engine);
     let entries = app.model_entries();
     let clashing: HashSet<String> = entries
@@ -697,6 +710,11 @@ async fn tab_key(app: &mut App) {
         .flat_map(|((_, model), _)| [Some(model.selection.clone()), model.id.clone()])
         .flatten()
         .collect();
+    (names, clashing)
+}
+/// Tab: completes a path or a command, off the loop.
+async fn tab_key(app: &mut App) {
+    let (names, clashing) = tab_names(app);
     if let Some(tab) = composer::model_tab(
         app.composer.editor.text(),
         app.composer.editor.cursor(),
