@@ -2805,7 +2805,7 @@ async fn opencode_prompt_sent_right_after_an_idle_switch_runs_under_the_new_agen
     let (mut seen, mut text) = (Vec::new(), String::new());
     loop {
         match next(&mut events).await {
-            Event::Notice(notice) => panic!("unexpected notice: {notice}"),
+            Event::Notice(notice) => seen.push(notice),
             Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
             Event::Started => seen.push("started".into()),
             Event::Text(t) => text.push_str(&t),
@@ -2814,7 +2814,15 @@ async fn opencode_prompt_sent_right_after_an_idle_switch_runs_under_the_new_agen
             _ => {}
         }
     }
-    assert_eq!(seen, ["mode accept-edits", "started"]);
+    // Held, the prompt says what it waits for; no next-turn notice follows.
+    assert_eq!(
+        seen,
+        [
+            "Waiting for opencode to confirm the switch to accept-edits before sending your prompt",
+            "mode accept-edits",
+            "started"
+        ]
+    );
     let echo: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
         echo["agents"],
@@ -2879,6 +2887,7 @@ async fn opencode_turn_held_for_a_switch_starts_when_the_switch_times_out() {
     assert_eq!(
         seen,
         [
+            "Waiting for opencode to confirm the switch to accept-edits before sending your prompt",
             "opencode has not confirmed the switch to accept-edits",
             "mode ask",
             "started",

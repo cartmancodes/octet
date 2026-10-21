@@ -27,6 +27,8 @@ struct Driver<P> {
     /// next prompt. While one is held no other command is read, so the
     /// command queue's own bound (and its `Busy` refusal) still applies.
     held: Option<Held>,
+    /// The mode of the last switch sent to the vendor.
+    switch_target: Option<Mode>,
 }
 
 /// A turn command held until a pending mode switch resolves.
@@ -63,6 +65,7 @@ pub(super) async fn run<P: Protocol>(
         protocol: P::default(),
         gate: TurnGate::default(),
         held: None,
+        switch_target: None,
     };
     let result = driver.run(&mut commands, &mut cancel, &mut stopping).await;
     driver.protocol.stopping(&driver.core);
@@ -128,8 +131,7 @@ impl<P: Protocol> Driver<P> {
                         if self.gate.cancelled(&command, cancel) {
                             self.cancelled_before_start(&command)?;
                         } else if self.must_hold(&command) {
-                            let turn = self.gate.last();
-                            self.held = Some(Held { command, turn });
+                            self.hold(command)?;
                         } else {
                             self.on_command(command).await?;
                         }
@@ -164,6 +166,17 @@ impl<P: Protocol> Driver<P> {
             && self.core.phase == Phase::Idle
             && self.core.config.engine.provider().mode_applies_next_turn
             && self.protocol.mode_change_pending()
+    }
+
+    /// Holds `command` until the pending switch resolves, saying so.
+    fn hold(&mut self, command: Command) -> Result<(), DriverError> {
+        let turn = self.gate.last();
+        self.held = Some(Held { command, turn });
+        let target = self.switch_target.map_or("the new mode", Mode::label);
+        self.core.emit(Event::Notice(format!(
+            "Waiting for {} to confirm the switch to {target} before sending your prompt",
+            self.core.config.engine.title()
+        )))
     }
 
     /// Starts the held turn once no switch is pending; one the user
@@ -449,6 +462,7 @@ impl<P: Protocol> Driver<P> {
         } else if target == core.mode {
             core.emit(Event::ModeChanged(core.mode))
         } else {
+            self.switch_target = Some(target);
             self.protocol.set_mode(&mut self.core, target).await
         }
     }
