@@ -329,6 +329,37 @@ fn opencode_header_distinguishes_running_permissions_from_next_turn() {
 }
 
 #[test]
+fn opencode_switch_sent_while_idle_applies_to_the_prompt_sent_behind_it() {
+    use octet_core::{Engine, Mode};
+    let vendor = crate::vendor::RecordingVendor::default();
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    crate::commands::switch_mode(&mut app, &vendor, Mode::AcceptEdits);
+    // A prompt follows before opencode confirms; the interface marks it
+    // running at once, but the driver holds it until the switch lands.
+    app.conn.start_turn();
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+    assert_eq!(app.conn.mode_for_turn, None);
+    assert!(!app.mode_details().contains("running turn still uses"));
+    app.event(Event::Started);
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+}
+
+#[test]
+fn opencode_switch_sent_mid_turn_waits_for_the_next_turn() {
+    use octet_core::{Engine, Mode};
+    let vendor = crate::vendor::RecordingVendor::default();
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    app.event(Event::Started);
+    crate::commands::switch_mode(&mut app, &vendor, Mode::AcceptEdits);
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    assert_eq!(mode_chip(&app).content, "ask → accept-edits next");
+    assert!(app.mode_details().contains("running turn still uses ask"));
+}
+
+#[test]
 fn every_provider_says_whether_a_mode_waits_for_the_next_turn() {
     use octet_core::Engine;
     let next_turn = |engine: Engine| engine.provider().mode_applies_next_turn;

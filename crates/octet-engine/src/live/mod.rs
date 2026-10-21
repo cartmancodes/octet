@@ -926,7 +926,15 @@ impl TurnGate {
             return false;
         }
         self.taken += 1;
-        *cancel.borrow() >= self.taken
+        Self::covers(self.taken, cancel)
+    }
+    /// The number of the last turn command counted.
+    fn last(&self) -> u64 {
+        self.taken
+    }
+    /// Whether the user's last cancel covers the turn numbered `turn`.
+    fn covers(turn: u64, cancel: &watch::Receiver<u64>) -> bool {
+        *cancel.borrow() >= turn
     }
 }
 

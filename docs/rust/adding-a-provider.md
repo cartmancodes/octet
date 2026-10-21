@@ -137,7 +137,7 @@ scenarios are per vendor.
 | `on_frame` | Turn vendor output into `Text`, `Tool`, `Usage`, `Approval` (through `core.queue_approval`, which denies a request too large to show or beyond the 8 already waiting) and, at the turn's end, `core.finish_turn(outcome, error)`, which closes the turn's approvals and makes the session idle. Ignore output for other sessions or turns. |
 | `answer` | The reply that allows or denies an approval request. The driver uses it for user answers, timeouts and oversized requests. |
 | `deny` | The reply denying an approval with a reason (the user's refusal, a timeout, the cap, a cancelled turn). Override it if the vendor passes a message on to the model, as Claude does; the default is `answer(wire, false)`. |
-| `mode_change_pending` | True while a mode switch waits for the vendor to confirm it. The driver then refuses another switch. |
+| `mode_change_pending` | True while a mode switch waits for the vendor to confirm it. The driver then refuses another switch, and holds a prompt sent while idle until the switch is confirmed, refused or times out, so the prompt runs under the mode the header shows. |
 | `is_progress` | Whether a frame shows the turn is alive. Return false for another thread's output. |
 | `deadline` / `on_deadline` | An optional protocol timer, such as Claude's mode confirmation. |
 | `turn_started` | Clear per-turn state. |

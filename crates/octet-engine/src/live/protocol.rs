@@ -274,7 +274,9 @@ pub(crate) trait Protocol: Default + Send {
     fn is_progress(&self, _core: &Core, _frame: &Value) -> bool {
         true
     }
-    /// A mode change is waiting for the vendor to confirm it.
+    /// A mode change is waiting for the vendor to confirm it. The driver
+    /// then refuses another switch and holds a turn sent while idle until
+    /// this is false, so the turn runs under the mode the header shows.
     fn mode_change_pending(&self) -> bool {
         false
     }

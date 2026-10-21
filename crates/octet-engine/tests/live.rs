@@ -2751,6 +2751,104 @@ async fn opencode_switch_between_turns_gives_no_next_turn_notice() {
     );
     stop(&handle, task).await;
 }
+#[tokio::test]
+async fn opencode_prompt_sent_right_after_an_idle_switch_runs_under_the_new_agent() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    // Back to back, before opencode can confirm: the driver holds the
+    // prompt until it does, so the header never shows ask over a turn
+    // that runs under octet-accept-edits.
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let (mut seen, mut text) = (Vec::new(), String::new());
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => panic!("unexpected notice: {notice}"),
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            Event::Started => seen.push("started".into()),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(seen, ["mode accept-edits", "started"]);
+    let echo: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_turn_held_for_a_switch_never_starts_once_cancelled() {
+    let confirmed = serde_json::json!({"result": {"configOptions": [
+        {"id": "mode", "currentValue": "octet-accept-edits"}]}});
+    let (dir, handle, mut events, task) =
+        opencode_switching_then(confirmed, "0.8", PROMPT_LOGGED).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    // Time for the driver to take the prompt and hold it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    handle.interrupt();
+    let mut seen = Vec::new();
+    while !seen.iter().any(|e: &String| e == "mode accept-edits") {
+        match next(&mut events).await {
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            Event::Started => seen.push("started".into()),
+            Event::Finished { outcome } => seen.push(format!("finished {outcome:?}")),
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        seen,
+        ["started", "finished Interrupted", "mode accept-edits"]
+    );
+    // Nothing starts after the switch resolves, and opencode got no prompt.
+    let started = timeout(
+        Duration::from_millis(500),
+        wait_for(&mut events, |e| matches!(e, Event::Started)),
+    )
+    .await;
+    assert!(started.is_err(), "{started:?}");
+    stop(&handle, task).await;
+    assert!(!dir.path().join("prompt").exists());
+}
+#[tokio::test]
+async fn opencode_turn_held_for_a_switch_starts_when_the_switch_times_out() {
+    let confirmed = serde_json::json!({"result": {"configOptions": [
+        {"id": "mode", "currentValue": "octet-accept-edits"}]}});
+    let (dir, handle, mut events, task) =
+        opencode_switching_then(confirmed, "1.6", PROMPT_LOGGED).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let mut seen = Vec::new();
+    loop {
+        match wait_for_within(&mut events, 8, |_| true).await {
+            Event::Notice(text) => seen.push(text),
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            Event::Started => seen.push("started".into()),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    // Sent while idle, the switch reaches this prompt: a late confirmation
+    // mid-turn gives no next-turn notice.
+    assert_eq!(
+        seen,
+        [
+            "opencode has not confirmed the switch to accept-edits",
+            "mode ask",
+            "started",
+            "opencode confirmed the switch to accept-edits late",
+            "mode accept-edits",
+        ]
+    );
+    assert!(dir.path().join("prompt").exists());
+    stop(&handle, task).await;
+}
 /// The fake opencode's `PARAMS` echo, from a session `config` opens.
 async fn opencode_params(
     handle: &octet_engine::live::Handle,
@@ -2973,18 +3071,28 @@ async fn opencode_other_session_updates_are_neither_progress_nor_output() {
     let _ = handle;
     ended(task).await;
 }
-/// An `ask` session with a scripted opencode that, asked to switch to
-/// accept-edits, answers `delay` seconds later with `reply` (the reply's
-/// `result` or `error` member). The switch has been sent.
-async fn opencode_switching(
-    reply: serde_json::Value,
-    delay: &str,
-) -> (
+/// What a scripted opencode (see `opencode_switching_then`) does after
+/// its switch reply: write the next request, a prompt, to `prompt` in its
+/// directory and end it.
+const PROMPT_LOGGED: &str = "if read line; then echo \"$line\" > \"$(dirname \"$0\")/prompt\"; \
+     echo '{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"stopReason\":\"end_turn\"}}'; fi\n\
+     exec sleep 30\n";
+/// A scripted session, the handle, its events and its task.
+type Scripted = (
     octet_testkit::TempDir,
     octet_engine::live::Handle,
     mpsc::Receiver<Event>,
     tokio::task::JoinHandle<()>,
-) {
+);
+/// An `ask` session with a scripted opencode that, asked to switch to
+/// accept-edits, answers `delay` seconds later with `reply` (the reply's
+/// `result` or `error` member). The switch has been sent.
+async fn opencode_switching(reply: serde_json::Value, delay: &str) -> Scripted {
+    opencode_switching_then(reply, delay, "exec sleep 30\n").await
+}
+/// As `opencode_switching`, the script going on with `after` once it has
+/// replied.
+async fn opencode_switching_then(reply: serde_json::Value, delay: &str, after: &str) -> Scripted {
     use serde_json::json;
     let mode = |agent: &str| json!([{"id": "mode", "currentValue": agent}]);
     let mut fourth = json!({"jsonrpc": "2.0", "id": 4});
@@ -3001,10 +3109,7 @@ async fn opencode_switching(
     for frame in &frames {
         let _ = write!(body, "read line\necho '{frame}'\n");
     }
-    let _ = write!(
-        body,
-        "read line\nsleep {delay}\necho '{fourth}'\nexec sleep 30\n"
-    );
+    let _ = write!(body, "read line\nsleep {delay}\necho '{fourth}'\n{after}");
     let (dir, vendor) = script_vendor("octet-live-opencode-switch", &body);
     let config = Config::new(Engine::OPENCODE, vendor, std::env::temp_dir());
     // A short confirmation window, and the usual connect limit: a shell

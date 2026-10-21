@@ -123,6 +123,12 @@ pub(crate) struct Connection {
     pub(crate) mode_pending: Option<octet_core::Mode>,
     /// Codex keeps the running turn's permissions when the next mode changes.
     pub(crate) mode_for_turn: Option<octet_core::Mode>,
+    /// Whether a turn was running when this interface last sent a mode
+    /// switch, until the switch lands. Where a mode applies from the next
+    /// turn, that, not the turn running when the vendor confirms, decides
+    /// whether the running turn keeps its mode: the driver holds a prompt
+    /// sent behind an idle switch until the switch resolves.
+    pub(crate) mode_sent_mid_turn: Option<bool>,
     pub(crate) workspace: String,
     pub(crate) model: String,
     pub(crate) requested_model: Option<String>,
@@ -165,6 +171,7 @@ impl Connection {
             mode: config.mode,
             mode_pending: None,
             mode_for_turn: None,
+            mode_sent_mid_turn: None,
             workspace: clean(&config.cwd.display().to_string()),
             model: "awaiting model metadata".into(),
             requested_model: config.model.clone(),
@@ -936,8 +943,21 @@ impl App {
             // refusing another: what a reconnect asks for follows it.
             Event::Effort(level) => self.conn.effort = level,
             Event::ModeChanged(mode) => {
-                if self.conn.engine.provider().mode_applies_next_turn && self.conn.is_running() {
+                // A mode change this interface did not ask for (Codex's own,
+                // or a late confirmation after another switch) goes by the
+                // turn running now.
+                let mid_turn = self
+                    .conn
+                    .mode_sent_mid_turn
+                    .unwrap_or_else(|| self.conn.is_running());
+                if self.conn.engine.provider().mode_applies_next_turn
+                    && mid_turn
+                    && self.conn.is_running()
+                {
                     self.conn.mode_for_turn.get_or_insert(self.conn.mode);
+                }
+                if mode != self.conn.mode {
+                    self.conn.mode_sent_mid_turn = None;
                 }
                 self.conn.mode = mode;
                 self.conn.mode_pending = None;

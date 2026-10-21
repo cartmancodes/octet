@@ -294,10 +294,14 @@ pub(crate) fn steer_with(
     true
 }
 
-/// Switches the permission mode live; the vendor confirms it later.
+/// Switches the permission mode live; the vendor confirms it later. Whether
+/// a turn runs now is recorded with it (see `mode_sent_mid_turn`).
 pub(crate) fn switch_mode(app: &mut App, vendor: &dyn Vendor, target: Mode) {
     match vendor.send(Command::SetMode(target)) {
-        Ok(()) => app.conn.mode_pending = Some(target),
+        Ok(()) => {
+            app.conn.mode_pending = Some(target);
+            app.conn.mode_sent_mid_turn = Some(app.conn.is_running());
+        }
         Err(error) => app.error(error.to_string()),
     }
 }

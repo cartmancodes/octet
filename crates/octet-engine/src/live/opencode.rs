@@ -80,9 +80,9 @@ enum Outstanding {
     SetModel,
     /// The agent that carries this mode, set as the handshake's last step.
     SetMode(Mode),
-    /// The agent that carries this mode, set in the open session at the
+    /// The agent that carries a mode, set in the open session at the
     /// user's request.
-    Switch(Mode),
+    Switch(Switch),
     /// An effort level: what the user asked for (`None`: the model's
     /// default) and the value sent for it.
     SetEffort(EffortRequest),
@@ -135,6 +135,18 @@ struct EffortOption {
     default: Option<String>,
 }
 
+/// A live mode switch, as it was sent.
+#[derive(Clone, Copy)]
+struct Switch {
+    /// The mode the user asked for.
+    target: Mode,
+    /// A turn was running when the switch was sent. opencode applies an
+    /// agent at the next `session/prompt`, so only then does the running
+    /// turn keep the previous mode; a switch sent while idle reaches the
+    /// next prompt, which the driver holds until the switch resolves.
+    mid_turn: bool,
+}
+
 /// A live mode switch awaiting opencode's reply.
 struct ModeRequest {
     /// The wire ID of the `session/set_config_option` request.
@@ -157,9 +169,9 @@ pub(super) struct OpencodeProtocol {
     requests: HashMap<u64, Outstanding>,
     /// The live mode switch awaiting its reply, until its deadline.
     mode_request: Option<ModeRequest>,
-    /// Timed-out switches opencode may still confirm, oldest first: the
-    /// header must follow the agent opencode is really in.
-    late_modes: VecDeque<(u64, Mode)>,
+    /// The wire IDs of timed-out switches opencode may still confirm,
+    /// oldest first: the header must follow the agent opencode is really in.
+    late_modes: VecDeque<u64>,
     /// A `session/cancel` was sent this turn. opencode ends a cancelled
     /// prompt with `end_turn`, so this is what makes it an interruption.
     cancel_sent: bool,
@@ -290,7 +302,11 @@ impl Protocol for OpencodeProtocol {
     /// Sets the agent that carries `target`. The mode changes only when
     /// opencode confirms it.
     async fn set_mode(&mut self, core: &mut Core, target: Mode) -> Result<(), DriverError> {
-        self.set_option(core, Outstanding::Switch(target), "mode", agent(target))
+        let switch = Switch {
+            target,
+            mid_turn: core.phase.is_running(),
+        };
+        self.set_option(core, Outstanding::Switch(switch), "mode", agent(target))
             .await?;
         self.mode_request = Some(ModeRequest {
             id: self.next_id,
@@ -579,7 +595,7 @@ impl OpencodeProtocol {
             Outstanding::Open(resumed) => self.opened(core, v, resumed).await,
             Outstanding::SetModel => self.model_set(core, v).await,
             Outstanding::SetMode(target) => self.mode_set(core, v, target),
-            Outstanding::Switch(target) => self.switched(core, v, target),
+            Outstanding::Switch(switch) => self.switched(core, v, switch),
             Outstanding::SetEffort(request) => self.effort_set(core, v, request).await,
             Outstanding::Prompt => self.prompt_ended(core, v),
         }
@@ -728,16 +744,18 @@ impl OpencodeProtocol {
     /// the session keeps its mode. A reply naming any other agent stops the
     /// session: opencode may then ask for less than the header shows. A
     /// reply after the switch timed out is handled the same way. opencode
-    /// applies an agent at the next `session/prompt`, so a switch confirmed
-    /// mid-turn says the running turn keeps its mode.
-    fn switched(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
+    /// applies an agent at the next `session/prompt`, so a switch sent
+    /// mid-turn, and confirmed while that turn runs, says the running turn
+    /// keeps its mode.
+    fn switched(&mut self, core: &mut Core, v: &Value, switch: Switch) -> Result<(), DriverError> {
+        let Switch { target, mid_turn } = switch;
         let id = v["id"].as_u64();
         let late = self
             .mode_request
             .take_if(|request| Some(request.id) == id)
             .is_none();
         if late {
-            self.late_modes.retain(|(late, _)| Some(*late) != id);
+            self.late_modes.retain(|late| Some(*late) != id);
         }
         if let Some(refusal) = self.agent_refusal(v, target) {
             let reason = match refusal {
@@ -773,7 +791,7 @@ impl OpencodeProtocol {
             )))?;
         }
         core.emit(Event::ModeChanged(target))?;
-        if core.phase.is_running() {
+        if mid_turn && core.phase.is_running() {
             core.emit(Event::Notice(super::MODE_NEXT_TURN_NOTICE.into()))?;
         }
         Ok(())
@@ -789,11 +807,7 @@ impl OpencodeProtocol {
             return Ok(());
         };
         // Kept bounded: a vendor that never answers cannot grow either list.
-        if let Some((dropped, _)) = push_bounded(
-            &mut self.late_modes,
-            (request.id, request.target),
-            MAX_LATE_SWITCHES,
-        ) {
+        if let Some(dropped) = push_bounded(&mut self.late_modes, request.id, MAX_LATE_SWITCHES) {
             self.requests.remove(&dropped);
         }
         core.emit(Event::Notice(format!(

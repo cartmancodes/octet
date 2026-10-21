@@ -21,6 +21,20 @@ struct Driver<P> {
     protocol: P,
     /// Turn commands the user cancelled before they started.
     gate: TurnGate,
+    /// A turn command that arrived, while idle, with a mode switch waiting
+    /// for the vendor: it starts once the switch is confirmed, refused or
+    /// reported unconfirmed, so a switch sent while idle lands before the
+    /// next prompt. While one is held no other command is read, so the
+    /// command queue's own bound (and its `Busy` refusal) still applies.
+    held: Option<Held>,
+}
+
+/// A turn command held until a pending mode switch resolves.
+struct Held {
+    /// The command, not yet sent.
+    command: Command,
+    /// Its number among turn commands, which a cancel may cover.
+    turn: u64,
 }
 
 /// Runs one session with protocol `P` until it stops.
@@ -48,6 +62,7 @@ pub(super) async fn run<P: Protocol>(
         core: Core::new::<P>(config, limits, process, events),
         protocol: P::default(),
         gate: TurnGate::default(),
+        held: None,
     };
     let result = driver.run(&mut commands, &mut cancel, &mut stopping).await;
     let report = driver.core.process.shutdown().await;
@@ -85,6 +100,7 @@ impl<P: Protocol> Driver<P> {
         self.protocol.initialize(&mut self.core).await?;
         self.core.deadline = deadline_after(self.core.limits.connect);
         loop {
+            self.release_held(cancel).await?;
             let wake = self.next_wake();
             // Backpressure: while the interface is behind, leave the vendor's
             // output in the transport's queue (and then the pipe) instead of
@@ -101,14 +117,18 @@ impl<P: Protocol> Driver<P> {
                     if changed.is_err() {
                         break;
                     }
+                    self.cancel_held(cancel)?;
                     self.on_cancel().await?;
                 }
                 () = tokio::time::sleep_until(wake), if self.timers_armed() => self.on_timer().await?,
-                command = commands.recv() => match command {
+                command = commands.recv(), if self.held.is_none() => match command {
                     None => break,
                     Some(command) => {
                         if self.gate.cancelled(&command, cancel) {
                             self.cancelled_before_start(&command)?;
+                        } else if self.must_hold(&command) {
+                            let turn = self.gate.last();
+                            self.held = Some(Held { command, turn });
                         } else {
                             self.on_command(command).await?;
                         }
@@ -130,6 +150,45 @@ impl<P: Protocol> Driver<P> {
             }
         }
         Ok(())
+    }
+
+    /// Whether `command` waits for the pending mode switch: a turn the
+    /// session could start now, sent while the vendor has not answered a
+    /// switch. A busy session refuses it at once, as it would anyway.
+    fn must_hold(&self, command: &Command) -> bool {
+        command.starts_turn()
+            && self.core.phase == Phase::Idle
+            && self.protocol.mode_change_pending()
+    }
+
+    /// Starts the held turn once no switch is pending; one the user
+    /// cancelled meanwhile is recorded as interrupted and never sent.
+    async fn release_held(&mut self, cancel: &watch::Receiver<u64>) -> Result<(), DriverError> {
+        if self.protocol.mode_change_pending() {
+            return Ok(());
+        }
+        let Some(held) = self.held.take() else {
+            return Ok(());
+        };
+        if TurnGate::covers(held.turn, cancel) {
+            self.cancelled_before_start(&held.command)
+        } else {
+            self.on_command(held.command).await
+        }
+    }
+
+    /// A cancel that covers the held turn ends it now, unsent, instead of
+    /// when the switch resolves.
+    fn cancel_held(&mut self, cancel: &watch::Receiver<u64>) -> Result<(), DriverError> {
+        match self.held.take() {
+            Some(held) if TurnGate::covers(held.turn, cancel) => {
+                self.cancelled_before_start(&held.command)
+            }
+            held => {
+                self.held = held;
+                Ok(())
+            }
+        }
     }
 
     /// The earliest timer. The connect/turn deadline is stale when idle;
