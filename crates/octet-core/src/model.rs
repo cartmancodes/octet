@@ -636,17 +636,18 @@ mod tests {
     }
 
     #[test]
-    fn opencode_takes_no_effort() {
-        assert_eq!(
-            Engine::OPENCODE.check_effort("high"),
-            Err("opencode does not take a reasoning effort level".to_owned())
-        );
+    fn opencode_takes_the_effort_level_along() {
+        // Its levels depend on the model, so any level is passed on.
+        assert_eq!(Engine::OPENCODE.check_effort("high"), Ok(()));
         let mut current = Config::new(Engine::CODEX, "codex", "/tmp");
         current.effort = Some("high".into());
         let opencode = Selection {
             provider: Engine::OPENCODE,
             model: None,
         };
-        assert_eq!(opencode.configure(&current, "t-1", None).effort, None);
+        assert_eq!(
+            opencode.configure(&current, "t-1", None).effort.as_deref(),
+            Some("high")
+        );
     }
 }

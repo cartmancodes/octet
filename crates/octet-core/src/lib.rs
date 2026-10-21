@@ -188,6 +188,7 @@ fn record(event: &Event) -> (&'static str, Value) {
         }
         Event::ModelSelected(id) => ("model_selected", json!(id)),
         Event::ModeChanged(mode) => ("mode", json!(mode.label())),
+        Event::Effort(level) => ("effort", json!(level)),
         Event::Ready { session } => ("ready", json!(session)),
         Event::User(text) => ("user", json!(text)),
         Event::Started => ("started", Value::Null),

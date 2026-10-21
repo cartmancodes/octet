@@ -33,7 +33,7 @@ pub(super) const PROVIDER: Provider = Provider {
     steer: false,                   // true if a running turn takes more input
     mode_applies_next_turn: false,  // true if a live /mode switch reaches only the next turn
     inline_images: false,           // true if images go in the prompt as base64
-    effort_live: false,             // true if effort is sent per turn, not at launch
+    effort_live: false,             // true if effort changes in the open session, not at launch
     takes_effort: true,             // false if the vendor has no reasoning effort setting
     ids_carry_name: false,          // true if model IDs can start with the provider's own name (opencode/X)
     efforts: &[],                   // the effort levels it takes; empty passes any word
@@ -56,7 +56,9 @@ the session can move between threads.
 
 Three fields change how the rest of Octet treats the vendor.
 `takes_effort: false` makes `/effort` say the vendor takes no level and change
-nothing (opencode has none). `ids_carry_name: true` is for a vendor whose model
+nothing. A live vendor that sets effort by request (opencode's `effort`
+session option) implements `Protocol::set_effort`; without it the driver
+records the level for the next turn (Codex). `ids_carry_name: true` is for a vendor whose model
 IDs are `provider/model` and can start with the vendor's own name (opencode
 has an `opencode` provider): `/model opencode/big-pickle` keeps
 `opencode/big-pickle` whole as the model, where other vendors have the leading

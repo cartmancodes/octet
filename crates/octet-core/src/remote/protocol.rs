@@ -252,6 +252,10 @@ pub static EVENTS: &[EventKind] = &[
         data: Str,
     },
     EventKind {
+        kind: "effort",
+        data: Json,
+    },
+    EventKind {
         kind: "usage",
         data: Str,
     },
@@ -2390,6 +2394,8 @@ mod tests {
                 description: String::new(),
             }]),
             Event::ModelSelected("opus".into()),
+            Event::Effort(Some("high".into())),
+            Event::Effort(None),
             Event::ModeChanged(octet_engine::live::Mode::Auto),
             Event::User("hi".into()),
             Event::Started,

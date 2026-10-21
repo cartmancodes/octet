@@ -932,6 +932,9 @@ impl App {
                 self.conn.resolved_model = Some(id);
                 self.refresh_model_label();
             }
+            // opencode confirms a level, or puts back the one in force after
+            // refusing another: what a reconnect asks for follows it.
+            Event::Effort(level) => self.conn.effort = level,
             Event::ModeChanged(mode) => {
                 if self.conn.engine.provider().mode_applies_next_turn && self.conn.is_running() {
                     self.conn.mode_for_turn.get_or_insert(self.conn.mode);

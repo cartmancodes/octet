@@ -291,6 +291,17 @@ pub(crate) trait Protocol: Default + Send {
     }
     /// A turn is starting: clears per-turn protocol state.
     fn turn_started(&mut self) {}
+    /// Sets the reasoning effort (`None`: the vendor's default) on a
+    /// provider that takes it live. `Ok(false)` means the protocol has no
+    /// request for it: the driver records the level for the next turn and
+    /// says so.
+    fn set_effort(
+        &mut self,
+        _core: &mut Core,
+        _effort: Option<String>,
+    ) -> impl Future<Output = Result<bool, DriverError>> + Send {
+        async { Ok(false) }
+    }
     /// Adds `text` to the running turn. `Ok(false)` means the protocol cannot
     /// steer; the driver says so.
     fn steer(

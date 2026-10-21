@@ -15,6 +15,9 @@ use std::{
 const MODEL_FREE: &str = "opencode/fixture-free";
 /// The agent (Octet calls it the mode) a session starts with.
 const MODE_BUILD: &str = "build";
+/// The effort levels `MODEL_FREE` offers, as opencode lists a model's
+/// variants; the first is its default. Other models offer none.
+const FREE_EFFORTS: [&str; 3] = ["low", "high", "max"];
 
 /// One opencode session's state; the fake serves one session per process.
 struct OpencodeFixture {
@@ -32,6 +35,10 @@ struct OpencodeFixture {
     modes: Vec<String>,
     /// The agent each prompt ran under, in order, for `PARAMS`.
     agents: Vec<String>,
+    /// The current effort level; `None` for a model without levels.
+    effort: Option<String>,
+    /// Every effort level asked for so far, accepted or not, for `PARAMS`.
+    efforts: Vec<String>,
     /// The model was set to `OPENCODE_REJECT_MODE`: mode switches are refused.
     rejects_modes: bool,
     /// The one mode switch (the handshake's) accepted after the model.
@@ -52,6 +59,8 @@ pub(crate) fn run() {
         mode: MODE_BUILD.to_owned(),
         modes: Vec::new(),
         agents: Vec::new(),
+        effort: Some(FREE_EFFORTS[0].to_owned()),
+        efforts: Vec::new(),
         rejects_modes: false,
         free_mode_switch: false,
         held: None,
@@ -113,10 +122,11 @@ fn end_turn(id: &Value) {
 }
 
 impl OpencodeFixture {
-    /// The `model` and `mode` selectors, with their current values.
+    /// The `model`, `mode` and (for a model with levels) `effort`
+    /// selectors, with their current values.
     fn config_options(&self) -> Value {
         let mode = |value: &str, description: &str| json!({"value":value,"name":value,"description":description});
-        json!([
+        let mut options = json!([
             {"id":"model","name":"Model","category":"model","type":"select","currentValue":self.model,"options":[
                 {"value":MODEL_FREE,"name":"OpenCode/Fixture Free"},
                 {"value":"openai/gpt-fixture","name":"OpenAI/GPT Fixture"}]},
@@ -126,7 +136,15 @@ impl OpencodeFixture {
                 mode("octet-ask", "Ask before each tool"),
                 mode("octet-accept-edits", "Accept edits, ask for the rest"),
                 mode("octet-full-access", "Allow every tool")]}
-        ])
+        ]);
+        if let (Some(current), Some(list)) = (&self.effort, options.as_array_mut()) {
+            let levels: Vec<Value> = FREE_EFFORTS
+                .iter()
+                .map(|level| json!({"value":level,"name":level}))
+                .collect();
+            list.push(json!({"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":current,"options":levels}));
+        }
+        options
     }
 
     /// Opens, resumes or forks the session. A resume replays its history
@@ -169,10 +187,24 @@ impl OpencodeFixture {
         match v["params"]["configId"].as_str() {
             Some("model") => {
                 value.clone_into(&mut self.model);
+                // A model's effort starts at its default, as in opencode.
+                self.effort = (value == MODEL_FREE).then(|| FREE_EFFORTS[0].to_owned());
                 if value == scenario::OPENCODE_REJECT_MODE && !self.rejects_modes {
                     self.rejects_modes = true;
                     self.free_mode_switch = true;
                 }
+            }
+            Some("effort") => {
+                self.efforts.push(value.to_owned());
+                if self.effort.is_none() || !FREE_EFFORTS.contains(&value) {
+                    emit(&acp_error(
+                        &v["id"],
+                        -32602,
+                        &format!("Invalid params: effort not found: {value}"),
+                    ));
+                    return;
+                }
+                self.effort = Some(value.to_owned());
             }
             Some("mode") => {
                 if self.rejects_modes && !std::mem::take(&mut self.free_mode_switch) {
@@ -276,6 +308,8 @@ impl OpencodeFixture {
                     },
                     "modes": self.modes,
                     "agents": self.agents,
+                    "effort": self.effort,
+                    "efforts": self.efforts,
                     "model": self.model,
                     "opened": self.opened,
                 })

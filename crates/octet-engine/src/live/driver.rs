@@ -251,7 +251,7 @@ impl<P: Protocol> Driver<P> {
             Command::Answer { id, allow } => self.answer_approval(id, allow).await,
             Command::SetMode(target) => self.set_mode(target).await,
             Command::Steer(text) => self.steer(text).await,
-            Command::SetEffort(effort) => self.set_effort(effort),
+            Command::SetEffort(effort) => self.set_effort(effort).await,
             Command::Compact => self.compact().await,
             Command::Skill {
                 name,
@@ -313,9 +313,9 @@ impl<P: Protocol> Driver<P> {
         Ok(true)
     }
 
-    /// Live where the provider takes effort per turn; otherwise the
-    /// interface reconnects instead of sending this.
-    fn set_effort(&mut self, effort: Option<String>) -> Result<(), DriverError> {
+    /// Live where the provider takes effort per turn or by request;
+    /// otherwise the interface reconnects instead of sending this.
+    async fn set_effort(&mut self, effort: Option<String>) -> Result<(), DriverError> {
         let provider = self.core.config.engine.provider();
         if !provider.effort_live {
             return self.core.emit(Event::Notice(format!(
@@ -323,15 +323,16 @@ impl<P: Protocol> Driver<P> {
                 provider.title
             )));
         }
-        let shown = effort.as_deref().unwrap_or("vendor default").to_owned();
+        if self
+            .protocol
+            .set_effort(&mut self.core, effort.clone())
+            .await?
+        {
+            return Ok(());
+        }
+        let notice = effort_notice(effort.as_deref(), self.core.phase.is_running());
         self.core.config.effort = effort;
-        let when = if self.core.phase.is_running() {
-            "from the next turn"
-        } else {
-            "from now on"
-        };
-        self.core
-            .emit(Event::Notice(format!("Reasoning effort: {shown} ({when})")))
+        self.core.emit(Event::Notice(notice))
     }
 
     async fn steer(&mut self, text: String) -> Result<(), DriverError> {
@@ -421,6 +422,19 @@ pub(super) fn with_stderr(error: DriverError, engine: Engine, tail: &[u8]) -> St
         format!("{error}\n{engine} stderr: {text}")
     }
 }
+/// What Octet says once the reasoning effort is `effort` (`None`: the
+/// vendor's default), from the next turn when one is `running`.
+pub(super) fn effort_notice(effort: Option<&str>, running: bool) -> String {
+    let shown = effort.unwrap_or("vendor default");
+    let when = if running {
+        "from the next turn"
+    } else {
+        "from now on"
+    };
+    format!("Reasoning effort: {shown} ({when})")
+}
+
+/// `limit` as a person reads it: milliseconds below a second.
 pub(super) fn seconds(limit: Duration) -> String {
     match limit.as_secs() {
         0 => format!("{} ms", limit.as_millis()),

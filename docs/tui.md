@@ -247,10 +247,15 @@ turn running, `/steer` sends the text as a prompt.
 `/effort` alone shows it and `/effort default` returns to the vendor's
 default. Claude takes `low`, `medium`, `high`, `xhigh` and `max`, and Octet
 refuses other levels for it. Codex's levels depend on the model, so any
-word is passed on and Codex decides. opencode has no effort setting, so
-`/effort` says so and changes nothing. A `/model` switch to a provider that
+word is passed on and Codex decides. opencode's levels depend on the model
+too (its variants: `opencode/deepseek-v4.1-flash-free` offers `low`, `high`
+and `max`; some models offer none), and Octet refuses a level the model
+does not list, naming the ones it does. A `/model` switch to a provider that
 does not take the level falls back to its default, with a notice.
 Codex takes it with each turn, so a change applies from the next turn.
+opencode sets it in the open session; `/effort default` goes back to the
+level the model started at. A model's level can reset when the model
+changes, so Octet sets it again at connect when the new model lists it.
 Claude takes it at launch, so a change reconnects to the same session. The
 level carries across `/model`, `/new` and `/reconnect`.
 

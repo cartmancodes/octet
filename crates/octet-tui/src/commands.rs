@@ -172,8 +172,9 @@ fn skill_command(app: &mut App, vendor: &dyn Vendor, name: &str, argument: &str)
     }
 }
 /// `/effort`: show the reasoning effort, or change it. Codex takes it per
-/// turn; Claude takes it at launch, so a change reconnects there; a provider
-/// with no effort setting (opencode) says so and changes nothing.
+/// turn and opencode in the open session; Claude takes it at launch, so a
+/// change reconnects there; a provider with no effort setting says so and
+/// changes nothing.
 fn effort_command(app: &mut App, vendor: &dyn Vendor, argument: &str) -> Action {
     if !app.conn.engine.provider().takes_effort {
         if let Err(error) = app.conn.engine.check_effort(argument) {

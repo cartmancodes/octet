@@ -211,8 +211,9 @@ The fake vendor and the protocol gate should record the exact shape of
     Rows without a clash stay as they are today.
 13. **Provider row:** `name: "opencode"`, `title: "opencode"`,
     `default_binary: "opencode"`, `steer: false`, `inline_images: true`
-    (ACP image content blocks are base64), `effort_live: false`,
-    `efforts: &[]` (see "Left to the builder"), and `lists_models: true`.
+    (ACP image content blocks are base64), `effort_live: true`,
+    `takes_effort: true`, `efforts: &[]` (amended after the final review:
+    see "Left to the builder"), and `lists_models: true`.
     The probe is a short `initialize` + `session/new` that reads `configOptions`
     and the commands, then closes the session; `opencode models` is the fallback.
     The daily probe must not leave empty sessions in the user's opencode history.
@@ -271,7 +272,10 @@ The fake vendor and the protocol gate should record the exact shape of
   target, and `usage_update` to `Event::Usage`.
 - Effort: whether opencode's `--variant` can reach an ACP session (the
   `opencode acp` command has no such flag; a config key may exist). If not,
-  `/effort` says opencode does not take it.
+  `/effort` says opencode does not take it. Resolved after the final review:
+  opencode 1.18.25 lists a model's variants as the session's `effort` option
+  (`session/set_config_option {configId: "effort"}`, live), for models that
+  have them, so `/effort` sets it; the levels depend on the model.
 - The `shutdown_grace`, timed against the real CLI.
 - Whether `/model` header counts need anything new for a list of a few dozen
   models (they should not).

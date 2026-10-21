@@ -620,6 +620,9 @@ pub enum Event {
     ModelSelected(String),
     /// The permission mode the vendor confirmed.
     ModeChanged(Mode),
+    /// The reasoning effort the vendor confirmed, or went back to after a
+    /// refusal; `None` is its default. Only opencode reports it.
+    Effort(Option<String>),
     /// The user's prompt, as the transcript shows it.
     User(String),
     /// A turn began.
@@ -1280,6 +1283,11 @@ mod tests {
     }
     #[test]
     fn effort_levels_are_checked_where_the_provider_lists_them() {
+        /// A provider with no effort setting at all.
+        static NONE: Provider = Provider {
+            takes_effort: false,
+            ..demo::PROVIDER
+        };
         for level in ["low", "medium", "high", "xhigh", "max"] {
             assert_eq!(Engine::CLAUDE.check_effort(level), Ok(()), "{level}");
         }
@@ -1287,8 +1295,15 @@ mod tests {
             Engine::CLAUDE.check_effort("bogus"),
             Err("Claude takes effort low, medium, high, xhigh or max".to_owned())
         );
-        // Codex's levels depend on the model, so any word is passed on.
+        // Codex's and opencode's levels depend on the model, so any word is
+        // passed on.
         assert_eq!(Engine::CODEX.check_effort("minimal"), Ok(()));
+        assert_eq!(Engine::OPENCODE.check_effort("max"), Ok(()));
+        // A provider with no effort setting at all says so.
+        assert_eq!(
+            Engine(&NONE).check_effort("high"),
+            Err("Demo does not take a reasoning effort level".to_owned())
+        );
     }
     #[test]
     fn the_table_is_complete_and_unambiguous() {

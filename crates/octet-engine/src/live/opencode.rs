@@ -36,8 +36,9 @@ pub(super) const PROVIDER: Provider = Provider {
     steer: false,
     mode_applies_next_turn: true,
     inline_images: true,
-    effort_live: false,
-    takes_effort: false,
+    // Levels depend on the model (its variants) and change live.
+    effort_live: true,
+    takes_effort: true,
     ids_carry_name: true,
     efforts: &[],
     // opencode 1.18.25 exits within 35 ms once its input closes, idle or
@@ -58,6 +59,8 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
 const MAX_TOOLS: usize = 256;
 /// The most models one catalog keeps.
 const MAX_MODELS: usize = 256;
+/// The most effort levels one model's option keeps.
+const MAX_EFFORTS: usize = 32;
 /// The most timed-out mode switches kept in case opencode confirms them late.
 const MAX_LATE_SWITCHES: usize = 8;
 /// How long a probe waits, after the session opens, for opencode to list its
@@ -80,8 +83,56 @@ enum Outstanding {
     /// The agent that carries this mode, set in the open session at the
     /// user's request.
     Switch(Mode),
+    /// An effort level: what the user asked for (`None`: the model's
+    /// default) and the value sent for it.
+    SetEffort(EffortRequest),
     /// `session/prompt`: its reply ends the turn.
     Prompt,
+}
+
+/// An effort level set in the session.
+struct EffortRequest {
+    /// The level Octet records once opencode confirms it; `None` is the
+    /// model's default.
+    level: Option<String>,
+    /// The value sent: the level, or the model's default level.
+    value: String,
+    /// Set during the handshake, which goes on to the agent afterwards.
+    handshake: bool,
+}
+
+/// What Octet knows of the current model's effort levels.
+#[derive(Default)]
+enum Efforts {
+    /// Nothing yet: no options reported since the model changed.
+    #[default]
+    Unknown,
+    /// opencode reported options without an `effort` one: the model has
+    /// no levels.
+    Absent,
+    /// The model's `effort` option.
+    Listed(EffortOption),
+}
+
+impl Efforts {
+    /// The model's `effort` option, when it has one.
+    fn listed(&self) -> Option<&EffortOption> {
+        match self {
+            Efforts::Listed(option) => Some(option),
+            Efforts::Unknown | Efforts::Absent => None,
+        }
+    }
+}
+
+/// The current model's `effort` option, as opencode last reported it.
+struct EffortOption {
+    /// The model's levels, in opencode's order, bounded.
+    values: Vec<String>,
+    /// The level in force.
+    current: Option<String>,
+    /// The level the model started at in this session: what
+    /// `/effort default` goes back to.
+    default: Option<String>,
 }
 
 /// A live mode switch awaiting opencode's reply.
@@ -116,6 +167,8 @@ pub(super) struct OpencodeProtocol {
     model: Option<String>,
     /// The session's agent (`currentValue` of its `mode` option).
     agent: Option<String>,
+    /// The current model's effort levels, as opencode last reported them.
+    effort: Efforts,
     /// Each tool call's name and target from its first frame, this turn.
     tools: HashMap<String, (String, String)>,
     /// A probe's session is open and its commands are awaited until this
@@ -247,6 +300,67 @@ impl Protocol for OpencodeProtocol {
         Ok(())
     }
 
+    /// Sets the effort option, live. A level the model does not list is
+    /// refused here, unsent, and the interface goes back to the level in
+    /// force. `/effort default` sets the level the model started at, when
+    /// opencode reported one; otherwise opencode keeps its level.
+    async fn set_effort(
+        &mut self,
+        core: &mut Core,
+        effort: Option<String>,
+    ) -> Result<bool, DriverError> {
+        if !core.phase.is_ready() {
+            // The handshake's effort step takes it.
+            core.config.effort = effort;
+            return Ok(true);
+        }
+        let option = self.effort.listed();
+        let request = match effort {
+            Some(level) => {
+                if let Some(refusal) = self.effort_refusal(&level) {
+                    core.emit(Event::Notice(refusal))?;
+                    core.emit(Event::Effort(core.config.effort.clone()))?;
+                    return Ok(true);
+                }
+                EffortRequest {
+                    value: level.clone(),
+                    level: Some(level),
+                    handshake: false,
+                }
+            }
+            None => match option.map(|option| (&option.current, &option.default)) {
+                Some((current, Some(default))) if current.as_ref() != Some(default) => {
+                    EffortRequest {
+                        value: default.clone(),
+                        level: None,
+                        handshake: false,
+                    }
+                }
+                Some((Some(current), None)) => {
+                    let notice = format!(
+                        "opencode keeps effort {} until the model changes",
+                        short(current)
+                    );
+                    core.config.effort = None;
+                    core.emit(Event::Notice(notice))?;
+                    return Ok(true);
+                }
+                _ => {
+                    // Already at the model's own level, or it has none.
+                    core.config.effort = None;
+                    core.emit(Event::Effort(None))?;
+                    core.emit(Event::Notice(super::driver::effort_notice(
+                        None,
+                        core.phase.is_running(),
+                    )))?;
+                    return Ok(true);
+                }
+            },
+        };
+        self.send_effort(core, request).await?;
+        Ok(true)
+    }
+
     async fn on_frame(&mut self, core: &mut Core, v: Value) -> Result<(), DriverError> {
         let method = v["method"].as_str().unwrap_or("");
         if method.is_empty() {
@@ -329,6 +443,99 @@ impl OpencodeProtocol {
             .await
     }
 
+    /// Why opencode's model cannot take `level`, from its last reported
+    /// options; `None` when it lists the level or its levels are unknown.
+    fn effort_refusal(&self, level: &str) -> Option<String> {
+        let model = short(self.model.as_deref().unwrap_or("default"));
+        match &self.effort {
+            Efforts::Absent => Some(format!("opencode's model {model} has no effort levels")),
+            Efforts::Listed(option) if !option.values.iter().any(|value| value == level) => {
+                let levels = match option.values.split_last() {
+                    Some((last, [])) => last.clone(),
+                    Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+                    None => "no levels".to_owned(),
+                };
+                Some(format!("opencode's model {model} takes effort {levels}"))
+            }
+            // Unknown levels are sent, and opencode decides.
+            Efforts::Unknown | Efforts::Listed(_) => None,
+        }
+    }
+
+    /// The handshake's effort step, after the model and before the agent:
+    /// the level the user asked for, when the model takes it. A level it
+    /// does not take is dropped with a notice; effort is not a safety
+    /// property, so the session carries on either way.
+    async fn effort_step(&mut self, core: &mut Core) -> Result<(), DriverError> {
+        if let Some(level) = core.config.effort.clone() {
+            let current = self
+                .effort
+                .listed()
+                .and_then(|option| option.current.as_deref());
+            if let Some(refusal) = self.effort_refusal(&level) {
+                core.emit(Event::Notice(refusal))?;
+                core.config.effort = None;
+                core.emit(Event::Effort(None))?;
+            } else if current != Some(level.as_str()) {
+                let request = EffortRequest {
+                    value: level.clone(),
+                    level: Some(level),
+                    handshake: true,
+                };
+                return self.send_effort(core, request).await;
+            }
+        }
+        self.set_agent(core).await
+    }
+
+    /// Sends `request`'s `effort` value.
+    async fn send_effort(
+        &mut self,
+        core: &Core,
+        request: EffortRequest,
+    ) -> Result<(), DriverError> {
+        let value = request.value.clone();
+        self.set_option(core, Outstanding::SetEffort(request), "effort", &value)
+            .await
+    }
+
+    /// An effort reply. A confirmation records the level and tells the
+    /// interface; a refusal is reported and the interface goes back to the
+    /// level in force. The handshake then sets the agent.
+    async fn effort_set(
+        &mut self,
+        core: &mut Core,
+        v: &Value,
+        request: EffortRequest,
+    ) -> Result<(), DriverError> {
+        if let Some(error) = v.get("error") {
+            core.emit(Event::Notice(format!(
+                "opencode did not set effort {}: {}",
+                short(&request.value),
+                error_text(error)
+            )))?;
+            if request.handshake {
+                core.config.effort = None;
+            }
+            core.emit(Event::Effort(core.config.effort.clone()))?;
+        } else {
+            self.note_options(&v["result"]["configOptions"]);
+            core.config.effort.clone_from(&request.level);
+            core.emit(Event::Effort(request.level.clone()))?;
+            if !request.handshake {
+                core.emit(Event::Notice(super::driver::effort_notice(
+                    request.level.as_deref(),
+                    core.phase.is_running(),
+                )))?;
+            }
+        }
+        if request.handshake {
+            self.set_agent(core).await
+        } else {
+            Ok(())
+        }
+    }
+
     /// Sends one of Octet's requests and records what its reply answers.
     async fn request(
         &mut self,
@@ -373,6 +580,7 @@ impl OpencodeProtocol {
             Outstanding::SetModel => self.model_set(core, v).await,
             Outstanding::SetMode(target) => self.mode_set(core, v, target),
             Outstanding::Switch(target) => self.switched(core, v, target),
+            Outstanding::SetEffort(request) => self.effort_set(core, v, request).await,
             Outstanding::Prompt => self.prompt_ended(core, v),
         }
     }
@@ -434,7 +642,7 @@ impl OpencodeProtocol {
                 self.set_option(core, Outstanding::SetModel, "model", &model)
                     .await
             }
-            _ => self.set_agent(core).await,
+            _ => self.effort_step(core).await,
         }
     }
 
@@ -446,8 +654,10 @@ impl OpencodeProtocol {
     }
 
     /// The model's reply. A refusal is reported and the session keeps
-    /// opencode's model; either way the agent is set next.
-    async fn model_set(&mut self, core: &Core, v: &Value) -> Result<(), DriverError> {
+    /// opencode's model; either way the effort and the agent are set next.
+    /// A new model may start at another level, so its levels are what its
+    /// reply reports.
+    async fn model_set(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
         let requested = core.config.model.clone().unwrap_or_default();
         if let Some(error) = v.get("error") {
             core.emit(Event::Notice(format!(
@@ -458,9 +668,10 @@ impl OpencodeProtocol {
         } else {
             // A reply without the options still confirms the request.
             self.model = Some(requested).filter(|model| valid_identifier(model));
+            self.effort = Efforts::Unknown;
             self.note_options(&v["result"]["configOptions"]);
         }
-        self.set_agent(core).await
+        self.effort_step(core).await
     }
 
     /// The agent's reply ends the handshake: ready, with the model and the
@@ -615,14 +826,47 @@ impl OpencodeProtocol {
         finish_probe(core)
     }
 
-    /// Records the model and agent `config_options` reports as current.
+    /// Records the model, agent and effort levels `config_options` reports
+    /// as current. Options without an `effort` one mean the model has no
+    /// levels; a model's first report of its level is its default.
     fn note_options(&mut self, config_options: &Value) {
-        if let Some(model) = current(config_options, "model") {
-            self.model = Some(model.to_owned());
+        let Some(list) = config_options.as_array() else {
+            return;
+        };
+        let model = current(config_options, "model").map(str::to_owned);
+        let changed = model.is_some() && model != self.model;
+        if let Some(model) = model {
+            self.model = Some(model);
         }
         if let Some(agent) = current(config_options, "mode") {
             self.agent = Some(agent.to_owned());
         }
+        let Some(effort) = list.iter().find(|option| option["id"] == "effort") else {
+            self.effort = Efforts::Absent;
+            return;
+        };
+        let values: Vec<String> = effort["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|choice| choice["value"].as_str())
+            .filter(|value| valid_identifier(value))
+            .take(MAX_EFFORTS)
+            .map(str::to_owned)
+            .collect();
+        let current = effort["currentValue"]
+            .as_str()
+            .filter(|value| valid_identifier(value))
+            .map(str::to_owned);
+        let default = match std::mem::take(&mut self.effort) {
+            Efforts::Listed(known) if !changed => known.default,
+            _ => current.clone(),
+        };
+        self.effort = Efforts::Listed(EffortOption {
+            values,
+            current,
+            default,
+        });
     }
 
     /// The prompt's reply ends the turn, with its token count when it has one.
@@ -1171,6 +1415,60 @@ mod tests {
             skill_prompt("review", "go", Some("earlier")),
             [text("/review go"), text("\n\nearlier")]
         );
+    }
+
+    /// `configOptions` for `model` with an effort option at `current`
+    /// offering `levels`, or none when `levels` is empty.
+    fn effort_options(model: &str, current: &str, levels: &[&str]) -> Value {
+        let mut options = json!([{"id": "model", "currentValue": model, "options": []}]);
+        if !levels.is_empty() {
+            let choices: Vec<Value> = levels.iter().map(|l| json!({"value": l})).collect();
+            options
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"id": "effort", "currentValue": current, "options": choices}));
+        }
+        options
+    }
+
+    #[test]
+    fn effort_levels_follow_the_reported_options() {
+        let mut protocol = OpencodeProtocol::default();
+        // Unknown until opencode reports options: the level is sent.
+        assert_eq!(protocol.effort_refusal("high"), None);
+        protocol.note_options(&effort_options("a/free", "low", &["low", "high", "max"]));
+        assert_eq!(protocol.effort_refusal("max"), None);
+        assert_eq!(
+            protocol.effort_refusal("bogus").as_deref(),
+            Some("opencode's model a/free takes effort low, high or max")
+        );
+        // The model's first level is its default; a later level keeps it.
+        protocol.note_options(&effort_options("a/free", "max", &["low", "high", "max"]));
+        let option = protocol.effort.listed().unwrap();
+        assert_eq!(option.current.as_deref(), Some("max"));
+        assert_eq!(option.default.as_deref(), Some("low"));
+        // Another model starts over.
+        protocol.note_options(&effort_options("b/paid", "none", &["none", "xhigh"]));
+        let option = protocol.effort.listed().unwrap();
+        assert_eq!(option.default.as_deref(), Some("none"));
+        assert_eq!(
+            protocol.effort_refusal("low").as_deref(),
+            Some("opencode's model b/paid takes effort none or xhigh")
+        );
+        protocol.note_options(&effort_options("c/one", "only", &["only"]));
+        assert_eq!(
+            protocol.effort_refusal("low").as_deref(),
+            Some("opencode's model c/one takes effort only")
+        );
+        // Options without an effort one: the model has no levels.
+        protocol.note_options(&effort_options("d/none", "", &[]));
+        assert_eq!(
+            protocol.effort_refusal("high").as_deref(),
+            Some("opencode's model d/none has no effort levels")
+        );
+        // A reply without options changes nothing.
+        protocol.note_options(&Value::Null);
+        assert!(matches!(protocol.effort, Efforts::Absent));
     }
 
     #[test]

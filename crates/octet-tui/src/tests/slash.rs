@@ -632,23 +632,28 @@ async fn effort_refuses_a_level_claude_does_not_take() {
     );
 }
 #[tokio::test]
-async fn effort_says_opencode_takes_none() {
+async fn opencode_takes_effort_live() {
     let mut opencode = crate::test_support::app_for(octet_core::Engine::OPENCODE);
     crate::test_support::idle(&mut opencode);
-    for line in ["/effort", "/effort high", "/effort default"] {
-        assert!(matches!(
-            command(&mut opencode, line).await,
-            Action::Continue
-        ));
-    }
+    // opencode sets the level in the open session: no reconnect.
     assert_eq!(
+        sends(&mut opencode, "/effort high").await,
+        [Command::SetEffort(Some("high".into()))]
+    );
+    assert_eq!(opencode.conn.effort.as_deref(), Some("high"));
+    command(&mut opencode, "/effort").await;
+    assert!(
         opencode
             .entries_text()
-            .matches("opencode does not take a reasoning effort level")
-            .count(),
-        3
+            .contains("Reasoning effort: high. Use /effort <level> (the levels your model offers)")
     );
+    // A level opencode refuses puts back the one in force.
+    opencode.event(octet_core::Event::Effort(None));
     assert_eq!(opencode.conn.effort, None);
+    assert_eq!(
+        sends(&mut opencode, "/effort default").await,
+        [Command::SetEffort(None)]
+    );
 }
 #[tokio::test]
 async fn every_command_needing_no_open_turn_refuses_the_same_way() {

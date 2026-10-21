@@ -2751,6 +2751,131 @@ async fn opencode_switch_between_turns_gives_no_next_turn_notice() {
     );
     stop(&handle, task).await;
 }
+/// The fake opencode's `PARAMS` echo, from a session `config` opens.
+async fn opencode_params(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+) -> serde_json::Value {
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    serde_json::from_str(&turn_text(events).await).unwrap()
+}
+#[tokio::test]
+async fn opencode_launch_effort_is_set_before_the_agent() {
+    let mut c = opencode();
+    c.effort = Some("high".into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["effort"], "high", "{echo}");
+    assert_eq!(echo["efforts"], serde_json::json!(["high"]), "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_changes_live() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetEffort(Some("max".into()))).unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Effort(Some(l)) if l == "max"),
+    )
+    .await;
+    let notice = next(&mut events).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "Reasoning effort: max (from now on)"),
+        "{notice:?}"
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["effort"], "max", "{echo}");
+    // `/effort default` goes back to the model's own level.
+    handle.send(Command::SetEffort(None)).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Effort(None))).await;
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["effort"], "low", "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_the_model_does_not_list_is_not_sent() {
+    let mut c = opencode();
+    c.effort = Some("high".into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::SetEffort(Some("bogus".into())))
+        .unwrap();
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode's model opencode/fixture-free takes effort low, high or max"),
+        "{notice:?}"
+    );
+    // The interface goes back to the level opencode is at.
+    let effort = next(&mut events).await;
+    assert!(
+        matches!(&effort, Event::Effort(Some(l)) if l == "high"),
+        "{effort:?}"
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["efforts"], serde_json::json!(["high"]), "{echo}");
+    assert_eq!(echo["effort"], "high", "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_model_without_effort_levels_says_so() {
+    let mut c = opencode();
+    c.model = Some("openai/gpt-fixture".into());
+    c.effort = Some("high".into());
+    let (handle, mut events, task) = spawn(c);
+    // At connect: nothing is sent, and the level is dropped.
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode's model openai/gpt-fixture has no effort levels"),
+        "{notice:?}"
+    );
+    wait_for(&mut events, |e| matches!(e, Event::Effort(None))).await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::SetEffort(Some("high".into())))
+        .unwrap();
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode's model openai/gpt-fixture has no effort levels"),
+        "{notice:?}"
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["efforts"], serde_json::json!([]), "{echo}");
+    assert_eq!(echo["effort"], serde_json::Value::Null, "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_refused_at_connect_is_reported_and_the_session_goes_on() {
+    use serde_json::json;
+    // No options reported, so the level is sent; opencode refuses it.
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32602, "message": "Invalid params: effort not found: high"}}),
+        json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
+    ];
+    let mut body = String::new();
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    body.push_str("exec sleep 30\n");
+    let (_dir, vendor) = script_vendor("octet-live-opencode-effort-refused", &body);
+    let mut c = Config::new(Engine::OPENCODE, vendor, std::env::temp_dir());
+    c.effort = Some("high".into());
+    let (handle, mut events, task) = spawn(c);
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode did not set effort high: Invalid params: effort not found: high"),
+        "{notice:?}"
+    );
+    wait_for(&mut events, |e| matches!(e, Event::Effort(None))).await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    stop(&handle, task).await;
+}
 #[tokio::test]
 async fn opencode_auto_is_the_build_agent() {
     let modes = opencode_agents_after_switching_to(Mode::Auto).await;
