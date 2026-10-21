@@ -2573,9 +2573,11 @@ async fn opencode_approval_denied_sends_reject() {
 }
 #[tokio::test]
 async fn opencode_approval_times_out_as_denied() {
+    // A second's window and the default limits: under load, neither a slow
+    // start nor a slow reply may end the session before the timeout does.
     let mut c = opencode();
-    c.approval_timeout = Duration::from_millis(200);
-    let (handle, mut events, task) = spawn_with_limits(c, quick());
+    c.approval_timeout = Duration::from_secs(1);
+    let (handle, mut events, task) = spawn(c);
     wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
     handle
         .send(Command::Prompt(scenario::APPROVAL.into()))
@@ -2585,12 +2587,28 @@ async fn opencode_approval_times_out_as_denied() {
     else {
         unreachable!()
     };
-    wait_for(
-        &mut events,
-        |e| matches!(e, Event::ApprovalClosed(closed) if *closed == id),
-    )
-    .await;
-    assert_eq!(turn_text(&mut events).await, "reject");
+    let shown = tokio::time::Instant::now();
+    // Unanswered, it is closed and denied by the timeout, which says so,
+    // and opencode is told `reject`.
+    let (mut seen, mut text) = (Vec::new(), String::new());
+    loop {
+        match wait_for_within(&mut events, 30, |_| true).await {
+            Event::ApprovalClosed(done) if done == id => {
+                assert!(
+                    shown.elapsed() >= Duration::from_millis(900),
+                    "{:?}",
+                    shown.elapsed()
+                );
+                seen.push("closed".to_owned());
+            }
+            Event::Notice(notice) => seen.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(seen, ["closed", "Approval timed out and was denied"]);
+    assert_eq!(text, "reject");
     stop(&handle, task).await;
 }
 #[tokio::test]
