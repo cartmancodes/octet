@@ -2788,15 +2788,18 @@ async fn opencode_other_session_updates_are_neither_progress_nor_output() {
     let _ = handle;
     ended(task).await;
 }
-/// What an `ask` session shows after asking a scripted opencode to switch
-/// to accept-edits, which answers `delay` seconds later with `reply` (the
-/// reply's `result` or `error` member): its notices and header modes, up to
-/// the `modes`th mode.
-async fn opencode_scripted_switch(
+/// An `ask` session with a scripted opencode that, asked to switch to
+/// accept-edits, answers `delay` seconds later with `reply` (the reply's
+/// `result` or `error` member). The switch has been sent.
+async fn opencode_switching(
     reply: serde_json::Value,
     delay: &str,
-    modes: usize,
-) -> Vec<String> {
+) -> (
+    octet_testkit::TempDir,
+    octet_engine::live::Handle,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<()>,
+) {
     use serde_json::json;
     let mode = |agent: &str| json!([{"id": "mode", "currentValue": agent}]);
     let mut fourth = json!({"jsonrpc": "2.0", "id": 4});
@@ -2817,7 +2820,7 @@ async fn opencode_scripted_switch(
         body,
         "read line\nsleep {delay}\necho '{fourth}'\nexec sleep 30\n"
     );
-    let (_dir, vendor) = script_vendor("octet-live-opencode-switch", &body);
+    let (dir, vendor) = script_vendor("octet-live-opencode-switch", &body);
     let config = Config::new(Engine::OPENCODE, vendor, std::env::temp_dir());
     // A short confirmation window, and the usual connect limit: a shell
     // vendor can be slow to start while the other tests run.
@@ -2828,6 +2831,17 @@ async fn opencode_scripted_switch(
     let (handle, mut events, task) = spawn_with_limits(config, limits);
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
     handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    (dir, handle, events, task)
+}
+/// What an `ask` session shows after asking a scripted opencode to switch
+/// to accept-edits (see `opencode_switching`): its notices and header
+/// modes, up to the `modes`th mode.
+async fn opencode_scripted_switch(
+    reply: serde_json::Value,
+    delay: &str,
+    modes: usize,
+) -> Vec<String> {
+    let (_dir, handle, mut events, task) = opencode_switching(reply, delay).await;
     let mut seen = Vec::new();
     while seen
         .iter()
@@ -2848,6 +2862,21 @@ async fn opencode_scripted_switch(
     stop(&handle, task).await;
     seen
 }
+/// The error that stops a session after a scripted switch (see
+/// `opencode_switching`); the header must never have shown accept-edits.
+async fn opencode_switch_error(reply: serde_json::Value, delay: &str) -> String {
+    let (_dir, _handle, mut events, task) = opencode_switching(reply, delay).await;
+    let error = loop {
+        match next(&mut events).await {
+            Event::Error(error) => break error,
+            Event::ModeChanged(Mode::AcceptEdits) => panic!("the header claimed accept-edits"),
+            Event::Stopped => panic!("stopped without an error"),
+            _ => {}
+        }
+    };
+    ended(task).await;
+    error
+}
 #[tokio::test]
 async fn opencode_unconfirmed_switch_times_out_then_applies_a_late_confirmation() {
     let confirmed = serde_json::json!({"result": {"configOptions": [
@@ -2863,16 +2892,27 @@ async fn opencode_unconfirmed_switch_times_out_then_applies_a_late_confirmation(
     );
 }
 #[tokio::test]
-async fn opencode_switch_reporting_another_agent_keeps_the_mode() {
-    let other = serde_json::json!({"result": {"configOptions": [
-        {"id": "mode", "currentValue": "build"}]}});
+async fn opencode_switch_reporting_another_agent_stops_or_keeps_the_mode() {
+    // opencode ignored the switch: it still reports the agent in force.
+    let ignored = serde_json::json!({"result": {"configOptions": [
+        {"id": "mode", "currentValue": "octet-ask"}]}});
     assert_eq!(
-        opencode_scripted_switch(other, "0", 1).await,
+        opencode_scripted_switch(ignored, "0", 1).await,
         [
-            "opencode did not switch to accept-edits: opencode reported agent build",
+            "opencode did not switch to accept-edits: opencode reported agent octet-ask",
             "mode ask",
         ]
     );
+    // opencode moved to an agent nobody asked for: the session stops.
+    for delay in ["0", "1.6"] {
+        let other = serde_json::json!({"result": {"configOptions": [
+            {"id": "mode", "currentValue": "build"}]}});
+        assert_eq!(
+            opencode_switch_error(other, delay).await,
+            "opencode switched to agent build instead of octet-accept-edits; Octet stopped the session so opencode never acts outside the mode you chose",
+            "after {delay} s"
+        );
+    }
 }
 #[tokio::test]
 async fn opencode_permission_outside_a_turn_is_rejected_with_a_notice() {

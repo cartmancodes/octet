@@ -431,7 +431,7 @@ impl OpencodeProtocol {
         let wanted = agent(target);
         let refusal = self.agent_refusal(v, target).map(|refusal| match refusal {
             Refusal::Error(message) => message,
-            Refusal::Reported(shown) => {
+            Refusal::Reported { shown, .. } => {
                 format!("opencode reported agent {shown} instead of {wanted}")
             }
         });
@@ -463,17 +463,20 @@ impl OpencodeProtocol {
         self.note_options(options);
         let reported = &option(options, "mode")["currentValue"];
         (!reported.is_null() && reported.as_str() != Some(agent(target))).then(|| {
-            Refusal::Reported(
-                reported
+            Refusal::Reported {
+                agent: reported.as_str().map(str::to_owned),
+                shown: reported
                     .as_str()
                     .map_or_else(|| short(&reported.to_string()), short),
-            )
+            }
         })
     }
 
-    /// A live switch's reply. Only a confirmation changes the mode; a
-    /// refusal is reported and the session keeps the mode it has. A reply
-    /// after the switch timed out is still applied.
+    /// A live switch's reply. Only a confirmation changes the mode. An
+    /// error, or a reply naming the agent already in force, is reported and
+    /// the session keeps its mode. A reply naming any other agent stops the
+    /// session: opencode may then ask for less than the header shows. A
+    /// reply after the switch timed out is handled the same way.
     fn switched(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
         let id = v["id"].as_u64();
         let late = self
@@ -486,7 +489,16 @@ impl OpencodeProtocol {
         if let Some(refusal) = self.agent_refusal(v, target) {
             let reason = match refusal {
                 Refusal::Error(message) => message,
-                Refusal::Reported(shown) => format!("opencode reported agent {shown}"),
+                Refusal::Reported { agent: kept, shown } => {
+                    if kept.as_deref() != Some(agent(core.mode)) {
+                        return Err(format!(
+                            "opencode switched to agent {shown} instead of {}; Octet stopped the session so opencode never acts outside the mode you chose",
+                            agent(target)
+                        )
+                        .into());
+                    }
+                    format!("opencode reported agent {shown}")
+                }
             };
             core.emit(Event::Notice(format!(
                 "opencode did not switch to {}: {reason}",
@@ -611,8 +623,13 @@ impl OpencodeProtocol {
 enum Refusal {
     /// An error reply, with its message.
     Error(String),
-    /// A success reply naming another agent as current, shown bounded.
-    Reported(String),
+    /// A success reply naming another agent as current.
+    Reported {
+        /// The agent named, when it is a string.
+        agent: Option<String>,
+        /// The agent named, bounded for display.
+        shown: String,
+    },
 }
 
 /// A request from opencode. A permission request for this session's running
