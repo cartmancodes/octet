@@ -16,6 +16,7 @@ mod demo;
 mod driver;
 mod image;
 mod mode;
+mod opencode;
 mod protocol;
 pub use activity::{APPROVAL_SCOPE, ApprovalSummary, ToolCall, ToolPhase};
 pub use claude::claude_stray_reply;
