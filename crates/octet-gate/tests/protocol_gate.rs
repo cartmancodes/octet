@@ -386,6 +386,192 @@ fn lockdown_passes_only_when_opencode_asks() {
     );
 }
 
+/// opencode's `reject_once`-style options, as 1.18.25 sends them.
+fn opencode_options() -> Value {
+    json!([
+        {"optionId":"once","kind":"allow_once"},
+        {"optionId":"always","kind":"allow_always"},
+        {"optionId":"reject","kind":"reject_once"},
+    ])
+}
+
+/// A permission request, numbered `id`, for `call` in session `ses_a`.
+fn opencode_ask(id: u64, call: &Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":"ses_a","toolCall":call,"options":opencode_options()}})
+}
+
+/// The gate's answer to the request numbered `id`, from what it sent.
+fn sent_answer(root: &std::path::Path, id: u64) -> Value {
+    let sent = std::fs::read_to_string(root.join("stdin")).unwrap();
+    sent.lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|frame| frame["id"] == id && frame.get("method").is_none())
+        .unwrap()
+}
+
+#[test]
+fn lockdown_counts_only_the_fixture_command() {
+    // A request for anything but `echo fixture` (another command, or an edit
+    // titled like it) is rejected and proves nothing.
+    for (n, call) in [
+        json!({"toolCallId":"c1","title":"rm -rf build","kind":"execute","rawInput":{"command":"rm -rf build"}}),
+        json!({"toolCallId":"c1","title":"echo fixture","kind":"edit","rawInput":{}}),
+        json!({"toolCallId":"c1","title":"echo fixture; rm -rf ~","kind":"execute","rawInput":{"command":"echo fixture; rm -rf ~"}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = octet_testkit::TempDir::new(&format!("octet-gate-lockdown-other-{n}"));
+        std::fs::create_dir_all(root.path()).unwrap();
+        let failed =
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"failed"});
+        let frames = opencode_frames(vec![opencode_ask(0, &call), opencode_update(&failed)]);
+        let (code, evidence) = probe_in(
+            root.path(),
+            "opencode",
+            "lockdown",
+            &opencode_script(&frames, "[]"),
+        );
+        let evidence = evidence.unwrap();
+        assert_eq!(code, Some(1), "{call}: {evidence}");
+        assert_eq!(evidence["approval_requests"], 0, "{call}");
+        assert_eq!(
+            evidence["status"],
+            "failed: protocol: the model ran no command, so lockdown is unproven",
+            "{call}"
+        );
+        assert_eq!(
+            sent_answer(root.path(), 0)["result"]["outcome"]["optionId"],
+            "reject",
+            "{call}"
+        );
+    }
+    // The title alone names the command when opencode sends no input yet.
+    let root = octet_testkit::TempDir::new("octet-gate-lockdown-title");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let call = json!({"toolCallId":"c1","title":"echo fixture","kind":"execute","rawInput":{}});
+    let frames = opencode_frames(vec![opencode_ask(0, &call)]);
+    let (code, evidence) = probe_in(
+        root.path(),
+        "opencode",
+        "lockdown",
+        &opencode_script(&frames, "[]"),
+    );
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(0), "{evidence}");
+    assert_eq!(evidence["approval_requests"], 1);
+}
+
+#[test]
+fn subagent_fails_when_a_subagent_runs() {
+    // opencode's task tool: kind other, titled `task`, with a subagent type.
+    let task = json!({"sessionUpdate":"tool_call","toolCallId":"t1","title":"task","kind":"other","status":"pending","rawInput":{"description":"run it","prompt":"run echo fixture","subagent_type":"general"}});
+    let done = json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","title":"run it","kind":"other","status":"completed"});
+    let root = octet_testkit::TempDir::new("octet-gate-subagent-ran");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let frames = opencode_frames(vec![opencode_update(&task), opencode_update(&done)]);
+    let (code, evidence) = probe_in(
+        root.path(),
+        "opencode",
+        "subagent",
+        &opencode_script(&frames, "[]"),
+    );
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(1), "{evidence}");
+    assert_eq!(
+        evidence["status"],
+        "failed: protocol: a subagent ran outside Octet's permission requests"
+    );
+    // Asked to start one, the gate allows it once, as a user might; the
+    // subagent that then runs still fails the run.
+    let root = octet_testkit::TempDir::new("octet-gate-subagent-asked");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let asked = opencode_ask(
+        0,
+        &json!({"toolCallId":"t1","title":"task","kind":"think","rawInput":{"subagent_type":"general"}}),
+    );
+    let frames = opencode_frames(vec![opencode_update(&task), asked, opencode_update(&done)]);
+    let (code, evidence) = probe_in(
+        root.path(),
+        "opencode",
+        "subagent",
+        &opencode_script(&frames, "[]"),
+    );
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(1), "{evidence}");
+    assert_eq!(evidence["approval_requests"], 0);
+    assert_eq!(
+        sent_answer(root.path(), 0),
+        json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"once"}}})
+    );
+    assert_eq!(
+        evidence["status"],
+        "failed: protocol: a subagent ran outside Octet's permission requests"
+    );
+    // A denied task tool, and a command the model then asked for itself and
+    // was refused: nothing ran unasked.
+    let root = octet_testkit::TempDir::new("octet-gate-subagent-denied");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let mut refused = done.clone();
+    refused["status"] = json!("failed");
+    let call = json!({"toolCallId":"c1","title":"echo fixture","kind":"execute","rawInput":{"command":"echo fixture"}});
+    let mut ran = call.clone();
+    ran["sessionUpdate"] = json!("tool_call");
+    let failed = json!({"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"failed"});
+    let frames = opencode_frames(vec![
+        opencode_update(&task),
+        opencode_update(&refused),
+        opencode_update(&ran),
+        opencode_ask(0, &call),
+        opencode_update(&failed),
+    ]);
+    let (code, evidence) = probe_in(
+        root.path(),
+        "opencode",
+        "subagent",
+        &opencode_script(&frames, "[]"),
+    );
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(0), "{evidence}");
+    assert_eq!(
+        sent_answer(root.path(), 0)["result"]["outcome"]["optionId"],
+        "reject"
+    );
+    // A command that ran unasked fails it, as in lockdown.
+    let root = octet_testkit::TempDir::new("octet-gate-subagent-bypass");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let completed =
+        json!({"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed"});
+    let frames = opencode_frames(vec![opencode_update(&ran), opencode_update(&completed)]);
+    let (code, evidence) = probe_in(
+        root.path(),
+        "opencode",
+        "subagent",
+        &opencode_script(&frames, "[]"),
+    );
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(1), "{evidence}");
+    assert_eq!(
+        evidence["status"],
+        "failed: protocol: a tool changed something without a permission request"
+    );
+    // Its prompt asks for a subagent, in octet-ask, with lockdown's rules.
+    let sent: Vec<Value> = std::fs::read_to_string(root.path().join("stdin"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let prompt = sent
+        .iter()
+        .find(|frame| frame["method"] == "session/prompt")
+        .unwrap();
+    let text = prompt["params"]["prompt"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("subagent") && text.contains("echo fixture"),
+        "{text}"
+    );
+}
+
 #[test]
 fn each_engine_runs_only_its_own_scenarios() {
     let refused = |engine: &str, scenario: &str| {
@@ -413,6 +599,8 @@ fn each_engine_runs_only_its_own_scenarios() {
     ] {
         assert!(refused("opencode", scenario), "{scenario}");
     }
-    assert!(refused("codex", "lockdown"));
-    assert!(refused("claude", "lockdown"));
+    for scenario in ["lockdown", "subagent"] {
+        assert!(refused("codex", scenario), "{scenario}");
+        assert!(refused("claude", scenario), "{scenario}");
+    }
 }

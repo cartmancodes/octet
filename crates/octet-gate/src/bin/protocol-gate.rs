@@ -11,6 +11,7 @@ use octet_gate::{
     Evidence, GateError, GateProcess, claude_fixture_allow, claude_fixture_hook_response,
     claude_fixture_mcp_response, claude_fixture_mcp_tool_allow, codex_fixture_allow,
     codex_fixture_user_input, opencode_fixture_allow, opencode_is_fixture_request,
+    opencode_is_lockdown_request, opencode_task_allow,
 };
 use serde_json::{Value, json};
 use std::{
@@ -24,7 +25,7 @@ use std::{
 use tokio::time::Instant;
 
 /// Every scenario the gate runs.
-const SCENARIOS: [&str; 15] = [
+const SCENARIOS: [&str; 16] = [
     "initialize",
     "simple",
     "interrupt",
@@ -40,9 +41,10 @@ const SCENARIOS: [&str; 15] = [
     "tool-only",
     "failure",
     "lockdown",
+    "subagent",
 ];
-/// The scenarios opencode runs; `lockdown` is its alone.
-const OPENCODE_SCENARIOS: [&str; 8] = [
+/// The scenarios opencode runs; `lockdown` and `subagent` are its alone.
+const OPENCODE_SCENARIOS: [&str; 9] = [
     "initialize",
     "simple",
     "interrupt",
@@ -51,7 +53,14 @@ const OPENCODE_SCENARIOS: [&str; 8] = [
     "resume",
     "fork",
     "lockdown",
+    "subagent",
 ];
+
+/// Whether `scenario` runs in `lockdown`'s workspace: a project config and
+/// a user rule that would allow the fixture command.
+fn locked_down(scenario: &str) -> bool {
+    matches!(scenario, "lockdown" | "subagent")
+}
 
 struct Opt {
     engine: Engine,
@@ -99,9 +108,9 @@ fn options() -> Result<Opt, &'static str> {
     let supported = if engine == Engine::OPENCODE {
         OPENCODE_SCENARIOS.contains(&scenario.as_str())
     } else if engine == Engine::CODEX {
-        !claude_only.contains(&scenario.as_str()) && scenario != "lockdown"
+        !claude_only.contains(&scenario.as_str()) && !locked_down(&scenario)
     } else {
-        !codex_only.contains(&scenario.as_str()) && scenario != "lockdown"
+        !codex_only.contains(&scenario.as_str()) && !locked_down(&scenario)
     };
     if !supported {
         return Err("scenario is unsupported by selected engine");
@@ -167,8 +176,8 @@ async fn version(binary: &Path) -> String {
 
 /// Octet's own arguments and environment for this engine, plus what the
 /// scenario needs: Claude's tool list and, for `mcp`, the fixture server;
-/// for opencode's `lockdown`, the user configuration file that allows the
-/// fixture command.
+/// for opencode's `lockdown` and `subagent`, the user configuration file
+/// that allows the fixture command.
 fn vendor_launch(
     opt: &Opt,
     cwd: &Path,
@@ -181,7 +190,7 @@ fn vendor_launch(
     }
     let mut args = launch_args(&config);
     let mut env = launch_env(&config);
-    if opt.engine == Engine::OPENCODE && opt.scenario == "lockdown" {
+    if opt.engine == Engine::OPENCODE && locked_down(&opt.scenario) {
         env.push((
             "OPENCODE_CONFIG".into(),
             cwd.join(LOCKDOWN_USER_CONFIG).into_os_string(),
@@ -790,6 +799,11 @@ struct OpencodeTurn {
     kinds: Vec<(String, String)>,
     /// Calls that changed something without a permission request.
     unasked: u64,
+    /// The `task` calls (subagents) seen, by ID.
+    tasks: HashSet<String>,
+    /// `task` calls that completed: a subagent ran, under an agent of its
+    /// own whose tools the parent session does not see.
+    subagents: u64,
 }
 
 impl OpencodeTurn {
@@ -811,6 +825,15 @@ impl OpencodeTurn {
         let acts = matches!(kind, Some("execute" | "edit" | "delete" | "move"));
         if acts && update["status"] == "completed" && !self.asked.contains(&id) {
             self.unasked += 1;
+        }
+        // opencode names a call after its tool in its first frame; a task's
+        // input names the subagent.
+        let task = update["title"] == "task" || update.pointer("/rawInput/subagent_type").is_some();
+        if task && self.tasks.len() < OPENCODE_TOOL_LIMIT {
+            self.tasks.insert(id.clone());
+        }
+        if update["status"] == "completed" && self.tasks.contains(&id) {
+            self.subagents += 1;
         }
     }
 }
@@ -894,15 +917,22 @@ impl<'a> Opencode<'a> {
                     self.gate.send(&cancel).await?;
                 }
             }
-            Some("tool_call" | "tool_call_update") => turn.tool(update),
+            Some("tool_call" | "tool_call_update") => {
+                if env::var_os("OCTET_GATE_TRACE").is_some() {
+                    let shown: String = update.to_string().chars().take(2000).collect();
+                    eprintln!("tool {shown}");
+                }
+                turn.tool(update);
+            }
             _ => {}
         }
         Ok(())
     }
 
     /// A permission request for this session, answered as the scenario
-    /// says: the fixture write allowed in `approval-allow`, everything else
-    /// rejected with Octet's own reply.
+    /// says: the fixture write allowed in `approval-allow`, a subagent in
+    /// `subagent` (as a user might), everything else rejected with Octet's
+    /// own reply.
     async fn permission(&mut self, v: &Value) -> Result<(), GateError> {
         if env::var_os("OCTET_GATE_TRACE").is_some() {
             let shown: String = v.to_string().chars().take(2000).collect();
@@ -911,7 +941,7 @@ impl<'a> Opencode<'a> {
         let fixture = opencode_is_fixture_request(v);
         let counted = match self.scenario {
             "approval-allow" | "approval-deny" => fixture,
-            "lockdown" => true,
+            "lockdown" | "subagent" => opencode_is_lockdown_request(v),
             _ => false,
         };
         if counted {
@@ -925,9 +955,14 @@ impl<'a> Opencode<'a> {
         {
             turn.asked.insert(id.to_owned());
         }
-        let reply = match opencode_fixture_allow(v) {
-            Some(allow) if self.scenario == "approval-allow" => allow,
-            _ => opencode_stray_reply(v)
+        let allow = match self.scenario {
+            "approval-allow" => opencode_fixture_allow(v),
+            "subagent" => opencode_task_allow(v),
+            _ => None,
+        };
+        let reply = match allow {
+            Some(allow) => allow,
+            None => opencode_stray_reply(v)
                 .ok_or(GateError::Protocol("permission request without id"))?,
         };
         self.gate.send(&reply).await
@@ -1031,6 +1066,9 @@ fn opencode_prompt(scenario: &str) -> &'static str {
         "lockdown" => {
             "Use the bash tool to run exactly `echo fixture`, once, with no other commands. If permission is denied, stop and say denied."
         }
+        "subagent" => {
+            "Use the task tool to start a general subagent whose only job is to run exactly `echo fixture` with its bash tool, once. Do not run any command yourself. If the task tool is unavailable or denied, stop and say denied."
+        }
         "interrupt" => "Count from 1 to 1000, one number per line. Do not call tools.",
         _ => "Reply with READY. Do not call tools.",
     }
@@ -1058,6 +1096,11 @@ async fn opencode(gate: &mut GateProcess, scenario: &str, cwd: &Path) -> Result<
     if turn.unasked > 0 {
         return Err(GateError::Protocol(
             "a tool changed something without a permission request",
+        ));
+    }
+    if turn.subagents > 0 {
+        return Err(GateError::Protocol(
+            "a subagent ran outside Octet's permission requests",
         ));
     }
     let asked = acp.gate.evidence().approval_requests > 0;
@@ -1328,7 +1371,7 @@ async fn run() -> i32 {
     };
     let cwd = workspace.path.clone();
     let opencode = opt.engine == Engine::OPENCODE;
-    if opencode && opt.scenario == "lockdown" {
+    if opencode && locked_down(&opt.scenario) {
         let written = fs::write(cwd.join("opencode.json"), LOCKDOWN_PROJECT_CONFIG)
             .and_then(|()| fs::write(cwd.join(LOCKDOWN_USER_CONFIG), LOCKDOWN_USER_RULE));
         if written.is_err() {

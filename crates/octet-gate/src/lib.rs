@@ -322,6 +322,45 @@ pub fn opencode_is_fixture_request(value: &Value) -> bool {
     opencode_fixture_command(value).is_some()
 }
 
+/// Allows a request to start a subagent (opencode's `task` tool), once,
+/// as a user might: `subagent` then checks the subagent cannot act unasked.
+/// `None` for any other request.
+pub fn opencode_task_allow(value: &Value) -> Option<Value> {
+    if value.get("method")?.as_str()? != "session/request_permission" {
+        return None;
+    }
+    let call = value.pointer("/params/toolCall")?;
+    if call.get("title")?.as_str()? != "task" {
+        return None;
+    }
+    let option = value
+        .pointer("/params/options")?
+        .as_array()?
+        .iter()
+        .find(|option| option["kind"] == "allow_once")?
+        .get("optionId")?;
+    Some(
+        json!({"jsonrpc":"2.0","id":value.get("id")?,"result":{"outcome":{"outcome":"selected","optionId":option}}}),
+    )
+}
+
+/// Whether `value` asks permission to run `lockdown`'s command: an
+/// `execute` call whose command (or, before its input arrives, title) is
+/// exactly `echo fixture`.
+pub fn opencode_is_lockdown_request(value: &Value) -> bool {
+    if value.get("method").and_then(Value::as_str) != Some("session/request_permission") {
+        return false;
+    }
+    let Some(call) = value.pointer("/params/toolCall") else {
+        return false;
+    };
+    let command = call
+        .pointer("/rawInput/command")
+        .and_then(Value::as_str)
+        .or_else(|| call.get("title").and_then(Value::as_str));
+    call.get("kind").and_then(Value::as_str) == Some("execute") && command == Some("echo fixture")
+}
+
 /// Answers a Codex question with each question's first option.
 pub fn codex_fixture_user_input(value: &Value) -> Option<Value> {
     if value.get("method")?.as_str()? != "item/tool/requestUserInput" {

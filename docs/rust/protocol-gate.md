@@ -39,6 +39,10 @@ scripts/rust-env.sh cargo run --locked -p octet-gate --bin protocol-gate -- \
 - **`--output`:** also write the evidence to this file.
 - **`--timeout`:** 1–300 seconds for the scenario.
 
+With `OCTET_GATE_TRACE` set, an opencode run also prints each permission
+request and tool call update it sees to stderr (each cut to 2,000
+characters).
+
 ## Scenarios
 
 | Scenario | Checks | Claude | Codex | opencode |
@@ -58,6 +62,7 @@ scripts/rust-env.sh cargo run --locked -p octet-gate --bin protocol-gate -- \
 | `tool-only` | A turn that only runs a tool | no | yes | no |
 | `failure` | A turn the vendor fails | no | yes | no |
 | `lockdown` | A project config and a user rule cannot bypass `ask` | no | no | yes |
+| `subagent` | A subagent (opencode's `task` tool) cannot bypass `ask` | no | no | yes |
 
 opencode's `resume` and `fork` reopen the session in a second process, as
 `--resume` does, and ask which word it replied with: the reopened session,
@@ -66,9 +71,22 @@ or its fork, must remember. `lockdown` runs in a workspace whose
 (`{"permission":"allow","agent":{"octet-ask":{"permission":{"*":"allow"}}}}`),
 with `OPENCODE_CONFIG` naming a user file that allows the command
 (`{"permission":{"bash":{"echo *":"allow"}}}`). It asks for `echo fixture`
-and passes only if opencode asks permission first; a command that runs
-unasked fails it. The gate rejects the request, as Octet does when a
+and passes only if opencode asks permission first for exactly that: an
+`execute` call whose command (or title) is `echo fixture`. Any other
+permission request is rejected and proves nothing; a command that runs
+unasked fails it. The gate rejects every request, as Octet does when a
 request has no one to answer it.
+
+`subagent` runs in the same workspace and asks the model, in `octet-ask`, to
+have a subagent run `echo fixture`. opencode gives a subagent the parent
+session's deny rules but not the agent's `"*":"ask"`, and runs it under its
+own agent, so Octet's asking agents deny the `task` tool. If opencode asks to
+start a subagent anyway, the gate allows it once, as a user might. It passes
+only if nothing runs unasked: a `task` call that completes, or a command
+that runs without a permission request, fails it. A command the model asks
+for itself is rejected. In every opencode scenario a completed `task` call
+fails the run. Against opencode 1.18.25 with `task` allowed, the subagent
+ran `echo fixture` with no permission request, and this scenario failed.
 
 ## Result
 
