@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A `/model` choice: which provider, and which of its models.
 pub struct Selection {
-    /// Claude or Codex; `parse` never yields `Demo`.
+    /// A vendor (Claude, Codex or opencode); `parse` never yields `Demo`.
     pub provider: Engine,
     /// The model name; `None` uses the provider's default.
     pub model: Option<String>,

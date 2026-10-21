@@ -9,7 +9,11 @@ pub(crate) enum Kind {
     File,
     Path,
     Command,
-    /// A model name; items read `name · provider`.
+    /// A model name. Tab completion's items read `name · provider`, or
+    /// `name (provider)` for a name another provider also lists; the
+    /// `/model` picker's read `selection · provider · Name`, or
+    /// `selection · Name (provider…)` for a model another provider also
+    /// serves.
     Model,
     /// A skill; items read `name · provider · description`.
     Skill,
