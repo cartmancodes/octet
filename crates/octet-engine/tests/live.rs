@@ -2865,25 +2865,42 @@ async fn opencode_turn_held_for_a_switch_never_starts_once_cancelled() {
     stop(&handle, task).await;
     assert!(!dir.path().join("prompt").exists());
 }
+/// What a held prompt's session shows until its turn ends, as text:
+/// notices, header modes, turn starts, errors and the outcome.
+async fn held_turn_events(events: &mut mpsc::Receiver<Event>) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        match wait_for_within(events, 8, |_| true).await {
+            Event::Notice(text) => seen.push(text),
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            Event::Started => seen.push("started".into()),
+            Event::Finished { outcome } => {
+                seen.push(format!("finished {outcome:?}"));
+                return seen;
+            }
+            _ => {}
+        }
+    }
+}
 #[tokio::test]
-async fn opencode_turn_held_for_a_switch_starts_when_the_switch_times_out() {
+async fn opencode_turn_held_for_a_switch_that_times_out_is_not_sent() {
     let confirmed = serde_json::json!({"result": {"configOptions": [
         {"id": "mode", "currentValue": "octet-accept-edits"}]}});
     let (dir, handle, mut events, task) =
         opencode_switching_then(confirmed, "1.6", PROMPT_LOGGED).await;
     handle.send(Command::Prompt("hello".into())).unwrap();
     let mut seen = Vec::new();
-    loop {
-        match wait_for_within(&mut events, 8, |_| true).await {
+    let error = loop {
+        match next(&mut events).await {
             Event::Notice(text) => seen.push(text),
             Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
             Event::Started => seen.push("started".into()),
-            Event::Finished { .. } => break,
+            Event::Error(error) => break error,
             _ => {}
         }
-    }
-    // Sent while idle, the switch reaches this prompt: a late confirmation
-    // mid-turn gives no next-turn notice.
+    };
+    // opencode already has the switch, so the prompt could run under the
+    // new agent while the header shows ask: it is not sent.
     assert_eq!(
         seen,
         [
@@ -2891,8 +2908,57 @@ async fn opencode_turn_held_for_a_switch_starts_when_the_switch_times_out() {
             "opencode has not confirmed the switch to accept-edits",
             "mode ask",
             "started",
+        ]
+    );
+    assert_eq!(
+        error,
+        "Not sent: opencode has not confirmed the switch to accept-edits; send it again once it does"
+    );
+    let finished = next(&mut events).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Failed
+            }
+        ),
+        "{finished:?}"
+    );
+    // The late confirmation, while idle, is a plain mode change.
+    let mut late = Vec::new();
+    while !late.iter().any(|e: &String| e.starts_with("mode ")) {
+        match wait_for_within(&mut events, 5, |_| true).await {
+            Event::Notice(text) => late.push(text),
+            Event::ModeChanged(mode) => late.push(format!("mode {}", mode.label())),
+            Event::Started => panic!("the held prompt started"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        late,
+        [
             "opencode confirmed the switch to accept-edits late",
-            "mode accept-edits",
+            "mode accept-edits"
+        ]
+    );
+    stop(&handle, task).await;
+    assert!(!dir.path().join("prompt").exists());
+}
+#[tokio::test]
+async fn opencode_turn_held_for_a_refused_switch_is_sent_under_the_old_mode() {
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    let (dir, handle, mut events, task) =
+        opencode_switching_then(refused, "0.3", PROMPT_LOGGED).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    // The mode is known, unchanged: the prompt goes out.
+    assert_eq!(
+        held_turn_events(&mut events).await,
+        [
+            "Waiting for opencode to confirm the switch to accept-edits before sending your prompt",
+            "opencode did not switch to accept-edits: unknown agent",
+            "mode ask",
+            "started",
+            "finished Completed",
         ]
     );
     assert!(dir.path().join("prompt").exists());

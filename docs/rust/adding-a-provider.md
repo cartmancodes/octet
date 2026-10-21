@@ -82,8 +82,8 @@ impl Protocol for GeminiProtocol {
     async fn set_mode(&mut self, core: &mut Core, target: Mode) -> Result<(), DriverError> { … }
     async fn on_frame(&mut self, core: &mut Core, frame: Value) -> Result<(), DriverError> { … }
     fn answer(wire: &Value, allow: bool) -> Value { … }
-    // Optional: deny, is_progress, mode_change_pending, deadline, on_deadline, turn_started,
-    // stopping, set_effort, steer.
+    // Optional: deny, is_progress, mode_change_pending, take_switch_timed_out, deadline,
+    // on_deadline, turn_started, stopping, set_effort, steer.
 }
 ```
 
@@ -138,9 +138,10 @@ scenarios are per vendor.
 | `on_frame` | Turn vendor output into `Text`, `Tool`, `Usage`, `Approval` (through `core.queue_approval`, which denies a request too large to show or beyond the 8 already waiting) and, at the turn's end, `core.finish_turn(outcome, error)`, which closes the turn's approvals and makes the session idle. Ignore output for other sessions or turns. |
 | `answer` | The reply that allows or denies an approval request. The driver uses it for user answers, timeouts and oversized requests. |
 | `deny` | The reply denying an approval with a reason (the user's refusal, a timeout, the cap, a cancelled turn). Override it if the vendor passes a message on to the model, as Claude does; the default is `answer(wire, false)`. |
-| `mode_change_pending` | True while a mode switch waits for the vendor to confirm it. The driver then refuses another switch. Where `mode_applies_next_turn` is set, it also holds a prompt sent while idle until the switch is confirmed or refused, so the prompt runs under the mode the header shows. |
+| `mode_change_pending` | True while a mode switch waits for the vendor to confirm it. The driver then refuses another switch. Where `mode_applies_next_turn` is set, it also holds a prompt sent while idle until the switch is confirmed or refused, so the prompt runs under the mode the header shows; a prompt held behind a switch that `take_switch_timed_out` reports unconfirmed fails unsent. |
 | `is_progress` | Whether a frame shows the turn is alive. Return false for another thread's output. |
 | `deadline` / `on_deadline` | An optional protocol timer, such as Claude's mode confirmation. |
+| `take_switch_timed_out` | Whether the last switch was reported unconfirmed since it was sent (reading clears it), so the driver does not send a prompt held behind it. |
 | `turn_started` | Clear per-turn state. |
 | `stopping` | The session is ending, however it ends, before the vendor process is stopped: clean up after it (opencode deletes a probe's session here when the probe ended early). |
 

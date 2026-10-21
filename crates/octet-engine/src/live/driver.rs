@@ -24,7 +24,7 @@ struct Driver<P> {
     /// A turn command that arrived, while idle, with a mode switch waiting
     /// for the vendor (see `must_hold`): it starts once the switch is
     /// confirmed or refused, so a switch sent while idle lands before the
-    /// next prompt. While one is held no other command is read, so the
+    /// next prompt, and fails unsent if the switch is reported unconfirmed. While one is held no other command is read, so the
     /// command queue's own bound (and its `Busy` refusal) still applies.
     held: Option<Held>,
     /// The mode of the last switch sent to the vendor.
@@ -180,7 +180,8 @@ impl<P: Protocol> Driver<P> {
     }
 
     /// Starts the held turn once no switch is pending; one the user
-    /// cancelled meanwhile is recorded as interrupted and never sent.
+    /// cancelled meanwhile is recorded as interrupted, and one whose switch
+    /// went unconfirmed fails, neither of them sent.
     async fn release_held(&mut self, cancel: &watch::Receiver<u64>) -> Result<(), DriverError> {
         if self.protocol.mode_change_pending() {
             return Ok(());
@@ -190,6 +191,8 @@ impl<P: Protocol> Driver<P> {
         };
         if TurnGate::covers(held.turn, cancel) {
             self.cancelled_before_start(&held.command)
+        } else if self.protocol.take_switch_timed_out() {
+            self.unsent_behind_switch(&held.command)
         } else {
             self.on_command(held.command).await
         }
@@ -314,6 +317,24 @@ impl<P: Protocol> Driver<P> {
         self.core.emit(Event::Started)?;
         self.core.emit(Event::Finished {
             outcome: Outcome::Interrupted,
+        })
+    }
+
+    /// A turn held behind a switch the vendor did not confirm in time:
+    /// recorded as failed, never sent. The vendor may already have applied
+    /// the switch, so the turn could run under a mode the header does not
+    /// show.
+    fn unsent_behind_switch(&self, command: &Command) -> Result<(), DriverError> {
+        let display = command.turn_display().unwrap_or_default().to_owned();
+        let target = self.switch_target.map_or("the new mode", Mode::label);
+        self.core.emit(Event::User(display))?;
+        self.core.emit(Event::Started)?;
+        self.core.emit(Event::Error(format!(
+            "Not sent: {} has not confirmed the switch to {target}; send it again once it does",
+            self.core.config.engine.title()
+        )))?;
+        self.core.emit(Event::Finished {
+            outcome: Outcome::Failed,
         })
     }
 

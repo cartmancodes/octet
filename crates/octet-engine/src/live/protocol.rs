@@ -281,6 +281,13 @@ pub(crate) trait Protocol: Default + Send {
     fn mode_change_pending(&self) -> bool {
         false
     }
+    /// Whether the last mode switch was reported unconfirmed (its
+    /// confirmation window passed) since it was sent; reading it clears it.
+    /// A turn held behind that switch is then not sent: the vendor may
+    /// already apply the new mode while the header shows the old one.
+    fn take_switch_timed_out(&mut self) -> bool {
+        false
+    }
     /// The protocol's own timer, if one is armed.
     fn deadline(&self) -> Option<Instant> {
         None

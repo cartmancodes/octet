@@ -178,6 +178,9 @@ pub(super) struct OpencodeProtocol {
     /// The wire IDs of timed-out switches opencode may still confirm,
     /// oldest first: the header must follow the agent opencode is really in.
     late_modes: VecDeque<u64>,
+    /// The last switch was reported unconfirmed and the driver has not
+    /// asked yet (see `Protocol::take_switch_timed_out`).
+    switch_timed_out: bool,
     /// A `session/cancel` was sent this turn. opencode ends a cancelled
     /// prompt with `end_turn`, so this is what makes it an interruption.
     cancel_sent: bool,
@@ -216,6 +219,10 @@ impl Protocol for OpencodeProtocol {
 
     fn mode_change_pending(&self) -> bool {
         self.mode_request.is_some()
+    }
+
+    fn take_switch_timed_out(&mut self) -> bool {
+        std::mem::take(&mut self.switch_timed_out)
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -336,6 +343,7 @@ impl Protocol for OpencodeProtocol {
             )))?;
             return core.emit(Event::ModeChanged(core.mode));
         }
+        self.switch_timed_out = false;
         let switch = Switch {
             target,
             mid_turn: core.phase.is_running(),
@@ -888,6 +896,7 @@ impl OpencodeProtocol {
         // Kept bounded: `set_mode` refuses a switch while the list is full,
         // so a vendor that never answers cannot grow it or `requests`.
         self.late_modes.push_back(request.id);
+        self.switch_timed_out = true;
         core.emit(Event::Notice(format!(
             "opencode has not confirmed the switch to {}",
             request.target.label()
