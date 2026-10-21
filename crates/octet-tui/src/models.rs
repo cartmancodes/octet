@@ -463,12 +463,22 @@ mod tests {
         let dir = temp("octet-models-binary");
         let mut models = Models::default();
         // Only Codex has an override; Claude would run its default CLI.
+        // opencode gets one that cannot start, so the test never runs the
+        // real opencode, which would open a session in the user's history.
         let mut prober = fake_prober();
         prober.binaries.retain(|engine, _| *engine == Engine::CODEX);
+        prober
+            .binaries
+            .insert(Engine::OPENCODE, dir.path().join("no-such-opencode"));
         models.attach(dir.path(), prober);
         models.probe_stale(Engine::CLAUDE, SystemTime::now());
-        let probed = models.next().await;
-        assert_eq!(probed.engine, Engine::CODEX);
+        // The probes finish in any order; opencode's fails at once.
+        let probed = loop {
+            let probed = models.next().await;
+            if probed.engine == Engine::CODEX {
+                break probed;
+            }
+        };
         assert_eq!(probed.result.unwrap().models[0].selection, "fixture");
     }
 
