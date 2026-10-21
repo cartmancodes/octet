@@ -1224,3 +1224,37 @@ async fn a_picked_skill_shows_its_switch_and_is_forgotten_when_the_draft_changes
         "typed again by hand, the current provider's runs"
     );
 }
+#[tokio::test]
+async fn tab_on_a_name_two_providers_list_shows_the_bracketed_row() {
+    // Codex lists gpt-5.5 and opencode lists openai/gpt-5.5, the same model.
+    let mut app = crate::test_support::app_for(Engine::CODEX);
+    crate::test_support::idle(&mut app);
+    let m = |s: &str, name: &str| octet_core::ModelInfo {
+        selection: s.into(),
+        id: Some(s.into()),
+        name: name.into(),
+        description: String::new(),
+    };
+    app.event(octet_core::Event::Models(vec![
+        m("gpt-5.5", "GPT-5.5"),
+        m("gpt-5.4", "GPT-5.4"),
+    ]));
+    app.models.catalogs.set(
+        Engine::OPENCODE,
+        vec![m("openai/gpt-5.5", "OpenAI/GPT-5.5")],
+        std::time::SystemTime::now(),
+    );
+    let vendor = RecordingVendor::default();
+    // The provider form has no picker: Tab offers that provider's names.
+    app.insert_or_warn("/model codex gpt-5.");
+    assert!(app.composer.completion.is_none());
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    let popup = app.composer.completion.as_ref().expect("Tab offers names");
+    assert_eq!(popup.items, ["gpt-5.5 (codex)", "gpt-5.4 · codex"]);
+    // Typing on narrows it; a draft that leaves the form closes it.
+    key_action(&mut app, &vendor, key(KeyCode::Char('5'))).await;
+    let popup = app.composer.completion.as_ref().expect("still open");
+    assert_eq!(popup.items, ["gpt-5.5 (codex)"]);
+    key_action(&mut app, &vendor, key(KeyCode::Char(' '))).await;
+    assert!(app.composer.completion.is_none());
+}

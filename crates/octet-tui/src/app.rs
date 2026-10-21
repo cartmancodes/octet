@@ -715,9 +715,9 @@ impl App {
                 .take(CATALOG_PAGE)
                 .map(|((engine, model), label)| {
                     // A model another provider also lists is named with its provider in brackets.
-                    let title = label
-                        .clone()
-                        .unwrap_or_else(|| format!("{} · {engine}", model.name));
+                    let title = label.clone().unwrap_or_else(|| {
+                        format!("{} · {engine}", crate::text::clean(&model.name))
+                    });
                     format!(
                         "{title}\nModel ID: {}\n{}\nSelect: {}",
                         model.id.as_deref().unwrap_or("unresolved alias"),

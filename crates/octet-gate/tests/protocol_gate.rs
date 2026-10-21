@@ -249,20 +249,26 @@ fn opencode_script(frames: &[Value], listed: &str) -> String {
     )
 }
 
-/// opencode's handshake for session `ses_a`, then `events` and the prompt's
-/// `end_turn` reply.
+/// opencode's reply `id` confirming option `option` at `value`.
+fn opencode_confirm(id: u64, option: &str, value: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"result":{"configOptions":[{"id":option,"currentValue":value}]}})
+}
+
+/// opencode's handshake for session `ses_a` (the free model and Octet's ask
+/// agent confirmed), then `events` and the prompt's `end_turn` reply.
 fn opencode_frames(mut events: Vec<Value>) -> Vec<Value> {
     let mut frames = vec![
         json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}),
         json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_a"}}),
-        json!({"jsonrpc":"2.0","id":3,"result":{}}),
-        json!({"jsonrpc":"2.0","id":4,"result":{}}),
+        opencode_confirm(3, "model", "opencode/deepseek-v4.1-flash-free"),
+        opencode_confirm(4, "mode", "octet-ask"),
     ];
     frames.append(&mut events);
     frames.push(json!({"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}));
     frames
 }
 
+/// A `session/update` notification for session `ses_a` carrying `update`.
 fn opencode_update(update: &Value) -> Value {
     json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_a","update":update}})
 }
@@ -311,6 +317,26 @@ fn an_opencode_run_deletes_its_session_afterwards() {
         "opencode/deepseek-v4.1-flash-free"
     );
     assert_eq!(sent[3]["params"]["value"], "octet-ask");
+}
+
+#[test]
+fn an_opencode_option_set_without_its_confirmation_fails_the_run() {
+    let root = octet_testkit::TempDir::new("octet-gate-opencode-unconfirmed");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let reply = opencode_update(
+        &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"READY"}}),
+    );
+    // opencode answers the agent switch without saying which agent is set.
+    let mut frames = opencode_frames(vec![reply]);
+    frames[3] = json!({"jsonrpc":"2.0","id":4,"result":{}});
+    let script = opencode_script(&frames, "[]");
+    let (code, evidence) = probe_in(root.path(), "opencode", "simple", &script);
+    let evidence = evidence.unwrap();
+    assert_ne!(code, Some(0), "{evidence}");
+    assert_eq!(
+        evidence["status"], "failed: protocol: set_config_option not confirmed",
+        "{evidence}"
+    );
 }
 
 #[test]

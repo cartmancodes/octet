@@ -125,11 +125,15 @@ fn refresh_picker(
         app.composer.editor.cursor(),
         command,
     ) else {
-        if app
-            .composer
-            .completion
-            .as_ref()
-            .is_some_and(|c| c.kind == kind)
+        // Tab's popup of one provider's names (`/model PROVIDER <word>`)
+        // stays, narrowed as the word grows; any other draft closes it.
+        let narrowed = kind == composer::Kind::Model && narrow_provider_popup(app, command);
+        if !narrowed
+            && app
+                .composer
+                .completion
+                .as_ref()
+                .is_some_and(|c| c.kind == kind)
         {
             app.composer.completion = None;
         }
@@ -151,6 +155,28 @@ fn refresh_picker(
         selected,
         start,
     });
+}
+/// Narrows the open popup to the names that still start with the word of
+/// `command PROVIDER <word>`; whether one is left to show.
+fn narrow_provider_popup(app: &mut App, command: &str) -> bool {
+    let Some((start, word)) = composer::provider_argument_query(
+        app.composer.editor.text(),
+        app.composer.editor.cursor(),
+        command,
+    ) else {
+        return false;
+    };
+    let Some(popup) = app.composer.completion.as_mut() else {
+        return false;
+    };
+    if popup.start != start {
+        return false;
+    }
+    popup
+        .items
+        .retain(|item| crate::clash::row_route(item).0.starts_with(word));
+    popup.selected = popup.selected.min(popup.items.len().saturating_sub(1));
+    !popup.items.is_empty()
 }
 /// The model picker, as the draft is or stops being `/model <word>`.
 pub(crate) fn refresh_model_picker(app: &mut App) {

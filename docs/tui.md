@@ -238,10 +238,11 @@ before Esc that the vendor had not started. `/queue` lists it and
 `/queue clear` empties it. An active goal's continuation goes first.
 
 **Steering.** `/steer TEXT` adds TEXT to the running turn. Codex takes it
-into the same turn (`turn/steer`). Claude has no steering request, so the
-text is queued as the next prompt, and Octet says so. While a cancelled turn
-is still stopping, `/steer` text is queued as the next prompt too. With no
-turn running, `/steer` sends the text as a prompt.
+into the same turn (`turn/steer`). Claude and opencode have no steering
+request, so the text is queued as the next prompt, and Octet says so; for
+opencode, that prompt runs under a mode selected meanwhile. While a
+cancelled turn is still stopping, `/steer` text is queued as the next
+prompt too. With no turn running, `/steer` sends the text as a prompt.
 
 **Reasoning effort.** `--effort LEVEL` at launch, or `/effort LEVEL` later;
 `/effort` alone shows it and `/effort default` returns to the vendor's
@@ -253,20 +254,24 @@ and `max`; some models offer none), and Octet refuses a level the model
 does not list, naming the ones it does. A `/model` switch to a provider that
 does not take the level falls back to its default, with a notice.
 Codex takes it with each turn, so a change applies from the next turn.
-opencode sets it in the open session; `/effort default` goes back to the
-level the model started at. A model's level can reset when the model
-changes, so Octet sets it again at connect when the new model lists it.
+opencode sets it in the open session: `--effort` once the session opens,
+after the model and before the first prompt (a level the model does not
+list is dropped with a notice and the session goes on), and `/effort` at
+once; `/effort default` goes back to the level the model started at. A
+model's level can reset when the model changes, so Octet sets it again at
+connect when the new model lists it.
 Claude takes it at launch, so a change reconnects to the same session. The
 level carries across `/model`, `/new` and `/reconnect`.
 
 **Fork.** `/fork` continues this conversation in a new vendor session and
 leaves the original as it was (Codex `thread/fork`, Claude
-`--resume ID --fork-session`). The transcript stays on screen and the new
-session's ID replaces the old one. "Forking from X…" shows at once;
-"Forked from X into Y" once the vendor names the new session. It
-needs an idle session that the vendor has already named. Claude names the
-fork with its first turn; a reconnect before then (for example `/effort`)
-forks again, so the original is never written to.
+`--resume ID --fork-session`, opencode `session/fork`). The transcript
+stays on screen and the new session's ID replaces the old one. "Forking
+from X…" shows at once; "Forked from X into Y" once the vendor names the
+new session. It needs an idle session that the vendor has already named.
+opencode names the fork as it opens. Claude names the fork with its first
+turn; a reconnect before then (for example `/effort`) forks again, so the
+original is never written to.
 
 **Compaction.** `/compact` asks the vendor to compact its context (Codex
 `thread/compact/start`, Claude's own `/compact`). It runs as a turn: its

@@ -1101,7 +1101,8 @@ enum Refusal {
 }
 
 /// A request from opencode. A permission request for this session's running
-/// turn is shown to the user, who decides; anything else gets the stray
+/// turn is shown to the user, who decides; anything else (another session's,
+/// one while the turn is being cancelled, or no turn's) gets the stray
 /// reply, with a notice.
 async fn server_request(core: &mut Core, v: Value) -> Result<(), DriverError> {
     let method = v["method"].as_str().unwrap_or_default();
@@ -1113,8 +1114,12 @@ async fn server_request(core: &mut Core, v: Value) -> Result<(), DriverError> {
     }
     if let Some(reply) = opencode_stray_reply(&v) {
         let notice = if method == "session/request_permission" {
-            "opencode asked for a permission outside this session's running turn; Octet rejected it"
-                .to_owned()
+            let when = if this_session && core.phase == Phase::Interrupting {
+                "while its turn is being cancelled"
+            } else {
+                "outside this session's running turn"
+            };
+            format!("opencode asked for a permission {when}; Octet rejected it")
         } else {
             format!("Request declined: {}", short(method))
         };

@@ -1021,7 +1021,8 @@ impl<'a> Opencode<'a> {
         Ok(())
     }
 
-    /// Sets the session's option `id` to `value`; the reply must confirm it.
+    /// Sets the session's option `id` to `value`; the reply must confirm it
+    /// by reporting the option at `value`, as Octet requires of an agent.
     async fn set(&mut self, id: &str, value: &str) -> Result<(), GateError> {
         let params = json!({"sessionId":self.session,"configId":id,"value":value});
         let reply = self.request("session/set_config_option", params).await?;
@@ -1033,7 +1034,7 @@ impl<'a> Opencode<'a> {
             .and_then(Value::as_array)
             .and_then(|options| options.iter().find(|option| option["id"] == id))
             .map(|option| &option["currentValue"]);
-        if reported.is_some_and(|current| current != value) {
+        if reported.is_none_or(|current| current != value) {
             return Err(GateError::Protocol("set_config_option not confirmed"));
         }
         Ok(())
@@ -1058,6 +1059,9 @@ impl<'a> Opencode<'a> {
     }
 }
 
+/// The prompt a scenario's first connection sends opencode: a plain reply,
+/// a counting reply to cancel, or a request for the one command (directly,
+/// or through a subagent) whose permission request the scenario checks.
 fn opencode_prompt(scenario: &str) -> &'static str {
     match scenario {
         s if s.starts_with("approval-") => {
@@ -1086,7 +1090,9 @@ async fn opencode(gate: &mut GateProcess, scenario: &str, cwd: &Path) -> Result<
     acp.set("model", OPENCODE_MODEL).await?;
     acp.set("mode", OPENCODE_ASK).await?;
     let (stop, turn) = acp.prompt(opencode_prompt(scenario)).await?;
-    // opencode ends a cancelled prompt with `end_turn`.
+    // A finished prompt ends with `end_turn`. opencode 1.18.25 ends a
+    // cancelled one the same way; ACP's own `cancelled` is accepted too, for
+    // the interrupt scenario only.
     let stopped = stop == "end_turn" || scenario == "interrupt" && stop == "cancelled";
     if !stopped {
         return Err(GateError::Protocol(

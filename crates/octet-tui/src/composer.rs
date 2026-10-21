@@ -122,6 +122,24 @@ pub(crate) fn argument_query<'a>(
     .then(|| (start, &text[start..cursor]))
 }
 
+/// The word the cursor ends in `command PROVIDER <word>` (a vendor named),
+/// with where it starts: the provider form of `/model`, which Tab
+/// completes from that provider's names. `None` for any other draft.
+pub(crate) fn provider_argument_query<'a>(
+    text: &'a str,
+    cursor: usize,
+    command: &str,
+) -> Option<(usize, &'a str)> {
+    let start = word_start(text, cursor);
+    let provider = text[..start]
+        .strip_prefix(command)?
+        .strip_prefix(' ')?
+        .trim();
+    let named = octet_core::Engine::parse(provider).is_some_and(octet_core::Engine::is_vendor);
+    (named && text[..start].ends_with(char::is_whitespace) && text[cursor..].trim().is_empty())
+        .then(|| (start, &text[start..cursor]))
+}
+
 /// The skills picker's lines for `query`: `name · provider · description`.
 /// A name or alias that is `query` comes first, then one that starts with it,
 /// then one that contains it, then a description that does; within each, the

@@ -49,6 +49,9 @@ struct OpencodeFixture {
     awaiting: usize,
     /// The pending permission requests are `APPROVALS_9`'s.
     approvals_9: bool,
+    /// A cancel asks for a permission before it ends the held prompt
+    /// (`OPENCODE_PERMISSION_ON_CANCEL`).
+    asks_on_cancel: bool,
 }
 
 pub(crate) fn run() {
@@ -66,6 +69,7 @@ pub(crate) fn run() {
         held: None,
         awaiting: 0,
         approvals_9: false,
+        asks_on_cancel: false,
     };
     for line in io::stdin().lock().lines() {
         let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
@@ -282,6 +286,16 @@ impl OpencodeFixture {
         }
         match text {
             scenario::HOLD => self.held = Some(id.clone()),
+            scenario::OPENCODE_OTHER_PERMISSION => {
+                self.held = Some(id.clone());
+                self.awaiting = 1;
+                self.approvals_9 = false;
+                emit(&permission("other-session", 0, "other-call"));
+            }
+            scenario::OPENCODE_PERMISSION_ON_CANCEL => {
+                self.held = Some(id.clone());
+                self.asks_on_cancel = true;
+            }
             scenario::CHATTER => {
                 // The turn goes silent while another session keeps talking.
                 self.held = Some(id.clone());
@@ -318,22 +332,7 @@ impl OpencodeFixture {
             }
             scenario::FAIL => emit(&acp_error(id, -32603, "Internal error: fixture failure")),
             scenario::PARAMS => {
-                let env_var = |name| env::var(name).ok();
-                let echo = json!({
-                    "argv": env::args().skip(1).collect::<Vec<_>>(),
-                    "env": {
-                        "OPENCODE_CONFIG_CONTENT": env_var("OPENCODE_CONFIG_CONTENT"),
-                        "OPENCODE_PURE": env_var("OPENCODE_PURE"),
-                    },
-                    "modes": self.modes,
-                    "agents": self.agents,
-                    "effort": self.effort,
-                    "efforts": self.efforts,
-                    "model": self.model,
-                    "opened": self.opened,
-                })
-                .to_string();
-                emit(&acp_text(&sid, &echo));
+                emit(&acp_text(&sid, &self.params()));
                 end_turn(id);
             }
             _ => {
@@ -347,8 +346,36 @@ impl OpencodeFixture {
         }
     }
 
-    /// Ends a held prompt, as opencode 1.18.25 does: with `end_turn`.
+    /// `PARAMS`'s echo: the launch arguments and environment, and what the
+    /// session was given so far.
+    fn params(&self) -> String {
+        let env_var = |name| env::var(name).ok();
+        json!({
+            "argv": env::args().skip(1).collect::<Vec<_>>(),
+            "env": {
+                "OPENCODE_CONFIG_CONTENT": env_var("OPENCODE_CONFIG_CONTENT"),
+                "OPENCODE_PURE": env_var("OPENCODE_PURE"),
+            },
+            "modes": self.modes,
+            "agents": self.agents,
+            "effort": self.effort,
+            "efforts": self.efforts,
+            "model": self.model,
+            "opened": self.opened,
+        })
+        .to_string()
+    }
+
+    /// Ends a held prompt, as opencode 1.18.25 does: with `end_turn`; or,
+    /// for `OPENCODE_PERMISSION_ON_CANCEL`, asks for a permission first and
+    /// ends it once that is answered.
     fn cancel(&mut self) {
+        if std::mem::take(&mut self.asks_on_cancel) {
+            self.awaiting = 1;
+            self.approvals_9 = false;
+            emit(&permission(&self.session, 0, "late-call"));
+            return;
+        }
         self.awaiting = 0;
         if let Some(id) = self.held.take() {
             end_turn(&id);

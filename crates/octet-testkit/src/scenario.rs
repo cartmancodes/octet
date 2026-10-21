@@ -99,6 +99,12 @@ pub const OPENCODE_REJECT_MODE: &str = "reject-mode";
 /// working directory, then waits for `release-<option>` there before its
 /// reply, so a test can act while the request is in flight.
 pub const OPENCODE_GATED: &str = "gated-options";
+/// opencode: hold the turn while another session asks for a permission;
+/// the answer is echoed and ends the turn.
+pub const OPENCODE_OTHER_PERMISSION: &str = "other-permission";
+/// opencode: hold the turn, and ask for a permission when it is cancelled;
+/// the answer is echoed and ends the turn.
+pub const OPENCODE_PERMISSION_ON_CANCEL: &str = "permission-on-cancel";
 /// opencode: the name of the skill the fake lists as a slash command.
 pub const OPENCODE_SKILL: &str = "fixture-opencode-skill";
 

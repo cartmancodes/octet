@@ -3513,6 +3513,62 @@ async fn opencode_permission_outside_a_turn_is_rejected_with_a_notice() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn opencode_permission_for_another_session_during_a_turn_is_rejected() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_OTHER_PERMISSION.into()))
+        .unwrap();
+    let (mut notices, mut text) = (Vec::new(), String::new());
+    loop {
+        match next(&mut events).await {
+            Event::Approval { detail, .. } => panic!("another session's request shown: {detail}"),
+            Event::Notice(notice) => notices.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        notices,
+        ["opencode asked for a permission outside this session's running turn; Octet rejected it"]
+    );
+    // The fake echoes the answer it got.
+    assert_eq!(text, "reject");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_permission_while_cancelling_is_rejected_and_says_so() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::Prompt(
+            scenario::OPENCODE_PERMISSION_ON_CANCEL.into(),
+        ))
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Started)).await;
+    handle.interrupt();
+    let (mut notices, mut text) = (Vec::new(), String::new());
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Approval { detail, .. } => panic!("shown while cancelling: {detail}"),
+            Event::Notice(notice) => notices.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { outcome } => break outcome,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert_eq!(
+        notices,
+        ["opencode asked for a permission while its turn is being cancelled; Octet rejected it"]
+    );
+    assert_eq!(text, "reject");
+    assert_eq!(outcome, Outcome::Interrupted);
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_probe_lists_models_and_skills() {
     let listing = probe(opencode(), PROBE_LIMIT).await.unwrap();
     assert_eq!(listing.models.len(), 2, "{:?}", listing.models);
