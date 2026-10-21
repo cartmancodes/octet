@@ -1,4 +1,4 @@
-//! Writing frames, and the frames both fake vendors build often.
+//! Writing frames, and the frames the fake vendors build often.
 use octet_testkit::scenario;
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -61,4 +61,27 @@ pub(crate) fn claude_control_success(request_id: &Value, response: &Value) -> Va
 /// Claude's refusal of the control request `request_id`.
 pub(crate) fn claude_control_error(request_id: &Value, error: &str) -> Value {
     json!({"type":"control_response","response":{"request_id":request_id,"subtype":"error","error":error}})
+}
+
+/// An ACP success reply to the request `id`.
+pub(crate) fn acp_result(id: &Value, result: &Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"result":result})
+}
+
+/// An ACP error reply to the request `id`.
+pub(crate) fn acp_error(id: &Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+}
+
+/// An ACP `session/update` notification for `sid`.
+pub(crate) fn acp_update(sid: &str, update: &Value) -> Value {
+    json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":update}})
+}
+
+/// An ACP agent message chunk holding `text`.
+pub(crate) fn acp_text(sid: &str, text: &str) -> Value {
+    acp_update(
+        sid,
+        &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}),
+    )
 }

@@ -2,7 +2,7 @@
 //! that drive it. A prompt with one of these texts (or, where noted, a
 //! `--model` value or launch argument) runs that script.
 
-/// Codex and Claude: hold the turn open until interrupted.
+/// Codex, Claude and opencode: hold the turn open until interrupted.
 pub const HOLD: &str = "hold";
 /// Codex: hold the turn, after a text marker that the turn is named.
 pub const HOLD_MARKED: &str = "hold-marked";
@@ -12,9 +12,9 @@ pub const LATE_START: &str = "late-start";
 pub const REFUSE_START: &str = "refuse-start";
 /// Codex: hold the turn and exit when asked to interrupt it.
 pub const DIE_ON_INTERRUPT: &str = "die-on-interrupt";
-/// Codex and Claude: ask for one approval and echo the answer.
+/// Codex, Claude and opencode: ask for one approval and echo the answer.
 pub const APPROVAL: &str = "approval";
-/// Codex and Claude: ask for nine approvals at once.
+/// Codex, Claude and opencode: ask for nine approvals at once.
 pub const APPROVALS_9: &str = "approvals-9";
 /// Codex: a file change starts, then asks for approval.
 pub const FILE_APPROVAL: &str = "file-approval";
@@ -24,7 +24,7 @@ pub const APPROVAL_CANCEL: &str = "approval-cancel";
 pub const BIGTOOL: &str = "bigtool";
 /// Codex: output for another thread that must not show, and no turn end.
 pub const CHATTER: &str = "chatter";
-/// Codex: a failed turn (usage limit).
+/// Codex: a failed turn (usage limit). opencode: an error reply to the prompt.
 pub const FAIL: &str = "fail";
 /// Codex: a failed turn whose message is nested JSON.
 pub const FAIL_NESTED: &str = "fail-nested";
@@ -32,11 +32,12 @@ pub const FAIL_NESTED: &str = "fail-nested";
 pub const SKILLS_CHANGED: &str = "skills-changed";
 /// Codex: a slow turn of dots.
 pub const SLOW: &str = "slow";
-/// Codex: echo the thread and turn parameters received.
+/// Codex: echo the thread and turn parameters received. opencode: echo the
+/// launch arguments, environment, model, modes and how the session was opened.
 pub const PARAMS: &str = "params";
 /// Claude: one tool use.
 pub const TOOL: &str = "tool";
-/// Codex and Claude: one tool whose result is an error.
+/// Codex, Claude and opencode: one tool whose result is an error.
 pub const TOOL_FAIL: &str = "tool-fail";
 /// Claude: a failed result with error details.
 pub const ERRORS: &str = "errors";
@@ -86,6 +87,14 @@ pub const REPORT_STRICTER: &str = "report-stricter";
 pub const CODEX_REPLY: &str = "Hello fixture";
 /// The reply the fake Claude gives a prompt with no script.
 pub const CLAUDE_REPLY: &str = "Hello Claude";
+/// The reply the fake opencode gives a prompt with no script.
+pub const OPENCODE_REPLY: &str = "Hello opencode";
+
+/// opencode model value: once set, every later mode switch is refused with
+/// "unknown agent" (the first one, right after the model, still succeeds).
+pub const OPENCODE_REJECT_MODE: &str = "reject-mode";
+/// opencode: the name of the skill the fake lists as a slash command.
+pub const OPENCODE_SKILL: &str = "fixture-opencode-skill";
 
 /// Goal objective (`/goal …`): one step, then completion with evidence.
 pub const GOAL: &str = "fixture-goal";
