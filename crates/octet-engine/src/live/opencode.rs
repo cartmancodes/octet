@@ -332,7 +332,8 @@ impl Protocol for OpencodeProtocol {
     /// Sets the effort option, live. A level the model does not list is
     /// refused here, unsent, and the interface goes back to the level in
     /// force. `/effort default` sets the level the model started at, when
-    /// opencode reported one; otherwise opencode keeps its level.
+    /// opencode reported one; otherwise opencode keeps its level, and with
+    /// levels not yet reported Octet says so instead of claiming a reset.
     async fn set_effort(
         &mut self,
         core: &mut Core,
@@ -361,6 +362,18 @@ impl Protocol for OpencodeProtocol {
                     level: Some(level),
                     handshake: false,
                 }
+            }
+            None if matches!(self.effort, Efforts::Unknown) => {
+                // Nothing says where the model started: claiming its default
+                // without sending one would be untrue.
+                const WHY: &str = "it has not reported its model's default level";
+                let notice = match &core.config.effort {
+                    Some(level) => format!("opencode keeps effort {}: {WHY}", short(level)),
+                    None => format!("opencode keeps its current effort level: {WHY}"),
+                };
+                core.emit(Event::Notice(notice))?;
+                core.emit(Event::Effort(core.config.effort.clone()))?;
+                return Ok(true);
             }
             None => match option.map(|option| (&option.current, &option.default)) {
                 Some((current, Some(default))) if current.as_ref() != Some(default) => {
@@ -557,7 +570,14 @@ impl OpencodeProtocol {
                 core.emit(Event::Effort(core.config.effort.clone()))?;
             }
         } else {
-            self.note_options(&v["result"]["configOptions"]);
+            let options = &v["result"]["configOptions"];
+            if options.is_array() {
+                self.note_options(options);
+            } else if let Efforts::Listed(option) = &mut self.effort {
+                // A reply without the options still confirms the value sent:
+                // `/effort default` must know the level moved.
+                option.current = Some(request.value.clone());
+            }
             core.config.effort.clone_from(&request.level);
             if !request.handshake || self.effort_wanted.is_none() {
                 core.emit(Event::Effort(request.level.clone()))?;

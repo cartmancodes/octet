@@ -2986,6 +2986,109 @@ async fn opencode_effort_asked_after_the_handshake_set_one_is_still_sent() {
     assert_eq!(echo["effort"], "max", "{echo}");
     stop(&handle, task).await;
 }
+/// A scripted opencode that answers its requests with `frames` in turn,
+/// writing every line it reads to `sent` in its directory.
+fn opencode_logging(name: &str, frames: &[serde_json::Value]) -> (octet_testkit::TempDir, Config) {
+    let mut body = String::from("log=\"$(dirname \"$0\")/sent\"\n");
+    for frame in frames {
+        let _ = write!(
+            body,
+            "read line\necho \"$line\" >> \"$log\"\necho '{frame}'\n"
+        );
+    }
+    body.push_str("while read line; do echo \"$line\" >> \"$log\"; done\n");
+    let (dir, vendor) = script_vendor(name, &body);
+    (
+        dir,
+        Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()),
+    )
+}
+/// The requests a `opencode_logging` script has read, after a moment for
+/// any still on their way.
+async fn requests_sent(dir: &octet_testkit::TempDir) -> Vec<serde_json::Value> {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::read_to_string(dir.path().join("sent"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+#[tokio::test]
+async fn opencode_effort_default_after_a_bare_confirmation_goes_back() {
+    use serde_json::json;
+    let options = json!([{"id": "effort", "currentValue": "low",
+        "options": [{"value": "low"}, {"value": "high"}]}]);
+    // opencode confirms `high` without reporting its options again.
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": options}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 5, "result": {}}),
+    ];
+    let (dir, c) = opencode_logging("octet-live-opencode-bare-effort", &frames);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::SetEffort(Some("high".into())))
+        .unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Effort(Some(l)) if l == "high"),
+    )
+    .await;
+    handle.send(Command::SetEffort(None)).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Effort(None))).await;
+    let sent = requests_sent(&dir).await;
+    let values: Vec<&serde_json::Value> = sent
+        .iter()
+        .filter(|frame| frame["params"]["configId"] == "effort")
+        .map(|frame| &frame["params"]["value"])
+        .collect();
+    assert_eq!(values, [&json!("high"), &json!("low")], "{sent:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_default_with_unknown_levels_is_not_claimed() {
+    use serde_json::json;
+    // opencode never reports its options: the levels stay unknown.
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
+    ];
+    let (dir, c) = opencode_logging("octet-live-opencode-unknown-effort", &frames);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::SetEffort(Some("high".into())))
+        .unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Effort(Some(l)) if l == "high"),
+    )
+    .await;
+    handle.send(Command::SetEffort(None)).unwrap();
+    let notice = wait_for(
+        &mut events,
+        |e| matches!(e, Event::Notice(t) if !t.contains("high (from")),
+    )
+    .await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode keeps effort high: it has not reported its model's default level"),
+        "{notice:?}"
+    );
+    // The interface goes back to the level in force.
+    let effort = next(&mut events).await;
+    assert!(
+        matches!(&effort, Event::Effort(Some(l)) if l == "high"),
+        "{effort:?}"
+    );
+    let sent = requests_sent(&dir).await;
+    assert_eq!(sent.len(), 4, "{sent:?}");
+    stop(&handle, task).await;
+}
 #[tokio::test]
 async fn opencode_effort_the_model_does_not_list_is_not_sent() {
     let mut c = opencode();
