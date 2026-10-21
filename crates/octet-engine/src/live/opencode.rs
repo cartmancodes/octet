@@ -28,8 +28,8 @@ pub(super) const PROVIDER: Provider = Provider {
     default_binary: "opencode",
     offline: false,
     modes: [
-        "opencode asks before edits, commands and other actions (agent octet-ask)",
-        "Edits proceed; commands and other actions ask (agent octet-accept-edits)",
+        "opencode asks before edits, commands and other actions; subagents are off (agent octet-ask)",
+        "Edits proceed; commands and other actions ask; subagents are off (agent octet-accept-edits)",
         "opencode's own permission settings decide (agent build; its defaults ask for nothing)",
         "No permission checks at all (agent octet-full-access)",
     ],
@@ -1098,19 +1098,21 @@ fn merged_content(user: Option<&str>) -> (String, Option<String>) {
 /// The agents Octet defines for its `ask`, `accept-edits` and `full-access`
 /// modes, as JSON text. Reads are allowed everywhere, since they change
 /// nothing. Each permission map starts with `"*"`: rules are last-match-wins,
-/// so the entries after it refine it.
+/// so the entries after it refine it. The asking agents deny `task`: opencode
+/// builds a subagent's permissions from the parent session's deny rules, not
+/// from the agent's `"*":"ask"`, so a subagent would act without asking.
 const OCTET_AGENTS: &[(&str, &str)] = &[
     (
         "octet-ask",
         r#"{"mode":"primary","description":"Octet: ask before edits and commands",
         "permission":{"*":"ask","read":"allow","glob":"allow","grep":"allow","list":"allow",
-        "lsp":"allow","todoread":"allow","todowrite":"allow","skill":"allow"}}"#,
+        "lsp":"allow","todoread":"allow","todowrite":"allow","skill":"allow","task":"deny"}}"#,
     ),
     (
         "octet-accept-edits",
         r#"{"mode":"primary","description":"Octet: edits proceed, other actions ask",
         "permission":{"*":"ask","edit":"allow","read":"allow","glob":"allow","grep":"allow",
-        "list":"allow","lsp":"allow","todoread":"allow","todowrite":"allow","skill":"allow"}}"#,
+        "list":"allow","lsp":"allow","todoread":"allow","todowrite":"allow","skill":"allow","task":"deny"}}"#,
     ),
     (
         "octet-full-access",
@@ -1450,6 +1452,44 @@ mod tests {
         // Last match wins, so a leading "*" is what lets the entries after it
         // refine it.
         assert_eq!(text.matches(r#""permission":{"*":""#).count(), 3, "{text}");
+    }
+
+    /// The permission map of Octet's agent `name`, as launched, with its
+    /// keys in order.
+    fn permission_map(name: &str) -> Vec<(String, Value)> {
+        let (env, _) = launch_env_from(&config(), None);
+        let text = var(&env, "OPENCODE_CONFIG_CONTENT").unwrap();
+        let agents = Ordered::parse(&text).unwrap();
+        let agent = Ordered::parse(agents.get("agent").unwrap().get()).unwrap();
+        let definition = Ordered::parse(agent.get(name).unwrap().get()).unwrap();
+        Ordered::parse(definition.get("permission").unwrap().get())
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|(key, value)| (key, serde_json::from_str(value.get()).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn the_asking_agents_turn_subagents_off() {
+        // opencode's task tool gives a subagent the parent session's deny
+        // rules, not the agent's "*":"ask", so it would run unasked.
+        for name in ["octet-ask", "octet-accept-edits"] {
+            let map = permission_map(name);
+            assert_eq!(map[0], ("*".to_owned(), json!("ask")), "{name}");
+            assert!(
+                map.contains(&("task".to_owned(), json!("deny"))),
+                "{name}: {map:?}"
+            );
+        }
+        assert_eq!(
+            PROVIDER.modes[0],
+            "opencode asks before edits, commands and other actions; subagents are off (agent octet-ask)"
+        );
+        assert_eq!(
+            PROVIDER.modes[1],
+            "Edits proceed; commands and other actions ask; subagents are off (agent octet-accept-edits)"
+        );
     }
 
     #[test]

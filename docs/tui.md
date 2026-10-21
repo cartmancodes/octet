@@ -311,13 +311,15 @@ it also shows the running mode when a change is waiting for the next turn.
 
 | Mode | Claude | Codex (sandbox · approval · reviewer) | opencode (agent) |
 | --- | --- | --- | --- |
-| `ask` | `default` | workspace-write · untrusted · user | `octet-ask` |
-| `accept-edits` | `acceptEdits` | workspace-write · on-request · user | `octet-accept-edits` |
+| `ask` | `default` | workspace-write · untrusted · user | `octet-ask` (subagents off) |
+| `accept-edits` | `acceptEdits` | workspace-write · on-request · user | `octet-accept-edits` (subagents off) |
 | `auto` | `auto` (Claude's classifier) | workspace-write · on-request · `auto_review` | `build` (opencode's own permission settings) |
 | `full-access` | `bypassPermissions` | danger-full-access · never · user | `octet-full-access` |
 
 `auto` hands approval decisions to the vendor's own reviewer; Octet never
-answers a vendor approval by itself. Codex has no edits-only mode, so
+answers a vendor approval by itself. opencode's `ask` and `accept-edits`
+agents turn subagents (its `task` tool) off: opencode runs a subagent under
+an agent of its own that would not ask. Codex has no edits-only mode, so
 `accept-edits` is its closest analogue: in-workspace edits already proceed under
 workspace-write, and the model asks only to escalate.
 
