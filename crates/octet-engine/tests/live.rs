@@ -2832,6 +2832,20 @@ async fn opencode_prompt_sent_right_after_an_idle_switch_runs_under_the_new_agen
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn opencode_compaction_held_for_a_switch_says_it_waits_to_start() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    handle.send(Command::Compact).unwrap();
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "Waiting for opencode to confirm the switch to accept-edits before starting the turn"),
+        "{notice:?}"
+    );
+    assert_eq!(turn_text(&mut events).await, "/compact");
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_turn_held_for_a_switch_never_starts_once_cancelled() {
     let confirmed = serde_json::json!({"result": {"configOptions": [
         {"id": "mode", "currentValue": "octet-accept-edits"}]}});

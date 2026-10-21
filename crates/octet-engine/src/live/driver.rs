@@ -207,13 +207,18 @@ impl<P: Protocol> Driver<P> {
         })
     }
 
-    /// Holds `command` until the pending switch resolves, saying so.
+    /// Holds `command` until the pending switch resolves, saying so: a
+    /// compaction or a skill is a turn, not the user's prompt.
     fn hold(&mut self, command: Command) -> Result<(), DriverError> {
+        let what = match command {
+            Command::Compact | Command::Skill { .. } => "starting the turn",
+            _ => "sending your prompt",
+        };
         let turn = self.gate.last();
         self.held = Some(Held { command, turn });
         let target = self.switch_target.map_or("the new mode", Mode::label);
         self.core.emit(Event::Notice(format!(
-            "Waiting for {} to confirm the switch to {target} before sending your prompt",
+            "Waiting for {} to confirm the switch to {target} before {what}",
             self.core.config.engine.title()
         )))
     }
