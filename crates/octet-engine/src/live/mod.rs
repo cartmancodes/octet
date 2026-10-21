@@ -916,6 +916,12 @@ fn emit(tx: &mpsc::Sender<Event>, event: Event) -> Result<(), DriverError> {
     Ok(())
 }
 
+/// How the error of a turn Octet never sent to the vendor starts: one held
+/// behind, or sent during, a mode switch the vendor has not confirmed. The
+/// interface keeps its queued prompts after such a turn, since they would
+/// only be refused too.
+pub const NOT_SENT: &str = "Not sent: ";
+
 /// The demo prompt that opens its sample approval dialog.
 pub const APPROVAL_DEMO: &str = "/approval-demo";
 /// Refusal: a turn is already running or the session is not ready.
@@ -1312,6 +1318,8 @@ mod tests {
             "Mode applies from the next turn. The running turn and steering keep their previous permissions; wait for it to finish, or interrupt it and send a new prompt"
         );
         assert_eq!(mode_next_turn_notice(true), MODE_NEXT_TURN_NOTICE);
+        // The interface recognises a turn never sent by this prefix.
+        assert_eq!(NOT_SENT, "Not sent: ");
         // A provider that cannot steer queues `/steer` as the next prompt,
         // which does run under the new mode: its notice leaves steering out.
         assert_eq!(

@@ -378,6 +378,9 @@ pub(crate) struct App {
     /// Another provider's skill, picked in `/skills`: it runs once the
     /// switch to that provider is ready.
     pub(crate) pending_skill: Option<SkillRun>,
+    /// The turn ending now was never sent (its error starts with
+    /// `NOT_SENT`): the queue waits instead of draining into refusals.
+    pub(crate) turn_not_sent: bool,
     /// Why the bridge to a hub is off, when it could not start or broke; `/remote-control` says it.
     pub(crate) remote_off: Option<String>,
     /// Whether the Task sidebar shows on wide terminals; F2 flips it.
@@ -446,6 +449,7 @@ impl App {
             models: crate::models::Models::default(),
             pending_handoff: None,
             pending_skill: None,
+            turn_not_sent: false,
             remote_off: None,
             sidebar: true,
             last_width: 0,

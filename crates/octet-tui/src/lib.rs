@@ -360,6 +360,11 @@ async fn session_event(app: &mut App, vendor: &dyn Vendor, event: octet_core::Ev
         _ => None,
     };
     let failed = matches!(event, octet_core::Event::Error(_));
+    if let octet_core::Event::Error(error) = &event
+        && error.starts_with(octet_core::NOT_SENT)
+    {
+        app.turn_not_sent = true;
+    }
     let ready = matches!(event, octet_core::Event::Ready { .. });
     let stopped = matches!(event, octet_core::Event::Stopped);
     if should_alert(app, &event) {
@@ -391,11 +396,12 @@ async fn session_event(app: &mut App, vendor: &dyn Vendor, event: octet_core::Ev
     let Some(outcome) = outcome else {
         return;
     };
+    let not_sent = std::mem::take(&mut app.turn_not_sent);
     match app.goals.turn_finished(&outcome).await {
-        Ok(Next::Idle) => send_queued(app, vendor),
+        Ok(Next::Idle) => after_turn(app, vendor, not_sent),
         Ok(Next::Stopped(summary)) => {
             app.note(summary);
-            send_queued(app, vendor);
+            after_turn(app, vendor, not_sent);
         }
         Ok(Next::Continue { prompt, display }) => {
             let command = Command::PromptWithDisplay {
@@ -405,13 +411,30 @@ async fn session_event(app: &mut App, vendor: &dyn Vendor, event: octet_core::Ev
             };
             if let Err(error) = app.begin_turn(vendor, command, By::Goal, "continuing goal") {
                 goal_send_failed(app, error).await;
-                send_queued(app, vendor);
+                after_turn(app, vendor, not_sent);
             }
         }
         Err(error) => {
             app.goal_save_failed(error, true);
-            send_queued(app, vendor);
+            after_turn(app, vendor, not_sent);
         }
+    }
+}
+/// After a turn ends: the next queued prompt goes out, unless the turn was
+/// never sent (the vendor's mode is unknown), when the queue is kept, since
+/// each prompt would only be refused too.
+fn after_turn(app: &mut App, vendor: &dyn Vendor, not_sent: bool) {
+    if !not_sent {
+        send_queued(app, vendor);
+        return;
+    }
+    let kept = app.composer.queue.len();
+    if kept > 0 {
+        app.note(format!(
+            "Kept {kept} queued prompt{}; send them again once {} confirms its mode",
+            if kept == 1 { "" } else { "s" },
+            app.conn.engine.title()
+        ));
     }
 }
 /// Sends the next prompt queued behind the turn that just ended.

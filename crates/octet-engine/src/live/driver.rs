@@ -3,7 +3,8 @@
 //! approvals and commands, and calls the protocol for the rest.
 use super::{
     BUSY, Channels, Command, Config, DriverError, Engine, Event, FULL_ACCESS_RECONNECTS, HEADROOM,
-    ImageAttachment, Limits, Mode, NO_TURN, Outcome, TurnGate, deadline_after, launch_env,
+    ImageAttachment, Limits, Mode, NO_TURN, NOT_SENT, Outcome, TurnGate, deadline_after,
+    launch_env,
     protocol::{Core, Phase, Protocol},
     vendor_process,
 };
@@ -195,7 +196,7 @@ impl<P: Protocol> Driver<P> {
         self.core.emit(Event::User(display))?;
         self.core.emit(Event::Started)?;
         self.core.emit(Event::Error(format!(
-            "Not sent: {} has not confirmed the switch to {}, so its mode is unknown. \
+            "{NOT_SENT}{} has not confirmed the switch to {}, so its mode is unknown. \
              Wait for it, or use /reconnect to start again in {}",
             self.core.config.engine.title(),
             target.label(),
@@ -368,7 +369,7 @@ impl<P: Protocol> Driver<P> {
         self.core.emit(Event::User(display))?;
         self.core.emit(Event::Started)?;
         self.core.emit(Event::Error(format!(
-            "Not sent: {} has not confirmed the switch to {target}; send it again once it does",
+            "{NOT_SENT}{} has not confirmed the switch to {target}; send it again once it does",
             self.core.config.engine.title()
         )))?;
         self.core.emit(Event::Finished {

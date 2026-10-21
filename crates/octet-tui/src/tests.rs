@@ -530,3 +530,51 @@ fn new_drops_the_handoff_and_an_empty_conversation_carries_nothing() {
     assert!(!fresh.carry_conversation());
     assert!(fresh.pending_handoff.is_none());
 }
+#[tokio::test]
+async fn a_turn_never_sent_keeps_the_queued_prompts() {
+    let config = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+    let mut app = App::new(&config, "journal".into());
+    crate::test_support::idle(&mut app);
+    let vendor = RecordingVendor::default();
+    app.conn.start_turn();
+    for text in ["queued one", "queued two"] {
+        app.composer.queue.push_back(Prompt::plain(text.into()));
+    }
+    // The driver refused the turn unsent: sending the queue now would only
+    // have each prompt refused and lost.
+    for event in [
+        octet_core::Event::Error(format!(
+            "{}opencode has not confirmed the switch to accept-edits",
+            octet_core::NOT_SENT
+        )),
+        octet_core::Event::Finished {
+            outcome: octet_core::Outcome::Failed,
+        },
+    ] {
+        session_event(&mut app, &vendor, event).await;
+    }
+    assert!(
+        vendor.sent.borrow().is_empty(),
+        "{:?}",
+        vendor.sent.borrow()
+    );
+    assert_eq!(app.composer.queue.len(), 2);
+    assert!(
+        app.entries_text()
+            .contains("Kept 2 queued prompts; send them again once opencode confirms its mode"),
+        "{}",
+        app.entries_text()
+    );
+    // An ordinary failed turn still goes on with the queue.
+    app.conn.start_turn();
+    session_event(
+        &mut app,
+        &vendor,
+        octet_core::Event::Finished {
+            outcome: octet_core::Outcome::Failed,
+        },
+    )
+    .await;
+    assert_eq!(vendor.sent.borrow().len(), 1);
+    assert_eq!(app.composer.queue.len(), 1);
+}
