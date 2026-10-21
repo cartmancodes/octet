@@ -181,51 +181,21 @@ impl Protocol for OpencodeProtocol {
             .await
     }
 
-    /// Images go inline as base64 blocks after the text, read now; an image
-    /// that cannot be read fails the turn.
+    /// Images go inline after the text (see `send_blocks`).
     async fn send_prompt(
         &mut self,
         core: &mut Core,
         text: &str,
         images: &[ImageAttachment],
     ) -> Result<(), DriverError> {
-        let mut prompt = vec![json!({"type": "text", "text": text})];
-        let mut encoded = Vec::with_capacity(images.len());
-        for image in images {
-            // A file swapped for a FIFO, or on a stalled mount, must not hold
-            // the session: cancel and stop wait while this runs.
-            match tokio::time::timeout(core.limits.image_read, image.read_base64()).await {
-                Ok(Ok(data)) => encoded.push((image, data)),
-                Ok(Err(error)) => return fail_turn(core, error.to_string()),
-                Err(_) => {
-                    return fail_turn(
-                        core,
-                        format!(
-                            "Reading {} took longer than {}; the prompt was not sent",
-                            image.name,
-                            super::driver::seconds(core.limits.image_read)
-                        ),
-                    );
-                }
-            }
-        }
-        // Files can change after they were attached; check what is sent.
-        let sizes = encoded
-            .iter()
-            .map(|(image, data)| (image.name.as_str(), data.len() as u64));
-        if let Err(error) = check_inline(PROVIDER.title, sizes) {
-            return fail_turn(core, error.to_string());
-        }
-        for (image, data) in encoded {
-            prompt.push(json!({"type": "image", "mimeType": image.media_type, "data": data}));
-        }
-        let params = json!({"sessionId": core.session, "prompt": prompt});
-        self.request(core, Outstanding::Prompt, "session/prompt", params)
+        self.send_blocks(core, vec![json!({"type": "text", "text": text})], images)
             .await
     }
 
-    /// A skill is one of opencode's slash commands: the prompt is
-    /// `/name args`, after the context and a blank line when there is one.
+    /// A skill is one of opencode's slash commands, `/name args`. opencode
+    /// runs a command only when the prompt starts with `/`, so any context
+    /// follows it in a second block; opencode passes that on to the command
+    /// with its arguments.
     async fn send_skill(
         &mut self,
         core: &mut Core,
@@ -234,8 +204,8 @@ impl Protocol for OpencodeProtocol {
         args: &str,
         context: Option<&str>,
     ) -> Result<(), DriverError> {
-        let text = skill_prompt(name, args, context);
-        self.send_prompt(core, &text, &[]).await
+        self.send_blocks(core, skill_prompt(name, args, context), &[])
+            .await
     }
 
     /// Compaction is opencode's `/compact` command, when its last command
@@ -315,6 +285,48 @@ impl Protocol for OpencodeProtocol {
 }
 
 impl OpencodeProtocol {
+    /// Sends the prompt `prompt`, with `images` inline as base64 blocks
+    /// after it, read now; an image that cannot be read fails the turn.
+    async fn send_blocks(
+        &mut self,
+        core: &mut Core,
+        mut prompt: Vec<Value>,
+        images: &[ImageAttachment],
+    ) -> Result<(), DriverError> {
+        let mut encoded = Vec::with_capacity(images.len());
+        for image in images {
+            // A file swapped for a FIFO, or on a stalled mount, must not hold
+            // the session: cancel and stop wait while this runs.
+            match tokio::time::timeout(core.limits.image_read, image.read_base64()).await {
+                Ok(Ok(data)) => encoded.push((image, data)),
+                Ok(Err(error)) => return fail_turn(core, error.to_string()),
+                Err(_) => {
+                    return fail_turn(
+                        core,
+                        format!(
+                            "Reading {} took longer than {}; the prompt was not sent",
+                            image.name,
+                            super::driver::seconds(core.limits.image_read)
+                        ),
+                    );
+                }
+            }
+        }
+        // Files can change after they were attached; check what is sent.
+        let sizes = encoded
+            .iter()
+            .map(|(image, data)| (image.name.as_str(), data.len() as u64));
+        if let Err(error) = check_inline(PROVIDER.title, sizes) {
+            return fail_turn(core, error.to_string());
+        }
+        for (image, data) in encoded {
+            prompt.push(json!({"type": "image", "mimeType": image.media_type, "data": data}));
+        }
+        let params = json!({"sessionId": core.session, "prompt": prompt});
+        self.request(core, Outstanding::Prompt, "session/prompt", params)
+            .await
+    }
+
     /// Sends one of Octet's requests and records what its reply answers.
     async fn request(
         &mut self,
@@ -700,14 +712,18 @@ fn delete_session(config: &Config, session: &str) {
     });
 }
 
-/// The prompt that runs the slash command `name`: `/name args`, trimmed,
-/// after `context` and a blank line when there is context.
-fn skill_prompt(name: &str, args: &str, context: Option<&str>) -> String {
+/// The prompt blocks that run the slash command `name`: `/name args`,
+/// trimmed, then `context` after a blank line in a block of its own when
+/// there is context. opencode 1.18.25 runs a command only when the prompt's
+/// text starts with `/`, and joins the text blocks as they are, so the blank
+/// line keeps the context apart from the arguments.
+fn skill_prompt(name: &str, args: &str, context: Option<&str>) -> Vec<Value> {
     let command = format!("/{name} {args}");
-    match context.filter(|context| !context.is_empty()) {
-        Some(context) => format!("{context}\n\n{}", command.trim()),
-        None => command.trim().to_owned(),
+    let mut blocks = vec![json!({"type": "text", "text": command.trim()})];
+    if let Some(context) = context.filter(|context| !context.is_empty()) {
+        blocks.push(json!({"type": "text", "text": format!("\n\n{context}")}));
     }
+    blocks
 }
 
 /// Whether the command list `list` holds the command `name`.
@@ -1123,14 +1139,19 @@ mod tests {
     }
 
     #[test]
-    fn a_skill_prompt_is_its_slash_command_after_any_context() {
-        assert_eq!(skill_prompt("review", "src", None), "/review src");
-        assert_eq!(skill_prompt("review", "", None), "/review");
-        assert_eq!(skill_prompt("review", "  a b ", None), "/review   a b");
-        assert_eq!(skill_prompt("review", "go", Some("")), "/review go");
+    fn a_skill_prompt_starts_with_its_slash_command_and_context_follows() {
+        let text = |text: &str| json!({"type": "text", "text": text});
+        assert_eq!(skill_prompt("review", "src", None), [text("/review src")]);
+        assert_eq!(skill_prompt("review", "", None), [text("/review")]);
+        assert_eq!(
+            skill_prompt("review", "  a b ", None),
+            [text("/review   a b")]
+        );
+        assert_eq!(skill_prompt("review", "go", Some("")), [text("/review go")]);
+        // Context first would make opencode read the command as plain text.
         assert_eq!(
             skill_prompt("review", "go", Some("earlier")),
-            "earlier\n\n/review go"
+            [text("/review go"), text("\n\nearlier")]
         );
     }
 

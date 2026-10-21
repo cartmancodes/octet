@@ -3030,6 +3030,27 @@ async fn opencode_skill_runs_as_a_slash_prompt() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn an_opencode_skill_with_context_still_starts_with_its_command() {
+    // opencode runs a command only when the prompt starts with `/`; the
+    // context goes in a block after it.
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Skill {
+            name: scenario::OPENCODE_SKILL.into(),
+            path: None,
+            args: "go".into(),
+            display: format!("/{} go", scenario::OPENCODE_SKILL),
+            context: Some("earlier conversation".into()),
+        })
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{} go", scenario::OPENCODE_SKILL)
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_compact_uses_its_command() {
     let (handle, mut events, task) = spawn(opencode());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
