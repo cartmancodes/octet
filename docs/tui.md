@@ -387,8 +387,10 @@ first; each entry names its provider and the line that selects it. A bare
 `/model NAME` goes to the provider whose list holds NAME (`/model opus` from
 Codex switches to Claude, carrying the conversation as any provider switch
 does); a name in no list goes to the provider whose listed IDs share its
-leading word (`gpt-5.5` to the provider listing `gpt-…` models), else stays
-with the current provider as a custom ID. `default` is always the current
+leading word (`gpt-5.5` to the provider listing `gpt-…` models), else to
+the one listing it after a `sub/` part (`glm-5.3-flash-free` to opencode's
+`opencode/glm-5.3-flash-free`), else stays with the current provider as a
+custom ID. `default` is always the current
 provider's, and the explicit forms (`/model codex X`, `claude/X`) work as
 before.
 

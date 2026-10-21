@@ -124,14 +124,15 @@ pub struct Resolved {
 
 impl Selection {
     /// Resolves a `/model` argument. A bare name goes to the provider whose
-    /// list holds it, else to the one whose listed IDs share its leading
-    /// word, else to `current`; `default` and the explicit forms
-    /// (`PROVIDER [NAME]`, `PROVIDER/NAME`) resolve as `parse` does.
+    /// list holds it (`current` first), else to the one whose listed IDs
+    /// share its leading word, else to the one listing it as `sub/NAME`
+    /// (with that full ID), else to `current`; `default` and the explicit
+    /// forms (`PROVIDER [NAME]`, `PROVIDER/NAME`) resolve as `parse` does.
     ///
     /// # Errors
     ///
     /// As `parse`; and a bare name in several providers' lists, none of
-    /// them `current`, is ambiguous.
+    /// them `current`, or the `sub/NAME` of several, is ambiguous.
     pub fn resolve(
         input: &str,
         current: Engine,
@@ -165,6 +166,9 @@ impl Selection {
             (*owner, Found::Listed)
         } else if !owners.is_empty() {
             return Err(ambiguous(bare, &owners));
+        } else if let [owner] = catalogs.prefix_owners(bare).as_slice() {
+            let word = bare.split_once('-').map_or("", |(word, _)| word);
+            (*owner, Found::Prefix(word.to_owned()))
         } else if let [(owner, id)] = suffixed.as_slice() {
             let selection = Self::parse(&format!("{owner} {id}"), current)?;
             return Ok(Resolved {
@@ -175,9 +179,6 @@ impl Selection {
             let mut owners: Vec<Engine> = suffixed.iter().map(|(engine, _)| *engine).collect();
             owners.dedup();
             return Err(ambiguous(bare, &owners));
-        } else if let [owner] = catalogs.prefix_owners(bare).as_slice() {
-            let word = bare.split_once('-').map_or("", |(word, _)| word);
-            (*owner, Found::Prefix(word.to_owned()))
         } else {
             (current, Found::Current)
         };
@@ -585,6 +586,28 @@ mod tests {
     fn a_unique_suffix_resolves_to_the_full_id() {
         let catalogs = with_opencode(&["opencode/glm-5.3-flash-free", "openai/gpt-5.5"]);
         let r = Selection::resolve("glm-5.3-flash-free", Engine::CLAUDE, &catalogs).unwrap();
+        assert_eq!(r.selection.provider, Engine::OPENCODE);
+        assert_eq!(
+            r.selection.model.as_deref(),
+            Some("opencode/glm-5.3-flash-free")
+        );
+        assert_eq!(r.found, Found::Listed);
+    }
+
+    #[test]
+    fn a_learned_prefix_beats_a_suffix_match() {
+        // Codex lists gpt-6-astra, so gpt-5.2 is a Codex name even though
+        // opencode lists openai/gpt-5.2.
+        let catalogs = with_opencode(&["openai/gpt-5.2"]);
+        for current in [Engine::CODEX, Engine::CLAUDE] {
+            let r = Selection::resolve("gpt-5.2", current, &catalogs).unwrap();
+            assert_eq!(r.selection.provider, Engine::CODEX, "from {current}");
+            assert_eq!(r.selection.model.as_deref(), Some("gpt-5.2"));
+            assert_eq!(r.found, Found::Prefix("gpt".into()));
+        }
+        // A name no list's leading word claims still goes by its suffix.
+        let catalogs = with_opencode(&["openai/gpt-5.2", "opencode/glm-5.3-flash-free"]);
+        let r = Selection::resolve("glm-5.3-flash-free", Engine::CODEX, &catalogs).unwrap();
         assert_eq!(r.selection.provider, Engine::OPENCODE);
         assert_eq!(
             r.selection.model.as_deref(),

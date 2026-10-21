@@ -184,9 +184,12 @@ The fake vendor and the protocol gate should record the exact shape of
    **Precedence (no existing name moves).** First, an exact match in any
    list, as today: `/model gpt-5.5` still goes to Codex when Codex lists it,
    and still stays with the current provider when that provider lists it.
-   Only when no list has the name exactly does the suffix match apply. It
-   ranks above the leading-word rule (`prefix_owners`), which keeps its place
-   after it.
+   Then the leading-word rule (`prefix_owners`, exactly one provider), as
+   today, so `/model gpt-5.2` from Codex stays with Codex even when opencode
+   lists `openai/gpt-5.2`. Only then the suffix match: exactly one provider
+   listing `sub/NAME` takes it, several are ambiguous; else the current
+   provider. (Amended after the final review: the suffix rule first ran
+   before `prefix_owners`, which moved such names to opencode.)
 12. **Clash detection.** Two entries from different providers are the same
     model when their IDs match after dropping opencode's `provider/` part
     and comparing case-insensitively: `openai/gpt-5.5` and Codex's `gpt-5.5`.
