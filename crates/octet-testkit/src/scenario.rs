@@ -23,6 +23,7 @@ pub const APPROVAL_CANCEL: &str = "approval-cancel";
 /// Codex: a tool with large output.
 pub const BIGTOOL: &str = "bigtool";
 /// Codex: output for another thread that must not show, and no turn end.
+/// opencode: the same, for another session.
 pub const CHATTER: &str = "chatter";
 /// Codex: a failed turn (usage limit). opencode: an error reply to the prompt.
 pub const FAIL: &str = "fail";

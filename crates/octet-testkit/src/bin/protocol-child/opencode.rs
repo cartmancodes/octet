@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 use std::{
     env, fs,
     io::{self, BufRead},
-    process,
+    process, thread,
+    time::Duration,
 };
 
 /// The model a session starts with.
@@ -223,6 +224,15 @@ impl OpencodeFixture {
         }
         match text {
             scenario::HOLD => self.held = Some(id.clone()),
+            scenario::CHATTER => {
+                // The turn goes silent while another session keeps talking.
+                self.held = Some(id.clone());
+                for _ in 0..8 {
+                    thread::sleep(Duration::from_millis(300));
+                    emit(&acp_text("other-session", "other"));
+                    emit(&tool_call("other-session", "other-call"));
+                }
+            }
             scenario::APPROVAL => {
                 self.held = Some(id.clone());
                 self.awaiting = 1;

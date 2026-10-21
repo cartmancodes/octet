@@ -3,15 +3,22 @@
 //! permission modes, and the environment that starts it), the handshake, the
 //! model catalog and turns.
 use super::{
-    BoxFuture, Channels, Config, DriverError, Event, ImageAttachment, Limits, Mode, ModelInfo,
-    Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
+    ApprovalSummary, BoxFuture, Channels, Config, DriverError, Event, ImageAttachment, Limits,
+    Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
     activity::one_line,
-    check_inline, limited,
+    check_inline, deadline_after, limited,
     protocol::{Core, Phase, Protocol},
-    short, valid_identifier,
+    push_bounded, short, valid_identifier,
 };
 use serde_json::{Value, json, value::RawValue};
-use std::{collections::HashMap, ffi::OsString, future::Future, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::OsString,
+    future::Future,
+    path::Path,
+    time::Duration,
+};
+use tokio::time::Instant;
 
 /// opencode's row in the provider table.
 pub(super) const PROVIDER: Provider = Provider {
@@ -37,6 +44,7 @@ pub(super) const PROVIDER: Provider = Provider {
     start,
 };
 
+/// Runs one opencode session through the shared driver.
 fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result<(), String>> {
     Box::pin(async move { super::driver::run::<OpencodeProtocol>(config, limits, channels).await })
 }
@@ -45,9 +53,12 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
 const MAX_TOOLS: usize = 256;
 /// The most models one catalog keeps.
 const MAX_MODELS: usize = 256;
+/// The most timed-out mode switches kept in case opencode confirms them late.
+const MAX_LATE_SWITCHES: usize = 8;
 
 /// What a reply from opencode answers: one of Octet's own requests.
 enum Outstanding {
+    /// `initialize`, the handshake's first request.
     Initialize,
     /// `session/new`, `session/resume` or `session/fork`, with the session a
     /// resume names, which its reply need not repeat.
@@ -56,18 +67,38 @@ enum Outstanding {
     SetModel,
     /// The agent that carries this mode, set as the handshake's last step.
     SetMode(Mode),
+    /// The agent that carries this mode, set in the open session at the
+    /// user's request.
+    Switch(Mode),
     /// `session/prompt`: its reply ends the turn.
     Prompt,
 }
 
+/// A live mode switch awaiting opencode's reply.
+struct ModeRequest {
+    /// The wire ID of the `session/set_config_option` request.
+    id: u64,
+    /// The mode the user asked for.
+    target: Mode,
+    /// When Octet stops waiting and says the switch is unconfirmed.
+    deadline: Instant,
+}
+
 /// opencode's per-connection state: Octet's requests awaiting replies, the
-/// session's model and agent as opencode last reported them, and the turn's
-/// tool calls.
+/// session's model and agent as opencode last reported them, live mode
+/// switches awaiting confirmation, and the turn's tool calls.
 #[derive(Default)]
 pub(super) struct OpencodeProtocol {
     /// Octet's last wire request ID.
     next_id: u64,
+    /// Octet's requests that have no reply yet, by wire ID, with what each
+    /// reply answers.
     requests: HashMap<u64, Outstanding>,
+    /// The live mode switch awaiting its reply, until its deadline.
+    mode_request: Option<ModeRequest>,
+    /// Timed-out switches opencode may still confirm, oldest first: the
+    /// header must follow the agent opencode is really in.
+    late_modes: VecDeque<(u64, Mode)>,
     /// A `session/cancel` was sent this turn. opencode ends a cancelled
     /// prompt with `end_turn`, so this is what makes it an interruption.
     cancel_sent: bool,
@@ -86,6 +117,24 @@ impl Protocol for OpencodeProtocol {
 
     fn answer(wire: &Value, allow: bool) -> Value {
         answer_wire(wire, allow)
+    }
+
+    fn mode_change_pending(&self) -> bool {
+        self.mode_request.is_some()
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.mode_request.as_ref().map(|request| request.deadline)
+    }
+
+    /// A switch opencode has not confirmed in time is reported, and kept in
+    /// case opencode confirms it late. Nothing here waits, so the work is
+    /// done at once and handed back as a ready future.
+    fn on_deadline(
+        &mut self,
+        core: &mut Core,
+    ) -> impl Future<Output = Result<(), DriverError>> + Send {
+        std::future::ready(self.report_late_mode(core))
     }
 
     /// Only frames for this session count: another session's chatter is
@@ -192,20 +241,17 @@ impl Protocol for OpencodeProtocol {
         .await
     }
 
-    /// Live switches are not offered yet: the mode stays as it is, and the
-    /// interface is told so. Nothing is sent, so the work is done at once.
-    fn set_mode(
-        &mut self,
-        core: &mut Core,
-        _target: Mode,
-    ) -> impl Future<Output = Result<(), DriverError>> + Send {
-        let refused = core
-            .emit(Event::Notice(format!(
-                "Octet cannot switch opencode's mode in a running session yet; it stays {}",
-                core.mode.label()
-            )))
-            .and_then(|()| core.emit(Event::ModeChanged(core.mode)));
-        std::future::ready(refused)
+    /// Sets the agent that carries `target`. The mode changes only when
+    /// opencode confirms it.
+    async fn set_mode(&mut self, core: &mut Core, target: Mode) -> Result<(), DriverError> {
+        self.set_option(core, Outstanding::Switch(target), "mode", agent(target))
+            .await?;
+        self.mode_request = Some(ModeRequest {
+            id: self.next_id,
+            target,
+            deadline: deadline_after(core.limits.mode_confirm),
+        });
+        Ok(())
     }
 
     async fn on_frame(&mut self, core: &mut Core, v: Value) -> Result<(), DriverError> {
@@ -214,7 +260,7 @@ impl Protocol for OpencodeProtocol {
             return self.response(core, &v).await;
         }
         if v.get("id").is_some() {
-            return server_request(core, &v).await;
+            return server_request(core, v).await;
         }
         let this_session = !core.session.is_empty()
             && v.pointer("/params/sessionId").and_then(Value::as_str)
@@ -286,6 +332,7 @@ impl OpencodeProtocol {
             Outstanding::Open(resumed) => self.opened(core, v, resumed).await,
             Outstanding::SetModel => self.model_set(core, v).await,
             Outstanding::SetMode(target) => self.mode_set(core, v, target),
+            Outstanding::Switch(target) => self.switched(core, v, target),
             Outstanding::Prompt => self.prompt_ended(core, v),
         }
     }
@@ -381,25 +428,13 @@ impl OpencodeProtocol {
     /// stops the session: whatever agent it kept may ask for less than the
     /// mode the user chose, so it must never act under it.
     fn mode_set(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
-        // Live switches, which reply once the session is ready, are not sent yet.
-        if core.phase.is_ready() {
-            return Ok(());
-        }
         let wanted = agent(target);
-        let refusal = if let Some(error) = v.get("error") {
-            Some(error_text(error))
-        } else {
-            let options = &v["result"]["configOptions"];
-            self.note_options(options);
-            // A reply without the options still confirms the request.
-            let reported = &option(options, "mode")["currentValue"];
-            (!reported.is_null() && reported.as_str() != Some(wanted)).then(|| {
-                let shown = reported
-                    .as_str()
-                    .map_or_else(|| short(&reported.to_string()), short);
+        let refusal = self.agent_refusal(v, target).map(|refusal| match refusal {
+            Refusal::Error(message) => message,
+            Refusal::Reported(shown) => {
                 format!("opencode reported agent {shown} instead of {wanted}")
-            })
-        };
+            }
+        });
         if let Some(reason) = refusal {
             return Err(format!(
                 "opencode would not switch to agent {wanted} ({reason}); Octet stopped the session so opencode never acts outside the mode you chose"
@@ -415,6 +450,88 @@ impl OpencodeProtocol {
             core.emit(Event::ModelSelected(model.clone()))?;
         }
         core.adopt_mode(Some((mode_of(wanted), wanted.to_owned())))
+    }
+
+    /// Why the reply `v` to setting the agent for `target` does not confirm
+    /// it, or `None` when it does. A reply without the options still
+    /// confirms the request; one naming another agent does not.
+    fn agent_refusal(&mut self, v: &Value, target: Mode) -> Option<Refusal> {
+        if let Some(error) = v.get("error") {
+            return Some(Refusal::Error(error_text(error)));
+        }
+        let options = &v["result"]["configOptions"];
+        self.note_options(options);
+        let reported = &option(options, "mode")["currentValue"];
+        (!reported.is_null() && reported.as_str() != Some(agent(target))).then(|| {
+            Refusal::Reported(
+                reported
+                    .as_str()
+                    .map_or_else(|| short(&reported.to_string()), short),
+            )
+        })
+    }
+
+    /// A live switch's reply. Only a confirmation changes the mode; a
+    /// refusal is reported and the session keeps the mode it has. A reply
+    /// after the switch timed out is still applied.
+    fn switched(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
+        let id = v["id"].as_u64();
+        let late = self
+            .mode_request
+            .take_if(|request| Some(request.id) == id)
+            .is_none();
+        if late {
+            self.late_modes.retain(|(late, _)| Some(*late) != id);
+        }
+        if let Some(refusal) = self.agent_refusal(v, target) {
+            let reason = match refusal {
+                Refusal::Error(message) => message,
+                Refusal::Reported(shown) => format!("opencode reported agent {shown}"),
+            };
+            core.emit(Event::Notice(format!(
+                "opencode did not switch to {}: {reason}",
+                target.label()
+            )))?;
+            // The header was already put back when the switch timed out.
+            return if late {
+                Ok(())
+            } else {
+                core.emit(Event::ModeChanged(core.mode))
+            };
+        }
+        self.agent = Some(agent(target).to_owned());
+        core.mode = target;
+        if late {
+            core.emit(Event::Notice(format!(
+                "opencode confirmed the switch to {} late",
+                target.label()
+            )))?;
+        }
+        core.emit(Event::ModeChanged(target))
+    }
+
+    /// Reports a live switch opencode did not confirm in time; the header
+    /// keeps the current mode until it does.
+    fn report_late_mode(&mut self, core: &Core) -> Result<(), DriverError> {
+        let Some(request) = self
+            .mode_request
+            .take_if(|request| request.deadline <= Instant::now())
+        else {
+            return Ok(());
+        };
+        // Kept bounded: a vendor that never answers cannot grow either list.
+        if let Some((dropped, _)) = push_bounded(
+            &mut self.late_modes,
+            (request.id, request.target),
+            MAX_LATE_SWITCHES,
+        ) {
+            self.requests.remove(&dropped);
+        }
+        core.emit(Event::Notice(format!(
+            "opencode has not confirmed the switch to {}",
+            request.target.label()
+        )))?;
+        core.emit(Event::ModeChanged(core.mode))
     }
 
     /// Records the model and agent `config_options` reports as current.
@@ -490,18 +607,67 @@ impl OpencodeProtocol {
     }
 }
 
-/// A request from opencode. Approvals are not shown yet, so every request
-/// gets the stray reply: a permission is rejected, anything else refused.
-async fn server_request(core: &Core, v: &Value) -> Result<(), DriverError> {
-    if let Some(reply) = opencode_stray_reply(v) {
+/// Why opencode's reply to setting an agent is not a confirmation.
+enum Refusal {
+    /// An error reply, with its message.
+    Error(String),
+    /// A success reply naming another agent as current, shown bounded.
+    Reported(String),
+}
+
+/// A request from opencode. A permission request for this session's running
+/// turn is shown to the user, who decides; anything else gets the stray
+/// reply, with a notice.
+async fn server_request(core: &mut Core, v: Value) -> Result<(), DriverError> {
+    let method = v["method"].as_str().unwrap_or_default();
+    let this_session = !core.session.is_empty()
+        && v.pointer("/params/sessionId").and_then(Value::as_str) == Some(core.session.as_str());
+    if method == "session/request_permission" && this_session && core.phase == Phase::InTurn {
+        let (detail, summary) = approval(&v["params"]["toolCall"]);
+        return core.queue_approval(v, detail, summary).await;
+    }
+    if let Some(reply) = opencode_stray_reply(&v) {
+        let notice = if method == "session/request_permission" {
+            "opencode asked for a permission outside this session's running turn; Octet rejected it"
+                .to_owned()
+        } else {
+            format!("Request declined: {}", short(method))
+        };
         core.send(reply).await?;
-        let method = v["method"].as_str().unwrap_or_default();
-        core.emit(Event::Notice(format!(
-            "Request declined: {}",
-            short(method)
-        )))?;
+        core.emit(Event::Notice(notice))?;
     }
     Ok(())
+}
+
+/// What a permission request's `toolCall` would do: the dialog's detail
+/// (`kind · title`, then its `rawInput` in full) and its summary.
+fn approval(tool_call: &Value) -> (String, ApprovalSummary) {
+    let kind = tool_call["kind"].as_str().unwrap_or("other");
+    let title = tool_call["title"].as_str().unwrap_or("tool");
+    let mut detail = format!("{kind} · {title}");
+    let input = &tool_call["rawInput"];
+    if !input.is_null() {
+        detail.push('\n');
+        detail.push_str(&serde_json::to_string_pretty(input).unwrap_or_default());
+    }
+    let summary = match kind {
+        "execute" => ApprovalSummary {
+            command: Some(title.to_owned()),
+            ..ApprovalSummary::new("Run a shell command")
+        },
+        "edit" => ApprovalSummary {
+            files: tool_call["locations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|location| location["path"].as_str())
+                .map(str::to_owned)
+                .collect(),
+            ..ApprovalSummary::new("Edit files")
+        },
+        _ => ApprovalSummary::new("Use a tool"),
+    };
+    (detail, summary)
 }
 
 /// The reply to a `session/request_permission`: the request's own
@@ -907,6 +1073,18 @@ mod tests {
             reply,
             json!({"jsonrpc":"2.0","id":5,"result":{"outcome":{"outcome":"selected","optionId":"no"}}})
         );
+        // opencode's own option IDs: an out-of-turn request is rejected.
+        let options = json!([
+            {"optionId": "once", "kind": "allow_once"},
+            {"optionId": "always", "kind": "allow_always"},
+            {"optionId": "reject", "kind": "reject_once"},
+        ]);
+        let permission = json!({"jsonrpc":"2.0","id":6,"method":"session/request_permission",
+            "params":{"sessionId":"s","options":options}});
+        assert_eq!(
+            opencode_stray_reply(&permission).unwrap()["result"]["outcome"]["optionId"],
+            "reject"
+        );
         // Notifications and replies are not requests: they get no reply.
         assert_eq!(
             opencode_stray_reply(&json!({"method":"session/update"})),
@@ -936,6 +1114,40 @@ mod tests {
             answer_wire(&bare, false)["result"]["outcome"]["optionId"],
             "reject"
         );
+    }
+
+    #[test]
+    fn an_approval_shows_the_tool_call_and_what_it_would_do() {
+        let (detail, summary) = approval(&json!({
+            "kind": "execute", "title": "rm -rf build",
+            "rawInput": {"command": "rm -rf build"}, "locations": [],
+        }));
+        assert_eq!(
+            detail,
+            "execute · rm -rf build\n{\n  \"command\": \"rm -rf build\"\n}"
+        );
+        assert_eq!(summary.action, "Run a shell command");
+        assert_eq!(summary.command.as_deref(), Some("rm -rf build"));
+        assert!(summary.files.is_empty());
+
+        let (detail, summary) = approval(&json!({
+            "kind": "edit", "title": "src/a.rs",
+            "locations": [{"path": "/w/src/a.rs"}, {"path": "/w/src/b.rs"}, {"line": 3}],
+        }));
+        assert_eq!(detail, "edit · src/a.rs");
+        assert_eq!(summary.action, "Edit files");
+        assert_eq!(summary.files, ["/w/src/a.rs", "/w/src/b.rs"]);
+        assert_eq!(summary.command, None);
+
+        for call in [
+            json!({"kind": "fetch", "title": "https://example.com", "rawInput": {}}),
+            json!({}),
+        ] {
+            let (_, summary) = approval(&call);
+            assert_eq!(summary.action, "Use a tool");
+            assert_eq!(summary.command, None);
+        }
+        assert_eq!(approval(&json!({})).0, "other · tool");
     }
 
     #[test]
