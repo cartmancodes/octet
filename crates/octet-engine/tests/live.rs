@@ -3605,7 +3605,8 @@ async fn opencode_compact_uses_its_command() {
     stop(&handle, task).await;
 }
 /// An opencode that opens its session and never lists any commands, then
-/// answers the mode switch if one comes.
+/// answers the mode switch if one comes. Its `session delete ID` leaves
+/// `deleted-ID` in its working directory.
 fn opencode_without_commands() -> (octet_testkit::TempDir, Config) {
     use serde_json::json;
     let options = json!([
@@ -3617,16 +3618,14 @@ fn opencode_without_commands() -> (octet_testkit::TempDir, Config) {
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": options}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
     ];
-    let mut body = String::new();
+    let mut body = String::from("if [ \"$1\" = session ]; then touch \"deleted-$3\"; exit 0; fi\n");
     for frame in &frames {
         let _ = write!(body, "read line\necho '{frame}'\n");
     }
     body.push_str("exec sleep 30\n");
     let (dir, vendor) = script_vendor("octet-live-opencode-no-commands", &body);
-    (
-        dir,
-        Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()),
-    )
+    let config = Config::new(Engine::OPENCODE, vendor, dir.path());
+    (dir, config)
 }
 #[tokio::test]
 async fn opencode_probe_settles_for_the_models_when_no_commands_come() {
@@ -3640,6 +3639,21 @@ async fn opencode_probe_settles_for_the_models_when_no_commands_come() {
         "{:?}",
         started.elapsed()
     );
+}
+#[tokio::test]
+async fn opencode_probe_that_gives_up_still_deletes_its_session() {
+    let (dir, config) = opencode_without_commands();
+    // The probe gives up before its two-second wait for the commands ends.
+    let error = probe(config, Duration::from_secs(1)).await.unwrap_err();
+    assert_eq!(error, "opencode did not list its models within 1 s");
+    let marker = dir.path().join("deleted-s1");
+    timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the probe's session was not deleted");
 }
 #[tokio::test]
 async fn opencode_compact_without_the_command_fails_the_turn() {

@@ -65,6 +65,7 @@ pub(super) async fn run<P: Protocol>(
         held: None,
     };
     let result = driver.run(&mut commands, &mut cancel, &mut stopping).await;
+    driver.protocol.stopping(&driver.core);
     let report = driver.core.process.shutdown().await;
     let verified = report.reaped && report.descendants_stopped;
     finish(result, verified, engine, &report.stderr_tail)

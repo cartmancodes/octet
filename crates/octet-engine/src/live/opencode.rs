@@ -192,6 +192,8 @@ pub(super) struct OpencodeProtocol {
     /// A probe's session is open and its commands are awaited until this
     /// moment; `None` once the probe has been answered.
     probe_wait: Option<Instant>,
+    /// The probe's session has been deleted (or its deletion started).
+    probe_deleted: bool,
     /// The last command list holds `compact`.
     compact_offered: bool,
     /// The handshake's effort step has run: a level asked for before the
@@ -247,6 +249,14 @@ impl Protocol for OpencodeProtocol {
     fn turn_started(&mut self) {
         self.cancel_sent = false;
         self.tools.clear();
+    }
+
+    /// A probe that ends before it has its catalog (an error, or the
+    /// caller giving up) still deletes the session it opened.
+    fn stopping(&mut self, core: &Core) {
+        if core.config.catalog_only {
+            self.delete_probe_session(core);
+        }
     }
 
     /// Says when the user's `OPENCODE_CONFIG_CONTENT` had to be replaced,
@@ -889,7 +899,7 @@ impl OpencodeProtocol {
             return Ok(());
         }
         core.emit(Event::Skills(commands(list)))?;
-        finish_probe(core)
+        self.finish_probe(core)
     }
 
     /// A probe whose commands did not come in time is done with the models
@@ -902,7 +912,25 @@ impl OpencodeProtocol {
         {
             return Ok(());
         }
-        finish_probe(core)
+        self.finish_probe(core)
+    }
+
+    /// The probe has what it came for: it says so, and its session, which
+    /// only read the catalog, is deleted so the user's history keeps no
+    /// empty session.
+    fn finish_probe(&mut self, core: &Core) -> Result<(), DriverError> {
+        self.delete_probe_session(core);
+        core.emit(Event::Ready {
+            session: String::new(),
+        })
+    }
+
+    /// Deletes the probe's session once, when it has one.
+    fn delete_probe_session(&mut self, core: &Core) {
+        if !self.probe_deleted && !core.session.is_empty() {
+            self.probe_deleted = true;
+            delete_session(&core.config, &core.session);
+        }
     }
 
     /// Records the model, agent and effort levels `config_options` reports
@@ -1009,15 +1037,6 @@ impl OpencodeProtocol {
             detail: content_text(&update["content"]),
         }))
     }
-}
-
-/// The probe has what it came for: it says so, and its session, which only
-/// read the catalog, is deleted so the user's history keeps no empty session.
-fn finish_probe(core: &Core) -> Result<(), DriverError> {
-    delete_session(&core.config, &core.session);
-    core.emit(Event::Ready {
-        session: String::new(),
-    })
 }
 
 /// Deletes `session` with `opencode session delete`, on a task of its own:

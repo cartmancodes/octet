@@ -293,6 +293,9 @@ pub(crate) trait Protocol: Default + Send {
     }
     /// A turn is starting: clears per-turn protocol state.
     fn turn_started(&mut self) {}
+    /// The session is ending, for whatever reason, and the vendor process
+    /// is about to be stopped: the last chance to clean up after it.
+    fn stopping(&mut self, _core: &Core) {}
     /// Sets the reasoning effort (`None`: the vendor's default) on a
     /// provider that takes it live. `Ok(false)` means the protocol has no
     /// request for it: the driver records the level for the next turn and

@@ -82,7 +82,8 @@ impl Protocol for GeminiProtocol {
     async fn set_mode(&mut self, core: &mut Core, target: Mode) -> Result<(), DriverError> { … }
     async fn on_frame(&mut self, core: &mut Core, frame: Value) -> Result<(), DriverError> { … }
     fn answer(wire: &Value, allow: bool) -> Value { … }
-    // Optional: deny, is_progress, mode_change_pending, deadline, on_deadline, turn_started, steer.
+    // Optional: deny, is_progress, mode_change_pending, deadline, on_deadline, turn_started,
+    // stopping, set_effort, steer.
 }
 ```
 
@@ -141,6 +142,7 @@ scenarios are per vendor.
 | `is_progress` | Whether a frame shows the turn is alive. Return false for another thread's output. |
 | `deadline` / `on_deadline` | An optional protocol timer, such as Claude's mode confirmation. |
 | `turn_started` | Clear per-turn state. |
+| `stopping` | The session is ending, however it ends, before the vendor process is stopped: clean up after it (opencode deletes a probe's session here when the probe ended early). |
 
 Requests Octet will not show the user (a permission outside a turn, a
 method it does not know) get a reply from a plain function in the vendor's
