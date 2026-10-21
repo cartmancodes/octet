@@ -344,9 +344,11 @@ messages continue that same turn and do not apply the change. Wait for the turn
 to finish, or press Esc and then send a new prompt to use the selected mode.
 With opencode, a prompt sent while a switch made between turns is still
 unconfirmed waits for opencode's answer, with a notice, so it runs under
-the mode the header shows. If opencode does not confirm within 10 seconds
-the prompt is not sent (opencode may already apply the new mode); send it
-again once the switch is confirmed.
+the mode the header shows. If opencode does not confirm within 10 seconds,
+the mode opencode runs is unknown: that prompt, and any sent before
+opencode answers, is not sent, with an error saying so. A late answer
+settles it and prompts run again; `/model opencode` reconnects in the mode
+the header shows.
 An already-open approval still needs your answer. A change Claude
 refuses (for example, auto mode unavailable for the account) leaves the previous
 mode in place with a notice; one Claude does not confirm within 10 seconds is

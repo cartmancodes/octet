@@ -348,6 +348,24 @@ mod tests {
     }
 
     #[test]
+    fn model_opencode_reconnects_in_the_headers_mode() {
+        // The way out of a mode opencode left unknown: `/model opencode`
+        // resumes the session and its handshake sets the header's mode.
+        let opencode = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+        let plan = plan_for(
+            Exit::Model(Selection {
+                provider: Engine::OPENCODE,
+                model: None,
+            }),
+            &opencode,
+            "ses-1",
+        );
+        assert_eq!(plan.config.engine, Engine::OPENCODE);
+        assert_eq!(plan.config.mode, Mode::Auto);
+        assert_eq!(plan.config.resume.as_deref(), Some("ses-1"));
+    }
+
+    #[test]
     fn every_plan_carries_the_confirmed_mode_and_effort() {
         let plan = plan_for(
             Exit::Reconnect,

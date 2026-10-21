@@ -82,8 +82,8 @@ impl Protocol for GeminiProtocol {
     async fn set_mode(&mut self, core: &mut Core, target: Mode) -> Result<(), DriverError> { … }
     async fn on_frame(&mut self, core: &mut Core, frame: Value) -> Result<(), DriverError> { … }
     fn answer(wire: &Value, allow: bool) -> Value { … }
-    // Optional: deny, is_progress, mode_change_pending, take_switch_timed_out, deadline,
-    // on_deadline, turn_started, stopping, set_effort, steer.
+    // Optional: deny, is_progress, mode_change_pending, mode_unsettled, take_switch_timed_out,
+    // deadline, on_deadline, turn_started, stopping, set_effort, steer.
 }
 ```
 
@@ -141,6 +141,7 @@ scenarios are per vendor.
 | `mode_change_pending` | True while a mode switch waits for the vendor to confirm it. The driver then refuses another switch. Where `mode_applies_next_turn` is set, it also holds a prompt sent while idle until the switch is confirmed or refused, so the prompt runs under the mode the header shows; a prompt held behind a switch that `take_switch_timed_out` reports unconfirmed fails unsent. |
 | `is_progress` | Whether a frame shows the turn is alive. Return false for another thread's output. |
 | `deadline` / `on_deadline` | An optional protocol timer, such as Claude's mode confirmation. |
+| `mode_unsettled` | The target of a timed-out switch the vendor has not answered yet, while it is unanswered: the vendor's mode is unknown, so a provider whose mode applies from the next turn has every turn refused unsent. |
 | `take_switch_timed_out` | Whether the last switch was reported unconfirmed since it was sent (reading clears it), so the driver does not send a prompt held behind it. |
 | `turn_started` | Clear per-turn state. |
 | `stopping` | The session is ending, however it ends, before the vendor process is stopped: clean up after it (opencode deletes a probe's session here when the probe ended early). |

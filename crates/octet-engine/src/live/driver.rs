@@ -131,6 +131,8 @@ impl<P: Protocol> Driver<P> {
                     Some(command) => {
                         if self.gate.cancelled(&command, cancel) {
                             self.cancelled_before_start(&command)?;
+                        } else if let Some(target) = self.mode_unknown_for(&command) {
+                            self.refuse_while_mode_unknown(&command, target)?;
                         } else if self.must_hold(&command) {
                             self.hold(command)?;
                         } else {
@@ -167,6 +169,42 @@ impl<P: Protocol> Driver<P> {
             && self.core.phase == Phase::Idle
             && self.core.config.engine.provider().mode_applies_next_turn
             && self.protocol.mode_change_pending()
+    }
+
+    /// The target of an unanswered, timed-out switch when `command` is a
+    /// turn the session could start now on a provider whose switch reaches
+    /// only the next turn: the vendor may run either mode, so the turn must
+    /// not be sent.
+    fn mode_unknown_for(&self, command: &Command) -> Option<Mode> {
+        (command.starts_turn()
+            && self.core.phase == Phase::Idle
+            && self.core.config.engine.provider().mode_applies_next_turn)
+            .then(|| self.protocol.mode_unsettled())
+            .flatten()
+    }
+
+    /// A turn sent while the vendor's mode is unknown: recorded as failed,
+    /// never sent, saying how to get out (wait, or reconnect, which sets the
+    /// header's mode again).
+    fn refuse_while_mode_unknown(
+        &self,
+        command: &Command,
+        target: Mode,
+    ) -> Result<(), DriverError> {
+        let display = command.turn_display().unwrap_or_default().to_owned();
+        let engine = self.core.config.engine;
+        self.core.emit(Event::User(display))?;
+        self.core.emit(Event::Started)?;
+        self.core.emit(Event::Error(format!(
+            "Not sent: {} has not confirmed the switch to {}, so its mode is unknown. \
+             Wait for it, or reconnect with /model {engine} to start again in {}",
+            engine.title(),
+            target.label(),
+            self.core.mode.label()
+        )))?;
+        self.core.emit(Event::Finished {
+            outcome: Outcome::Failed,
+        })
     }
 
     /// Holds `command` until the pending switch resolves, saying so.

@@ -391,6 +391,29 @@ fn a_late_confirmation_does_not_reuse_an_answered_switchs_turn_state() {
 }
 
 #[test]
+fn a_late_confirmation_after_a_refused_prompt_is_a_plain_mode_change() {
+    use octet_core::{Engine, Mode, Outcome};
+    let vendor = crate::vendor::RecordingVendor::default();
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    // The switch times out; the prompt sent next is refused unsent, as
+    // the driver does while the mode is unknown.
+    crate::commands::switch_mode(&mut app, &vendor, Mode::AcceptEdits);
+    app.event(Event::ModeChanged(Mode::Ask));
+    app.conn.start_turn();
+    app.event(Event::User("hello".into()));
+    app.event(Event::Started);
+    app.event(Event::Error("Not sent: the mode is unknown".into()));
+    app.event(Event::Finished {
+        outcome: Outcome::Failed,
+    });
+    // No turn runs when the late confirmation comes: no "next turn".
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+    assert_eq!(app.conn.mode_for_turn, None);
+}
+
+#[test]
 fn every_provider_says_whether_a_mode_waits_for_the_next_turn() {
     use octet_core::Engine;
     let next_turn = |engine: Engine| engine.provider().mode_applies_next_turn;

@@ -175,9 +175,10 @@ pub(super) struct OpencodeProtocol {
     requests: HashMap<u64, Outstanding>,
     /// The live mode switch awaiting its reply, until its deadline.
     mode_request: Option<ModeRequest>,
-    /// The wire IDs of timed-out switches opencode may still confirm,
-    /// oldest first: the header must follow the agent opencode is really in.
-    late_modes: VecDeque<u64>,
+    /// The wire IDs and targets of timed-out switches opencode may still
+    /// confirm, oldest first: the header must follow the agent opencode is
+    /// really in, and while any is unanswered that agent is unknown.
+    late_modes: VecDeque<(u64, Mode)>,
     /// The last switch was reported unconfirmed and the driver has not
     /// asked yet (see `Protocol::take_switch_timed_out`).
     switch_timed_out: bool,
@@ -219,6 +220,10 @@ impl Protocol for OpencodeProtocol {
 
     fn mode_change_pending(&self) -> bool {
         self.mode_request.is_some()
+    }
+
+    fn mode_unsettled(&self) -> Option<Mode> {
+        self.late_modes.back().map(|(_, target)| *target)
     }
 
     fn take_switch_timed_out(&mut self) -> bool {
@@ -840,7 +845,7 @@ impl OpencodeProtocol {
             .take_if(|request| Some(request.id) == id)
             .is_none();
         if late {
-            self.late_modes.retain(|late| Some(*late) != id);
+            self.late_modes.retain(|(late, _)| Some(*late) != id);
         }
         if let Some(refusal) = self.agent_refusal(v, target) {
             let reason = match refusal {
@@ -895,7 +900,7 @@ impl OpencodeProtocol {
         };
         // Kept bounded: `set_mode` refuses a switch while the list is full,
         // so a vendor that never answers cannot grow it or `requests`.
-        self.late_modes.push_back(request.id);
+        self.late_modes.push_back((request.id, request.target));
         self.switch_timed_out = true;
         core.emit(Event::Notice(format!(
             "opencode has not confirmed the switch to {}",

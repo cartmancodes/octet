@@ -2964,6 +2964,132 @@ async fn opencode_turn_held_for_a_refused_switch_is_sent_under_the_old_mode() {
     assert!(dir.path().join("prompt").exists());
     stop(&handle, task).await;
 }
+/// The events of one refused or finished turn, as text, up to its end.
+async fn turn_events(events: &mut mpsc::Receiver<Event>) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        match next(events).await {
+            Event::User(text) => seen.push(format!("user {text}")),
+            Event::Started => seen.push("started".into()),
+            Event::Error(error) => seen.push(format!("error {error}")),
+            Event::Notice(text) => seen.push(text),
+            Event::Finished { outcome } => {
+                seen.push(format!("finished {outcome:?}"));
+                return seen;
+            }
+            _ => {}
+        }
+    }
+}
+/// The refusal of a prompt sent while the switch to accept-edits is
+/// unanswered.
+const UNKNOWN_MODE: &str = "error Not sent: opencode has not confirmed the switch to accept-edits, \
+     so its mode is unknown. Wait for it, or reconnect with /model opencode to start again in ask";
+#[tokio::test]
+async fn opencode_prompts_wait_for_a_timed_out_switch_then_run_under_its_agent() {
+    // The gated fake answers the live switch only once the test releases it.
+    let dir = octet_testkit::TempDir::new("octet-live-opencode-unknown-mode");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    c.model = Some(scenario::OPENCODE_GATED.into());
+    let release = dir.path().join("release-mode");
+    std::fs::write(&release, "").unwrap();
+    let limits = Limits {
+        mode_confirm: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (handle, mut events, task) = spawn_with_limits(c, limits);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    std::fs::remove_file(&release).unwrap();
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Notice(t) if t.contains("has not confirmed")),
+    )
+    .await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    // opencode may already run the new agent: nothing is sent.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    assert_eq!(
+        turn_events(&mut events).await,
+        ["user hello", "started", UNKNOWN_MODE, "finished Failed"]
+    );
+    std::fs::write(&release, "").unwrap();
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    // Settled: prompts flow again, under the confirmed agent, and the
+    // refused one never reached opencode.
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_prompts_run_under_the_old_agent_once_a_timed_out_switch_is_refused() {
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    let (dir, handle, mut events, task) =
+        opencode_switching_then(refused, "1.6", PROMPT_LOGGED).await;
+    wait_for_within(
+        &mut events,
+        5,
+        |e| matches!(e, Event::Notice(t) if t.contains("has not confirmed")),
+    )
+    .await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    assert_eq!(
+        turn_events(&mut events).await,
+        ["user hello", "started", UNKNOWN_MODE, "finished Failed"]
+    );
+    // The late refusal settles it: the mode is still ask.
+    wait_for_within(
+        &mut events,
+        5,
+        |e| matches!(e, Event::Notice(t) if t.starts_with("opencode did not switch")),
+    )
+    .await;
+    handle.send(Command::Prompt("again".into())).unwrap();
+    assert_eq!(
+        turn_events(&mut events).await,
+        ["user again", "started", "finished Completed"]
+    );
+    let sent = std::fs::read_to_string(dir.path().join("prompt")).unwrap();
+    assert!(sent.contains("again"), "{sent}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_reconnect_sets_the_agent_of_the_headers_mode() {
+    // `/model opencode` resumes the session in the mode the header shows;
+    // the handshake sets that mode's agent, so a mode left unknown by an
+    // unanswered switch is known again.
+    let mut c = opencode();
+    c.resume = Some("ses-before".into());
+    c.mode = Mode::AcceptEdits;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["opened"], "session/resume", "{echo}");
+    assert_eq!(
+        echo["modes"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
 /// The fake opencode's `PARAMS` echo, from a session `config` opens.
 async fn opencode_params(
     handle: &octet_engine::live::Handle,

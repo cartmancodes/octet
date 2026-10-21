@@ -288,6 +288,13 @@ pub(crate) trait Protocol: Default + Send {
     fn take_switch_timed_out(&mut self) -> bool {
         false
     }
+    /// A switch that timed out is still unanswered, so the mode the vendor
+    /// runs is unknown: the target of the latest such switch. For a
+    /// provider whose mode applies from the next turn, the driver refuses
+    /// every turn until the vendor answers.
+    fn mode_unsettled(&self) -> Option<Mode> {
+        None
+    }
     /// The protocol's own timer, if one is armed.
     fn deadline(&self) -> Option<Instant> {
         None
