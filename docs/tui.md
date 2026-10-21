@@ -319,7 +319,9 @@ it also shows the running mode when a change is waiting for the next turn.
 `auto` hands approval decisions to the vendor's own reviewer; Octet never
 answers a vendor approval by itself. opencode's `ask` and `accept-edits`
 agents turn subagents (its `task` tool) off: opencode runs a subagent under
-an agent of its own that would not ask. Codex has no edits-only mode, so
+an agent of its own that would not ask. Reading files proceeds in both,
+except `.env` files (not `.env.example`), which ask as in opencode's own
+defaults. Codex has no edits-only mode, so
 `accept-edits` is its closest analogue: in-workspace edits already proceed under
 workspace-write, and the model asks only to escalate.
 

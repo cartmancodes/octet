@@ -150,7 +150,10 @@ The fake vendor and the protocol gate should record the exact shape of
    Both deny `task` (amended after the final review): opencode builds a
    subagent's permissions from the parent session's deny rules only, and runs
    it under its own agent (`general` allows everything), so a subagent would
-   act without asking.
+   act without asking. Reads stay allowed except `.env` files (`*.env`,
+   `*.env.*` ask; `*.env.example` is allowed), as in opencode's own defaults,
+   and `question`, `plan_enter` and `plan_exit` stay denied, as opencode
+   denies them by default (also amended after the final review).
    The launch turns off project config (`OPENCODE_DISABLE_PROJECT_CONFIG`) and,
    as `--no-plugins` says, plugins (`OPENCODE_PURE`). MCP tools fall under the
    wildcard, so they ask too.

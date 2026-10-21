@@ -1097,7 +1097,9 @@ fn merged_content(user: Option<&str>) -> (String, Option<String>) {
 
 /// The agents Octet defines for its `ask`, `accept-edits` and `full-access`
 /// modes, as JSON text. Reads are allowed everywhere, since they change
-/// nothing. Each permission map starts with `"*"`: rules are last-match-wins,
+/// nothing, except `.env` files, which ask as opencode's own defaults do.
+/// `question`, `plan_enter` and `plan_exit` stay denied, as opencode denies
+/// them by default; the catch-all would make them ask. Each permission map starts with `"*"`: rules are last-match-wins,
 /// so the entries after it refine it. The asking agents deny `task`: opencode
 /// builds a subagent's permissions from the parent session's deny rules, not
 /// from the agent's `"*":"ask"`, so a subagent would act without asking.
@@ -1105,14 +1107,20 @@ const OCTET_AGENTS: &[(&str, &str)] = &[
     (
         "octet-ask",
         r#"{"mode":"primary","description":"Octet: ask before edits and commands",
-        "permission":{"*":"ask","read":"allow","glob":"allow","grep":"allow","list":"allow",
-        "lsp":"allow","todoread":"allow","todowrite":"allow","skill":"allow","task":"deny"}}"#,
+        "permission":{"*":"ask",
+        "read":{"*":"allow","*.env":"ask","*.env.*":"ask","*.env.example":"allow"},
+        "glob":"allow","grep":"allow","list":"allow","lsp":"allow","todoread":"allow",
+        "todowrite":"allow","skill":"allow","task":"deny",
+        "question":"deny","plan_enter":"deny","plan_exit":"deny"}}"#,
     ),
     (
         "octet-accept-edits",
         r#"{"mode":"primary","description":"Octet: edits proceed, other actions ask",
-        "permission":{"*":"ask","edit":"allow","read":"allow","glob":"allow","grep":"allow",
-        "list":"allow","lsp":"allow","todoread":"allow","todowrite":"allow","skill":"allow","task":"deny"}}"#,
+        "permission":{"*":"ask","edit":"allow",
+        "read":{"*":"allow","*.env":"ask","*.env.*":"ask","*.env.example":"allow"},
+        "glob":"allow","grep":"allow","list":"allow","lsp":"allow","todoread":"allow",
+        "todowrite":"allow","skill":"allow","task":"deny",
+        "question":"deny","plan_enter":"deny","plan_exit":"deny"}}"#,
     ),
     (
         "octet-full-access",
@@ -1490,6 +1498,40 @@ mod tests {
             PROVIDER.modes[1],
             "Edits proceed; commands and other actions ask; subagents are off (agent octet-accept-edits)"
         );
+    }
+
+    #[test]
+    fn the_asking_agents_keep_opencodes_env_file_protection() {
+        // A plain "read":"allow" would let the model read .env files that
+        // opencode asks for by default.
+        for name in ["octet-ask", "octet-accept-edits"] {
+            let map = permission_map(name);
+            let read = map.iter().find(|(key, _)| key == "read").unwrap();
+            assert_eq!(
+                serde_json::to_string(&read.1).unwrap(),
+                r#"{"*":"allow","*.env":"ask","*.env.*":"ask","*.env.example":"allow"}"#,
+                "{name}"
+            );
+        }
+        // Last match wins: the catch-all comes first, the exception last.
+        let (env, _) = launch_env_from(&config(), None);
+        let text = var(&env, "OPENCODE_CONFIG_CONTENT").unwrap();
+        let read = r#""read":{"*":"allow","*.env":"ask","*.env.*":"ask","*.env.example":"allow"}"#;
+        assert_eq!(text.matches(read).count(), 2, "{text}");
+    }
+
+    #[test]
+    fn the_asking_agents_deny_what_opencode_denies_by_default() {
+        // "*":"ask" would turn these into questions to the user.
+        for name in ["octet-ask", "octet-accept-edits"] {
+            let map = permission_map(name);
+            for tool in ["question", "plan_enter", "plan_exit"] {
+                assert!(
+                    map.contains(&(tool.to_owned(), json!("deny"))),
+                    "{name} {tool}: {map:?}"
+                );
+            }
+        }
     }
 
     #[test]
