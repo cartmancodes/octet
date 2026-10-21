@@ -1086,6 +1086,11 @@ mod tests {
             process(Engine::CODEX).shutdown_grace,
             Duration::from_millis(150)
         );
+        // opencode takes under 35 ms, idle or mid-turn.
+        assert_eq!(
+            process(Engine::OPENCODE).shutdown_grace,
+            Duration::from_millis(250)
+        );
     }
     #[test]
     fn the_turn_gate_stops_only_turns_sent_before_a_cancel() {

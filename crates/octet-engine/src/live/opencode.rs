@@ -39,8 +39,9 @@ pub(super) const PROVIDER: Provider = Provider {
     takes_effort: false,
     ids_carry_name: true,
     efforts: &[],
-    // A placeholder until it is timed against the real CLI.
-    shutdown_grace: Duration::from_millis(500),
+    // opencode 1.18.25 exits within 35 ms once its input closes, idle or
+    // mid-turn, with or without plugins.
+    shutdown_grace: Duration::from_millis(250),
     lists_models: true,
     launch_args: <OpencodeProtocol as Protocol>::launch_args,
     launch_env,
