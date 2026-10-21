@@ -24,8 +24,9 @@ struct Driver<P> {
     /// A turn command that arrived, while idle, with a mode switch waiting
     /// for the vendor (see `must_hold`): it starts once the switch is
     /// confirmed or refused, so a switch sent while idle lands before the
-    /// next prompt, and fails unsent if the switch is reported unconfirmed. While one is held no other command is read, so the
-    /// command queue's own bound (and its `Busy` refusal) still applies.
+    /// next prompt, and fails unsent if the switch is reported unconfirmed.
+    /// While one is held no other command is read, so the command queue's
+    /// own bound (and its `Busy` refusal) still applies.
     held: Option<Held>,
     /// The mode of the last switch sent to the vendor.
     switch_target: Option<Mode>,
