@@ -2,7 +2,7 @@
 //! Octet's permission modes, and the environment that starts it.
 #![expect(dead_code, reason = "used by the protocol in the next task")]
 use super::{Config, Mode};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, value::RawValue};
 use std::ffi::OsString;
 
 /// What Octet says when `OPENCODE_CONFIG_CONTENT` is not a JSON object and
@@ -54,24 +54,9 @@ pub(super) fn launch_env_from(
     config: &Config,
     user: Option<&str>,
 ) -> (Vec<(OsString, OsString)>, Option<String>) {
-    let (mut content, notice) = match user.map(serde_json::from_str::<Value>) {
-        None => (Map::new(), None),
-        Some(Ok(Value::Object(object))) => (object, None),
-        Some(_) => (Map::new(), Some(AGENT_NOTICE.to_owned())),
-    };
-    let mut agents = match content.remove("agent") {
-        Some(Value::Object(agents)) => agents,
-        _ => Map::new(),
-    };
-    if let Value::Object(octet) = octet_agents() {
-        agents.extend(octet);
-    }
-    content.insert("agent".into(), Value::Object(agents));
+    let (content, notice) = merged_content(user);
     let mut env: Vec<(OsString, OsString)> = vec![
-        (
-            "OPENCODE_CONFIG_CONTENT".into(),
-            Value::Object(content).to_string().into(),
-        ),
+        ("OPENCODE_CONFIG_CONTENT".into(), content.into()),
         ("OPENCODE_DISABLE_PROJECT_CONFIG".into(), "1".into()),
     ];
     if !config.plugins.load || !config.plugins.hooks || config.catalog_only {
@@ -80,31 +65,130 @@ pub(super) fn launch_env_from(
     (env, notice)
 }
 
-/// The agents Octet defines for its `ask`, `accept-edits` and `full-access`
-/// modes. Reads are allowed everywhere, since they change nothing.
-fn octet_agents() -> Value {
-    json!({
-        "octet-ask": {
-            "mode": "primary",
-            "description": "Octet: ask before edits and commands",
-            "permission": {"*": "ask", "read": "allow", "glob": "allow", "grep": "allow",
-                "list": "allow", "lsp": "allow", "todoread": "allow", "todowrite": "allow",
-                "skill": "allow"}
-        },
-        "octet-accept-edits": {
-            "mode": "primary",
-            "description": "Octet: edits proceed, other actions ask",
-            "permission": {"*": "ask", "edit": "allow", "read": "allow", "glob": "allow",
-                "grep": "allow", "list": "allow", "lsp": "allow", "todoread": "allow",
-                "todowrite": "allow", "skill": "allow"}
-        },
-        "octet-full-access": {
-            "mode": "primary",
-            "description": "Octet: no permission checks",
-            "permission": {"*": "allow"}
-        }
-    })
+/// A JSON object as its keys and values in source order. opencode applies a
+/// permission map's rules last-match-wins in that order, so a merge must not
+/// sort them; each value is kept as the text it was written in.
+struct Ordered(Vec<(String, Box<RawValue>)>);
+
+/// `text` without the leading whitespace JSON allows.
+fn skip_space(text: &str) -> &str {
+    text.trim_start_matches([' ', '\t', '\n', '\r'])
 }
+
+impl Ordered {
+    /// The members of `text` in source order; `None` unless it is exactly
+    /// one JSON object.
+    fn parse(text: &str) -> Option<Ordered> {
+        let mut ordered = Ordered(Vec::new());
+        let mut rest = skip_space(skip_space(text).strip_prefix('{')?);
+        if let Some(end) = rest.strip_prefix('}') {
+            return skip_space(end).is_empty().then_some(ordered);
+        }
+        loop {
+            let mut keys = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+            let key = keys.next()?.ok()?;
+            rest = skip_space(&rest[keys.byte_offset()..]);
+            rest = skip_space(rest.strip_prefix(':')?);
+            let mut values = serde_json::Deserializer::from_str(rest).into_iter::<&RawValue>();
+            let value = values.next()?.ok()?.to_owned();
+            rest = skip_space(&rest[values.byte_offset()..]);
+            ordered.set(key, value);
+            if let Some(more) = rest.strip_prefix(',') {
+                rest = skip_space(more);
+            } else {
+                return skip_space(rest.strip_prefix('}')?)
+                    .is_empty()
+                    .then_some(ordered);
+            }
+        }
+    }
+
+    /// Give `key` the value `value`: where `key` already is, or at the end.
+    /// A repeated key keeps its first place and its last value, as when a
+    /// parser builds a map.
+    fn set(&mut self, key: String, value: Box<RawValue>) {
+        match self.0.iter_mut().find(|(existing, _)| *existing == key) {
+            Some(entry) => entry.1 = value,
+            None => self.0.push((key, value)),
+        }
+    }
+
+    /// The value of `key`, if it is set.
+    fn get(&self, key: &str) -> Option<&RawValue> {
+        self.0
+            .iter()
+            .find(|(existing, _)| existing == key)
+            .map(|(_, value)| &**value)
+    }
+
+    /// The object as JSON text, in order, each value as it was.
+    fn to_json(&self) -> String {
+        let mut out = String::from("{");
+        for (index, (key, value)) in self.0.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&Value::String(key.clone()).to_string());
+            out.push(':');
+            out.push_str(value.get());
+        }
+        out.push('}');
+        out
+    }
+
+    /// This object as a value to put in another.
+    fn into_raw(self) -> Box<RawValue> {
+        raw(self.to_json())
+    }
+}
+
+/// `json` as a raw value. Callers pass text they just built from valid JSON.
+fn raw(json: String) -> Box<RawValue> {
+    RawValue::from_string(json).expect("the text was built from valid JSON")
+}
+
+/// The `OPENCODE_CONFIG_CONTENT` text: the user's object with Octet's agents
+/// set in its `agent` object, and the notice when `user` was not an object.
+fn merged_content(user: Option<&str>) -> (String, Option<String>) {
+    let (mut content, notice) = match user.map(Ordered::parse) {
+        None => (Ordered(Vec::new()), None),
+        Some(Some(object)) => (object, None),
+        Some(None) => (Ordered(Vec::new()), Some(AGENT_NOTICE.to_owned())),
+    };
+    let mut agents = content
+        .get("agent")
+        .and_then(|agents| Ordered::parse(agents.get()))
+        .unwrap_or(Ordered(Vec::new()));
+    for (name, definition) in OCTET_AGENTS {
+        agents.set((*name).to_owned(), raw((*definition).to_owned()));
+    }
+    content.set("agent".to_owned(), agents.into_raw());
+    (content.to_json(), notice)
+}
+
+/// The agents Octet defines for its `ask`, `accept-edits` and `full-access`
+/// modes, as JSON text. Reads are allowed everywhere, since they change
+/// nothing. Each permission map starts with `"*"`: rules are last-match-wins,
+/// so the entries after it refine it.
+const OCTET_AGENTS: &[(&str, &str)] = &[
+    (
+        "octet-ask",
+        r#"{"mode":"primary","description":"Octet: ask before edits and commands",
+        "permission":{"*":"ask","read":"allow","glob":"allow","grep":"allow","list":"allow",
+        "lsp":"allow","todoread":"allow","todowrite":"allow","skill":"allow"}}"#,
+    ),
+    (
+        "octet-accept-edits",
+        r#"{"mode":"primary","description":"Octet: edits proceed, other actions ask",
+        "permission":{"*":"ask","edit":"allow","read":"allow","glob":"allow","grep":"allow",
+        "list":"allow","lsp":"allow","todoread":"allow","todowrite":"allow","skill":"allow"}}"#,
+    ),
+    (
+        "octet-full-access",
+        r#"{"mode":"primary","description":"Octet: no permission checks",
+        "permission":{"*":"allow"}}"#,
+    ),
+];
 
 #[cfg(test)]
 mod tests {
@@ -217,5 +301,77 @@ mod tests {
         c.catalog_only = true;
         assert_eq!(disabled(&c), Some("1".into()));
         assert_eq!(pure(&c), Some("1".into()));
+    }
+
+    #[test]
+    fn the_users_key_order_survives_the_merge() {
+        // opencode's rules are last-match-wins in object order, so a re-sort
+        // would change what the user's own configuration decides.
+        let user = r#"{"permission":{"rm *":"deny","*":"allow"},
+            "agent":{"mine":{"permission":{"z":"ask","a":"allow"}}},"model":"x"}"#;
+        let (env, notice) = launch_env_from(&config(), Some(user));
+        assert_eq!(notice, None);
+        let text = var(&env, "OPENCODE_CONFIG_CONTENT").unwrap();
+        let before = |first: &str, second: &str| {
+            let at = |needle: &str| {
+                text.find(needle)
+                    .unwrap_or_else(|| panic!("{needle} in {text}"))
+            };
+            assert!(at(first) < at(second), "{first} before {second} in {text}");
+        };
+        before(r#""rm *":"deny""#, r#""*":"allow""#);
+        before(r#""z":"ask""#, r#""a":"allow""#);
+        // The top-level keys keep their places too, and the agents are added.
+        before(r#""permission""#, r#""agent""#);
+        before(r#""agent""#, r#""model""#);
+        let content: Value = serde_json::from_str(&text).unwrap();
+        for name in [
+            "octet-ask",
+            "octet-accept-edits",
+            "octet-full-access",
+            "mine",
+        ] {
+            assert!(content["agent"][name].is_object(), "{name}");
+        }
+        assert_eq!(content["model"], "x");
+    }
+
+    #[test]
+    fn octet_permission_maps_start_with_the_catch_all() {
+        let (env, _) = launch_env_from(&config(), None);
+        let text = var(&env, "OPENCODE_CONFIG_CONTENT").unwrap();
+        // Last match wins, so a leading "*" is what lets the entries after it
+        // refine it.
+        assert_eq!(text.matches(r#""permission":{"*":""#).count(), 3, "{text}");
+    }
+
+    #[test]
+    fn only_one_json_object_is_parsed_as_the_users_content() {
+        let keys = |text: &str| {
+            Ordered::parse(text).map(|o| {
+                o.0.into_iter()
+                    .map(|(k, v)| (k, v.get().to_owned()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(keys(" { } "), Some(vec![]));
+        assert_eq!(
+            keys(r#" {"b" : [1, {"x":"}"}] , "a":"\"q\"" , "b":2 } "#),
+            Some(vec![
+                ("b".into(), "2".into()),
+                ("a".into(), r#""\"q\"""#.into())
+            ])
+        );
+        for bad in [
+            "",
+            "[1]",
+            "{",
+            r#"{"a":1,}"#,
+            r#"{"a":1} x"#,
+            r#"{"a" 1}"#,
+            "{1:2}",
+        ] {
+            assert!(Ordered::parse(bad).is_none(), "{bad}");
+        }
     }
 }

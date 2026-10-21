@@ -10,7 +10,7 @@ rust-version.workspace = true
 [dependencies]
 octet-proc.workspace = true
 tokio.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 
 [dev-dependencies]
