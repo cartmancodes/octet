@@ -382,11 +382,25 @@ pub struct Listing {
     pub skills: Vec<SkillInfo>,
 }
 
-/// What Octet says when a provider whose mode applies from the next turn
-/// confirms a switch while a turn runs.
+/// What Octet says when a provider whose mode applies from the next turn,
+/// and that steers (Codex), confirms a switch while a turn runs.
 pub(super) const MODE_NEXT_TURN_NOTICE: &str = "Mode applies from the next turn. \
     The running turn and steering keep their previous permissions; \
     wait for it to finish, or interrupt it and send a new prompt";
+/// [`MODE_NEXT_TURN_NOTICE`] for a provider that cannot steer (opencode):
+/// its `/steer` is queued as the next prompt, which runs under the new mode.
+const MODE_NEXT_TURN_NOTICE_NO_STEER: &str = "Mode applies from the next turn. \
+    The running turn keeps its previous permissions; \
+    wait for it to finish, or interrupt it and send a new prompt";
+
+/// The next-turn notice for a provider that can `steer` or not.
+pub(super) fn mode_next_turn_notice(steer: bool) -> &'static str {
+    if steer {
+        MODE_NEXT_TURN_NOTICE
+    } else {
+        MODE_NEXT_TURN_NOTICE_NO_STEER
+    }
+}
 
 /// The most skills one list keeps, live or cached.
 pub const MAX_SKILLS: usize = 512;
@@ -1296,6 +1310,13 @@ mod tests {
         assert_eq!(
             MODE_NEXT_TURN_NOTICE,
             "Mode applies from the next turn. The running turn and steering keep their previous permissions; wait for it to finish, or interrupt it and send a new prompt"
+        );
+        assert_eq!(mode_next_turn_notice(true), MODE_NEXT_TURN_NOTICE);
+        // A provider that cannot steer queues `/steer` as the next prompt,
+        // which does run under the new mode: its notice leaves steering out.
+        assert_eq!(
+            mode_next_turn_notice(false),
+            "Mode applies from the next turn. The running turn keeps its previous permissions; wait for it to finish, or interrupt it and send a new prompt"
         );
     }
     #[test]

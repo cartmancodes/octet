@@ -556,9 +556,14 @@ impl App {
         {
             let _ = write!(
                 text,
-                " (next turn; running turn still uses {}). Steering does not start a new turn",
+                " (next turn; running turn still uses {})",
                 active.label()
             );
+            // Only a provider that steers adds to the running turn; elsewhere
+            // `/steer` is the next prompt, which takes the new mode.
+            if self.conn.engine.provider().steer {
+                text.push_str(". Steering does not start a new turn");
+            }
         }
         if let Some(pending) = self.conn.mode_pending {
             let _ = write!(text, " (switching to {})", pending.label());

@@ -792,7 +792,9 @@ impl OpencodeProtocol {
         }
         core.emit(Event::ModeChanged(target))?;
         if mid_turn && core.phase.is_running() {
-            core.emit(Event::Notice(super::MODE_NEXT_TURN_NOTICE.into()))?;
+            core.emit(Event::Notice(
+                super::mode_next_turn_notice(PROVIDER.steer).into(),
+            ))?;
         }
         Ok(())
     }

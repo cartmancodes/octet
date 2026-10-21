@@ -2709,6 +2709,11 @@ async fn opencode_switch_during_a_turn_applies_from_the_next_turn() {
         matches!(&notice, Event::Notice(t) if t.starts_with("Mode applies from the next turn")),
         "{notice:?}"
     );
+    // opencode cannot steer: its `/steer` is the next prompt, under the new mode.
+    assert!(
+        matches!(&notice, Event::Notice(t) if !t.contains("steering")),
+        "{notice:?}"
+    );
     handle.interrupt();
     wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
     handle

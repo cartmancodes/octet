@@ -280,6 +280,10 @@ fn codex_header_distinguishes_running_permissions_from_next_turn() {
         assert_eq!(mode_chip(&app).content, "ask → auto next");
         assert_eq!(mode_chip(&app).style.fg, Some(MUTED));
         assert!(app.mode_details().contains("running turn still uses ask"));
+        assert!(
+            app.mode_details()
+                .contains("Steering does not start a new turn")
+        );
         let rows = screen(width, 24, &mut app);
         assert!(
             rows.iter().any(|row| row.contains("ask → auto next")),
@@ -357,6 +361,12 @@ fn opencode_switch_sent_mid_turn_waits_for_the_next_turn() {
     app.event(Event::ModeChanged(Mode::AcceptEdits));
     assert_eq!(mode_chip(&app).content, "ask → accept-edits next");
     assert!(app.mode_details().contains("running turn still uses ask"));
+    // opencode cannot steer, so the details do not talk about steering.
+    assert!(
+        !app.mode_details().contains("Steering"),
+        "{}",
+        app.mode_details()
+    );
 }
 
 #[test]
