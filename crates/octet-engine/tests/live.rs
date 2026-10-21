@@ -2966,3 +2966,131 @@ async fn opencode_permission_outside_a_turn_is_rejected_with_a_notice() {
     );
     stop(&handle, task).await;
 }
+#[tokio::test]
+async fn opencode_probe_lists_models_and_skills() {
+    let listing = probe(opencode(), PROBE_LIMIT).await.unwrap();
+    assert_eq!(listing.models.len(), 2, "{:?}", listing.models);
+    assert!(
+        listing
+            .skills
+            .iter()
+            .any(|s| s.name == scenario::OPENCODE_SKILL),
+        "{:?}",
+        listing.skills
+    );
+}
+#[tokio::test]
+async fn opencode_probe_deletes_its_session() {
+    // The fake's `session delete <id>` leaves `deleted-<id>` in its working
+    // directory, which is the probe's.
+    let dir = octet_testkit::TempDir::new("octet-opencode-probe-delete");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    probe(c, PROBE_LIMIT).await.unwrap();
+    let marker = dir.path().join("deleted-fixture-ses");
+    let started = tokio::time::Instant::now();
+    while !marker.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the probe's session was not deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+#[tokio::test]
+async fn opencode_real_sessions_are_not_deleted() {
+    let dir = octet_testkit::TempDir::new("octet-opencode-keep");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    stop(&handle, task).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!dir.path().join("deleted-fixture-ses").exists());
+}
+#[tokio::test]
+async fn opencode_skill_runs_as_a_slash_prompt() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Skill {
+            name: scenario::OPENCODE_SKILL.into(),
+            path: None,
+            args: "go".into(),
+            display: format!("/{} go", scenario::OPENCODE_SKILL),
+            context: None,
+        })
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{} go", scenario::OPENCODE_SKILL)
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_compact_uses_its_command() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Compact).unwrap();
+    assert_eq!(turn_text(&mut events).await, "/compact");
+    stop(&handle, task).await;
+}
+/// An opencode that opens its session and never lists any commands, then
+/// answers the mode switch if one comes.
+fn opencode_without_commands() -> (octet_testkit::TempDir, Config) {
+    use serde_json::json;
+    let options = json!([
+        {"id": "model", "currentValue": "a/b", "options": [{"value": "a/b", "name": "A B"}]},
+        {"id": "mode", "currentValue": "build", "options": [{"value": "build", "name": "build"}]},
+    ]);
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": options}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+    ];
+    let mut body = String::new();
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    body.push_str("exec sleep 30\n");
+    let (dir, vendor) = script_vendor("octet-live-opencode-no-commands", &body);
+    (
+        dir,
+        Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()),
+    )
+}
+#[tokio::test]
+async fn opencode_probe_settles_for_the_models_when_no_commands_come() {
+    let (_dir, config) = opencode_without_commands();
+    let started = tokio::time::Instant::now();
+    let listing = probe(config, PROBE_LIMIT).await.unwrap();
+    assert_eq!(listing.models.len(), 1);
+    assert!(listing.skills.is_empty());
+    assert!(
+        started.elapsed() >= Duration::from_millis(1900),
+        "{:?}",
+        started.elapsed()
+    );
+}
+#[tokio::test]
+async fn opencode_compact_without_the_command_fails_the_turn() {
+    let (_dir, config) = opencode_without_commands();
+    let (handle, mut events, task) = spawn(config);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Compact).unwrap();
+    let error = expect_error(&mut events).await;
+    assert_eq!(error, "opencode does not offer compaction in this session");
+    let finished = next(&mut events).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Failed
+            }
+        ),
+        "{finished:?}"
+    );
+    stop(&handle, task).await;
+}

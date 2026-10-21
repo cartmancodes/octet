@@ -1,7 +1,7 @@
 //! opencode over the Agent Client Protocol (`opencode acp`): its row, the
 //! launch configuration (its arguments, the agents that carry Octet's
 //! permission modes, and the environment that starts it), the handshake, the
-//! model catalog and turns.
+//! model catalog, turns, skills and the probe.
 use super::{
     ApprovalSummary, BoxFuture, Channels, Config, DriverError, Event, ImageAttachment, Limits,
     Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
@@ -16,6 +16,7 @@ use std::{
     ffi::OsString,
     future::Future,
     path::Path,
+    process::Stdio,
     time::Duration,
 };
 use tokio::time::Instant;
@@ -55,6 +56,11 @@ const MAX_TOOLS: usize = 256;
 const MAX_MODELS: usize = 256;
 /// The most timed-out mode switches kept in case opencode confirms them late.
 const MAX_LATE_SWITCHES: usize = 8;
+/// How long a probe waits, after the session opens, for opencode to list its
+/// commands before it settles for the models alone.
+const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
+/// How long `opencode session delete` may run before it is killed.
+const SESSION_DELETE_LIMIT: Duration = Duration::from_secs(10);
 
 /// What a reply from opencode answers: one of Octet's own requests.
 enum Outstanding {
@@ -108,6 +114,11 @@ pub(super) struct OpencodeProtocol {
     agent: Option<String>,
     /// Each tool call's name and target from its first frame, this turn.
     tools: HashMap<String, (String, String)>,
+    /// A probe's session is open and its commands are awaited until this
+    /// moment; `None` once the probe has been answered.
+    probe_wait: Option<Instant>,
+    /// The last command list holds `compact`.
+    compact_offered: bool,
 }
 
 impl Protocol for OpencodeProtocol {
@@ -124,17 +135,22 @@ impl Protocol for OpencodeProtocol {
     }
 
     fn deadline(&self) -> Option<Instant> {
-        self.mode_request.as_ref().map(|request| request.deadline)
+        let mode = self.mode_request.as_ref().map(|request| request.deadline);
+        [mode, self.probe_wait].into_iter().flatten().min()
     }
 
     /// A switch opencode has not confirmed in time is reported, and kept in
-    /// case opencode confirms it late. Nothing here waits, so the work is
-    /// done at once and handed back as a ready future.
+    /// case opencode confirms it late. A probe whose commands never came
+    /// settles for the models. Nothing here waits, so the work is done at
+    /// once and handed back as a ready future.
     fn on_deadline(
         &mut self,
         core: &mut Core,
     ) -> impl Future<Output = Result<(), DriverError>> + Send {
-        std::future::ready(self.report_late_mode(core))
+        std::future::ready(
+            self.report_late_mode(core)
+                .and_then(|()| self.probe_timed_out(core)),
+        )
     }
 
     /// Only frames for this session count: another session's chatter is
@@ -206,27 +222,30 @@ impl Protocol for OpencodeProtocol {
             .await
     }
 
-    /// Not offered yet: the turn ends at once, failed, saying so.
-    fn send_skill(
+    /// A skill is one of opencode's slash commands: the prompt is
+    /// `/name args`, after the context and a blank line when there is one.
+    async fn send_skill(
         &mut self,
         core: &mut Core,
-        _name: &str,
+        name: &str,
         _path: Option<&Path>,
-        _args: &str,
-        _context: Option<&str>,
-    ) -> impl Future<Output = Result<(), DriverError>> + Send {
-        std::future::ready(fail_turn(
-            core,
-            "Octet cannot run opencode skills yet".to_owned(),
-        ))
+        args: &str,
+        context: Option<&str>,
+    ) -> Result<(), DriverError> {
+        let text = skill_prompt(name, args, context);
+        self.send_prompt(core, &text, &[]).await
     }
 
-    /// Not offered yet: the turn ends at once, failed, saying so.
-    fn compact(&mut self, core: &mut Core) -> impl Future<Output = Result<(), DriverError>> + Send {
-        std::future::ready(fail_turn(
+    /// Compaction is opencode's `/compact` command, when its last command
+    /// list offered one; otherwise the turn ends, failed, saying so.
+    async fn compact(&mut self, core: &mut Core) -> Result<(), DriverError> {
+        if self.compact_offered {
+            return self.send_prompt(core, "/compact", &[]).await;
+        }
+        fail_turn(
             core,
-            "Octet cannot compact an opencode session yet".to_owned(),
-        ))
+            "opencode does not offer compaction in this session".to_owned(),
+        )
     }
 
     /// Sends the `session/cancel` notification. opencode then ends the
@@ -271,7 +290,12 @@ impl Protocol for OpencodeProtocol {
         let update = &v["params"]["update"];
         match update["sessionUpdate"].as_str().unwrap_or("") {
             "available_commands_update" => {
-                core.emit(Event::Skills(commands(&update["availableCommands"])))
+                let list = &update["availableCommands"];
+                self.compact_offered = offers(list, "compact");
+                if core.config.catalog_only {
+                    return self.probe_listed(core, list);
+                }
+                core.emit(Event::Skills(commands(list)))
             }
             // A resume replays the session's history before any prompt: it
             // is not this turn's output.
@@ -384,10 +408,10 @@ impl OpencodeProtocol {
         self.note_options(&result["configOptions"]);
         core.emit(Event::Models(catalog(&result["configOptions"])))?;
         if core.config.catalog_only {
-            // A probe takes the models now.
-            return core.emit(Event::Ready {
-                session: String::new(),
-            });
+            // A probe takes the models with the commands, which follow the
+            // session's reply; it waits a little for them.
+            self.probe_wait = Some(deadline_after(PROBE_COMMANDS_WAIT));
+            return Ok(());
         }
         match core.config.model.clone() {
             Some(model) if self.model.as_deref() != Some(model.as_str()) => {
@@ -546,6 +570,29 @@ impl OpencodeProtocol {
         core.emit(Event::ModeChanged(core.mode))
     }
 
+    /// A probe's commands arrived: they go out as its skills, then the probe
+    /// is done. A repeated list, after that, is not the probe's.
+    fn probe_listed(&mut self, core: &Core, list: &Value) -> Result<(), DriverError> {
+        if self.probe_wait.take().is_none() {
+            return Ok(());
+        }
+        core.emit(Event::Skills(commands(list)))?;
+        finish_probe(core)
+    }
+
+    /// A probe whose commands did not come in time is done with the models
+    /// alone.
+    fn probe_timed_out(&mut self, core: &Core) -> Result<(), DriverError> {
+        if self
+            .probe_wait
+            .take_if(|wait| *wait <= Instant::now())
+            .is_none()
+        {
+            return Ok(());
+        }
+        finish_probe(core)
+    }
+
     /// Records the model and agent `config_options` reports as current.
     fn note_options(&mut self, config_options: &Value) {
         if let Some(model) = current(config_options, "model") {
@@ -617,6 +664,56 @@ impl OpencodeProtocol {
             detail: content_text(&update["content"]),
         }))
     }
+}
+
+/// The probe has what it came for: it says so, and its session, which only
+/// read the catalog, is deleted so the user's history keeps no empty session.
+fn finish_probe(core: &Core) -> Result<(), DriverError> {
+    delete_session(&core.config, &core.session);
+    core.emit(Event::Ready {
+        session: String::new(),
+    })
+}
+
+/// Deletes `session` with `opencode session delete`, on a task of its own:
+/// neither the probe nor the session's shutdown waits for it, and its result
+/// is ignored. The command is killed after [`SESSION_DELETE_LIMIT`], and when
+/// the task is dropped with the runtime.
+fn delete_session(config: &Config, session: &str) {
+    // An ID that looks like an option must not be read as one.
+    if session.starts_with('-') || !valid_identifier(session) {
+        return;
+    }
+    let mut command = tokio::process::Command::new(&config.binary);
+    command
+        .args(["session", "delete", session])
+        .envs(launch_env(config))
+        .current_dir(&config.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(SESSION_DELETE_LIMIT, command.status()).await;
+    });
+}
+
+/// The prompt that runs the slash command `name`: `/name args`, trimmed,
+/// after `context` and a blank line when there is context.
+fn skill_prompt(name: &str, args: &str, context: Option<&str>) -> String {
+    let command = format!("/{name} {args}");
+    match context.filter(|context| !context.is_empty()) {
+        Some(context) => format!("{context}\n\n{}", command.trim()),
+        None => command.trim().to_owned(),
+    }
+}
+
+/// Whether the command list `list` holds the command `name`.
+fn offers(list: &Value, name: &str) -> bool {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .any(|command| command["name"] == name)
 }
 
 /// Why opencode's reply to setting an agent is not a confirmation.
@@ -1021,6 +1118,27 @@ mod tests {
             {"id": "mode", "currentValue": "build", "options": [{"value": "build", "name": "build"}]},
             {"id": "model", "currentValue": "a/b", "options": choices},
         ])
+    }
+
+    #[test]
+    fn a_skill_prompt_is_its_slash_command_after_any_context() {
+        assert_eq!(skill_prompt("review", "src", None), "/review src");
+        assert_eq!(skill_prompt("review", "", None), "/review");
+        assert_eq!(skill_prompt("review", "  a b ", None), "/review   a b");
+        assert_eq!(skill_prompt("review", "go", Some("")), "/review go");
+        assert_eq!(
+            skill_prompt("review", "go", Some("earlier")),
+            "earlier\n\n/review go"
+        );
+    }
+
+    #[test]
+    fn compaction_is_offered_when_the_command_list_holds_it() {
+        let list = json!([{"name": "init"}, {"name": "compact"}]);
+        assert!(offers(&list, "compact"));
+        assert!(!offers(&json!([{"name": "init"}]), "compact"));
+        assert!(!offers(&json!([]), "compact"));
+        assert!(!offers(&Value::Null, "compact"));
     }
 
     #[test]
