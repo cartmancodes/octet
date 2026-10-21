@@ -106,6 +106,9 @@ pub struct Provider {
     pub modes: [&'static str; 4],
     /// Text can be added to a running turn (`/steer`).
     pub steer: bool,
+    /// A live mode switch takes effect from the next turn; the running one
+    /// keeps its mode.
+    pub mode_applies_next_turn: bool,
     /// Images go inside the prompt as base64, so [`check_inline`]'s limits
     /// apply; otherwise the vendor reads the files itself.
     pub inline_images: bool,
@@ -378,6 +381,10 @@ pub struct Listing {
     /// The skills, empty when the CLI listed none.
     pub skills: Vec<SkillInfo>,
 }
+
+/// What Octet says when a provider whose mode applies from the next turn
+/// confirms a switch while a turn runs.
+pub(super) const MODE_NEXT_TURN_NOTICE: &str = "Mode applies from the next turn. The running turn and steering keep their previous permissions; wait for it to finish, or interrupt it and send a new prompt";
 
 /// The most skills one list keeps, live or cached.
 pub const MAX_SKILLS: usize = 512;

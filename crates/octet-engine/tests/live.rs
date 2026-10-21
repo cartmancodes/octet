@@ -2692,6 +2692,66 @@ async fn opencode_live_switch_sets_the_agent() {
     );
 }
 #[tokio::test]
+async fn opencode_switch_during_a_turn_applies_from_the_next_turn() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::Prompt(scenario::HOLD.into())).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Started)).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    // opencode applies an agent at the next prompt: the running turn keeps
+    // octet-ask, and Octet says so as it does for Codex.
+    let notice = next(&mut events).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t.starts_with("Mode applies from the next turn")),
+        "{notice:?}"
+    );
+    handle.interrupt();
+    wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-ask", "octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_switch_between_turns_gives_no_next_turn_notice() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let mut text = String::new();
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => panic!("unexpected notice: {notice}"),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    let echo: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_auto_is_the_build_agent() {
     let modes = opencode_agents_after_switching_to(Mode::Auto).await;
     assert_eq!(

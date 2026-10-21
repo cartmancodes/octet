@@ -19,6 +19,7 @@ pub(super) const PROVIDER: Provider = Provider {
         "Offline demo: /approval-demo is allowed without a dialog",
     ],
     steer: false,
+    mode_applies_next_turn: false,
     inline_images: false,
     effort_live: false,
     takes_effort: true,

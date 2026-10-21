@@ -31,6 +31,7 @@ pub(super) const PROVIDER: Provider = Provider {
         "…ask…", "…accept-edits…", "…auto…", "…full-access…",
     ],
     steer: false,                   // true if a running turn takes more input
+    mode_applies_next_turn: false,  // true if a live /mode switch reaches only the next turn
     inline_images: false,           // true if images go in the prompt as base64
     effort_live: false,             // true if effort is sent per turn, not at launch
     takes_effort: true,             // false if the vendor has no reasoning effort setting

@@ -305,6 +305,40 @@ fn codex_header_distinguishes_running_permissions_from_next_turn() {
 }
 
 #[test]
+fn opencode_header_distinguishes_running_permissions_from_next_turn() {
+    use octet_core::{Engine, Mode, Outcome};
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    app.event(Event::Started);
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    // opencode applies an agent at the next prompt, as Codex does.
+    assert_eq!(mode_chip(&app).content, "ask → accept-edits next");
+    assert!(app.mode_details().contains("running turn still uses ask"));
+    let rows = screen(80, 24, &mut app);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("ask → accept-edits next")),
+        "{rows:?}"
+    );
+    app.event(Event::Finished {
+        outcome: Outcome::Completed,
+    });
+    app.event(Event::Started);
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+    assert_eq!(app.conn.mode_for_turn, None);
+}
+
+#[test]
+fn every_provider_says_whether_a_mode_waits_for_the_next_turn() {
+    use octet_core::Engine;
+    let next_turn = |engine: Engine| engine.provider().mode_applies_next_turn;
+    assert!(next_turn(Engine::CODEX));
+    assert!(next_turn(Engine::OPENCODE));
+    assert!(!next_turn(Engine::CLAUDE));
+    assert!(!next_turn(Engine::DEMO));
+}
+
+#[test]
 fn claude_mode_confirmation_updates_the_running_turn() {
     let mut app = crate::test_support::app_for(octet_core::Engine::CLAUDE);
     crate::test_support::idle(&mut app);

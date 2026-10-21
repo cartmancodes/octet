@@ -24,10 +24,14 @@ struct OpencodeFixture {
     opened: String,
     /// The current model.
     model: String,
-    /// The current mode.
+    /// The session's mode (opencode's `modeId`): the agent the next prompt
+    /// runs under. As in opencode 1.18.25, a switch does not reach a prompt
+    /// already running.
     mode: String,
     /// Every mode accepted so far, for `PARAMS`.
     modes: Vec<String>,
+    /// The agent each prompt ran under, in order, for `PARAMS`.
+    agents: Vec<String>,
     /// The model was set to `OPENCODE_REJECT_MODE`: mode switches are refused.
     rejects_modes: bool,
     /// The one mode switch (the handshake's) accepted after the model.
@@ -47,6 +51,7 @@ pub(crate) fn run() {
         model: MODEL_FREE.to_owned(),
         mode: MODE_BUILD.to_owned(),
         modes: Vec::new(),
+        agents: Vec::new(),
         rejects_modes: false,
         free_mode_switch: false,
         held: None,
@@ -188,9 +193,11 @@ impl OpencodeFixture {
         ));
     }
 
-    /// Runs the script the prompt's first text block names.
+    /// Runs the script the prompt's first text block names, under the
+    /// session's agent as it is now.
     fn prompt(&mut self, v: &Value) {
         let id = &v["id"];
+        self.agents.push(self.mode.clone());
         let sid = self.session.clone();
         let blocks = v
             .pointer("/params/prompt")
@@ -268,6 +275,7 @@ impl OpencodeFixture {
                         "OPENCODE_PURE": env_var("OPENCODE_PURE"),
                     },
                     "modes": self.modes,
+                    "agents": self.agents,
                     "model": self.model,
                     "opened": self.opened,
                 })

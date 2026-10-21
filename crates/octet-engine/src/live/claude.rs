@@ -32,6 +32,7 @@ pub(super) const PROVIDER: Provider = Provider {
         "No permission checks at all (bypassPermissions)",
     ],
     steer: false,
+    mode_applies_next_turn: false,
     inline_images: true,
     effort_live: false,
     takes_effort: true,

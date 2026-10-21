@@ -933,7 +933,7 @@ impl App {
                 self.refresh_model_label();
             }
             Event::ModeChanged(mode) => {
-                if self.conn.engine == octet_core::Engine::CODEX && self.conn.is_running() {
+                if self.conn.engine.provider().mode_applies_next_turn && self.conn.is_running() {
                     self.conn.mode_for_turn.get_or_insert(self.conn.mode);
                 }
                 self.conn.mode = mode;

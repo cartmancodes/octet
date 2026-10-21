@@ -34,6 +34,7 @@ pub(super) const PROVIDER: Provider = Provider {
         "No permission checks at all (agent octet-full-access)",
     ],
     steer: false,
+    mode_applies_next_turn: true,
     inline_images: true,
     effort_live: false,
     takes_effort: false,
@@ -515,7 +516,9 @@ impl OpencodeProtocol {
     /// error, or a reply naming the agent already in force, is reported and
     /// the session keeps its mode. A reply naming any other agent stops the
     /// session: opencode may then ask for less than the header shows. A
-    /// reply after the switch timed out is handled the same way.
+    /// reply after the switch timed out is handled the same way. opencode
+    /// applies an agent at the next `session/prompt`, so a switch confirmed
+    /// mid-turn says the running turn keeps its mode.
     fn switched(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
         let id = v["id"].as_u64();
         let late = self
@@ -558,7 +561,11 @@ impl OpencodeProtocol {
                 target.label()
             )))?;
         }
-        core.emit(Event::ModeChanged(target))
+        core.emit(Event::ModeChanged(target))?;
+        if core.phase.is_running() {
+            core.emit(Event::Notice(super::MODE_NEXT_TURN_NOTICE.into()))?;
+        }
+        Ok(())
     }
 
     /// Reports a live switch opencode did not confirm in time; the header

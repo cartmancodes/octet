@@ -30,6 +30,7 @@ pub(super) const PROVIDER: Provider = Provider {
         "No sandbox; never asks (danger-full-access)",
     ],
     steer: true,
+    mode_applies_next_turn: true,
     inline_images: false,
     effort_live: true,
     takes_effort: true,
@@ -570,9 +571,7 @@ fn adopt_mode_now(core: &mut Core, target: Mode) -> Result<(), DriverError> {
     core.mode = target;
     core.emit(Event::ModeChanged(core.mode))?;
     if core.phase.is_running() {
-        core.emit(Event::Notice(
-            "Mode applies from the next turn. The running turn and steering keep their previous permissions; wait for it to finish, or interrupt it and send a new prompt".into(),
-        ))?;
+        core.emit(Event::Notice(super::MODE_NEXT_TURN_NOTICE.into()))?;
     }
     Ok(())
 }
