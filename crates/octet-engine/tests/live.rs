@@ -2984,7 +2984,7 @@ async fn turn_events(events: &mut mpsc::Receiver<Event>) -> Vec<String> {
 /// The refusal of a prompt sent while the switch to accept-edits is
 /// unanswered.
 const UNKNOWN_MODE: &str = "error Not sent: opencode has not confirmed the switch to accept-edits, \
-     so its mode is unknown. Wait for it, or reconnect with /model opencode to start again in ask";
+     so its mode is unknown. Wait for it, or use /reconnect to start again in ask";
 #[tokio::test]
 async fn opencode_prompts_wait_for_a_timed_out_switch_then_run_under_its_agent() {
     // The gated fake answers the live switch only once the test releases it.
@@ -3065,12 +3065,13 @@ async fn opencode_prompts_run_under_the_old_agent_once_a_timed_out_switch_is_ref
 }
 #[tokio::test]
 async fn opencode_reconnect_sets_the_agent_of_the_headers_mode() {
-    // `/model opencode` resumes the session in the mode the header shows;
-    // the handshake sets that mode's agent, so a mode left unknown by an
-    // unanswered switch is known again.
+    // `/reconnect` resumes the session with its model, in the mode the
+    // header shows; the handshake sets that mode's agent, so a mode left
+    // unknown by an unanswered switch is known again.
     let mut c = opencode();
     c.resume = Some("ses-before".into());
     c.mode = Mode::AcceptEdits;
+    c.model = Some("openai/gpt-fixture".into());
     let (handle, mut events, task) = spawn(c);
     wait_for(&mut events, |e| {
         matches!(e, Event::ModeChanged(Mode::AcceptEdits))
@@ -3078,6 +3079,7 @@ async fn opencode_reconnect_sets_the_agent_of_the_headers_mode() {
     .await;
     let echo = opencode_params(&handle, &mut events).await;
     assert_eq!(echo["opened"], "session/resume", "{echo}");
+    assert_eq!(echo["model"], "openai/gpt-fixture", "{echo}");
     assert_eq!(
         echo["modes"],
         serde_json::json!(["octet-accept-edits"]),

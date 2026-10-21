@@ -347,8 +347,8 @@ unconfirmed waits for opencode's answer, with a notice, so it runs under
 the mode the header shows. If opencode does not confirm within 10 seconds,
 the mode opencode runs is unknown: that prompt, and any sent before
 opencode answers, is not sent, with an error saying so. A late answer
-settles it and prompts run again; `/model opencode` reconnects in the mode
-the header shows.
+settles it and prompts run again; `/reconnect` resumes the session, with
+its model, in the mode the header shows.
 An already-open approval still needs your answer. A change Claude
 refuses (for example, auto mode unavailable for the account) leaves the previous
 mode in place with a notice; one Claude does not confirm within 10 seconds is

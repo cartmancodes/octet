@@ -184,21 +184,20 @@ impl<P: Protocol> Driver<P> {
     }
 
     /// A turn sent while the vendor's mode is unknown: recorded as failed,
-    /// never sent, saying how to get out (wait, or reconnect, which sets the
-    /// header's mode again).
+    /// never sent, saying how to get out (wait, or `/reconnect`, which
+    /// resumes the session with its model and sets the header's mode).
     fn refuse_while_mode_unknown(
         &self,
         command: &Command,
         target: Mode,
     ) -> Result<(), DriverError> {
         let display = command.turn_display().unwrap_or_default().to_owned();
-        let engine = self.core.config.engine;
         self.core.emit(Event::User(display))?;
         self.core.emit(Event::Started)?;
         self.core.emit(Event::Error(format!(
             "Not sent: {} has not confirmed the switch to {}, so its mode is unknown. \
-             Wait for it, or reconnect with /model {engine} to start again in {}",
-            engine.title(),
+             Wait for it, or use /reconnect to start again in {}",
+            self.core.config.engine.title(),
             target.label(),
             self.core.mode.label()
         )))?;

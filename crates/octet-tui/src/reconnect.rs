@@ -348,6 +348,23 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_keeps_opencodes_model_and_takes_the_headers_mode() {
+        // The way out of a mode opencode left unknown: `/reconnect` resumes
+        // the session with its model, and its handshake sets the header's
+        // mode.
+        let mut opencode = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+        opencode.model = Some("opencode/deepseek-v4.1-flash-free".into());
+        let plan = plan_for(Exit::Reconnect, &opencode, "ses-1");
+        assert_eq!(plan.config.engine, Engine::OPENCODE);
+        assert_eq!(
+            plan.config.model.as_deref(),
+            Some("opencode/deepseek-v4.1-flash-free")
+        );
+        assert_eq!(plan.config.mode, Mode::Auto);
+        assert_eq!(plan.config.resume.as_deref(), Some("ses-1"));
+    }
+
+    #[test]
     fn model_opencode_reconnects_in_the_headers_mode() {
         // The way out of a mode opencode left unknown: `/model opencode`
         // resumes the session and its handshake sets the header's mode.
