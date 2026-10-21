@@ -259,10 +259,13 @@ impl Protocol for OpencodeProtocol {
         }
     }
 
-    /// Says when the user's `OPENCODE_CONFIG_CONTENT` had to be replaced,
-    /// then sends `initialize`, offering no client capabilities.
+    /// Says when the user's `OPENCODE_CONFIG_CONTENT` had to be ignored or
+    /// replaced, then sends `initialize`, offering no client capabilities.
     async fn initialize(&mut self, core: &mut Core) -> Result<(), DriverError> {
-        let user = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+        let (user, unreadable) = user_content();
+        if let Some(notice) = unreadable {
+            core.emit(Event::Notice(notice.to_owned()))?;
+        }
         if let Some(notice) = launch_env_from(&core.config, user.as_deref()).1 {
             core.emit(Event::Notice(notice))?;
         }
@@ -1281,6 +1284,31 @@ fn content_text(content: &Value) -> String {
 pub(super) const AGENT_NOTICE: &str =
     "OPENCODE_CONFIG_CONTENT is not a JSON object; Octet replaced it for this session";
 
+/// What Octet says when `OPENCODE_CONFIG_CONTENT`'s `agent` is not a JSON
+/// object and has to be replaced.
+pub(super) const AGENT_OBJECT_NOTICE: &str =
+    "OPENCODE_CONFIG_CONTENT's agent is not a JSON object; Octet replaced it for this session";
+/// What Octet says when `OPENCODE_CONFIG_CONTENT` is not text and is left
+/// out.
+pub(super) const UTF8_NOTICE: &str =
+    "OPENCODE_CONFIG_CONTENT is not valid UTF-8; Octet ignored it for this session";
+
+/// The user's `OPENCODE_CONFIG_CONTENT`, read from the environment (see
+/// `user_content_from`).
+fn user_content() -> (Option<String>, Option<&'static str>) {
+    user_content_from(std::env::var_os("OPENCODE_CONFIG_CONTENT"))
+}
+
+/// The user's `OPENCODE_CONFIG_CONTENT` as text, given its `value`, and the
+/// notice when it is not valid UTF-8 and so is treated as absent.
+fn user_content_from(value: Option<OsString>) -> (Option<String>, Option<&'static str>) {
+    match value.map(OsString::into_string) {
+        None => (None, None),
+        Some(Ok(text)) => (Some(text), None),
+        Some(Err(_)) => (None, Some(UTF8_NOTICE)),
+    }
+}
+
 /// The agent that carries `mode`. `Auto` is opencode's own `build`, whose
 /// permissions are the user's.
 pub(super) fn agent(mode: Mode) -> &'static str {
@@ -1312,13 +1340,13 @@ pub(super) fn launch_args(config: &Config) -> Vec<OsString> {
 /// `OPENCODE_CONFIG_CONTENT` read from the environment. The notice is for
 /// the caller that can show one; this one drops it.
 pub(super) fn launch_env(config: &Config) -> Vec<(OsString, OsString)> {
-    let user = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+    let (user, _) = user_content();
     launch_env_from(config, user.as_deref()).0
 }
 
 /// The variables that start opencode, given the user's
-/// `OPENCODE_CONFIG_CONTENT` as `user`, and a notice when that content was
-/// not a JSON object and was replaced. Octet's three agents are set over the
+/// `OPENCODE_CONFIG_CONTENT` as `user`, and a notice when that content, or
+/// its `agent`, was not a JSON object and was replaced. Octet's three agents are set over the
 /// user's `agent` object; everything else the user wrote is kept, including
 /// a top-level `permission`, which `build` uses.
 pub(super) fn launch_env_from(
@@ -1419,17 +1447,25 @@ fn raw(json: String) -> Box<RawValue> {
 }
 
 /// The `OPENCODE_CONFIG_CONTENT` text: the user's object with Octet's agents
-/// set in its `agent` object, and the notice when `user` was not an object.
+/// set in its `agent` object, and the notice when `user`, or its `agent`,
+/// was not an object.
 fn merged_content(user: Option<&str>) -> (String, Option<String>) {
-    let (mut content, notice) = match user.map(Ordered::parse) {
+    let (mut content, mut notice) = match user.map(Ordered::parse) {
         None => (Ordered(Vec::new()), None),
         Some(Some(object)) => (object, None),
         Some(None) => (Ordered(Vec::new()), Some(AGENT_NOTICE.to_owned())),
     };
-    let mut agents = content
+    let mut agents = match content
         .get("agent")
-        .and_then(|agents| Ordered::parse(agents.get()))
-        .unwrap_or(Ordered(Vec::new()));
+        .map(|agents| Ordered::parse(agents.get()))
+    {
+        None => Ordered(Vec::new()),
+        Some(Some(agents)) => agents,
+        Some(None) => {
+            notice = Some(AGENT_OBJECT_NOTICE.to_owned());
+            Ordered(Vec::new())
+        }
+    };
     for (name, definition) in OCTET_AGENTS {
         agents.set((*name).to_owned(), raw((*definition).to_owned()));
     }
@@ -1772,6 +1808,41 @@ mod tests {
         // Content that is not JSON at all is replaced the same way.
         let (_, notice) = launch_env_from(&config(), Some("{oops"));
         assert_eq!(notice.as_deref(), Some(AGENT_NOTICE));
+    }
+
+    #[test]
+    fn an_agent_that_is_not_an_object_is_replaced_with_a_notice() {
+        let user = r#"{"model":"x","agent":5}"#;
+        let (env, notice) = launch_env_from(&config(), Some(user));
+        assert_eq!(notice.as_deref(), Some(AGENT_OBJECT_NOTICE));
+        assert_eq!(
+            AGENT_OBJECT_NOTICE,
+            "OPENCODE_CONFIG_CONTENT's agent is not a JSON object; Octet replaced it for this session"
+        );
+        let content: Value =
+            serde_json::from_str(&var(&env, "OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(content["model"], "x");
+        assert_eq!(content["agent"].as_object().unwrap().len(), 3);
+        // An agent object of the user's gives no notice.
+        let (_, notice) = launch_env_from(&config(), Some(r#"{"agent":{}}"#));
+        assert_eq!(notice, None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn content_that_is_not_unicode_is_ignored_with_a_notice() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![b'{', 0xff, b'}']);
+        assert_eq!(user_content_from(Some(bad)), (None, Some(UTF8_NOTICE)));
+        assert_eq!(
+            UTF8_NOTICE,
+            "OPENCODE_CONFIG_CONTENT is not valid UTF-8; Octet ignored it for this session"
+        );
+        assert_eq!(
+            user_content_from(Some("{}".into())),
+            (Some("{}".to_owned()), None)
+        );
+        assert_eq!(user_content_from(None), (None, None));
     }
 
     #[test]
