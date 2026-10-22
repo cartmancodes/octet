@@ -901,6 +901,46 @@ async fn enter_in_the_skills_picker_prepares_the_skill() {
     ));
 }
 #[tokio::test]
+async fn esc_from_the_skills_picker_leaves_an_empty_prompt() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(app.composer.completion.is_some(), "picker open");
+    key_action(&mut app, &vendor, key(KeyCode::Esc)).await;
+    // The `/skills ` line was only the picker's: it goes with it, so what
+    // is typed next is a prompt, not a filter.
+    assert_eq!(app.composer.editor.text(), "");
+    assert!(app.composer.completion.is_none());
+    type_keys(&mut app, &vendor, "Reply RED.").await;
+    assert!(app.composer.completion.is_none());
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(
+        matches!(vendor.sent.borrow().first(), Some(Command::Prompt(text)) if text == "Reply RED."),
+        "{:?}",
+        vendor.sent.borrow()
+    );
+}
+#[tokio::test]
+async fn enter_on_a_skills_filter_that_matches_nothing_says_so() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills zzz").await;
+    assert!(picker_items(&app).is_empty());
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert_eq!(app.composer.editor.text(), "/skills zzz");
+    assert_eq!(app.status_line, "No skill matches zzz; Esc clears the line");
+    assert!(vendor.sent.borrow().is_empty());
+}
+/// The open popup's lines.
+fn picker_items(app: &App) -> Vec<String> {
+    app.composer
+        .completion
+        .as_ref()
+        .map(|c| c.items.clone())
+        .unwrap_or_default()
+}
+#[tokio::test]
 async fn the_skills_picker_filters_and_tab_inserts() {
     let mut app = skills_app();
     let vendor = RecordingVendor::default();

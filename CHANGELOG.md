@@ -351,6 +351,9 @@ Claude Code and Codex CLIs.
   `sub/` is now resolved as typed, so Codex's `gpt-` prefix comes first.
 - A command refused with "Finish or cancel the current turn first" (or
   "Wait for the connection") cleared the prompt box; its line now stays.
+- Esc from the `/skills` picker left `/skills ` in the prompt, so the next
+  prompt reopened the picker and Enter did nothing. Esc now clears that
+  line, and Enter on a filter that matches nothing says so.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

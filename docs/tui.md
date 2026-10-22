@@ -116,7 +116,7 @@ respected. The minimum usable size is 38 columns by 12 rows.
 | Ctrl+P | Command palette: type to filter it, Backspace edits, Up/Down choose, Enter runs (also offers Ctrl+G, `@`, `!` and Ctrl+O) |
 | `@` | Mention a workspace file; a popup suggests paths as you type (Enter or Tab inserts, Esc closes) |
 | `/model` | Model picker: Up/Down choose, Enter switches, Tab inserts the name, Esc closes |
-| `/skills` | Skills picker: Up/Down choose, Enter or Tab puts `/name ` in the prompt (nothing runs until you send it), Esc closes |
+| `/skills` | Skills picker: Up/Down choose, Enter or Tab puts `/name ` in the prompt (nothing runs until you send it), Esc closes it and clears its `/skills` line |
 | Tab | Complete a path, or a `/command` at the start of the prompt |
 | Ctrl+G | Write the prompt in `$VISUAL` or `$EDITOR` (default `vi`), run by the shell as git runs it: quote a path with spaces |
 | Ctrl+X | Copy the last reply to the clipboard (same as `/copy`) |
