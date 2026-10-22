@@ -607,7 +607,9 @@ first: provider, session ID, model, age and the session's first prompt (from its
 oldest journal listed), then its latest prompt when that differs. `/resume N` reopens
 entry N, switching provider when it belongs to the other vendor, in a fresh
 view. The list comes from Octet's own journals (at most the first 64 KiB of
-each, skipping a torn last line); reconnects of one session show as one entry.
+each, skipping a torn last line, and the last 256 KiB for the latest prompt,
+which is left out when it is further back); reconnects of one session show as
+one entry.
 Reconnection does not load the earlier local transcript into the viewport yet.
 `/new` starts fresh vendor context without deleting previous journals.
 

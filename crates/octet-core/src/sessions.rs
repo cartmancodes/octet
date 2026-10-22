@@ -16,7 +16,8 @@ pub struct RecentSession {
     pub journal: PathBuf,
     /// What that journal says about it, except `first_prompt`, the oldest
     /// listed journal's of the same session (the session's own first), and
-    /// `last_prompt`, from an older one when the newest has none.
+    /// `last_prompt`, from an older one when no newer one had a prompt
+    /// (`None` when the latest is too far from its journal's end to read).
     pub summary: JournalSummary,
 }
 
@@ -61,6 +62,8 @@ pub async fn recent_sessions_in(
     total: usize,
 ) -> Vec<RecentSession> {
     let mut found: Vec<RecentSession> = Vec::new();
+    // For each found session, whether a journal read so far had a prompt.
+    let mut prompted: Vec<bool> = Vec::new();
     for journal in newest_journals(directory).await {
         let Some(summary) = read_summary(&journal).await else {
             continue;
@@ -74,18 +77,21 @@ pub async fn recent_sessions_in(
         // Reconnects write a journal per connection; the newest stands for
         // the session. Journals come newest first, so an older one's first
         // prompt is the session's, and its last one counts only while no
-        // newer journal had a prompt.
-        if let Some(known) = found.iter_mut().find(|s| {
+        // newer journal had a prompt (one may have, its latest unread).
+        let has_prompt = summary.first_prompt.is_some() || summary.last_prompt.is_some();
+        if let Some(index) = found.iter().position(|s| {
             s.engine == engine
                 && s.summary.session == summary.session
                 && s.summary.cwd == summary.cwd
         }) {
+            let known = &mut found[index].summary;
+            if !prompted[index] {
+                known.last_prompt = summary.last_prompt;
+            }
             if summary.first_prompt.is_some() {
-                known.summary.first_prompt = summary.first_prompt;
+                known.first_prompt = summary.first_prompt;
             }
-            if known.summary.last_prompt.is_none() {
-                known.summary.last_prompt = summary.last_prompt;
-            }
+            prompted[index] |= has_prompt;
             continue;
         }
         if found.len() == total {
@@ -98,6 +104,7 @@ pub async fn recent_sessions_in(
         if in_workspace == per_workspace {
             continue;
         }
+        prompted.push(has_prompt);
         found.push(RecentSession {
             engine,
             journal,
@@ -247,6 +254,32 @@ mod tests {
         assert!(found[0].journal.ends_with("session-3-1.jsonl"));
         assert_eq!(summary.first_prompt.as_deref(), Some("Reply with OK."));
         assert_eq!(summary.last_prompt.as_deref(), Some("fourth"));
+    }
+
+    #[tokio::test]
+    async fn an_older_journals_prompt_is_not_the_latest_of_a_newer_one_with_prompts() {
+        let temp = octet_testkit::TempDir::new("octet-core-sessions-unknown");
+        let dir = temp.path();
+        std::fs::create_dir_all(dir).unwrap();
+        journal(dir, 1, "claude", "/work", "c-1", Some("older"));
+        // The newest journal has prompts, but its latest is too far from its
+        // end to be read: it is not known, and the older one's is not it.
+        let header =
+            json!({"engine":"claude","cwd":"/work","resume":"c-1","model":null,"mode":"ask"});
+        let reply = "y".repeat(512 * 1024);
+        let records = [
+            ("session", header),
+            ("ready", json!("c-1")),
+            ("user", json!("newer")),
+            ("text", json!(reply)),
+            ("user", json!("newest")),
+            ("text", json!(reply)),
+        ];
+        octet_testkit::write_journal(dir, 2, &records, "");
+        let found = recent_sessions(dir, Path::new("/work"), 20).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].summary.first_prompt.as_deref(), Some("older"));
+        assert_eq!(found[0].summary.last_prompt, None);
     }
 
     #[tokio::test]

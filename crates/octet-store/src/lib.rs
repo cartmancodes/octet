@@ -122,6 +122,9 @@ impl Journal {
 }
 /// How much of a journal [`read_summary`] reads.
 const SUMMARY_BYTES: u64 = 64 * 1024;
+/// How much of a longer journal's end [`read_summary`] reads for its latest
+/// prompt.
+const TAIL_BYTES: u64 = 256 * 1024;
 /// When the journal at `path` was created, in nanoseconds since the Unix
 /// epoch, from its name (`session-<nanos>-<pid>[-<count>].jsonl`); `None`
 /// for any other name.
@@ -150,12 +153,14 @@ pub struct JournalSummary {
     pub session: String,
     /// The first prompt the user sent, if any.
     pub first_prompt: Option<String>,
-    /// The last prompt the user sent within the summary's window, if any.
+    /// The latest prompt the user sent, if any and if it is in the journal's
+    /// last 256 KiB.
     pub last_prompt: Option<String>,
 }
-/// Summarises the journal at `path` from at most its first 64 KiB. `None` if
-/// it is not a journal: a name other than `session-<nanos>-<pid>.jsonl`, or
-/// a first record that is not a session header.
+/// Summarises the journal at `path` from at most its first 64 KiB, and its
+/// latest prompt from at most its last 256 KiB. `None` if it is not a
+/// journal: a name other than `session-<nanos>-<pid>.jsonl`, or a first
+/// record that is not a session header.
 ///
 /// Reading stops at the first line that does not parse (a torn tail), or at
 /// 64 KiB. The session is the last one named in that window: Claude names a
@@ -163,10 +168,9 @@ pub struct JournalSummary {
 pub async fn read_summary(path: &Path) -> Option<JournalSummary> {
     use tokio::io::AsyncReadExt;
     let nanos = journal_stamp(path)?;
+    let mut file = File::open(path).await.ok()?;
     let mut bytes = Vec::new();
-    File::open(path)
-        .await
-        .ok()?
+    (&mut file)
         .take(SUMMARY_BYTES)
         .read_to_end(&mut bytes)
         .await
@@ -204,7 +208,48 @@ pub async fn read_summary(path: &Path) -> Option<JournalSummary> {
             _ => {}
         }
     }
+    // A longer journal's latest prompt is near its end, not in the window.
+    if let Ok(metadata) = file.metadata().await
+        && metadata.len() > bytes.len() as u64
+    {
+        let earlier = summary.last_prompt.take();
+        summary.last_prompt =
+            latest_prompt(&mut file, metadata.len(), complete as u64, earlier).await;
+    }
     Some(summary)
+}
+/// The latest user prompt in the journal `file`, `length` bytes long, whose
+/// summary window ended on a whole line at byte `read` with the prompt
+/// `earlier`. Only the last [`TAIL_BYTES`] are read: `None` if the latest
+/// is before them, since an earlier prompt is not the latest.
+async fn latest_prompt(
+    file: &mut File,
+    length: u64,
+    read: u64,
+    earlier: Option<String>,
+) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let start = length.saturating_sub(TAIL_BYTES).max(read);
+    file.seek(io::SeekFrom::Start(start)).await.ok()?;
+    let mut tail = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut tail).await.ok()?;
+    // Past the window's end the first line may be cut; a torn last line
+    // does not parse.
+    let covered = start == read;
+    let whole = if covered {
+        &tail[..]
+    } else {
+        let cut = tail.iter().position(|&b| b == b'\n')?;
+        &tail[cut + 1..]
+    };
+    let latest = whole
+        .split(|&b| b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter(|record| record["format"] == FORMAT && record["type"] == "user")
+        .filter_map(|record| record["data"].as_str().map(str::to_owned))
+        .last();
+    // With the window, the tail covers the journal: the window's is latest.
+    latest.or(if covered { earlier } else { None })
 }
 #[cfg(test)]
 mod tests {
@@ -287,6 +332,69 @@ mod tests {
             "",
         );
         assert_eq!(read_summary(&path).await.unwrap().session, "");
+    }
+    #[tokio::test]
+    async fn summary_reads_the_latest_prompt_from_a_long_journals_tail() {
+        let temp = octet_testkit::TempDir::new("octet-store-tail");
+        let reply = "y".repeat(100 * 1024);
+        let path = journal_file(
+            temp.path(),
+            1,
+            &[
+                header("claude"),
+                ("ready", serde_json::json!("c-1")),
+                ("user", serde_json::json!("first")),
+                ("text", serde_json::json!(reply)),
+                ("user", serde_json::json!("second")),
+                ("text", serde_json::json!(reply)),
+                ("user", serde_json::json!("third")),
+                ("text", serde_json::json!("done")),
+            ],
+            r#"{"format":"octet-preview-1","seq":8,"ty"#,
+        );
+        let summary = read_summary(&path).await.unwrap();
+        assert_eq!(summary.first_prompt.as_deref(), Some("first"));
+        assert_eq!(summary.last_prompt.as_deref(), Some("third"));
+    }
+    #[tokio::test]
+    async fn summary_keeps_the_windows_prompt_when_none_follows_it() {
+        let temp = octet_testkit::TempDir::new("octet-store-covered");
+        let reply = "y".repeat(100 * 1024);
+        let path = journal_file(
+            temp.path(),
+            1,
+            &[
+                header("claude"),
+                ("user", serde_json::json!("only")),
+                ("text", serde_json::json!(reply)),
+            ],
+            "",
+        );
+        let summary = read_summary(&path).await.unwrap();
+        assert_eq!(summary.last_prompt.as_deref(), Some("only"));
+    }
+    #[tokio::test]
+    async fn summary_has_no_latest_prompt_when_the_tail_holds_none() {
+        let temp = octet_testkit::TempDir::new("octet-store-no-tail");
+        // More than the tail reads after the latest prompt: it is not known,
+        // and an earlier one is not the latest.
+        let reply = "y".repeat(TAIL_BYTES as usize + 1024);
+        let path = journal_file(
+            temp.path(),
+            1,
+            &[
+                header("claude"),
+                ("ready", serde_json::json!("c-1")),
+                ("user", serde_json::json!("first")),
+                ("text", serde_json::json!(reply)),
+                ("user", serde_json::json!("second")),
+                ("text", serde_json::json!(reply)),
+            ],
+            "",
+        );
+        let summary = read_summary(&path).await.unwrap();
+        assert_eq!(summary.first_prompt.as_deref(), Some("first"));
+        assert_eq!(summary.last_prompt, None);
     }
     #[tokio::test]
     async fn summary_takes_the_last_named_session() {
