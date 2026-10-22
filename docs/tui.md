@@ -434,9 +434,10 @@ another provider), and Esc closes the picker. Without the picker, Tab after
 `/model ` completes from the current provider's names, and after
 `/model PROVIDER ` from that provider's. While a turn runs,
 Enter is refused with the usual hint and the picker stays open. A name typed
-in full (one a list holds, or `default`) is sent as typed and resolved like any
-`/model NAME`, so `default` stays the current provider's; so is a name that
-matches nothing. A partial name takes the highlighted line; to send a custom
+in full (one a list holds, what follows the `sub/` of a listed ID, or `default`)
+is sent as typed and resolved like any `/model NAME`, so `default` stays the
+current provider's and `gpt-5.5` goes to Codex by its `gpt-` prefix though the
+picker shows opencode's `openai/gpt-5.5`; so is a name that matches nothing. A partial name takes the highlighted line; to send a custom
 name that begins like a listed one, press Esc, then Enter.
 
 The current provider's list comes live from its CLI with each connection

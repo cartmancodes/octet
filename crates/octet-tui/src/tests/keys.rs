@@ -742,6 +742,50 @@ async fn an_unlisted_name_is_sent_as_typed() {
     );
     assert_eq!(selection.model.as_deref(), Some("gpt-5.5"));
 }
+#[tokio::test]
+async fn a_whole_name_after_a_sub_provider_goes_by_the_prefix_rule() {
+    // opencode lists openai/gpt-5.5, so the picker shows it for `gpt-5.5`;
+    // Enter must still resolve the name as typed, where Codex's `gpt-`
+    // prefix comes before the match after `openai/`.
+    let mut app = codex_picker_app();
+    let m = |s: &str| octet_core::ModelInfo {
+        selection: s.into(),
+        id: Some(s.into()),
+        name: s.into(),
+        description: String::new(),
+    };
+    app.models.catalogs.set(
+        octet_core::Engine::OPENCODE,
+        vec![m("openai/gpt-5.5"), m("opencode/glm-5.3-flash-free")],
+        std::time::SystemTime::now(),
+    );
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/model gpt-5.5").await;
+    assert!(
+        !picker(&app).items.is_empty(),
+        "the picker shows openai/gpt-5.5"
+    );
+    let Action::Exit(Exit::Model(selection)) =
+        key_action(&mut app, &vendor, key(KeyCode::Enter)).await
+    else {
+        panic!("expected a model switch");
+    };
+    assert_eq!(selection.provider, octet_core::Engine::CODEX);
+    assert_eq!(selection.model.as_deref(), Some("gpt-5.5"));
+    // A whole name no prefix claims still goes to the one ID ending in it.
+    app.composer.editor.set(String::new());
+    type_keys(&mut app, &vendor, "/model glm-5.3-flash-free").await;
+    let Action::Exit(Exit::Model(selection)) =
+        key_action(&mut app, &vendor, key(KeyCode::Enter)).await
+    else {
+        panic!("expected a model switch");
+    };
+    assert_eq!(selection.provider, octet_core::Engine::OPENCODE);
+    assert_eq!(
+        selection.model.as_deref(),
+        Some("opencode/glm-5.3-flash-free")
+    );
+}
 /// A Codex interface whose list has no `default`, beside Claude's that does.
 fn codex_picker_app() -> App {
     let mut app = crate::test_support::app_for(octet_core::Engine::CODEX);

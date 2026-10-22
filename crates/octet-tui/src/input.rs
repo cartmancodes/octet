@@ -296,8 +296,12 @@ fn send_or_queue(app: &mut App, vendor: &dyn Vendor, prompt: Prompt) -> bool {
     }
     true
 }
-/// The model picker is open on a draft that already names a model exactly:
-/// `default`, or a name or full ID some provider lists.
+/// The model picker is open on a draft that already names a model whole:
+/// `default`, a name or full ID some provider lists, or what follows the
+/// `sub/` of one (`gpt-5.5` for `openai/gpt-5.5`). Such a name is resolved
+/// as typed, so a provider's leading word (Codex's `gpt-`) comes before
+/// that `sub/` match, as `/model NAME` decides; the highlighted row would
+/// skip that.
 fn typed_a_model(app: &App) -> bool {
     if app
         .composer
@@ -314,11 +318,13 @@ fn typed_a_model(app: &App) -> bool {
     ) else {
         return false;
     };
+    let after_sub = |id: &str| id.rsplit_once('/').is_some_and(|(_, name)| name == query);
     query == "default"
-        || app
-            .model_entries()
-            .iter()
-            .any(|(_, m)| m.selection == query || m.id.as_deref() == Some(query))
+        || app.model_entries().iter().any(|(_, m)| {
+            m.selection == query
+                || m.id.as_deref() == Some(query)
+                || after_sub(m.id.as_deref().unwrap_or(&m.selection))
+        })
 }
 /// The command a picked model line sends: the explicit form, so the line's
 /// provider is the one used.

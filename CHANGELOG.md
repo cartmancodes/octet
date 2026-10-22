@@ -346,6 +346,9 @@ Claude Code and Codex CLIs.
   /mode ask to turn them on"). Every switch to another provider notes the
   mode it starts in, and says when that is not the mode you last chose (a
   provider that refused `auto` no longer drops it silently for the rest).
+- `/model gpt-5.5` + Enter switched to opencode's `openai/gpt-5.5`: the
+  picker's highlighted row won over the name rules. A whole name after a
+  `sub/` is now resolved as typed, so Codex's `gpt-` prefix comes first.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.
