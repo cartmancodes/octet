@@ -1276,6 +1276,34 @@ async fn codex_compact_runs_as_a_turn() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn codex_compaction_that_fails_to_start_is_not_compacted() {
+    let mut c = config();
+    c.model = Some(scenario::REFUSE_COMPACT.into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(Command::Compact).unwrap();
+    let mut notices = Vec::new();
+    let mut errors = Vec::new();
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Notice(n) => notices.push(n),
+            Event::Error(e) => errors.push(e),
+            Event::Finished { outcome } => break outcome,
+            _ => {}
+        }
+    };
+    assert_eq!(outcome, Outcome::Failed, "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("compaction refused")),
+        "{errors:?}"
+    );
+    assert!(
+        !notices.iter().any(|n| n.contains("compacted")),
+        "{notices:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn claude_fork_passes_fork_session() {
     let mut c = claude();
     c.resume = Some("claude-fixture".into());

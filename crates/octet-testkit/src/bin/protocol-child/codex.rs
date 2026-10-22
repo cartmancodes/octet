@@ -123,6 +123,10 @@ impl CodexFixture {
 
     /// Codex runs compaction as a turn on the thread.
     fn compact(&mut self, v: &Value) {
+        if self.thread_params["model"] == scenario::REFUSE_COMPACT {
+            emit(&json!({"id":v["id"],"error":{"code":-32600,"message":"compaction refused"}}));
+            return;
+        }
         self.next_turn();
         let active = &self.active;
         emit(&json!({"id":v["id"],"result":{}}));

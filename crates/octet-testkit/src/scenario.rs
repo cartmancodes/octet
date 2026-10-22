@@ -92,6 +92,8 @@ pub const SLOW_START_HOOK: &str = "slow-start-hook";
 
 /// Codex `--model`: refuse to open the thread.
 pub const REFUSE_THREAD: &str = "refuse-thread";
+/// Codex `--model`: refuse to start a compaction.
+pub const REFUSE_COMPACT: &str = "refuse-compact";
 /// Codex `--model`: report a stricter policy than asked for.
 pub const REPORT_STRICTER: &str = "report-stricter";
 
