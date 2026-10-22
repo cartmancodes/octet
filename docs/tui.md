@@ -717,7 +717,10 @@ Under 30 rows the banner gives way to a one-row header with the same facts:
 `◆ Octet · mode · engine / model  workspace   ● status · usage`.
 
 Status and usage stay at the right edge, sized to their text so a narrow
-terminal never cuts them. Below the banner, the conversation
+terminal never cuts them. The usage is what the provider reports: Claude's
+session cost; for Codex, the context the last request used, of the model's
+window (`14.3k/272k context`), which drops after `/compact`; for opencode,
+its token count. Below the banner, the conversation
 area stays empty until the first message; the composer's placeholder says
 what to type.
 

@@ -335,6 +335,10 @@ Claude Code and Codex CLIs.
   paragraph too, and a denied approval's note starts its own line.
 - `/compact` on Codex finished without a word; a completed compaction now
   notes "Context compacted" (every provider).
+- Codex's header figure was a running total of every turn's tokens (14k
+  for a one-word reply, ~1M after 70 turns, never dropping after
+  `/compact`). It now shows the context in use of the model's window, such
+  as `14.3k/272k context`.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

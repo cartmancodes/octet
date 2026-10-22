@@ -250,11 +250,7 @@ impl Protocol for CodexProtocol {
             }
         }
         if method == "thread/tokenUsage/updated" {
-            let total = v
-                .pointer("/params/tokenUsage/total/totalTokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            core.emit(Event::Usage(format!("{total} tokens")))?;
+            core.emit(Event::Usage(codex_usage(&v["params"]["tokenUsage"])))?;
         }
         if !core.phase.is_running() {
             return Ok(());
@@ -688,6 +684,42 @@ fn skills(data: &Value) -> Vec<SkillInfo> {
         .collect()
 }
 
+/// What the header shows for Codex's `tokenUsage`: the context the last
+/// request used (`last`), of the model's window when Codex names it. The
+/// running `total` counts every turn's re-read input again, so it grows
+/// fast and never drops after compaction; it shows, named as a total, only
+/// from a CLI that reports nothing else.
+fn codex_usage(usage: &Value) -> String {
+    let count = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64);
+    match (count("/last/totalTokens"), count("/modelContextWindow")) {
+        (Some(used), Some(window)) => {
+            format!("{}/{} context", short_count(used), short_count(window))
+        }
+        (Some(used), None) => format!("{} context", short_count(used)),
+        (None, _) => {
+            let total = count("/total/totalTokens").unwrap_or(0);
+            format!("{} tokens in all", short_count(total))
+        }
+    }
+}
+
+/// `n` in a few characters: `950`, `14.3k`, `272k`, `1.3M`.
+fn short_count(n: u64) -> String {
+    /// `tenths` as a whole number, or with one decimal when it has one.
+    fn tenths(tenths: u64, unit: &str) -> String {
+        match tenths % 10 {
+            0 => format!("{}{unit}", tenths / 10),
+            digit => format!("{}.{digit}{unit}", tenths / 10),
+        }
+    }
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..99_950 => tenths((n + 50) / 100, "k"),
+        99_950..999_500 => format!("{}k", (n + 500) / 1_000),
+        _ => tenths((n + 50_000) / 100_000, "M"),
+    }
+}
+
 /// Each catalog entry's model and its default reasoning effort, bounded.
 fn default_efforts(value: &Value) -> impl Iterator<Item = (String, String)> + '_ {
     value
@@ -900,6 +932,35 @@ pub(crate) fn codex_turn_overrides(mode: Mode) -> Value {
 mod tests {
     use super::*;
     use crate::live::Engine;
+    #[test]
+    fn usage_is_the_context_in_use_not_the_running_total() {
+        let usage = |v: Value| codex_usage(&v);
+        let window = json!({"total":{"totalTokens":954_802},"last":{"totalTokens":14_266},
+            "modelContextWindow":272_000});
+        assert_eq!(usage(window), "14.3k/272k context");
+        let no_window = json!({"total":{"totalTokens":954_802},"last":{"totalTokens":950}});
+        assert_eq!(usage(no_window), "950 context");
+        // An older CLI with only the running total: named as one.
+        let total = json!({"total":{"totalTokens":1_250_000}});
+        assert_eq!(usage(total), "1.3M tokens in all");
+        assert_eq!(usage(json!({})), "0 tokens in all");
+    }
+    #[test]
+    fn token_counts_read_short() {
+        let cases = [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1k"),
+            (14_266, "14.3k"),
+            (99_960, "100k"),
+            (272_000, "272k"),
+            (1_000_000, "1M"),
+            (1_250_000, "1.3M"),
+        ];
+        for (n, shown) in cases {
+            assert_eq!(short_count(n), shown, "{n}");
+        }
+    }
     #[test]
     fn plugin_switches_reach_the_app_server() {
         let mut c = Config::new(Engine::CODEX, "codex", ".");
