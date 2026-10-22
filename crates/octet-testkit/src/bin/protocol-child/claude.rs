@@ -70,6 +70,25 @@ impl ClaudeFixture {
             eprintln!("No conversation found with session ID: fixture");
             process::exit(1);
         }
+        if self.launched_with(scenario::START_HOOK) {
+            // Claude runs SessionStart hooks before it answers, and their
+            // frames already carry the new session's ID.
+            for subtype in ["hook_started", "hook_response"] {
+                emit(&json!({
+                    "type": "system",
+                    "subtype": subtype,
+                    "hook_name": "SessionStart:startup",
+                    "hook_event": "SessionStart",
+                    "outcome": "success",
+                    "exit_code": 0,
+                    "output": "",
+                    "session_id": self.sid,
+                }));
+            }
+            // The reply comes a moment later: a prompt sent on the hook's
+            // ID arrives before it.
+            thread::sleep(Duration::from_millis(300));
+        }
         let requested = self
             .argv
             .iter()

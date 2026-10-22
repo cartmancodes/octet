@@ -78,6 +78,9 @@ pub const ODD_MODE: &str = "odd-mode";
 pub const LATE_MODE: &str = "late-mode";
 /// Claude launch argument: refuse every switch.
 pub const REJECT_MODE: &str = "reject-mode";
+/// Claude launch argument: run a `SessionStart` hook before the handshake's
+/// reply, whose frames name the session, as Claude does with a plugin's hook.
+pub const START_HOOK: &str = "start-hook";
 
 /// Codex `--model`: refuse to open the thread.
 pub const REFUSE_THREAD: &str = "refuse-thread";

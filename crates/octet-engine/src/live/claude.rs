@@ -315,8 +315,13 @@ impl Protocol for ClaudeProtocol {
         if kind == "control_response" && self.control_response(core, &v)? {
             return Ok(());
         }
+        // A SessionStart hook's frames name a new session before the
+        // handshake's reply, but Claude saves it only with its first turn,
+        // whose frames name it again: an ID taken earlier could not be
+        // resumed, and a ready sent then would come before the session is.
         if let Some(id) = v["session_id"].as_str()
             && core.session != id
+            && core.phase.is_ready()
         {
             // The ID goes into the journal and later `--resume` arguments.
             if valid_identifier(id) {
@@ -525,8 +530,8 @@ impl ClaudeProtocol {
             if !core.phase.is_ready() {
                 core.phase = Phase::Idle;
             }
-            // A fork is a new session that Claude names with its first turn;
-            // until then there is none to resume.
+            // A new session or a fork is saved, and named, with its first
+            // turn; until then there is none to resume.
             let session = if core.config.fork {
                 String::new()
             } else {

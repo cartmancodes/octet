@@ -59,6 +59,21 @@ fn print_writes_the_reply_and_exits_zero() {
 }
 
 #[test]
+fn print_runs_on_a_claude_session_a_start_hook_named() {
+    // A plugin's SessionStart hook names the session before Claude is ready.
+    let start_hook = octet_testkit::scenario::START_HOOK;
+    let args = [
+        "--engine", "claude", "--model", start_hook, "--print", "hello",
+    ];
+    let (code, stdout, stderr) = run(&args, "");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        format!("{}\n", octet_testkit::scenario::CLAUDE_REPLY)
+    );
+}
+
+#[test]
 fn print_reads_the_prompt_from_stdin() {
     let (code, stdout, stderr) = run(&["-p", "-"], "params\n");
     assert_eq!(code, 0, "{stderr}");
