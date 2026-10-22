@@ -299,6 +299,7 @@ pub(crate) fn steer_with(
 pub(crate) fn switch_mode(app: &mut App, vendor: &dyn Vendor, target: Mode) {
     match vendor.send(Command::SetMode(target)) {
         Ok(()) => {
+            app.mode_chosen = target;
             app.conn.mode_pending = Some(target);
             app.conn.mode_sent_mid_turn = Some(app.conn.is_running());
         }

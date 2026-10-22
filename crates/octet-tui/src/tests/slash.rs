@@ -336,6 +336,17 @@ async fn full_access_requires_idle_ready_session() {
     ));
 }
 #[tokio::test]
+async fn a_live_mode_switch_is_remembered_as_the_users_choice() {
+    let mut app = app();
+    crate::test_support::idle(&mut app);
+    command(&mut app, "/mode auto").await;
+    assert_eq!(app.mode_chosen, octet_core::Mode::Auto);
+    // A vendor that refuses it reports another mode; the choice stays.
+    app.event(octet_core::Event::ModeChanged(octet_core::Mode::Ask));
+    assert_eq!(app.conn.mode, octet_core::Mode::Ask);
+    assert_eq!(app.mode_chosen, octet_core::Mode::Auto);
+}
+#[tokio::test]
 async fn cycle_is_ignored_while_a_switch_is_pending() {
     let mut app = app();
     app.conn.mode_pending = Some(octet_core::Mode::AcceptEdits);

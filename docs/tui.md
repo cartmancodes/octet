@@ -319,8 +319,14 @@ latest output.
 
 `--mode MODE` at launch, `/mode MODE` at runtime, Shift+Tab to cycle. The default
 is `ask`; the mode is not remembered between launches but is kept across
-`/model`, `/new` and `/reconnect`. `/mode` alone shows the table for the current
-provider. The header shows the selected mode; during a Codex or opencode turn
+`/model`, `/new` and `/reconnect`. It is the mode the last provider confirmed, so
+one that refused your choice (Claude's `auto` on Haiku) passes its own on. A
+switch to another provider (`/model`, or `/resume` of another provider's
+session) notes the mode it starts in, and when that is not the one you last
+chose, says so ("opencode starts in ask, not auto as you last chose"). Full
+access carried to another provider is a warning: "Full access carried to
+Claude: no permission checks. /mode ask to turn them on". `/mode` alone shows
+the table for the current provider. The header shows the selected mode; during a Codex or opencode turn
 it also shows the running mode when a change is waiting for the next turn.
 
 | Mode | Claude | Codex (sandbox · approval · reviewer) | opencode (agent) |

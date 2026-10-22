@@ -341,6 +341,11 @@ Claude Code and Codex CLIs.
   as `14.3k/272k context`.
 - `/model refresh` said only "Fetching…"; it now notes each list as it
   comes in or fails.
+- Full access carried to another provider without a word; that switch now
+  shows a warning ("Full access carried to Claude: no permission checks.
+  /mode ask to turn them on"). Every switch to another provider notes the
+  mode it starts in, and says when that is not the mode you last chose (a
+  provider that refused `auto` no longer drops it silently for the rest).
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

@@ -534,6 +534,20 @@ fn mascot_tracks_activity_and_keeps_errors_visible_after_disconnect() {
     }
 }
 #[test]
+fn a_warning_is_labelled_and_on_the_status_line() {
+    let c = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp/project");
+    let mut app = App::new(&c, "journal".into());
+    app.warn("Full access carried to Claude: no permission checks.");
+    let rows = screen(100, 30, &mut app);
+    let text = rows.join("\n");
+    assert!(text.contains("WARNING"), "{text}");
+    assert!(text.contains("Full access carried to Claude"), "{text}");
+    assert_eq!(
+        app.status_line,
+        "Full access carried to Claude: no permission checks."
+    );
+}
+#[test]
 fn renders_narrow_wide_and_approval_without_panics() {
     for (w, h) in [(30, 8), (40, 12), (80, 24), (120, 36)] {
         let c = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp/project");

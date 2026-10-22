@@ -33,6 +33,8 @@ pub(crate) enum Role {
     Assistant,
     Tool,
     Notice,
+    /// A notice the user must not miss, shown like an error.
+    Warning,
     Error,
     Shell,
     ShellFailed,
@@ -387,6 +389,10 @@ pub(crate) struct App {
     pub(crate) sidebar: bool,
     /// The terminal's width at the last frame, for F2 to say when the sidebar can show.
     pub(crate) last_width: u16,
+    /// The permission mode the user last chose (at launch, Shift+Tab or
+    /// `/mode`), which a vendor may have refused: a switch to another
+    /// provider says when that one starts in another.
+    pub(crate) mode_chosen: octet_core::Mode,
 }
 /// A skill to run on a provider the interface is switching to.
 #[derive(Debug, Clone)]
@@ -453,6 +459,7 @@ impl App {
             remote_off: None,
             sidebar: true,
             last_width: 0,
+            mode_chosen: config.mode,
         }
     }
     pub(crate) fn connection(&mut self, config: &octet_core::Config, journal: PathBuf) {
@@ -861,6 +868,13 @@ impl App {
     #[cfg(test)]
     pub(crate) fn last_role(&self) -> Option<Role> {
         self.chat.entries.back().map(|entry| entry.role)
+    }
+    /// Something the user must not miss, such as permission checks being
+    /// off: a transcript warning and the status line.
+    pub(crate) fn warn(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.status(StatusKind::Plain, &text);
+        self.add(Role::Warning, &text);
     }
     /// Information, as a transcript note and on the status line.
     pub(crate) fn note(&mut self, text: impl Into<String>) {
