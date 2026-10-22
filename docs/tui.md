@@ -419,7 +419,10 @@ the one listing it after a `sub/` part (`glm-5.3-flash-free` to opencode's
 `opencode/glm-5.3-flash-free`), else stays with the current provider as a
 custom ID. `default` is always the current
 provider's, and the explicit forms (`/model codex X`, `claude/X`) work as
-before.
+before. A model the provider refuses when the session connects (a typo, or
+one opencode does not list) stops the session with an error naming the model
+and the provider's reason, as `--model` does in `--print` and `--rpc` (exit
+1): Octet never runs your prompts on the provider's default instead.
 
 `/model` alone, or typing `/model ` (with the space), opens the model picker
 above the prompt box: every provider's models, the current provider's first,

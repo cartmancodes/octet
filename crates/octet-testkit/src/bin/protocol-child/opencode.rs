@@ -233,6 +233,14 @@ impl OpencodeFixture {
             gate(option);
         }
         match v["params"]["configId"].as_str() {
+            Some("model") if value == scenario::OPENCODE_UNKNOWN_MODEL => {
+                emit(&acp_error(
+                    &v["id"],
+                    -32602,
+                    "Invalid params: model not found",
+                ));
+                return;
+            }
             Some("model") => {
                 value.clone_into(&mut self.model);
                 // A model's effort starts at its default, as in opencode.

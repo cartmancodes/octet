@@ -825,24 +825,25 @@ impl OpencodeProtocol {
             .await
     }
 
-    /// The model's reply. A refusal is reported and the session keeps
-    /// opencode's model; either way the effort and the agent are set next.
-    /// A new model may start at another level, so its levels are what its
-    /// reply reports.
+    /// The model's reply; the effort and the agent are set next. A refusal
+    /// stops the session: going on would run the user's prompts on
+    /// opencode's own default, a model (and perhaps a bill) they never
+    /// chose. A new model may start at another level, so its levels are
+    /// what its reply reports.
     async fn model_set(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
         let requested = core.config.model.clone().unwrap_or_default();
         if let Some(error) = v.get("error") {
-            core.emit(Event::Notice(format!(
-                "opencode did not switch to model {}: {}",
+            return Err(format!(
+                "opencode refused the model {}: {}",
                 short(&requested),
                 error_text(error)
-            )))?;
-        } else {
-            // A reply without the options still confirms the request.
-            self.model = Some(requested).filter(|model| valid_identifier(model));
-            self.effort = Efforts::Unknown;
-            self.note_options(&v["result"]["configOptions"]);
+            )
+            .into());
         }
+        // A reply without the options still confirms the request.
+        self.model = Some(requested).filter(|model| valid_identifier(model));
+        self.effort = Efforts::Unknown;
+        self.note_options(&v["result"]["configOptions"]);
         self.effort_step(core).await
     }
 

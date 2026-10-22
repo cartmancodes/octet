@@ -108,6 +108,23 @@ fn print_failed_turn_exits_one() {
 }
 
 #[test]
+fn print_exits_one_when_opencode_refuses_the_model() {
+    let model = octet_testkit::scenario::OPENCODE_UNKNOWN_MODEL;
+    let (code, stdout, stderr) = run(
+        &["--engine", "opencode", "--model", model, "--print", "hello"],
+        "",
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stdout, "", "the prompt ran");
+    assert!(
+        stderr.contains(&format!(
+            "opencode refused the model {model}: Invalid params: model not found"
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn print_and_rpc_cannot_be_combined() {
     let (code, _, stderr) = run(&["--print", "hello", "--rpc"], "");
     assert_eq!(code, 2, "a usage error");

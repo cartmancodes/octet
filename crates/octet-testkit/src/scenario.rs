@@ -99,6 +99,9 @@ pub const OPENCODE_REJECT_MODE: &str = "reject-mode";
 /// working directory, then waits for `release-<option>` there before its
 /// reply, so a test can act while the request is in flight.
 pub const OPENCODE_GATED: &str = "gated-options";
+/// opencode model value: refused, as opencode 1.18.25 refuses a model it
+/// does not list ("Invalid params: model not found").
+pub const OPENCODE_UNKNOWN_MODEL: &str = "opencode/unknown-model";
 /// opencode: hold the turn while another session asks for a permission;
 /// the answer is echoed and ends the turn.
 pub const OPENCODE_OTHER_PERMISSION: &str = "other-permission";

@@ -2388,6 +2388,31 @@ async fn opencode_requested_model_is_set_and_confirmed() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn an_opencode_model_refused_at_connect_stops_the_session() {
+    // Running on opencode's own default instead would be a model, and
+    // perhaps a bill, the user never chose.
+    let mut c = opencode();
+    c.model = Some(scenario::OPENCODE_UNKNOWN_MODEL.into());
+    let (_handle, mut events, task) = spawn(c);
+    loop {
+        match next(&mut events).await {
+            Event::Ready { session } => panic!("the session opened: {session}"),
+            Event::Error(error) => {
+                assert_eq!(
+                    error,
+                    format!(
+                        "opencode refused the model {}: Invalid params: model not found",
+                        scenario::OPENCODE_UNKNOWN_MODEL
+                    )
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    ended(task).await;
+}
+#[tokio::test]
 async fn opencode_resume_ignores_the_replayed_history() {
     let mut c = opencode();
     c.resume = Some("ses-old".into());
