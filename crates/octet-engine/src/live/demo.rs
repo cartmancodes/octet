@@ -191,7 +191,7 @@ impl DemoTurn<'_> {
                 format!("\n\nA model would receive:\n\n{text}")
             };
             format!(
-                "This is an offline demo. Your prompt was:\n\n{display}{sent}\n\nThe editor, streaming transcript, approval dialog, history, and cancellation are live. Start with --engine codex or --engine claude to work with a model.\n\nTry /approval-demo to preview a permission request."
+                "This is an offline demo. Your prompt was:\n\n{display}{sent}\n\nThe editor, streaming transcript, approval dialog, history, and cancellation are live. Start with --engine codex, --engine claude or --engine opencode to work with a model.\n\nTry /approval-demo to preview a permission request."
             )
         } else if !matches!(*self.mode, Mode::Ask | Mode::AcceptEdits) {
             emit(

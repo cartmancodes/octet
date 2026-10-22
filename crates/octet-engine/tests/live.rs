@@ -1485,6 +1485,19 @@ async fn a_prompt_cancelled_before_it_starts_is_not_run() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn the_demo_names_every_provider_to_start_with() {
+    let mut c = config();
+    c.engine = Engine::DEMO;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let text = turn_text(&mut events).await;
+    for engine in ["--engine codex", "--engine claude", "--engine opencode"] {
+        assert!(text.contains(engine), "{text}");
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn the_demo_also_cancels_a_prompt_that_had_not_started() {
     let mut c = config();
     c.engine = Engine::DEMO;

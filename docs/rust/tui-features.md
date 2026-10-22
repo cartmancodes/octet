@@ -1,8 +1,8 @@
 # Octet TUI features
 
 This document describes the **Rust terminal UI preview**. It is a native terminal
-application for Linux and macOS that runs the installed `codex` or `claude` CLI as
-a child process. It does not need a browser, localhost server, or Python runtime.
+application for Linux and macOS that runs the installed `codex`, `claude` or
+`opencode` CLI as a child process. It does not need a browser, localhost server, or Python runtime.
 The vendor CLIs handle their own login. The [usage guide](../tui.md) has the full
 key reference and installation details; the [parity matrix](parity-matrix.md)
 tracks the work remaining for parity with the earlier Python harness, which was
@@ -12,7 +12,7 @@ removed from the repository on 2026-10-04.
 
 | Feature | Current behavior |
 | --- | --- |
-| Provider sessions | Start a multi-turn conversation with Codex or Claude. Responses stream into the transcript alongside tool activity, usage, and errors. An offline `demo` engine exercises the interface without a vendor login, and shows the full text a model would receive when `!` attachments or a goal change it. |
+| Provider sessions | Start a multi-turn conversation with Codex, Claude or opencode. Responses stream into the transcript alongside tool activity, usage, and errors. An offline `demo` engine exercises the interface without a vendor login, and shows the full text a model would receive when `!` attachments or a goal change it. |
 | Model discovery | `/model` lists **every provider's** models in one list, the current provider's first, with names, full model IDs, descriptions, freshness and selection commands. The current list is live (Codex pages through `model/list`; Claude uses its initialization catalog); others come from `models.json`, fetched in the background when missing or a day old by starting that CLI catalog-only (no session, no tokens). `/model refresh` fetches them now; `/model list N` opens another page. |
 | Plugins and skills | Claude loads the plugins its settings enable (`enabledPlugins` from user, project and local settings, nothing else); Codex loads its own. `--no-plugins` and `--no-plugin-hooks` turn plugins, or only their hooks, off on both. Hooks are journaled; failed, blocking or approval-deciding ones show. `/skills` lists every provider's skills (live for the current one, `skills.json` per workspace for others); Enter puts one in the prompt and nothing runs until you send it (another provider's skill switches provider on send, with an amber hint); `/NAME args` runs the current provider's. |
 | Model selection | Start with `--model ID`, or use `/model ID`, `/model codex ID`, or `/model claude ID`. A bare `/model ID` goes to the provider whose list holds it, else by the leading word its listed IDs share, else the current provider; Tab completes model names across providers; `/model` alone opens a picker (Up/Down, Enter switches). `/model default` selects the current provider's default. `/session` shows the requested selection, catalog ID, and confirmed session model ID separately. Custom IDs may be entered even when absent from the catalog. |
@@ -53,8 +53,8 @@ make rust-build
 ./target/release/octet --engine claude --cwd /path/to/project
 ```
 
-Codex and Claude modes require the corresponding vendor CLI installed and signed
-in. The engine defaults to Codex and the workspace defaults to the current
+Codex, Claude and opencode modes require the corresponding vendor CLI installed
+and signed in. The engine defaults to Codex and the workspace defaults to the current
 directory. `--binary PATH` selects a custom vendor executable, and
 `--journal-dir PATH` changes where preview journals are written.
 

@@ -360,6 +360,8 @@ Claude Code and Codex CLIs.
 - `/sessions` labelled a reconnected session with the first prompt of its
   newest journal, neither its first nor its latest. It now shows the
   session's first prompt, and its latest when that differs.
+- The offline demo's reply named only `--engine codex` and `--engine
+  claude`; it names `--engine opencode` too.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.
