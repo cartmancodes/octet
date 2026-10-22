@@ -1281,6 +1281,74 @@ async fn claude_fork_names_the_new_session_only_after_the_first_prompt() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn claude_named_by_a_start_hook_is_ready_once_and_resumable_after_its_first_turn() {
+    let mut c = claude();
+    c.model = Some(scenario::START_HOOK.into());
+    let (handle, mut events, task) = spawn(c);
+    // A SessionStart hook names the session before the handshake's reply,
+    // but Claude saves the session only with its first turn: until then
+    // there is none to resume, so the session is ready once, with no ID.
+    let mut readies = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Ready { session } => readies.push(session),
+            Event::ModeChanged(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(readies, [""]);
+    // The first turn names it again, and now it is kept.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Ready { session } if session == "claude-fixture"),
+    )
+    .await;
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn claude_takes_a_prompt_sent_at_ready_after_a_start_hook() {
+    let mut c = claude();
+    c.model = Some(scenario::START_HOOK.into());
+    let (handle, mut events, task) = spawn(c);
+    // Headless runs send their prompt on the first ready.
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let event = wait_for(&mut events, |e| {
+        matches!(e, Event::Finished { .. } | Event::Notice(_))
+    })
+    .await;
+    assert!(
+        matches!(
+            event,
+            Event::Finished {
+                outcome: Outcome::Completed
+            }
+        ),
+        "{event:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn claude_local_command_keeps_the_session_model() {
+    let (handle, mut events, task) = spawn(claude());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::SYNTHETIC.into()))
+        .unwrap();
+    let mut models = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::ModelSelected(model) => models.push(model),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    // `<synthetic>` marks a reply no model wrote; it names no model.
+    assert_eq!(models, ["claude-fixture-full-id"]);
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn codex_rejected_steer_is_reported_with_its_text() {
     let (handle, mut events, task) = spawn(config());
     wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;

@@ -398,7 +398,9 @@ journal is retained; the new connection writes a new journal.
 The header and sidebar show the provider-reported name and full ID where space
 permits. `/session` and `/model` print complete, scrollable details: requested
 selection, catalog ID, confirmed session model ID, name and description. An alias
-or default is marked unconfirmed until the runtime reports the active model.
+or default is marked unconfirmed until the runtime reports the active model. A
+resumed session asked for no model runs on its own, which Claude names only with
+the first turn: until then the header says "the resumed session's model".
 Names unavailable in the catalog are explicitly marked as not reported.
 
 `/model` lists every provider's models in one list, the current provider's

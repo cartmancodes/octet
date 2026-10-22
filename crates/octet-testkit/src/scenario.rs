@@ -59,6 +59,8 @@ pub const DELTA_FLOOD: &str = "delta-flood";
 pub const SUBAGENT: &str = "subagent";
 /// Claude: a result whose session ID holds an escape sequence.
 pub const ODD_SESSION: &str = "odd-session";
+/// Claude: a local command's reply, whose model is the placeholder `<synthetic>`.
+pub const SYNTHETIC: &str = "synthetic";
 /// Codex: a huge unknown server request, then a huge unknown turn status.
 pub const ODD_STRINGS: &str = "odd-strings";
 /// Codex: hold the turn and acknowledge interrupts without ending it.
@@ -78,6 +80,9 @@ pub const ODD_MODE: &str = "odd-mode";
 pub const LATE_MODE: &str = "late-mode";
 /// Claude launch argument: refuse every switch.
 pub const REJECT_MODE: &str = "reject-mode";
+/// Claude launch argument: run a `SessionStart` hook before the handshake's
+/// reply, whose frames name the session, as Claude does with a plugin's hook.
+pub const START_HOOK: &str = "start-hook";
 
 /// Codex `--model`: refuse to open the thread.
 pub const REFUSE_THREAD: &str = "refuse-thread";
