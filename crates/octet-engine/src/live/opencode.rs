@@ -448,7 +448,14 @@ impl Protocol for OpencodeProtocol {
             return self.response(core, &v).await;
         }
         if v.get("id").is_some() {
-            return server_request(core, v).await;
+            // What the request's tool call named earlier this turn.
+            let known = v
+                .pointer("/params/toolCall/toolCallId")
+                .and_then(Value::as_str)
+                .and_then(|id| self.tools.get(&one_line(id)))
+                .map(|(_, target)| target.clone())
+                .filter(|target| !target.is_empty());
+            return server_request(core, v, known.as_deref()).await;
         }
         let this_session = !core.session.is_empty()
             && v.pointer("/params/sessionId").and_then(Value::as_str)
@@ -1133,12 +1140,12 @@ enum Refusal {
 /// one while the turn is being cancelled, or no turn's) gets the stray
 /// reply, with a notice, except a client capability's, which is refused
 /// quietly.
-async fn server_request(core: &mut Core, v: Value) -> Result<(), DriverError> {
+async fn server_request(core: &mut Core, v: Value, known: Option<&str>) -> Result<(), DriverError> {
     let method = v["method"].as_str().unwrap_or_default();
     let this_session = !core.session.is_empty()
         && v.pointer("/params/sessionId").and_then(Value::as_str) == Some(core.session.as_str());
     if method == "session/request_permission" && this_session && core.phase == Phase::InTurn {
-        let (detail, summary) = approval(&v["params"]["toolCall"]);
+        let (detail, summary) = approval(&v["params"]["toolCall"], known);
         return core.queue_approval(v, detail, summary).await;
     }
     if let Some(reply) = opencode_stray_reply(&v) {
@@ -1172,8 +1179,10 @@ fn client_capability(method: &str) -> bool {
 }
 
 /// What a permission request's `toolCall` would do: the dialog's detail
-/// (`kind · title`, then its `rawInput` in full) and its summary.
-fn approval(tool_call: &Value) -> (String, ApprovalSummary) {
+/// (`kind · title`, then its `rawInput` in full) and its summary. `known` is
+/// the target its tool call named earlier: opencode 1.18.25 asks to read a
+/// file without naming it.
+fn approval(tool_call: &Value, known: Option<&str>) -> (String, ApprovalSummary) {
     let kind = tool_call["kind"].as_str().unwrap_or("other");
     let title = tool_call["title"].as_str().unwrap_or("tool");
     let mut detail = format!("{kind} · {title}");
@@ -1182,24 +1191,75 @@ fn approval(tool_call: &Value) -> (String, ApprovalSummary) {
         detail.push('\n');
         detail.push_str(&serde_json::to_string_pretty(input).unwrap_or_default());
     }
+    let locations: Vec<String> = tool_call["locations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|location| location["path"].as_str())
+        .map(str::to_owned)
+        .collect();
+    let command = input["command"].as_str().map(str::to_owned);
     let summary = match kind {
         "execute" => ApprovalSummary {
             command: Some(title.to_owned()),
             ..ApprovalSummary::new("Run a shell command")
         },
         "edit" => ApprovalSummary {
-            files: tool_call["locations"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|location| location["path"].as_str())
-                .map(str::to_owned)
-                .collect(),
+            files: locations,
             ..ApprovalSummary::new("Edit files")
         },
+        "read" => {
+            let files = if locations.is_empty() {
+                known.map(str::to_owned).into_iter().collect()
+            } else {
+                locations
+            };
+            let action = match files.as_slice() {
+                [] => "Read a file opencode did not name".to_owned(),
+                [file] => format!("Read {}", file_name(file)),
+                many => format!("Read {} files", many.len()),
+            };
+            ApprovalSummary {
+                files,
+                ..ApprovalSummary::new(action)
+            }
+        }
+        "fetch" => {
+            let address = input["url"].as_str().unwrap_or(title);
+            ApprovalSummary::new(format!("Fetch {}", one_line(address)))
+        }
+        // opencode's `external_directory` permission: a path outside the
+        // workspace, for a read or edit, or for a command.
+        "other"
+            if ["filepath", "parentDir", "directories"]
+                .iter()
+                .any(|key| !input[key].is_null()) =>
+        {
+            let path = input["filepath"]
+                .as_str()
+                .or_else(|| input.pointer("/directories/0").and_then(Value::as_str))
+                .or_else(|| input["parentDir"].as_str())
+                .or(known)
+                .unwrap_or(title);
+            ApprovalSummary {
+                command,
+                files: locations,
+                ..ApprovalSummary::new(format!("Reach {}, outside the workspace", one_line(path)))
+            }
+        }
         _ => ApprovalSummary::new("Use a tool"),
     };
     (detail, summary)
+}
+
+/// The last part of `path` in one short line, or the path itself when it
+/// has none.
+fn file_name(path: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    one_line(name)
 }
 
 /// The reply to a `session/request_permission`: the request's own
@@ -1774,10 +1834,13 @@ mod tests {
 
     #[test]
     fn an_approval_shows_the_tool_call_and_what_it_would_do() {
-        let (detail, summary) = approval(&json!({
-            "kind": "execute", "title": "rm -rf build",
-            "rawInput": {"command": "rm -rf build"}, "locations": [],
-        }));
+        let (detail, summary) = approval(
+            &json!({
+                "kind": "execute", "title": "rm -rf build",
+                "rawInput": {"command": "rm -rf build"}, "locations": [],
+            }),
+            None,
+        );
         assert_eq!(
             detail,
             "execute · rm -rf build\n{\n  \"command\": \"rm -rf build\"\n}"
@@ -1786,24 +1849,75 @@ mod tests {
         assert_eq!(summary.command.as_deref(), Some("rm -rf build"));
         assert!(summary.files.is_empty());
 
-        let (detail, summary) = approval(&json!({
-            "kind": "edit", "title": "src/a.rs",
-            "locations": [{"path": "/w/src/a.rs"}, {"path": "/w/src/b.rs"}, {"line": 3}],
-        }));
+        let (detail, summary) = approval(
+            &json!({
+                "kind": "edit", "title": "src/a.rs",
+                "locations": [{"path": "/w/src/a.rs"}, {"path": "/w/src/b.rs"}, {"line": 3}],
+            }),
+            None,
+        );
         assert_eq!(detail, "edit · src/a.rs");
         assert_eq!(summary.action, "Edit files");
         assert_eq!(summary.files, ["/w/src/a.rs", "/w/src/b.rs"]);
         assert_eq!(summary.command, None);
 
-        for call in [
-            json!({"kind": "fetch", "title": "https://example.com", "rawInput": {}}),
-            json!({}),
-        ] {
-            let (_, summary) = approval(&call);
-            assert_eq!(summary.action, "Use a tool");
-            assert_eq!(summary.command, None);
-        }
-        assert_eq!(approval(&json!({})).0, "other · tool");
+        let (_, summary) = approval(&json!({}), None);
+        assert_eq!(summary.action, "Use a tool");
+        assert_eq!(summary.command, None);
+        assert_eq!(approval(&json!({}), None).0, "other · tool");
+    }
+
+    #[test]
+    fn a_read_approval_names_its_file_even_when_the_request_does_not() {
+        // opencode 1.18.25 sends a read's request with no path at all; the
+        // path is the one its tool call named.
+        let request = json!({"kind": "read", "title": "read", "locations": [], "rawInput": {}});
+        let (detail, summary) = approval(&request, Some("/w/.env"));
+        assert_eq!(detail, "read · read\n{}");
+        assert_eq!(summary.action, "Read .env");
+        assert_eq!(summary.files, ["/w/.env"]);
+        let (_, summary) = approval(&request, None);
+        assert_eq!(summary.action, "Read a file opencode did not name");
+        assert!(summary.files.is_empty());
+        // A path the request names wins.
+        let named = json!({"kind": "read", "title": "a.rs", "locations": [{"path": "/w/a.rs"}]});
+        let (_, summary) = approval(&named, Some("/w/.env"));
+        assert_eq!(summary.action, "Read a.rs");
+        assert_eq!(summary.files, ["/w/a.rs"]);
+    }
+
+    #[test]
+    fn a_fetch_approval_names_its_address() {
+        let request = json!({"kind": "fetch", "title": "https://example.com", "locations": [],
+            "rawInput": {"url": "https://example.com/a", "format": "text"}});
+        let (_, summary) = approval(&request, None);
+        assert_eq!(summary.action, "Fetch https://example.com/a");
+        assert!(summary.files.is_empty());
+        let (_, summary) = approval(
+            &json!({"kind": "fetch", "title": "https://b.example"}),
+            None,
+        );
+        assert_eq!(summary.action, "Fetch https://b.example");
+    }
+
+    #[test]
+    fn an_outside_the_workspace_approval_names_the_path_and_any_command() {
+        // A read outside the workspace, as opencode 1.18.25 asks for it.
+        let read = json!({"kind": "other", "title": "/etc",
+            "locations": [{"path": "/etc/hosts"}, {"path": "/etc"}],
+            "rawInput": {"filepath": "/etc/hosts", "parentDir": "/etc"}});
+        let (_, summary) = approval(&read, Some("/etc/hosts"));
+        assert_eq!(summary.action, "Reach /etc/hosts, outside the workspace");
+        assert_eq!(summary.files, ["/etc/hosts", "/etc"]);
+        assert_eq!(summary.command, None);
+        // A command that touches another folder.
+        let command = json!({"kind": "other", "title": "touch /h/x.txt",
+            "locations": [{"path": "/h"}],
+            "rawInput": {"command": "touch /h/x.txt", "directories": ["/h"], "patterns": ["/h/*"]}});
+        let (_, summary) = approval(&command, None);
+        assert_eq!(summary.action, "Reach /h, outside the workspace");
+        assert_eq!(summary.command.as_deref(), Some("touch /h/x.txt"));
+        assert_eq!(summary.files, ["/h"]);
     }
 
     #[test]

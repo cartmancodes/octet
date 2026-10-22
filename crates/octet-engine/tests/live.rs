@@ -2584,6 +2584,24 @@ async fn opencode_approval_allowed_sends_allow_once() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn an_opencode_read_approval_names_the_file_its_tool_call_named() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_READ_ENV.into()))
+        .unwrap();
+    let Event::Approval { id, summary, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(summary.action, "Read .env");
+    assert_eq!(summary.files, ["/w/.env"]);
+    handle.send(Command::Answer { id, allow: false }).unwrap();
+    assert_eq!(turn_text(&mut events).await, "reject");
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_approval_denied_sends_reject() {
     let text = answer_first_approval(opencode(), scenario::APPROVAL, false).await;
     assert!(text.contains("reject"), "{text}");

@@ -109,6 +109,10 @@ pub const OPENCODE_PERMISSION_ON_CANCEL: &str = "permission-on-cancel";
 /// file with `fs/write_text_file`, as opencode 1.18.25 does although Octet
 /// offers no file system, then echo that reply's error code and end the turn.
 pub const OPENCODE_EDIT: &str = "opencode-edit";
+/// opencode: read `/w/.env`, asking first as opencode 1.18.25 does: the tool
+/// call names the file, the permission request that follows names none.
+/// The answer is echoed and ends the turn.
+pub const OPENCODE_READ_ENV: &str = "opencode-read-env";
 /// opencode: the name of the skill the fake lists as a slash command.
 pub const OPENCODE_SKILL: &str = "fixture-opencode-skill";
 

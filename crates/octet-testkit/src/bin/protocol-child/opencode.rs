@@ -320,6 +320,22 @@ impl OpencodeFixture {
                 self.held = Some(id.clone());
                 self.asks_on_cancel = true;
             }
+            scenario::OPENCODE_READ_ENV => {
+                self.held = Some(id.clone());
+                self.awaiting = 1;
+                self.approvals_9 = false;
+                emit(&acp_update(
+                    &sid,
+                    &json!({"sessionUpdate":"tool_call","toolCallId":"read-0","title":"read","kind":"read","status":"pending","locations":[],"rawInput":{}}),
+                ));
+                emit(&acp_update(
+                    &sid,
+                    &json!({"sessionUpdate":"tool_call_update","toolCallId":"read-0","status":"in_progress","kind":"read","title":"read","locations":[{"path":"/w/.env"}],"rawInput":{"filePath":"/w/.env"}}),
+                ));
+                emit(
+                    &json!({"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":sid,"toolCall":{"toolCallId":"read-0","title":"read","kind":"read","status":"pending","locations":[],"rawInput":{}},"options":[{"optionId":"once","kind":"allow_once","name":"Allow once"},{"optionId":"reject","kind":"reject_once","name":"Reject"}]}}),
+                );
+            }
             scenario::CHATTER => {
                 // The turn goes silent while another session keeps talking.
                 self.held = Some(id.clone());
