@@ -3961,7 +3961,9 @@ async fn an_opencode_skill_with_context_still_starts_with_its_command() {
     stop(&handle, task).await;
 }
 #[tokio::test]
-async fn opencode_compact_uses_its_command() {
+async fn opencode_compact_is_sent_though_opencode_does_not_list_it() {
+    // opencode 1.18.25 summarizes the session for a `/compact` prompt
+    // although its command list never names `compact`.
     let (handle, mut events, task) = spawn(opencode());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
     handle.send(Command::Compact).unwrap();
@@ -4053,24 +4055,4 @@ async fn opencode_probe_that_fails_still_deletes_its_session() {
     let error = probe(config, PROBE_LIMIT).await.unwrap_err();
     assert!(error.starts_with("Vendor disconnected"), "{error}");
     probe_session_deleted(&dir).await;
-}
-#[tokio::test]
-async fn opencode_compact_without_the_command_fails_the_turn() {
-    let (_dir, config) = opencode_without_commands();
-    let (handle, mut events, task) = spawn(config);
-    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
-    handle.send(Command::Compact).unwrap();
-    let error = expect_error(&mut events).await;
-    assert_eq!(error, "opencode does not offer compaction in this session");
-    let finished = next(&mut events).await;
-    assert!(
-        matches!(
-            finished,
-            Event::Finished {
-                outcome: Outcome::Failed
-            }
-        ),
-        "{finished:?}"
-    );
-    stop(&handle, task).await;
 }

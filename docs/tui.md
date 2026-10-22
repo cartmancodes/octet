@@ -274,7 +274,9 @@ turn; a reconnect before then (for example `/effort`) forks again, so the
 original is never written to.
 
 **Compaction.** `/compact` asks the vendor to compact its context (Codex
-`thread/compact/start`, Claude's own `/compact`). It runs as a turn: its
+`thread/compact/start`, Claude's own `/compact`, and opencode's `/compact`,
+which summarizes the session although opencode does not list it among its
+commands). It runs as a turn: its
 output streams as usual and Esc cancels it.
 
 **Images.** `/image PATH` attaches an image to the next prompt; the prompt

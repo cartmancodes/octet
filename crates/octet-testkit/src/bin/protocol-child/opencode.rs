@@ -213,11 +213,11 @@ impl OpencodeFixture {
             emit(&acp_text(sid, "REPLAYED"));
             emit(&tool_call(sid, "replayed-call"));
         }
+        // As in opencode 1.18.25, `/compact` is not listed, though it runs.
         emit(&acp_update(
             sid,
             &json!({"sessionUpdate":"available_commands_update","availableCommands":[
-                {"name":scenario::OPENCODE_SKILL,"description":"An opencode fixture skill"},
-                {"name":"compact","description":"Compact the session"}]}),
+                {"name":scenario::OPENCODE_SKILL,"description":"An opencode fixture skill"}]}),
         ));
     }
 

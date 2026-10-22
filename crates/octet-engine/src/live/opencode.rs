@@ -198,8 +198,6 @@ pub(super) struct OpencodeProtocol {
     probe_wait: Option<Instant>,
     /// The probe's session has been deleted (or its deletion started).
     probe_deleted: bool,
-    /// The last command list holds `compact`.
-    compact_offered: bool,
     /// The handshake's effort step has run: a level asked for before the
     /// session is ready no longer reaches it.
     effort_stepped: bool,
@@ -313,16 +311,11 @@ impl Protocol for OpencodeProtocol {
             .await
     }
 
-    /// Compaction is opencode's `/compact` command, when its last command
-    /// list offered one; otherwise the turn ends, failed, saying so.
+    /// Compaction is the prompt `/compact`. opencode 1.18.25 never lists that
+    /// command, yet summarizes the session for it (`session.summarize`) when
+    /// no command of that name is listed; one that is runs instead.
     async fn compact(&mut self, core: &mut Core) -> Result<(), DriverError> {
-        if self.compact_offered {
-            return self.send_prompt(core, "/compact", &[]).await;
-        }
-        fail_turn(
-            core,
-            "opencode does not offer compaction in this session".to_owned(),
-        )
+        self.send_prompt(core, "/compact", &[]).await
     }
 
     /// Sends the `session/cancel` notification. opencode then ends the
@@ -467,7 +460,6 @@ impl Protocol for OpencodeProtocol {
         match update["sessionUpdate"].as_str().unwrap_or("") {
             "available_commands_update" => {
                 let list = &update["availableCommands"];
-                self.compact_offered = offers(list, "compact");
                 if core.config.catalog_only {
                     return self.probe_listed(core, list);
                 }
@@ -1114,14 +1106,6 @@ fn skill_prompt(name: &str, args: &str, context: Option<&str>) -> Vec<Value> {
     blocks
 }
 
-/// Whether the command list `list` holds the command `name`.
-fn offers(list: &Value, name: &str) -> bool {
-    list.as_array()
-        .into_iter()
-        .flatten()
-        .any(|command| command["name"] == name)
-}
-
 /// Why opencode's reply to setting an agent is not a confirmation.
 enum Refusal {
     /// An error reply, with its message.
@@ -1711,15 +1695,6 @@ mod tests {
         // A reply without options changes nothing.
         protocol.note_options(&Value::Null);
         assert!(matches!(protocol.effort, Efforts::Absent));
-    }
-
-    #[test]
-    fn compaction_is_offered_when_the_command_list_holds_it() {
-        let list = json!([{"name": "init"}, {"name": "compact"}]);
-        assert!(offers(&list, "compact"));
-        assert!(!offers(&json!([{"name": "init"}]), "compact"));
-        assert!(!offers(&json!([]), "compact"));
-        assert!(!offers(&Value::Null, "compact"));
     }
 
     #[test]
