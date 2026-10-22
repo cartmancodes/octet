@@ -199,7 +199,8 @@ pub(crate) fn plan(
     })
 }
 
-/// What a switch to another provider says about the mode it starts in.
+/// What a switch to another provider says about the mode it asks for, which
+/// the provider confirms (or not) once it is ready.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StartMode {
     /// Full access: shown as a warning, since nothing asks any more.
@@ -218,13 +219,14 @@ pub(crate) fn provider_mode(engine: Engine, mode: Mode, chosen: Mode) -> StartMo
             "Full access carried to {title}: no permission checks. /mode ask to turn them on"
         ));
     }
+    // A request: the provider confirms the mode it takes once it is ready.
     let mode = mode.label();
     StartMode::Note(if chosen.label() == mode {
-        format!("{title} starts in {mode}")
+        format!("Asking {title} for {mode}")
     } else {
         let chosen = chosen.label();
         format!(
-            "{title} starts in {mode}, not {chosen} as you last chose. /mode {chosen} to ask for it again"
+            "Asking {title} for {mode}, not {chosen} as you last chose. /mode {chosen} to ask for it again"
         )
     })
 }
@@ -361,19 +363,20 @@ mod tests {
         let same = switch_in(Engine::CODEX, Mode::FullAccess, Mode::FullAccess);
         assert_eq!(same.warning, None);
         assert!(
-            !same.notes.iter().any(|n| n.contains("starts in")),
+            !same.notes.iter().any(|n| n.starts_with("Asking")),
             "{:?}",
             same.notes
         );
     }
 
     #[test]
-    fn another_provider_names_the_mode_it_starts_in() {
+    fn another_provider_names_the_mode_it_is_asked_for() {
+        // The provider has not confirmed it yet (Claude may report ask).
         let plan = switch_in(Engine::OPENCODE, Mode::Auto, Mode::Auto);
         assert_eq!(plan.warning, None);
         assert_eq!(
             plan.notes.last().map(String::as_str),
-            Some("opencode starts in auto")
+            Some("Asking opencode for auto")
         );
     }
 
@@ -385,7 +388,7 @@ mod tests {
         assert_eq!(
             plan.notes.last().map(String::as_str),
             Some(
-                "opencode starts in ask, not auto as you last chose. /mode auto to ask for it again"
+                "Asking opencode for ask, not auto as you last chose. /mode auto to ask for it again"
             )
         );
     }

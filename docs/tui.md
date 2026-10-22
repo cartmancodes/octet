@@ -325,8 +325,10 @@ is `ask`; the mode is not remembered between launches but is kept across
 `/model`, `/new` and `/reconnect`. It is the mode the last provider confirmed, so
 one that refused your choice (Claude's `auto` on Haiku) passes its own on. A
 switch to another provider (`/model`, or `/resume` of another provider's
-session) notes the mode it starts in, and when that is not the one you last
-chose, says so ("opencode starts in ask, not auto as you last chose"). Full
+session) notes the mode it asks the new provider for, which that provider
+confirms once ready (the header then shows the mode it took), and when that is
+not the one you last chose, says so ("Asking opencode for ask, not auto as you
+last chose"). Full
 access carried to another provider is a warning: "Full access carried to
 Claude: no permission checks. /mode ask to turn them on". `/mode` alone shows
 the table for the current provider. The header shows the selected mode; during a Codex or opencode turn

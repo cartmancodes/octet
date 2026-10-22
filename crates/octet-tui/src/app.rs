@@ -397,7 +397,7 @@ pub(crate) struct App {
     pub(crate) last_width: u16,
     /// The permission mode the user last chose (at launch, Shift+Tab or
     /// `/mode`), which a vendor may have refused: a switch to another
-    /// provider says when that one starts in another.
+    /// provider says when it asks that one for another.
     pub(crate) mode_chosen: octet_core::Mode,
     /// The command running now was refused (`App::refuse`), so its typed
     /// line stays; reset before each command.
