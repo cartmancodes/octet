@@ -59,6 +59,8 @@ pub const DELTA_FLOOD: &str = "delta-flood";
 pub const SUBAGENT: &str = "subagent";
 /// Claude: a result whose session ID holds an escape sequence.
 pub const ODD_SESSION: &str = "odd-session";
+/// Claude: a local command's reply, whose model is the placeholder `<synthetic>`.
+pub const SYNTHETIC: &str = "synthetic";
 /// Codex: a huge unknown server request, then a huge unknown turn status.
 pub const ODD_STRINGS: &str = "odd-strings";
 /// Codex: hold the turn and acknowledge interrupts without ending it.

@@ -227,6 +227,14 @@ impl ClaudeFixture {
                 emit(&claude_init(sid));
                 emit(&claude_result("s\u{1b}[2Jx", ""));
             }
+            // A local command (`/context`): Claude marks its reply's model `<synthetic>`.
+            scenario::SYNTHETIC => {
+                emit(&claude_init(sid));
+                emit(
+                    &json!({"type":"assistant","parent_tool_use_id":null,"message":{"model":"<synthetic>","content":[{"type":"text","text":"Context"}]}}),
+                );
+                emit(&claude_result(sid, "Context"));
+            }
             // A result that omits is_error, as an older CLI might send.
             scenario::NO_IS_ERROR => {
                 emit(&json!({"type":"result","result":"odd","session_id":sid}));

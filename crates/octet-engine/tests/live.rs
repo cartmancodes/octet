@@ -1330,6 +1330,25 @@ async fn claude_takes_a_prompt_sent_at_ready_after_a_start_hook() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn claude_local_command_keeps_the_session_model() {
+    let (handle, mut events, task) = spawn(claude());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::SYNTHETIC.into()))
+        .unwrap();
+    let mut models = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::ModelSelected(model) => models.push(model),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    // `<synthetic>` marks a reply no model wrote; it names no model.
+    assert_eq!(models, ["claude-fixture-full-id"]);
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn codex_rejected_steer_is_reported_with_its_text() {
     let (handle, mut events, task) = spawn(config());
     wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;

@@ -46,6 +46,10 @@ pub(super) const PROVIDER: Provider = Provider {
     start,
 };
 
+/// The model Claude puts on a message no model wrote, such as a local
+/// command's reply.
+const SYNTHETIC_MODEL: &str = "<synthetic>";
+
 fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result<(), String>> {
     Box::pin(async move { super::driver::run::<ClaudeProtocol>(config, limits, channels).await })
 }
@@ -346,7 +350,10 @@ impl Protocol for ClaudeProtocol {
             "stream_event" => v["event"]["message"]["model"].as_str(),
             _ => None,
         };
-        if let Some(model) = actual.filter(|model| valid_identifier(model))
+        // Claude marks a reply no model wrote (a local command such as
+        // `/context`) with the model `<synthetic>`: it names no model.
+        if let Some(model) =
+            actual.filter(|model| valid_identifier(model) && *model != SYNTHETIC_MODEL)
             && self.selected_model != model
         {
             self.selected_model = model.into();
