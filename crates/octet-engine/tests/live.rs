@@ -1156,6 +1156,46 @@ async fn codex_effort_default_without_a_configured_level_is_the_models() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn codex_effort_default_on_a_resumed_thread_is_sent_whatever_the_reply_says() {
+    // The resume reply may name the configured level rather than the one
+    // the thread was left at: after a resume the thread's level is unknown.
+    let dir = octet_testkit::TempDir::new("octet-live-codex-effort-resume");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(dir.path().join("config-effort"), "high").unwrap();
+    let mut c = config();
+    c.cwd = dir.path().to_path_buf();
+    c.resume = Some("fixture-thread".into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Models(m) if m.len() == 2),
+    )
+    .await;
+    let default = codex_turn_effort(&handle, &mut events, None).await;
+    assert_eq!(default, "high");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn codex_resumed_prompt_sent_at_ready_goes_back_to_the_default() {
+    // A headless run sends its prompt on ready, so a resumed thread is ready
+    // only once Codex's config says what the default is.
+    let dir = octet_testkit::TempDir::new("octet-live-codex-effort-ready");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(dir.path().join("config-effort"), "high").unwrap();
+    std::fs::write(dir.path().join("config-slow"), "").unwrap();
+    let mut c = config();
+    c.cwd = dir.path().to_path_buf();
+    c.resume = Some("fixture-thread".into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    assert_eq!(echo["turn"]["effort"], "high", "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn codex_agent_messages_back_to_back_are_separate_paragraphs() {
     let (handle, mut events, task) = spawn(config());
     wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;

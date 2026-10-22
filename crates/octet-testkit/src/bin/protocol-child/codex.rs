@@ -37,6 +37,10 @@ pub(crate) fn run() {
             Some("initialize") => emit(&json!({"id":v["id"],"result":{}})),
             Some("config/read") => {
                 let effort = configured_effort(&v["params"]["cwd"]);
+                if workspace_has(&v["params"]["cwd"], "config-slow") {
+                    // The answer comes after a prompt sent at ready would.
+                    thread::sleep(Duration::from_millis(300));
+                }
                 emit(&json!({"id":v["id"],"result":{"config":{"model_reasoning_effort":effort}}}));
             }
             Some("thread/start" | "thread/resume" | "thread/fork") => codex.open_thread(&v),
@@ -58,6 +62,12 @@ fn configured_effort(cwd: &Value) -> Value {
             std::fs::read_to_string(std::path::Path::new(cwd).join("config-effort")).ok()
         })
         .map_or(Value::Null, |effort| json!(effort.trim()))
+}
+
+/// Whether the working directory `cwd` holds a file `name`.
+fn workspace_has(cwd: &Value, name: &str) -> bool {
+    cwd.as_str()
+        .is_some_and(|cwd| std::path::Path::new(cwd).join(name).exists())
 }
 
 /// Two catalog pages: `picker-fixture` (default effort `medium`), then `picker-other`.

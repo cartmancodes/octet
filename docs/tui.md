@@ -257,7 +257,9 @@ does not take the level falls back to its default, with a notice.
 Codex takes it with each turn, so a change applies from the next turn.
 Codex keeps a turn's level for the turns after it (and in the thread, for
 `--resume`), so `/effort default` sends the level Codex picks itself: the
-`model_reasoning_effort` of its config, else the model's own default.
+`model_reasoning_effort` of its config, else the model's own default. A
+resumed or forked Codex thread with no level chosen sends that level with its
+first turn too, and is ready once Octet has read it.
 opencode sets it in the open session: `--effort` once the session opens,
 after the model and before the first prompt (a level the model does not
 list is dropped with a notice and the session goes on), and `/effort` at
