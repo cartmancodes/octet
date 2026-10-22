@@ -51,6 +51,22 @@ pub(crate) fn run() {
     }
 }
 
+/// A `SessionStart` hook's two frames, which name the session `sid`.
+fn start_hook(sid: &str) {
+    for subtype in ["hook_started", "hook_response"] {
+        emit(&json!({
+            "type": "system",
+            "subtype": subtype,
+            "hook_name": "SessionStart:startup",
+            "hook_event": "SessionStart",
+            "outcome": "success",
+            "exit_code": 0,
+            "output": "",
+            "session_id": sid,
+        }));
+    }
+}
+
 impl ClaudeFixture {
     fn launched_with(&self, flag: &str) -> bool {
         self.argv.iter().any(|a| a == flag)
@@ -73,21 +89,19 @@ impl ClaudeFixture {
         if self.launched_with(scenario::START_HOOK) {
             // Claude runs SessionStart hooks before it answers, and their
             // frames already carry the new session's ID.
-            for subtype in ["hook_started", "hook_response"] {
-                emit(&json!({
-                    "type": "system",
-                    "subtype": subtype,
-                    "hook_name": "SessionStart:startup",
-                    "hook_event": "SessionStart",
-                    "outcome": "success",
-                    "exit_code": 0,
-                    "output": "",
-                    "session_id": self.sid,
-                }));
-            }
+            start_hook(self.sid);
             // The reply comes a moment later: a prompt sent on the hook's
             // ID arrives before it.
             thread::sleep(Duration::from_millis(300));
+        }
+        if self.launched_with(scenario::SLOW_START_HOOK) {
+            // A slow hook's frames come after the reply, still before any
+            // turn has saved the session they name.
+            let sid = self.sid;
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                start_hook(sid);
+            });
         }
         let requested = self
             .argv

@@ -1418,6 +1418,32 @@ async fn claude_named_by_a_start_hook_is_ready_once_and_resumable_after_its_firs
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn claude_named_by_a_slow_start_hook_after_its_reply_is_not_ready_with_that_id() {
+    let mut c = claude();
+    c.model = Some(scenario::SLOW_START_HOOK.into());
+    let (handle, mut events, task) = spawn(c);
+    // A slow SessionStart hook's frames come after the handshake's reply,
+    // still before the first turn saves the session they name: a ready with
+    // that ID would send a reconnect to a session Claude cannot resume.
+    let mut readies = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Ready { session } => readies.push(session),
+            Event::Hook { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(readies, [""]);
+    // Only the first turn names the session.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Ready { session } if session == "claude-fixture"),
+    )
+    .await;
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn claude_takes_a_prompt_sent_at_ready_after_a_start_hook() {
     let mut c = claude();
     c.model = Some(scenario::START_HOOK.into());
