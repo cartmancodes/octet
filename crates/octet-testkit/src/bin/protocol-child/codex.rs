@@ -35,6 +35,10 @@ pub(crate) fn run() {
                 &json!({"id":v["id"],"result":{"data":[{"cwd":".","errors":[],"skills":[{"name":"fixture-codex-skill","description":"A Codex fixture skill","enabled":true,"path":"/tmp/fixture-codex-skill/SKILL.md","scope":"user"}]}]}}),
             ),
             Some("initialize") => emit(&json!({"id":v["id"],"result":{}})),
+            Some("config/read") => {
+                let effort = configured_effort(&v["params"]["cwd"]);
+                emit(&json!({"id":v["id"],"result":{"config":{"model_reasoning_effort":effort}}}));
+            }
             Some("thread/start" | "thread/resume" | "thread/fork") => codex.open_thread(&v),
             Some("thread/compact/start") => codex.compact(&v),
             Some("turn/start") => codex.start_turn(&v),
@@ -46,7 +50,17 @@ pub(crate) fn run() {
     }
 }
 
-/// Two catalog pages: `picker-fixture`, then `picker-other`.
+/// The `model_reasoning_effort` of the fake's config: the text of
+/// `config-effort` in the working directory `cwd`, or none.
+fn configured_effort(cwd: &Value) -> Value {
+    cwd.as_str()
+        .and_then(|cwd| {
+            std::fs::read_to_string(std::path::Path::new(cwd).join("config-effort")).ok()
+        })
+        .map_or(Value::Null, |effort| json!(effort.trim()))
+}
+
+/// Two catalog pages: `picker-fixture` (default effort `medium`), then `picker-other`.
 fn model_list(v: &Value) {
     if v["params"]["cursor"].as_str() == Some("page-two") {
         emit(
@@ -54,7 +68,7 @@ fn model_list(v: &Value) {
         );
     } else {
         emit(
-            &json!({"id":v["id"],"result":{"data":[{"id":"picker-fixture","model":"fixture","displayName":"Fixture Model","description":"Runtime metadata"}],"nextCursor":"page-two"}}),
+            &json!({"id":v["id"],"result":{"data":[{"id":"picker-fixture","model":"fixture","displayName":"Fixture Model","description":"Runtime metadata","defaultReasoningEffort":"medium"}],"nextCursor":"page-two"}}),
         );
     }
 }
@@ -95,8 +109,10 @@ impl CodexFixture {
         } else {
             "fixture-thread"
         };
+        // A new thread takes the configured effort, and Codex reports it.
+        let effort = configured_effort(&p["cwd"]);
         emit(
-            &json!({"id":v["id"],"result":{"thread":{"id":thread},"model":"fixture","sandbox":sandbox,"approvalPolicy":policy,"approvalsReviewer":reviewer}}),
+            &json!({"id":v["id"],"result":{"thread":{"id":thread},"model":"fixture","sandbox":sandbox,"approvalPolicy":policy,"approvalsReviewer":reviewer,"reasoningEffort":effort}}),
         );
     }
 

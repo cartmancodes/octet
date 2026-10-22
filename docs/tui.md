@@ -254,6 +254,9 @@ and `max`; some models offer none), and Octet refuses a level the model
 does not list, naming the ones it does. A `/model` switch to a provider that
 does not take the level falls back to its default, with a notice.
 Codex takes it with each turn, so a change applies from the next turn.
+Codex keeps a turn's level for the turns after it (and in the thread, for
+`--resume`), so `/effort default` sends the level Codex picks itself: the
+`model_reasoning_effort` of its config, else the model's own default.
 opencode sets it in the open session: `--effort` once the session opens,
 after the model and before the first prompt (a level the model does not
 list is dropped with a notice and the session goes on), and `/effort` at

@@ -6,7 +6,7 @@ use super::{
     activity::one_line,
     limited, model_catalog_with,
     protocol::{Core, Phase, Protocol},
-    push_bounded, short, valid_identifier,
+    push_bounded, short, valid_effort, valid_identifier,
 };
 use serde_json::{Value, json};
 use std::{
@@ -57,11 +57,25 @@ enum Outstanding {
     OpenThread,
     ModelList,
     SkillsList,
+    /// `config/read`: the reasoning effort Codex's config names.
+    ConfigRead,
     /// `turn/start` or `thread/compact/start`: an error fails the turn.
     Start,
     Interrupt,
     /// A steer, kept so a refusal can say which text was lost.
     Steer(String),
+}
+
+/// What Codex's config says about the reasoning effort (`config/read`).
+#[derive(Default)]
+enum ConfiguredEffort {
+    /// Codex has not said (or could not).
+    #[default]
+    Unknown,
+    /// No level: each model's own default applies.
+    Unset,
+    /// `model_reasoning_effort`.
+    Level(String),
 }
 
 /// Codex's per-connection state: the turn in flight, Octet's own requests
@@ -80,6 +94,15 @@ pub(super) struct CodexProtocol {
     pending_steer: VecDeque<String>,
     /// Each `fileChange` item's paths from its start, for its approval; cleared as the turn ends.
     file_changes: HashMap<String, Vec<String>>,
+    /// Each listed model's default reasoning effort, by its selection.
+    model_efforts: HashMap<String, String>,
+    /// The effort Codex's config names.
+    configured_effort: ConfiguredEffort,
+    /// The model Codex opened the thread with.
+    thread_model: Option<String>,
+    /// The effort the thread runs at, as Codex reported it or Octet last
+    /// sent it: Codex keeps a turn's effort for the turns after it.
+    thread_effort: Option<String>,
 }
 
 impl Protocol for CodexProtocol {
@@ -363,8 +386,21 @@ impl CodexProtocol {
                 }
                 Ok(())
             }
+            Outstanding::ConfigRead => {
+                if v.get("error").is_none() {
+                    let effort = v.pointer("/result/config/model_reasoning_effort");
+                    self.configured_effort =
+                        match effort.and_then(Value::as_str).filter(|e| valid_effort(e)) {
+                            Some(effort) => ConfiguredEffort::Level(effort.to_owned()),
+                            None => ConfiguredEffort::Unset,
+                        };
+                }
+                Ok(())
+            }
             Outstanding::Start => {
                 if v.get("error").is_some() {
+                    // Codex may not have taken the turn's effort.
+                    self.thread_effort = None;
                     self.drop_held_steers(core)?;
                     core.finish_turn(Outcome::Failed, Some(error_text(&v["error"])))?;
                 }
@@ -437,20 +473,51 @@ impl CodexProtocol {
             .as_str()
             .filter(|m| valid_identifier(m))
         {
+            self.thread_model = Some(model.into());
             core.emit(Event::ModelSelected(model.into()))?;
         }
+        self.thread_effort = v["result"]["reasoningEffort"]
+            .as_str()
+            .filter(|e| valid_effort(e))
+            .map(str::to_owned);
         self.request_models(core, None).await?;
-        self.request_skills(core, false).await
+        self.request_skills(core, false).await?;
+        let params = json!({"cwd": core.config.cwd});
+        self.request(core, Outstanding::ConfigRead, "config/read", params)
+            .await
+    }
+
+    /// The effort Codex picks with no override: its config's, else the
+    /// model's own default; `None` while Octet does not know it.
+    fn default_effort(&self, core: &Core) -> Option<String> {
+        match &self.configured_effort {
+            ConfiguredEffort::Level(effort) => Some(effort.clone()),
+            ConfiguredEffort::Unset => {
+                let model = core.config.model.as_ref().or(self.thread_model.as_ref())?;
+                self.model_efforts.get(model).cloned()
+            }
+            ConfiguredEffort::Unknown => None,
+        }
     }
 
     /// `turn/start` with `input`, the model, effort and the mode's overrides.
+    /// The vendor default goes as its level when the thread may run at
+    /// another: Codex keeps the last turn's effort, so leaving it out would
+    /// not go back.
     async fn turn_start(&mut self, core: &Core, input: Vec<Value>) -> Result<(), DriverError> {
         let mut params = json!({"threadId":core.session,"input":input});
         if let Some(model) = &core.config.model {
             params["model"] = json!(model);
         }
-        if let Some(effort) = &core.config.effort {
+        let effort = match &core.config.effort {
+            Some(effort) => Some(effort.clone()),
+            None => self
+                .default_effort(core)
+                .filter(|default| self.thread_effort.as_ref() != Some(default)),
+        };
+        if let Some(effort) = effort {
             params["effort"] = json!(effort);
+            self.thread_effort = Some(effort);
         }
         if let (Some(target), Value::Object(extra)) =
             (params.as_object_mut(), codex_turn_overrides(core.mode))
@@ -492,6 +559,11 @@ impl CodexProtocol {
                 "Model catalog unavailable from this CLI; explicit model IDs remain supported"
                     .into(),
             ));
+        }
+        for (model, effort) in default_efforts(&v["result"]["data"]) {
+            if self.model_efforts.len() < 256 {
+                self.model_efforts.insert(model, effort);
+            }
         }
         for model in catalog(&v["result"]["data"]) {
             if self.catalog.len() < 256
@@ -587,6 +659,22 @@ fn skills(data: &Value) -> Vec<SkillInfo> {
         .filter_map(SkillInfo::from_json)
         .take(super::MAX_SKILLS)
         .collect()
+}
+
+/// Each catalog entry's model and its default reasoning effort, bounded.
+fn default_efforts(value: &Value) -> impl Iterator<Item = (String, String)> + '_ {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(256)
+        .filter_map(|v| {
+            let model = v["model"].as_str().filter(|m| valid_identifier(m))?;
+            let effort = v["defaultReasoningEffort"]
+                .as_str()
+                .filter(|e| valid_effort(e))?;
+            Some((model.to_owned(), effort.to_owned()))
+        })
 }
 
 fn catalog(value: &Value) -> Vec<ModelInfo> {

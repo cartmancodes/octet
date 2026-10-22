@@ -327,6 +327,9 @@ Claude Code and Codex CLIs.
 - A mid-turn Codex permission change now shows both the running and next mode
   in the terminal header and `/mode` details. The notice explains that steering
   keeps the old permissions until a new turn starts.
+- `/effort default` did not reset Codex's reasoning effort: Codex kept the
+  last level for later turns. Octet now sends the level Codex picks itself
+  (its config's, else the model's default).
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.
