@@ -2456,6 +2456,31 @@ async fn opencode_requested_model_is_set_and_confirmed() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn an_opencode_model_refused_at_connect_stops_the_session() {
+    // Running on opencode's own default instead would be a model, and
+    // perhaps a bill, the user never chose.
+    let mut c = opencode();
+    c.model = Some(scenario::OPENCODE_UNKNOWN_MODEL.into());
+    let (_handle, mut events, task) = spawn(c);
+    loop {
+        match next(&mut events).await {
+            Event::Ready { session } => panic!("the session opened: {session}"),
+            Event::Error(error) => {
+                assert_eq!(
+                    error,
+                    format!(
+                        "opencode refused the model {}: Invalid params: model not found",
+                        scenario::OPENCODE_UNKNOWN_MODEL
+                    )
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    ended(task).await;
+}
+#[tokio::test]
 async fn opencode_resume_ignores_the_replayed_history() {
     let mut c = opencode();
     c.resume = Some("ses-old".into());
@@ -2649,6 +2674,24 @@ async fn opencode_approval_allowed_sends_allow_once() {
     let text = turn_text(&mut events).await;
     assert!(text.contains("once"), "{text}");
     assert!(!text.contains("always"), "{text}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn an_opencode_read_approval_names_the_file_its_tool_call_named() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_READ_ENV.into()))
+        .unwrap();
+    let Event::Approval { id, summary, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(summary.action, "Read .env");
+    assert_eq!(summary.files, ["/w/.env"]);
+    handle.send(Command::Answer { id, allow: false }).unwrap();
+    assert_eq!(turn_text(&mut events).await, "reject");
     stop(&handle, task).await;
 }
 #[tokio::test]
@@ -3540,6 +3583,32 @@ async fn opencode_full_access_launches_with_its_agent() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn an_opencode_command_is_shown_by_its_command_not_its_folder() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::TOOL_FAIL.into()))
+        .unwrap();
+    let mut tools = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Tool(call) => tools.push((call.name, call.target, call.phase)),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    // The first frame names no command yet, only the working directory.
+    assert_eq!(
+        tools,
+        [
+            ("bash".to_owned(), String::new(), ToolPhase::Running),
+            ("bash".to_owned(), "false".to_owned(), ToolPhase::Failed),
+        ]
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_failed_turn_shows_the_message() {
     let (handle, mut events, task) = spawn(opencode());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
@@ -3841,6 +3910,36 @@ async fn opencode_permission_for_another_session_during_a_turn_is_rejected() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn opencode_file_writes_after_an_allowed_edit_are_refused_quietly() {
+    // opencode 1.18.25 also asks the client to write an edit it was allowed,
+    // although Octet offers no file system: refused, with nothing to show.
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_EDIT.into()))
+        .unwrap();
+    let Event::Approval { id, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    handle.send(Command::Answer { id, allow: true }).unwrap();
+    let (mut notices, mut text) = (Vec::new(), String::new());
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => notices.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    // The fake echoes the error code of Octet's reply to its write.
+    assert_eq!(text, "oncefs -32601");
+    assert!(notices.is_empty(), "{notices:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_permission_while_cancelling_is_rejected_and_says_so() {
     let (handle, mut events, task) = spawn(opencode());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
@@ -3933,6 +4032,119 @@ async fn opencode_skill_runs_as_a_slash_prompt() {
     );
     stop(&handle, task).await;
 }
+/// An opencode skill `name` with `args`, as the interface sends it.
+fn opencode_skill(name: &str, args: &str) -> Command {
+    Command::Skill {
+        name: name.into(),
+        path: None,
+        args: args.into(),
+        display: format!("/{name} {args}"),
+        context: None,
+    }
+}
+/// The error and outcome that end the turn `command` starts in a session
+/// in `mode`, and the text it streamed; it must end by itself.
+async fn opencode_turn_ending(mode: Mode, command: Command) -> (Option<String>, Outcome, String) {
+    let mut c = opencode();
+    c.mode = mode;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(command).unwrap();
+    let (mut error, mut text) = (None, String::new());
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Error(message) => error = Some(message),
+            Event::Text(t) => text.push_str(&t),
+            Event::Approval { detail, .. } => panic!("an approval was shown: {detail}"),
+            Event::Finished { outcome } => break outcome,
+            _ => {}
+        }
+    };
+    stop(&handle, task).await;
+    (error, outcome, text)
+}
+#[tokio::test]
+async fn opencodes_review_is_not_sent_while_the_mode_asks() {
+    // `/review` runs as a subagent, whose approvals opencode never passes on:
+    // in ask or accept-edits the turn would wait for ever.
+    for (mode, command) in [
+        (Mode::Ask, opencode_skill("review", "HEAD")),
+        (Mode::AcceptEdits, opencode_skill("review", "")),
+        (Mode::Ask, Command::Prompt("/review HEAD".into())),
+    ] {
+        let (error, outcome, text) = opencode_turn_ending(mode, command).await;
+        assert_eq!(
+            error.as_deref(),
+            Some(subtask_refusal("/review", mode, "Octet did not send it").as_str())
+        );
+        assert_eq!(outcome, Outcome::Failed);
+        // The fake echoes a command it is sent.
+        assert_eq!(text, "");
+    }
+}
+/// What Octet says when opencode's subagent command `command` cannot run
+/// in `mode`, ending with what Octet did about it.
+fn subtask_refusal(command: &str, mode: Mode, done: &str) -> String {
+    format!(
+        "opencode runs {command} in a subagent, whose approval requests it never passes on to Octet; \
+         subagents are off in {}, so {done}. In auto, opencode's own permission settings decide",
+        mode.label()
+    )
+}
+#[tokio::test]
+async fn opencodes_review_is_sent_in_auto() {
+    let (error, outcome, text) =
+        opencode_turn_ending(Mode::Auto, opencode_skill("review", "HEAD")).await;
+    assert_eq!(error, None);
+    assert_eq!(outcome, Outcome::Completed);
+    assert_eq!(text, "/review HEAD");
+}
+#[tokio::test]
+async fn an_opencode_subagent_started_while_the_mode_asks_stops_the_turn() {
+    // A command opencode runs as a subagent that Octet cannot know of
+    // beforehand: its `task` call is the sign, and the turn is cancelled.
+    let (error, outcome, _) =
+        opencode_turn_ending(Mode::Ask, opencode_skill(scenario::OPENCODE_SUBTASK, "")).await;
+    let command = format!("/{}", scenario::OPENCODE_SUBTASK);
+    assert_eq!(
+        error.as_deref(),
+        Some(subtask_refusal(&command, Mode::Ask, "Octet stopped the turn").as_str())
+    );
+    assert_eq!(outcome, Outcome::Failed);
+}
+#[tokio::test]
+async fn an_opencode_subagent_in_auto_runs_until_cancelled() {
+    let mut c = opencode();
+    c.mode = Mode::Auto;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SUBTASK, ""))
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Tool(_))).await;
+    // Nothing stops it: the subagent's approvals are opencode's to decide.
+    let quiet = timeout(Duration::from_millis(500), async {
+        loop {
+            if let Event::Finished { .. } | Event::Error(_) = next(&mut events).await {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "the turn ended by itself");
+    handle.interrupt();
+    let finished = wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Interrupted
+            }
+        ),
+        "{finished:?}"
+    );
+    stop(&handle, task).await;
+}
 #[tokio::test]
 async fn an_opencode_skill_with_context_still_starts_with_its_command() {
     // opencode runs a command only when the prompt starts with `/`; the
@@ -3955,7 +4167,9 @@ async fn an_opencode_skill_with_context_still_starts_with_its_command() {
     stop(&handle, task).await;
 }
 #[tokio::test]
-async fn opencode_compact_uses_its_command() {
+async fn opencode_compact_is_sent_though_opencode_does_not_list_it() {
+    // opencode 1.18.25 summarizes the session for a `/compact` prompt
+    // although its command list never names `compact`.
     let (handle, mut events, task) = spawn(opencode());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
     handle.send(Command::Compact).unwrap();
@@ -4047,24 +4261,4 @@ async fn opencode_probe_that_fails_still_deletes_its_session() {
     let error = probe(config, PROBE_LIMIT).await.unwrap_err();
     assert!(error.starts_with("Vendor disconnected"), "{error}");
     probe_session_deleted(&dir).await;
-}
-#[tokio::test]
-async fn opencode_compact_without_the_command_fails_the_turn() {
-    let (_dir, config) = opencode_without_commands();
-    let (handle, mut events, task) = spawn(config);
-    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
-    handle.send(Command::Compact).unwrap();
-    let error = expect_error(&mut events).await;
-    assert_eq!(error, "opencode does not offer compaction in this session");
-    let finished = next(&mut events).await;
-    assert!(
-        matches!(
-            finished,
-            Event::Finished {
-                outcome: Outcome::Failed
-            }
-        ),
-        "{finished:?}"
-    );
-    stop(&handle, task).await;
 }

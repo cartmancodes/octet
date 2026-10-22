@@ -198,8 +198,6 @@ pub(super) struct OpencodeProtocol {
     probe_wait: Option<Instant>,
     /// The probe's session has been deleted (or its deletion started).
     probe_deleted: bool,
-    /// The last command list holds `compact`.
-    compact_offered: bool,
     /// The handshake's effort step has run: a level asked for before the
     /// session is ready no longer reaches it.
     effort_stepped: bool,
@@ -207,6 +205,35 @@ pub(super) struct OpencodeProtocol {
     /// session is ready. It is set through the live path once the
     /// handshake ends, and no handshake confirmation is shown over it.
     effort_wanted: Option<Wanted>,
+    /// The mode the running turn's prompt was sent under: opencode runs a
+    /// prompt under the agent it started with.
+    turn_mode: Option<Mode>,
+    /// Why Octet cancelled the running turn: it started a subagent that
+    /// cannot ask for approval (see `stop_subtask`).
+    subtask_stopped: Option<String>,
+}
+
+/// opencode 1.18.25's commands that always run in a subagent: `review` is
+/// built in with `subtask: true`.
+const SUBTASK_COMMANDS: &[&str] = &["review"];
+
+/// Why opencode's command `name` (`None`: one it did not name) cannot run
+/// as a subagent under `mode`, ending with `done`, what Octet did about it;
+/// `None` when `mode` lets opencode decide. opencode passes on only the
+/// approval requests of the sessions opened over ACP: a subagent's would
+/// wait for ever, unseen.
+fn subtask_refusal(name: Option<&str>, mode: Mode, done: &str) -> Option<String> {
+    let command = name.map_or_else(
+        || "a command".to_owned(),
+        |name| format!("/{}", short(name)),
+    );
+    matches!(mode, Mode::Ask | Mode::AcceptEdits).then(|| {
+        format!(
+            "opencode runs {command} in a subagent, whose approval requests it never passes on to Octet; \
+             subagents are off in {}, so {done}. In auto, opencode's own permission settings decide",
+            mode.label()
+        )
+    })
 }
 
 impl Protocol for OpencodeProtocol {
@@ -261,6 +288,8 @@ impl Protocol for OpencodeProtocol {
     fn turn_started(&mut self) {
         self.cancel_sent = false;
         self.tools.clear();
+        self.turn_mode = None;
+        self.subtask_stopped = None;
     }
 
     /// A probe that ends before it has its catalog (an error, or the
@@ -313,16 +342,11 @@ impl Protocol for OpencodeProtocol {
             .await
     }
 
-    /// Compaction is opencode's `/compact` command, when its last command
-    /// list offered one; otherwise the turn ends, failed, saying so.
+    /// Compaction is the prompt `/compact`. opencode 1.18.25 never lists that
+    /// command, yet summarizes the session for it (`session.summarize`) when
+    /// no command of that name is listed; one that is runs instead.
     async fn compact(&mut self, core: &mut Core) -> Result<(), DriverError> {
-        if self.compact_offered {
-            return self.send_prompt(core, "/compact", &[]).await;
-        }
-        fail_turn(
-            core,
-            "opencode does not offer compaction in this session".to_owned(),
-        )
+        self.send_prompt(core, "/compact", &[]).await
     }
 
     /// Sends the `session/cancel` notification. opencode then ends the
@@ -448,7 +472,14 @@ impl Protocol for OpencodeProtocol {
             return self.response(core, &v).await;
         }
         if v.get("id").is_some() {
-            return server_request(core, v).await;
+            // What the request's tool call named earlier this turn.
+            let known = v
+                .pointer("/params/toolCall/toolCallId")
+                .and_then(Value::as_str)
+                .and_then(|id| self.tools.get(&one_line(id)))
+                .map(|(_, target)| target.clone())
+                .filter(|target| !target.is_empty());
+            return server_request(core, v, known.as_deref()).await;
         }
         let this_session = !core.session.is_empty()
             && v.pointer("/params/sessionId").and_then(Value::as_str)
@@ -460,7 +491,6 @@ impl Protocol for OpencodeProtocol {
         match update["sessionUpdate"].as_str().unwrap_or("") {
             "available_commands_update" => {
                 let list = &update["availableCommands"];
-                self.compact_offered = offers(list, "compact");
                 if core.config.catalog_only {
                     return self.probe_listed(core, list);
                 }
@@ -475,21 +505,69 @@ impl Protocol for OpencodeProtocol {
                 }
                 _ => Ok(()),
             },
-            "tool_call" | "tool_call_update" => self.tool(core, update),
+            "tool_call" | "tool_call_update" => {
+                self.tool(core, update)?;
+                self.stop_subtask(core, update).await
+            }
             _ => Ok(()),
         }
     }
 }
 
 impl OpencodeProtocol {
+    /// Cancels the running turn when `update` is a subagent's `task` call
+    /// (opencode's only `think` tool) and the turn's mode asks: opencode
+    /// never passes the subagent's approval requests on, so it would wait
+    /// for ever. The asking agents deny `task` to the model, so such a call
+    /// comes from a command that runs as a subagent. The turn then ends,
+    /// failed, saying why (see `prompt_ended`).
+    async fn stop_subtask(&mut self, core: &mut Core, update: &Value) -> Result<(), DriverError> {
+        if update["kind"] != "think"
+            || core.phase != Phase::InTurn
+            || self.subtask_stopped.is_some()
+        {
+            return Ok(());
+        }
+        let name = update
+            .pointer("/rawInput/command")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty());
+        let Some(refusal) = self
+            .turn_mode
+            .and_then(|mode| subtask_refusal(name, mode, "Octet stopped the turn"))
+        else {
+            return Ok(());
+        };
+        self.subtask_stopped = Some(refusal);
+        core.phase = Phase::Interrupting;
+        <Self as Protocol>::interrupt(self, core).await?;
+        core.deadline = deadline_after(core.limits.interrupt);
+        core.deny_all_pending().await
+    }
+
     /// Sends the prompt `prompt`, with `images` inline as base64 blocks
-    /// after it, read now; an image that cannot be read fails the turn.
+    /// after it, read now; an image that cannot be read fails the turn, and
+    /// so does a command that always runs in a subagent while the mode asks
+    /// (see `subtask_refusal`).
     async fn send_blocks(
         &mut self,
         core: &mut Core,
         mut prompt: Vec<Value>,
         images: &[ImageAttachment],
     ) -> Result<(), DriverError> {
+        // opencode runs a command when the prompt's text starts with `/name`.
+        let command = prompt
+            .first()
+            .and_then(|block| block["text"].as_str())
+            .and_then(|text| text.strip_prefix('/'))
+            .and_then(|text| text.split_whitespace().next())
+            .filter(|name| SUBTASK_COMMANDS.contains(name));
+        if let Some(refusal) =
+            command.and_then(|name| subtask_refusal(Some(name), core.mode, "Octet did not send it"))
+        {
+            return fail_turn(core, refusal);
+        }
+        self.turn_mode = Some(core.mode);
         let mut encoded = Vec::with_capacity(images.len());
         for image in images {
             // A file swapped for a FIFO, or on a stalled mount, must not hold
@@ -747,24 +825,25 @@ impl OpencodeProtocol {
             .await
     }
 
-    /// The model's reply. A refusal is reported and the session keeps
-    /// opencode's model; either way the effort and the agent are set next.
-    /// A new model may start at another level, so its levels are what its
-    /// reply reports.
+    /// The model's reply; the effort and the agent are set next. A refusal
+    /// stops the session: going on would run the user's prompts on
+    /// opencode's own default, a model (and perhaps a bill) they never
+    /// chose. A new model may start at another level, so its levels are
+    /// what its reply reports.
     async fn model_set(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
         let requested = core.config.model.clone().unwrap_or_default();
         if let Some(error) = v.get("error") {
-            core.emit(Event::Notice(format!(
-                "opencode did not switch to model {}: {}",
+            return Err(format!(
+                "opencode refused the model {}: {}",
                 short(&requested),
                 error_text(error)
-            )))?;
-        } else {
-            // A reply without the options still confirms the request.
-            self.model = Some(requested).filter(|model| valid_identifier(model));
-            self.effort = Efforts::Unknown;
-            self.note_options(&v["result"]["configOptions"]);
+            )
+            .into());
         }
+        // A reply without the options still confirms the request.
+        self.model = Some(requested).filter(|model| valid_identifier(model));
+        self.effort = Efforts::Unknown;
+        self.note_options(&v["result"]["configOptions"]);
         self.effort_step(core).await
     }
 
@@ -999,6 +1078,9 @@ impl OpencodeProtocol {
             return Ok(());
         }
         self.tools.clear();
+        if let Some(refusal) = self.subtask_stopped.take() {
+            return core.finish_turn(Outcome::Failed, Some(refusal));
+        }
         if let Some(error) = v.get("error") {
             return core.finish_turn(Outcome::Failed, Some(error_text(error)));
         }
@@ -1016,18 +1098,16 @@ impl OpencodeProtocol {
     }
 
     /// A `tool_call` or `tool_call_update`: the call as it now stands. Its
-    /// name is the title of its first frame; its target is the first path it
-    /// touches, else its command.
+    /// name is the title of its first frame; its target is the newest one a
+    /// frame names (see `frame_target`).
     fn tool(&mut self, core: &Core, update: &Value) -> Result<(), DriverError> {
         let id = one_line(update["toolCallId"].as_str().unwrap_or_default());
-        let target = update
-            .pointer("/locations/0/path")
-            .and_then(Value::as_str)
-            .or_else(|| update.pointer("/rawInput/command").and_then(Value::as_str))
-            .map(one_line)
-            .filter(|target| !target.is_empty());
-        let (name, target) = if let Some((name, known)) = self.tools.get(&id) {
-            (name.clone(), target.unwrap_or_else(|| known.clone()))
+        let target = frame_target(update);
+        let (name, target) = if let Some((name, known)) = self.tools.get_mut(&id) {
+            if let Some(target) = target {
+                *known = target;
+            }
+            (name.clone(), known.clone())
         } else {
             let name = update["title"]
                 .as_str()
@@ -1054,6 +1134,22 @@ impl OpencodeProtocol {
             detail: content_text(&update["content"]),
         }))
     }
+}
+
+/// What a tool call's frame says the call acts on, in one line: a command's
+/// command (its location is only the folder it runs in), else the first path
+/// it touches, else its command; `None` when the frame names none of them.
+fn frame_target(update: &Value) -> Option<String> {
+    let command = update.pointer("/rawInput/command").and_then(Value::as_str);
+    let target = if update["kind"] == "execute" {
+        command
+    } else {
+        update
+            .pointer("/locations/0/path")
+            .and_then(Value::as_str)
+            .or(command)
+    };
+    target.map(one_line).filter(|target| !target.is_empty())
 }
 
 /// Deletes `session` with `opencode session delete`, on a task of its own:
@@ -1093,14 +1189,6 @@ fn skill_prompt(name: &str, args: &str, context: Option<&str>) -> Vec<Value> {
     blocks
 }
 
-/// Whether the command list `list` holds the command `name`.
-fn offers(list: &Value, name: &str) -> bool {
-    list.as_array()
-        .into_iter()
-        .flatten()
-        .any(|command| command["name"] == name)
-}
-
 /// Why opencode's reply to setting an agent is not a confirmation.
 enum Refusal {
     /// An error reply, with its message.
@@ -1117,16 +1205,23 @@ enum Refusal {
 /// A request from opencode. A permission request for this session's running
 /// turn is shown to the user, who decides; anything else (another session's,
 /// one while the turn is being cancelled, or no turn's) gets the stray
-/// reply, with a notice.
-async fn server_request(core: &mut Core, v: Value) -> Result<(), DriverError> {
+/// reply, with a notice, except a client capability's, which is refused
+/// quietly.
+async fn server_request(core: &mut Core, v: Value, known: Option<&str>) -> Result<(), DriverError> {
     let method = v["method"].as_str().unwrap_or_default();
     let this_session = !core.session.is_empty()
         && v.pointer("/params/sessionId").and_then(Value::as_str) == Some(core.session.as_str());
     if method == "session/request_permission" && this_session && core.phase == Phase::InTurn {
-        let (detail, summary) = approval(&v["params"]["toolCall"]);
+        let (detail, summary) = approval(&v["params"]["toolCall"], known);
         return core.queue_approval(v, detail, summary).await;
     }
     if let Some(reply) = opencode_stray_reply(&v) {
+        if client_capability(method) {
+            // opencode 1.18.25 asks the client to write every edit it was
+            // allowed, although Octet offers no file system; it has already
+            // written the file itself, so the refusal is nothing to report.
+            return core.send(reply).await;
+        }
         let notice = if method == "session/request_permission" {
             let when = if this_session && core.phase == Phase::Interrupting {
                 "while its turn is being cancelled"
@@ -1143,9 +1238,18 @@ async fn server_request(core: &mut Core, v: Value) -> Result<(), DriverError> {
     Ok(())
 }
 
+/// Whether `method` is one of the client capabilities (`fs/*`, `terminal/*`)
+/// Octet does not offer in `initialize`: such a request is refused without
+/// a notice.
+fn client_capability(method: &str) -> bool {
+    method.starts_with("fs/") || method.starts_with("terminal/")
+}
+
 /// What a permission request's `toolCall` would do: the dialog's detail
-/// (`kind · title`, then its `rawInput` in full) and its summary.
-fn approval(tool_call: &Value) -> (String, ApprovalSummary) {
+/// (`kind · title`, then its `rawInput` in full) and its summary. `known` is
+/// the target its tool call named earlier: opencode 1.18.25 asks to read a
+/// file without naming it.
+fn approval(tool_call: &Value, known: Option<&str>) -> (String, ApprovalSummary) {
     let kind = tool_call["kind"].as_str().unwrap_or("other");
     let title = tool_call["title"].as_str().unwrap_or("tool");
     let mut detail = format!("{kind} · {title}");
@@ -1154,24 +1258,75 @@ fn approval(tool_call: &Value) -> (String, ApprovalSummary) {
         detail.push('\n');
         detail.push_str(&serde_json::to_string_pretty(input).unwrap_or_default());
     }
+    let locations: Vec<String> = tool_call["locations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|location| location["path"].as_str())
+        .map(str::to_owned)
+        .collect();
+    let command = input["command"].as_str().map(str::to_owned);
     let summary = match kind {
         "execute" => ApprovalSummary {
             command: Some(title.to_owned()),
             ..ApprovalSummary::new("Run a shell command")
         },
         "edit" => ApprovalSummary {
-            files: tool_call["locations"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|location| location["path"].as_str())
-                .map(str::to_owned)
-                .collect(),
+            files: locations,
             ..ApprovalSummary::new("Edit files")
         },
+        "read" => {
+            let files = if locations.is_empty() {
+                known.map(str::to_owned).into_iter().collect()
+            } else {
+                locations
+            };
+            let action = match files.as_slice() {
+                [] => "Read a file opencode did not name".to_owned(),
+                [file] => format!("Read {}", file_name(file)),
+                many => format!("Read {} files", many.len()),
+            };
+            ApprovalSummary {
+                files,
+                ..ApprovalSummary::new(action)
+            }
+        }
+        "fetch" => {
+            let address = input["url"].as_str().unwrap_or(title);
+            ApprovalSummary::new(format!("Fetch {}", one_line(address)))
+        }
+        // opencode's `external_directory` permission: a path outside the
+        // workspace, for a read or edit, or for a command.
+        "other"
+            if ["filepath", "parentDir", "directories"]
+                .iter()
+                .any(|key| !input[key].is_null()) =>
+        {
+            let path = input["filepath"]
+                .as_str()
+                .or_else(|| input.pointer("/directories/0").and_then(Value::as_str))
+                .or_else(|| input["parentDir"].as_str())
+                .or(known)
+                .unwrap_or(title);
+            ApprovalSummary {
+                command,
+                files: locations,
+                ..ApprovalSummary::new(format!("Reach {}, outside the workspace", one_line(path)))
+            }
+        }
         _ => ApprovalSummary::new("Use a tool"),
     };
     (detail, summary)
+}
+
+/// The last part of `path` in one short line, or the path itself when it
+/// has none.
+fn file_name(path: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    one_line(name)
 }
 
 /// The reply to a `session/request_permission`: the request's own
@@ -1626,15 +1781,6 @@ mod tests {
     }
 
     #[test]
-    fn compaction_is_offered_when_the_command_list_holds_it() {
-        let list = json!([{"name": "init"}, {"name": "compact"}]);
-        assert!(offers(&list, "compact"));
-        assert!(!offers(&json!([{"name": "init"}]), "compact"));
-        assert!(!offers(&json!([]), "compact"));
-        assert!(!offers(&Value::Null, "compact"));
-    }
-
-    #[test]
     fn the_catalog_is_the_model_options_values_and_names() {
         let models = catalog(&model_options(&json!([
             {"value": "opencode/free", "name": "OpenCode/Free"},
@@ -1746,10 +1892,13 @@ mod tests {
 
     #[test]
     fn an_approval_shows_the_tool_call_and_what_it_would_do() {
-        let (detail, summary) = approval(&json!({
-            "kind": "execute", "title": "rm -rf build",
-            "rawInput": {"command": "rm -rf build"}, "locations": [],
-        }));
+        let (detail, summary) = approval(
+            &json!({
+                "kind": "execute", "title": "rm -rf build",
+                "rawInput": {"command": "rm -rf build"}, "locations": [],
+            }),
+            None,
+        );
         assert_eq!(
             detail,
             "execute · rm -rf build\n{\n  \"command\": \"rm -rf build\"\n}"
@@ -1758,24 +1907,75 @@ mod tests {
         assert_eq!(summary.command.as_deref(), Some("rm -rf build"));
         assert!(summary.files.is_empty());
 
-        let (detail, summary) = approval(&json!({
-            "kind": "edit", "title": "src/a.rs",
-            "locations": [{"path": "/w/src/a.rs"}, {"path": "/w/src/b.rs"}, {"line": 3}],
-        }));
+        let (detail, summary) = approval(
+            &json!({
+                "kind": "edit", "title": "src/a.rs",
+                "locations": [{"path": "/w/src/a.rs"}, {"path": "/w/src/b.rs"}, {"line": 3}],
+            }),
+            None,
+        );
         assert_eq!(detail, "edit · src/a.rs");
         assert_eq!(summary.action, "Edit files");
         assert_eq!(summary.files, ["/w/src/a.rs", "/w/src/b.rs"]);
         assert_eq!(summary.command, None);
 
-        for call in [
-            json!({"kind": "fetch", "title": "https://example.com", "rawInput": {}}),
-            json!({}),
-        ] {
-            let (_, summary) = approval(&call);
-            assert_eq!(summary.action, "Use a tool");
-            assert_eq!(summary.command, None);
-        }
-        assert_eq!(approval(&json!({})).0, "other · tool");
+        let (_, summary) = approval(&json!({}), None);
+        assert_eq!(summary.action, "Use a tool");
+        assert_eq!(summary.command, None);
+        assert_eq!(approval(&json!({}), None).0, "other · tool");
+    }
+
+    #[test]
+    fn a_read_approval_names_its_file_even_when_the_request_does_not() {
+        // opencode 1.18.25 sends a read's request with no path at all; the
+        // path is the one its tool call named.
+        let request = json!({"kind": "read", "title": "read", "locations": [], "rawInput": {}});
+        let (detail, summary) = approval(&request, Some("/w/.env"));
+        assert_eq!(detail, "read · read\n{}");
+        assert_eq!(summary.action, "Read .env");
+        assert_eq!(summary.files, ["/w/.env"]);
+        let (_, summary) = approval(&request, None);
+        assert_eq!(summary.action, "Read a file opencode did not name");
+        assert!(summary.files.is_empty());
+        // A path the request names wins.
+        let named = json!({"kind": "read", "title": "a.rs", "locations": [{"path": "/w/a.rs"}]});
+        let (_, summary) = approval(&named, Some("/w/.env"));
+        assert_eq!(summary.action, "Read a.rs");
+        assert_eq!(summary.files, ["/w/a.rs"]);
+    }
+
+    #[test]
+    fn a_fetch_approval_names_its_address() {
+        let request = json!({"kind": "fetch", "title": "https://example.com", "locations": [],
+            "rawInput": {"url": "https://example.com/a", "format": "text"}});
+        let (_, summary) = approval(&request, None);
+        assert_eq!(summary.action, "Fetch https://example.com/a");
+        assert!(summary.files.is_empty());
+        let (_, summary) = approval(
+            &json!({"kind": "fetch", "title": "https://b.example"}),
+            None,
+        );
+        assert_eq!(summary.action, "Fetch https://b.example");
+    }
+
+    #[test]
+    fn an_outside_the_workspace_approval_names_the_path_and_any_command() {
+        // A read outside the workspace, as opencode 1.18.25 asks for it.
+        let read = json!({"kind": "other", "title": "/etc",
+            "locations": [{"path": "/etc/hosts"}, {"path": "/etc"}],
+            "rawInput": {"filepath": "/etc/hosts", "parentDir": "/etc"}});
+        let (_, summary) = approval(&read, Some("/etc/hosts"));
+        assert_eq!(summary.action, "Reach /etc/hosts, outside the workspace");
+        assert_eq!(summary.files, ["/etc/hosts", "/etc"]);
+        assert_eq!(summary.command, None);
+        // A command that touches another folder.
+        let command = json!({"kind": "other", "title": "touch /h/x.txt",
+            "locations": [{"path": "/h"}],
+            "rawInput": {"command": "touch /h/x.txt", "directories": ["/h"], "patterns": ["/h/*"]}});
+        let (_, summary) = approval(&command, None);
+        assert_eq!(summary.action, "Reach /h, outside the workspace");
+        assert_eq!(summary.command.as_deref(), Some("touch /h/x.txt"));
+        assert_eq!(summary.files, ["/h"]);
     }
 
     #[test]

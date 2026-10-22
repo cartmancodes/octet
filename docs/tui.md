@@ -274,7 +274,9 @@ turn; a reconnect before then (for example `/effort`) forks again, so the
 original is never written to.
 
 **Compaction.** `/compact` asks the vendor to compact its context (Codex
-`thread/compact/start`, Claude's own `/compact`). It runs as a turn: its
+`thread/compact/start`, Claude's own `/compact`, and opencode's `/compact`,
+which summarizes the session although opencode does not list it among its
+commands). It runs as a turn: its
 output streams as usual and Esc cancels it.
 
 **Images.** `/image PATH` attaches an image to the next prompt; the prompt
@@ -329,7 +331,13 @@ it also shows the running mode when a change is waiting for the next turn.
 `auto` hands approval decisions to the vendor's own reviewer; Octet never
 answers a vendor approval by itself. opencode's `ask` and `accept-edits`
 agents turn subagents (its `task` tool) off: opencode runs a subagent under
-an agent of its own that would not ask. Reading files proceeds in both,
+an agent of its own that would not ask. A command opencode runs as a
+subagent (its built-in `/review`, or one of yours with `subtask: true`) does
+not run in those modes either: opencode 1.18.25 never passes a subagent's
+approval requests on to Octet, so the turn would wait unseen. Octet refuses
+`/review` before sending it, and stops the turn, saying why, as soon as
+another command starts a subagent. In `auto`, opencode's own permission
+settings decide. Reading files proceeds in both,
 except `.env` files (not `.env.example`), which ask as in opencode's own
 defaults. Codex has no edits-only mode, so
 `accept-edits` is its closest analogue: in-workspace edits already proceed under
@@ -413,7 +421,10 @@ the one listing it after a `sub/` part (`glm-5.3-flash-free` to opencode's
 `opencode/glm-5.3-flash-free`), else stays with the current provider as a
 custom ID. `default` is always the current
 provider's, and the explicit forms (`/model codex X`, `claude/X`) work as
-before.
+before. A model the provider refuses when the session connects (a typo, or
+one opencode does not list) stops the session with an error naming the model
+and the provider's reason, as `--model` does in `--print` and `--rpc` (exit
+1): Octet never runs your prompts on the provider's default instead.
 
 `/model` alone, or typing `/model ` (with the space), opens the model picker
 above the prompt box: every provider's models, the current provider's first,
