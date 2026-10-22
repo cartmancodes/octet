@@ -282,6 +282,50 @@ impl OpencodeFixture {
         ));
     }
 
+    /// `OPENCODE_SUBTASK`: the subagent's tool call starts; its approval
+    /// requests never reach the client, so the prompt `id` waits for a cancel.
+    fn start_subtask(&mut self, id: &Value) {
+        self.held = Some(id.clone());
+        emit(&acp_update(
+            &self.session,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"task-0","title":"task","kind":"think","status":"pending","locations":[],"rawInput":{"prompt":"Do the fixture subtask","description":"A fixture subtask","subagent_type":self.mode,"command":scenario::OPENCODE_SUBTASK}}),
+        ));
+    }
+
+    /// `OPENCODE_READ_ENV`, for the prompt `id`: the read's tool call names
+    /// the file, its permission request does not.
+    fn read_env(&mut self, id: &Value) {
+        self.held = Some(id.clone());
+        self.awaiting = 1;
+        self.approvals_9 = false;
+        let sid = &self.session;
+        emit(&acp_update(
+            sid,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"read-0","title":"read","kind":"read","status":"pending","locations":[],"rawInput":{}}),
+        ));
+        emit(&acp_update(
+            sid,
+            &json!({"sessionUpdate":"tool_call_update","toolCallId":"read-0","status":"in_progress","kind":"read","title":"read","locations":[{"path":"/w/.env"}],"rawInput":{"filePath":"/w/.env"}}),
+        ));
+        emit(
+            &json!({"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":sid,"toolCall":{"toolCallId":"read-0","title":"read","kind":"read","status":"pending","locations":[],"rawInput":{}},"options":[{"optionId":"once","kind":"allow_once","name":"Allow once"},{"optionId":"reject","kind":"reject_once","name":"Reject"}]}}),
+        );
+    }
+
+    /// `OPENCODE_EDIT`, for the prompt `id`: asks to edit `fixture.txt`.
+    fn edit(&mut self, id: &Value) {
+        self.held = Some(id.clone());
+        self.awaiting = 1;
+        self.approvals_9 = false;
+        self.writes_on_allow = true;
+        let path = edit_path();
+        emit(&acp_update(
+            &self.session,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"edit-0","title":"write","kind":"edit","status":"pending","locations":[{"path":path}],"rawInput":{"filePath":path,"content":"hi"}}),
+        ));
+        emit(&edit_permission(&self.session, "edit-0", &path));
+    }
+
     /// Runs the script the prompt's first text block names, under the
     /// session's agent as it is now.
     fn prompt(&mut self, v: &Value) {
@@ -314,13 +358,7 @@ impl OpencodeFixture {
         }
         let subtask = format!("/{}", scenario::OPENCODE_SUBTASK);
         if text.split_whitespace().next() == Some(subtask.as_str()) {
-            // The subagent's tool call starts; its approval requests never
-            // reach the client, so the prompt waits for a cancel.
-            self.held = Some(id.clone());
-            emit(&acp_update(
-                &sid,
-                &json!({"sessionUpdate":"tool_call","toolCallId":"task-0","title":"task","kind":"think","status":"pending","locations":[],"rawInput":{"prompt":"Do the fixture subtask","description":"A fixture subtask","subagent_type":self.mode,"command":scenario::OPENCODE_SUBTASK}}),
-            ));
+            self.start_subtask(id);
             return;
         }
         // A slash command is echoed as the reply, as a skill's expansion would be.
@@ -341,22 +379,7 @@ impl OpencodeFixture {
                 self.held = Some(id.clone());
                 self.asks_on_cancel = true;
             }
-            scenario::OPENCODE_READ_ENV => {
-                self.held = Some(id.clone());
-                self.awaiting = 1;
-                self.approvals_9 = false;
-                emit(&acp_update(
-                    &sid,
-                    &json!({"sessionUpdate":"tool_call","toolCallId":"read-0","title":"read","kind":"read","status":"pending","locations":[],"rawInput":{}}),
-                ));
-                emit(&acp_update(
-                    &sid,
-                    &json!({"sessionUpdate":"tool_call_update","toolCallId":"read-0","status":"in_progress","kind":"read","title":"read","locations":[{"path":"/w/.env"}],"rawInput":{"filePath":"/w/.env"}}),
-                ));
-                emit(
-                    &json!({"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":sid,"toolCall":{"toolCallId":"read-0","title":"read","kind":"read","status":"pending","locations":[],"rawInput":{}},"options":[{"optionId":"once","kind":"allow_once","name":"Allow once"},{"optionId":"reject","kind":"reject_once","name":"Reject"}]}}),
-                );
-            }
+            scenario::OPENCODE_READ_ENV => self.read_env(id),
             scenario::CHATTER => {
                 // The turn goes silent while another session keeps talking.
                 self.held = Some(id.clone());
@@ -373,18 +396,7 @@ impl OpencodeFixture {
                 emit(&tool_call(&sid, "call-0"));
                 emit(&permission(&sid, 0, "call-0"));
             }
-            scenario::OPENCODE_EDIT => {
-                self.held = Some(id.clone());
-                self.awaiting = 1;
-                self.approvals_9 = false;
-                self.writes_on_allow = true;
-                let path = edit_path();
-                emit(&acp_update(
-                    &sid,
-                    &json!({"sessionUpdate":"tool_call","toolCallId":"edit-0","title":"write","kind":"edit","status":"pending","locations":[{"path":path}],"rawInput":{"filePath":path,"content":"hi"}}),
-                ));
-                emit(&edit_permission(&sid, "edit-0", &path));
-            }
+            scenario::OPENCODE_EDIT => self.edit(id),
             scenario::APPROVALS_9 => {
                 self.held = Some(id.clone());
                 self.awaiting = 9;
