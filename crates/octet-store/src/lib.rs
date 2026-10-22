@@ -150,6 +150,8 @@ pub struct JournalSummary {
     pub session: String,
     /// The first prompt the user sent, if any.
     pub first_prompt: Option<String>,
+    /// The last prompt the user sent within the summary's window, if any.
+    pub last_prompt: Option<String>,
 }
 /// Summarises the journal at `path` from at most its first 64 KiB. `None` if
 /// it is not a journal: a name other than `session-<nanos>-<pid>.jsonl`, or
@@ -186,14 +188,18 @@ pub async fn read_summary(path: &Path) -> Option<JournalSummary> {
         model: data["model"].as_str().map(str::to_owned),
         session: String::new(),
         first_prompt: None,
+        last_prompt: None,
     };
     for record in records {
         match (record["type"].as_str(), record["data"].as_str()) {
             (Some("ready"), Some(session)) if !session.is_empty() => {
                 session.clone_into(&mut summary.session);
             }
-            (Some("user"), Some(text)) if summary.first_prompt.is_none() => {
-                summary.first_prompt = Some(text.to_owned());
+            (Some("user"), Some(text)) => {
+                if summary.first_prompt.is_none() {
+                    summary.first_prompt = Some(text.to_owned());
+                }
+                summary.last_prompt = Some(text.to_owned());
             }
             _ => {}
         }

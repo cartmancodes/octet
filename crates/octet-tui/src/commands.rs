@@ -487,10 +487,19 @@ pub(crate) fn show_sessions(app: &mut App, listed: Vec<octet_core::RecentSession
             } else {
                 ""
             };
-            let prompt = summary
+            let mut prompt = summary
                 .first_prompt
                 .as_deref()
                 .map_or_else(|| "(no prompt)".to_owned(), |p| cut(p, 60));
+            // The first prompt names the session; the latest says where it got to.
+            if let Some(last) = summary
+                .last_prompt
+                .as_deref()
+                .filter(|last| summary.first_prompt.as_deref() != Some(*last))
+            {
+                prompt.push_str("\n   latest: ");
+                prompt.push_str(&cut(last, 60));
+            }
             format!(
                 "{}. {} · {}{this} · {} · {}\n   {prompt}",
                 index + 1,

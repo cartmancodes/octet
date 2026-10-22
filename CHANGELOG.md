@@ -357,6 +357,9 @@ Claude Code and Codex CLIs.
 - The goal completion marker `[[OCTET_GOAL_COMPLETE]]` showed in the
   conversation; it is now hidden there and from `/copy` (the journal keeps
   the reply as sent).
+- `/sessions` labelled a reconnected session with the first prompt of its
+  newest journal, neither its first nor its latest. It now shows the
+  session's first prompt, and its latest when that differs.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

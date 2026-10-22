@@ -590,7 +590,8 @@ See [the goal workflow guide](rust/goals.md).
 `/session` shows the vendor session ID and journal path. `/reconnect` reopens that
 vendor context; `--resume VENDOR_SESSION_ID` does the same on a later launch.
 `/sessions` lists up to 20 recent vendor sessions in this workspace, newest
-first: provider, session ID, model, age and first prompt. `/resume N` reopens
+first: provider, session ID, model, age and the session's first prompt (from its
+oldest journal listed), then its latest prompt when that differs. `/resume N` reopens
 entry N, switching provider when it belongs to the other vendor, in a fresh
 view. The list comes from Octet's own journals (at most the first 64 KiB of
 each, skipping a torn last line); reconnects of one session show as one entry.

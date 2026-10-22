@@ -521,6 +521,38 @@ async fn oversized_or_unknown_images_are_refused() {
     key_action(&mut app, &vendor, key(KeyCode::Esc)).await;
     assert!(app.composer.images.is_empty());
 }
+#[test]
+fn sessions_show_the_first_prompt_and_the_latest_when_it_differs() {
+    let mut app = app();
+    let summary = |first: &str, last: &str| octet_core::JournalSummary {
+        started: std::time::SystemTime::now(),
+        engine: "codex".into(),
+        cwd: "/work".into(),
+        model: None,
+        session: format!("t-{first}"),
+        first_prompt: Some(first.into()),
+        last_prompt: Some(last.into()),
+    };
+    let listed = [
+        summary("Reply OK1.", "Reply OK39."),
+        summary("Only one.", "Only one."),
+    ]
+    .into_iter()
+    .map(|summary| octet_core::RecentSession {
+        engine: Engine::CODEX,
+        journal: "/j/session-1-1.jsonl".into(),
+        summary,
+    })
+    .collect();
+    crate::commands::show_sessions(&mut app, listed);
+    let text = app.entries_text();
+    assert!(
+        text.contains("   Reply OK1.\n   latest: Reply OK39."),
+        "{text}"
+    );
+    assert!(text.contains("   Only one."), "{text}");
+    assert!(!text.contains("latest: Only one."), "{text}");
+}
 #[tokio::test]
 async fn resume_picks_the_listed_session() {
     let temp = octet_testkit::TempDir::new("octet-tui-sessions");

@@ -14,8 +14,9 @@ pub struct RecentSession {
     pub engine: Engine,
     /// The newest journal for it.
     pub journal: PathBuf,
-    /// What that journal says about it; `first_prompt` comes from an older
-    /// journal of the same session when the newest has none.
+    /// What that journal says about it, except `first_prompt`, the oldest
+    /// listed journal's of the same session (the session's own first), and
+    /// `last_prompt`, from an older one when the newest has none.
     pub summary: JournalSummary,
 }
 
@@ -71,14 +72,19 @@ pub async fn recent_sessions_in(
             continue;
         }
         // Reconnects write a journal per connection; the newest stands for
-        // the session, and an older one may know its first prompt.
+        // the session. Journals come newest first, so an older one's first
+        // prompt is the session's, and its last one counts only while no
+        // newer journal had a prompt.
         if let Some(known) = found.iter_mut().find(|s| {
             s.engine == engine
                 && s.summary.session == summary.session
                 && s.summary.cwd == summary.cwd
         }) {
-            if known.summary.first_prompt.is_none() {
+            if summary.first_prompt.is_some() {
                 known.summary.first_prompt = summary.first_prompt;
+            }
+            if known.summary.last_prompt.is_none() {
+                known.summary.last_prompt = summary.last_prompt;
             }
             continue;
         }
@@ -209,6 +215,38 @@ mod tests {
         let few = recent_sessions_in(dir, &wanted, 20, 3).await;
         assert_eq!(listed(&few), ["a-2", "a-3", "b-1"]);
         assert!(recent_sessions_in(dir, &[], 20, 20).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reconnected_session_shows_its_first_and_latest_prompts() {
+        let temp = octet_testkit::TempDir::new("octet-core-sessions-span");
+        let dir = temp.path();
+        std::fs::create_dir_all(dir).unwrap();
+        // One session over three connections (a journal each).
+        journal(dir, 1, "opencode", "/work", "ses-1", Some("Reply with OK."));
+        journal(
+            dir,
+            2,
+            "opencode",
+            "/work",
+            "ses-1",
+            Some("Launch a subagent"),
+        );
+        let header =
+            json!({"engine":"opencode","cwd":"/work","resume":"ses-1","model":null,"mode":"ask"});
+        let records = [
+            ("session", header),
+            ("ready", json!("ses-1")),
+            ("user", json!("third")),
+            ("user", json!("fourth")),
+        ];
+        octet_testkit::write_journal(dir, 3, &records, "");
+        let found = recent_sessions(dir, Path::new("/work"), 20).await;
+        assert_eq!(found.len(), 1);
+        let summary = &found[0].summary;
+        assert!(found[0].journal.ends_with("session-3-1.jsonl"));
+        assert_eq!(summary.first_prompt.as_deref(), Some("Reply with OK."));
+        assert_eq!(summary.last_prompt.as_deref(), Some("fourth"));
     }
 
     #[tokio::test]
