@@ -359,7 +359,12 @@ impl OpencodeFixture {
                 }
             }
             scenario::TOOL_FAIL => {
-                emit(&tool_call(&sid, "call-9"));
+                // As opencode 1.18.25 starts a `bash` call: its location is
+                // the working directory, and the command comes later.
+                emit(&acp_update(
+                    &sid,
+                    &json!({"sessionUpdate":"tool_call","toolCallId":"call-9","title":"bash","kind":"execute","status":"pending","locations":[{"path":"/tmp"}],"rawInput":{"cwd":"/tmp"}}),
+                ));
                 emit(&acp_update(
                     &sid,
                     &json!({"sessionUpdate":"tool_call_update","toolCallId":"call-9","status":"failed","kind":"execute","title":"false","locations":[{"path":"/tmp"}],"rawInput":{"command":"false"},"content":[{"type":"content","content":{"type":"text","text":"boom"}}]}),

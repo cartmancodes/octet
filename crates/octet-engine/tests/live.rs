@@ -3472,6 +3472,32 @@ async fn opencode_full_access_launches_with_its_agent() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn an_opencode_command_is_shown_by_its_command_not_its_folder() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::TOOL_FAIL.into()))
+        .unwrap();
+    let mut tools = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Tool(call) => tools.push((call.name, call.target, call.phase)),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    // The first frame names no command yet, only the working directory.
+    assert_eq!(
+        tools,
+        [
+            ("bash".to_owned(), String::new(), ToolPhase::Running),
+            ("bash".to_owned(), "false".to_owned(), ToolPhase::Failed),
+        ]
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_failed_turn_shows_the_message() {
     let (handle, mut events, task) = spawn(opencode());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;

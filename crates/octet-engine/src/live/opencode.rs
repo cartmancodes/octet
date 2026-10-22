@@ -1016,18 +1016,16 @@ impl OpencodeProtocol {
     }
 
     /// A `tool_call` or `tool_call_update`: the call as it now stands. Its
-    /// name is the title of its first frame; its target is the first path it
-    /// touches, else its command.
+    /// name is the title of its first frame; its target is the newest one a
+    /// frame names (see `frame_target`).
     fn tool(&mut self, core: &Core, update: &Value) -> Result<(), DriverError> {
         let id = one_line(update["toolCallId"].as_str().unwrap_or_default());
-        let target = update
-            .pointer("/locations/0/path")
-            .and_then(Value::as_str)
-            .or_else(|| update.pointer("/rawInput/command").and_then(Value::as_str))
-            .map(one_line)
-            .filter(|target| !target.is_empty());
-        let (name, target) = if let Some((name, known)) = self.tools.get(&id) {
-            (name.clone(), target.unwrap_or_else(|| known.clone()))
+        let target = frame_target(update);
+        let (name, target) = if let Some((name, known)) = self.tools.get_mut(&id) {
+            if let Some(target) = target {
+                *known = target;
+            }
+            (name.clone(), known.clone())
         } else {
             let name = update["title"]
                 .as_str()
@@ -1054,6 +1052,22 @@ impl OpencodeProtocol {
             detail: content_text(&update["content"]),
         }))
     }
+}
+
+/// What a tool call's frame says the call acts on, in one line: a command's
+/// command (its location is only the folder it runs in), else the first path
+/// it touches, else its command; `None` when the frame names none of them.
+fn frame_target(update: &Value) -> Option<String> {
+    let command = update.pointer("/rawInput/command").and_then(Value::as_str);
+    let target = if update["kind"] == "execute" {
+        command
+    } else {
+        update
+            .pointer("/locations/0/path")
+            .and_then(Value::as_str)
+            .or(command)
+    };
+    target.map(one_line).filter(|target| !target.is_empty())
 }
 
 /// Deletes `session` with `opencode session delete`, on a task of its own:
