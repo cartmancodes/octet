@@ -10,6 +10,62 @@ fn screen(width: u16, height: u16, app: &mut App) -> Vec<String> {
         .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
         .collect()
 }
+/// A Claude interface with a conversation that fills the width.
+fn talkative_app() -> App {
+    let c = octet_core::Config::new(octet_core::Engine::CLAUDE, "claude", "/tmp/project");
+    let mut app = App::new(&c, "journal".into());
+    crate::test_support::idle(&mut app);
+    for n in 0..6 {
+        app.event(Event::User(format!(
+            "prompt {n} with a long line of text that goes on and on to fill the width"
+        )));
+        app.event(Event::Text(format!(
+            "reply {n} with a long line of text that goes on and on to fill the width"
+        )));
+    }
+    app
+}
+#[test]
+fn the_model_picker_is_as_wide_as_its_longest_line() {
+    let mut app = talkative_app();
+    let long = octet_core::ModelInfo {
+        selection: "openai/gpt-5.4-mini-fast".into(),
+        id: Some("openai/gpt-5.4-mini-fast".into()),
+        name: "OpenAI/GPT-5.4 mini Fast (priority tier)".into(),
+        description: String::new(),
+    };
+    app.models.catalogs.set(
+        octet_core::Engine::OPENCODE,
+        vec![long],
+        std::time::SystemTime::now(),
+    );
+    app.composer.editor.set("/model openai/gpt-5.4-mini".into());
+    crate::input::refresh_model_picker(&mut app);
+    let rows = screen(160, 50, &mut app);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("OpenAI/GPT-5.4 mini Fast (priority tier)")),
+        "{}",
+        rows.join("\n")
+    );
+}
+#[test]
+fn the_approval_dialog_is_framed_apart_from_the_conversation() {
+    let mut app = talkative_app();
+    app.event(approval(7, "Write /tmp/project/hello.txt"));
+    let rows = screen(160, 50, &mut app);
+    // Its own border sets it apart from the conversation it covers.
+    let heading = rows
+        .iter()
+        .position(|row| row.contains("Permission required"))
+        .expect("the dialog shows");
+    assert!(
+        rows[heading].contains("│ Permission required"),
+        "{}",
+        rows.join("\n")
+    );
+    assert!(rows[heading - 1].contains("╭─"), "{}", rows.join("\n"));
+}
 #[test]
 fn following_the_latest_cancels_a_pending_catalog_scroll() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
@@ -532,6 +588,20 @@ fn mascot_tracks_activity_and_keeps_errors_visible_after_disconnect() {
             rows[3]
         );
     }
+}
+#[test]
+fn a_warning_is_labelled_and_on_the_status_line() {
+    let c = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp/project");
+    let mut app = App::new(&c, "journal".into());
+    app.warn("Full access carried to Claude: no permission checks.");
+    let rows = screen(100, 30, &mut app);
+    let text = rows.join("\n");
+    assert!(text.contains("WARNING"), "{text}");
+    assert!(text.contains("Full access carried to Claude"), "{text}");
+    assert_eq!(
+        app.status_line,
+        "Full access carried to Claude: no permission checks."
+    );
 }
 #[test]
 fn renders_narrow_wide_and_approval_without_panics() {

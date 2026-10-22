@@ -61,6 +61,8 @@ pub(crate) struct Models {
     /// Set once the interface may start probes.
     prober: Option<Prober>,
     pub(crate) probing: HashSet<Engine>,
+    /// Probes `/model refresh` asked for: their end is noted.
+    reporting: HashSet<Engine>,
     /// Probes that failed this run: not retried until `/model refresh`.
     pub(crate) failed: HashMap<Engine, String>,
     tx: mpsc::UnboundedSender<Probed>,
@@ -77,6 +79,7 @@ impl Default for Models {
             skill_path: None,
             prober: None,
             probing: HashSet::new(),
+            reporting: HashSet::new(),
             failed: HashMap::new(),
             tx,
             rx,
@@ -126,7 +129,8 @@ impl Models {
     }
 
     /// `/model refresh`: probes every other provider now, forgetting any
-    /// earlier failure.
+    /// earlier failure. How each probe it started or found running ends is
+    /// noted.
     pub(crate) fn refresh(&mut self, active: Engine) -> Refreshed {
         let mut refreshed = Refreshed::default();
         for engine in others(active) {
@@ -135,7 +139,10 @@ impl Models {
                 refreshed.running.push(engine);
             } else if self.probe(engine) {
                 refreshed.started.push(engine);
+            } else {
+                continue;
             }
+            self.reporting.insert(engine);
         }
         refreshed
     }
@@ -171,27 +178,45 @@ impl Models {
         }
     }
 
-    /// A probe ended. A note when the lists could not be saved.
-    pub(crate) fn probed(&mut self, probed: Probed, now: SystemTime) -> Option<String> {
-        self.probing.remove(&probed.engine);
+    /// A probe ended. Notes how, when `/model refresh` asked for it, and
+    /// when the lists could not be saved.
+    pub(crate) fn probed(&mut self, probed: Probed, now: SystemTime) -> Vec<String> {
+        let engine = probed.engine;
+        self.probing.remove(&engine);
+        let reported = self.reporting.remove(&engine);
+        let mut notes = Vec::new();
         match probed.result {
             Ok(listing) => {
-                self.failed.remove(&probed.engine);
-                self.catalogs.set(probed.engine, listing.models, now);
+                self.failed.remove(&engine);
+                if reported {
+                    let count = listing.models.len();
+                    let models = if count == 1 { "model" } else { "models" };
+                    notes.push(format!(
+                        "Fetched {}'s model list ({count} {models})",
+                        engine.as_str()
+                    ));
+                }
+                self.catalogs.set(engine, listing.models, now);
                 let saved = self.save();
                 // The probe ran in the workspace, so its skills are that one's.
                 let skills_saved = self.prober.as_ref().map(|p| p.cwd.clone()).and_then(|ws| {
-                    self.skill_catalogs
-                        .set(probed.engine, &ws, listing.skills, now);
+                    self.skill_catalogs.set(engine, &ws, listing.skills, now);
                     self.save_skills()
                 });
-                saved.or(skills_saved)
+                notes.extend(saved.or(skills_saved));
             }
             Err(error) => {
-                self.failed.insert(probed.engine, error);
-                None
+                if reported {
+                    let reason = error.lines().next().unwrap_or_default();
+                    notes.push(format!(
+                        "Could not fetch {}'s model list: {reason}",
+                        engine.as_str()
+                    ));
+                }
+                self.failed.insert(engine, error);
             }
         }
+        notes
     }
 
     /// The active provider's live list. A note when it could not be saved.
@@ -370,10 +395,11 @@ mod tests {
         // Codex skills yet.
         models.probe_stale(Engine::CLAUDE, now);
         assert!(models.probing.contains(&Engine::CODEX));
-        // opencode, with no list at all, is probed too.
+        // opencode, with no list at all, is probed too. Nobody asked for
+        // these, so they end quietly.
         while !models.probing.is_empty() {
             let probed = models.next().await;
-            models.probed(probed, SystemTime::now());
+            assert!(models.probed(probed, SystemTime::now()).is_empty());
         }
         // All fresh now: no probe.
         models.probe_stale(Engine::CLAUDE, SystemTime::now());
@@ -421,7 +447,7 @@ mod tests {
             engine: Engine::CODEX,
             result: Ok(listing),
         };
-        assert!(models.probed(probed, SystemTime::now()).is_none());
+        assert!(models.probed(probed, SystemTime::now()).is_empty());
         // `fake_prober` probes in the temporary directory.
         let ws = std::env::temp_dir();
         assert_eq!(models.skills(Engine::CODEX, &ws)[0].name, "pdf");
@@ -443,7 +469,9 @@ mod tests {
         while !models.probing.is_empty() {
             let probed = models.next().await;
             engines.push(probed.engine.as_str());
-            assert!(models.probed(probed, SystemTime::now()).is_none());
+            // Saved: the only note is the one the refresh asked for.
+            let notes = models.probed(probed, SystemTime::now());
+            assert!(notes.iter().all(|n| n.starts_with("Fetched")), "{notes:?}");
         }
         engines.sort_unstable();
         assert_eq!(engines, ["codex", "opencode"]);
@@ -490,6 +518,39 @@ mod tests {
         let refreshed = models.refresh(Engine::CLAUDE);
         assert!(refreshed.started.is_empty());
         assert_eq!(refreshed.running, [Engine::CODEX, Engine::OPENCODE]);
+        // Those were asked for again, so their end is reported too.
+        let mut notes = Vec::new();
+        while !models.probing.is_empty() {
+            let probed = models.next().await;
+            notes.extend(models.probed(probed, SystemTime::now()));
+        }
+        assert_eq!(notes.len(), 2, "{notes:?}");
+    }
+
+    #[tokio::test]
+    async fn refresh_notes_each_list_as_it_comes_in_or_fails() {
+        let dir = temp("octet-models-refresh-done");
+        let mut prober = fake_prober();
+        // An opencode that cannot start: its probe fails at once.
+        prober
+            .binaries
+            .insert(Engine::OPENCODE, dir.path().join("no-such-opencode"));
+        let mut models = Models::default();
+        models.attach(dir.path(), prober);
+        let refreshed = models.refresh(Engine::CLAUDE);
+        assert_eq!(refreshed.started, [Engine::CODEX, Engine::OPENCODE]);
+        let mut notes = Vec::new();
+        while !models.probing.is_empty() {
+            let probed = models.next().await;
+            notes.extend(models.probed(probed, SystemTime::now()));
+        }
+        notes.sort();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes[0].starts_with("Could not fetch opencode's model list: "),
+            "{notes:?}"
+        );
+        assert_eq!(notes[1], "Fetched codex's model list (2 models)");
     }
 
     #[test]

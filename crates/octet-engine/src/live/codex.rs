@@ -6,7 +6,7 @@ use super::{
     activity::one_line,
     limited, model_catalog_with,
     protocol::{Core, Phase, Protocol},
-    push_bounded, short, valid_identifier,
+    push_bounded, short, valid_effort, valid_identifier,
 };
 use serde_json::{Value, json};
 use std::{
@@ -57,11 +57,25 @@ enum Outstanding {
     OpenThread,
     ModelList,
     SkillsList,
+    /// `config/read`: the reasoning effort Codex's config names.
+    ConfigRead,
     /// `turn/start` or `thread/compact/start`: an error fails the turn.
     Start,
     Interrupt,
     /// A steer, kept so a refusal can say which text was lost.
     Steer(String),
+}
+
+/// What Codex's config says about the reasoning effort (`config/read`).
+#[derive(Default)]
+enum ConfiguredEffort {
+    /// Codex has not said (or could not).
+    #[default]
+    Unknown,
+    /// No level: each model's own default applies.
+    Unset,
+    /// `model_reasoning_effort`.
+    Level(String),
 }
 
 /// Codex's per-connection state: the turn in flight, Octet's own requests
@@ -80,6 +94,18 @@ pub(super) struct CodexProtocol {
     pending_steer: VecDeque<String>,
     /// Each `fileChange` item's paths from its start, for its approval; cleared as the turn ends.
     file_changes: HashMap<String, Vec<String>>,
+    /// Each listed model's default reasoning effort, by its selection.
+    model_efforts: HashMap<String, String>,
+    /// The effort Codex's config names.
+    configured_effort: ConfiguredEffort,
+    /// The model Codex opened the thread with.
+    thread_model: Option<String>,
+    /// The effort the thread runs at, as Codex reported it or Octet last
+    /// sent it: Codex keeps a turn's effort for the turns after it.
+    thread_effort: Option<String>,
+    /// The agent message whose text was shown last, until a tool call:
+    /// another message after it starts a new paragraph.
+    last_text_item: Option<String>,
 }
 
 impl Protocol for CodexProtocol {
@@ -105,6 +131,7 @@ impl Protocol for CodexProtocol {
         self.turn = None;
         self.text_items.clear();
         self.pending_steer.clear();
+        self.last_text_item = None;
     }
 
     /// Steers the turn, or holds the text until Codex names the turn.
@@ -223,11 +250,7 @@ impl Protocol for CodexProtocol {
             }
         }
         if method == "thread/tokenUsage/updated" {
-            let total = v
-                .pointer("/params/tokenUsage/total/totalTokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            core.emit(Event::Usage(format!("{total} tokens")))?;
+            core.emit(Event::Usage(codex_usage(&v["params"]["tokenUsage"])))?;
         }
         if !core.phase.is_running() {
             return Ok(());
@@ -241,7 +264,8 @@ impl Protocol for CodexProtocol {
             "item/agentMessage/delta" => {
                 if let Some(text) = v.pointer("/params/delta").and_then(Value::as_str) {
                     // A repeated item is already counted; only a new one can hit the limit.
-                    if let Some(id) = v.pointer("/params/itemId").and_then(Value::as_str)
+                    let id = v.pointer("/params/itemId").and_then(Value::as_str);
+                    if let Some(id) = id
                         && !self.text_items.contains(id)
                     {
                         if self.text_items.len() >= 4096 {
@@ -249,17 +273,18 @@ impl Protocol for CodexProtocol {
                         }
                         self.text_items.insert(id.to_owned());
                     }
-                    core.emit(Event::Text(text.into()))?;
+                    self.message_text(core, id.unwrap_or_default(), text)?;
                 }
             }
             "item/started" | "item/completed" => {
                 let item = &v["params"]["item"];
                 match item["type"].as_str().unwrap_or("") {
                     "agentMessage" if method == "item/completed" => {
-                        if !self.text_items.contains(item["id"].as_str().unwrap_or(""))
+                        let id = item["id"].as_str().unwrap_or("");
+                        if !self.text_items.contains(id)
                             && let Some(text) = item["text"].as_str()
                         {
-                            core.emit(Event::Text(text.into()))?;
+                            self.message_text(core, id, text)?;
                         }
                     }
                     "commandExecution" | "fileChange" | "mcpToolCall" => {
@@ -268,6 +293,7 @@ impl Protocol for CodexProtocol {
                             let id = one_line(item["id"].as_str().unwrap_or_default());
                             self.file_changes.insert(id, change_paths(item));
                         }
+                        self.last_text_item = None;
                         core.emit(Event::Tool(codex_tool_call(item, started)))?;
                     }
                     _ => {}
@@ -293,6 +319,26 @@ impl Protocol for CodexProtocol {
 }
 
 impl CodexProtocol {
+    /// Shows agent message `item`'s `text`. Codex sends each message as its
+    /// own item with no break between them, so a new message straight after
+    /// another starts a paragraph.
+    fn message_text(&mut self, core: &Core, item: &str, text: &str) -> Result<(), DriverError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if self
+            .last_text_item
+            .as_deref()
+            .is_some_and(|last| last != item)
+        {
+            core.emit(Event::Text("\n\n".into()))?;
+        }
+        if self.last_text_item.as_deref() != Some(item) {
+            self.last_text_item = Some(item.to_owned());
+        }
+        core.emit(Event::Text(text.into()))
+    }
+
     /// Sends one of Octet's requests and records what its reply answers.
     async fn request(
         &mut self,
@@ -363,8 +409,21 @@ impl CodexProtocol {
                 }
                 Ok(())
             }
+            Outstanding::ConfigRead => {
+                if v.get("error").is_none() {
+                    let effort = v.pointer("/result/config/model_reasoning_effort");
+                    self.configured_effort =
+                        match effort.and_then(Value::as_str).filter(|e| valid_effort(e)) {
+                            Some(effort) => ConfiguredEffort::Level(effort.to_owned()),
+                            None => ConfiguredEffort::Unset,
+                        };
+                }
+                Ok(())
+            }
             Outstanding::Start => {
                 if v.get("error").is_some() {
+                    // Codex may not have taken the turn's effort.
+                    self.thread_effort = None;
                     self.drop_held_steers(core)?;
                     core.finish_turn(Outcome::Failed, Some(error_text(&v["error"])))?;
                 }
@@ -437,20 +496,51 @@ impl CodexProtocol {
             .as_str()
             .filter(|m| valid_identifier(m))
         {
+            self.thread_model = Some(model.into());
             core.emit(Event::ModelSelected(model.into()))?;
         }
+        self.thread_effort = v["result"]["reasoningEffort"]
+            .as_str()
+            .filter(|e| valid_effort(e))
+            .map(str::to_owned);
         self.request_models(core, None).await?;
-        self.request_skills(core, false).await
+        self.request_skills(core, false).await?;
+        let params = json!({"cwd": core.config.cwd});
+        self.request(core, Outstanding::ConfigRead, "config/read", params)
+            .await
+    }
+
+    /// The effort Codex picks with no override: its config's, else the
+    /// model's own default; `None` while Octet does not know it.
+    fn default_effort(&self, core: &Core) -> Option<String> {
+        match &self.configured_effort {
+            ConfiguredEffort::Level(effort) => Some(effort.clone()),
+            ConfiguredEffort::Unset => {
+                let model = core.config.model.as_ref().or(self.thread_model.as_ref())?;
+                self.model_efforts.get(model).cloned()
+            }
+            ConfiguredEffort::Unknown => None,
+        }
     }
 
     /// `turn/start` with `input`, the model, effort and the mode's overrides.
+    /// The vendor default goes as its level when the thread may run at
+    /// another: Codex keeps the last turn's effort, so leaving it out would
+    /// not go back.
     async fn turn_start(&mut self, core: &Core, input: Vec<Value>) -> Result<(), DriverError> {
         let mut params = json!({"threadId":core.session,"input":input});
         if let Some(model) = &core.config.model {
             params["model"] = json!(model);
         }
-        if let Some(effort) = &core.config.effort {
+        let effort = match &core.config.effort {
+            Some(effort) => Some(effort.clone()),
+            None => self
+                .default_effort(core)
+                .filter(|default| self.thread_effort.as_ref() != Some(default)),
+        };
+        if let Some(effort) = effort {
             params["effort"] = json!(effort);
+            self.thread_effort = Some(effort);
         }
         if let (Some(target), Value::Object(extra)) =
             (params.as_object_mut(), codex_turn_overrides(core.mode))
@@ -492,6 +582,11 @@ impl CodexProtocol {
                 "Model catalog unavailable from this CLI; explicit model IDs remain supported"
                     .into(),
             ));
+        }
+        for (model, effort) in default_efforts(&v["result"]["data"]) {
+            if self.model_efforts.len() < 256 {
+                self.model_efforts.insert(model, effort);
+            }
         }
         for model in catalog(&v["result"]["data"]) {
             if self.catalog.len() < 256
@@ -587,6 +682,58 @@ fn skills(data: &Value) -> Vec<SkillInfo> {
         .filter_map(SkillInfo::from_json)
         .take(super::MAX_SKILLS)
         .collect()
+}
+
+/// What the header shows for Codex's `tokenUsage`: the context the last
+/// request used (`last`), of the model's window when Codex names it. The
+/// running `total` counts every turn's re-read input again, so it grows
+/// fast and never drops after compaction; it shows, named as a total, only
+/// from a CLI that reports nothing else.
+fn codex_usage(usage: &Value) -> String {
+    let count = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64);
+    match (count("/last/totalTokens"), count("/modelContextWindow")) {
+        (Some(used), Some(window)) => {
+            format!("{}/{} context", short_count(used), short_count(window))
+        }
+        (Some(used), None) => format!("{} context", short_count(used)),
+        (None, _) => {
+            let total = count("/total/totalTokens").unwrap_or(0);
+            format!("{} tokens in all", short_count(total))
+        }
+    }
+}
+
+/// `n` in a few characters: `950`, `14.3k`, `272k`, `1.3M`.
+fn short_count(n: u64) -> String {
+    /// `tenths` as a whole number, or with one decimal when it has one.
+    fn tenths(tenths: u64, unit: &str) -> String {
+        match tenths % 10 {
+            0 => format!("{}{unit}", tenths / 10),
+            digit => format!("{}.{digit}{unit}", tenths / 10),
+        }
+    }
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..99_950 => tenths((n + 50) / 100, "k"),
+        99_950..999_500 => format!("{}k", (n + 500) / 1_000),
+        _ => tenths((n + 50_000) / 100_000, "M"),
+    }
+}
+
+/// Each catalog entry's model and its default reasoning effort, bounded.
+fn default_efforts(value: &Value) -> impl Iterator<Item = (String, String)> + '_ {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(256)
+        .filter_map(|v| {
+            let model = v["model"].as_str().filter(|m| valid_identifier(m))?;
+            let effort = v["defaultReasoningEffort"]
+                .as_str()
+                .filter(|e| valid_effort(e))?;
+            Some((model.to_owned(), effort.to_owned()))
+        })
 }
 
 fn catalog(value: &Value) -> Vec<ModelInfo> {
@@ -785,6 +932,35 @@ pub(crate) fn codex_turn_overrides(mode: Mode) -> Value {
 mod tests {
     use super::*;
     use crate::live::Engine;
+    #[test]
+    fn usage_is_the_context_in_use_not_the_running_total() {
+        let usage = |v: Value| codex_usage(&v);
+        let window = json!({"total":{"totalTokens":954_802},"last":{"totalTokens":14_266},
+            "modelContextWindow":272_000});
+        assert_eq!(usage(window), "14.3k/272k context");
+        let no_window = json!({"total":{"totalTokens":954_802},"last":{"totalTokens":950}});
+        assert_eq!(usage(no_window), "950 context");
+        // An older CLI with only the running total: named as one.
+        let total = json!({"total":{"totalTokens":1_250_000}});
+        assert_eq!(usage(total), "1.3M tokens in all");
+        assert_eq!(usage(json!({})), "0 tokens in all");
+    }
+    #[test]
+    fn token_counts_read_short() {
+        let cases = [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1k"),
+            (14_266, "14.3k"),
+            (99_960, "100k"),
+            (272_000, "272k"),
+            (1_000_000, "1M"),
+            (1_250_000, "1.3M"),
+        ];
+        for (n, shown) in cases {
+            assert_eq!(short_count(n), shown, "{n}");
+        }
+    }
     #[test]
     fn plugin_switches_reach_the_app_server() {
         let mut c = Config::new(Engine::CODEX, "codex", ".");

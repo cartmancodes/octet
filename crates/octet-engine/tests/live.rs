@@ -1080,6 +1080,93 @@ async fn codex_sends_effort_on_each_turn_and_takes_changes_live() {
     assert!(turn_text(&mut events).await.contains("\"effort\":\"low\""));
     stop(&handle, task).await;
 }
+/// The effort a Codex `PARAMS` turn asked for, after `/effort` set `effort`;
+/// `Null` when the turn named none.
+async fn codex_turn_effort(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+    effort: Option<&str>,
+) -> serde_json::Value {
+    if let Some(effort) = effort {
+        handle
+            .send(Command::SetEffort(Some(effort.into())))
+            .unwrap();
+    } else {
+        handle.send(Command::SetEffort(None)).unwrap();
+    }
+    wait_for(
+        events,
+        |e| matches!(e, Event::Notice(n) if n.starts_with("Reasoning effort")),
+    )
+    .await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(events).await).unwrap();
+    echo["turn"]["effort"].clone()
+}
+/// A Codex session in `dir`, its catalog and config read.
+async fn codex_settled(
+    dir: &octet_testkit::TempDir,
+) -> (
+    octet_engine::live::Handle,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut c = config();
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn(c);
+    // The second catalog page is asked for after the config.
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Models(m) if m.len() == 2),
+    )
+    .await;
+    (handle, events, task)
+}
+#[tokio::test]
+async fn codex_effort_default_goes_back_to_the_configured_level() {
+    // Codex keeps a turn's effort for the turns after it, so "default" has
+    // to name the level Codex would pick: here its config's.
+    let dir = octet_testkit::TempDir::new("octet-live-codex-effort-config");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(dir.path().join("config-effort"), "high").unwrap();
+    let (handle, mut events, task) = codex_settled(&dir).await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    // A new thread already runs at the configured level.
+    assert_eq!(echo["turn"]["effort"], serde_json::Value::Null, "{echo}");
+    let low = codex_turn_effort(&handle, &mut events, Some("low")).await;
+    assert_eq!(low, "low");
+    let default = codex_turn_effort(&handle, &mut events, None).await;
+    assert_eq!(default, "high");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn codex_effort_default_without_a_configured_level_is_the_models() {
+    let dir = octet_testkit::TempDir::new("octet-live-codex-effort-model");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let (handle, mut events, task) = codex_settled(&dir).await;
+    let low = codex_turn_effort(&handle, &mut events, Some("low")).await;
+    assert_eq!(low, "low");
+    let default = codex_turn_effort(&handle, &mut events, None).await;
+    assert_eq!(default, "medium");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn codex_agent_messages_back_to_back_are_separate_paragraphs() {
+    let (handle, mut events, task) = spawn(config());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::MESSAGES.into()))
+        .unwrap();
+    // Deltas of one message join; the next message starts a paragraph. A
+    // tool call between messages already separates them.
+    assert_eq!(turn_text(&mut events).await, "First.\n\nSecond.Third.");
+    stop(&handle, task).await;
+}
 #[tokio::test]
 async fn claude_launches_with_effort() {
     let mut c = claude();
@@ -1153,15 +1240,39 @@ async fn codex_compact_runs_as_a_turn() {
     )
     .await;
     wait_for(&mut events, |e| matches!(e, Event::Started)).await;
-    wait_for(&mut events, |e| {
+    // Codex compacts without a word, so Octet says it is done.
+    let done = wait_for(&mut events, |e| {
+        matches!(e, Event::Notice(_) | Event::Finished { .. })
+    })
+    .await;
+    assert!(
+        matches!(&done, Event::Notice(n) if n == "Context compacted"),
+        "{done:?}"
+    );
+    let finished = next(&mut events).await;
+    assert!(
         matches!(
-            e,
+            finished,
             Event::Finished {
                 outcome: Outcome::Completed
             }
-        )
-    })
-    .await;
+        ),
+        "{finished:?}"
+    );
+    // A later turn is not a compaction.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let mut notices = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Notice(n) => notices.push(n),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        !notices.iter().any(|n| n.contains("compacted")),
+        "{notices:?}"
+    );
     stop(&handle, task).await;
 }
 #[tokio::test]
@@ -1439,6 +1550,19 @@ async fn a_prompt_cancelled_before_it_starts_is_not_run() {
     // A later prompt is not affected.
     handle.send(Command::Prompt("hello".into())).unwrap();
     assert_eq!(turn_text(&mut events).await, scenario::CODEX_REPLY);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn the_demo_names_every_provider_to_start_with() {
+    let mut c = config();
+    c.engine = Engine::DEMO;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let text = turn_text(&mut events).await;
+    for engine in ["--engine codex", "--engine claude", "--engine opencode"] {
+        assert!(text.contains(engine), "{text}");
+    }
     stop(&handle, task).await;
 }
 #[tokio::test]

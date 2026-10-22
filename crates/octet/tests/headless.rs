@@ -74,6 +74,21 @@ fn print_runs_on_a_claude_session_a_start_hook_named() {
 }
 
 #[test]
+fn print_separates_the_messages_of_a_reply() {
+    let (code, stdout, stderr) = run(&["--print", octet_testkit::scenario::MESSAGES], "");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "First.\n\nSecond.\n\nThird.\n");
+}
+
+#[test]
+fn print_starts_no_paragraph_before_the_first_text() {
+    let (code, stdout, stderr) = run(&["--print", octet_testkit::scenario::FILE_APPROVAL], "");
+    assert_eq!(code, 0, "{stderr}");
+    // A tool call before any text leaves no blank line.
+    assert_eq!(stdout, "decline\n", "{stdout}");
+}
+
+#[test]
 fn print_reads_the_prompt_from_stdin() {
     let (code, stdout, stderr) = run(&["-p", "-"], "params\n");
     assert_eq!(code, 0, "{stderr}");

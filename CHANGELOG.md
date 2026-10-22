@@ -327,6 +327,45 @@ Claude Code and Codex CLIs.
 - A mid-turn Codex permission change now shows both the running and next mode
   in the terminal header and `/mode` details. The notice explains that steering
   keeps the old permissions until a new turn starts.
+- `/effort default` did not reset Codex's reasoning effort: Codex kept the
+  last level for later turns. Octet now sends the level Codex picks itself
+  (its config's, else the model's default).
+- Consecutive Codex messages ran together ("…complete it.Unable to…"); each
+  now starts a paragraph. In `--print`, text after a tool call starts a
+  paragraph too, and a denied approval's note starts its own line.
+- `/compact` on Codex finished without a word; a completed compaction now
+  notes "Context compacted" (every provider).
+- Codex's header figure was a running total of every turn's tokens (14k
+  for a one-word reply, ~1M after 70 turns, never dropping after
+  `/compact`). It now shows the context in use of the model's window, such
+  as `14.3k/272k context`.
+- `/model refresh` said only "Fetching…"; it now notes each list as it
+  comes in or fails.
+- Full access carried to another provider without a word; that switch now
+  shows a warning ("Full access carried to Claude: no permission checks.
+  /mode ask to turn them on"). Every switch to another provider notes the
+  mode it starts in, and says when that is not the mode you last chose (a
+  provider that refused `auto` no longer drops it silently for the rest).
+- `/model gpt-5.5` + Enter switched to opencode's `openai/gpt-5.5`: the
+  picker's highlighted row won over the name rules. A whole name after a
+  `sub/` is now resolved as typed, so Codex's `gpt-` prefix comes first.
+- A command refused with "Finish or cancel the current turn first" (or
+  "Wait for the connection") cleared the prompt box; its line now stays.
+- Esc from the `/skills` picker left `/skills ` in the prompt, so the next
+  prompt reopened the picker and Enter did nothing. Esc now clears that
+  line, and Enter on a filter that matches nothing says so.
+- The goal completion marker `[[OCTET_GOAL_COMPLETE]]` showed in the
+  conversation; it is now hidden there and from `/copy` (the journal keeps
+  the reply as sent).
+- `/sessions` labelled a reconnected session with the first prompt of its
+  newest journal, neither its first nor its latest. It now shows the
+  session's first prompt, and its latest when that differs.
+- The offline demo's reply named only `--engine codex` and `--engine
+  claude`; it names `--engine opencode` too.
+- The approval dialog had no frame, so on a wide screen the conversation
+  around it read as a narrow column beside it; it is framed now (where
+  there is room). The model picker cut long lines at 64 columns; it widens
+  to its longest line while the screen has room.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

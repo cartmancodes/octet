@@ -33,6 +33,8 @@ pub(crate) enum Role {
     Assistant,
     Tool,
     Notice,
+    /// A notice the user must not miss, shown like an error.
+    Warning,
     Error,
     Shell,
     ShellFailed,
@@ -250,6 +252,8 @@ pub(crate) struct Transcript {
     pub(crate) entries: VecDeque<Entry>,
     pub(crate) bytes: usize,
     pub(crate) sanitizer: Sanitizer,
+    /// Hides the goal completion marker from the reply as shown and copied.
+    pub(crate) marker: crate::text::MarkerFilter,
     pub(crate) scroll: usize,
     pub(crate) catalog_focus: Option<usize>,
     /// The current turn's reply as sent, tabs and all, for `/copy`.
@@ -391,6 +395,13 @@ pub(crate) struct App {
     pub(crate) sidebar: bool,
     /// The terminal's width at the last frame, for F2 to say when the sidebar can show.
     pub(crate) last_width: u16,
+    /// The permission mode the user last chose (at launch, Shift+Tab or
+    /// `/mode`), which a vendor may have refused: a switch to another
+    /// provider says when that one starts in another.
+    pub(crate) mode_chosen: octet_core::Mode,
+    /// The command running now was refused (`App::refuse`), so its typed
+    /// line stays; reset before each command.
+    pub(crate) refused: bool,
 }
 /// A skill to run on a provider the interface is switching to.
 #[derive(Debug, Clone)]
@@ -407,6 +418,7 @@ impl App {
                 entries: VecDeque::new(),
                 bytes: 0,
                 sanitizer: Sanitizer::default(),
+                marker: crate::text::MarkerFilter::default(),
                 scroll: 0,
                 catalog_focus: None,
                 reply: String::new(),
@@ -457,6 +469,8 @@ impl App {
             remote_off: None,
             sidebar: true,
             last_width: 0,
+            mode_chosen: config.mode,
+            refused: false,
         }
     }
     pub(crate) fn connection(&mut self, config: &octet_core::Config, journal: PathBuf) {
@@ -874,6 +888,13 @@ impl App {
     pub(crate) fn last_role(&self) -> Option<Role> {
         self.chat.entries.back().map(|entry| entry.role)
     }
+    /// Something the user must not miss, such as permission checks being
+    /// off: a transcript warning and the status line.
+    pub(crate) fn warn(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.status(StatusKind::Plain, &text);
+        self.add(Role::Warning, &text);
+    }
     /// Information, as a transcript note and on the status line.
     pub(crate) fn note(&mut self, text: impl Into<String>) {
         let text = text.into();
@@ -930,6 +951,12 @@ impl App {
     /// A refusal or a passing hint, on the status line only.
     pub(crate) fn hint(&mut self, text: impl Into<String>) {
         self.status(StatusKind::Plain, &text.into());
+    }
+    /// A command that would reconnect cannot now (`TURN_OPEN`,
+    /// `NOT_CONNECTED`): says why, and keeps a typed line in the prompt box.
+    pub(crate) fn refuse(&mut self, refusal: &'static str) {
+        self.hint(refusal);
+        self.refused = true;
     }
     /// Shows `text` on the status line as a `kind` of message.
     pub(crate) fn status(&mut self, kind: StatusKind, text: &str) {
@@ -1026,33 +1053,11 @@ impl App {
             }
             Event::Text(text) => {
                 self.conn.activity = State::Thinking;
-                self.keep_reply(&text);
-                let text = self.chat.sanitizer.push(&text);
-                if self
-                    .chat
-                    .entries
-                    .back()
-                    .is_none_or(|e| e.role != Role::Assistant)
-                {
-                    self.add(Role::Assistant, "");
+                let shown = self.chat.marker.push(&text);
+                // All of it held (a possible start of the goal marker): nothing yet.
+                if !shown.is_empty() || text.is_empty() {
+                    self.reply_text(&shown);
                 }
-                let e = self
-                    .chat
-                    .entries
-                    .back_mut()
-                    .expect("an assistant entry was just ensured");
-                e.append(&text);
-                self.chat.bytes += text.len();
-                if e.text.len() > BLOCK_BYTES + BLOCK_SLACK {
-                    let remove = e.text.ceil_char_boundary(e.text.len() - BLOCK_BYTES);
-                    e.text.drain(..remove);
-                    self.chat.bytes -= remove;
-                    // Its start moved: the next paint wraps it whole, and a
-                    // scrolled-up reader re-anchors there without moving.
-                    e.invalidate();
-                    self.chat.anchor = None;
-                }
-                self.trim();
             }
             Event::Tool(call) => {
                 self.chat.reply_break = true;
@@ -1091,6 +1096,11 @@ impl App {
             }
             Event::Usage(text) => self.conn.usage = clean(&text),
             Event::Finished { outcome } => {
+                // A tail held as a possible goal marker was not one.
+                let held = self.chat.marker.flush();
+                if !held.is_empty() {
+                    self.reply_text(&held);
+                }
                 self.calls_over();
                 self.conn.end_turn();
                 self.clear_status(StatusKind::Cancelling);
@@ -1235,6 +1245,37 @@ impl App {
     /// turn, for `/copy`.
     pub(crate) fn last_reply(&self) -> Option<&str> {
         (!self.chat.reply.is_empty()).then_some(self.chat.reply.as_str())
+    }
+    /// Streamed reply text, the goal marker already out: kept for `/copy`
+    /// and appended to the reply on screen.
+    fn reply_text(&mut self, text: &str) {
+        self.keep_reply(text);
+        let text = self.chat.sanitizer.push(text);
+        if self
+            .chat
+            .entries
+            .back()
+            .is_none_or(|e| e.role != Role::Assistant)
+        {
+            self.add(Role::Assistant, "");
+        }
+        let e = self
+            .chat
+            .entries
+            .back_mut()
+            .expect("an assistant entry was just ensured");
+        e.append(&text);
+        self.chat.bytes += text.len();
+        if e.text.len() > BLOCK_BYTES + BLOCK_SLACK {
+            let remove = e.text.ceil_char_boundary(e.text.len() - BLOCK_BYTES);
+            e.text.drain(..remove);
+            self.chat.bytes -= remove;
+            // Its start moved: the next paint wraps it whole, and a
+            // scrolled-up reader re-anchors there without moving.
+            e.invalidate();
+            self.chat.anchor = None;
+        }
+        self.trim();
     }
     /// Adds streamed text to the reply `/copy` takes, up to just over the
     /// clipboard limit so a cut can still be reported.

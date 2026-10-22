@@ -316,6 +316,7 @@ fn wrapped(role: Role, text: &str, width: u16) -> (Vec<Line<'static>>, Tail) {
         // Tools entries draw their own rows (`Entry::rows`) and never come here.
         Role::Tool | Role::Notice => ("NOTE", MUTED),
         Role::Error => ("ERROR", AMBER),
+        Role::Warning => ("WARNING", AMBER),
         Role::Shell => ("SHELL", MUTED),
         Role::ShellFailed => ("SHELL", AMBER),
     };
@@ -357,7 +358,7 @@ fn body(
                 Style::default().fg(MUTED),
             )));
         } else {
-            let style = if role == Role::Error {
+            let style = if matches!(role, Role::Error | Role::Warning) {
                 Style::default().fg(AMBER)
             } else if code {
                 Style::default().fg(MUTED)

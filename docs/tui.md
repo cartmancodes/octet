@@ -116,7 +116,7 @@ respected. The minimum usable size is 38 columns by 12 rows.
 | Ctrl+P | Command palette: type to filter it, Backspace edits, Up/Down choose, Enter runs (also offers Ctrl+G, `@`, `!` and Ctrl+O) |
 | `@` | Mention a workspace file; a popup suggests paths as you type (Enter or Tab inserts, Esc closes) |
 | `/model` | Model picker: Up/Down choose, Enter switches, Tab inserts the name, Esc closes |
-| `/skills` | Skills picker: Up/Down choose, Enter or Tab puts `/name ` in the prompt (nothing runs until you send it), Esc closes |
+| `/skills` | Skills picker: Up/Down choose, Enter or Tab puts `/name ` in the prompt (nothing runs until you send it), Esc closes it and clears its `/skills` line |
 | Tab | Complete a path, or a `/command` at the start of the prompt |
 | Ctrl+G | Write the prompt in `$VISUAL` or `$EDITOR` (default `vi`), run by the shell as git runs it: quote a path with spaces |
 | Ctrl+X | Copy the last reply to the clipboard (same as `/copy`) |
@@ -208,7 +208,8 @@ it as a QR code and a link for the phone app (it works once and expires after
 [Phone app (hub)](remote-control.md#phone-app-hub).
 The preview also supports persistent multi-turn goals through `/goal`.
 Changing sessions or exporting requires an idle turn, and `/compact` a
-connected one; a refused command explains why on the status line.
+connected one; a refused command explains why on the status line and its
+line stays in the prompt box, to send again.
 
 `/sessions`, `/export` and `/remote-control` run in the background: the
 status line names the job, and replies, approvals and keys keep working.
@@ -254,6 +255,9 @@ and `max`; some models offer none), and Octet refuses a level the model
 does not list, naming the ones it does. A `/model` switch to a provider that
 does not take the level falls back to its default, with a notice.
 Codex takes it with each turn, so a change applies from the next turn.
+Codex keeps a turn's level for the turns after it (and in the thread, for
+`--resume`), so `/effort default` sends the level Codex picks itself: the
+`model_reasoning_effort` of its config, else the model's own default.
 opencode sets it in the open session: `--effort` once the session opens,
 after the model and before the first prompt (a level the model does not
 list is dropped with a notice and the session goes on), and `/effort` at
@@ -276,8 +280,9 @@ original is never written to.
 **Compaction.** `/compact` asks the vendor to compact its context (Codex
 `thread/compact/start`, Claude's own `/compact`, and opencode's `/compact`,
 which summarizes the session although opencode does not list it among its
-commands). It runs as a turn: its
-output streams as usual and Esc cancels it.
+commands). It runs as a turn: its output streams as usual and Esc cancels it.
+Once it completes Octet notes "Context compacted", as Codex compacts without
+a word.
 
 **Images.** `/image PATH` attaches an image to the next prompt; the prompt
 box's chips row shows `+ image name.png` (or `+N images`). PNG, JPEG, GIF and WebP
@@ -317,8 +322,14 @@ latest output.
 
 `--mode MODE` at launch, `/mode MODE` at runtime, Shift+Tab to cycle. The default
 is `ask`; the mode is not remembered between launches but is kept across
-`/model`, `/new` and `/reconnect`. `/mode` alone shows the table for the current
-provider. The header shows the selected mode; during a Codex or opencode turn
+`/model`, `/new` and `/reconnect`. It is the mode the last provider confirmed, so
+one that refused your choice (Claude's `auto` on Haiku) passes its own on. A
+switch to another provider (`/model`, or `/resume` of another provider's
+session) notes the mode it starts in, and when that is not the one you last
+chose, says so ("opencode starts in ask, not auto as you last chose"). Full
+access carried to another provider is a warning: "Full access carried to
+Claude: no permission checks. /mode ask to turn them on". `/mode` alone shows
+the table for the current provider. The header shows the selected mode; during a Codex or opencode turn
 it also shows the running mode when a change is waiting for the next turn.
 
 | Mode | Claude | Codex (sandbox · approval · reviewer) | opencode (agent) |
@@ -437,9 +448,10 @@ another provider), and Esc closes the picker. Without the picker, Tab after
 `/model ` completes from the current provider's names, and after
 `/model PROVIDER ` from that provider's. While a turn runs,
 Enter is refused with the usual hint and the picker stays open. A name typed
-in full (one a list holds, or `default`) is sent as typed and resolved like any
-`/model NAME`, so `default` stays the current provider's; so is a name that
-matches nothing. A partial name takes the highlighted line; to send a custom
+in full (one a list holds, what follows the `sub/` of a listed ID, or `default`)
+is sent as typed and resolved like any `/model NAME`, so `default` stays the
+current provider's and `gpt-5.5` goes to Codex by its `gpt-` prefix though the
+picker shows opencode's `openai/gpt-5.5`; so is a name that matches nothing. A partial name takes the highlighted line; to send a custom
 name that begins like a listed one, press Esc, then Enter.
 
 The current provider's list comes live from its CLI with each connection
@@ -453,8 +465,9 @@ prompt, no tokens, at most 20 seconds. It runs the CLI Octet runs for that
 provider (a `--binary` override, else the one on PATH). Claude Code backs up
 its own settings each time it starts (`~/.claude/backups/`), so a fetch of
 Claude's list adds one such backup. `/model refresh` fetches every other list
-now, and says which are already on their way; a provider whose fetch failed is
-not tried again until then. A save keeps any list another window saved more
+now, and says which are already on their way, then notes each one as it comes
+in ("Fetched claude's model list (12 models)") or fails; a provider whose fetch
+failed is not tried again until then. A save keeps any list another window saved more
 recently. The
 list's header shows each provider's count and freshness (`live`,
 `cached 2 h ago`, `probing…`, `unavailable: …`); `/model list <page>` pages
@@ -573,7 +586,9 @@ bring, and runs them.
 `/goal <objective>` begins a persistent multi-turn goal. After each successful
 turn, Octet asks the same provider to continue. The goal completes only when
 the assistant gives an evidence summary followed by
-`[[OCTET_GOAL_COMPLETE]]` on its final line. This is a model-reported audit,
+`[[OCTET_GOAL_COMPLETE]]` on its final line. The marker is Octet's own signal:
+the conversation and `/copy` leave it out, and the journal keeps the reply as
+sent. This is a model-reported audit,
 not independent verification. `/goal` or `/goal status` shows state; `/goal pause`,
 `/goal resume`, `/goal complete` (request an audit turn), and `/goal clear` manage
 it. Esc/Ctrl+C pauses an active goal while interrupting its current turn. Failed
@@ -588,7 +603,8 @@ See [the goal workflow guide](rust/goals.md).
 `/session` shows the vendor session ID and journal path. `/reconnect` reopens that
 vendor context; `--resume VENDOR_SESSION_ID` does the same on a later launch.
 `/sessions` lists up to 20 recent vendor sessions in this workspace, newest
-first: provider, session ID, model, age and first prompt. `/resume N` reopens
+first: provider, session ID, model, age and the session's first prompt (from its
+oldest journal listed), then its latest prompt when that differs. `/resume N` reopens
 entry N, switching provider when it belongs to the other vendor, in a fresh
 view. The list comes from Octet's own journals (at most the first 64 KiB of
 each, skipping a torn last line); reconnects of one session show as one entry.
@@ -726,7 +742,10 @@ Under 30 rows the banner gives way to a one-row header with the same facts:
 `◆ Octet · mode · engine / model  workspace   ● status · usage`.
 
 Status and usage stay at the right edge, sized to their text so a narrow
-terminal never cuts them. Below the banner, the conversation
+terminal never cuts them. The usage is what the provider reports: Claude's
+session cost; for Codex, the context the last request used, of the model's
+window (`14.3k/272k context`), which drops after `/compact`; for opencode,
+its token count. Below the banner, the conversation
 area stays empty until the first message; the composer's placeholder says
 what to type.
 

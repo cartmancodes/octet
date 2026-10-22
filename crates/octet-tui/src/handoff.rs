@@ -95,7 +95,7 @@ fn block(entry: &Entry) -> Option<String> {
             let last = text.lines().last().unwrap_or_default();
             format!("{first} · {last}\n")
         }
-        Role::Notice | Role::Error => return None,
+        Role::Notice | Role::Warning | Role::Error => return None,
     })
 }
 
