@@ -52,6 +52,10 @@ struct OpencodeFixture {
     /// A cancel asks for a permission before it ends the held prompt
     /// (`OPENCODE_PERMISSION_ON_CANCEL`).
     asks_on_cancel: bool,
+    /// An allowed edit is followed by `fs/write_text_file` (`OPENCODE_EDIT`).
+    writes_on_allow: bool,
+    /// The `fs/write_text_file` request waits for Octet's reply.
+    fs_pending: bool,
 }
 
 pub(crate) fn run() {
@@ -70,6 +74,8 @@ pub(crate) fn run() {
         awaiting: 0,
         approvals_9: false,
         asks_on_cancel: false,
+        writes_on_allow: false,
+        fs_pending: false,
     };
     for line in io::stdin().lock().lines() {
         let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
@@ -128,6 +134,24 @@ fn tool_call(sid: &str, call: &str) -> Value {
 /// A `session/request_permission` request, numbered `id`, for the command `call`.
 fn permission(sid: &str, id: usize, call: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":sid,"toolCall":{"toolCallId":call,"title":"echo fixture","kind":"execute","status":"pending","locations":[],"rawInput":{"command":"echo fixture"}},"options":[{"optionId":"once","kind":"allow_once","name":"Allow once"},{"optionId":"always","kind":"allow_always","name":"Always allow"},{"optionId":"reject","kind":"reject_once","name":"Reject"}]}})
+}
+
+/// The wire ID of the fake's `fs/write_text_file` request.
+const FS_REQUEST_ID: u64 = 100;
+
+/// The file `OPENCODE_EDIT` edits, in the working directory.
+fn edit_path() -> String {
+    env::current_dir()
+        .unwrap()
+        .join("fixture.txt")
+        .display()
+        .to_string()
+}
+
+/// A `session/request_permission` request, numbered 0, to edit `path` in
+/// the tool call `call`, as opencode 1.18.25 sends it.
+fn edit_permission(sid: &str, call: &str, path: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":sid,"toolCall":{"toolCallId":call,"title":path,"kind":"edit","status":"pending","locations":[{"path":path}],"rawInput":{"filepath":path,"diff":"+hi"}},"options":[{"optionId":"once","kind":"allow_once","name":"Allow once"},{"optionId":"reject","kind":"reject_once","name":"Reject"}]}})
 }
 
 /// The end of a turn.
@@ -312,6 +336,18 @@ impl OpencodeFixture {
                 emit(&tool_call(&sid, "call-0"));
                 emit(&permission(&sid, 0, "call-0"));
             }
+            scenario::OPENCODE_EDIT => {
+                self.held = Some(id.clone());
+                self.awaiting = 1;
+                self.approvals_9 = false;
+                self.writes_on_allow = true;
+                let path = edit_path();
+                emit(&acp_update(
+                    &sid,
+                    &json!({"sessionUpdate":"tool_call","toolCallId":"edit-0","title":"write","kind":"edit","status":"pending","locations":[{"path":path}],"rawInput":{"filePath":path,"content":"hi"}}),
+                ));
+                emit(&edit_permission(&sid, "edit-0", &path));
+            }
             scenario::APPROVALS_9 => {
                 self.held = Some(id.clone());
                 self.awaiting = 9;
@@ -385,6 +421,17 @@ impl OpencodeFixture {
     /// Octet's answer to one of our permission requests, echoed as text; the
     /// last answer ends the turn.
     fn answer(&mut self, v: &Value) {
+        if self.fs_pending && v["id"] == FS_REQUEST_ID {
+            self.fs_pending = false;
+            emit(&acp_text(
+                &self.session,
+                &format!("fs {}", v["error"]["code"]),
+            ));
+            if let Some(id) = self.held.take() {
+                end_turn(&id);
+            }
+            return;
+        }
         if self.awaiting == 0 {
             return;
         }
@@ -400,6 +447,15 @@ impl OpencodeFixture {
         };
         emit(&acp_text(&self.session, &reply));
         self.awaiting -= 1;
+        if std::mem::take(&mut self.writes_on_allow) && choice == "once" {
+            // opencode writes an allowed edit through the client as well.
+            self.fs_pending = true;
+            let params = json!({"sessionId":self.session,"path":edit_path(),"content":"hi\n"});
+            emit(
+                &json!({"jsonrpc":"2.0","id":FS_REQUEST_ID,"method":"fs/write_text_file","params":params}),
+            );
+            return;
+        }
         if self.awaiting == 0
             && let Some(id) = self.held.take()
         {

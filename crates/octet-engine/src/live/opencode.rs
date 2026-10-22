@@ -1117,7 +1117,8 @@ enum Refusal {
 /// A request from opencode. A permission request for this session's running
 /// turn is shown to the user, who decides; anything else (another session's,
 /// one while the turn is being cancelled, or no turn's) gets the stray
-/// reply, with a notice.
+/// reply, with a notice, except a client capability's, which is refused
+/// quietly.
 async fn server_request(core: &mut Core, v: Value) -> Result<(), DriverError> {
     let method = v["method"].as_str().unwrap_or_default();
     let this_session = !core.session.is_empty()
@@ -1127,6 +1128,12 @@ async fn server_request(core: &mut Core, v: Value) -> Result<(), DriverError> {
         return core.queue_approval(v, detail, summary).await;
     }
     if let Some(reply) = opencode_stray_reply(&v) {
+        if client_capability(method) {
+            // opencode 1.18.25 asks the client to write every edit it was
+            // allowed, although Octet offers no file system; it has already
+            // written the file itself, so the refusal is nothing to report.
+            return core.send(reply).await;
+        }
         let notice = if method == "session/request_permission" {
             let when = if this_session && core.phase == Phase::Interrupting {
                 "while its turn is being cancelled"
@@ -1141,6 +1148,13 @@ async fn server_request(core: &mut Core, v: Value) -> Result<(), DriverError> {
         core.emit(Event::Notice(notice))?;
     }
     Ok(())
+}
+
+/// Whether `method` is one of the client capabilities (`fs/*`, `terminal/*`)
+/// Octet does not offer in `initialize`: such a request is refused without
+/// a notice.
+fn client_capability(method: &str) -> bool {
+    method.starts_with("fs/") || method.starts_with("terminal/")
 }
 
 /// What a permission request's `toolCall` would do: the dialog's detail

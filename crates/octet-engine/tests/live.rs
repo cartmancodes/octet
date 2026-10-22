@@ -3773,6 +3773,36 @@ async fn opencode_permission_for_another_session_during_a_turn_is_rejected() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn opencode_file_writes_after_an_allowed_edit_are_refused_quietly() {
+    // opencode 1.18.25 also asks the client to write an edit it was allowed,
+    // although Octet offers no file system: refused, with nothing to show.
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_EDIT.into()))
+        .unwrap();
+    let Event::Approval { id, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    handle.send(Command::Answer { id, allow: true }).unwrap();
+    let (mut notices, mut text) = (Vec::new(), String::new());
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => notices.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    // The fake echoes the error code of Octet's reply to its write.
+    assert_eq!(text, "oncefs -32601");
+    assert!(notices.is_empty(), "{notices:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn opencode_permission_while_cancelling_is_rejected_and_says_so() {
     let (handle, mut events, task) = spawn(opencode());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;

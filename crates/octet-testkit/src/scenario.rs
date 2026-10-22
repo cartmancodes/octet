@@ -105,6 +105,10 @@ pub const OPENCODE_OTHER_PERMISSION: &str = "other-permission";
 /// opencode: hold the turn, and ask for a permission when it is cancelled;
 /// the answer is echoed and ends the turn.
 pub const OPENCODE_PERMISSION_ON_CANCEL: &str = "permission-on-cancel";
+/// opencode: ask to edit `fixture.txt`; once allowed, ask Octet to write the
+/// file with `fs/write_text_file`, as opencode 1.18.25 does although Octet
+/// offers no file system, then echo that reply's error code and end the turn.
+pub const OPENCODE_EDIT: &str = "opencode-edit";
 /// opencode: the name of the skill the fake lists as a slash command.
 pub const OPENCODE_SKILL: &str = "fixture-opencode-skill";
 
