@@ -444,8 +444,9 @@ prompt, no tokens, at most 20 seconds. It runs the CLI Octet runs for that
 provider (a `--binary` override, else the one on PATH). Claude Code backs up
 its own settings each time it starts (`~/.claude/backups/`), so a fetch of
 Claude's list adds one such backup. `/model refresh` fetches every other list
-now, and says which are already on their way; a provider whose fetch failed is
-not tried again until then. A save keeps any list another window saved more
+now, and says which are already on their way, then notes each one as it comes
+in ("Fetched claude's model list (12 models)") or fails; a provider whose fetch
+failed is not tried again until then. A save keeps any list another window saved more
 recently. The
 list's header shows each provider's count and freshness (`live`,
 `cached 2 h ago`, `probing…`, `unavailable: …`); `/model list <page>` pages

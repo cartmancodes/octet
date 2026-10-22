@@ -339,6 +339,8 @@ Claude Code and Codex CLIs.
   for a one-word reply, ~1M after 70 turns, never dropping after
   `/compact`). It now shows the context in use of the model's window, such
   as `14.3k/272k context`.
+- `/model refresh` said only "Fetching…"; it now notes each list as it
+  comes in or fails.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

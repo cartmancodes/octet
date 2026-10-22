@@ -209,7 +209,7 @@ impl Loop<'_> {
                 }
             }
             Wake::Probed(probed) => {
-                if let Some(note) = app.models.probed(probed, std::time::SystemTime::now()) {
+                for note in app.models.probed(probed, std::time::SystemTime::now()) {
                     app.note(note);
                 }
             }
