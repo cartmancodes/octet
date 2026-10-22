@@ -70,6 +70,7 @@ async fn a_new_connection_settles_the_old_sessions_command_and_popup() {
         kind: crate::composer::Kind::File,
         items: Vec::new(),
         selected: 0,
+        moved: false,
         start: 0,
     });
     let config = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp");

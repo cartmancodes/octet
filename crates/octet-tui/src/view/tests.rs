@@ -92,6 +92,7 @@ fn the_popup_keeps_the_selected_row_in_sight_on_a_short_screen() {
         kind: crate::composer::Kind::File,
         items: (0..8).map(|i| format!("file{i}.rs")).collect(),
         selected: 7,
+        moved: false,
         start: 0,
     });
     let rows = screen(80, 14, &mut app);
@@ -108,6 +109,7 @@ fn the_popup_lists_suggestions_above_the_prompt() {
         kind: crate::composer::Kind::File,
         items: vec!["src/main.rs".into(), "src/model.rs".into()],
         selected: 1,
+        moved: false,
         start: 0,
     });
     let rows = screen(100, 30, &mut app);
@@ -1173,6 +1175,7 @@ fn the_popup_draws_items_cleaned() {
         kind: crate::composer::Kind::Model,
         items: vec!["evil\u{202e}name · codex · Evil".into()],
         selected: 0,
+        moved: false,
         start: 7,
     });
     let rows = screen(100, 30, &mut app).join("\n");

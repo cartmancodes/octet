@@ -25,6 +25,8 @@ pub(crate) struct Completion {
     pub kind: Kind,
     pub items: Vec<String>,
     pub selected: usize,
+    /// The user moved the highlight with the arrows: Enter takes that row.
+    pub moved: bool,
     /// Where the word being completed starts in the draft.
     pub start: usize,
 }
@@ -285,6 +287,7 @@ pub(crate) fn model_tab(
                     .map(|(name, engine)| model_item(name, *engine, clashing))
                     .collect(),
                 selected: 0,
+                moved: false,
                 start,
             };
             if prefix.len() > word.len() {
@@ -351,6 +354,7 @@ fn choose(start: usize, word: &str, items: Vec<String>, kind: Kind, suffix: &str
                 kind,
                 items: items.into_iter().take(crate::files::SHOWN).collect(),
                 selected: 0,
+                moved: false,
                 start,
             };
             if prefix.len() > word.len() {
