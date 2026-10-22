@@ -393,6 +393,9 @@ pub(crate) struct App {
     /// `/mode`), which a vendor may have refused: a switch to another
     /// provider says when that one starts in another.
     pub(crate) mode_chosen: octet_core::Mode,
+    /// The command running now was refused (`App::refuse`), so its typed
+    /// line stays; reset before each command.
+    pub(crate) refused: bool,
 }
 /// A skill to run on a provider the interface is switching to.
 #[derive(Debug, Clone)]
@@ -460,6 +463,7 @@ impl App {
             sidebar: true,
             last_width: 0,
             mode_chosen: config.mode,
+            refused: false,
         }
     }
     pub(crate) fn connection(&mut self, config: &octet_core::Config, journal: PathBuf) {
@@ -932,6 +936,12 @@ impl App {
     /// A refusal or a passing hint, on the status line only.
     pub(crate) fn hint(&mut self, text: impl Into<String>) {
         self.status(StatusKind::Plain, &text.into());
+    }
+    /// A command that would reconnect cannot now (`TURN_OPEN`,
+    /// `NOT_CONNECTED`): says why, and keeps a typed line in the prompt box.
+    pub(crate) fn refuse(&mut self, refusal: &'static str) {
+        self.hint(refusal);
+        self.refused = true;
     }
     /// Shows `text` on the status line as a `kind` of message.
     pub(crate) fn status(&mut self, kind: StatusKind, text: &str) {

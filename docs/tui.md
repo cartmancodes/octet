@@ -208,7 +208,8 @@ it as a QR code and a link for the phone app (it works once and expires after
 [Phone app (hub)](remote-control.md#phone-app-hub).
 The preview also supports persistent multi-turn goals through `/goal`.
 Changing sessions or exporting requires an idle turn, and `/compact` a
-connected one; a refused command explains why on the status line.
+connected one; a refused command explains why on the status line and its
+line stays in the prompt box, to send again.
 
 `/sessions`, `/export` and `/remote-control` run in the background: the
 status line names the job, and replies, approvals and keys keep working.

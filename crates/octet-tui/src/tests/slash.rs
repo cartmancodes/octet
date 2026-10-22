@@ -725,6 +725,24 @@ fn exported() -> crate::jobs::Done {
     }
 }
 #[tokio::test]
+async fn a_command_refused_while_a_turn_runs_keeps_the_draft() {
+    let mut app = app();
+    crate::test_support::idle(&mut app);
+    app.conn.start_turn();
+    let vendor = RecordingVendor::default();
+    // Refused by the command table, by /model's own check, and by /mode's.
+    for line in ["/new", "/model claude-sonnet-4-6", "/mode full-access"] {
+        app.composer.editor.set(line.into());
+        key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+        assert_eq!(app.composer.editor.text(), line);
+        assert_eq!(app.status_line, crate::registry::TURN_OPEN, "{line}");
+    }
+    // A command that ran still takes its line.
+    app.composer.editor.set("/session".into());
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert_eq!(app.composer.editor.text(), "");
+}
+#[tokio::test]
 async fn a_second_job_keeps_the_draft() {
     let mut app = app();
     let vendor = RecordingVendor::default();

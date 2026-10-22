@@ -349,6 +349,8 @@ Claude Code and Codex CLIs.
 - `/model gpt-5.5` + Enter switched to opencode's `openai/gpt-5.5`: the
   picker's highlighted row won over the name rules. A whole name after a
   `sub/` is now resolved as typed, so Codex's `gpt-` prefix comes first.
+- A command refused with "Finish or cancel the current turn first" (or
+  "Wait for the connection") cleared the prompt box; its line now stays.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.
