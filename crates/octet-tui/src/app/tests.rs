@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn the_goal_marker_shows_neither_on_screen_nor_in_copy() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    for delta in ["DONE ", "[[OCTET_GOAL", "_COMPLETE]]"] {
+        app.event(Event::Text(delta.into()));
+    }
+    app.event(Event::Finished {
+        outcome: octet_core::Outcome::Completed,
+    });
+    assert!(
+        !app.entries_text().contains("OCTET_GOAL"),
+        "{}",
+        app.entries_text()
+    );
+    assert!(app.entries_text().contains("DONE"));
+    assert_eq!(app.last_reply(), Some("DONE "));
+    // A held start that was no marker shows when the turn ends.
+    app.event(Event::Started);
+    app.event(Event::Text("see [[".into()));
+    app.event(Event::Finished {
+        outcome: octet_core::Outcome::Completed,
+    });
+    assert!(
+        app.entries_text().ends_with("see [["),
+        "{}",
+        app.entries_text()
+    );
+}
+#[test]
 fn copy_keeps_the_last_reply_until_new_text_arrives() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.event(Event::Started);

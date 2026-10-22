@@ -573,7 +573,9 @@ bring, and runs them.
 `/goal <objective>` begins a persistent multi-turn goal. After each successful
 turn, Octet asks the same provider to continue. The goal completes only when
 the assistant gives an evidence summary followed by
-`[[OCTET_GOAL_COMPLETE]]` on its final line. This is a model-reported audit,
+`[[OCTET_GOAL_COMPLETE]]` on its final line. The marker is Octet's own signal:
+the conversation and `/copy` leave it out, and the journal keeps the reply as
+sent. This is a model-reported audit,
 not independent verification. `/goal` or `/goal status` shows state; `/goal pause`,
 `/goal resume`, `/goal complete` (request an audit turn), and `/goal clear` manage
 it. Esc/Ctrl+C pauses an active goal while interrupting its current turn. Failed

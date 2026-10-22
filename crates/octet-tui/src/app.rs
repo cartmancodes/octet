@@ -248,6 +248,8 @@ pub(crate) struct Transcript {
     pub(crate) entries: VecDeque<Entry>,
     pub(crate) bytes: usize,
     pub(crate) sanitizer: Sanitizer,
+    /// Hides the goal completion marker from the reply as shown and copied.
+    pub(crate) marker: crate::text::MarkerFilter,
     pub(crate) scroll: usize,
     pub(crate) catalog_focus: Option<usize>,
     /// The current turn's reply as sent, tabs and all, for `/copy`.
@@ -412,6 +414,7 @@ impl App {
                 entries: VecDeque::new(),
                 bytes: 0,
                 sanitizer: Sanitizer::default(),
+                marker: crate::text::MarkerFilter::default(),
                 scroll: 0,
                 catalog_focus: None,
                 reply: String::new(),
@@ -1038,33 +1041,11 @@ impl App {
             }
             Event::Text(text) => {
                 self.conn.activity = State::Thinking;
-                self.keep_reply(&text);
-                let text = self.chat.sanitizer.push(&text);
-                if self
-                    .chat
-                    .entries
-                    .back()
-                    .is_none_or(|e| e.role != Role::Assistant)
-                {
-                    self.add(Role::Assistant, "");
+                let shown = self.chat.marker.push(&text);
+                // All of it held (a possible start of the goal marker): nothing yet.
+                if !shown.is_empty() || text.is_empty() {
+                    self.reply_text(&shown);
                 }
-                let e = self
-                    .chat
-                    .entries
-                    .back_mut()
-                    .expect("an assistant entry was just ensured");
-                e.append(&text);
-                self.chat.bytes += text.len();
-                if e.text.len() > BLOCK_BYTES + BLOCK_SLACK {
-                    let remove = e.text.ceil_char_boundary(e.text.len() - BLOCK_BYTES);
-                    e.text.drain(..remove);
-                    self.chat.bytes -= remove;
-                    // Its start moved: the next paint wraps it whole, and a
-                    // scrolled-up reader re-anchors there without moving.
-                    e.invalidate();
-                    self.chat.anchor = None;
-                }
-                self.trim();
             }
             Event::Tool(call) => {
                 self.chat.reply_break = true;
@@ -1103,6 +1084,11 @@ impl App {
             }
             Event::Usage(text) => self.conn.usage = clean(&text),
             Event::Finished { outcome } => {
+                // A tail held as a possible goal marker was not one.
+                let held = self.chat.marker.flush();
+                if !held.is_empty() {
+                    self.reply_text(&held);
+                }
                 self.calls_over();
                 self.conn.end_turn();
                 self.clear_status(StatusKind::Cancelling);
@@ -1247,6 +1233,37 @@ impl App {
     /// turn, for `/copy`.
     pub(crate) fn last_reply(&self) -> Option<&str> {
         (!self.chat.reply.is_empty()).then_some(self.chat.reply.as_str())
+    }
+    /// Streamed reply text, the goal marker already out: kept for `/copy`
+    /// and appended to the reply on screen.
+    fn reply_text(&mut self, text: &str) {
+        self.keep_reply(text);
+        let text = self.chat.sanitizer.push(text);
+        if self
+            .chat
+            .entries
+            .back()
+            .is_none_or(|e| e.role != Role::Assistant)
+        {
+            self.add(Role::Assistant, "");
+        }
+        let e = self
+            .chat
+            .entries
+            .back_mut()
+            .expect("an assistant entry was just ensured");
+        e.append(&text);
+        self.chat.bytes += text.len();
+        if e.text.len() > BLOCK_BYTES + BLOCK_SLACK {
+            let remove = e.text.ceil_char_boundary(e.text.len() - BLOCK_BYTES);
+            e.text.drain(..remove);
+            self.chat.bytes -= remove;
+            // Its start moved: the next paint wraps it whole, and a
+            // scrolled-up reader re-anchors there without moving.
+            e.invalidate();
+            self.chat.anchor = None;
+        }
+        self.trim();
     }
     /// Adds streamed text to the reply `/copy` takes, up to just over the
     /// clipboard limit so a cut can still be reported.

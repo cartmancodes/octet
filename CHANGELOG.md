@@ -354,6 +354,9 @@ Claude Code and Codex CLIs.
 - Esc from the `/skills` picker left `/skills ` in the prompt, so the next
   prompt reopened the picker and Enter did nothing. Esc now clears that
   line, and Enter on a filter that matches nothing says so.
+- The goal completion marker `[[OCTET_GOAL_COMPLETE]]` showed in the
+  conversation; it is now hidden there and from `/copy` (the journal keeps
+  the reply as sent).
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.
