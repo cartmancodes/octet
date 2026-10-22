@@ -418,3 +418,41 @@ fn a_large_tool_run_keeps_its_recent_calls() {
             .all(|e| e.size() <= BLOCK_BYTES + 33 * 1024)
     );
 }
+#[test]
+fn a_resumed_session_asked_for_no_model_is_not_labelled_the_default() {
+    let mut app = crate::test_support::app_for(octet_core::Engine::CLAUDE);
+    let mut config = octet_core::Config::new(octet_core::Engine::CLAUDE, "claude", "/tmp");
+    config.resume = Some("s1".into());
+    app.connection(&config, "journal-2".into());
+    let m = |s: &str, id: &str, name: &str| octet_core::ModelInfo {
+        selection: s.into(),
+        id: Some(id.into()),
+        name: name.into(),
+        description: String::new(),
+    };
+    app.event(Event::Models(vec![
+        m("default", "claude-opus-5-5", "Default (recommended)"),
+        m("sonnet", "claude-sonnet-5-5", "Sonnet 5.5"),
+    ]));
+    app.event(Event::Ready {
+        session: "s1".into(),
+    });
+    // Claude resumes on the session's own model, which it names only with
+    // the first turn: the header must not claim the account's default.
+    assert_eq!(app.conn.model, "the resumed session's model · unconfirmed");
+    assert_eq!(app.current_model(), None);
+    app.event(Event::ModelSelected("claude-sonnet-5-5".into()));
+    assert_eq!(app.conn.model, "Sonnet 5.5 · claude-sonnet-5-5");
+    // Asked for by name, the model is the one asked for.
+    config.model = Some("sonnet".into());
+    app.connection(&config, "journal-3".into());
+    app.event(Event::Models(vec![m(
+        "sonnet",
+        "claude-sonnet-5-5",
+        "Sonnet 5.5",
+    )]));
+    assert_eq!(
+        app.conn.model,
+        "Sonnet 5.5 · claude-sonnet-5-5 · unconfirmed"
+    );
+}

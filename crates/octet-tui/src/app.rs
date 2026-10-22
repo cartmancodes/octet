@@ -133,6 +133,9 @@ pub(crate) struct Connection {
     pub(crate) workspace: String,
     pub(crate) model: String,
     pub(crate) requested_model: Option<String>,
+    /// The connection resumes (or forks) a vendor session. Asked for no
+    /// model, it runs on that session's own, not the provider's default.
+    pub(crate) resumes: bool,
     pub(crate) resolved_model: Option<String>,
     pub(crate) models: Vec<octet_core::ModelInfo>,
     /// The active provider's skills, as it last listed them.
@@ -176,6 +179,7 @@ impl Connection {
             workspace: clean(&config.cwd.display().to_string()),
             model: "awaiting model metadata".into(),
             requested_model: config.model.clone(),
+            resumes: config.resume.is_some(),
             resolved_model: None,
             models: Vec::new(),
             skills: Vec::new(),
@@ -524,7 +528,11 @@ impl App {
                         self.conn
                             .requested_model
                             .as_deref()
-                            .unwrap_or("provider default")
+                            .unwrap_or(if self.conn.resumes {
+                                "the resumed session's model"
+                            } else {
+                                "provider default"
+                            })
                     )
                 },
                 |m| {
@@ -545,6 +553,10 @@ impl App {
     fn catalog_selection(&self) -> Option<&octet_core::ModelInfo> {
         if let Some(id) = &self.conn.resolved_model {
             self.conn.models.iter().find(|m| m.id.as_ref() == Some(id))
+        } else if self.conn.requested_model.is_none() && self.conn.resumes {
+            // A resumed session keeps its own model, which the vendor names
+            // only with its first turn (Claude); the default is not it.
+            None
         } else {
             self.conn
                 .models
