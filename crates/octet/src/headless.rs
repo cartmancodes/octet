@@ -123,6 +123,7 @@ async fn drive_print(
                     .map_err(|e| e.to_string())?;
             }
             Event::Text(text) if !json => out.text(&text).await?,
+            Event::Tool(_) if !json => out.tool().await?,
             Event::Approval { id, summary, .. } => {
                 warn(&format!(
                     "denied an approval ({}); print mode cannot ask. \
@@ -477,13 +478,31 @@ async fn read_line(
 struct Reply {
     /// Whether the last text written left a line open.
     open_line: bool,
+    /// Whether any reply text was written.
+    written: bool,
+    /// A tool call came after the text: the next text is a new paragraph.
+    paragraph: bool,
 }
 impl Reply {
     async fn text(&mut self, text: &str) -> Result<(), String> {
         if !text.is_empty() {
+            if std::mem::take(&mut self.paragraph) {
+                write_out(b"\n").await?;
+            }
             self.open_line = !text.ends_with('\n');
+            self.written = true;
         }
         write_out(text.as_bytes()).await
+    }
+    /// A tool call: the line is ended now, so a note about it (a denied
+    /// approval) starts its own line, and the text after it is a new
+    /// paragraph, as the terminal interface shows it.
+    async fn tool(&mut self) -> Result<(), String> {
+        if self.written {
+            self.end_text().await?;
+            self.paragraph = true;
+        }
+        Ok(())
     }
     /// Ends the reply with a newline, if it did not end with one.
     async fn end_text(&mut self) -> Result<(), String> {

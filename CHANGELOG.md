@@ -330,6 +330,9 @@ Claude Code and Codex CLIs.
 - `/effort default` did not reset Codex's reasoning effort: Codex kept the
   last level for later turns. Octet now sends the level Codex picks itself
   (its config's, else the model's default).
+- Consecutive Codex messages ran together ("…complete it.Unable to…"); each
+  now starts a paragraph. In `--print`, text after a tool call starts a
+  paragraph too, and a denied approval's note starts its own line.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

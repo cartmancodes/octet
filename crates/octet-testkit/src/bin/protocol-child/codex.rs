@@ -185,6 +185,21 @@ impl CodexFixture {
             scenario::APPROVAL => emit(
                 &json!({"id":"permission","method":"item/commandExecution/requestApproval","params":{"threadId":"fixture-thread","turnId":active,"command":"echo fixture"}}),
             ),
+            scenario::MESSAGES => {
+                emit(&codex_delta("fixture-thread", &active, "m1", "Fir"));
+                emit(&codex_delta("fixture-thread", &active, "m1", "st."));
+                emit(
+                    &json!({"method":"item/completed","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"m1","type":"agentMessage","text":"First."}}}),
+                );
+                emit(
+                    &json!({"method":"item/completed","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"m2","type":"agentMessage","text":"Second."}}}),
+                );
+                emit(
+                    &json!({"method":"item/completed","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"cmd-1","type":"commandExecution","command":"true","status":"completed","exitCode":0}}}),
+                );
+                emit(&codex_delta("fixture-thread", &active, "m3", "Third."));
+                done();
+            }
             scenario::TOOL_FAIL => {
                 emit(
                     &json!({"method":"item/started","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"cmd-9","type":"commandExecution","command":"false","status":"inProgress"}}}),

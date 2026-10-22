@@ -1156,6 +1156,18 @@ async fn codex_effort_default_without_a_configured_level_is_the_models() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn codex_agent_messages_back_to_back_are_separate_paragraphs() {
+    let (handle, mut events, task) = spawn(config());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::MESSAGES.into()))
+        .unwrap();
+    // Deltas of one message join; the next message starts a paragraph. A
+    // tool call between messages already separates them.
+    assert_eq!(turn_text(&mut events).await, "First.\n\nSecond.Third.");
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn claude_launches_with_effort() {
     let mut c = claude();
     c.effort = Some("max".into());

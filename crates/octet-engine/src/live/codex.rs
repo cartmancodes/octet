@@ -103,6 +103,9 @@ pub(super) struct CodexProtocol {
     /// The effort the thread runs at, as Codex reported it or Octet last
     /// sent it: Codex keeps a turn's effort for the turns after it.
     thread_effort: Option<String>,
+    /// The agent message whose text was shown last, until a tool call:
+    /// another message after it starts a new paragraph.
+    last_text_item: Option<String>,
 }
 
 impl Protocol for CodexProtocol {
@@ -128,6 +131,7 @@ impl Protocol for CodexProtocol {
         self.turn = None;
         self.text_items.clear();
         self.pending_steer.clear();
+        self.last_text_item = None;
     }
 
     /// Steers the turn, or holds the text until Codex names the turn.
@@ -264,7 +268,8 @@ impl Protocol for CodexProtocol {
             "item/agentMessage/delta" => {
                 if let Some(text) = v.pointer("/params/delta").and_then(Value::as_str) {
                     // A repeated item is already counted; only a new one can hit the limit.
-                    if let Some(id) = v.pointer("/params/itemId").and_then(Value::as_str)
+                    let id = v.pointer("/params/itemId").and_then(Value::as_str);
+                    if let Some(id) = id
                         && !self.text_items.contains(id)
                     {
                         if self.text_items.len() >= 4096 {
@@ -272,17 +277,18 @@ impl Protocol for CodexProtocol {
                         }
                         self.text_items.insert(id.to_owned());
                     }
-                    core.emit(Event::Text(text.into()))?;
+                    self.message_text(core, id.unwrap_or_default(), text)?;
                 }
             }
             "item/started" | "item/completed" => {
                 let item = &v["params"]["item"];
                 match item["type"].as_str().unwrap_or("") {
                     "agentMessage" if method == "item/completed" => {
-                        if !self.text_items.contains(item["id"].as_str().unwrap_or(""))
+                        let id = item["id"].as_str().unwrap_or("");
+                        if !self.text_items.contains(id)
                             && let Some(text) = item["text"].as_str()
                         {
-                            core.emit(Event::Text(text.into()))?;
+                            self.message_text(core, id, text)?;
                         }
                     }
                     "commandExecution" | "fileChange" | "mcpToolCall" => {
@@ -291,6 +297,7 @@ impl Protocol for CodexProtocol {
                             let id = one_line(item["id"].as_str().unwrap_or_default());
                             self.file_changes.insert(id, change_paths(item));
                         }
+                        self.last_text_item = None;
                         core.emit(Event::Tool(codex_tool_call(item, started)))?;
                     }
                     _ => {}
@@ -316,6 +323,26 @@ impl Protocol for CodexProtocol {
 }
 
 impl CodexProtocol {
+    /// Shows agent message `item`'s `text`. Codex sends each message as its
+    /// own item with no break between them, so a new message straight after
+    /// another starts a paragraph.
+    fn message_text(&mut self, core: &Core, item: &str, text: &str) -> Result<(), DriverError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if self
+            .last_text_item
+            .as_deref()
+            .is_some_and(|last| last != item)
+        {
+            core.emit(Event::Text("\n\n".into()))?;
+        }
+        if self.last_text_item.as_deref() != Some(item) {
+            self.last_text_item = Some(item.to_owned());
+        }
+        core.emit(Event::Text(text.into()))
+    }
+
     /// Sends one of Octet's requests and records what its reply answers.
     async fn request(
         &mut self,
