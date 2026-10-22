@@ -362,6 +362,10 @@ Claude Code and Codex CLIs.
   session's first prompt, and its latest when that differs.
 - The offline demo's reply named only `--engine codex` and `--engine
   claude`; it names `--engine opencode` too.
+- The approval dialog had no frame, so on a wide screen the conversation
+  around it read as a narrow column beside it; it is framed now (where
+  there is room). The model picker cut long lines at 64 columns; it widens
+  to its longest line while the screen has room.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

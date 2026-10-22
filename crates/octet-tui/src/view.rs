@@ -424,10 +424,14 @@ fn completion_popup(frame: &mut Frame, composer: Rect, app: &App) {
         lines = lines.into_iter().skip(skip).take(room).collect();
     }
     let height = cells(lines.len()).saturating_add(2);
+    // At least 64 columns, and as wide as its longest line (the marker,
+    // the borders and a space beside it), so a long model or skill line is
+    // not cut while the screen has room.
+    let longest = lines.iter().map(Line::width).max().unwrap_or(0);
     let area = Rect {
         x: composer.x,
         y: composer.y.saturating_sub(height),
-        width: composer.width.min(64),
+        width: composer.width.min(cells(longest).saturating_add(3).max(64)),
         height: height.min(composer.y),
     };
     frame.render_widget(Clear, area);
@@ -807,7 +811,21 @@ fn approval(
 ) {
     let area = modal(area, 86, 24);
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(Style::default().bg(PANEL)), area);
+    // Framed where there is room, so on a wide screen it reads as a dialog
+    // over the conversation rather than a column of it; a small screen
+    // keeps every row for the request.
+    let border = Block::default()
+        .borders(if area.height >= 16 && area.width >= 50 {
+            Borders::ALL
+        } else {
+            Borders::NONE
+        })
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(AMBER))
+        .style(Style::default().bg(PANEL));
+    let inner = border.inner(area);
+    frame.render_widget(border, area);
+    let area = inner;
     let width = usize::from(area.width.saturating_sub(2));
     let lines = summary_lines(&asked.summary);
     // The folder (when there is one) and the grant are the rows that must stay.
