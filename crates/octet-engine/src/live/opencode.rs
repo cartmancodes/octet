@@ -205,6 +205,35 @@ pub(super) struct OpencodeProtocol {
     /// session is ready. It is set through the live path once the
     /// handshake ends, and no handshake confirmation is shown over it.
     effort_wanted: Option<Wanted>,
+    /// The mode the running turn's prompt was sent under: opencode runs a
+    /// prompt under the agent it started with.
+    turn_mode: Option<Mode>,
+    /// Why Octet cancelled the running turn: it started a subagent that
+    /// cannot ask for approval (see `stop_subtask`).
+    subtask_stopped: Option<String>,
+}
+
+/// opencode 1.18.25's commands that always run in a subagent: `review` is
+/// built in with `subtask: true`.
+const SUBTASK_COMMANDS: &[&str] = &["review"];
+
+/// Why opencode's command `name` (`None`: one it did not name) cannot run
+/// as a subagent under `mode`, ending with `done`, what Octet did about it;
+/// `None` when `mode` lets opencode decide. opencode passes on only the
+/// approval requests of the sessions opened over ACP: a subagent's would
+/// wait for ever, unseen.
+fn subtask_refusal(name: Option<&str>, mode: Mode, done: &str) -> Option<String> {
+    let command = name.map_or_else(
+        || "a command".to_owned(),
+        |name| format!("/{}", short(name)),
+    );
+    matches!(mode, Mode::Ask | Mode::AcceptEdits).then(|| {
+        format!(
+            "opencode runs {command} in a subagent, whose approval requests it never passes on to Octet; \
+             subagents are off in {}, so {done}. In auto, opencode's own permission settings decide",
+            mode.label()
+        )
+    })
 }
 
 impl Protocol for OpencodeProtocol {
@@ -259,6 +288,8 @@ impl Protocol for OpencodeProtocol {
     fn turn_started(&mut self) {
         self.cancel_sent = false;
         self.tools.clear();
+        self.turn_mode = None;
+        self.subtask_stopped = None;
     }
 
     /// A probe that ends before it has its catalog (an error, or the
@@ -474,21 +505,69 @@ impl Protocol for OpencodeProtocol {
                 }
                 _ => Ok(()),
             },
-            "tool_call" | "tool_call_update" => self.tool(core, update),
+            "tool_call" | "tool_call_update" => {
+                self.tool(core, update)?;
+                self.stop_subtask(core, update).await
+            }
             _ => Ok(()),
         }
     }
 }
 
 impl OpencodeProtocol {
+    /// Cancels the running turn when `update` is a subagent's `task` call
+    /// (opencode's only `think` tool) and the turn's mode asks: opencode
+    /// never passes the subagent's approval requests on, so it would wait
+    /// for ever. The asking agents deny `task` to the model, so such a call
+    /// comes from a command that runs as a subagent. The turn then ends,
+    /// failed, saying why (see `prompt_ended`).
+    async fn stop_subtask(&mut self, core: &mut Core, update: &Value) -> Result<(), DriverError> {
+        if update["kind"] != "think"
+            || core.phase != Phase::InTurn
+            || self.subtask_stopped.is_some()
+        {
+            return Ok(());
+        }
+        let name = update
+            .pointer("/rawInput/command")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty());
+        let Some(refusal) = self
+            .turn_mode
+            .and_then(|mode| subtask_refusal(name, mode, "Octet stopped the turn"))
+        else {
+            return Ok(());
+        };
+        self.subtask_stopped = Some(refusal);
+        core.phase = Phase::Interrupting;
+        <Self as Protocol>::interrupt(self, core).await?;
+        core.deadline = deadline_after(core.limits.interrupt);
+        core.deny_all_pending().await
+    }
+
     /// Sends the prompt `prompt`, with `images` inline as base64 blocks
-    /// after it, read now; an image that cannot be read fails the turn.
+    /// after it, read now; an image that cannot be read fails the turn, and
+    /// so does a command that always runs in a subagent while the mode asks
+    /// (see `subtask_refusal`).
     async fn send_blocks(
         &mut self,
         core: &mut Core,
         mut prompt: Vec<Value>,
         images: &[ImageAttachment],
     ) -> Result<(), DriverError> {
+        // opencode runs a command when the prompt's text starts with `/name`.
+        let command = prompt
+            .first()
+            .and_then(|block| block["text"].as_str())
+            .and_then(|text| text.strip_prefix('/'))
+            .and_then(|text| text.split_whitespace().next())
+            .filter(|name| SUBTASK_COMMANDS.contains(name));
+        if let Some(refusal) =
+            command.and_then(|name| subtask_refusal(Some(name), core.mode, "Octet did not send it"))
+        {
+            return fail_turn(core, refusal);
+        }
+        self.turn_mode = Some(core.mode);
         let mut encoded = Vec::with_capacity(images.len());
         for image in images {
             // A file swapped for a FIFO, or on a stalled mount, must not hold
@@ -998,6 +1077,9 @@ impl OpencodeProtocol {
             return Ok(());
         }
         self.tools.clear();
+        if let Some(refusal) = self.subtask_stopped.take() {
+            return core.finish_turn(Outcome::Failed, Some(refusal));
+        }
         if let Some(error) = v.get("error") {
             return core.finish_turn(Outcome::Failed, Some(error_text(error)));
         }

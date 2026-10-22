@@ -3939,6 +3939,119 @@ async fn opencode_skill_runs_as_a_slash_prompt() {
     );
     stop(&handle, task).await;
 }
+/// An opencode skill `name` with `args`, as the interface sends it.
+fn opencode_skill(name: &str, args: &str) -> Command {
+    Command::Skill {
+        name: name.into(),
+        path: None,
+        args: args.into(),
+        display: format!("/{name} {args}"),
+        context: None,
+    }
+}
+/// The error and outcome that end the turn `command` starts in a session
+/// in `mode`, and the text it streamed; it must end by itself.
+async fn opencode_turn_ending(mode: Mode, command: Command) -> (Option<String>, Outcome, String) {
+    let mut c = opencode();
+    c.mode = mode;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(command).unwrap();
+    let (mut error, mut text) = (None, String::new());
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Error(message) => error = Some(message),
+            Event::Text(t) => text.push_str(&t),
+            Event::Approval { detail, .. } => panic!("an approval was shown: {detail}"),
+            Event::Finished { outcome } => break outcome,
+            _ => {}
+        }
+    };
+    stop(&handle, task).await;
+    (error, outcome, text)
+}
+#[tokio::test]
+async fn opencodes_review_is_not_sent_while_the_mode_asks() {
+    // `/review` runs as a subagent, whose approvals opencode never passes on:
+    // in ask or accept-edits the turn would wait for ever.
+    for (mode, command) in [
+        (Mode::Ask, opencode_skill("review", "HEAD")),
+        (Mode::AcceptEdits, opencode_skill("review", "")),
+        (Mode::Ask, Command::Prompt("/review HEAD".into())),
+    ] {
+        let (error, outcome, text) = opencode_turn_ending(mode, command).await;
+        assert_eq!(
+            error.as_deref(),
+            Some(subtask_refusal("/review", mode, "Octet did not send it").as_str())
+        );
+        assert_eq!(outcome, Outcome::Failed);
+        // The fake echoes a command it is sent.
+        assert_eq!(text, "");
+    }
+}
+/// What Octet says when opencode's subagent command `command` cannot run
+/// in `mode`, ending with what Octet did about it.
+fn subtask_refusal(command: &str, mode: Mode, done: &str) -> String {
+    format!(
+        "opencode runs {command} in a subagent, whose approval requests it never passes on to Octet; \
+         subagents are off in {}, so {done}. In auto, opencode's own permission settings decide",
+        mode.label()
+    )
+}
+#[tokio::test]
+async fn opencodes_review_is_sent_in_auto() {
+    let (error, outcome, text) =
+        opencode_turn_ending(Mode::Auto, opencode_skill("review", "HEAD")).await;
+    assert_eq!(error, None);
+    assert_eq!(outcome, Outcome::Completed);
+    assert_eq!(text, "/review HEAD");
+}
+#[tokio::test]
+async fn an_opencode_subagent_started_while_the_mode_asks_stops_the_turn() {
+    // A command opencode runs as a subagent that Octet cannot know of
+    // beforehand: its `task` call is the sign, and the turn is cancelled.
+    let (error, outcome, _) =
+        opencode_turn_ending(Mode::Ask, opencode_skill(scenario::OPENCODE_SUBTASK, "")).await;
+    let command = format!("/{}", scenario::OPENCODE_SUBTASK);
+    assert_eq!(
+        error.as_deref(),
+        Some(subtask_refusal(&command, Mode::Ask, "Octet stopped the turn").as_str())
+    );
+    assert_eq!(outcome, Outcome::Failed);
+}
+#[tokio::test]
+async fn an_opencode_subagent_in_auto_runs_until_cancelled() {
+    let mut c = opencode();
+    c.mode = Mode::Auto;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SUBTASK, ""))
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Tool(_))).await;
+    // Nothing stops it: the subagent's approvals are opencode's to decide.
+    let quiet = timeout(Duration::from_millis(500), async {
+        loop {
+            if let Event::Finished { .. } | Event::Error(_) = next(&mut events).await {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "the turn ended by itself");
+    handle.interrupt();
+    let finished = wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Interrupted
+            }
+        ),
+        "{finished:?}"
+    );
+    stop(&handle, task).await;
+}
 #[tokio::test]
 async fn an_opencode_skill_with_context_still_starts_with_its_command() {
     // opencode runs a command only when the prompt starts with `/`; the

@@ -331,7 +331,13 @@ it also shows the running mode when a change is waiting for the next turn.
 `auto` hands approval decisions to the vendor's own reviewer; Octet never
 answers a vendor approval by itself. opencode's `ask` and `accept-edits`
 agents turn subagents (its `task` tool) off: opencode runs a subagent under
-an agent of its own that would not ask. Reading files proceeds in both,
+an agent of its own that would not ask. A command opencode runs as a
+subagent (its built-in `/review`, or one of yours with `subtask: true`) does
+not run in those modes either: opencode 1.18.25 never passes a subagent's
+approval requests on to Octet, so the turn would wait unseen. Octet refuses
+`/review` before sending it, and stops the turn, saying why, as soon as
+another command starts a subagent. In `auto`, opencode's own permission
+settings decide. Reading files proceeds in both,
 except `.env` files (not `.env.example`), which ask as in opencode's own
 defaults. Codex has no edits-only mode, so
 `accept-edits` is its closest analogue: in-workspace edits already proceed under

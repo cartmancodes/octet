@@ -113,6 +113,11 @@ pub const OPENCODE_EDIT: &str = "opencode-edit";
 /// call names the file, the permission request that follows names none.
 /// The answer is echoed and ends the turn.
 pub const OPENCODE_READ_ENV: &str = "opencode-read-env";
+/// opencode: a slash command the fake lists that runs as a subagent, as a
+/// command with `subtask: true` does in opencode 1.18.25: its `task` tool
+/// call starts, then nothing comes (the subagent's approval requests never
+/// reach the client) until the turn is cancelled.
+pub const OPENCODE_SUBTASK: &str = "fixture-subtask";
 /// opencode: the name of the skill the fake lists as a slash command.
 pub const OPENCODE_SKILL: &str = "fixture-opencode-skill";
 

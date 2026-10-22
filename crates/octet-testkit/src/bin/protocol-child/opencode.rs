@@ -217,7 +217,9 @@ impl OpencodeFixture {
         emit(&acp_update(
             sid,
             &json!({"sessionUpdate":"available_commands_update","availableCommands":[
-                {"name":scenario::OPENCODE_SKILL,"description":"An opencode fixture skill"}]}),
+                {"name":scenario::OPENCODE_SKILL,"description":"An opencode fixture skill"},
+                {"name":scenario::OPENCODE_SUBTASK,"description":"An opencode fixture subtask"},
+                {"name":"review","description":"review changes [commit|branch|pr], defaults to uncommitted"}]}),
         ));
     }
 
@@ -300,6 +302,17 @@ impl OpencodeFixture {
         if !images.is_empty() {
             emit(&acp_text(&sid, &images.join(",")));
             end_turn(id);
+            return;
+        }
+        let subtask = format!("/{}", scenario::OPENCODE_SUBTASK);
+        if text.split_whitespace().next() == Some(subtask.as_str()) {
+            // The subagent's tool call starts; its approval requests never
+            // reach the client, so the prompt waits for a cancel.
+            self.held = Some(id.clone());
+            emit(&acp_update(
+                &sid,
+                &json!({"sessionUpdate":"tool_call","toolCallId":"task-0","title":"task","kind":"think","status":"pending","locations":[],"rawInput":{"prompt":"Do the fixture subtask","description":"A fixture subtask","subagent_type":self.mode,"command":scenario::OPENCODE_SUBTASK}}),
+            ));
             return;
         }
         // A slash command is echoed as the reply, as a skill's expansion would be.
