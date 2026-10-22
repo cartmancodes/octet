@@ -333,6 +333,8 @@ Claude Code and Codex CLIs.
 - Consecutive Codex messages ran together ("…complete it.Unable to…"); each
   now starts a paragraph. In `--print`, text after a tool call starts a
   paragraph too, and a denied approval's note starts its own line.
+- `/compact` on Codex finished without a word; a completed compaction now
+  notes "Context compacted" (every provider).
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

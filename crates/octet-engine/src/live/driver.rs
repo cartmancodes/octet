@@ -432,9 +432,11 @@ impl<P: Protocol> Driver<P> {
         Ok(())
     }
 
-    /// Compaction runs as a turn, so Esc cancels it and its events stream.
+    /// Compaction runs as a turn, so Esc cancels it and its events stream;
+    /// its completion is announced.
     async fn compact(&mut self) -> Result<(), DriverError> {
         if self.begin_turn("/compact".into())? {
+            self.core.compacting = true;
             self.protocol.compact(&mut self.core).await?;
         }
         Ok(())
@@ -448,6 +450,7 @@ impl<P: Protocol> Driver<P> {
             return Ok(false);
         }
         self.core.phase = Phase::InTurn;
+        self.core.compacting = false;
         self.protocol.turn_started();
         self.core.deadline = deadline_after(self.core.limits.turn_idle);
         self.core.emit(Event::User(display))?;

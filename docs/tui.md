@@ -278,7 +278,8 @@ original is never written to.
 
 **Compaction.** `/compact` asks the vendor to compact its context (Codex
 `thread/compact/start`, Claude's own `/compact`). It runs as a turn: its
-output streams as usual and Esc cancels it.
+output streams as usual and Esc cancels it. Once it completes Octet notes
+"Context compacted", as Codex compacts without a word.
 
 **Images.** `/image PATH` attaches an image to the next prompt; the prompt
 box's chips row shows `+ image name.png` (or `+N images`). PNG, JPEG, GIF and WebP

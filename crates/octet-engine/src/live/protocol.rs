@@ -44,6 +44,9 @@ impl Phase {
     }
 }
 
+/// What Octet says once a compaction turn completes.
+pub(super) const COMPACTED: &str = "Context compacted";
+
 /// The most approvals waiting on the user at once; more are denied.
 pub(super) const MAX_PENDING_APPROVALS: usize = 8;
 
@@ -69,6 +72,9 @@ pub(crate) struct Core {
     /// wire requests.
     pub(super) approval_id: u64,
     pub(super) pending: HashMap<u64, Pending>,
+    /// The running turn is a compaction: its completion is announced, as
+    /// vendors compact without a word.
+    pub(super) compacting: bool,
     /// The protocol's approval reply, for approvals denied here. `Core`
     /// keeps the protocol's functions as pointers rather than being generic
     /// over it, so the driver, `Core` and every protocol share one
@@ -96,6 +102,7 @@ impl Core {
             deadline: deadline_after(limits.connect),
             approval_id: 0,
             pending: HashMap::new(),
+            compacting: false,
             answer: P::answer,
             deny: P::deny,
         }
@@ -199,6 +206,9 @@ impl Core {
         self.close_all_pending()?;
         if let Some(error) = error {
             self.emit(Event::Error(error))?;
+        }
+        if std::mem::take(&mut self.compacting) && outcome == Outcome::Completed {
+            self.emit(Event::Notice(COMPACTED.into()))?;
         }
         self.emit(Event::Finished { outcome })
     }

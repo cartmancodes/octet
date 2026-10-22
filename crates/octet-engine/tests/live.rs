@@ -1240,15 +1240,39 @@ async fn codex_compact_runs_as_a_turn() {
     )
     .await;
     wait_for(&mut events, |e| matches!(e, Event::Started)).await;
-    wait_for(&mut events, |e| {
+    // Codex compacts without a word, so Octet says it is done.
+    let done = wait_for(&mut events, |e| {
+        matches!(e, Event::Notice(_) | Event::Finished { .. })
+    })
+    .await;
+    assert!(
+        matches!(&done, Event::Notice(n) if n == "Context compacted"),
+        "{done:?}"
+    );
+    let finished = next(&mut events).await;
+    assert!(
         matches!(
-            e,
+            finished,
             Event::Finished {
                 outcome: Outcome::Completed
             }
-        )
-    })
-    .await;
+        ),
+        "{finished:?}"
+    );
+    // A later turn is not a compaction.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let mut notices = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Notice(n) => notices.push(n),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        !notices.iter().any(|n| n.contains("compacted")),
+        "{notices:?}"
+    );
     stop(&handle, task).await;
 }
 #[tokio::test]
