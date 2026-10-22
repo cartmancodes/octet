@@ -154,6 +154,18 @@ fn edit_permission(sid: &str, call: &str, path: &str) -> Value {
     json!({"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":sid,"toolCall":{"toolCallId":call,"title":path,"kind":"edit","status":"pending","locations":[{"path":path}],"rawInput":{"filepath":path,"diff":"+hi"}},"options":[{"optionId":"once","kind":"allow_once","name":"Allow once"},{"optionId":"reject","kind":"reject_once","name":"Reject"}]}})
 }
 
+/// A slash command, echoed as the reply as a skill's expansion would be:
+/// every text block of the prompt `id`, joined as opencode 1.18.25 joins
+/// them into the command's arguments.
+fn echo_command(sid: &str, id: &Value, blocks: &[Value]) {
+    let joined: String = blocks
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    emit(&acp_text(sid, &joined));
+    end_turn(id);
+}
+
 /// The end of a turn.
 fn end_turn(id: &Value) {
     emit(&acp_result(
@@ -361,10 +373,8 @@ impl OpencodeFixture {
             self.start_subtask(id);
             return;
         }
-        // A slash command is echoed as the reply, as a skill's expansion would be.
         if text.starts_with('/') {
-            emit(&acp_text(&sid, text));
-            end_turn(id);
+            echo_command(&sid, id, blocks);
             return;
         }
         match text {

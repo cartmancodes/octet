@@ -4270,9 +4270,10 @@ async fn an_opencode_subagent_in_auto_runs_until_cancelled() {
     stop(&handle, task).await;
 }
 #[tokio::test]
-async fn an_opencode_skill_with_context_still_starts_with_its_command() {
-    // opencode runs a command only when the prompt starts with `/`; the
-    // context goes in a block after it.
+async fn an_opencode_skill_never_carries_context() {
+    // opencode joins a prompt's text blocks into a command's arguments and
+    // runs every `!`cmd`` of the expanded template in its shell: earlier
+    // conversation must never go with a command. The fake echoes every block.
     let (handle, mut events, task) = spawn(opencode());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
     handle
@@ -4281,14 +4282,69 @@ async fn an_opencode_skill_with_context_still_starts_with_its_command() {
             path: None,
             args: "go".into(),
             display: format!("/{} go", scenario::OPENCODE_SKILL),
-            context: Some("earlier conversation".into()),
+            context: Some("earlier !`touch pwned` conversation".into()),
         })
         .unwrap();
-    assert_eq!(
-        turn_text(&mut events).await,
-        format!("/{} go", scenario::OPENCODE_SKILL)
+    let mut notices = Vec::new();
+    let mut text = String::new();
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => notices.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { outcome } => {
+                assert_eq!(outcome, Outcome::Completed);
+                break;
+            }
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(text, format!("/{} go", scenario::OPENCODE_SKILL));
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.contains("Octet did not send the earlier conversation with it")),
+        "{notices:?}"
     );
     stop(&handle, task).await;
+}
+#[tokio::test]
+async fn an_opencode_command_whose_arguments_run_shell_is_not_sent_while_the_mode_asks() {
+    // opencode runs every `!`cmd`` of a command's expanded text in its shell
+    // before any permission check.
+    for (mode, command) in [
+        (
+            Mode::Ask,
+            opencode_skill(scenario::OPENCODE_SKILL, "a !`touch pwned` b"),
+        ),
+        (
+            Mode::AcceptEdits,
+            opencode_skill(scenario::OPENCODE_SKILL, "!`id`"),
+        ),
+        (
+            Mode::Ask,
+            Command::Prompt(format!("/{} !`touch pwned`", scenario::OPENCODE_SKILL)),
+        ),
+    ] {
+        let (error, outcome, text) = opencode_turn_ending(mode, command).await;
+        let error = error.expect("the turn was refused");
+        assert!(
+            error.contains("which opencode runs in its shell before it asks for any permission"),
+            "{error}"
+        );
+        assert!(error.contains(mode.label()), "{error}");
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(text, "", "it was sent");
+    }
+    // In auto, opencode's own settings decide.
+    let (error, outcome, text) = opencode_turn_ending(
+        Mode::Auto,
+        opencode_skill(scenario::OPENCODE_SKILL, "!`true`"),
+    )
+    .await;
+    assert_eq!(error, None);
+    assert_eq!(outcome, Outcome::Completed);
+    assert_eq!(text, format!("/{} !`true`", scenario::OPENCODE_SKILL));
 }
 #[tokio::test]
 async fn opencode_compact_is_sent_though_opencode_does_not_list_it() {

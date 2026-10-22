@@ -410,7 +410,11 @@ tools and `!` commands. It is at most 64 KiB: the newest turns are kept, your
 first prompt always stays, and a marker says how many turns between them were
 dropped. It then lives in the new vendor's own history, so `/reconnect`,
 `/effort`, `/fork` and `/compact` keep it. If the first send is refused, the next
-prompt carries it instead. A same-provider switch resumes the vendor session and
+prompt carries it instead. opencode never gets it with a slash command or
+skill: opencode puts a command's text into the command's template and runs
+every `` !`cmd` `` in the result through its shell before any permission check,
+and the transcript holds replies and tool output. The command runs without it,
+a note says so, and your next plain prompt carries it. A same-provider switch resumes the vendor session and
 carries nothing; `/new` starts fresh, and `/resume N` reopens that session's own
 history. Earlier messages and prompt history remain visible, and the previous
 journal is retained; the new connection writes a new journal.
@@ -557,8 +561,9 @@ bring, and runs them.
 - Enter (or Tab) on a skill puts `/name ` in the prompt, and nothing runs
   until you send it; add arguments first if it takes any. Sending another
   provider's skill switches to that provider (its default model, the
-  conversation carried as for any switch), then runs the skill as the first
-  turn, with its arguments. While the draft names only another provider's
+  conversation carried as for any switch, except to opencode, where it waits
+  for your next prompt), then runs the skill as the first turn, with its
+  arguments. While the draft names only another provider's
   skill, the hint row turns amber: `Enter switches to {provider}, then runs
   /name`. If the switch fails, the skill is not run and a note says so.
   When both providers list the same name, the one you picked is the one that

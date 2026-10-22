@@ -45,6 +45,9 @@ pub(super) const PROVIDER: Provider = Provider {
     // mid-turn, with or without plugins.
     shutdown_grace: Duration::from_millis(250),
     lists_models: true,
+    // opencode 1.18.25's `command()` runs each `` !`cmd` `` of the expanded
+    // template in the shell, before any agent or permission applies.
+    commands_expand_shell: true,
     launch_args: <OpencodeProtocol as Protocol>::launch_args,
     launch_env,
     start,
@@ -326,10 +329,12 @@ impl Protocol for OpencodeProtocol {
             .await
     }
 
-    /// A skill is one of opencode's slash commands, `/name args`. opencode
-    /// runs a command only when the prompt starts with `/`, so any context
-    /// follows it in a second block; opencode passes that on to the command
-    /// with its arguments.
+    /// A skill is one of opencode's slash commands, `/name args`. Context is
+    /// never sent with it: opencode 1.18.25 joins every text block of the
+    /// prompt into the command's arguments, substitutes them into its
+    /// template and runs each `` !`cmd` `` of the result in its shell before
+    /// any permission applies, and earlier conversation holds replies and
+    /// tool output. The interface keeps it for the next prompt instead.
     async fn send_skill(
         &mut self,
         core: &mut Core,
@@ -338,8 +343,14 @@ impl Protocol for OpencodeProtocol {
         args: &str,
         context: Option<&str>,
     ) -> Result<(), DriverError> {
-        self.send_blocks(core, skill_prompt(name, args, context), &[])
-            .await
+        if context.is_some_and(|context| !context.is_empty()) {
+            core.emit(Event::Notice(format!(
+                "opencode runs a command's text through its shell, so Octet did not send the earlier \
+                 conversation with it (/{})",
+                short(name)
+            )))?;
+        }
+        self.send_blocks(core, skill_prompt(name, args), &[]).await
     }
 
     /// Compaction is the prompt `/compact`. opencode 1.18.25 never lists that
@@ -547,25 +558,25 @@ impl OpencodeProtocol {
 
     /// Sends the prompt `prompt`, with `images` inline as base64 blocks
     /// after it, read now; an image that cannot be read fails the turn, and
-    /// so does a command that always runs in a subagent while the mode asks
-    /// (see `subtask_refusal`).
+    /// so, while the mode asks, does a command that always runs in a
+    /// subagent (see `subtask_refusal`) or whose arguments hold shell (see
+    /// `shell_refusal`).
     async fn send_blocks(
         &mut self,
         core: &mut Core,
         mut prompt: Vec<Value>,
         images: &[ImageAttachment],
     ) -> Result<(), DriverError> {
-        // opencode runs a command when the prompt's text starts with `/name`.
-        let command = prompt
-            .first()
-            .and_then(|block| block["text"].as_str())
-            .and_then(|text| text.strip_prefix('/'))
-            .and_then(|text| text.split_whitespace().next())
-            .filter(|name| SUBTASK_COMMANDS.contains(name));
-        if let Some(refusal) =
-            command.and_then(|name| subtask_refusal(Some(name), core.mode, "Octet did not send it"))
-        {
-            return fail_turn(core, refusal);
+        if let Some((name, args)) = slash_command(&prompt) {
+            let refusal = shell_refusal(&name, &args, core.mode).or_else(|| {
+                SUBTASK_COMMANDS
+                    .contains(&name.as_str())
+                    .then(|| subtask_refusal(Some(&name), core.mode, "Octet did not send it"))
+                    .flatten()
+            });
+            if let Some(refusal) = refusal {
+                return fail_turn(core, refusal);
+            }
         }
         self.turn_mode = Some(core.mode);
         let mut encoded = Vec::with_capacity(images.len());
@@ -1176,17 +1187,50 @@ fn delete_session(config: &Config, session: &str) {
 }
 
 /// The prompt blocks that run the slash command `name`: `/name args`,
-/// trimmed, then `context` after a blank line in a block of its own when
-/// there is context. opencode 1.18.25 runs a command only when the prompt's
-/// text starts with `/`, and joins the text blocks as they are, so the blank
-/// line keeps the context apart from the arguments.
-fn skill_prompt(name: &str, args: &str, context: Option<&str>) -> Vec<Value> {
+/// trimmed, in one block. opencode 1.18.25 runs a command only when the
+/// prompt's text starts with `/`.
+fn skill_prompt(name: &str, args: &str) -> Vec<Value> {
     let command = format!("/{name} {args}");
-    let mut blocks = vec![json!({"type": "text", "text": command.trim()})];
-    if let Some(context) = context.filter(|context| !context.is_empty()) {
-        blocks.push(json!({"type": "text", "text": format!("\n\n{context}")}));
+    vec![json!({"type": "text", "text": command.trim()})]
+}
+
+/// The command `prompt` runs and its arguments, read as opencode 1.18.25's
+/// ACP agent reads them: every text block joined as it is, trimmed; a
+/// command when that starts with `/` and a name follows at once; the
+/// arguments are the words after the name, one space apart. `None` for a
+/// plain prompt.
+fn slash_command(prompt: &[Value]) -> Option<(String, String)> {
+    let text: String = prompt
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    let rest = text.trim().strip_prefix('/')?;
+    if rest.starts_with(char::is_whitespace) {
+        return None;
     }
-    blocks
+    let mut words = rest.split_whitespace();
+    let name = words.next()?.to_owned();
+    Some((name, words.collect::<Vec<_>>().join(" ")))
+}
+
+/// opencode's mark for a shell command that a command's text runs: each
+/// `` !`cmd` `` of the expanded template is replaced by `cmd`'s output.
+const SHELL_MARK: &str = "!`";
+
+/// Why the command `name` cannot be sent with `args` under `mode`: the
+/// arguments hold [`SHELL_MARK`], which opencode would run in its shell
+/// before any permission check. `None` when they do not, or `mode` lets
+/// opencode decide.
+fn shell_refusal(name: &str, args: &str, mode: Mode) -> Option<String> {
+    (matches!(mode, Mode::Ask | Mode::AcceptEdits) && args.contains(SHELL_MARK)).then(|| {
+        format!(
+            "The arguments of /{} hold `!`…``, which opencode runs in its shell before it asks for any \
+             permission; in {} Octet did not send it. In auto, opencode's own permission settings decide",
+            short(name),
+            mode.label()
+        )
+    })
 }
 
 /// Why opencode's reply to setting an agent is not a confirmation.
@@ -1710,20 +1754,43 @@ mod tests {
     }
 
     #[test]
-    fn a_skill_prompt_starts_with_its_slash_command_and_context_follows() {
+    fn a_skill_prompt_is_its_slash_command_alone() {
         let text = |text: &str| json!({"type": "text", "text": text});
-        assert_eq!(skill_prompt("review", "src", None), [text("/review src")]);
-        assert_eq!(skill_prompt("review", "", None), [text("/review")]);
+        assert_eq!(skill_prompt("review", "src"), [text("/review src")]);
+        assert_eq!(skill_prompt("review", ""), [text("/review")]);
+        assert_eq!(skill_prompt("review", "  a b "), [text("/review   a b")]);
+    }
+
+    #[test]
+    fn a_slash_command_is_read_as_opencode_reads_it() {
+        let text = |text: &str| json!({"type": "text", "text": text});
+        let image = json!({"type": "image", "mimeType": "image/png", "data": "AA"});
+        let read = |blocks: &[Value]| slash_command(blocks);
+        let command = |name: &str, args: &str| Some((name.to_owned(), args.to_owned()));
+        assert_eq!(read(&[text("/review  a\n b ")]), command("review", "a b"));
+        assert_eq!(read(&[text("  /init")]), command("init", ""));
+        // Every text block joins the arguments, as they are.
         assert_eq!(
-            skill_prompt("review", "  a b ", None),
-            [text("/review   a b")]
+            read(&[text("/review go"), image, text("\n\nmore")]),
+            command("review", "go more")
         );
-        assert_eq!(skill_prompt("review", "go", Some("")), [text("/review go")]);
-        // Context first would make opencode read the command as plain text.
-        assert_eq!(
-            skill_prompt("review", "go", Some("earlier")),
-            [text("/review go"), text("\n\nearlier")]
-        );
+        assert_eq!(read(&[text("/rev"), text("iew x")]), command("review", "x"));
+        for plain in ["hello /review", "/ review", "/", ""] {
+            assert_eq!(read(&[text(plain)]), None, "{plain:?}");
+        }
+    }
+
+    #[test]
+    fn shell_in_a_commands_arguments_is_refused_only_while_the_mode_asks() {
+        for mode in [Mode::Ask, Mode::AcceptEdits] {
+            let refusal = shell_refusal("x", "a !`id` b", mode).unwrap();
+            assert!(refusal.contains("/x"), "{refusal}");
+            assert!(refusal.contains(mode.label()), "{refusal}");
+            assert_eq!(shell_refusal("x", "a `id` ! b", mode), None);
+        }
+        for mode in [Mode::Auto, Mode::FullAccess] {
+            assert_eq!(shell_refusal("x", "!`id`", mode), None);
+        }
     }
 
     /// `configOptions` for `model` with an effort option at `current`

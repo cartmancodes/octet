@@ -128,8 +128,18 @@ impl App {
         status: &str,
     ) -> Result<(), SendError> {
         // The first prompt after another provider took over carries the
-        // conversation so far; it is taken only once the send succeeds.
+        // conversation so far; it is taken only once the send succeeds. A
+        // provider that runs a command's text through its shell gets none
+        // with a command: it waits for the next prompt.
+        let shell_commands = self.conn.engine.provider().commands_expand_shell;
+        let mut held_for = None;
         let (command, carried) = match (&self.pending_handoff, command) {
+            (Some(_), command @ Command::Skill { .. }) if shell_commands => {
+                if let Command::Skill { name, .. } = &command {
+                    held_for = Some(name.clone());
+                }
+                (command, None)
+            }
             (Some(handoff), Command::Prompt(text)) => (
                 Command::PromptWithDisplay {
                     wire: handoff.wrap(&text),
@@ -175,6 +185,13 @@ impl App {
             (_, command) => (command, None),
         };
         vendor.send(command)?;
+        if let Some(name) = held_for {
+            self.note(format!(
+                "The earlier conversation goes with your next prompt, not with /{name}: {} would run \
+                 a command's text through its shell",
+                self.conn.engine
+            ));
+        }
         if let Some((turns, bytes)) = carried {
             self.pending_handoff = None;
             self.note(format!(
