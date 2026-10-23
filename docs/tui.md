@@ -371,7 +371,10 @@ still start (a definition that changed after Octet read it), Octet cancels
 the turn as soon as opencode reports it; by then opencode has started it.
 Plugin code, including a plugin's `command.execute.before` hook, runs
 outside these checks. A plain prompt runs no shell. In `auto`, opencode's
-own permission settings decide. Reading files proceeds in `ask` and `accept-edits`,
+own permission settings decide; a subagent whose own settings ask then waits
+unseen, so when a turn goes quiet for 10 s after a subagent starts, a notice
+says it may be waiting for a permission Octet cannot show (Esc cancels).
+Reading files proceeds in `ask` and `accept-edits`,
 except `.env` files (not `.env.example`), which ask as in opencode's own
 defaults. Codex has no edits-only mode, so
 `accept-edits` is its closest analogue: in-workspace edits already proceed under

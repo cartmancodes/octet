@@ -219,6 +219,10 @@ pub(super) struct OpencodeProtocol {
     /// The commands opencode lists, and their definitions as Octet read
     /// them, to check a command before it is sent while the mode asks.
     commands: commands::Commands,
+    /// When a running subagent's silence is reported (see `watch_subagent`).
+    subagent_quiet: Option<Instant>,
+    /// That silence has been reported this turn.
+    subagent_noted: bool,
 }
 
 /// Why opencode's command `name` (`None`: one it did not name) cannot run
@@ -263,20 +267,24 @@ impl Protocol for OpencodeProtocol {
 
     fn deadline(&self) -> Option<Instant> {
         let mode = self.mode_request.as_ref().map(|request| request.deadline);
-        [mode, self.probe_wait].into_iter().flatten().min()
+        [mode, self.probe_wait, self.subagent_quiet]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// A switch opencode has not confirmed in time is reported, and kept in
     /// case opencode confirms it late. A probe whose commands never came
-    /// settles for the models. Nothing here waits, so the work is done at
-    /// once and handed back as a ready future.
+    /// settles for the models. A quiet subagent is reported. Nothing here
+    /// waits, so the work is done at once and handed back as a ready future.
     fn on_deadline(
         &mut self,
         core: &mut Core,
     ) -> impl Future<Output = Result<(), DriverError>> + Send {
         std::future::ready(
             self.report_late_mode(core)
-                .and_then(|()| self.probe_timed_out(core)),
+                .and_then(|()| self.probe_timed_out(core))
+                .and_then(|()| self.report_quiet_subagent(core)),
         )
     }
 
@@ -294,6 +302,8 @@ impl Protocol for OpencodeProtocol {
         self.tools.clear();
         self.turn_mode = None;
         self.subtask_stopped = None;
+        self.subagent_quiet = None;
+        self.subagent_noted = false;
     }
 
     /// A probe that ends before it has its catalog (an error, or the
@@ -500,6 +510,10 @@ impl Protocol for OpencodeProtocol {
             return Ok(());
         }
         let update = &v["params"]["update"];
+        if self.subagent_quiet.is_some() {
+            // The turn is not quiet.
+            self.subagent_quiet = Some(deadline_after(core.limits.subagent_quiet));
+        }
         match update["sessionUpdate"].as_str().unwrap_or("") {
             "available_commands_update" => {
                 let list = &update["availableCommands"];
@@ -524,6 +538,7 @@ impl Protocol for OpencodeProtocol {
             },
             "tool_call" | "tool_call_update" => {
                 self.tool(core, update)?;
+                self.watch_subagent(core, update);
                 self.stop_subtask(core, update).await
             }
             _ => Ok(()),
@@ -532,6 +547,43 @@ impl Protocol for OpencodeProtocol {
 }
 
 impl OpencodeProtocol {
+    /// Watches a subagent `update` starts or ends (opencode's `task`, its
+    /// only `think` tool) in an `auto` turn: opencode never passes on the
+    /// subagent's permission requests, so one its own settings ask for
+    /// waits unseen. Once the turn has been quiet for
+    /// `Limits::subagent_quiet` after the subagent starts, Octet says so,
+    /// once a turn (see `report_quiet_subagent`).
+    fn watch_subagent(&mut self, core: &Core, update: &Value) {
+        if update["kind"] != "think"
+            || self.turn_mode != Some(Mode::Auto)
+            || !core.phase.is_running()
+        {
+            return;
+        }
+        self.subagent_quiet = match update["status"].as_str() {
+            Some("completed" | "failed") => None,
+            _ if self.subagent_noted => None,
+            _ => Some(deadline_after(core.limits.subagent_quiet)),
+        };
+    }
+
+    /// Says a quiet subagent may be waiting for a permission, once its
+    /// deadline has passed.
+    fn report_quiet_subagent(&mut self, core: &Core) -> Result<(), DriverError> {
+        if self.subagent_quiet.is_none_or(|at| Instant::now() < at) {
+            return Ok(());
+        }
+        self.subagent_quiet = None;
+        if !core.phase.is_running() {
+            return Ok(());
+        }
+        self.subagent_noted = true;
+        core.emit(Event::Notice(
+            "opencode's subagent may be waiting for a permission Octet cannot show; Esc cancels"
+                .to_owned(),
+        ))
+    }
+
     /// Cancels the running turn when `update` is a subagent's `task` call
     /// (opencode's only `think` tool) and the turn's mode asks: opencode
     /// never passes the subagent's approval requests on, so it would wait
@@ -1098,6 +1150,7 @@ impl OpencodeProtocol {
             return Ok(());
         }
         self.tools.clear();
+        self.subagent_quiet = None;
         if let Some(refusal) = self.subtask_stopped.take() {
             return core.finish_turn(Outcome::Failed, Some(refusal));
         }

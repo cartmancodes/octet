@@ -4721,3 +4721,43 @@ async fn opencodes_commands_are_read_once_and_again_when_the_list_changes() {
     assert_eq!(calls().matches("config").count(), 2, "{}", calls());
     stop(&handle, task).await;
 }
+#[tokio::test]
+async fn a_quiet_opencode_subagent_in_auto_gets_a_notice() {
+    // In auto, a subagent whose own settings ask waits for a permission
+    // opencode never passes on: once the turn goes quiet, Octet says so.
+    let mut c = opencode();
+    c.mode = Mode::Auto;
+    let limits = Limits {
+        subagent_quiet: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (handle, mut events, task) = spawn_with_limits(c, limits);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SUBTASK, ""))
+        .unwrap();
+    let notice = wait_for(&mut events, |e| {
+        matches!(e, Event::Notice(_) | Event::Finished { .. })
+    })
+    .await;
+    match notice {
+        Event::Notice(notice) => assert_eq!(
+            notice,
+            "opencode's subagent may be waiting for a permission Octet cannot show; Esc cancels"
+        ),
+        other => panic!("{other:?}"),
+    }
+    // Once is enough.
+    let again = timeout(Duration::from_millis(800), async {
+        loop {
+            if let Event::Notice(_) | Event::Finished { .. } = next(&mut events).await {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(again.is_err(), "another notice, or the turn ended");
+    handle.interrupt();
+    wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    stop(&handle, task).await;
+}

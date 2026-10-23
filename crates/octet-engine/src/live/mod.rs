@@ -61,6 +61,10 @@ pub struct Limits {
     /// (opencode's `opencode debug config` and `debug skill`), for a
     /// provider that checks a command first.
     pub command_check: Duration,
+    /// Silence in a turn after a subagent starts before Octet says it may
+    /// be waiting for a permission the vendor never passes on (opencode in
+    /// `auto`).
+    pub subagent_quiet: Duration,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -71,6 +75,7 @@ impl Default for Limits {
             mode_confirm: Duration::from_secs(10),
             image_read: Duration::from_secs(10),
             command_check: Duration::from_secs(20),
+            subagent_quiet: Duration::from_secs(10),
         }
     }
 }
