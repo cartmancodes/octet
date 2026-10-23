@@ -408,8 +408,10 @@ checks; and an MCP prompt with the same name and description as a command.
 Should a subagent still start, Octet cancels the turn as soon as opencode
 reports it; by then opencode has started it. A plain prompt runs no shell. In `auto`, opencode's
 own permission settings decide; a subagent whose own settings ask then waits
-unseen, so when a turn goes quiet for 10 s after a subagent starts, a notice
-says it may be waiting for a permission Octet cannot show (Esc cancels).
+unseen (in `auto` and in `full-access`, where its own agent's settings
+apply), so when a turn goes quiet for 10 s after a subagent starts, a notice
+says it may still be working, or waiting for a permission Octet cannot show
+(Esc cancels).
 Reading files proceeds in `ask` and `accept-edits`,
 except `.env` files (not `.env.example`), which ask as in opencode's own
 defaults. Codex has no edits-only mode, so

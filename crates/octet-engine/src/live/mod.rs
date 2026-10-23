@@ -67,7 +67,7 @@ pub struct Limits {
     pub command_check: Duration,
     /// Silence in a turn after a subagent starts before Octet says it may
     /// be waiting for a permission the vendor never passes on (opencode in
-    /// `auto`).
+    /// `auto` and `full-access`).
     pub subagent_quiet: Duration,
 }
 impl Default for Limits {

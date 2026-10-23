@@ -586,14 +586,14 @@ impl Protocol for OpencodeProtocol {
 
 impl OpencodeProtocol {
     /// Watches a subagent `update` starts or ends (opencode's `task`, its
-    /// only `think` tool) in an `auto` turn: opencode never passes on the
-    /// subagent's permission requests, so one its own settings ask for
-    /// waits unseen. Once the turn has been quiet for
+    /// only `think` tool) in an `auto` or `full-access` turn, where opencode
+    /// lets it run: opencode never passes on the subagent's permission
+    /// requests, so one its own settings ask for waits unseen. Once the turn has been quiet for
     /// `Limits::subagent_quiet` after the subagent starts, Octet says so,
     /// once a turn (see `report_quiet_subagent`).
     fn watch_subagent(&mut self, core: &Core, update: &Value) {
         if update["kind"] != "think"
-            || self.turn_mode != Some(Mode::Auto)
+            || !matches!(self.turn_mode, Some(Mode::Auto | Mode::FullAccess))
             || !core.phase.is_running()
         {
             return;
@@ -617,7 +617,8 @@ impl OpencodeProtocol {
         }
         self.subagent_noted = true;
         core.emit(Event::Notice(
-            "opencode's subagent may be waiting for a permission Octet cannot show; Esc cancels"
+            "opencode's subagent has gone quiet: it may still be working, or waiting for a permission \
+             Octet cannot show; Esc cancels"
                 .to_owned(),
         ))
     }
