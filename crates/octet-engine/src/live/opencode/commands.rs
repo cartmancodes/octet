@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     ffi::OsString,
-    io::Read as _,
+    io::{Read as _, Seek as _},
     os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     process::Stdio,
@@ -483,40 +483,44 @@ pub(super) async fn read(launch: Launch) -> Result<Book, String> {
         .map_err(|why| format!("opencode debug printed something else: {why}"))
 }
 
-/// A file `opencode debug` writes its output to, removed when dropped.
-/// opencode 1.18.25 exits before a pipe takes more than 64 KiB of its
-/// output, so its output goes to a file instead.
-struct Output(PathBuf);
-
-impl Drop for Output {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// A file for `opencode debug`'s output, with no name: opencode 1.18.25
+/// exits before a pipe takes more than 64 KiB of its output, so it writes to
+/// a file instead, and that output (the whole merged configuration,
+/// provider keys included) must be neither found by another program nor
+/// left behind, even when Octet is killed. The file is made `O_EXCL` and
+/// 0600, and its name removed at once; Octet and the child keep it open.
+fn unnamed_output(what: &str) -> std::io::Result<std::fs::File> {
+    /// Tells this process's output files apart.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "octet-opencode-{what}-{}-{n}.json",
+        std::process::id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
 }
 
 /// `opencode debug what`'s output, as JSON.
 async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
-    /// Tells this process's output files apart.
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let output = Output(std::env::temp_dir().join(format!(
-        "octet-opencode-{what}-{}-{n}.json",
-        std::process::id()
-    )));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&output.0)
-        .map_err(|error| {
-            format!("Octet could not make a file for opencode debug {what}: {error}")
-        })?;
+    let mut file = unnamed_output(what).map_err(|error| {
+        format!("Octet could not make a file for opencode debug {what}: {error}")
+    })?;
+    let stdout = file.try_clone().map_err(|error| {
+        format!("Octet could not make a file for opencode debug {what}: {error}")
+    })?;
     let status = tokio::process::Command::new(&launch.binary)
         .args(["debug", what])
         .envs(launch.env.iter().cloned())
         .current_dir(&launch.cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(file))
+        .stdout(Stdio::from(stdout))
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .status()
@@ -526,8 +530,8 @@ async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
         return Err(format!("opencode debug {what} {status}"));
     }
     let mut text = String::new();
-    std::fs::File::open(&output.0)
-        .and_then(|file| file.take(MAX_OUTPUT + 1).read_to_string(&mut text))
+    file.seek(std::io::SeekFrom::Start(0))
+        .and_then(|_| file.take(MAX_OUTPUT + 1).read_to_string(&mut text))
         .map_err(|error| format!("opencode debug {what}'s output could not be read: {error}"))?;
     if text.len() as u64 > MAX_OUTPUT {
         return Err(format!(
@@ -819,6 +823,34 @@ impl Commands {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// How Octet would start the scripted `opencode` `body` (a shell
+    /// script), in a folder of its own that lives as long as the guard.
+    fn scripted(name: &str, body: &str) -> (octet_testkit::TempDir, Launch) {
+        let dir = octet_testkit::TempDir::new(name);
+        let binary = octet_testkit::write_script(dir.path(), "opencode", body);
+        let launch = Launch {
+            binary,
+            cwd: dir.path().to_path_buf(),
+            env: Vec::new(),
+        };
+        (dir, launch)
+    }
+
+    #[tokio::test]
+    async fn the_debug_output_has_no_name_while_opencode_writes_it() {
+        // It holds the whole merged configuration, provider keys included:
+        // nothing else should find it, and nothing should outlive Octet.
+        // The script counts the files named as Octet names its output.
+        let (_dir, launch) = scripted(
+            "octet-debug-unnamed",
+            "n=$(ls \"${TMPDIR:-/tmp}\" | grep -c \"^octet-opencode-$2-$PPID-\")\n\
+             if [ \"$2\" = config ]; then echo \"{\\\"command\\\":{\\\"probe\\\":{\\\"template\\\":\\\"$n\\\"}}}\"; \
+             else echo '[]'; fi",
+        );
+        let book = read(launch).await.unwrap();
+        assert_eq!(book["probe"].template.as_deref(), Some("0"));
+    }
 
     /// A book of `commands` (a `command` map) and `skills`.
     fn book(commands: &Value, skills: &Value) -> Book {
