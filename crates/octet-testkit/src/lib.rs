@@ -127,6 +127,12 @@ fn changed(built: &Path, copy: &Path) -> bool {
 /// of one could wait past its limits. The run here, waited for without a
 /// limit, takes that wait out of the test.
 ///
+/// On Linux, a process another thread forks while the script is written
+/// holds it open for writing until that process execs, and running the
+/// script meanwhile fails with ETXTBSY. No new process can inherit it once
+/// it is written and closed, so the warm-up run tries again (for at most
+/// [`QUICK`]) until it starts, and once it has, so do the test's.
+///
 /// # Panics
 ///
 /// If the script cannot be written, or its warm-up run fails.
@@ -140,11 +146,22 @@ pub fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     )
     .expect("script");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
-    let warm = Command::new(&path)
-        .arg("warm")
-        .stdin(std::process::Stdio::null())
-        .status()
-        .expect("the script runs");
+    let deadline = std::time::Instant::now() + QUICK;
+    let warm = loop {
+        match Command::new(&path)
+            .arg("warm")
+            .stdin(std::process::Stdio::null())
+            .status()
+        {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            ran => break ran.expect("the script runs"),
+        }
+    };
     assert!(warm.success(), "the script's warm-up run failed");
     path
 }
@@ -373,6 +390,45 @@ mod tests {
             .expect("the script");
         assert!(warm.success());
         assert_eq!(std::fs::read_to_string(&marks).expect("marks"), "go\n");
+    }
+    #[test]
+    fn scripts_are_written_and_run_while_other_threads_start_processes() {
+        // On Linux, a process forked by another thread while a script is
+        // written holds the script open for writing until it execs, and
+        // running the script meanwhile fails with ETXTBSY.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let writers: Vec<_> = (0..4)
+            .map(|n| {
+                std::thread::spawn(move || {
+                    let dir = TempDir::new("octet-testkit-busy");
+                    for m in 0..15 {
+                        write_script(dir.path(), &format!("tool-{n}-{m}"), "exit 0");
+                    }
+                })
+            })
+            .collect();
+        let written = writers
+            .into_iter()
+            .map(std::thread::JoinHandle::join)
+            .collect::<Vec<_>>();
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().expect("a spawner");
+        }
+        assert!(
+            written.iter().all(Result::is_ok),
+            "a script could not be run"
+        );
     }
     #[test]
     fn temp_dirs_are_unique_and_removed() {
