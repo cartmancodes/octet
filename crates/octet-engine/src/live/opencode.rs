@@ -664,6 +664,9 @@ impl OpencodeProtocol {
         mut prompt: Vec<Value>,
         images: &[ImageAttachment],
     ) -> Result<(), DriverError> {
+        if let Some(refusal) = blocks_refusal(&prompt, core.mode) {
+            return fail_turn(core, refusal);
+        }
         if let Some((name, args)) = slash_command(&prompt) {
             if let Some(refusal) = shell_refusal(&name, &args, core.mode) {
                 return fail_turn(core, refusal);
@@ -1338,6 +1341,28 @@ fn slash_command(prompt: &[Value]) -> Option<(String, String)> {
     Some((name, words.collect::<Vec<_>>().join(" ")))
 }
 
+/// Why `prompt` cannot be sent under `mode`: it holds a block other than
+/// text or an image. opencode 1.18.25 turns a `resource` (and a
+/// `resource_link` that is not a file) into text, which joins a command's
+/// arguments or even starts a command, and Octet reads only text blocks
+/// (see `slash_command`). `None` when it holds none, or `mode` lets
+/// opencode decide. Octet itself sends only text and images.
+fn blocks_refusal(prompt: &[Value], mode: Mode) -> Option<String> {
+    if !matches!(mode, Mode::Ask | Mode::AcceptEdits) {
+        return None;
+    }
+    let kind = prompt
+        .iter()
+        .map(|block| block["type"].as_str().unwrap_or("untyped"))
+        .find(|kind| !matches!(*kind, "text" | "image"))?;
+    Some(format!(
+        "The prompt holds a {} block, which opencode reads as text Octet cannot check; in {} Octet \
+         sends opencode only text and images, and did not send it",
+        short(kind),
+        mode.label()
+    ))
+}
+
 /// opencode's mark for a shell command that a command's text runs: each
 /// `` !`cmd` `` of the expanded template is replaced by `cmd`'s output.
 const SHELL_MARK: &str = "!`";
@@ -1883,6 +1908,31 @@ mod tests {
         assert_eq!(skill_prompt("review", "src"), [text("/review src")]);
         assert_eq!(skill_prompt("review", ""), [text("/review")]);
         assert_eq!(skill_prompt("review", "  a b "), [text("/review   a b")]);
+    }
+
+    #[test]
+    fn blocks_opencode_reads_as_text_octet_cannot_check_are_refused_while_the_mode_asks() {
+        // opencode turns a `resource` (and a `resource_link` that is not a
+        // file) into text that joins a command's arguments, or starts one.
+        let text = json!({"type": "text", "text": "/x a"});
+        let image = json!({"type": "image", "mimeType": "image/png", "data": "AA"});
+        let resource =
+            json!({"type": "resource", "resource": {"uri": "file:///w/a", "text": "!`id`"}});
+        let link = json!({"type": "resource_link", "uri": "/review", "name": "r"});
+        for mode in [Mode::Ask, Mode::AcceptEdits] {
+            assert_eq!(blocks_refusal(&[text.clone(), image.clone()], mode), None);
+            for (block, kind) in [(&resource, "resource"), (&link, "resource_link")] {
+                let refusal = blocks_refusal(&[text.clone(), block.clone()], mode).unwrap();
+                assert!(refusal.contains(&format!("a {kind} block")), "{refusal}");
+                assert!(refusal.contains(mode.label()), "{refusal}");
+            }
+        }
+        for mode in [Mode::Auto, Mode::FullAccess] {
+            assert_eq!(
+                blocks_refusal(&[text.clone(), resource.clone()], mode),
+                None
+            );
+        }
     }
 
     #[test]
