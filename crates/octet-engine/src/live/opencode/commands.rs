@@ -253,8 +253,14 @@ pub(super) fn refusal(
             "/{shown}: its template runs shell commands (`!`…``) before opencode asks for any permission"
         ));
     }
-    let shell = expand(template, args).is_none_or(|text| text.contains(SHELL_MARK));
-    if shell {
+    let Some(expanded) = expand(template, args) else {
+        return refuse(format!(
+            "/{shown} with these arguments expands to more than {} MiB of text, too long for Octet to \
+             check",
+            MAX_EXPANDED >> 20
+        ));
+    };
+    if expanded.contains(SHELL_MARK) {
         return shell_refusal(name, SHELL_MARK, mode);
     }
     None
@@ -898,6 +904,18 @@ mod tests {
             replace_all("a$ARGUMENTSb", "$ARGUMENTS", "$$").as_deref(),
             Some("a$b")
         );
+    }
+
+    #[test]
+    fn a_command_too_long_to_expand_is_refused_for_its_length() {
+        let read = book(
+            &json!({"long": {"template": "$ARGUMENTS".repeat(2048)}}),
+            &json!([]),
+        );
+        let refusal = refusal(&read, None, "long", &"a".repeat(4096), Mode::Ask).unwrap();
+        assert!(refusal.contains("too long for Octet to check"), "{refusal}");
+        assert!(!refusal.contains("shell"), "{refusal}");
+        assert!(refusal.contains("ask"), "{refusal}");
     }
 
     #[test]
