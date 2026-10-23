@@ -6,7 +6,7 @@ use octet_testkit::scenario;
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::{self, BufRead},
+    io::{self, BufRead, Write as _},
     process, thread,
     time::Duration,
 };
@@ -113,7 +113,7 @@ pub(crate) fn session_command() {
 /// `protocol-child debug config|skill`: the stand-in for `opencode debug
 /// config` and `opencode debug skill`, run in the session's working
 /// directory. Each run appends its subcommand to `debug-calls` there, when
-/// the test made one.
+/// the test made one, in one write, so runs side by side keep every line.
 /// `config` prints a `command` map: `OPENCODE_SKILL` plain, and
 /// `OPENCODE_SUBTASK` plain too, so only its `task` call shows it is a
 /// subagent (a definition that changed after Octet read it); then the
@@ -122,10 +122,9 @@ pub(crate) fn session_command() {
 /// exit 1; with `debug-hangs`, both wait a minute first.
 pub(crate) fn debug_command() {
     let what = env::args().nth(2).unwrap_or_default();
-    if let Ok(mut calls) = fs::read_to_string("debug-calls") {
-        calls.push_str(&what);
-        calls.push('\n');
-        fs::write("debug-calls", calls).unwrap();
+    // Appended in one write: runs side by side must not lose each other's.
+    if let Ok(mut calls) = fs::OpenOptions::new().append(true).open("debug-calls") {
+        calls.write_all(format!("{what}\n").as_bytes()).unwrap();
     }
     if fs::exists("debug-hangs").unwrap_or(false) {
         thread::sleep(Duration::from_secs(60));

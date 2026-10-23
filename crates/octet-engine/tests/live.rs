@@ -4855,3 +4855,28 @@ async fn a_quiet_opencode_subagent_in_auto_gets_a_notice() {
     wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
     stop(&handle, task).await;
 }
+#[test]
+fn the_fake_opencode_counts_every_debug_run_though_they_run_at_once() {
+    // Octet runs `debug config` and `debug skill` side by side; the fake's
+    // count of them must not lose one to the other.
+    let dir = opencode_workspace(
+        "octet-fake-debug-calls",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    let runs: Vec<_> = (0..16)
+        .map(|n| {
+            std::process::Command::new(octet_testkit::protocol_child())
+                .args(["debug", if n % 2 == 0 { "config" } else { "skill" }])
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut run in runs {
+        assert!(run.wait().unwrap().success());
+    }
+    let calls = std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    assert_eq!(calls.lines().count(), 16, "{calls}");
+}
