@@ -16,6 +16,9 @@ pub(crate) struct Handoff {
     pub(crate) turns: usize,
     /// Where the transcript block ends, before the new-message line.
     context_end: usize,
+    /// The interface has said this waits for the next prompt (a command
+    /// went without it): it says so once.
+    pub(crate) held_noted: bool,
 }
 
 /// What the new model reads first: whose conversation this is, and how to
@@ -182,6 +185,7 @@ pub(crate) fn render<'a>(
         text,
         turns,
         context_end,
+        held_noted: false,
     })
 }
 
