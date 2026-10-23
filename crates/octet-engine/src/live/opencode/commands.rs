@@ -47,6 +47,11 @@ const MAX_OUTPUT: u64 = 16 * 1024 * 1024;
 /// How often Octet looks at the size of `opencode debug`'s output while it
 /// runs.
 const OUTPUT_POLL: Duration = Duration::from_millis(50);
+/// How long a changed command list must stay unchanged before Octet reads
+/// it: each `opencode debug` run starts opencode, plugins included, and
+/// opencode may list its commands again within moments (as MCP servers
+/// connect one by one).
+const LIST_SETTLE: Duration = Duration::from_millis(200);
 /// The most bytes a command's expanded text may have before Octet stops
 /// expanding it and refuses the command (a `$'` in its arguments repeats
 /// the template).
@@ -684,7 +689,7 @@ impl Commands {
         }
         self.listed = listed;
         self.retried = false;
-        self.start(launch, limit);
+        self.start(launch, limit, LIST_SETTLE);
         self.edited = running.filter(|mode| edits_unasked(*mode));
         self.tainted = self.edited;
     }
@@ -738,7 +743,7 @@ impl Commands {
                 .map_or(Verdict::Send, Verdict::Refuse),
             Reading::Done(Err(_)) | Reading::None if !self.retried && self.edited.is_none() => {
                 self.retried = true;
-                self.start(launch, limit);
+                self.start(launch, limit, Duration::ZERO);
                 Verdict::Wait
             }
             Reading::Done(Err(why)) => Verdict::Refuse(self.unread(why, name, mode)),
@@ -810,11 +815,12 @@ impl Commands {
     }
 
     /// Starts a reading with `launch`, for at most `limit`, in place of
-    /// any under way.
-    fn start(&mut self, launch: Launch, limit: Duration) {
+    /// any under way, once `settle` has passed without another.
+    fn start(&mut self, launch: Launch, limit: Duration, settle: Duration) {
         self.stop_reading();
         let (sender, result) = oneshot::channel();
         let task = tokio::spawn(async move {
+            tokio::time::sleep(settle).await;
             let read = tokio::time::timeout(limit, read(launch))
                 .await
                 .unwrap_or_else(|_| {

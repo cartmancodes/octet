@@ -305,7 +305,7 @@ impl OpencodeFixture {
     /// Opens, resumes or forks the session. A resume replays its history
     /// after its reply, before any prompt, as opencode 1.18.25 does. With
     /// `ticks` in the working directory, the commands are listed again
-    /// every 100 ms.
+    /// every 100 ms; with `relist-burst`, four changed lists follow at once.
     fn open(&mut self, method: &str, v: &Value) {
         method.clone_into(&mut self.opened);
         self.session = match method {
@@ -338,6 +338,17 @@ impl OpencodeFixture {
                 for _ in 0..100 {
                     thread::sleep(Duration::from_millis(100));
                     list_commands(&sid, false);
+                }
+            });
+        }
+        if fs::exists("relist-burst").unwrap_or(false) {
+            // Lists that change four times within 120 ms, as opencode's
+            // do while MCP servers connect one by one.
+            let sid = sid.clone();
+            thread::spawn(move || {
+                for late in [true, false, true, false] {
+                    thread::sleep(Duration::from_millis(30));
+                    list_commands(&sid, late);
                 }
             });
         }

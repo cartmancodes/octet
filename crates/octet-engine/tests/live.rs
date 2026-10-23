@@ -5250,6 +5250,30 @@ async fn a_verified_opencode_says_nothing_of_its_version() {
     }
     stop(&handle, task).await;
 }
+#[tokio::test]
+async fn lists_that_change_in_a_burst_are_read_once() {
+    // Each `opencode debug` run starts opencode, plugins included; lists
+    // that change within moments of each other need one reading.
+    let dir = opencode_workspace(
+        "octet-opencode-burst",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("relist-burst"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let calls = std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    assert_eq!(calls.matches("config").count(), 1, "{calls}");
+    // The reading is of the last list.
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{} go", scenario::OPENCODE_SKILL)
+    );
+    stop(&handle, task).await;
+}
 #[test]
 fn the_fake_opencode_counts_every_debug_run_though_they_run_at_once() {
     // Octet runs `debug config` and `debug skill` side by side; the fake's
