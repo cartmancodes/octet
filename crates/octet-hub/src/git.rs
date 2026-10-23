@@ -1959,13 +1959,18 @@ mod tests {
         let ws = dir.path();
         let vendor = ws.join("vendor");
         std::fs::create_dir_all(&vendor).expect("vendor");
-        for n in 0..20_000 {
+        // Four listings' worth: the listing is cut short, and git still runs once, not per
+        // file. Git's own work grows with the change (per file it opens it twice, maps it,
+        // hashes it and diffs it): 20,000 files took it 2 s alone on a Mac, and past its 10 s
+        // limit with a few such tests at once.
+        let changed = 4 * FILES_LIMIT;
+        for n in 0..changed {
             std::fs::write(vendor.join(format!("f{n:05}.js")), "x\n").expect("write");
         }
         git_in(ws, &["add", "-A"]);
         git_in(ws, &["commit", "-q", "-m", "Vendor"]);
         // A vendored update: every tracked file changed, which numstat diffs one by one.
-        for n in 0..20_000 {
+        for n in 0..changed {
             std::fs::write(vendor.join(format!("f{n:05}.js")), "y\ny\n").expect("write");
         }
         let before = git.calls();
@@ -1974,7 +1979,7 @@ mod tests {
         assert!(began.elapsed() < GIT_WITHIN, "{:?}", began.elapsed());
         assert_eq!(git.calls() - before, 3);
         assert_eq!(changes.info.files.len(), FILES_LIMIT);
-        assert_eq!(changes.info.more, 20_000 - FILES_LIMIT as u64);
+        assert_eq!(changes.info.more, (changed - FILES_LIMIT) as u64);
         assert!(
             changes
                 .info
