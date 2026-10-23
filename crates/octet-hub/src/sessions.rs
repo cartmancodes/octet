@@ -383,6 +383,21 @@ struct Live {
 }
 
 impl Live {
+    /// The state's phase; none while there is no state.
+    fn phase(&self) -> Option<&str> {
+        self.state.as_ref()?.get("phase")?.as_str()
+    }
+
+    /// The ids of the state's open approvals.
+    fn approval_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.state
+            .as_ref()
+            .and_then(|s| s.get("approvals")?.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|approval| approval.get("id")?.as_u64())
+    }
+
     /// Forgets the link and what it said, which is no longer current.
     fn lose_link(&mut self) {
         self.link = None;
@@ -710,22 +725,28 @@ impl Sessions {
     pub(crate) fn snapshots(&self) -> Vec<Snapshot> {
         self.live
             .iter()
-            .map(|live| {
-                let state = live.state.as_ref();
-                Snapshot {
-                    id: live.registration.id.clone(),
-                    journals: live.registration.journals.clone(),
-                    phase: state
-                        .and_then(|s| s.get("phase")?.as_str())
-                        .map(str::to_owned),
-                    approvals: state
-                        .and_then(|s| s.get("approvals")?.as_array())
-                        .map(|list| list.iter().filter_map(|a| a.get("id")?.as_u64()).collect())
-                        .unwrap_or_default(),
-                    errors: live.facts.errors,
-                }
+            .map(|live| Snapshot {
+                id: live.registration.id.clone(),
+                journals: live.registration.journals.clone(),
+                phase: live.phase().map(str::to_owned),
+                approvals: live.approval_ids().collect(),
+                errors: live.facts.errors,
             })
             .collect()
+    }
+
+    /// Whether [`snapshots`](Self::snapshots) would give `snapshots` again, found without
+    /// making them: a state that changes only what a row shows (its NOW line, say) leaves them
+    /// as they were.
+    pub(crate) fn same_as(&self, snapshots: &[Snapshot]) -> bool {
+        self.live.len() == snapshots.len()
+            && self.live.iter().zip(snapshots).all(|(live, snapshot)| {
+                live.registration.id == snapshot.id
+                    && live.facts.errors == snapshot.errors
+                    && live.phase() == snapshot.phase.as_deref()
+                    && live.approval_ids().eq(snapshot.approvals.iter().copied())
+                    && live.registration.journals == snapshot.journals
+            })
     }
 
     /// How many sessions the hub's `start` launched are registered.
@@ -1804,6 +1825,58 @@ mod tests {
         for name in ["4004.json", "9999.json", "4006.json", "4007.json"] {
             assert!(!env.run.join(name).exists(), "{name} stays");
         }
+    }
+
+    #[tokio::test]
+    async fn a_state_that_changes_only_its_row_leaves_the_snapshots_as_they_were() {
+        // Pushes and the Live Activity look only at the snapshots: a storm of NOW lines must
+        // not cost each session's snapshot on every frame.
+        /// Sends `frame` as the bridge's state, and takes its update.
+        async fn send(write: &mut OwnedWriteHalf, sessions: &mut Sessions, frame: Value) {
+            write
+                .write_all(format!("{}\n", bridge_state_frame(&frame)).as_bytes())
+                .await
+                .unwrap();
+            assert!(matches!(next(sessions).await, SessionUpdate::State { .. }));
+        }
+        let env = Env::new();
+        env.journal("session-1-1.jsonl", 0..1);
+        let registration = env.registration(4011, &["session-1-1.jsonl"]);
+        let bridge = Env::listen(&registration);
+        registration.write(&env.run).await.unwrap();
+        let mut sessions = Sessions::new(env.run.clone());
+        sessions.refresh().await;
+        let (stream, _) = bridge.accept().await.unwrap();
+        let (_read, mut write) = stream.into_split();
+        assert_eq!(next(&mut sessions).await, SessionUpdate::Changed);
+        let state = |now: &str, approvals: Value| {
+            json!({"phase": "running", "queue": [], "queued": 0, "mode": "ask", "now": now,
+                "approvals": approvals})
+        };
+        send(&mut write, &mut sessions, state("Step 1", json!([]))).await;
+        let seen = sessions.snapshots();
+        assert!(sessions.same_as(&seen));
+        send(&mut write, &mut sessions, state("Step 2", json!([]))).await;
+        assert!(sessions.same_as(&seen), "a NOW line changed the snapshots");
+        send(
+            &mut write,
+            &mut sessions,
+            state("Step 3", json!([{"id": 1, "summary": {"action": "Edit"}}])),
+        )
+        .await;
+        assert!(
+            !sessions.same_as(&seen),
+            "an approval left the snapshots as they were"
+        );
+        let seen = sessions.snapshots();
+        let mut idle = state("Step 3", json!([{"id": 1, "summary": {"action": "Edit"}}]));
+        idle["phase"] = json!("idle");
+        send(&mut write, &mut sessions, idle).await;
+        assert!(
+            !sessions.same_as(&seen),
+            "a phase left the snapshots as they were"
+        );
+        assert!(!sessions.same_as(&[]), "no snapshots is the same as one");
     }
 
     #[tokio::test]

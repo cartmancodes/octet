@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 [dependencies]
 octet-core.workspace = true
+octet-proc.workspace = true
 octet-store.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

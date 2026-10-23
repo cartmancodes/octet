@@ -435,3 +435,66 @@ async fn a_send_after_exit_is_broken_pipe_then_closed() {
     ));
     assert!(process.shutdown().await.reaped);
 }
+
+/// A vendor that says its pid, its group's id, then forks 100 `sleep 30`
+/// while it is stopped (a vendor ignoring SIGTERM, as the sleeps then do too,
+/// so only SIGKILL stops them), with graces short enough that the kill comes
+/// mid-way. Stopped by `stop`, which may keep the process (alive until the
+/// check is done); true if no process is left in its group after.
+async fn stopped_while_forking(stop: impl AsyncFnOnce(Process) -> Option<Process>) -> bool {
+    let forks = "trap '' TERM; echo \"{\\\"pid\\\":$$}\"; \
+                 i=0; while [ $i -lt 100 ]; do sleep 30 & i=$((i+1)); done; wait";
+    let mut process = Process::spawn(&ProcessConfig {
+        executable: "/bin/sh".into(),
+        args: vec!["-c".into(), forks.into()],
+        shutdown_grace: Duration::from_millis(1),
+        term_grace: Duration::from_millis(1),
+        ..config("")
+    })
+    .expect("sh starts");
+    let frame = next_within(&mut process)
+        .await
+        .expect("a frame")
+        .expect("its pid");
+    let group = frame["pid"]
+        .as_i64()
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        .expect("a pid");
+    let kept = stop(process).await;
+    // SAFETY: signal 0 to the group only checks that a member exists.
+    let gone = octet_testkit::wait_until(octet_testkit::QUICK, || unsafe {
+        libc::kill(-group, 0) != 0
+    });
+    // SAFETY: signals only the group this test started, so a failed run leaves nothing.
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    drop(kept);
+    gone
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_process_mid_fork_kills_the_child_being_forked() {
+    // On macOS a child being forked as the group's SIGKILL goes out is not
+    // yet in the group: the vendor dies and the child lives on.
+    let gone = stopped_while_forking(async |process| {
+        drop(process);
+        None
+    })
+    .await;
+    assert!(gone, "a child forked as the process dropped outlived it");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_mid_fork_kills_the_child_being_forked() {
+    // Kept past the check: dropping it would kill the group again.
+    let gone = stopped_while_forking(async |mut process| {
+        let _ = process.shutdown().await;
+        Some(process)
+    })
+    .await;
+    assert!(
+        gone,
+        "a child forked as shutdown killed the group outlived it"
+    );
+}

@@ -2,6 +2,9 @@
 #[cfg(not(unix))]
 compile_error!("Octet supports Linux and macOS only");
 
+mod group;
+pub use group::GroupLeader;
+
 use serde_json::Value;
 use std::{
     collections::VecDeque,
@@ -15,7 +18,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, Command},
+    process::{ChildStdin, Command},
     sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
     time::timeout,
@@ -169,7 +172,8 @@ pub struct ShutdownReport {
 
 /// A vendor CLI in its own process group, read as bounded JSON lines.
 pub struct Process {
-    child: Child,
+    /// The child, which leads its own group: only this reaps it.
+    leader: GroupLeader,
     sender: ProcessSender,
     frame_rx: mpsc::Receiver<FrameEvent>,
     reader_task: Option<JoinHandle<()>>,
@@ -261,7 +265,7 @@ impl Process {
             config.stderr_bytes,
         ));
         Ok(Self {
-            child,
+            leader: GroupLeader::new(child),
             sender: ProcessSender {
                 stdin: Arc::new(AsyncMutex::new(Some(stdin))),
                 max_frame_bytes: config.max_frame_bytes,
@@ -332,24 +336,27 @@ impl Process {
             guard.take();
         }
         let mut stage = ShutdownStage::AlreadyExited;
-        let initial_exit = self.child.try_wait().ok().flatten().is_some();
+        let initial_exit = self.leader.child().try_wait().ok().flatten().is_some();
         if !initial_exit {
-            let _ = timeout(self.shutdown_grace, self.child.wait()).await;
+            let _ = timeout(self.shutdown_grace, self.leader.child().wait()).await;
         }
         if self.group_alive() {
             stage = ShutdownStage::Term;
             self.signal_group(libc::SIGTERM);
-            self.wait_for_group_exit().await;
+            self.wait_for_group_exit(false).await;
         }
         if self.group_alive() {
             stage = ShutdownStage::Kill;
-            self.signal_group(libc::SIGKILL);
-            self.wait_for_group_exit().await;
+            self.kill_group();
+            self.wait_for_group_exit(true).await;
         }
-        let reaped = if self.child.try_wait().ok().flatten().is_some() {
+        let reaped = if self.leader.child().try_wait().ok().flatten().is_some() {
             true
         } else {
-            matches!(timeout(self.term_grace, self.child.wait()).await, Ok(Ok(_)))
+            matches!(
+                timeout(self.term_grace, self.leader.child().wait()).await,
+                Ok(Ok(_))
+            )
         };
         if let Some(task) = &self.reader_task {
             task.abort();
@@ -388,17 +395,33 @@ impl Process {
             .is_some_and(|report| report.reaped && report.descendants_stopped)
     }
 
-    async fn wait_for_group_exit(&mut self) {
+    /// Waits, at most `term_grace`, for the group to be gone, reaping the
+    /// leader once it exits. With `kill`, a member still seen is killed again
+    /// each time: one forked as an earlier SIGKILL went out missed it.
+    async fn wait_for_group_exit(&mut self, kill: bool) {
         let deadline = tokio::time::Instant::now() + self.term_grace;
         loop {
-            let _ = self.child.try_wait();
+            let _ = self.leader.child().try_wait();
             if !self.group_alive() || tokio::time::Instant::now() >= deadline {
                 break;
+            }
+            if kill {
+                self.signal_group(libc::SIGKILL);
             }
             tokio::time::sleep_until(
                 deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
             )
             .await;
+        }
+    }
+
+    /// SIGKILLs the group: while the leader is unreaped, killed, waited for
+    /// and killed again (see [`GroupLeader::kill_group`]). Once it is reaped,
+    /// a member seen just before keeps the group's id from reuse, and the
+    /// group is killed once.
+    fn kill_group(&self) {
+        if !self.leader.kill_group() && self.group_alive() {
+            self.signal_group(libc::SIGKILL);
         }
     }
 
@@ -421,8 +444,8 @@ impl Drop for Process {
     fn drop(&mut self) {
         // Last-resort synchronous cleanup when callers forget explicit
         // shutdown; `kill_on_drop` then covers the leader itself.
-        if !self.shutdown_complete() && self.group_alive() {
-            self.signal_group(libc::SIGKILL);
+        if !self.shutdown_complete() {
+            self.kill_group();
         }
         if let Some(task) = &self.reader_task {
             task.abort();

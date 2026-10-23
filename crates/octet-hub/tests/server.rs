@@ -2657,15 +2657,57 @@ fn raise_open_files(wanted: u64) {
     );
 }
 
-/// The `sessions` frames `phone` gets until `until`, each with when it came.
-async fn sessions_until(phone: &mut Phone, until: tokio::time::Instant) -> Vec<(Instant, Value)> {
+/// The `sessions` frames `phone` gets until `until`, moved on by `stalls`, each with when it
+/// came.
+async fn sessions_until(
+    phone: &mut Phone,
+    until: tokio::time::Instant,
+    stalls: &Stalls,
+) -> Vec<(Instant, Value)> {
     let mut got = Vec::new();
-    while let Ok(frame) = tokio::time::timeout_at(until, recv(phone)).await {
-        if frame["type"] == "sessions" {
-            got.push((Instant::now(), frame));
+    loop {
+        let deadline = until + stalls.lost();
+        match tokio::time::timeout_at(deadline, recv(phone)).await {
+            Ok(frame) if frame["type"] == "sessions" => got.push((Instant::now(), frame)),
+            Ok(_) => {}
+            // A stall since moves the deadline on.
+            Err(_) if until + stalls.lost() > deadline => {}
+            Err(_) => return got,
         }
     }
-    got
+}
+
+/// How long the machine has kept this test from running, as a ticker every 10 ms sees it: the
+/// time its ticks came late, summed. A deadline on the wall clock moved on by it holds the hub
+/// to its own pace, not to a busy machine's: a hub that falls behind on its own still fails,
+/// since the ticker, on another worker, keeps time meanwhile.
+#[derive(Clone)]
+struct Stalls(std::sync::Arc<AtomicU64>);
+
+impl Stalls {
+    /// Starts the ticker, which runs as long as the test's runtime.
+    fn start() -> Self {
+        let lost = std::sync::Arc::new(AtomicU64::new(0));
+        let ticks = std::sync::Arc::clone(&lost);
+        tokio::spawn(async move {
+            let tick = Duration::from_millis(10);
+            loop {
+                let asleep = Instant::now();
+                tokio::time::sleep(tick).await;
+                let late = asleep.elapsed().saturating_sub(tick);
+                ticks.fetch_add(
+                    u64::try_from(late.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+        });
+        Self(lost)
+    }
+
+    /// The time lost so far.
+    fn lost(&self) -> Duration {
+        Duration::from_micros(self.0.load(Ordering::Relaxed))
+    }
 }
 
 /// The most `sessions` frames a phone may get in `elapsed`: four a second, and the one a hello
@@ -2697,11 +2739,17 @@ async fn a_storm_of_state_changes_sends_at_most_four_lists_a_second() {
     let (mut slow, _) = env.phone("Slow phone").await;
     let (rounds, every) = (10, Duration::from_millis(200));
     let storm = every * rounds;
+    // The machine may be busy with other tests: the wall-clock bounds below are moved on by
+    // the time it kept this test from running.
+    let stalls = Stalls::start();
     let began = Instant::now();
     let settle = tokio::time::Instant::now() + storm + Duration::from_millis(1500);
     let readers: Vec<_> = phones
         .into_iter()
-        .map(|mut phone| tokio::spawn(async move { sessions_until(&mut phone, settle).await }))
+        .map(|mut phone| {
+            let stalls = stalls.clone();
+            tokio::spawn(async move { sessions_until(&mut phone, settle, &stalls).await })
+        })
         .collect();
     // Every session changes its NOW line five times a second: 1,000 state frames a second. The
     // first one's approval comes halfway, and stays.
@@ -2722,11 +2770,11 @@ async fn a_storm_of_state_changes_sends_at_most_four_lists_a_second() {
             bridge_write(write, bridge_state_frame(&state(round, approval))).await;
         }
         if round == rounds / 2 {
-            asked = Some(Instant::now());
+            asked = Some((Instant::now(), stalls.lost()));
         }
         tokio::time::sleep(every).await;
     }
-    let asked = asked.expect("the approval was sent");
+    let (asked, lost_by_then) = asked.expect("the approval was sent");
     let last = format!("Step {}", rounds - 1);
     for reader in readers {
         let got = reader.await.expect("the phone's reader");
@@ -2743,9 +2791,10 @@ async fn a_storm_of_state_changes_sends_at_most_four_lists_a_second() {
             .find(|(_, frame)| frame["sessions"][0]["approvals"] == 1)
             .map(|(at, _)| at.saturating_duration_since(asked))
             .expect("the approval is listed");
+        let stalled = stalls.lost().saturating_sub(lost_by_then);
         assert!(
-            shown < Duration::from_secs(1),
-            "the approval took {shown:?}"
+            shown < Duration::from_secs(1) + stalled,
+            "the approval took {shown:?}, {stalled:?} of it stalled"
         );
         let (_, final_list) = got.last().expect("lists came");
         let rows = final_list["sessions"].as_array().expect("rows");

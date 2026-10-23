@@ -5274,6 +5274,95 @@ async fn lists_that_change_in_a_burst_are_read_once() {
     );
     stop(&handle, task).await;
 }
+#[tokio::test]
+async fn an_opencode_debug_runs_processes_go_with_it() {
+    // `opencode debug` starts opencode, plugins included: a process one
+    // starts must not outlive the run, whether it ends or is stopped (here
+    // past the check's limit).
+    for hangs in [false, true] {
+        let dir = opencode_workspace(
+            "octet-opencode-debug-children",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+        );
+        std::fs::write(dir.path().join("debug-grandchild"), "").unwrap();
+        if hangs {
+            std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+        }
+        let limits = Limits {
+            command_check: Duration::from_millis(500),
+            ..Limits::default()
+        };
+        let (error, outcome, _) = opencode_turn_in(
+            &dir,
+            Mode::Ask,
+            limits,
+            opencode_skill(scenario::OPENCODE_SKILL, ""),
+        )
+        .await;
+        let expected = if hangs {
+            Outcome::Failed
+        } else {
+            Outcome::Completed
+        };
+        assert_eq!(outcome, expected, "hangs: {hangs}: {error:?}");
+        let pids: Vec<libc::pid_t> =
+            std::fs::read_to_string(dir.path().join("debug-grandchildren"))
+                .unwrap()
+                .lines()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+        assert!(!pids.is_empty());
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = |pid: &libc::pid_t| unsafe { libc::kill(*pid, 0) == 0 };
+        let gone = octet_testkit::wait_until(octet_testkit::QUICK, || !pids.iter().any(alive));
+        for pid in &pids {
+            // SAFETY: signals only the sleeps this test's fake started.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        assert!(gone, "hangs: {hangs}: a debug run's process outlived it");
+    }
+}
+#[tokio::test]
+async fn lists_that_never_settle_do_not_hold_a_command_forever() {
+    // A changed list restarts the reading's settle; lists that change for
+    // good must not keep a command waiting for good. Past the bound, the
+    // reading under way runs to its end, and is untrusted when the list
+    // changed meanwhile.
+    let dir = opencode_workspace(
+        "octet-opencode-storm",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("relist-storm"), "").unwrap();
+    std::fs::write(dir.path().join("debug-delay-ms"), "300").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let ended = timeout(Duration::from_secs(8), async {
+        let mut error = None;
+        loop {
+            match events.recv().await {
+                Some(Event::Error(message)) => error = Some(message),
+                Some(Event::Finished { outcome }) => break (error, outcome),
+                Some(_) => {}
+                None => panic!("the session ended"),
+            }
+        }
+    })
+    .await;
+    let (error, outcome) = ended.expect("the command was still held");
+    assert_eq!(outcome, Outcome::Failed);
+    assert!(
+        error
+            .as_deref()
+            .unwrap_or("")
+            .contains("command list changed while Octet read"),
+        "{error:?}"
+    );
+    stop(&handle, task).await;
+}
 #[test]
 fn the_fake_opencode_counts_every_debug_run_though_they_run_at_once() {
     // Octet runs `debug config` and `debug skill` side by side; the fake's

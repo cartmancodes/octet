@@ -52,6 +52,10 @@ const OUTPUT_POLL: Duration = Duration::from_millis(50);
 /// opencode may list its commands again within moments (as MCP servers
 /// connect one by one).
 const LIST_SETTLE: Duration = Duration::from_millis(200);
+/// How long changed lists may keep restarting the reading (see
+/// [`LIST_SETTLE`]). Past it, the reading under way runs to its end, so a
+/// list that never settles cannot hold a command for good.
+const SETTLE_BOUND: Duration = Duration::from_secs(2);
 /// The most bytes a command's expanded text may have before Octet stops
 /// expanding it and refuses the command (a `$'` in its arguments repeats
 /// the template).
@@ -515,7 +519,10 @@ fn unnamed_output(what: &str) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// `opencode debug what`'s output, as JSON.
+/// `opencode debug what`'s output, as JSON. It runs in a process group of
+/// its own: it starts opencode, plugins included, and whatever those start
+/// is killed with it, whether it ends or is stopped (see
+/// [`octet_proc::GroupLeader`]).
 async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
     let mut file = unnamed_output(what).map_err(|error| {
         format!("Octet could not make a file for opencode debug {what}: {error}")
@@ -523,16 +530,19 @@ async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
     let stdout = file.try_clone().map_err(|error| {
         format!("Octet could not make a file for opencode debug {what}: {error}")
     })?;
-    let mut child = tokio::process::Command::new(&launch.binary)
-        .args(["debug", what])
-        .envs(launch.env.iter().cloned())
-        .current_dir(&launch.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("opencode debug {what} did not start: {error}"))?;
+    let mut debug = octet_proc::GroupLeader::new(
+        tokio::process::Command::new(&launch.binary)
+            .args(["debug", what])
+            .envs(launch.env.iter().cloned())
+            .current_dir(&launch.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0)
+            .spawn()
+            .map_err(|error| format!("opencode debug {what} did not start: {error}"))?,
+    );
     let too_much = || {
         format!(
             "opencode debug {what} printed more than {} MiB",
@@ -540,18 +550,23 @@ async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
         )
     };
     // The bound holds while it runs: one that goes on printing is stopped
-    // (dropping the child kills it).
-    let status = loop {
-        tokio::select! {
-            status = child.wait() => break status,
-            () = tokio::time::sleep(OUTPUT_POLL) => {
-                if file.metadata().is_ok_and(|output| output.len() > MAX_OUTPUT) {
-                    return Err(too_much());
-                }
-            }
+    // (dropping `debug` kills its group).
+    while !debug.exited_within(OUTPUT_POLL).await {
+        if file
+            .metadata()
+            .is_ok_and(|output| output.len() > MAX_OUTPUT)
+        {
+            return Err(too_much());
         }
     }
-    .map_err(|error| format!("opencode debug {what} could not be waited for: {error}"))?;
+    // Exited and not yet reaped, so its group's id is still its own: what it
+    // left running goes before it is reaped.
+    debug.kill_group();
+    let status = debug
+        .child()
+        .wait()
+        .await
+        .map_err(|error| format!("opencode debug {what} could not be waited for: {error}"))?;
     if !status.success() {
         return Err(format!("opencode debug {what} {status}"));
     }
@@ -618,6 +633,12 @@ pub(super) struct Commands {
     /// What Octet says when opencode reported a version not in
     /// [`VERIFIED_VERSIONS`]: then no command is sent while the mode asks.
     unverified: Option<String>,
+    /// Since when changed lists have restarted the reading, until one
+    /// lands with the list unchanged meanwhile (see [`SETTLE_BOUND`]).
+    restarting_since: Option<tokio::time::Instant>,
+    /// The list changed while the reading under way, past the bound, ran
+    /// on: what it reads may not be what opencode now lists.
+    relisted: bool,
 }
 
 /// Whether opencode edits files without asking in `mode`.
@@ -688,6 +709,17 @@ impl Commands {
             return;
         }
         self.listed = listed;
+        let now = tokio::time::Instant::now();
+        let since = *self.restarting_since.get_or_insert(now);
+        if self.reading() && now.duration_since(since) >= SETTLE_BOUND {
+            // Restarted for long enough: this reading runs on, untrusted.
+            self.relisted = true;
+            if let Some(mode) = running.filter(|mode| edits_unasked(*mode)) {
+                self.edited = Some(mode);
+                self.tainted = Some(mode);
+            }
+            return;
+        }
         self.retried = false;
         self.start(launch, limit, LIST_SETTLE);
         self.edited = running.filter(|mode| edits_unasked(*mode));
@@ -789,13 +821,22 @@ impl Commands {
     }
 
     /// Keeps the result `read` of the reading under way, which a turn sent
-    /// meanwhile leaves untrusted.
+    /// meanwhile, or a list changed past the bound, leaves untrusted. Only
+    /// a reading the list did not change under ends the run of restarts.
     fn land(&mut self, read: Result<Book, String>) {
+        let relisted = std::mem::take(&mut self.relisted);
+        if !relisted {
+            self.restarting_since = None;
+        }
         let read = match self.tainted.take() {
             Some(mode) if read.is_ok() => Err(format!(
                 "a turn ran in {} while Octet read them, so they may not be what opencode loaded",
                 mode.label()
             )),
+            _ if relisted && read.is_ok() => Err(
+                "opencode's command list changed while Octet read them, and kept changing"
+                    .to_owned(),
+            ),
             _ => read,
         };
         self.reading = Reading::Done(read);

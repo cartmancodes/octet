@@ -129,13 +129,29 @@ pub(crate) fn session_command() {
 /// subagent (a definition that changed after Octet read it); then the
 /// commands in `fixture-commands.json`, when there is one. `skill` prints
 /// `fixture-skills.json`, or no skills. With `debug-fails` present, both
-/// exit 1; with `debug-hangs`, both wait a minute first, and with
+/// exit 1; with `debug-grandchild`, each first starts a `sleep 30` (as a
+/// plugin's process would be) and appends its pid to `debug-grandchildren`;
+/// with `debug-hangs`, both wait a minute first, and with
 /// `debug-delay-ms`, the milliseconds it holds.
 pub(crate) fn debug_command() {
     let what = env::args().nth(2).unwrap_or_default();
     // Appended in one write: runs side by side must not lose each other's.
     if let Ok(mut calls) = fs::OpenOptions::new().append(true).open("debug-calls") {
         calls.write_all(format!("{what}\n").as_bytes()).unwrap();
+    }
+    if fs::exists("debug-grandchild").unwrap_or(false) {
+        #[expect(
+            clippy::zombie_processes,
+            reason = "the sleep is to outlive this run: the test checks that Octet kills it"
+        )]
+        let grandchild = process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut pids = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("debug-grandchildren")
+            .unwrap();
+        pids.write_all(format!("{}\n", grandchild.id()).as_bytes())
+            .unwrap();
     }
     if fs::exists("debug-hangs").unwrap_or(false) {
         thread::sleep(Duration::from_secs(60));
@@ -305,7 +321,8 @@ impl OpencodeFixture {
     /// Opens, resumes or forks the session. A resume replays its history
     /// after its reply, before any prompt, as opencode 1.18.25 does. With
     /// `ticks` in the working directory, the commands are listed again
-    /// every 100 ms; with `relist-burst`, four changed lists follow at once.
+    /// every 100 ms; with `relist-burst`, four changed lists follow at once;
+    /// with `relist-storm`, a changed list every 100 ms for thirty seconds.
     fn open(&mut self, method: &str, v: &Value) {
         method.clone_into(&mut self.opened);
         self.session = match method {
@@ -338,6 +355,17 @@ impl OpencodeFixture {
                 for _ in 0..100 {
                     thread::sleep(Duration::from_millis(100));
                     list_commands(&sid, false);
+                }
+            });
+        }
+        if fs::exists("relist-storm").unwrap_or(false) {
+            // Lists that never settle: a changed one every 100 ms for thirty
+            // seconds.
+            let sid = sid.clone();
+            thread::spawn(move || {
+                for n in 0..300 {
+                    thread::sleep(Duration::from_millis(100));
+                    list_commands(&sid, n % 2 == 0);
                 }
             });
         }
