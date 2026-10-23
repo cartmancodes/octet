@@ -359,9 +359,13 @@ So Octet reads the definitions once too, as opencode lists them, in every
 mode, with `opencode debug config` and `opencode debug skill` run with the
 session's own launch settings in its workspace (at most 20 s), and checks
 every command against that reading for the rest of the session; it reads
-them again only if opencode lists different commands. A command sent before
-the reading is done waits for it ("Checking /name against opencode's
-definitions…"); the session goes on meanwhile, and Esc cancels the command.
+them again only if opencode lists different commands, once the list has
+stayed the same for 200 ms (opencode lists them again as MCP servers
+connect). A list that keeps changing restarts the reading for at most 2 s;
+past that the reading under way runs to its end, and is not trusted if the
+list changed meanwhile. A command sent before the reading is done waits for
+it ("Checking /name against opencode's definitions…"); the session goes on
+meanwhile, and Esc cancels the command.
 
 The check emulates how opencode 1.18.25 expands and runs a command, so it
 holds only for the opencode versions Octet has verified (1.18.25). opencode

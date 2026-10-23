@@ -5274,6 +5274,46 @@ async fn lists_that_change_in_a_burst_are_read_once() {
     );
     stop(&handle, task).await;
 }
+#[tokio::test]
+async fn lists_that_never_settle_do_not_hold_a_command_forever() {
+    // A changed list restarts the reading's settle; lists that change for
+    // good must not keep a command waiting for good. Past the bound, the
+    // reading under way runs to its end, and is untrusted when the list
+    // changed meanwhile.
+    let dir = opencode_workspace(
+        "octet-opencode-storm",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("relist-storm"), "").unwrap();
+    std::fs::write(dir.path().join("debug-delay-ms"), "300").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let ended = timeout(Duration::from_secs(8), async {
+        let mut error = None;
+        loop {
+            match events.recv().await {
+                Some(Event::Error(message)) => error = Some(message),
+                Some(Event::Finished { outcome }) => break (error, outcome),
+                Some(_) => {}
+                None => panic!("the session ended"),
+            }
+        }
+    })
+    .await;
+    let (error, outcome) = ended.expect("the command was still held");
+    assert_eq!(outcome, Outcome::Failed);
+    assert!(
+        error
+            .as_deref()
+            .unwrap_or("")
+            .contains("command list changed while Octet read"),
+        "{error:?}"
+    );
+    stop(&handle, task).await;
+}
 #[test]
 fn the_fake_opencode_counts_every_debug_run_though_they_run_at_once() {
     // Octet runs `debug config` and `debug skill` side by side; the fake's
