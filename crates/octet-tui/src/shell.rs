@@ -237,13 +237,51 @@ impl Drop for Group {
     }
 }
 
+/// How long a killed shell may take to die before its group is killed again regardless. It
+/// blocks the thread dropping the run, but a shell dies of SIGKILL in a moment.
+const SHELL_DEATH: Duration = Duration::from_secs(1);
+
+/// SIGKILLs the group led by the shell `group`, which is unreaped, so the group's id cannot
+/// be reused meanwhile. A child the shell is forking as the signal goes out is not in the
+/// group yet, and macOS does not signal it: the shell dies and the child lives on. A shell
+/// that has died forks no more, so once it has, a second signal gets the rest.
 fn kill_group(group: Option<u32>) {
-    if let Some(pid) = group.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-        // SAFETY: signals only the process group this command was started in.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
+    let Some(pid) = group.and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
+        return;
+    };
+    // SAFETY: signals only the process group this command was started in.
+    let kill = || unsafe { libc::kill(-pid, libc::SIGKILL) };
+    kill();
+    let deadline = std::time::Instant::now() + SHELL_DEATH;
+    while !has_exited(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
     }
+    kill();
+}
+
+/// Whether the child `pid` has exited, leaving it unreaped; true too if it is no child to wait
+/// for (already reaped).
+fn has_exited(pid: libc::pid_t) -> bool {
+    let Ok(id) = libc::id_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: siginfo_t is plain C data, for which all zeroes is valid.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid writes only into `info`; WNOWAIT leaves the child for tokio to reap, and
+    // WNOHANG returns at once.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &raw mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if result != 0 {
+        return std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted;
+    }
+    // SAFETY: waitid filled `info`; its pid stays zero while the child has not exited.
+    unsafe { info.si_pid() != 0 }
 }
 
 /// The end of the output read so far.
@@ -300,14 +338,13 @@ fn overstrike(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Multi-threaded: the run makes progress while this test polls for it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropping_a_shell_run_kills_its_group() {
+    /// Runs `echo $$ > <file>; <then>` and drops the run once the shell has written its pid,
+    /// which is its group's id (setsid); true if no process is left in the group after.
+    async fn dropped_mid_run_leaves_nothing(then: &str) -> bool {
         let dir = octet_testkit::TempDir::new("octet-shell-drop");
         std::fs::create_dir_all(dir.path()).unwrap();
         let pidfile = dir.path().join("group");
-        // The shell's pid is its group's id (setsid); the pipeline lives on in it.
-        let command = format!("echo $$ > {}; sleep 30 | cat", pidfile.display());
+        let command = format!("echo $$ > {}; {then}", pidfile.display());
         let run = tokio::spawn(async move {
             let (_keep, cancel) = oneshot::channel();
             run_with("sh", &command, Path::new("."), cancel, TIME_LIMIT).await
@@ -327,7 +364,24 @@ mod tests {
         let gone = octet_testkit::wait_until(octet_testkit::QUICK, || unsafe {
             libc::kill(-group, 0) != 0
         });
+        // SAFETY: signals only the group this test started, so a failed run leaves nothing.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        gone
+    }
+    // Multi-threaded: the run makes progress while these tests poll for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_shell_run_kills_its_group() {
+        // The pipeline lives on in the shell's group.
+        let gone = dropped_mid_run_leaves_nothing("sleep 30 | cat").await;
         assert!(gone, "the command's processes outlived it");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_forked_as_the_run_drops_dies_too() {
+        // The shell is still forking when its group is killed. On macOS a child mid-fork is
+        // not yet in the group the kill goes to: the shell dies and the child lives on.
+        let forks = "i=0; while [ $i -lt 100 ]; do sleep 30 & i=$((i+1)); done; wait";
+        let gone = dropped_mid_run_leaves_nothing(forks).await;
+        assert!(gone, "a child forked as the run dropped outlived it");
     }
     async fn sh(command: &str) -> Ran {
         let (_keep, cancel) = oneshot::channel();

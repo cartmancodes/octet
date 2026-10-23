@@ -375,6 +375,26 @@ fn last_journal_record(directory: &std::path::Path) -> String {
     text.lines().last().unwrap_or_default().to_owned()
 }
 
+/// Waits, up to [`LIMIT`], for a journal in `directory` to hold `text`.
+fn wait_for_journal(directory: &std::path::Path, text: &str) {
+    let deadline = std::time::Instant::now() + LIMIT;
+    loop {
+        let found = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
+            .any(|path| std::fs::read_to_string(path).is_ok_and(|journal| journal.contains(text)));
+        if found {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no journal says {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn print_shuts_down_when_stdout_closes() {
     let (mut child, temp) = octet(&["--print", "hello", "--output", "json"]);
@@ -470,7 +490,7 @@ fn rpc_quits_while_stdin_stays_open() {
 
 #[test]
 fn print_says_when_the_session_ends_unfinished() {
-    let (mut child, _temp) = octet(&[
+    let (mut child, temp) = octet(&[
         "--engine",
         "claude",
         "--print",
@@ -479,9 +499,11 @@ fn print_says_when_the_session_ends_unfinished() {
         "json",
     ]);
     drop(child.stdin.take());
-    // Nobody reads the replies for a while: the session gives up on us.
+    // Nobody reads the replies until the session gives up on us. Its 2 s limit
+    // runs from when the flood fills the pipes, not from launch, so a fixed wait
+    // can end before it does on a slow machine: wait for the journal to say so.
     let stdout = child.stdout.take().unwrap();
-    std::thread::sleep(Duration::from_secs(4));
+    wait_for_journal(temp.path(), "did not keep up");
     let drain = std::thread::spawn(move || std::io::read_to_string(stdout).unwrap_or_default());
     let output = octet_testkit::wait_child(child, LIMIT);
     let _ = drain.join();
