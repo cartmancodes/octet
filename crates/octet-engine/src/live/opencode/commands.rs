@@ -44,6 +44,9 @@ const MAX_VERSION: usize = 64;
 const MAX_COMMANDS: usize = 4096;
 /// The most bytes one `opencode debug` output may have.
 const MAX_OUTPUT: u64 = 16 * 1024 * 1024;
+/// How often Octet looks at the size of `opencode debug`'s output while it
+/// runs.
+const OUTPUT_POLL: Duration = Duration::from_millis(50);
 /// The most bytes a command's expanded text may have before Octet stops
 /// expanding it and refuses the command (a `$'` in its arguments repeats
 /// the template).
@@ -515,7 +518,7 @@ async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
     let stdout = file.try_clone().map_err(|error| {
         format!("Octet could not make a file for opencode debug {what}: {error}")
     })?;
-    let status = tokio::process::Command::new(&launch.binary)
+    let mut child = tokio::process::Command::new(&launch.binary)
         .args(["debug", what])
         .envs(launch.env.iter().cloned())
         .current_dir(&launch.cwd)
@@ -523,9 +526,27 @@ async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::null())
         .kill_on_drop(true)
-        .status()
-        .await
+        .spawn()
         .map_err(|error| format!("opencode debug {what} did not start: {error}"))?;
+    let too_much = || {
+        format!(
+            "opencode debug {what} printed more than {} MiB",
+            MAX_OUTPUT >> 20
+        )
+    };
+    // The bound holds while it runs: one that goes on printing is stopped
+    // (dropping the child kills it).
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status,
+            () = tokio::time::sleep(OUTPUT_POLL) => {
+                if file.metadata().is_ok_and(|output| output.len() > MAX_OUTPUT) {
+                    return Err(too_much());
+                }
+            }
+        }
+    }
+    .map_err(|error| format!("opencode debug {what} could not be waited for: {error}"))?;
     if !status.success() {
         return Err(format!("opencode debug {what} {status}"));
     }
@@ -534,10 +555,7 @@ async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
         .and_then(|_| file.take(MAX_OUTPUT + 1).read_to_string(&mut text))
         .map_err(|error| format!("opencode debug {what}'s output could not be read: {error}"))?;
     if text.len() as u64 > MAX_OUTPUT {
-        return Err(format!(
-            "opencode debug {what} printed more than {} MiB",
-            MAX_OUTPUT >> 20
-        ));
+        return Err(too_much());
     }
     serde_json::from_str(&text)
         .map_err(|error| format!("opencode debug {what} printed no JSON ({error})"))
@@ -835,6 +853,24 @@ mod tests {
             env: Vec::new(),
         };
         (dir, launch)
+    }
+
+    #[tokio::test]
+    async fn opencode_debug_is_stopped_once_it_prints_too_much() {
+        // It goes on running after passing the bound; Octet stops it then,
+        // not when it exits.
+        let (_dir, launch) = scripted(
+            "octet-debug-too-much",
+            "head -c 17000000 /dev/zero; exec sleep 30",
+        );
+        let started = std::time::Instant::now();
+        let error = debug_json(&launch, "config").await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(error, "opencode debug config printed more than 16 MiB");
     }
 
     #[tokio::test]
