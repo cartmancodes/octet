@@ -519,7 +519,10 @@ fn unnamed_output(what: &str) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// `opencode debug what`'s output, as JSON.
+/// `opencode debug what`'s output, as JSON. It runs in a process group of
+/// its own: it starts opencode, plugins included, and whatever those start
+/// is killed with it, whether it ends or is stopped (see
+/// [`octet_proc::GroupLeader`]).
 async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
     let mut file = unnamed_output(what).map_err(|error| {
         format!("Octet could not make a file for opencode debug {what}: {error}")
@@ -527,16 +530,19 @@ async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
     let stdout = file.try_clone().map_err(|error| {
         format!("Octet could not make a file for opencode debug {what}: {error}")
     })?;
-    let mut child = tokio::process::Command::new(&launch.binary)
-        .args(["debug", what])
-        .envs(launch.env.iter().cloned())
-        .current_dir(&launch.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("opencode debug {what} did not start: {error}"))?;
+    let mut debug = octet_proc::GroupLeader::new(
+        tokio::process::Command::new(&launch.binary)
+            .args(["debug", what])
+            .envs(launch.env.iter().cloned())
+            .current_dir(&launch.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0)
+            .spawn()
+            .map_err(|error| format!("opencode debug {what} did not start: {error}"))?,
+    );
     let too_much = || {
         format!(
             "opencode debug {what} printed more than {} MiB",
@@ -544,18 +550,23 @@ async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
         )
     };
     // The bound holds while it runs: one that goes on printing is stopped
-    // (dropping the child kills it).
-    let status = loop {
-        tokio::select! {
-            status = child.wait() => break status,
-            () = tokio::time::sleep(OUTPUT_POLL) => {
-                if file.metadata().is_ok_and(|output| output.len() > MAX_OUTPUT) {
-                    return Err(too_much());
-                }
-            }
+    // (dropping `debug` kills its group).
+    while !debug.exited_within(OUTPUT_POLL).await {
+        if file
+            .metadata()
+            .is_ok_and(|output| output.len() > MAX_OUTPUT)
+        {
+            return Err(too_much());
         }
     }
-    .map_err(|error| format!("opencode debug {what} could not be waited for: {error}"))?;
+    // Exited and not yet reaped, so its group's id is still its own: what it
+    // left running goes before it is reaped.
+    debug.kill_group();
+    let status = debug
+        .child()
+        .wait()
+        .await
+        .map_err(|error| format!("opencode debug {what} could not be waited for: {error}"))?;
     if !status.success() {
         return Err(format!("opencode debug {what} {status}"));
     }
