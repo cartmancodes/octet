@@ -64,7 +64,7 @@ use crate::{
     git::{self, Git},
     launch::{self, Launches, StartRequest, clip as clip_to},
     owner::published_url,
-    push::{self, Limiter, Pusher, Sender},
+    push::{self, Limiter, Pusher, Sender, Snapshot},
     sessions::{SessionUpdate, Sessions},
     store::{
         ActivityTokens, Change, Device, Disk, PAIR_NOT_SAVED, Pairing, SECRET_REFUSED, Store,
@@ -802,6 +802,8 @@ pub struct Hub {
     /// The Live Activity while phones are away; none unless `hub.json` names APNs and its key
     /// loads.
     activity: Option<Activity>,
+    /// The snapshots the pushes and the Live Activity last looked at.
+    observed: Vec<Snapshot>,
     /// Where the hub is published, as Tailscale last said: each push names its host as `mac`.
     published: Published,
     /// The last id given to a connection, hub req or replay.
@@ -922,6 +924,7 @@ impl Hub {
             sender: Sender::new(push::endpoint(), dead_tokens),
             cap: Limiter::default(),
             activity,
+            observed: Vec::new(),
             published,
             ids: 0,
         };
@@ -2056,6 +2059,12 @@ impl Hub {
     /// pusher finds new waits in a window for each device with a push token (whether it is
     /// connected is judged when the window closes).
     fn observe_sessions(&mut self) {
+        // What these look at is the snapshots alone, and the same snapshots again change
+        // nothing: a storm of state frames that change only rows (their NOW lines) costs one
+        // look at each session per frame, not a snapshot of each.
+        if self.sessions.same_as(&self.observed) {
+            return;
+        }
         let snapshots = self.sessions.snapshots();
         let notices = self.pusher.observe(&snapshots);
         let now = Instant::now();
@@ -2067,6 +2076,7 @@ impl Hub {
                 self.pusher.offer(&device.token_sha256, &notices, now);
             }
         }
+        self.observed = snapshots;
     }
 
     /// Posts the pushes whose windows have closed, in the background. A device with a phone
