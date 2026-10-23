@@ -118,17 +118,34 @@ fn changed(built: &Path, copy: &Path) -> bool {
 }
 
 /// Writes an executable shell script `dir/name` (creating `dir`): a
-/// `#!/bin/sh` line, then `body`. Returns its path.
+/// `#!/bin/sh` line, a line that exits at once when the first argument is
+/// `warm`, then `body`; runs it once with `warm`, and returns its path.
+///
+/// macOS checks a newly written program the first time it runs, one at a
+/// time across the machine, while the process waits before its first
+/// instruction: with the suite writing and running many, a test's first run
+/// of one could wait past its limits. The run here, waited for without a
+/// limit, takes that wait out of the test.
 ///
 /// # Panics
 ///
-/// If the script cannot be written.
+/// If the script cannot be written, or its warm-up run fails.
 pub fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).expect("script directory");
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{body}\n"),
+    )
+    .expect("script");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let warm = Command::new(&path)
+        .arg("warm")
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("the script runs");
+    assert!(warm.success(), "the script's warm-up run failed");
     path
 }
 
@@ -331,6 +348,31 @@ mod tests {
             seen.is_empty(),
             "the binary was replaced or missing during a build: {seen:?}"
         );
+    }
+    #[test]
+    fn a_written_script_has_run_once_and_runs_its_body_after() {
+        // The first run of a new executable waits for macOS to check it, so
+        // the script is run once, with `warm`, which stops before its body.
+        let dir = TempDir::new("octet-testkit-script");
+        let marks = dir.path().join("marks");
+        let script = write_script(
+            dir.path(),
+            "tool",
+            &format!("echo \"$1\" >> '{}'", marks.display()),
+        );
+        assert!(!marks.exists(), "the warm run reached the body");
+        let ran = Command::new(&script)
+            .arg("go")
+            .status()
+            .expect("the script");
+        assert!(ran.success());
+        assert_eq!(std::fs::read_to_string(&marks).expect("marks"), "go\n");
+        let warm = Command::new(&script)
+            .arg("warm")
+            .status()
+            .expect("the script");
+        assert!(warm.success());
+        assert_eq!(std::fs::read_to_string(&marks).expect("marks"), "go\n");
     }
     #[test]
     fn temp_dirs_are_unique_and_removed() {
