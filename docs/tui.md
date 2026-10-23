@@ -363,6 +363,13 @@ them again only if opencode lists different commands. A command sent before
 the reading is done waits for it ("Checking /name against opencode's
 definitions…"); the session goes on meanwhile, and Esc cancels the command.
 
+The check emulates how opencode 1.18.25 expands and runs a command, so it
+holds only for the opencode versions Octet has verified (1.18.25). opencode
+updates itself; when it reports another version at connect, Octet says so
+once, and in `ask` and `accept-edits` sends no command or skill at all: plain
+prompts still work, and `/mode auto` runs commands under opencode's own
+settings. `docs/rust/protocol-gate.md` says how a new version is verified.
+
 Under Octet's launch settings opencode takes commands from your own
 configuration (`~/.config/opencode` and `~/.opencode`: `opencode.json`,
 `command/`, `commands/`, skill folders; `OPENCODE_CONFIG`,

@@ -882,6 +882,14 @@ impl OpencodeProtocol {
             return Err(format!("opencode initialization failed: {}", error_text(error)).into());
         }
         core.phase = Phase::Handshaken;
+        let version = v
+            .pointer("/result/agentInfo/version")
+            .and_then(Value::as_str);
+        if let Some(notice) = self.commands.reported(version)
+            && !core.config.catalog_only
+        {
+            core.emit(Event::Notice(notice))?;
+        }
         let config = &core.config;
         let mut params = json!({"cwd": config.cwd, "mcpServers": []});
         let (method, resumed) = match &config.resume {

@@ -80,10 +80,7 @@ pub(crate) fn run() {
     for line in io::stdin().lock().lines() {
         let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
         match v["method"].as_str() {
-            Some("initialize") => emit(&acp_result(
-                &v["id"],
-                &json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true},"sessionCapabilities":{"resume":{},"fork":{},"close":{}}}}),
-            )),
+            Some("initialize") => emit(&acp_result(&v["id"], &initialized())),
             Some(method @ ("session/new" | "session/resume" | "session/fork")) => {
                 fixture.open(method, &v);
             }
@@ -98,6 +95,19 @@ pub(crate) fn run() {
             None => fixture.answer(&v),
         }
     }
+}
+
+/// The reply to `initialize`, as opencode 1.18.25 gives it, naming that
+/// version, or the one `fixture-version` in the working directory holds
+/// (`none`: no `agentInfo` at all).
+fn initialized() -> Value {
+    let version = fs::read_to_string("fixture-version")
+        .map_or_else(|_| "1.18.25".to_owned(), |text| text.trim().to_owned());
+    let mut reply = json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true},"sessionCapabilities":{"resume":{},"fork":{},"close":{}}}});
+    if version != "none" {
+        reply["agentInfo"] = json!({"name":"OpenCode","version":version});
+    }
+    reply
 }
 
 /// `protocol-child session delete <id>`: the stand-in for `opencode session

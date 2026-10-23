@@ -2804,7 +2804,7 @@ async fn opencode_agent_refusal(opened: serde_json::Value, reply: serde_json::Va
         .unwrap()
         .extend(reply.as_object().unwrap().clone());
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": [opened]}}),
         third,
     ];
@@ -3601,7 +3601,7 @@ async fn opencode_effort_default_after_a_bare_confirmation_goes_back() {
         "options": [{"value": "low"}, {"value": "high"}]}]);
     // opencode confirms `high` without reporting its options again.
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": options}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
         json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
@@ -3634,7 +3634,7 @@ async fn opencode_effort_default_with_unknown_levels_is_not_claimed() {
     use serde_json::json;
     // opencode never reports its options: the levels stay unknown.
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
         json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
@@ -3727,7 +3727,7 @@ async fn opencode_effort_refused_at_connect_is_reported_and_the_session_goes_on(
     use serde_json::json;
     // No options reported, so the level is sent; opencode refuses it.
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
         json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32602, "message": "Invalid params: effort not found: high"}}),
         json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
@@ -3903,7 +3903,7 @@ async fn opencode_switching_then(reply: serde_json::Value, delay: &str, after: &
         .unwrap()
         .extend(reply.as_object().unwrap().clone());
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": mode("build")}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {"configOptions": mode("octet-ask")}}),
     ];
@@ -3987,7 +3987,7 @@ async fn opencode_unconfirmed_switch_times_out_then_applies_a_late_confirmation(
 async fn opencode_refuses_a_switch_while_eight_wait_for_confirmation() {
     use serde_json::json;
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
     ];
@@ -4056,7 +4056,7 @@ async fn opencode_permission_outside_a_turn_is_rejected_with_a_notice() {
     std::fs::create_dir_all(dir.path()).unwrap();
     let reply_file = dir.path().join("reply");
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": []}}),
     ];
     let mut body = String::new();
@@ -4461,7 +4461,7 @@ fn opencode_without_commands() -> (octet_testkit::TempDir, Config) {
         {"id": "mode", "currentValue": "build", "options": [{"value": "build", "name": "build"}]},
     ]);
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": options}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
     ];
@@ -4524,7 +4524,7 @@ async fn opencode_probe_that_fails_still_deletes_its_session() {
     use serde_json::json;
     // opencode opens the session, then exits before listing anything.
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
     ];
     let mut body = String::from("if [ \"$1\" = session ]; then touch \"deleted-$3\"; exit 0; fi\n");
@@ -5167,6 +5167,78 @@ async fn a_turn_that_asks_during_the_reading_leaves_it_trusted() {
     .await;
     assert_eq!((error, outcome), (None, Outcome::Completed));
     assert_eq!(text, format!("/{} go", scenario::OPENCODE_SKILL));
+    stop(&handle, task).await;
+}
+/// What Octet says of an opencode `version` its command check is not
+/// verified against.
+fn unverified(version: &str) -> String {
+    format!(
+        "opencode {version} is not verified for Octet's command check; commands are off in ask and \
+         accept-edits — plain prompts work; /mode auto runs them under opencode's own settings"
+    )
+}
+#[tokio::test]
+async fn an_unverified_opencode_runs_no_command_while_the_mode_asks() {
+    // The check emulates opencode 1.18.25's internals; another version may
+    // run a command otherwise.
+    for (reported, shown) in [("1.99.0", "1.99.0"), ("none", "(version not reported)")] {
+        let dir = opencode_workspace(
+            "octet-opencode-unverified",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+        );
+        std::fs::write(dir.path().join("fixture-version"), reported).unwrap();
+        let mut c = opencode();
+        c.mode = Mode::Ask;
+        c.cwd = dir.path().to_path_buf();
+        let (handle, mut events, task) = spawn(c);
+        let mut notices = Vec::new();
+        loop {
+            match next(&mut events).await {
+                Event::Notice(notice) => notices.push(notice),
+                Event::Ready { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(notices, [unverified(shown)], "at connect");
+        for command in [
+            opencode_skill(scenario::OPENCODE_SKILL, "go"),
+            Command::Prompt("/init".into()),
+        ] {
+            let (error, outcome, text) = turn_end(&handle, &mut events, command).await;
+            let error = error.expect("the command was sent");
+            assert!(error.ends_with(&unverified(shown)), "{error}");
+            assert_eq!((outcome, text.as_str()), (Outcome::Failed, ""));
+        }
+        // Plain prompts work, and so does opencode's own summary.
+        let (error, outcome, _) =
+            turn_end(&handle, &mut events, Command::Prompt("hello".into())).await;
+        assert_eq!((error, outcome), (None, Outcome::Completed));
+        let (error, outcome, _) = turn_end(&handle, &mut events, Command::Compact).await;
+        assert_eq!((error, outcome), (None, Outcome::Completed));
+        // In auto, opencode's own settings decide.
+        switch_to(&handle, &mut events, Mode::Auto).await;
+        let (error, outcome, text) = turn_end(
+            &handle,
+            &mut events,
+            opencode_skill(scenario::OPENCODE_SKILL, "go"),
+        )
+        .await;
+        assert_eq!((error, outcome), (None, Outcome::Completed));
+        assert_eq!(text, format!("/{} go", scenario::OPENCODE_SKILL));
+        stop(&handle, task).await;
+    }
+}
+#[tokio::test]
+async fn a_verified_opencode_says_nothing_of_its_version() {
+    let (handle, mut events, task) = spawn(opencode());
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => panic!("{notice}"),
+            Event::Ready { .. } => break,
+            _ => {}
+        }
+    }
     stop(&handle, task).await;
 }
 #[test]

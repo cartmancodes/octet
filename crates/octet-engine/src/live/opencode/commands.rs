@@ -25,6 +25,21 @@ use std::{
 };
 use tokio::{sync::oneshot, task::JoinHandle};
 
+/// The opencode versions Octet's check is verified against: their
+/// built-in commands (see `built_ins`), `command()` expansion (see
+/// `expand`), ACP prompt parsing (`slash_command`) and subtask rule are the
+/// ones emulated here. While the mode asks, an opencode reporting any other
+/// version (`agentInfo.version` in its `initialize` reply) runs no command.
+///
+/// To verify a new version: read its `Command.state`, `command()` and
+/// `ACP.prompt` against this file; run the protocol gate's opencode
+/// `command-expansion`, `lockdown` and `subagent` scenarios against it
+/// (`docs/rust/protocol-gate.md`), which must all pass; then add it here.
+pub(super) const VERIFIED_VERSIONS: &[&str] = &["1.18.25"];
+
+/// The most characters of a reported version Octet shows.
+const MAX_VERSION: usize = 64;
+
 /// The most commands one reading keeps; the rest are unknown, so refused.
 const MAX_COMMANDS: usize = 4096;
 /// The most bytes one `opencode debug` output may have.
@@ -549,6 +564,9 @@ pub(super) struct Commands {
     /// Such a turn was sent while the reading under way ran, so what it
     /// reads may not be what opencode loaded.
     tainted: Option<Mode>,
+    /// What Octet says when opencode reported a version not in
+    /// [`VERIFIED_VERSIONS`]: then no command is sent while the mode asks.
+    unverified: Option<String>,
 }
 
 /// Whether opencode edits files without asking in `mode`.
@@ -563,6 +581,30 @@ impl Drop for Commands {
 }
 
 impl Commands {
+    /// opencode's `initialize` reply reported `version` (`None`: none). The
+    /// notice to show when it is not one Octet's check is verified against.
+    pub(super) fn reported(&mut self, version: Option<&str>) -> Option<String> {
+        if version.is_some_and(|version| VERIFIED_VERSIONS.contains(&version)) {
+            self.unverified = None;
+            return None;
+        }
+        let shown = version.map_or_else(
+            || "(version not reported)".to_owned(),
+            |version| {
+                version
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(MAX_VERSION)
+                    .collect()
+            },
+        );
+        self.unverified = Some(format!(
+            "opencode {shown} is not verified for Octet's command check; commands are off in ask and \
+             accept-edits — plain prompts work; /mode auto runs them under opencode's own settings"
+        ));
+        self.unverified.clone()
+    }
+
     /// opencode listed `list` (`availableCommands`). A list that differs
     /// from the last drops what was read, and a reading of the new list
     /// starts with `launch`, for at most `limit`. `running` is the mode of
@@ -616,7 +658,9 @@ impl Commands {
     /// [`refusal`]). A command that needs a reading not yet at hand waits;
     /// one starts with `launch`, for at most `limit`, when none is under
     /// way, and a reading that failed is tried once more, unless a turn
-    /// may have changed the files since opencode loaded them. `compact`, when
+    /// may have changed the files since opencode loaded them. An opencode
+    /// of a version the check is not verified against sends none (see
+    /// [`Commands::reported`]). `compact`, when
     /// opencode lists no command of that name, is its own summary and
     /// needs none.
     pub(super) fn verdict(
@@ -637,6 +681,9 @@ impl Commands {
             .map(|(_, description)| description.clone());
         if name == "compact" && listed.is_none() {
             return Verdict::Send;
+        }
+        if let Some(unverified) = &self.unverified {
+            return Verdict::Refuse(format!("Octet did not send /{}: {unverified}", short(name)));
         }
         self.poll();
         match &self.reading {
