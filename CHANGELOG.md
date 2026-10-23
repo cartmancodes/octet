@@ -289,6 +289,9 @@ Claude Code and Codex CLIs.
 - `--print` takes a prompt that starts with dashes, and `--print=TEXT`.
 - The protocol gate launches the vendor with Octet's own arguments and
   limits.
+- The protocol gate's opencode lockdown checks that `opencode debug config`
+  shows a command's agent, subtask and template, as Octet's command check
+  needs.
 - Edition 2024; clippy pedantic, `#[expect(lint, reason)]` for every
   exception, `Debug` on every public type; a `cargo doc` build and a
   `cargo-deny` licence check in CI.
@@ -386,6 +389,18 @@ Claude Code and Codex CLIs.
   around it read as a narrow column beside it; it is framed now (where
   there is room). The model picker cut long lines at 64 columns; it widens
   to its longest line while the screen has room.
+- After a provider switch, an opencode slash command or skill carried the
+  earlier conversation, and opencode ran any `` !`cmd` `` found in it
+  through its shell, in every mode. A command or skill now never carries
+  it; the conversation waits for your next prompt.
+- In ask and accept-edits, Octet checks each opencode command and skill
+  against its definition (`opencode debug config` / `debug skill`) before
+  sending it. It refuses one that names another agent, runs as a subagent,
+  or would run shell (`` !`…` ``) from its template, skill text or
+  arguments, and one it cannot check: an MCP prompt, a changed definition,
+  or no reading.
+- In auto, an opencode turn that goes quiet after a subagent starts now
+  says the subagent may be waiting for a permission Octet cannot show.
 - On macOS, a `!` command dropped by a reconnect or quit while its shell
   was starting a process left that process running: it was not yet in the
   group Octet killed. Octet now kills the group again once the shell has
