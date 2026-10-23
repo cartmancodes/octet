@@ -436,6 +436,10 @@ Claude Code and Codex CLIs.
 - The same held for the phone's git calls: one dropped or timed out while a
   hook was starting a process left that process running. The hub now kills
   git's group again once git has died, git still unreaped.
+- And for the vendor CLIs: a session ended while the CLI was starting a
+  process left that process running. Octet now kills the CLI's group
+  again once the CLI has died, and kills any member still seen while it
+  waits for the group to go.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.
