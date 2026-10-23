@@ -762,6 +762,7 @@ dependencies = [
  "crossterm",
  "libc",
  "octet-core",
+ "octet-proc",
  "octet-testkit",
  "qrcode",
  "ratatui",

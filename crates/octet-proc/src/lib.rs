@@ -2,6 +2,9 @@
 #[cfg(not(unix))]
 compile_error!("Octet supports Linux and macOS only");
 
+mod group;
+pub use group::GroupLeader;
+
 use serde_json::Value;
 use std::{
     collections::VecDeque,

@@ -96,7 +96,7 @@ async fn run_with(
     };
     // One pipe for stdout and stderr keeps their order.
     let (reader, writer) = std::io::pipe().map_err(fail)?;
-    let mut child = {
+    let mut leader = {
         let mut cmd = Command::new(shell);
         cmd.arg("-c")
             .arg(command)
@@ -110,7 +110,7 @@ async fn run_with(
             .kill_on_drop(true);
         // SAFETY: setsid is async-signal-safe. A new session has no
         // controlling terminal, so opening /dev/tty fails at once instead of
-        // drawing over Octet; its group id is its pid, for kill_group.
+        // drawing over Octet; its group id is its pid, for GroupLeader.
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -119,13 +119,12 @@ async fn run_with(
                 Ok(())
             });
         }
-        cmd.spawn().map_err(fail)?
+        // Leading its own group, the shell is killed with the whole group
+        // on an early drop (a reconnect or quit drops this future):
+        // `kill_on_drop` alone stops only the shell.
+        octet_proc::GroupLeader::new(cmd.spawn().map_err(fail)?)
     };
-    let group = child.id();
-    // Declared after `child`, so on an early drop (a reconnect or quit drops
-    // this future) it runs first, while the shell is unreaped and its pid,
-    // the group's id, still reserved.
-    let guard = Group(group);
+    let group = leader.child().id();
     let tail = std::sync::Arc::new(std::sync::Mutex::new(Tail::default()));
     let reader_tail = std::sync::Arc::clone(&tail);
     // A plain thread, not spawn_blocking: a reader stuck on a pipe held by a
@@ -144,8 +143,8 @@ async fn run_with(
         _ = &mut cancel => Some(Status::Cancelled),
     };
     // Children left in the group would hold the pipe open.
-    drop(guard);
-    let code = child.wait().await.map_err(fail)?.code();
+    leader.kill_group();
+    let code = leader.child().wait().await.map_err(fail)?.code();
     if status.is_none() {
         status = Some(code.map_or(Status::Signalled, Status::Exited));
     }
@@ -168,7 +167,7 @@ async fn run_with(
 
 /// A `!` command running in the background, and whether its output goes
 /// with the next prompt. Dropping it (a session that ends) aborts the run,
-/// whose guard kills the command's whole process group.
+/// whose group leader kills the command's whole process group.
 pub(crate) struct Running {
     task: tokio::task::JoinHandle<Result<Ran, ShellError>>,
     cancel: Option<oneshot::Sender<()>>,
@@ -226,62 +225,6 @@ fn wait_exit(pid: Option<u32>) {
             return;
         }
     }
-}
-
-/// Kills a command's process group when dropped, so no path leaves the
-/// pipeline running: `kill_on_drop` alone stops only the shell.
-struct Group(Option<u32>);
-impl Drop for Group {
-    fn drop(&mut self) {
-        kill_group(self.0.take());
-    }
-}
-
-/// How long a killed shell may take to die before its group is killed again regardless. It
-/// blocks the thread dropping the run, but a shell dies of SIGKILL in a moment.
-const SHELL_DEATH: Duration = Duration::from_secs(1);
-
-/// SIGKILLs the group led by the shell `group`, which is unreaped, so the group's id cannot
-/// be reused meanwhile. A child the shell is forking as the signal goes out is not in the
-/// group yet, and macOS does not signal it: the shell dies and the child lives on. A shell
-/// that has died forks no more, so once it has, a second signal gets the rest.
-fn kill_group(group: Option<u32>) {
-    let Some(pid) = group.and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
-        return;
-    };
-    // SAFETY: signals only the process group this command was started in.
-    let kill = || unsafe { libc::kill(-pid, libc::SIGKILL) };
-    kill();
-    let deadline = std::time::Instant::now() + SHELL_DEATH;
-    while !has_exited(pid) && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    kill();
-}
-
-/// Whether the child `pid` has exited, leaving it unreaped; true too if it is no child to wait
-/// for (already reaped).
-fn has_exited(pid: libc::pid_t) -> bool {
-    let Ok(id) = libc::id_t::try_from(pid) else {
-        return true;
-    };
-    // SAFETY: siginfo_t is plain C data, for which all zeroes is valid.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: waitid writes only into `info`; WNOWAIT leaves the child for tokio to reap, and
-    // WNOHANG returns at once.
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            id,
-            &raw mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    if result != 0 {
-        return std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted;
-    }
-    // SAFETY: waitid filled `info`; its pid stays zero while the child has not exited.
-    unsafe { info.si_pid() != 0 }
 }
 
 /// The end of the output read so far.
