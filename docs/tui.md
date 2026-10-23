@@ -372,7 +372,10 @@ holds only for the opencode versions Octet has verified (1.18.25). opencode
 updates itself; when it reports another version at connect, Octet says so
 once, and in `ask` and `accept-edits` sends no command or skill at all: plain
 prompts still work, and `/mode auto` runs commands under opencode's own
-settings. `docs/rust/protocol-gate.md` says how a new version is verified.
+settings. The one exception is `/compact` while opencode lists no command of
+that name: opencode then runs its own summary, with no expansion and no
+shell, so Octet still sends it. `docs/rust/protocol-gate.md` says how a new
+version is verified.
 
 Under Octet's launch settings opencode takes commands from your own
 configuration (`~/.config/opencode` and `~/.opencode`: `opencode.json`,
@@ -399,8 +402,11 @@ failed is tried once more when a command needs it, but not after a turn
 has run in `accept-edits`, `auto` or `full-access`, where opencode edits
 files without asking: the files may then differ from what opencode loaded.
 For the same reason a reading made while such a turn was sent is not
-trusted. In both cases `/reconnect` starts opencode, and the reading,
-afresh. The turn then fails with the reason, and nothing reaches opencode;
+trusted: a prompt sent in `auto` or `full-access` while the reading made at
+connect still runs leaves it untrusted, so after a later switch to `ask` or
+`accept-edits` every command is refused until `/reconnect`. In both cases
+`/reconnect` starts opencode, and the reading, afresh. The turn then fails
+with the reason, and nothing reaches opencode;
 `/compact` (opencode's own summary) needs only to not be one of your
 commands.
 
