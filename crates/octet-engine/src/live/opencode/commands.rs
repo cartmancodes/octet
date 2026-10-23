@@ -294,7 +294,7 @@ pub(super) fn js_space(c: char) -> bool {
 /// word of `args` (the highest by every word from there on), each
 /// `$ARGUMENTS` by `args` with JavaScript's replacement patterns, and
 /// `args` appended on a line of its own when the template takes none.
-/// `None` when it would be longer than [`MAX_EXPANDED`].
+/// `None` when it would be longer than Octet checks (4 MiB).
 pub fn expand(template: &str, args: &str) -> Option<String> {
     let words = words(args);
     // The template as text between `$N`s, each with the number after it.
