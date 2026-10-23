@@ -1103,11 +1103,27 @@ mod tests {
         dir
     }
 
+    /// Writes the hook `name` of the repository at `dir`, a shell script running `body`.
     fn hook(dir: &Path, name: &str, body: &str) {
         let path = dir.join(".git/hooks").join(name);
         std::fs::create_dir_all(path.parent().expect("hooks")).expect("hooks directory");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("hook");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        script(&path, body);
+    }
+
+    /// Writes the shell script `path` running `body`, and runs it once with `warm`, which
+    /// returns before `body`. macOS checks a newly written program the first time it runs, one
+    /// at a time across the machine (the process waits before its first instruction): with the
+    /// suite writing and running many, git's first run of one could wait past a test's limit.
+    /// The run here, waited for without a limit, takes that wait out of the test.
+    fn script(path: &Path, body: &str) {
+        let text = format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{body}\n");
+        std::fs::write(path, text).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let warm = std::process::Command::new(path)
+            .arg("warm")
+            .status()
+            .expect("the script runs");
+        assert!(warm.success(), "the script's warm-up run failed");
     }
 
     /// Commits with the session's turn clear throughout.
@@ -1846,12 +1862,11 @@ mod tests {
         let bin = TempDir::new("octet-git-fake-bin");
         std::fs::create_dir_all(bin.path()).expect("bin");
         let fake = bin.path().join("git");
-        std::fs::write(
+        script(
             &fake,
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 3000 ]; do echo \"warning: could not open directory number $i\" >&2; i=$((i+1)); done\necho listed\n",
-        )
-        .expect("fake git");
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            "i=0\nwhile [ $i -lt 3000 ]; do \
+             echo \"warning: could not open directory number $i\" >&2; i=$((i+1)); done\necho listed",
+        );
         let git = Git::with_environment(vec![("PATH".into(), bin.path().into())]);
         let ws = TempDir::new("octet-git-fake-ws");
         std::fs::create_dir_all(ws.path()).expect("ws");
