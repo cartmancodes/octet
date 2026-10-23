@@ -779,8 +779,16 @@ const OPENCODE_TOOL_LIMIT: usize = 256;
 const LOCKDOWN_PROJECT_CONFIG: &str =
     r#"{"permission":"allow","agent":{"octet-ask":{"permission":{"*":"allow"}}}}"#;
 /// `lockdown`'s user rule, read through `OPENCODE_CONFIG`: it allows the
-/// command the scenario asks for.
-const LOCKDOWN_USER_RULE: &str = r#"{"permission":{"bash":{"echo *":"allow"}}}"#;
+/// command the scenario asks for, and defines [`GATE_COMMAND`], a slash
+/// command Octet must refuse in `ask` (its own agent, a subagent, shell in
+/// its template), which nothing sends.
+const LOCKDOWN_USER_RULE: &str = r#"{"permission":{"bash":{"echo *":"allow"}},
+"command":{"octet-gate-command":{"description":"Octet gate command","agent":"build","subtask":true,
+"template":"Gate !`echo gate`"}}}"#;
+/// The slash command `lockdown`'s user rule defines.
+const GATE_COMMAND: &str = "octet-gate-command";
+/// The description `lockdown`'s user rule gives [`GATE_COMMAND`].
+const GATE_COMMAND_DESCRIPTION: &str = "Octet gate command";
 /// Where in the workspace `lockdown` keeps its user rule.
 const LOCKDOWN_USER_CONFIG: &str = "user-config.json";
 /// How long one `opencode session` command may run.
@@ -848,6 +856,9 @@ struct Opencode<'a> {
     turn: Option<OpencodeTurn>,
     /// Updates for the session before its first prompt: a resume's replay.
     replayed: u64,
+    /// The description opencode lists [`GATE_COMMAND`] with, once it lists
+    /// its commands.
+    gate_command: Option<String>,
 }
 
 impl<'a> Opencode<'a> {
@@ -860,6 +871,7 @@ impl<'a> Opencode<'a> {
             session: String::new(),
             turn: None,
             replayed: 0,
+            gate_command: None,
         }
     }
 
@@ -898,6 +910,19 @@ impl<'a> Opencode<'a> {
             return Ok(());
         }
         let update = &v["params"]["update"];
+        if update["sessionUpdate"] == "available_commands_update" {
+            self.gate_command = update["availableCommands"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|command| command["name"] == GATE_COMMAND)
+                .map(|command| {
+                    command["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                });
+        }
         let Some(turn) = self.turn.as_mut() else {
             if update["sessionUpdate"] != "available_commands_update" {
                 self.replayed += 1;
@@ -1125,6 +1150,11 @@ async fn opencode(gate: &mut GateProcess, scenario: &str, cwd: &Path) -> Result<
         "lockdown" if !asked => Err(GateError::Protocol(
             "the model ran no command, so lockdown is unproven",
         )),
+        // Octet checks a command against its definition using the
+        // description opencode lists it with.
+        "lockdown" if acp.gate_command.as_deref() != Some(GATE_COMMAND_DESCRIPTION) => Err(
+            GateError::Protocol("opencode does not list the gate command with its description"),
+        ),
         _ => Ok(()),
     }
 }
@@ -1179,7 +1209,10 @@ async fn run_opencode(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evid
         Ok(gate) => gate,
         Err(error) => return (format!("failed: {error}"), Evidence::default(), 0, false),
     };
-    let result = opencode(&mut gate, &opt.scenario, cwd).await;
+    let mut result = opencode(&mut gate, &opt.scenario, cwd).await;
+    if result.is_ok() && opt.scenario == "lockdown" {
+        result = opencode_command_contract(opt, cwd).await;
+    }
     let mut evidence = gate.evidence().clone();
     let report = gate.shutdown().await;
     let mut cleaned = report.reaped && report.descendants_stopped;
@@ -1212,6 +1245,62 @@ async fn run_opencode(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evid
         Ok(replayed) => ("passed".into(), evidence, replayed, cleaned),
         Err(error) => (format!("failed: {error}"), evidence, 0, cleaned),
     }
+}
+
+/// What Octet reads before it sends a command while the mode asks:
+/// `opencode debug config`, run with the session's launch environment in
+/// its workspace, must show [`GATE_COMMAND`]'s agent, subtask setting and
+/// template, and `opencode debug skill` must print a list of skills.
+async fn opencode_command_contract(opt: &Opt, cwd: &Path) -> Result<(), GateError> {
+    let config = opencode_debug(opt, cwd, "config")
+        .await
+        .ok_or(GateError::Protocol("opencode debug config printed no JSON"))?;
+    let command = &config["command"][GATE_COMMAND];
+    let shown = command["agent"] == "build"
+        && command["subtask"] == true
+        && command["template"]
+            .as_str()
+            .is_some_and(|template| template.contains("!`"))
+        && command["description"] == GATE_COMMAND_DESCRIPTION;
+    if !shown {
+        return Err(GateError::Protocol(
+            "opencode debug config does not show a command's agent, subtask and template",
+        ));
+    }
+    let skills = opencode_debug(opt, cwd, "skill")
+        .await
+        .ok_or(GateError::Protocol("opencode debug skill printed no JSON"))?;
+    if !skills.is_array() {
+        return Err(GateError::Protocol("opencode debug skill printed no list"));
+    }
+    Ok(())
+}
+
+/// `opencode debug what`'s output as JSON, run as Octet runs it (the
+/// scenario's launch environment, in `cwd`, its output to a file: opencode
+/// 1.18.25 exits before a pipe takes more than 64 KiB); `None` when it
+/// fails, overruns or prints something else.
+async fn opencode_debug(opt: &Opt, cwd: &Path, what: &str) -> Option<Value> {
+    let path = cwd.join(format!("debug-{what}.json"));
+    let file = fs::File::create(&path).ok()?;
+    let (_, env) = vendor_launch(opt, cwd, None);
+    let mut command = tokio::process::Command::new(&opt.binary);
+    command
+        .args(["debug", what])
+        .envs(env)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(file))
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(OPENCODE_SESSION_LIMIT, command.status())
+        .await
+        .ok()?
+        .ok()?;
+    let text = fs::read_to_string(&path).ok();
+    let _ = fs::remove_file(&path);
+    status.success().then_some(())?;
+    serde_json::from_str(&text?).ok()
 }
 
 /// Runs `opencode session ARGS` as Octet's launch would, in `cwd`; its

@@ -526,6 +526,53 @@ fn a_skill_after_a_switch_carries_the_handoff_as_context() {
     );
 }
 #[test]
+fn an_opencode_command_after_a_switch_leaves_the_handoff_for_the_next_prompt() {
+    // opencode substitutes a command's text into its template and runs every
+    // `!`cmd`` in the result through its shell: the earlier conversation
+    // (replies, tool output) must never become a command's text.
+    let mut app = switched_to_codex();
+    app.conn.engine = Engine::OPENCODE;
+    let vendor = RecordingVendor::default();
+    app.begin_turn(
+        &vendor,
+        Command::Skill {
+            name: "review".into(),
+            path: None,
+            args: "go".into(),
+            display: "/review go".into(),
+            context: None,
+        },
+        By::User,
+        "sending",
+    )
+    .unwrap();
+    match &vendor.sent.borrow()[..] {
+        [Command::Skill { context, args, .. }] => {
+            assert_eq!(context.as_deref(), None);
+            assert_eq!(args, "go");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(app.pending_handoff.is_some());
+    assert!(
+        app.entries_text()
+            .contains("The earlier conversation goes with your next prompt, not with /review"),
+        "{}",
+        app.entries_text()
+    );
+    crate::test_support::idle(&mut app);
+    app.begin_turn(&vendor, Command::Prompt("next".into()), By::User, "sending")
+        .unwrap();
+    match &vendor.sent.borrow()[1] {
+        Command::PromptWithDisplay { wire, display, .. } => {
+            assert!(wire.starts_with("[Octet handoff]"), "{wire}");
+            assert_eq!(display, "next");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(app.pending_handoff.is_none());
+}
+#[test]
 fn a_refused_send_keeps_the_handoff() {
     let mut app = switched_to_codex();
     let vendor = RecordingVendor::default();

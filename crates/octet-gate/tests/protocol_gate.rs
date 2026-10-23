@@ -238,8 +238,14 @@ fn the_workspace_is_removed_on_failure() {
 
 /// A scripted `opencode`: `acp` writes `frames`, then keeps what the gate
 /// sent in `stdin`; `session delete ID` appends ID to `deleted`, and
-/// `session list` prints `listed`.
+/// `session list` prints `listed`; `debug config` shows the gate command as
+/// lockdown's user rule defines it, `debug skill` no skills.
 fn opencode_script(frames: &[Value], listed: &str) -> String {
+    opencode_script_with(frames, listed, &gate_command(Some("build")))
+}
+
+/// As `opencode_script`, with `debug config` printing `config`.
+fn opencode_script_with(frames: &[Value], listed: &str, config: &Value) -> String {
     let wire = frames
         .iter()
         .map(Value::to_string)
@@ -250,6 +256,7 @@ fn opencode_script(frames: &[Value], listed: &str) -> String {
          case \"$1\" in\n\
          --version) echo 1.18.25; exit ;;\n\
          session) if [ \"$2\" = delete ]; then echo \"$3\" >> \"$dir/deleted\"; else echo '{listed}'; fi; exit ;;\n\
+         debug) if [ \"$2\" = config ]; then echo '{config}'; else echo '[]'; fi; exit ;;\n\
          esac\n\
          cat <<'WIRE'\n{wire}\nWIRE\ncat > \"$dir/stdin\""
     )
@@ -261,13 +268,23 @@ fn opencode_confirm(id: u64, option: &str, value: &str) -> Value {
 }
 
 /// opencode's handshake for session `ses_a` (the free model and Octet's ask
-/// agent confirmed), then `events` and the prompt's `end_turn` reply.
-fn opencode_frames(mut events: Vec<Value>) -> Vec<Value> {
+/// agent confirmed, then its command list naming the gate command), then
+/// `events` and the prompt's `end_turn` reply.
+fn opencode_frames(events: Vec<Value>) -> Vec<Value> {
+    opencode_frames_listing("Octet gate command", events)
+}
+
+/// As `opencode_frames`, the gate command listed with `description`.
+fn opencode_frames_listing(description: &str, mut events: Vec<Value>) -> Vec<Value> {
     let mut frames = vec![
         json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}),
         json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_a"}}),
         opencode_confirm(3, "model", "opencode/deepseek-v4.1-flash-free"),
         opencode_confirm(4, "mode", "octet-ask"),
+        opencode_update(
+            &json!({"sessionUpdate":"available_commands_update","availableCommands":[
+            {"name":"octet-gate-command","description":description}]}),
+        ),
     ];
     frames.append(&mut events);
     frames.push(json!({"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}));
@@ -634,5 +651,63 @@ fn each_engine_runs_only_its_own_scenarios() {
     for scenario in ["lockdown", "subagent"] {
         assert!(refused("codex", scenario), "{scenario}");
         assert!(refused("claude", scenario), "{scenario}");
+    }
+}
+
+/// A scripted `opencode` for `lockdown`: the gate command listed with
+/// `description`, a permission request for `echo fixture`, and `debug
+/// config` printing `config`.
+fn opencode_lockdown_script(description: &str, config: &Value) -> String {
+    let permission = json!({"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"ses_a",
+        "toolCall":{"toolCallId":"c1","title":"echo fixture","kind":"execute","rawInput":{"command":"echo fixture"}},
+        "options":[{"optionId":"once","kind":"allow_once","name":"Allow once"}]}});
+    opencode_script_with(
+        &opencode_frames_listing(description, vec![permission]),
+        "[]",
+        config,
+    )
+}
+
+/// The `command` entry `opencode debug config` shows for the gate command.
+fn gate_command(agent: Option<&str>) -> Value {
+    let mut command =
+        json!({"description":"Octet gate command","subtask":true,"template":"Gate !`echo gate`"});
+    if let Some(agent) = agent {
+        command["agent"] = json!(agent);
+    }
+    json!({"command":{"octet-gate-command":command}})
+}
+
+#[test]
+fn opencode_lockdown_checks_what_octet_reads_of_a_command() {
+    // Octet checks a command against `opencode debug config` and the list's
+    // description before it sends it while the mode asks.
+    let root = octet_testkit::TempDir::new("octet-gate-lockdown-command");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let script = opencode_lockdown_script("Octet gate command", &gate_command(Some("build")));
+    let (code, evidence) = probe_in(root.path(), "opencode", "lockdown", &script);
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(0), "{evidence}");
+    assert_eq!(evidence["status"], "passed");
+    for (description, config, why) in [
+        (
+            "Octet gate command",
+            gate_command(None),
+            "opencode debug config does not show a command's agent",
+        ),
+        (
+            "Another",
+            gate_command(Some("build")),
+            "does not list the gate command",
+        ),
+    ] {
+        let script = opencode_lockdown_script(description, &config);
+        let (code, evidence) = probe_in(root.path(), "opencode", "lockdown", &script);
+        let evidence = evidence.unwrap();
+        assert_eq!(code, Some(1), "{evidence}");
+        assert!(
+            evidence["status"].as_str().unwrap().contains(why),
+            "{evidence}"
+        );
     }
 }

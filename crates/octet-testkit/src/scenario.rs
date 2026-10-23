@@ -136,6 +136,11 @@ pub const OPENCODE_READ_ENV: &str = "opencode-read-env";
 pub const OPENCODE_SUBTASK: &str = "fixture-subtask";
 /// opencode: the name of the skill the fake lists as a slash command.
 pub const OPENCODE_SKILL: &str = "fixture-opencode-skill";
+/// opencode: list the commands again, adding `OPENCODE_LATE`, as opencode
+/// does when its commands change, then end the turn.
+pub const OPENCODE_RELIST: &str = "opencode-relist";
+/// opencode: the command `OPENCODE_RELIST` adds to the list.
+pub const OPENCODE_LATE: &str = "fixture-late";
 
 /// Goal objective (`/goal …`): one step, then completion with evidence.
 pub const GOAL: &str = "fixture-goal";

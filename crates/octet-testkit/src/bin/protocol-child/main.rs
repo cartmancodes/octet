@@ -27,6 +27,7 @@ fn main() {
         "--print" => claude::run(),
         "acp" => opencode::run(),
         "session" => opencode::session_command(),
+        "debug" => opencode::debug_command(),
         "split" => {
             let mut stdout = io::stdout().lock();
             stdout.write_all(b"{\"part\":").unwrap();

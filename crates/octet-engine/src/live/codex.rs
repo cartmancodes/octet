@@ -38,6 +38,7 @@ pub(super) const PROVIDER: Provider = Provider {
     efforts: &[],
     shutdown_grace: Duration::from_millis(150),
     lists_models: true,
+    commands_expand_shell: false,
     launch_args: <CodexProtocol as Protocol>::launch_args,
     launch_env: super::no_env,
     start,

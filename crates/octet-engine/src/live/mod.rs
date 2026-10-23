@@ -57,6 +57,14 @@ pub struct Limits {
     /// takes the bytes inline: a file swapped for a FIFO, or on a stalled
     /// mount, must not hold the session.
     pub image_read: Duration,
+    /// Reading a vendor's command definitions before a command is sent
+    /// (opencode's `opencode debug config` and `debug skill`), for a
+    /// provider that checks a command first.
+    pub command_check: Duration,
+    /// Silence in a turn after a subagent starts before Octet says it may
+    /// be waiting for a permission the vendor never passes on (opencode in
+    /// `auto`).
+    pub subagent_quiet: Duration,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -66,6 +74,8 @@ impl Default for Limits {
             interrupt: Duration::from_secs(10),
             mode_confirm: Duration::from_secs(10),
             image_read: Duration::from_secs(10),
+            command_check: Duration::from_secs(20),
+            subagent_quiet: Duration::from_secs(10),
         }
     }
 }
@@ -128,6 +138,12 @@ pub struct Provider {
     pub shutdown_grace: Duration,
     /// The CLI can list its models without opening a session (`probe`).
     pub lists_models: bool,
+    /// A slash command's text (its arguments, and anything sent with them)
+    /// is substituted into the command's template and every `` !`cmd` `` in
+    /// the result runs in the vendor's shell before any permission check
+    /// (opencode). The earlier conversation a provider switch carries must
+    /// then never go with a command: it holds replies and tool output.
+    pub commands_expand_shell: bool,
     /// The vendor CLI's arguments for `config` (none for the demo).
     pub(crate) launch_args: fn(&Config) -> Vec<OsString>,
     /// The environment variables the vendor CLI is launched with, on top of
