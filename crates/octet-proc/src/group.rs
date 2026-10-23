@@ -65,7 +65,7 @@ impl GroupLeader {
 
     /// SIGKILLs the whole group. A child a member is forking as the signal goes out is not in
     /// the group yet, and macOS does not signal it: the member dies and the child lives on. So
-    /// once the leader has died (or [`LEADER_DEATH`] has passed) the group is killed again,
+    /// once the leader has died (or a second has passed) the group is killed again,
     /// which gets the rest when the leader was the one forking: a dead process forks no more.
     /// The leader stays unreaped throughout. A leader already reaped is not signalled at all.
     pub fn kill_group(&self) {
