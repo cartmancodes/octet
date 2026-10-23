@@ -612,7 +612,9 @@ vendor context; `--resume VENDOR_SESSION_ID` does the same on a later launch.
 first: provider, session ID, model, age and the session's first prompt (from its
 oldest journal listed), then its latest prompt when that differs. `/resume N` reopens
 entry N, switching provider when it belongs to the other vendor, in a fresh
-view. The list comes from Octet's own journals (at most the first 64 KiB of
+view, with the model its journal names; when the provider refuses that model
+(opencode's free models come and go), the session stops and says that
+`/model PROVIDER MODEL` resumes the same session with another. The list comes from Octet's own journals (at most the first 64 KiB of
 each, skipping a torn last line, and the last 256 KiB for the latest prompt,
 which is left out when it is further back); reconnects of one session show as
 one entry.

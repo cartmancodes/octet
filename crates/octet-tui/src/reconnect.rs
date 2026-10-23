@@ -352,6 +352,22 @@ mod tests {
     }
 
     #[test]
+    fn another_model_after_a_resume_that_did_not_open_resumes_the_same_session() {
+        // `/resume N` was refused its model before opencode named the
+        // session: the hint's `/model opencode <model>` must resume it.
+        let mut config = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+        config.resume = Some("ses-1".into());
+        config.model = Some("opencode/gone-free".into());
+        let exit = Exit::Model(Selection {
+            provider: Engine::OPENCODE,
+            model: Some("opencode/glm-5.3-flash-free".into()),
+        });
+        let next = plan_for(exit, &config, "").config;
+        assert_eq!(next.resume.as_deref(), Some("ses-1"));
+        assert_eq!(next.model.as_deref(), Some("opencode/glm-5.3-flash-free"));
+    }
+
+    #[test]
     fn full_access_carried_to_another_provider_is_a_warning() {
         let plan = switch_in(Engine::CLAUDE, Mode::FullAccess, Mode::FullAccess);
         assert_eq!(plan.config.mode, Mode::FullAccess);

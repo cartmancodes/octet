@@ -1151,6 +1151,20 @@ impl App {
                 self.conn.activity = State::Error;
             }
             Event::Stopped => {
+                // A resumed session that stops with an error before it opens
+                // may have been refused its model (`/resume N` asks for the
+                // journal's, which opencode's rotating free models may drop);
+                // /model keeps the session, so it can open with another.
+                if self.conn.phase == ConnPhase::Connecting
+                    && self.conn.activity == State::Error
+                    && self.conn.resumes
+                    && self.conn.requested_model.is_some()
+                {
+                    self.note(format!(
+                        "/model {} <model> resumes the same session with another model",
+                        self.conn.engine
+                    ));
+                }
                 // A cancelled connection stops without finishing a turn.
                 self.calls_over();
                 self.clear_status(StatusKind::Cancelling);
