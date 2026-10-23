@@ -44,7 +44,16 @@ pub fn detached_sleep() -> PathBuf {
 }
 
 /// Builds one of this crate's binaries for the profile the calling test runs
-/// in. Release and custom target directories get their own copy.
+/// in, and returns the copy tests run. Release and custom target directories
+/// get their own.
+///
+/// Test processes sharing a target directory each call this as they start.
+/// Cargo replaces its own copy (`<profile>/<name>`) on every build, fresh or
+/// not, removing it first, so a test running that one could find it missing
+/// or half written. Tests run a copy of it in `<profile>/octet-testkit/`
+/// instead, replaced only when cargo's has changed (its length or time), and
+/// then by a rename, so a test sees the old binary or the new one, whole.
+/// Builds and copies take turns, under a lock in that directory.
 fn testkit_bin(name: &str) -> PathBuf {
     // Test executables live in <target>/<profile>/deps/.
     let profile_dir = std::env::current_exe()
@@ -58,6 +67,10 @@ fn testkit_bin(name: &str) -> PathBuf {
         Some("debug") | None => "dev",
         Some(other) => other,
     };
+    let kept_dir = profile_dir.join("octet-testkit");
+    std::fs::create_dir_all(&kept_dir).expect("the test binaries' directory");
+    let lock = std::fs::File::create(kept_dir.join(".lock")).expect("the build lock");
+    lock.lock().expect("the build lock");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let status = Command::new(&cargo)
@@ -75,7 +88,33 @@ fn testkit_bin(name: &str) -> PathBuf {
             )
         });
     assert!(status.success(), "building {name} failed");
-    profile_dir.join(name)
+    let built = profile_dir.join(name);
+    let kept = kept_dir.join(name);
+    if changed(&built, &kept) {
+        let temporary = kept_dir.join(format!(".{name}.{}", std::process::id()));
+        std::fs::copy(&built, &temporary).expect("a copy of the built binary");
+        let time = std::fs::metadata(&built)
+            .and_then(|meta| meta.modified())
+            .expect("the built binary's time");
+        std::fs::File::options()
+            .write(true)
+            .open(&temporary)
+            .and_then(|copy| copy.set_modified(time))
+            .expect("the copy's time");
+        std::fs::rename(&temporary, &kept).expect("the copy in place");
+    }
+    kept
+}
+
+/// Whether `copy` differs from `built` in length or modification time, or
+/// is missing.
+fn changed(built: &Path, copy: &Path) -> bool {
+    let look = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| Ok((meta.len(), meta.modified()?)))
+            .ok()
+    };
+    look(copy).is_none() || look(copy) != look(built)
 }
 
 /// Writes an executable shell script `dir/name` (creating `dir`): a
@@ -261,6 +300,37 @@ mod tests {
             calls == 3
         }));
         assert!(!wait_until(Duration::from_millis(30), || false));
+    }
+    #[test]
+    fn a_build_beside_a_running_test_leaves_its_binary_in_place() {
+        // Test processes sharing a target directory each build the fake vendor as they start;
+        // one that builds must not take away, or rewrite, the binary another is running.
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::atomic::AtomicBool;
+        let path = protocol_child();
+        let inode = std::fs::metadata(&path).expect("the binary").ino();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (path, stop) = (path.clone(), std::sync::Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let now = std::fs::metadata(&path).map(|meta| meta.ino()).ok();
+                    if now != Some(inode) && seen.last() != Some(&now) {
+                        seen.push(now);
+                    }
+                }
+                seen
+            })
+        };
+        let again = testkit_bin("protocol-child");
+        stop.store(true, Ordering::Relaxed);
+        let seen = watcher.join().expect("the watcher");
+        assert_eq!(again, path);
+        assert!(
+            seen.is_empty(),
+            "the binary was replaced or missing during a build: {seen:?}"
+        );
     }
     #[test]
     fn temp_dirs_are_unique_and_removed() {
