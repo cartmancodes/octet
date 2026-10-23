@@ -242,12 +242,12 @@ async fn latest_prompt(
         let cut = tail.iter().position(|&b| b == b'\n')?;
         &tail[cut + 1..]
     };
+    // From the end: the first user record found is the latest.
     let latest = whole
-        .split(|&b| b == b'\n')
+        .rsplit(|&b| b == b'\n')
         .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
         .filter(|record| record["format"] == FORMAT && record["type"] == "user")
-        .filter_map(|record| record["data"].as_str().map(str::to_owned))
-        .last();
+        .find_map(|record| record["data"].as_str().map(str::to_owned));
     // With the window, the tail covers the journal: the window's is latest.
     latest.or(if covered { earlier } else { None })
 }
@@ -378,7 +378,8 @@ mod tests {
         let temp = octet_testkit::TempDir::new("octet-store-no-tail");
         // More than the tail reads after the latest prompt: it is not known,
         // and an earlier one is not the latest.
-        let reply = "y".repeat(TAIL_BYTES as usize + 1024);
+        let reply = "y".repeat(257 * 1024);
+        assert!(reply.len() as u64 > TAIL_BYTES);
         let path = journal_file(
             temp.path(),
             1,
