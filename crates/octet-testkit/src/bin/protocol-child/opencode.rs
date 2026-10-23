@@ -6,7 +6,7 @@ use octet_testkit::scenario;
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::{self, BufRead},
+    io::{self, BufRead, Write as _},
     process, thread,
     time::Duration,
 };
@@ -80,10 +80,7 @@ pub(crate) fn run() {
     for line in io::stdin().lock().lines() {
         let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
         match v["method"].as_str() {
-            Some("initialize") => emit(&acp_result(
-                &v["id"],
-                &json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true},"sessionCapabilities":{"resume":{},"fork":{},"close":{}}}}),
-            )),
+            Some("initialize") => emit(&acp_result(&v["id"], &initialized())),
             Some(method @ ("session/new" | "session/resume" | "session/fork")) => {
                 fixture.open(method, &v);
             }
@@ -100,6 +97,19 @@ pub(crate) fn run() {
     }
 }
 
+/// The reply to `initialize`, as opencode 1.18.25 gives it, naming that
+/// version, or the one `fixture-version` in the working directory holds
+/// (`none`: no `agentInfo` at all).
+fn initialized() -> Value {
+    let version = fs::read_to_string("fixture-version")
+        .map_or_else(|_| "1.18.25".to_owned(), |text| text.trim().to_owned());
+    let mut reply = json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true},"sessionCapabilities":{"resume":{},"fork":{},"close":{}}}});
+    if version != "none" {
+        reply["agentInfo"] = json!({"name":"OpenCode","version":version});
+    }
+    reply
+}
+
 /// `protocol-child session delete <id>`: the stand-in for `opencode session
 /// delete <id>`, leaving an empty `deleted-<id>` file in the working directory.
 pub(crate) fn session_command() {
@@ -113,22 +123,28 @@ pub(crate) fn session_command() {
 /// `protocol-child debug config|skill`: the stand-in for `opencode debug
 /// config` and `opencode debug skill`, run in the session's working
 /// directory. Each run appends its subcommand to `debug-calls` there, when
-/// the test made one.
+/// the test made one, in one write, so runs side by side keep every line.
 /// `config` prints a `command` map: `OPENCODE_SKILL` plain, and
 /// `OPENCODE_SUBTASK` plain too, so only its `task` call shows it is a
 /// subagent (a definition that changed after Octet read it); then the
 /// commands in `fixture-commands.json`, when there is one. `skill` prints
 /// `fixture-skills.json`, or no skills. With `debug-fails` present, both
-/// exit 1; with `debug-hangs`, both wait a minute first.
+/// exit 1; with `debug-hangs`, both wait a minute first, and with
+/// `debug-delay-ms`, the milliseconds it holds.
 pub(crate) fn debug_command() {
     let what = env::args().nth(2).unwrap_or_default();
-    if let Ok(mut calls) = fs::read_to_string("debug-calls") {
-        calls.push_str(&what);
-        calls.push('\n');
-        fs::write("debug-calls", calls).unwrap();
+    // Appended in one write: runs side by side must not lose each other's.
+    if let Ok(mut calls) = fs::OpenOptions::new().append(true).open("debug-calls") {
+        calls.write_all(format!("{what}\n").as_bytes()).unwrap();
     }
     if fs::exists("debug-hangs").unwrap_or(false) {
         thread::sleep(Duration::from_secs(60));
+    }
+    if let Some(delay) = fs::read_to_string("debug-delay-ms")
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+    {
+        thread::sleep(Duration::from_millis(delay));
     }
     if fs::exists("debug-fails").unwrap_or(false) {
         process::exit(1);
@@ -287,7 +303,9 @@ impl OpencodeFixture {
     }
 
     /// Opens, resumes or forks the session. A resume replays its history
-    /// after its reply, before any prompt, as opencode 1.18.25 does.
+    /// after its reply, before any prompt, as opencode 1.18.25 does. With
+    /// `ticks` in the working directory, the commands are listed again
+    /// every 100 ms; with `relist-burst`, four changed lists follow at once.
     fn open(&mut self, method: &str, v: &Value) {
         method.clone_into(&mut self.opened);
         self.session = match method {
@@ -312,6 +330,28 @@ impl OpencodeFixture {
             emit(&tool_call(sid, "replayed-call"));
         }
         list_commands(sid, false);
+        if fs::exists("ticks").unwrap_or(false) {
+            // Frames that keep coming whatever Octet does: the same list,
+            // every 100 ms for ten seconds.
+            let sid = sid.clone();
+            thread::spawn(move || {
+                for _ in 0..100 {
+                    thread::sleep(Duration::from_millis(100));
+                    list_commands(&sid, false);
+                }
+            });
+        }
+        if fs::exists("relist-burst").unwrap_or(false) {
+            // Lists that change four times within 120 ms, as opencode's
+            // do while MCP servers connect one by one.
+            let sid = sid.clone();
+            thread::spawn(move || {
+                for late in [true, false, true, false] {
+                    thread::sleep(Duration::from_millis(30));
+                    list_commands(&sid, late);
+                }
+            });
+        }
     }
 
     /// Accepts any model; refuses modes once the model is `OPENCODE_REJECT_MODE`,

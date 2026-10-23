@@ -3,8 +3,8 @@
 //! permission modes, and the environment that starts it), the handshake, the
 //! model catalog, turns, skills and the probe.
 use super::{
-    ApprovalSummary, BoxFuture, Channels, Config, DriverError, Event, ImageAttachment, Limits,
-    Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
+    ApprovalSummary, BoxFuture, Channels, Command, Config, DriverError, Event, ImageAttachment,
+    Limits, Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
     activity::one_line,
     check_inline, deadline_after, limited,
     protocol::{Core, Phase, Protocol},
@@ -22,6 +22,11 @@ use std::{
 use tokio::time::Instant;
 
 mod commands;
+
+pub use commands::{
+    VERIFIED_VERSIONS as OPENCODE_VERIFIED_VERSIONS,
+    built_in_descriptions as opencode_built_in_commands, expand as opencode_command_expansion,
+};
 
 /// opencode's row in the provider table.
 pub(super) const PROVIDER: Provider = Provider {
@@ -263,6 +268,38 @@ impl Protocol for OpencodeProtocol {
 
     fn take_switch_timed_out(&mut self) -> bool {
         std::mem::take(&mut self.switch_timed_out)
+    }
+
+    /// A slash command waits while Octet reads the definitions its check
+    /// needs (see `commands::Commands::verdict`); it names the command.
+    fn must_wait(&mut self, core: &Core, command: &Command) -> Option<String> {
+        let prompt = match command {
+            Command::Prompt(text) => vec![json!({"type": "text", "text": text})],
+            Command::PromptWithDisplay { wire, .. } => vec![json!({"type": "text", "text": wire})],
+            Command::Skill { name, args, .. } => skill_prompt(name, args),
+            Command::Compact => vec![json!({"type": "text", "text": "/compact"})],
+            _ => return None,
+        };
+        let (name, args) = slash_command(&prompt)?;
+        if shell_refusal(&name, &args, core.mode).is_some() {
+            return None;
+        }
+        let verdict = self.commands.verdict(
+            commands::Launch::of(&core.config),
+            core.limits.command_check,
+            &name,
+            &args,
+            core.mode,
+        );
+        (verdict == commands::Verdict::Wait).then(|| short(&name))
+    }
+
+    fn waiting(&mut self) -> bool {
+        self.commands.reading()
+    }
+
+    fn wait_over(&mut self) -> impl Future<Output = ()> + Send {
+        self.commands.finished()
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -520,11 +557,12 @@ impl Protocol for OpencodeProtocol {
                 if core.config.catalog_only {
                     return self.probe_listed(core, list);
                 }
-                // Read the definitions now, while the mode asks, so the
-                // first command need not wait for them.
-                let launch = matches!(core.mode, Mode::Ask | Mode::AcceptEdits)
-                    .then(|| commands::Launch::of(&core.config));
-                self.commands.listed(list, launch);
+                // Read the definitions now, in every mode: opencode loads
+                // them once, now, and a command need not wait for them.
+                let launch = commands::Launch::of(&core.config);
+                let running = self.turn_mode.filter(|_| core.phase.is_running());
+                self.commands
+                    .listed(list, launch, core.limits.command_check, running);
                 core.emit(Event::Skills(commands(list)))
             }
             // A resume replays the session's history before any prompt: it
@@ -548,14 +586,14 @@ impl Protocol for OpencodeProtocol {
 
 impl OpencodeProtocol {
     /// Watches a subagent `update` starts or ends (opencode's `task`, its
-    /// only `think` tool) in an `auto` turn: opencode never passes on the
-    /// subagent's permission requests, so one its own settings ask for
-    /// waits unseen. Once the turn has been quiet for
+    /// only `think` tool) in an `auto` or `full-access` turn, where opencode
+    /// lets it run: opencode never passes on the subagent's permission
+    /// requests, so one its own settings ask for waits unseen. Once the turn has been quiet for
     /// `Limits::subagent_quiet` after the subagent starts, Octet says so,
     /// once a turn (see `report_quiet_subagent`).
     fn watch_subagent(&mut self, core: &Core, update: &Value) {
         if update["kind"] != "think"
-            || self.turn_mode != Some(Mode::Auto)
+            || !matches!(self.turn_mode, Some(Mode::Auto | Mode::FullAccess))
             || !core.phase.is_running()
         {
             return;
@@ -579,7 +617,8 @@ impl OpencodeProtocol {
         }
         self.subagent_noted = true;
         core.emit(Event::Notice(
-            "opencode's subagent may be waiting for a permission Octet cannot show; Esc cancels"
+            "opencode's subagent has gone quiet: it may still be working, or waiting for a permission \
+             Octet cannot show; Esc cancels"
                 .to_owned(),
         ))
     }
@@ -625,18 +664,33 @@ impl OpencodeProtocol {
         mut prompt: Vec<Value>,
         images: &[ImageAttachment],
     ) -> Result<(), DriverError> {
+        if let Some(refusal) = blocks_refusal(&prompt, core.mode) {
+            return fail_turn(core, refusal);
+        }
         if let Some((name, args)) = slash_command(&prompt) {
             if let Some(refusal) = shell_refusal(&name, &args, core.mode) {
                 return fail_turn(core, refusal);
             }
             let launch = commands::Launch::of(&core.config);
             let limit = core.limits.command_check;
-            if let Some(refusal) = self
+            match self
                 .commands
-                .check(launch, limit, &name, &args, core.mode)
-                .await
+                .verdict(launch, limit, &name, &args, core.mode)
             {
-                return fail_turn(core, refusal);
+                commands::Verdict::Send => {}
+                commands::Verdict::Refuse(refusal) => return fail_turn(core, refusal),
+                // The driver holds a command until its check can be made
+                // (`must_wait`); one that reaches here unchecked is not sent.
+                commands::Verdict::Wait => {
+                    return fail_turn(
+                        core,
+                        format!(
+                            "Octet has not finished reading opencode's commands, so it did not send /{}; \
+                             send it again",
+                            short(&name)
+                        ),
+                    );
+                }
             }
         }
         self.turn_mode = Some(core.mode);
@@ -669,6 +723,7 @@ impl OpencodeProtocol {
         for (image, data) in encoded {
             prompt.push(json!({"type": "image", "mimeType": image.media_type, "data": data}));
         }
+        self.commands.turn_sent(core.mode);
         let params = json!({"sessionId": core.session, "prompt": prompt});
         self.request(core, Outstanding::Prompt, "session/prompt", params)
             .await
@@ -836,6 +891,14 @@ impl OpencodeProtocol {
             return Err(format!("opencode initialization failed: {}", error_text(error)).into());
         }
         core.phase = Phase::Handshaken;
+        let version = v
+            .pointer("/result/agentInfo/version")
+            .and_then(Value::as_str);
+        if let Some(notice) = self.commands.reported(version)
+            && !core.config.catalog_only
+        {
+            core.emit(Event::Notice(notice))?;
+        }
         let config = &core.config;
         let mut params = json!({"cwd": config.cwd, "mcpServers": []});
         let (method, resumed) = match &config.resume {
@@ -1276,6 +1339,28 @@ fn slash_command(prompt: &[Value]) -> Option<(String, String)> {
         .filter(|word| !word.is_empty());
     let name = words.next()?.to_owned();
     Some((name, words.collect::<Vec<_>>().join(" ")))
+}
+
+/// Why `prompt` cannot be sent under `mode`: it holds a block other than
+/// text or an image. opencode 1.18.25 turns a `resource` (and a
+/// `resource_link` that is not a file) into text, which joins a command's
+/// arguments or even starts a command, and Octet reads only text blocks
+/// (see `slash_command`). `None` when it holds none, or `mode` lets
+/// opencode decide. Octet itself sends only text and images.
+fn blocks_refusal(prompt: &[Value], mode: Mode) -> Option<String> {
+    if !matches!(mode, Mode::Ask | Mode::AcceptEdits) {
+        return None;
+    }
+    let kind = prompt
+        .iter()
+        .map(|block| block["type"].as_str().unwrap_or("untyped"))
+        .find(|kind| !matches!(*kind, "text" | "image"))?;
+    Some(format!(
+        "The prompt holds a {} block, which opencode reads as text Octet cannot check; in {} Octet \
+         sends opencode only text and images, and did not send it",
+        short(kind),
+        mode.label()
+    ))
 }
 
 /// opencode's mark for a shell command that a command's text runs: each
@@ -1823,6 +1908,31 @@ mod tests {
         assert_eq!(skill_prompt("review", "src"), [text("/review src")]);
         assert_eq!(skill_prompt("review", ""), [text("/review")]);
         assert_eq!(skill_prompt("review", "  a b "), [text("/review   a b")]);
+    }
+
+    #[test]
+    fn blocks_opencode_reads_as_text_octet_cannot_check_are_refused_while_the_mode_asks() {
+        // opencode turns a `resource` (and a `resource_link` that is not a
+        // file) into text that joins a command's arguments, or starts one.
+        let text = json!({"type": "text", "text": "/x a"});
+        let image = json!({"type": "image", "mimeType": "image/png", "data": "AA"});
+        let resource =
+            json!({"type": "resource", "resource": {"uri": "file:///w/a", "text": "!`id`"}});
+        let link = json!({"type": "resource_link", "uri": "/review", "name": "r"});
+        for mode in [Mode::Ask, Mode::AcceptEdits] {
+            assert_eq!(blocks_refusal(&[text.clone(), image.clone()], mode), None);
+            for (block, kind) in [(&resource, "resource"), (&link, "resource_link")] {
+                let refusal = blocks_refusal(&[text.clone(), block.clone()], mode).unwrap();
+                assert!(refusal.contains(&format!("a {kind} block")), "{refusal}");
+                assert!(refusal.contains(mode.label()), "{refusal}");
+            }
+        }
+        for mode in [Mode::Auto, Mode::FullAccess] {
+            assert_eq!(
+                blocks_refusal(&[text.clone(), resource.clone()], mode),
+                None
+            );
+        }
     }
 
     #[test]

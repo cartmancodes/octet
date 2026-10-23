@@ -25,7 +25,10 @@ pub use image::{
     IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment, ImageError, check_inline, encoded_len,
 };
 pub use mode::Mode;
-pub use opencode::opencode_stray_reply;
+pub use opencode::{
+    OPENCODE_VERIFIED_VERSIONS, opencode_built_in_commands, opencode_command_expansion,
+    opencode_stray_reply,
+};
 
 /// The longest prompt, in bytes, a user may type (or a command may send as
 /// its displayed text).
@@ -57,13 +60,14 @@ pub struct Limits {
     /// takes the bytes inline: a file swapped for a FIFO, or on a stalled
     /// mount, must not hold the session.
     pub image_read: Duration,
-    /// Reading a vendor's command definitions before a command is sent
-    /// (opencode's `opencode debug config` and `debug skill`), for a
-    /// provider that checks a command first.
+    /// Reading a vendor's command definitions, for a provider that checks a
+    /// command before it is sent (opencode's `opencode debug config` and
+    /// `debug skill`). The session goes on meanwhile; a command that needs
+    /// the reading waits for it.
     pub command_check: Duration,
     /// Silence in a turn after a subagent starts before Octet says it may
     /// be waiting for a permission the vendor never passes on (opencode in
-    /// `auto`).
+    /// `auto` and `full-access`).
     pub subagent_quiet: Duration,
 }
 impl Default for Limits {

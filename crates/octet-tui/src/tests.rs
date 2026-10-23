@@ -573,6 +573,38 @@ fn an_opencode_command_after_a_switch_leaves_the_handoff_for_the_next_prompt() {
     assert!(app.pending_handoff.is_none());
 }
 #[test]
+fn the_handoff_waits_for_the_next_prompt_saying_so_once() {
+    // Several opencode commands after a switch: the note that the earlier
+    // conversation waits comes with the first only.
+    let mut app = switched_to_codex();
+    app.conn.engine = Engine::OPENCODE;
+    let vendor = RecordingVendor::default();
+    for name in ["review", "init", "review"] {
+        app.begin_turn(
+            &vendor,
+            Command::Skill {
+                name: name.into(),
+                path: None,
+                args: String::new(),
+                display: format!("/{name}"),
+                context: None,
+            },
+            By::User,
+            "sending",
+        )
+        .unwrap();
+        crate::test_support::idle(&mut app);
+    }
+    let text = app.entries_text();
+    assert_eq!(
+        text.matches("The earlier conversation goes with your next prompt")
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(app.pending_handoff.is_some());
+}
+#[test]
 fn a_refused_send_keeps_the_handoff() {
     let mut app = switched_to_codex();
     let vendor = RecordingVendor::default();

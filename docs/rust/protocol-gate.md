@@ -63,6 +63,7 @@ characters).
 | `failure` | A turn the vendor fails | no | yes | no |
 | `lockdown` | A project config and a user rule cannot bypass `ask` | no | no | yes |
 | `subagent` | A subagent (opencode's `task` tool) cannot bypass `ask` | no | no | yes |
+| `command-expansion` | Octet's emulation of how opencode expands a command | no | no | yes |
 
 opencode's `resume` and `fork` reopen the session in a second process, as
 `--resume` does, and ask which word it replied with: the reopened session,
@@ -87,6 +88,37 @@ that runs without a permission request, fails it. A command the model asks
 for itself is rejected. In every opencode scenario a completed `task` call
 fails the run. Against opencode 1.18.25 with `task` allowed, the subagent
 ran `echo fixture` with no permission request, and this scenario failed.
+
+`command-expansion` checks what Octet's command check assumes of opencode
+(`crates/octet-engine/src/live/opencode/commands.rs`). Its user rule (through
+`OPENCODE_CONFIG`) defines six throwaway commands whose templates and
+arguments cover a template's own `` !`cmd` ``, `$1` alone and with a quoted
+word, `$ARGUMENTS` with JavaScript's `` $' `` pattern, arguments appended to
+a template that takes none, and the highest `$N` taking every word from there
+on. Each shell command touches a marker in the workspace's `marks` folder.
+The gate sends each command as Octet does, in opencode's `build` agent with
+Octet's launch environment, so opencode runs the shell first, and cancels
+each turn as soon as it shows life, before the model does anything. It
+passes only if the markers left are exactly those Octet's emulation
+(`octet_engine::live::opencode_command_expansion`) predicts, and opencode
+lists its built-in commands with the descriptions Octet's check knows (a
+drift signal). The evidence's `expansion` holds the version opencode
+reported, whether Octet lists it as verified, and the predicted and actual
+markers. No model output is involved, so the result is deterministic.
+
+### Verifying a new opencode version
+
+Octet's command check holds only for the opencode versions in
+`VERIFIED_VERSIONS` (`opencode/commands.rs`); on any other, Octet runs no
+command or skill in `ask` and `accept-edits`. When opencode updates:
+
+1. Read the new version's `Command.state`, `SessionPrompt.command` and
+   `ACP.prompt` (and how often it lists commands) against `commands.rs` and
+   `slash_command` in `opencode.rs`; change the emulation where they differ.
+2. Run `command-expansion`, `lockdown` and `subagent` against it, and the
+   offline tests (`make rust-check`). All must pass.
+3. Add the version to `VERIFIED_VERSIONS`, with the gate evidence in the
+   commit message.
 
 ## Result
 

@@ -6,26 +6,52 @@
 //! expanded text run in the shell first. Octet reads each definition as
 //! that opencode would (`opencode debug config` and `opencode debug skill`,
 //! with the session's launch environment, in its workspace), and refuses a
-//! command it cannot read or that would run any of those ways.
+//! command it cannot read or that would run any of those ways. opencode
+//! 1.18.25 loads its commands once per process and never reloads them, so
+//! Octet reads them once too, when opencode lists them, and not again after
+//! a turn that may have changed their files unasked.
 use super::{SHELL_MARK, agent, shell_refusal, subtask_refusal};
 use crate::live::{Config, Mode, short};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     ffi::OsString,
-    io::Read as _,
+    io::{Read as _, Seek as _},
     os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::oneshot, task::JoinHandle};
+
+/// The opencode versions Octet's check is verified against: their
+/// built-in commands (see `built_ins`), `command()` expansion (see
+/// `expand`), ACP prompt parsing (`slash_command`) and subtask rule are the
+/// ones emulated here. While the mode asks, an opencode reporting any other
+/// version (`agentInfo.version` in its `initialize` reply) runs no command.
+///
+/// To verify a new version: read its `Command.state`, `command()` and
+/// `ACP.prompt` against this file; run the protocol gate's opencode
+/// `command-expansion`, `lockdown` and `subagent` scenarios against it
+/// (`docs/rust/protocol-gate.md`), which must all pass; then add it here.
+pub const VERIFIED_VERSIONS: &[&str] = &["1.18.25"];
+
+/// The most characters of a reported version Octet shows.
+const MAX_VERSION: usize = 64;
 
 /// The most commands one reading keeps; the rest are unknown, so refused.
 const MAX_COMMANDS: usize = 4096;
 /// The most bytes one `opencode debug` output may have.
 const MAX_OUTPUT: u64 = 16 * 1024 * 1024;
+/// How often Octet looks at the size of `opencode debug`'s output while it
+/// runs.
+const OUTPUT_POLL: Duration = Duration::from_millis(50);
+/// How long a changed command list must stay unchanged before Octet reads
+/// it: each `opencode debug` run starts opencode, plugins included, and
+/// opencode may list its commands again within moments (as MCP servers
+/// connect one by one).
+const LIST_SETTLE: Duration = Duration::from_millis(200);
 /// The most bytes a command's expanded text may have before Octet stops
 /// expanding it and refuses the command (a `$'` in its arguments repeats
 /// the template).
@@ -69,6 +95,18 @@ fn built_ins() -> Book {
             ),
         ),
     ])
+}
+
+/// The built-in commands Octet's check knows, each name and the
+/// description opencode lists it with: what the protocol gate compares the
+/// running opencode's list with.
+pub fn built_in_descriptions() -> Vec<(String, String)> {
+    let mut built_ins: Vec<(String, String)> = built_ins()
+        .into_iter()
+        .map(|(name, definition)| (name, definition.description))
+        .collect();
+    built_ins.sort();
+    built_ins
 }
 
 /// The book from `opencode debug config`'s `config` and `opencode debug
@@ -223,8 +261,14 @@ pub(super) fn refusal(
             "/{shown}: its template runs shell commands (`!`…``) before opencode asks for any permission"
         ));
     }
-    let shell = expand(template, args).is_none_or(|text| text.contains(SHELL_MARK));
-    if shell {
+    let Some(expanded) = expand(template, args) else {
+        return refuse(format!(
+            "/{shown} with these arguments expands to more than {} MiB of text, too long for Octet to \
+             check",
+            MAX_EXPANDED >> 20
+        ));
+    };
+    if expanded.contains(SHELL_MARK) {
         return shell_refusal(name, SHELL_MARK, mode);
     }
     None
@@ -250,8 +294,8 @@ pub(super) fn js_space(c: char) -> bool {
 /// word of `args` (the highest by every word from there on), each
 /// `$ARGUMENTS` by `args` with JavaScript's replacement patterns, and
 /// `args` appended on a line of its own when the template takes none.
-/// `None` when it would be longer than [`MAX_EXPANDED`].
-pub(super) fn expand(template: &str, args: &str) -> Option<String> {
+/// `None` when it would be longer than Octet checks (4 MiB).
+pub fn expand(template: &str, args: &str) -> Option<String> {
     let words = words(args);
     // The template as text between `$N`s, each with the number after it.
     let mut pieces: Vec<(&str, Option<u128>)> = Vec::new();
@@ -374,34 +418,40 @@ fn image_word(chars: &[char], at: usize) -> Option<usize> {
 
 /// `text.replaceAll(pattern, replacement)` as JavaScript does it with a
 /// text pattern: `$$`, `$&`, `` $` `` and `$'` in `replacement` are a
-/// dollar, the match, and the text before and after it. `None` past
-/// [`MAX_EXPANDED`].
+/// dollar, the match, and the text before and after it. `None` as soon as
+/// the result would pass [`MAX_EXPANDED`]: every piece is counted before it
+/// is added, so the text never grows past the bound.
 fn replace_all(text: &str, pattern: &str, replacement: &str) -> Option<String> {
+    /// Adds `piece` to `out`, unless that would pass the bound.
+    fn add(out: &mut String, piece: &str) -> Option<()> {
+        (out.len() + piece.len() <= MAX_EXPANDED).then(|| out.push_str(piece))
+    }
     let mut out = String::new();
     let mut last = 0;
     for (at, _) in text.match_indices(pattern) {
-        out.push_str(&text[last..at]);
+        add(&mut out, &text[last..at])?;
         let after = at + pattern.len();
-        let mut chars = replacement.char_indices().peekable();
-        while let Some((_, c)) = chars.next() {
-            match (c, chars.peek().map(|&(_, next)| next)) {
-                ('$', Some('$')) => out.push('$'),
-                ('$', Some('&')) => out.push_str(pattern),
-                ('$', Some('`')) => out.push_str(&text[..at]),
-                ('$', Some('\'')) => out.push_str(&text[after..]),
+        let mut rest = replacement;
+        while let Some(dollar) = rest.find('$') {
+            add(&mut out, &rest[..dollar])?;
+            let piece = match rest[dollar + 1..].chars().next() {
+                Some('$') => "$",
+                Some('&') => pattern,
+                Some('`') => &text[..at],
+                Some('\'') => &text[after..],
                 _ => {
-                    out.push(c);
+                    add(&mut out, "$")?;
+                    rest = &rest[dollar + 1..];
                     continue;
                 }
-            }
-            chars.next();
-            if out.len() > MAX_EXPANDED {
-                return None;
-            }
+            };
+            add(&mut out, piece)?;
+            rest = &rest[dollar + 2..];
         }
+        add(&mut out, rest)?;
         last = after;
     }
-    out.push_str(&text[last..]);
+    add(&mut out, &text[last..])?;
     Some(out)
 }
 
@@ -441,60 +491,109 @@ pub(super) async fn read(launch: Launch) -> Result<Book, String> {
         .map_err(|why| format!("opencode debug printed something else: {why}"))
 }
 
-/// A file `opencode debug` writes its output to, removed when dropped.
-/// opencode 1.18.25 exits before a pipe takes more than 64 KiB of its
-/// output, so its output goes to a file instead.
-struct Output(PathBuf);
-
-impl Drop for Output {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// A file for `opencode debug`'s output, with no name: opencode 1.18.25
+/// exits before a pipe takes more than 64 KiB of its output, so it writes to
+/// a file instead, and that output (the whole merged configuration,
+/// provider keys included) must be neither found by another program nor
+/// left behind, even when Octet is killed. The file is made `O_EXCL` and
+/// 0600, and its name removed at once; Octet and the child keep it open.
+fn unnamed_output(what: &str) -> std::io::Result<std::fs::File> {
+    /// Tells this process's output files apart.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "octet-opencode-{what}-{}-{n}.json",
+        std::process::id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
 }
 
 /// `opencode debug what`'s output, as JSON.
 async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
-    /// Tells this process's output files apart.
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let output = Output(std::env::temp_dir().join(format!(
-        "octet-opencode-{what}-{}-{n}.json",
-        std::process::id()
-    )));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&output.0)
-        .map_err(|error| {
-            format!("Octet could not make a file for opencode debug {what}: {error}")
-        })?;
-    let status = tokio::process::Command::new(&launch.binary)
+    let mut file = unnamed_output(what).map_err(|error| {
+        format!("Octet could not make a file for opencode debug {what}: {error}")
+    })?;
+    let stdout = file.try_clone().map_err(|error| {
+        format!("Octet could not make a file for opencode debug {what}: {error}")
+    })?;
+    let mut child = tokio::process::Command::new(&launch.binary)
         .args(["debug", what])
         .envs(launch.env.iter().cloned())
         .current_dir(&launch.cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(file))
+        .stdout(Stdio::from(stdout))
         .stderr(Stdio::null())
         .kill_on_drop(true)
-        .status()
-        .await
+        .spawn()
         .map_err(|error| format!("opencode debug {what} did not start: {error}"))?;
+    let too_much = || {
+        format!(
+            "opencode debug {what} printed more than {} MiB",
+            MAX_OUTPUT >> 20
+        )
+    };
+    // The bound holds while it runs: one that goes on printing is stopped
+    // (dropping the child kills it).
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status,
+            () = tokio::time::sleep(OUTPUT_POLL) => {
+                if file.metadata().is_ok_and(|output| output.len() > MAX_OUTPUT) {
+                    return Err(too_much());
+                }
+            }
+        }
+    }
+    .map_err(|error| format!("opencode debug {what} could not be waited for: {error}"))?;
     if !status.success() {
         return Err(format!("opencode debug {what} {status}"));
     }
     let mut text = String::new();
-    std::fs::File::open(&output.0)
-        .and_then(|file| file.take(MAX_OUTPUT + 1).read_to_string(&mut text))
+    file.seek(std::io::SeekFrom::Start(0))
+        .and_then(|_| file.take(MAX_OUTPUT + 1).read_to_string(&mut text))
         .map_err(|error| format!("opencode debug {what}'s output could not be read: {error}"))?;
     if text.len() as u64 > MAX_OUTPUT {
-        return Err(format!(
-            "opencode debug {what} printed more than {} MiB",
-            MAX_OUTPUT >> 20
-        ));
+        return Err(too_much());
     }
     serde_json::from_str(&text)
         .map_err(|error| format!("opencode debug {what} printed no JSON ({error})"))
+}
+
+/// What a command's check decided.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Verdict {
+    /// It may be sent.
+    Send,
+    /// It must not be sent, for this reason.
+    Refuse(String),
+    /// Octet is still reading the definitions it needs: the command waits
+    /// (see [`Commands::finished`]).
+    Wait,
+}
+
+/// Where Octet's reading of opencode's commands is.
+#[derive(Default)]
+enum Reading {
+    /// None has started.
+    #[default]
+    None,
+    /// One is under way: its task, killed with its `opencode debug`
+    /// processes when dropped, and where its result arrives.
+    Running {
+        /// The task that reads.
+        task: JoinHandle<()>,
+        /// Its result, once it has one.
+        result: oneshot::Receiver<Result<Book, String>>,
+    },
+    /// It is done.
+    Done(Result<Book, String>),
 }
 
 /// The commands opencode lists, and what Octet read of them.
@@ -503,10 +602,27 @@ pub(super) struct Commands {
     /// The commands opencode last listed: each name and description,
     /// bounded.
     listed: Vec<(String, String)>,
-    /// What Octet read for the current list.
-    book: Option<Book>,
-    /// The reading under way.
-    reading: Option<JoinHandle<Result<Book, String>>>,
+    /// The reading for the current list.
+    reading: Reading,
+    /// A reading that failed has been tried again since the list changed.
+    retried: bool,
+    /// The mode of a turn sent since opencode listed its commands in which
+    /// opencode edits files without asking. opencode 1.18.25 loads its
+    /// commands once per process and never reloads them, so after such a
+    /// turn their files may no longer be what opencode runs: Octet does not
+    /// read them again.
+    edited: Option<Mode>,
+    /// Such a turn was sent while the reading under way ran, so what it
+    /// reads may not be what opencode loaded.
+    tainted: Option<Mode>,
+    /// What Octet says when opencode reported a version not in
+    /// [`VERIFIED_VERSIONS`]: then no command is sent while the mode asks.
+    unverified: Option<String>,
+}
+
+/// Whether opencode edits files without asking in `mode`.
+fn edits_unasked(mode: Mode) -> bool {
+    !matches!(mode, Mode::Ask)
 }
 
 impl Drop for Commands {
@@ -516,10 +632,42 @@ impl Drop for Commands {
 }
 
 impl Commands {
+    /// opencode's `initialize` reply reported `version` (`None`: none). The
+    /// notice to show when it is not one Octet's check is verified against.
+    pub(super) fn reported(&mut self, version: Option<&str>) -> Option<String> {
+        if version.is_some_and(|version| VERIFIED_VERSIONS.contains(&version)) {
+            self.unverified = None;
+            return None;
+        }
+        let shown = version.map_or_else(
+            || "(version not reported)".to_owned(),
+            |version| {
+                version
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(MAX_VERSION)
+                    .collect()
+            },
+        );
+        self.unverified = Some(format!(
+            "opencode {shown} is not verified for Octet's command check; commands are off in ask and \
+             accept-edits — plain prompts work; /mode auto runs them under opencode's own settings"
+        ));
+        self.unverified.clone()
+    }
+
     /// opencode listed `list` (`availableCommands`). A list that differs
-    /// from the last drops what was read; with `launch`, a reading of the
-    /// new list starts.
-    pub(super) fn listed(&mut self, list: &Value, launch: Option<Launch>) {
+    /// from the last drops what was read, and a reading of the new list
+    /// starts with `launch`, for at most `limit`. `running` is the mode of
+    /// the turn running meanwhile, if any: one that edits unasked leaves
+    /// the reading untrusted.
+    pub(super) fn listed(
+        &mut self,
+        list: &Value,
+        launch: Launch,
+        limit: Duration,
+        running: Option<Mode>,
+    ) {
         let listed: Vec<(String, String)> = list
             .as_array()
             .into_iter()
@@ -536,73 +684,161 @@ impl Commands {
             })
             .take(MAX_COMMANDS)
             .collect();
-        if listed == self.listed && (self.book.is_some() || self.reading.is_some()) {
+        if listed == self.listed && !matches!(self.reading, Reading::None) {
             return;
         }
         self.listed = listed;
-        self.book = None;
-        self.stop_reading();
-        if let Some(launch) = launch {
-            self.reading = Some(tokio::spawn(read(launch)));
+        self.retried = false;
+        self.start(launch, limit, LIST_SETTLE);
+        self.edited = running.filter(|mode| edits_unasked(*mode));
+        self.tainted = self.edited;
+    }
+
+    /// A turn is being sent in `mode` (see `edited` and `tainted`).
+    pub(super) fn turn_sent(&mut self, mode: Mode) {
+        if !edits_unasked(mode) {
+            return;
+        }
+        self.edited = Some(mode);
+        if self.reading() {
+            self.tainted = Some(mode);
         }
     }
 
-    /// Why `name` cannot be sent with `args` under `mode` (see
-    /// [`refusal`]), reading the commands first when nothing read is at
-    /// hand, for at most `limit`.
-    pub(super) async fn check(
+    /// Whether `name` may be sent with `args` under `mode` (see
+    /// [`refusal`]). A command that needs a reading not yet at hand waits;
+    /// one starts with `launch`, for at most `limit`, when none is under
+    /// way, and a reading that failed is tried once more, unless a turn
+    /// may have changed the files since opencode loaded them. An opencode
+    /// of a version the check is not verified against sends none (see
+    /// [`Commands::reported`]). `compact`, when
+    /// opencode lists no command of that name, is its own summary and
+    /// needs none.
+    pub(super) fn verdict(
         &mut self,
         launch: Launch,
         limit: Duration,
         name: &str,
         args: &str,
         mode: Mode,
-    ) -> Option<String> {
+    ) -> Verdict {
         if !matches!(mode, Mode::Ask | Mode::AcceptEdits) {
-            return None;
-        }
-        if self.book.is_none() {
-            let mut reading = self
-                .reading
-                .take()
-                .unwrap_or_else(|| tokio::spawn(read(launch)));
-            let read = match tokio::time::timeout(limit, &mut reading).await {
-                Ok(Ok(read)) => read,
-                Ok(Err(error)) => Err(format!("the reading stopped: {error}")),
-                Err(_) => {
-                    reading.abort();
-                    Err(format!(
-                        "opencode debug took longer than {}",
-                        crate::live::driver::seconds(limit)
-                    ))
-                }
-            };
-            match read {
-                Ok(book) => self.book = Some(book),
-                Err(why) => {
-                    return Some(format!(
-                        "Octet could not read opencode's commands ({why}), so it cannot check /{}; in {} \
-                         Octet sends only commands it has checked, and did not send it. In auto, opencode's \
-                         own permission settings decide",
-                        short(name),
-                        mode.label()
-                    ));
-                }
-            }
+            return Verdict::Send;
         }
         let listed = self
             .listed
             .iter()
             .find(|(listed, _)| listed == name)
-            .map(|(_, description)| description.as_str());
-        refusal(self.book.as_ref()?, listed, name, args, mode)
+            .map(|(_, description)| description.clone());
+        if name == "compact" && listed.is_none() {
+            return Verdict::Send;
+        }
+        if let Some(unverified) = &self.unverified {
+            return Verdict::Refuse(format!("Octet did not send /{}: {unverified}", short(name)));
+        }
+        self.poll();
+        match &self.reading {
+            Reading::Running { .. } => Verdict::Wait,
+            Reading::Done(Ok(book)) => refusal(book, listed.as_deref(), name, args, mode)
+                .map_or(Verdict::Send, Verdict::Refuse),
+            Reading::Done(Err(_)) | Reading::None if !self.retried && self.edited.is_none() => {
+                self.retried = true;
+                self.start(launch, limit, Duration::ZERO);
+                Verdict::Wait
+            }
+            Reading::Done(Err(why)) => Verdict::Refuse(self.unread(why, name, mode)),
+            Reading::None => Verdict::Refuse(self.unread("none was made in time", name, mode)),
+        }
+    }
+
+    /// Why `name` cannot be sent under `mode` when Octet could not read
+    /// opencode's commands, `why`.
+    fn unread(&self, why: &str, name: &str, mode: Mode) -> String {
+        let again = self.edited.map_or_else(String::new, |edited| {
+            format!(
+                " A turn has run in {} since opencode loaded its commands, which opencode does not \
+                 load again, so Octet does not read them again either; /reconnect starts opencode \
+                 afresh.",
+                edited.label()
+            )
+        });
+        format!(
+            "Octet could not read opencode's commands ({why}), so it cannot check /{}; in {} \
+             Octet sends only commands it has checked, and did not send it. In auto, opencode's \
+             own permission settings decide.{again}",
+            short(name),
+            mode.label()
+        )
+    }
+
+    /// Whether a reading is under way.
+    pub(super) fn reading(&mut self) -> bool {
+        self.poll();
+        matches!(self.reading, Reading::Running { .. })
+    }
+
+    /// Resolves once the reading under way is done; never while none is.
+    pub(super) async fn finished(&mut self) {
+        let Reading::Running { result, .. } = &mut self.reading else {
+            return std::future::pending().await;
+        };
+        let read = result
+            .await
+            .unwrap_or_else(|_| Err("the reading stopped".to_owned()));
+        self.land(read);
+    }
+
+    /// Keeps the result `read` of the reading under way, which a turn sent
+    /// meanwhile leaves untrusted.
+    fn land(&mut self, read: Result<Book, String>) {
+        let read = match self.tainted.take() {
+            Some(mode) if read.is_ok() => Err(format!(
+                "a turn ran in {} while Octet read them, so they may not be what opencode loaded",
+                mode.label()
+            )),
+            _ => read,
+        };
+        self.reading = Reading::Done(read);
+    }
+
+    /// Takes the result of a reading that has one.
+    fn poll(&mut self) {
+        if let Reading::Running { result, .. } = &mut self.reading {
+            match result.try_recv() {
+                Ok(read) => self.land(read),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.land(Err("the reading stopped".to_owned()));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    /// Starts a reading with `launch`, for at most `limit`, in place of
+    /// any under way, once `settle` has passed without another.
+    fn start(&mut self, launch: Launch, limit: Duration, settle: Duration) {
+        self.stop_reading();
+        let (sender, result) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(settle).await;
+            let read = tokio::time::timeout(limit, read(launch))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!(
+                        "opencode debug took longer than {}",
+                        crate::live::driver::seconds(limit)
+                    ))
+                });
+            let _ = sender.send(read);
+        });
+        self.reading = Reading::Running { task, result };
     }
 
     /// Stops the reading under way, if any; its `opencode debug` processes
     /// are killed with it.
     fn stop_reading(&mut self) {
-        if let Some(reading) = self.reading.take() {
-            reading.abort();
+        if let Reading::Running { task, .. } = std::mem::take(&mut self.reading) {
+            task.abort();
         }
     }
 }
@@ -611,6 +847,52 @@ impl Commands {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// How Octet would start the scripted `opencode` `body` (a shell
+    /// script), in a folder of its own that lives as long as the guard.
+    fn scripted(name: &str, body: &str) -> (octet_testkit::TempDir, Launch) {
+        let dir = octet_testkit::TempDir::new(name);
+        let binary = octet_testkit::write_script(dir.path(), "opencode", body);
+        let launch = Launch {
+            binary,
+            cwd: dir.path().to_path_buf(),
+            env: Vec::new(),
+        };
+        (dir, launch)
+    }
+
+    #[tokio::test]
+    async fn opencode_debug_is_stopped_once_it_prints_too_much() {
+        // It goes on running after passing the bound; Octet stops it then,
+        // not when it exits.
+        let (_dir, launch) = scripted(
+            "octet-debug-too-much",
+            "head -c 17000000 /dev/zero; exec sleep 30",
+        );
+        let started = std::time::Instant::now();
+        let error = debug_json(&launch, "config").await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(error, "opencode debug config printed more than 16 MiB");
+    }
+
+    #[tokio::test]
+    async fn the_debug_output_has_no_name_while_opencode_writes_it() {
+        // It holds the whole merged configuration, provider keys included:
+        // nothing else should find it, and nothing should outlive Octet.
+        // The script counts the files named as Octet names its output.
+        let (_dir, launch) = scripted(
+            "octet-debug-unnamed",
+            "n=$(ls \"${TMPDIR:-/tmp}\" | grep -c \"^octet-opencode-$2-$PPID-\")\n\
+             if [ \"$2\" = config ]; then echo \"{\\\"command\\\":{\\\"probe\\\":{\\\"template\\\":\\\"$n\\\"}}}\"; \
+             else echo '[]'; fi",
+        );
+        let book = read(launch).await.unwrap();
+        assert_eq!(book["probe"].template.as_deref(), Some("0"));
+    }
 
     /// A book of `commands` (a `command` map) and `skills`.
     fn book(commands: &Value, skills: &Value) -> Book {
@@ -680,6 +962,34 @@ mod tests {
             expand("<$ARGUMENTS>", "$$ $& $` $'").unwrap(),
             "<$ $ARGUMENTS < >>"
         );
+    }
+
+    #[test]
+    fn a_replacement_stops_once_its_text_is_too_long() {
+        // Many matches of a long replacement with no pattern in it: plain
+        // text alone passes the bound.
+        let text = "$ARGUMENTS".repeat(2048);
+        let replacement = "a".repeat(4096);
+        assert_eq!(replace_all(&text, "$ARGUMENTS", &replacement), None);
+        // Text between the matches counts too.
+        let text = format!("{}$ARGUMENTS", "t".repeat(MAX_EXPANDED + 1));
+        assert_eq!(replace_all(&text, "$ARGUMENTS", "x"), None);
+        assert_eq!(
+            replace_all("a$ARGUMENTSb", "$ARGUMENTS", "$$").as_deref(),
+            Some("a$b")
+        );
+    }
+
+    #[test]
+    fn a_command_too_long_to_expand_is_refused_for_its_length() {
+        let read = book(
+            &json!({"long": {"template": "$ARGUMENTS".repeat(2048)}}),
+            &json!([]),
+        );
+        let refusal = refusal(&read, None, "long", &"a".repeat(4096), Mode::Ask).unwrap();
+        assert!(refusal.contains("too long for Octet to check"), "{refusal}");
+        assert!(!refusal.contains("shell"), "{refusal}");
+        assert!(refusal.contains("ask"), "{refusal}");
     }
 
     #[test]

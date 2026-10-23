@@ -2804,7 +2804,7 @@ async fn opencode_agent_refusal(opened: serde_json::Value, reply: serde_json::Va
         .unwrap()
         .extend(reply.as_object().unwrap().clone());
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": [opened]}}),
         third,
     ];
@@ -3601,7 +3601,7 @@ async fn opencode_effort_default_after_a_bare_confirmation_goes_back() {
         "options": [{"value": "low"}, {"value": "high"}]}]);
     // opencode confirms `high` without reporting its options again.
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": options}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
         json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
@@ -3634,7 +3634,7 @@ async fn opencode_effort_default_with_unknown_levels_is_not_claimed() {
     use serde_json::json;
     // opencode never reports its options: the levels stay unknown.
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
         json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
@@ -3727,7 +3727,7 @@ async fn opencode_effort_refused_at_connect_is_reported_and_the_session_goes_on(
     use serde_json::json;
     // No options reported, so the level is sent; opencode refuses it.
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
         json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32602, "message": "Invalid params: effort not found: high"}}),
         json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
@@ -3903,7 +3903,7 @@ async fn opencode_switching_then(reply: serde_json::Value, delay: &str, after: &
         .unwrap()
         .extend(reply.as_object().unwrap().clone());
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": mode("build")}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {"configOptions": mode("octet-ask")}}),
     ];
@@ -3987,7 +3987,7 @@ async fn opencode_unconfirmed_switch_times_out_then_applies_a_late_confirmation(
 async fn opencode_refuses_a_switch_while_eight_wait_for_confirmation() {
     use serde_json::json;
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
     ];
@@ -4056,7 +4056,7 @@ async fn opencode_permission_outside_a_turn_is_rejected_with_a_notice() {
     std::fs::create_dir_all(dir.path()).unwrap();
     let reply_file = dir.path().join("reply");
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": []}}),
     ];
     let mut body = String::new();
@@ -4461,7 +4461,7 @@ fn opencode_without_commands() -> (octet_testkit::TempDir, Config) {
         {"id": "mode", "currentValue": "build", "options": [{"value": "build", "name": "build"}]},
     ]);
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": options}}),
         json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
     ];
@@ -4524,7 +4524,7 @@ async fn opencode_probe_that_fails_still_deletes_its_session() {
     use serde_json::json;
     // opencode opens the session, then exits before listing anything.
     let frames = [
-        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
     ];
     let mut body = String::from("if [ \"$1\" = session ]; then touch \"deleted-$3\"; exit 0; fi\n");
@@ -4816,42 +4816,486 @@ async fn opencodes_commands_are_read_once_and_again_when_the_list_changes() {
     stop(&handle, task).await;
 }
 #[tokio::test]
-async fn a_quiet_opencode_subagent_in_auto_gets_a_notice() {
-    // In auto, a subagent whose own settings ask waits for a permission
-    // opencode never passes on: once the turn goes quiet, Octet says so.
+async fn a_quiet_opencode_subagent_gets_a_notice_where_opencode_decides() {
+    // In auto and full access, a subagent whose own settings ask waits for
+    // a permission opencode never passes on: once the turn goes quiet,
+    // Octet says so, without claiming it is stuck.
+    for mode in [Mode::Auto, Mode::FullAccess] {
+        let mut c = opencode();
+        c.mode = mode;
+        let limits = Limits {
+            subagent_quiet: Duration::from_millis(300),
+            ..Limits::default()
+        };
+        let (handle, mut events, task) = spawn_with_limits(c, limits);
+        wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+        handle
+            .send(opencode_skill(scenario::OPENCODE_SUBTASK, ""))
+            .unwrap();
+        let notice = timeout(
+            Duration::from_secs(3),
+            wait_for(&mut events, |e| {
+                matches!(e, Event::Notice(_) | Event::Finished { .. })
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{mode:?}: no notice"));
+        match notice {
+            Event::Notice(notice) => assert_eq!(
+                notice,
+                "opencode's subagent has gone quiet: it may still be working, or waiting for a \
+                 permission Octet cannot show; Esc cancels",
+                "{mode:?}"
+            ),
+            other => panic!("{mode:?}: {other:?}"),
+        }
+        // Once is enough.
+        let again = timeout(Duration::from_millis(800), async {
+            loop {
+                if let Event::Notice(_) | Event::Finished { .. } = next(&mut events).await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(again.is_err(), "another notice, or the turn ended");
+        handle.interrupt();
+        wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+        stop(&handle, task).await;
+    }
+}
+/// A session in `mode` working in `dir`, ready.
+async fn opencode_session_in(
+    dir: &octet_testkit::TempDir,
+    mode: Mode,
+    limits: Limits,
+) -> (
+    octet_engine::live::Handle,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<()>,
+) {
     let mut c = opencode();
-    c.mode = Mode::Auto;
-    let limits = Limits {
-        subagent_quiet: Duration::from_millis(300),
-        ..Limits::default()
-    };
+    c.mode = mode;
+    c.cwd = dir.path().to_path_buf();
     let (handle, mut events, task) = spawn_with_limits(c, limits);
     wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    (handle, events, task)
+}
+/// What Octet says while a command waits for its check.
+fn checking(name: &str) -> String {
+    format!("Checking /{name} against opencode's definitions…")
+}
+#[tokio::test]
+async fn esc_while_an_opencode_command_waits_for_its_check_cancels_at_once() {
+    // The reading never ends; the session must not wait for it.
+    let dir = opencode_workspace(
+        "octet-opencode-check-esc",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
     handle
-        .send(opencode_skill(scenario::OPENCODE_SUBTASK, ""))
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
         .unwrap();
-    let notice = wait_for(&mut events, |e| {
-        matches!(e, Event::Notice(_) | Event::Finished { .. })
-    })
-    .await;
-    match notice {
-        Event::Notice(notice) => assert_eq!(
-            notice,
-            "opencode's subagent may be waiting for a permission Octet cannot show; Esc cancels"
+    let notice = checking(scenario::OPENCODE_SKILL);
+    timeout(
+        Duration::from_secs(5),
+        wait_for(
+            &mut events,
+            |e| matches!(e, Event::Notice(n) if *n == notice),
         ),
-        other => panic!("{other:?}"),
-    }
-    // Once is enough.
-    let again = timeout(Duration::from_millis(800), async {
-        loop {
-            if let Event::Notice(_) | Event::Finished { .. } = next(&mut events).await {
-                break;
+    )
+    .await
+    .expect("no notice that the command waits for its check");
+    let cancelled = tokio::time::Instant::now();
+    handle.interrupt();
+    let finished = timeout(
+        Duration::from_secs(25),
+        wait_for(&mut events, |e| matches!(e, Event::Finished { .. })),
+    )
+    .await
+    .expect("the turn never ended");
+    let took = cancelled.elapsed();
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Interrupted
             }
+        ),
+        "{finished:?} after {took:?}"
+    );
+    assert!(took < Duration::from_millis(500), "Esc took {took:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn quitting_while_an_opencode_command_waits_for_its_check_stops_at_once() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-quit",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let notice = checking(scenario::OPENCODE_SKILL);
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Notice(n) if *n == notice),
+    )
+    .await;
+    let quit = tokio::time::Instant::now();
+    stop(&handle, task).await;
+    assert!(
+        quit.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        quit.elapsed()
+    );
+}
+#[tokio::test]
+async fn opencodes_frames_keep_coming_while_a_command_waits_for_its_check() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-frames",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    std::fs::write(dir.path().join("ticks"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let notice = checking(scenario::OPENCODE_SKILL);
+    timeout(
+        Duration::from_secs(5),
+        wait_for(
+            &mut events,
+            |e| matches!(e, Event::Notice(n) if *n == notice),
+        ),
+    )
+    .await
+    .expect("no notice that the command waits for its check");
+    // The fake lists its commands every 100 ms.
+    for _ in 0..3 {
+        timeout(
+            Duration::from_secs(1),
+            wait_for(&mut events, |e| matches!(e, Event::Skills(_))),
+        )
+        .await
+        .expect("opencode's frames stopped while the command waited");
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencodes_commands_are_read_when_it_lists_them_in_every_mode() {
+    for mode in [Mode::Auto, Mode::FullAccess] {
+        let dir = opencode_workspace(
+            "octet-opencode-read-at-connect",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+        );
+        let (handle, _events, task) = opencode_session_in(&dir, mode, Limits::default()).await;
+        let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !calls().contains("config") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{mode:?}: no reading: {:?}", calls()));
+        stop(&handle, task).await;
+    }
+}
+#[tokio::test]
+async fn a_reading_that_failed_in_the_background_is_tried_again_once() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-retry",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-fails"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    let configs = || calls().matches("config").count();
+    timeout(Duration::from_secs(5), async {
+        while configs() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await;
-    assert!(again.is_err(), "another notice, or the turn ended");
-    handle.interrupt();
-    wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    .await
+    .expect("no reading at connect");
+    // The background reading failed; one that works now is used.
+    std::fs::remove_file(dir.path().join("debug-fails")).unwrap();
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{} go", scenario::OPENCODE_SKILL)
+    );
+    assert_eq!(configs(), 2, "{}", calls());
     stop(&handle, task).await;
+}
+#[tokio::test]
+async fn compact_does_not_wait_for_a_reading_when_no_command_is_named_compact() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-compact",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle.send(Command::Compact).unwrap();
+    assert_eq!(turn_text(&mut events).await, "/compact");
+    stop(&handle, task).await;
+}
+/// The fixture skill's definition, as `debug config` shows it, running
+/// `template`.
+fn fixture_skill_running(template: &str) -> serde_json::Value {
+    serde_json::json!({scenario::OPENCODE_SKILL: {
+        "description": "An opencode fixture skill", "template": template}})
+}
+/// Switches the session to `mode` and waits for the switch.
+async fn switch_to(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+    mode: Mode,
+) {
+    handle.send(Command::SetMode(mode)).unwrap();
+    wait_for(events, |e| matches!(e, Event::ModeChanged(m) if *m == mode)).await;
+}
+/// The error and outcome of the turn `command` starts, and its text.
+async fn turn_end(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+    command: Command,
+) -> (Option<String>, Outcome, String) {
+    handle.send(command).unwrap();
+    let (mut error, mut text) = (None, String::new());
+    let outcome = loop {
+        match next(events).await {
+            Event::Error(message) => error = Some(message),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { outcome } => break outcome,
+            _ => {}
+        }
+    };
+    (error, outcome, text)
+}
+#[tokio::test]
+async fn opencodes_commands_are_not_read_again_once_a_turn_may_have_changed_them() {
+    // opencode 1.18.25 loads its commands once per process and runs that
+    // copy whatever its files say later. When the first reading failed and
+    // a turn has since run in auto, the files may no longer be what
+    // opencode loaded: here the model "rewrote" a command that runs shell
+    // into a harmless one. Octet must not read the new text and send it.
+    let dir = opencode_workspace(
+        "octet-opencode-no-reread",
+        &fixture_skill_running("Run !`touch pwned`"),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-fails"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Auto, Limits::default()).await;
+    let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    timeout(Duration::from_secs(5), async {
+        while !calls().contains("config") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no reading at connect");
+    let (error, _, _) = turn_end(&handle, &mut events, Command::Prompt("hello".into())).await;
+    assert_eq!(error, None);
+    std::fs::write(
+        dir.path().join("fixture-commands.json"),
+        fixture_skill_running("Say $ARGUMENTS").to_string(),
+    )
+    .unwrap();
+    std::fs::remove_file(dir.path().join("debug-fails")).unwrap();
+    switch_to(&handle, &mut events, Mode::Ask).await;
+    let (error, outcome, text) = turn_end(
+        &handle,
+        &mut events,
+        opencode_skill(scenario::OPENCODE_SKILL, "go"),
+    )
+    .await;
+    let error = error.expect("the command was sent");
+    assert!(
+        error.contains("could not read opencode's commands"),
+        "{error}"
+    );
+    assert!(error.contains("/reconnect"), "{error}");
+    assert_eq!((outcome, text.as_str()), (Outcome::Failed, ""));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn a_reading_made_while_a_turn_ran_unasked_is_not_trusted() {
+    // A turn in auto that edits a command while Octet reads them leaves a
+    // book that may differ from what opencode loaded.
+    let dir = opencode_workspace(
+        "octet-opencode-tainted",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-delay-ms"), "1500").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Auto, Limits::default()).await;
+    let (error, _, _) = turn_end(&handle, &mut events, Command::Prompt("hello".into())).await;
+    assert_eq!(error, None);
+    switch_to(&handle, &mut events, Mode::Ask).await;
+    let (error, outcome, text) = turn_end(
+        &handle,
+        &mut events,
+        opencode_skill(scenario::OPENCODE_SKILL, "go"),
+    )
+    .await;
+    let error = error.expect("the command was sent");
+    assert!(error.contains("while Octet read them"), "{error}");
+    assert_eq!((outcome, text.as_str()), (Outcome::Failed, ""));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn a_turn_that_asks_during_the_reading_leaves_it_trusted() {
+    // In ask, opencode asks before every edit, so the reading still holds.
+    let dir = opencode_workspace(
+        "octet-opencode-untainted",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-delay-ms"), "1500").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    let (error, _, _) = turn_end(&handle, &mut events, Command::Prompt("hello".into())).await;
+    assert_eq!(error, None);
+    let (error, outcome, text) = turn_end(
+        &handle,
+        &mut events,
+        opencode_skill(scenario::OPENCODE_SKILL, "go"),
+    )
+    .await;
+    assert_eq!((error, outcome), (None, Outcome::Completed));
+    assert_eq!(text, format!("/{} go", scenario::OPENCODE_SKILL));
+    stop(&handle, task).await;
+}
+/// What Octet says of an opencode `version` its command check is not
+/// verified against.
+fn unverified(version: &str) -> String {
+    format!(
+        "opencode {version} is not verified for Octet's command check; commands are off in ask and \
+         accept-edits — plain prompts work; /mode auto runs them under opencode's own settings"
+    )
+}
+#[tokio::test]
+async fn an_unverified_opencode_runs_no_command_while_the_mode_asks() {
+    // The check emulates opencode 1.18.25's internals; another version may
+    // run a command otherwise.
+    for (reported, shown) in [("1.99.0", "1.99.0"), ("none", "(version not reported)")] {
+        let dir = opencode_workspace(
+            "octet-opencode-unverified",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+        );
+        std::fs::write(dir.path().join("fixture-version"), reported).unwrap();
+        let mut c = opencode();
+        c.mode = Mode::Ask;
+        c.cwd = dir.path().to_path_buf();
+        let (handle, mut events, task) = spawn(c);
+        let mut notices = Vec::new();
+        loop {
+            match next(&mut events).await {
+                Event::Notice(notice) => notices.push(notice),
+                Event::Ready { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(notices, [unverified(shown)], "at connect");
+        for command in [
+            opencode_skill(scenario::OPENCODE_SKILL, "go"),
+            Command::Prompt("/init".into()),
+        ] {
+            let (error, outcome, text) = turn_end(&handle, &mut events, command).await;
+            let error = error.expect("the command was sent");
+            assert!(error.ends_with(&unverified(shown)), "{error}");
+            assert_eq!((outcome, text.as_str()), (Outcome::Failed, ""));
+        }
+        // Plain prompts work, and so does opencode's own summary.
+        let (error, outcome, _) =
+            turn_end(&handle, &mut events, Command::Prompt("hello".into())).await;
+        assert_eq!((error, outcome), (None, Outcome::Completed));
+        let (error, outcome, _) = turn_end(&handle, &mut events, Command::Compact).await;
+        assert_eq!((error, outcome), (None, Outcome::Completed));
+        // In auto, opencode's own settings decide.
+        switch_to(&handle, &mut events, Mode::Auto).await;
+        let (error, outcome, text) = turn_end(
+            &handle,
+            &mut events,
+            opencode_skill(scenario::OPENCODE_SKILL, "go"),
+        )
+        .await;
+        assert_eq!((error, outcome), (None, Outcome::Completed));
+        assert_eq!(text, format!("/{} go", scenario::OPENCODE_SKILL));
+        stop(&handle, task).await;
+    }
+}
+#[tokio::test]
+async fn a_verified_opencode_says_nothing_of_its_version() {
+    let (handle, mut events, task) = spawn(opencode());
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => panic!("{notice}"),
+            Event::Ready { .. } => break,
+            _ => {}
+        }
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn lists_that_change_in_a_burst_are_read_once() {
+    // Each `opencode debug` run starts opencode, plugins included; lists
+    // that change within moments of each other need one reading.
+    let dir = opencode_workspace(
+        "octet-opencode-burst",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("relist-burst"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let calls = std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    assert_eq!(calls.matches("config").count(), 1, "{calls}");
+    // The reading is of the last list.
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{} go", scenario::OPENCODE_SKILL)
+    );
+    stop(&handle, task).await;
+}
+#[test]
+fn the_fake_opencode_counts_every_debug_run_though_they_run_at_once() {
+    // Octet runs `debug config` and `debug skill` side by side; the fake's
+    // count of them must not lose one to the other.
+    let dir = opencode_workspace(
+        "octet-fake-debug-calls",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    let runs: Vec<_> = (0..16)
+        .map(|n| {
+            std::process::Command::new(octet_testkit::protocol_child())
+                .args(["debug", if n % 2 == 0 { "config" } else { "skill" }])
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut run in runs {
+        assert!(run.wait().unwrap().success());
+    }
+    let calls = std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    assert_eq!(calls.lines().count(), 16, "{calls}");
 }
