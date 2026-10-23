@@ -424,7 +424,10 @@ Claude Code and Codex CLIs.
   most 2 s; past that the reading under way runs to its end, and if the
   list changed meanwhile the command is refused with that reason.
 - `opencode debug`'s output file had a name while it was written, and no
-  size limit; it is now unnamed until read, and stopped past 16 MiB.
+  size limit; it is now unnamed until read, and stopped past 16 MiB. It
+  was stopped by its pid alone, so a process it started (a plugin's)
+  outlived it; it now runs in a process group of its own, killed whole
+  when it ends or is stopped.
 - In auto and full access, an opencode turn that goes quiet after a
   subagent starts now says the subagent may be waiting for a permission
   Octet cannot show, without claiming it is stuck.
@@ -440,6 +443,11 @@ Claude Code and Codex CLIs.
   process left that process running. Octet now kills the CLI's group
   again once the CLI has died, and kills any member still seen while it
   waits for the group to go.
+- A storm of session state changes (hundreds of sessions, each changing
+  its NOW line several times a second) made the hub snapshot every
+  session for each change; short of CPU, it fell seconds behind and the
+  phones' lists came late and stale. A change that touches only a row's
+  text no longer does.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.
