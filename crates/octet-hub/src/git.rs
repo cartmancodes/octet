@@ -1090,20 +1090,15 @@ mod tests {
         script(&path, body);
     }
 
-    /// Writes the shell script `path` running `body`, and runs it once with `warm`, which
-    /// returns before `body`. macOS checks a newly written program the first time it runs, one
-    /// at a time across the machine (the process waits before its first instruction): with the
-    /// suite writing and running many, git's first run of one could wait past a test's limit.
-    /// The run here, waited for without a limit, takes that wait out of the test.
+    /// Writes the shell script `path` running `body` with [`octet_testkit::write_script`],
+    /// which runs it once first: git's first run of a newly written program could otherwise
+    /// wait past a test's limit for macOS to check it, or fail on Linux as "Text file busy".
     fn script(path: &Path, body: &str) {
-        let text = format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{body}\n");
-        std::fs::write(path, text).expect("script");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let warm = std::process::Command::new(path)
-            .arg("warm")
-            .status()
-            .expect("the script runs");
-        assert!(warm.success(), "the script's warm-up run failed");
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            panic!("a script path: {}", path.display());
+        };
+        octet_testkit::write_script(dir, name, body);
     }
 
     /// Commits with the session's turn clear throughout.
