@@ -1060,6 +1060,7 @@ impl App {
                 }
             }
             Event::Tool(call) => {
+                self.flush_marker();
                 self.chat.reply_break = true;
                 self.conn.activity = State::tool(&call);
                 self.tool(call);
@@ -1069,6 +1070,7 @@ impl App {
                 detail,
                 summary,
             } => {
+                self.flush_marker();
                 let first = self.overlay.approvals.is_empty();
                 let summary = octet_core::ApprovalSummary {
                     action: clean(&summary.action),
@@ -1096,11 +1098,7 @@ impl App {
             }
             Event::Usage(text) => self.conn.usage = clean(&text),
             Event::Finished { outcome } => {
-                // A tail held as a possible goal marker was not one.
-                let held = self.chat.marker.flush();
-                if !held.is_empty() {
-                    self.reply_text(&held);
-                }
+                self.flush_marker();
                 self.calls_over();
                 self.conn.end_turn();
                 self.clear_status(StatusKind::Cancelling);
@@ -1259,6 +1257,15 @@ impl App {
     /// turn, for `/copy`.
     pub(crate) fn last_reply(&self) -> Option<&str> {
         (!self.chat.reply.is_empty()).then_some(self.chat.reply.as_str())
+    }
+    /// Shows a tail held as a possible start of the goal marker: the turn's
+    /// end, a tool call or an approval shows it was none, and it belongs to
+    /// the reply before them.
+    fn flush_marker(&mut self) {
+        let held = self.chat.marker.flush();
+        if !held.is_empty() {
+            self.reply_text(&held);
+        }
     }
     /// Streamed reply text, the goal marker already out: kept for `/copy`
     /// and appended to the reply on screen.
