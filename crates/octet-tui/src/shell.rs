@@ -367,10 +367,12 @@ mod tests {
     }
     #[tokio::test]
     async fn a_process_that_left_the_group_cannot_hold_the_result() {
+        // Built first, and outside the time: the build can wait on another
+        // cargo using the same target directory (rust-analyzer's, say).
+        let escaped = octet_testkit::detached_sleep();
         let started = std::time::Instant::now();
         // Without the fix this waits the full 60 s; the bound leaves room
         // for a machine busy with the rest of the suite.
-        let escaped = octet_testkit::detached_sleep();
         let ran = sh(&format!(
             "'{}' 60 & sleep 0.5; echo started",
             escaped.display()
