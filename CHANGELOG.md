@@ -292,6 +292,10 @@ Claude Code and Codex CLIs.
 - The protocol gate's opencode lockdown checks that `opencode debug config`
   shows a command's agent, subtask and template, as Octet's command check
   needs.
+- The protocol gate's new opencode scenario, `command-expansion`, checks
+  Octet's emulation of opencode's command expansion and built-in commands
+  against the running CLI; `docs/rust/protocol-gate.md` says how to verify a
+  new opencode version.
 - Edition 2024; clippy pedantic, `#[expect(lint, reason)]` for every
   exception, `Debug` on every public type; a `cargo doc` build and a
   `cargo-deny` licence check in CI.
@@ -392,19 +396,46 @@ Claude Code and Codex CLIs.
 - After a provider switch, an opencode slash command or skill carried the
   earlier conversation, and opencode ran any `` !`cmd` `` found in it
   through its shell, in every mode. A command or skill now never carries
-  it; the conversation waits for your next prompt.
+  it; the conversation waits for your next prompt. After a switch to
+  opencode, the note saying so is shown once.
 - In ask and accept-edits, Octet checks each opencode command and skill
   against its definition (`opencode debug config` / `debug skill`) before
   sending it. It refuses one that names another agent, runs as a subagent,
   or would run shell (`` !`…` ``) from its template, skill text or
   arguments, and one it cannot check: an MCP prompt, a changed definition,
-  or no reading.
-- In auto, an opencode turn that goes quiet after a subagent starts now
-  says the subagent may be waiting for a permission Octet cannot show.
+  or no reading. In those modes Octet sends opencode only text and image
+  blocks, and a command too long to check is refused with its own reason.
+- Octet reads opencode's command definitions once, when opencode lists them,
+  in every mode, as opencode 1.18.25 loads them once per process and never
+  reloads them; a burst of command-list changes is read once. It does not
+  read them again after a turn that could have edited them unasked
+  (accept-edits, auto, full access), so a command rewritten on disk cannot
+  pass the check while opencode runs the old copy.
+- The command check runs only on verified opencode versions (1.18.25). On
+  any other, Octet says so at connect and sends no command or skill in ask
+  and accept-edits (plain prompts work; `/mode auto` runs them under
+  opencode's settings; `/compact`, opencode's own summary, still goes).
+- An opencode command or skill waiting for Octet's check froze the session
+  (Esc took ~20 s). It now waits ("Checking /name against opencode's
+  definitions…") while Esc, quit and opencode's output stay live, and Esc
+  cancels it at once.
+- A command list opencode kept changing held a command waiting for its
+  check until the list settled. Changes now restart the reading for at
+  most 2 s; past that the reading under way runs to its end, and if the
+  list changed meanwhile the command is refused with that reason.
+- `opencode debug`'s output file had a name while it was written, and no
+  size limit; it is now unnamed until read, and stopped past 16 MiB.
+- In auto and full access, an opencode turn that goes quiet after a
+  subagent starts now says the subagent may be waiting for a permission
+  Octet cannot show, without claiming it is stuck.
 - On macOS, a `!` command dropped by a reconnect or quit while its shell
   was starting a process left that process running: it was not yet in the
   group Octet killed. Octet now kills the group again once the shell has
-  died.
+  died, and only while the shell is unreaped, so the group's id is still
+  its own.
+- The same held for the phone's git calls: one dropped or timed out while a
+  hook was starting a process left that process running. The hub now kills
+  git's group again once git has died, git still unreaped.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.
