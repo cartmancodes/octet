@@ -351,14 +351,26 @@ subagent's approval requests on to Octet.
 
 opencode's slash commands and skills run in ways those agents cannot see,
 so in `ask` and `accept-edits` Octet checks each one before it sends it,
-against the definition opencode would run. It reads the definitions with
-`opencode debug config` and `opencode debug skill`, run with the session's own
-launch settings in its workspace, in every mode, once for each command list
-opencode reports (at most 20 s), so a change opencode reports is read again. A
-command sent before the reading is done waits for it ("Checking /name against
-opencode's definitions…"); the session goes on meanwhile, and Esc cancels the
-command. A reading that failed is tried once more when a command needs it.
-Octet does not send a command that:
+against the definition opencode would run. opencode 1.18.25 loads its
+commands and skills once, when the session opens, and runs that copy for the
+rest of the process: a command or skill file edited afterwards, by you or by
+opencode's own tools, changes neither what opencode runs nor what it lists.
+So Octet reads the definitions once too, as opencode lists them, in every
+mode, with `opencode debug config` and `opencode debug skill` run with the
+session's own launch settings in its workspace (at most 20 s), and checks
+every command against that reading for the rest of the session; it reads
+them again only if opencode lists different commands. A command sent before
+the reading is done waits for it ("Checking /name against opencode's
+definitions…"); the session goes on meanwhile, and Esc cancels the command.
+
+Under Octet's launch settings opencode takes commands from your own
+configuration (`~/.config/opencode` and `~/.opencode`: `opencode.json`,
+`command/`, `commands/`, skill folders; `OPENCODE_CONFIG`,
+`OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT`), from plugins and MCP
+prompts, and from skills in `~/.claude/skills`, `~/.agents/skills`, and the
+workspace's own `.claude/skills` and `.agents/skills` (up to the repository
+root). It does not read the workspace's `opencode.json` or `.opencode/`
+folder. Octet does not send a command that:
 
 - names an agent other than the mode's (`agent: build`, say), whose
   permissions would apply instead of the mode's;
@@ -371,13 +383,23 @@ Octet does not send a command that:
 It also does not send one it cannot check: a command with no definition it
 can read (an MCP prompt), one opencode lists differently from the
 definition Octet read (an MCP prompt of the same name takes a command's
-place), or any command when the definitions cannot be read. The turn then
-fails with the reason, and nothing reaches opencode; `/compact` (opencode's
-own summary) needs only to not be one of your commands. Should a subagent
-still start (a definition that changed after Octet read it), Octet cancels
-the turn as soon as opencode reports it; by then opencode has started it.
-Plugin code, including a plugin's `command.execute.before` hook, runs
-outside these checks. A plain prompt runs no shell. In `auto`, opencode's
+place), or any command when the definitions cannot be read. A reading that
+failed is tried once more when a command needs it, but not after a turn
+has run in `accept-edits`, `auto` or `full-access`, where opencode edits
+files without asking: the files may then differ from what opencode loaded.
+For the same reason a reading made while such a turn was sent is not
+trusted. In both cases `/reconnect` starts opencode, and the reading,
+afresh. The turn then fails with the reason, and nothing reaches opencode;
+`/compact` (opencode's own summary) needs only to not be one of your
+commands.
+
+What this does not catch: a file changed in the seconds between opencode
+loading it and Octet reading it by anything other than an `accept-edits`,
+`auto` or `full-access` turn (your editor, another program); plugin code,
+including a plugin's `command.execute.before` hook, which runs outside these
+checks; and an MCP prompt with the same name and description as a command.
+Should a subagent still start, Octet cancels the turn as soon as opencode
+reports it; by then opencode has started it. A plain prompt runs no shell. In `auto`, opencode's
 own permission settings decide; a subagent whose own settings ask then waits
 unseen, so when a turn goes quiet for 10 s after a subagent starts, a notice
 says it may be waiting for a permission Octet cannot show (Esc cancels).

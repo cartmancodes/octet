@@ -6,7 +6,10 @@
 //! expanded text run in the shell first. Octet reads each definition as
 //! that opencode would (`opencode debug config` and `opencode debug skill`,
 //! with the session's launch environment, in its workspace), and refuses a
-//! command it cannot read or that would run any of those ways.
+//! command it cannot read or that would run any of those ways. opencode
+//! 1.18.25 loads its commands once per process and never reloads them, so
+//! Octet reads them once too, when opencode lists them, and not again after
+//! a turn that may have changed their files unasked.
 use super::{SHELL_MARK, agent, shell_refusal, subtask_refusal};
 use crate::live::{Config, Mode, short};
 use serde_json::Value;
@@ -537,6 +540,20 @@ pub(super) struct Commands {
     reading: Reading,
     /// A reading that failed has been tried again since the list changed.
     retried: bool,
+    /// The mode of a turn sent since opencode listed its commands in which
+    /// opencode edits files without asking. opencode 1.18.25 loads its
+    /// commands once per process and never reloads them, so after such a
+    /// turn their files may no longer be what opencode runs: Octet does not
+    /// read them again.
+    edited: Option<Mode>,
+    /// Such a turn was sent while the reading under way ran, so what it
+    /// reads may not be what opencode loaded.
+    tainted: Option<Mode>,
+}
+
+/// Whether opencode edits files without asking in `mode`.
+fn edits_unasked(mode: Mode) -> bool {
+    !matches!(mode, Mode::Ask)
 }
 
 impl Drop for Commands {
@@ -548,8 +565,16 @@ impl Drop for Commands {
 impl Commands {
     /// opencode listed `list` (`availableCommands`). A list that differs
     /// from the last drops what was read, and a reading of the new list
-    /// starts with `launch`, for at most `limit`.
-    pub(super) fn listed(&mut self, list: &Value, launch: Launch, limit: Duration) {
+    /// starts with `launch`, for at most `limit`. `running` is the mode of
+    /// the turn running meanwhile, if any: one that edits unasked leaves
+    /// the reading untrusted.
+    pub(super) fn listed(
+        &mut self,
+        list: &Value,
+        launch: Launch,
+        limit: Duration,
+        running: Option<Mode>,
+    ) {
         let listed: Vec<(String, String)> = list
             .as_array()
             .into_iter()
@@ -572,12 +597,26 @@ impl Commands {
         self.listed = listed;
         self.retried = false;
         self.start(launch, limit);
+        self.edited = running.filter(|mode| edits_unasked(*mode));
+        self.tainted = self.edited;
+    }
+
+    /// A turn is being sent in `mode` (see `edited` and `tainted`).
+    pub(super) fn turn_sent(&mut self, mode: Mode) {
+        if !edits_unasked(mode) {
+            return;
+        }
+        self.edited = Some(mode);
+        if self.reading() {
+            self.tainted = Some(mode);
+        }
     }
 
     /// Whether `name` may be sent with `args` under `mode` (see
     /// [`refusal`]). A command that needs a reading not yet at hand waits;
     /// one starts with `launch`, for at most `limit`, when none is under
-    /// way, and a reading that failed is tried once more. `compact`, when
+    /// way, and a reading that failed is tried once more, unless a turn
+    /// may have changed the files since opencode loaded them. `compact`, when
     /// opencode lists no command of that name, is its own summary and
     /// needs none.
     pub(super) fn verdict(
@@ -604,23 +643,34 @@ impl Commands {
             Reading::Running { .. } => Verdict::Wait,
             Reading::Done(Ok(book)) => refusal(book, listed.as_deref(), name, args, mode)
                 .map_or(Verdict::Send, Verdict::Refuse),
-            Reading::Done(Err(_)) if !self.retried => {
+            Reading::Done(Err(_)) | Reading::None if !self.retried && self.edited.is_none() => {
                 self.retried = true;
                 self.start(launch, limit);
                 Verdict::Wait
             }
-            Reading::Done(Err(why)) => Verdict::Refuse(format!(
-                "Octet could not read opencode's commands ({why}), so it cannot check /{}; in {} \
-                 Octet sends only commands it has checked, and did not send it. In auto, opencode's \
-                 own permission settings decide",
-                short(name),
-                mode.label()
-            )),
-            Reading::None => {
-                self.start(launch, limit);
-                Verdict::Wait
-            }
+            Reading::Done(Err(why)) => Verdict::Refuse(self.unread(why, name, mode)),
+            Reading::None => Verdict::Refuse(self.unread("none was made in time", name, mode)),
         }
+    }
+
+    /// Why `name` cannot be sent under `mode` when Octet could not read
+    /// opencode's commands, `why`.
+    fn unread(&self, why: &str, name: &str, mode: Mode) -> String {
+        let again = self.edited.map_or_else(String::new, |edited| {
+            format!(
+                " A turn has run in {} since opencode loaded its commands, which opencode does not \
+                 load again, so Octet does not read them again either; /reconnect starts opencode \
+                 afresh.",
+                edited.label()
+            )
+        });
+        format!(
+            "Octet could not read opencode's commands ({why}), so it cannot check /{}; in {} \
+             Octet sends only commands it has checked, and did not send it. In auto, opencode's \
+             own permission settings decide.{again}",
+            short(name),
+            mode.label()
+        )
     }
 
     /// Whether a reading is under way.
@@ -637,6 +687,19 @@ impl Commands {
         let read = result
             .await
             .unwrap_or_else(|_| Err("the reading stopped".to_owned()));
+        self.land(read);
+    }
+
+    /// Keeps the result `read` of the reading under way, which a turn sent
+    /// meanwhile leaves untrusted.
+    fn land(&mut self, read: Result<Book, String>) {
+        let read = match self.tainted.take() {
+            Some(mode) if read.is_ok() => Err(format!(
+                "a turn ran in {} while Octet read them, so they may not be what opencode loaded",
+                mode.label()
+            )),
+            _ => read,
+        };
         self.reading = Reading::Done(read);
     }
 
@@ -644,9 +707,9 @@ impl Commands {
     fn poll(&mut self) {
         if let Reading::Running { result, .. } = &mut self.reading {
             match result.try_recv() {
-                Ok(read) => self.reading = Reading::Done(read),
+                Ok(read) => self.land(read),
                 Err(oneshot::error::TryRecvError::Closed) => {
-                    self.reading = Reading::Done(Err("the reading stopped".to_owned()));
+                    self.land(Err("the reading stopped".to_owned()));
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
             }

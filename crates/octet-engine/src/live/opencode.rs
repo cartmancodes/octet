@@ -552,11 +552,12 @@ impl Protocol for OpencodeProtocol {
                 if core.config.catalog_only {
                     return self.probe_listed(core, list);
                 }
-                // Read the definitions now, in every mode, so a command
-                // need not wait for them.
+                // Read the definitions now, in every mode: opencode loads
+                // them once, now, and a command need not wait for them.
                 let launch = commands::Launch::of(&core.config);
+                let running = self.turn_mode.filter(|_| core.phase.is_running());
                 self.commands
-                    .listed(list, launch, core.limits.command_check);
+                    .listed(list, launch, core.limits.command_check, running);
                 core.emit(Event::Skills(commands(list)))
             }
             // A resume replays the session's history before any prompt: it
@@ -713,6 +714,7 @@ impl OpencodeProtocol {
         for (image, data) in encoded {
             prompt.push(json!({"type": "image", "mimeType": image.media_type, "data": data}));
         }
+        self.commands.turn_sent(core.mode);
         let params = json!({"sessionId": core.session, "prompt": prompt});
         self.request(core, Outstanding::Prompt, "session/prompt", params)
             .await
