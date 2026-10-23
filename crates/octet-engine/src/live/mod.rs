@@ -57,6 +57,10 @@ pub struct Limits {
     /// takes the bytes inline: a file swapped for a FIFO, or on a stalled
     /// mount, must not hold the session.
     pub image_read: Duration,
+    /// Reading a vendor's command definitions before a command is sent
+    /// (opencode's `opencode debug config` and `debug skill`), for a
+    /// provider that checks a command first.
+    pub command_check: Duration,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -66,6 +70,7 @@ impl Default for Limits {
             interrupt: Duration::from_secs(10),
             mode_confirm: Duration::from_secs(10),
             image_read: Duration::from_secs(10),
+            command_check: Duration::from_secs(20),
         }
     }
 }

@@ -4225,8 +4225,9 @@ async fn opencodes_review_is_sent_in_auto() {
 }
 #[tokio::test]
 async fn an_opencode_subagent_started_while_the_mode_asks_stops_the_turn() {
-    // A command opencode runs as a subagent that Octet cannot know of
-    // beforehand: its `task` call is the sign, and the turn is cancelled.
+    // A command opencode runs as a subagent although the definition Octet
+    // read says otherwise (it changed since): its `task` call is the sign,
+    // and the turn is cancelled.
     let (error, outcome, _) =
         opencode_turn_ending(Mode::Ask, opencode_skill(scenario::OPENCODE_SUBTASK, "")).await;
     let command = format!("/{}", scenario::OPENCODE_SUBTASK);
@@ -4441,4 +4442,282 @@ async fn opencode_probe_that_fails_still_deletes_its_session() {
     let error = probe(config, PROBE_LIMIT).await.unwrap_err();
     assert!(error.starts_with("Vendor disconnected"), "{error}");
     probe_session_deleted(&dir).await;
+}
+/// A workspace for the fake opencode, with `commands` as the extra command
+/// definitions its `debug config` shows (`fixture-commands.json`) and
+/// `skills` as what its `debug skill` shows, and an empty `debug-calls`.
+fn opencode_workspace(
+    name: &str,
+    commands: &serde_json::Value,
+    skills: &serde_json::Value,
+) -> octet_testkit::TempDir {
+    let dir = octet_testkit::TempDir::new(name);
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(
+        dir.path().join("fixture-commands.json"),
+        commands.to_string(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("fixture-skills.json"), skills.to_string()).unwrap();
+    std::fs::write(dir.path().join("debug-calls"), "").unwrap();
+    dir
+}
+/// The error, outcome and text of the turn `command` starts in a session in
+/// `mode` working in `dir`, with `limits`; it must end by itself.
+async fn opencode_turn_in(
+    dir: &octet_testkit::TempDir,
+    mode: Mode,
+    limits: Limits,
+    command: Command,
+) -> (Option<String>, Outcome, String) {
+    let mut c = opencode();
+    c.mode = mode;
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn_with_limits(c, limits);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(command).unwrap();
+    let (mut error, mut text) = (None, String::new());
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Error(message) => error = Some(message),
+            Event::Text(t) => text.push_str(&t),
+            Event::Approval { detail, .. } => panic!("an approval was shown: {detail}"),
+            Event::Finished { outcome } => break outcome,
+            _ => {}
+        }
+    };
+    stop(&handle, task).await;
+    (error, outcome, text)
+}
+/// Asserts that `command`, sent in `mode` in `dir`, ended Failed unsent
+/// with an error that contains `why` and names the mode.
+async fn assert_opencode_refuses(
+    dir: &octet_testkit::TempDir,
+    mode: Mode,
+    command: Command,
+    why: &str,
+) {
+    let (error, outcome, text) = opencode_turn_in(dir, mode, Limits::default(), command).await;
+    let error = error.expect("the turn was refused");
+    assert!(error.contains(why), "{error}");
+    assert!(error.contains(mode.label()), "{error}");
+    assert_eq!(outcome, Outcome::Failed);
+    assert_eq!(text, "", "it was sent");
+}
+#[tokio::test]
+async fn an_opencode_command_under_another_agent_is_not_sent_while_the_mode_asks() {
+    // A command's own `agent` replaces the mode's: under `build` its edits
+    // and commands would follow the user's own permissions, unasked.
+    let dir = opencode_workspace(
+        "octet-opencode-agent",
+        &serde_json::json!({
+            "fixture-build": {"agent": "build", "template": "Edit it"},
+            "fixture-general": {"agent": "general", "template": "Edit it"},
+            "fixture-own": {"agent": "octet-ask", "template": "Say hi"},
+        }),
+        &serde_json::json!([]),
+    );
+    for (mode, name) in [
+        (Mode::Ask, "fixture-build"),
+        (Mode::AcceptEdits, "fixture-build"),
+        (Mode::Ask, "fixture-general"),
+        (Mode::AcceptEdits, "fixture-own"),
+    ] {
+        let why = if name == "fixture-general" {
+            "agent general"
+        } else if name == "fixture-own" {
+            "agent octet-ask"
+        } else {
+            "agent build"
+        };
+        assert_opencode_refuses(&dir, mode, opencode_skill(name, ""), why).await;
+    }
+    // The mode's own agent changes nothing.
+    let (error, outcome, text) = opencode_turn_in(
+        &dir,
+        Mode::Ask,
+        Limits::default(),
+        opencode_skill("fixture-own", ""),
+    )
+    .await;
+    assert_eq!((error, outcome), (None, Outcome::Completed));
+    assert_eq!(text, "/fixture-own");
+    // In auto, opencode's own settings decide.
+    let (error, outcome, text) = opencode_turn_in(
+        &dir,
+        Mode::Auto,
+        Limits::default(),
+        opencode_skill("fixture-build", ""),
+    )
+    .await;
+    assert_eq!((error, outcome), (None, Outcome::Completed));
+    assert_eq!(text, "/fixture-build");
+}
+#[tokio::test]
+async fn an_opencode_subtask_command_is_not_sent_while_the_mode_asks() {
+    let dir = opencode_workspace(
+        "octet-opencode-subtask",
+        &serde_json::json!({"fixture-sub": {"subtask": true, "template": "Edit it"}}),
+        &serde_json::json!([]),
+    );
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        Command::Prompt("/fixture-sub now".into()),
+        &subtask_refusal("/fixture-sub", Mode::Ask, "Octet did not send it"),
+    )
+    .await;
+}
+#[tokio::test]
+async fn an_opencode_command_whose_text_runs_shell_is_not_sent_while_the_mode_asks() {
+    // opencode runs each `!`cmd`` of a command's expanded template in its
+    // shell before any permission check: a template's own, one its
+    // arguments complete, and a skill's.
+    let dir = opencode_workspace(
+        "octet-opencode-template-shell",
+        &serde_json::json!({
+            "fixture-date": {"template": "Today: !`date`"},
+            "fixture-bang": {"template": "Run !$1 now"},
+            "fixture-plain": {"template": "Say $ARGUMENTS"},
+        }),
+        &serde_json::json!([
+            {"name": "fixture-shell-skill", "description": "", "location": "/s/SKILL.md", "content": "x !`id` y"}
+        ]),
+    );
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        opencode_skill("fixture-date", ""),
+        "its template runs",
+    )
+    .await;
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        opencode_skill("fixture-shell-skill", ""),
+        "its template runs",
+    )
+    .await;
+    assert_opencode_refuses(
+        &dir,
+        Mode::AcceptEdits,
+        opencode_skill("fixture-bang", "`touch pwned`"),
+        "which opencode runs in its shell before it asks for any permission",
+    )
+    .await;
+    let (error, outcome, text) = opencode_turn_in(
+        &dir,
+        Mode::Ask,
+        Limits::default(),
+        opencode_skill("fixture-plain", "hi `x`"),
+    )
+    .await;
+    assert_eq!((error, outcome), (None, Outcome::Completed));
+    assert_eq!(text, "/fixture-plain hi `x`");
+}
+#[tokio::test]
+async fn an_opencode_command_octet_cannot_check_is_not_sent_while_the_mode_asks() {
+    // Fail closed: what Octet cannot read, it does not send.
+    let dir = opencode_workspace(
+        "octet-opencode-unknown",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        Command::Prompt("/nowhere x".into()),
+        "no definition",
+    )
+    .await;
+    // A listed command whose definition differs from the list (an MCP
+    // prompt of the same name takes the command's place in opencode).
+    std::fs::write(
+        dir.path().join("fixture-commands.json"),
+        serde_json::json!({scenario::OPENCODE_SKILL: {"description": "Another", "template": "x"}})
+            .to_string(),
+    )
+    .unwrap();
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        opencode_skill(scenario::OPENCODE_SKILL, ""),
+        "another description",
+    )
+    .await;
+    std::fs::write(dir.path().join("fixture-commands.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("debug-fails"), "").unwrap();
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        opencode_skill(scenario::OPENCODE_SKILL, ""),
+        "could not read",
+    )
+    .await;
+    std::fs::remove_file(dir.path().join("debug-fails")).unwrap();
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let limits = Limits {
+        command_check: Duration::from_millis(500),
+        ..Limits::default()
+    };
+    let started = tokio::time::Instant::now();
+    let (error, outcome, text) = opencode_turn_in(
+        &dir,
+        Mode::Ask,
+        limits,
+        opencode_skill(scenario::OPENCODE_SKILL, ""),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        error.as_deref().unwrap_or("").contains("could not read"),
+        "{error:?}"
+    );
+    assert_eq!((outcome, text.as_str()), (Outcome::Failed, ""));
+}
+#[tokio::test]
+async fn opencodes_commands_are_read_once_and_again_when_the_list_changes() {
+    let dir = opencode_workspace(
+        "octet-opencode-relist",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    for _ in 0..2 {
+        handle
+            .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+            .unwrap();
+        assert_eq!(
+            turn_text(&mut events).await,
+            format!("/{} go", scenario::OPENCODE_SKILL)
+        );
+    }
+    let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    assert_eq!(calls().matches("config").count(), 1, "{}", calls());
+    std::fs::write(
+        dir.path().join("fixture-commands.json"),
+        serde_json::json!({scenario::OPENCODE_LATE: {"description": "A late fixture command", "template": "x"}})
+            .to_string(),
+    )
+    .unwrap();
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_RELIST.into()))
+        .unwrap();
+    turn_text(&mut events).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_LATE, ""))
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{}", scenario::OPENCODE_LATE)
+    );
+    assert_eq!(calls().matches("config").count(), 2, "{}", calls());
+    stop(&handle, task).await;
 }

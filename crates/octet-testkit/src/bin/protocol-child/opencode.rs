@@ -110,6 +110,53 @@ pub(crate) fn session_command() {
     }
 }
 
+/// `protocol-child debug config|skill`: the stand-in for `opencode debug
+/// config` and `opencode debug skill`, run in the session's working
+/// directory. Each run appends its subcommand to `debug-calls` there, when
+/// the test made one.
+/// `config` prints a `command` map: `OPENCODE_SKILL` plain, and
+/// `OPENCODE_SUBTASK` plain too, so only its `task` call shows it is a
+/// subagent (a definition that changed after Octet read it); then the
+/// commands in `fixture-commands.json`, when there is one. `skill` prints
+/// `fixture-skills.json`, or no skills. With `debug-fails` present, both
+/// exit 1; with `debug-hangs`, both wait a minute first.
+pub(crate) fn debug_command() {
+    let what = env::args().nth(2).unwrap_or_default();
+    if let Ok(mut calls) = fs::read_to_string("debug-calls") {
+        calls.push_str(&what);
+        calls.push('\n');
+        fs::write("debug-calls", calls).unwrap();
+    }
+    if fs::exists("debug-hangs").unwrap_or(false) {
+        thread::sleep(Duration::from_secs(60));
+    }
+    if fs::exists("debug-fails").unwrap_or(false) {
+        process::exit(1);
+    }
+    let file = |name: &str| {
+        fs::read_to_string(name)
+            .ok()
+            .map(|text| serde_json::from_str::<Value>(&text).unwrap())
+    };
+    let output = match what.as_str() {
+        "config" => {
+            let mut commands = json!({
+                scenario::OPENCODE_SKILL: {"description":"An opencode fixture skill","template":"Fixture: $ARGUMENTS"},
+                scenario::OPENCODE_SUBTASK: {"description":"An opencode fixture subtask","template":"Fixture subtask"},
+            });
+            if let (Some(Value::Object(extra)), Some(map)) =
+                (file("fixture-commands.json"), commands.as_object_mut())
+            {
+                map.extend(extra);
+            }
+            json!({"$schema":"https://opencode.ai/config.json","agent":{},"command":commands})
+        }
+        "skill" => file("fixture-skills.json").unwrap_or_else(|| json!([])),
+        _ => process::exit(2),
+    };
+    println!("{output:#}");
+}
+
 /// `OPENCODE_GATED`'s gate: says the request for `option` came, then waits
 /// (at most ten seconds) for the test to release it.
 fn gate(option: &str) {
@@ -152,6 +199,45 @@ fn edit_path() -> String {
 /// the tool call `call`, as opencode 1.18.25 sends it.
 fn edit_permission(sid: &str, call: &str, path: &str) -> Value {
     json!({"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":sid,"toolCall":{"toolCallId":call,"title":path,"kind":"edit","status":"pending","locations":[{"path":path}],"rawInput":{"filepath":path,"diff":"+hi"}},"options":[{"optionId":"once","kind":"allow_once","name":"Allow once"},{"optionId":"reject","kind":"reject_once","name":"Reject"}]}})
+}
+
+/// The `available_commands_update` for the session `sid`; `late` adds
+/// `OPENCODE_LATE`. As in opencode 1.18.25, `/compact` is not listed, though
+/// it runs.
+fn list_commands(sid: &str, late: bool) {
+    let mut commands = vec![
+        json!({"name":scenario::OPENCODE_SKILL,"description":"An opencode fixture skill"}),
+        json!({"name":scenario::OPENCODE_SUBTASK,"description":"An opencode fixture subtask"}),
+        json!({"name":"review","description":"review changes [commit|branch|pr], defaults to uncommitted"}),
+    ];
+    if late {
+        commands
+            .push(json!({"name":scenario::OPENCODE_LATE,"description":"A late fixture command"}));
+    }
+    emit(&acp_update(
+        sid,
+        &json!({"sessionUpdate":"available_commands_update","availableCommands":commands}),
+    ));
+}
+
+/// Echoes the images of the prompt `id`, so tests can check what was sent,
+/// and ends it; whether it had any.
+fn echo_images(sid: &str, id: &Value, blocks: &[Value]) -> bool {
+    let images: Vec<String> = blocks
+        .iter()
+        .filter(|block| block["type"] == "image")
+        .map(|block| {
+            let mime = block["mimeType"].as_str().unwrap_or("?");
+            let length = block["data"].as_str().map_or(0, str::len);
+            format!("image {mime} {length}")
+        })
+        .collect();
+    if images.is_empty() {
+        return false;
+    }
+    emit(&acp_text(sid, &images.join(",")));
+    end_turn(id);
+    true
 }
 
 /// A slash command, echoed as the reply as a skill's expansion would be:
@@ -225,14 +311,7 @@ impl OpencodeFixture {
             emit(&acp_text(sid, "REPLAYED"));
             emit(&tool_call(sid, "replayed-call"));
         }
-        // As in opencode 1.18.25, `/compact` is not listed, though it runs.
-        emit(&acp_update(
-            sid,
-            &json!({"sessionUpdate":"available_commands_update","availableCommands":[
-                {"name":scenario::OPENCODE_SKILL,"description":"An opencode fixture skill"},
-                {"name":scenario::OPENCODE_SUBTASK,"description":"An opencode fixture subtask"},
-                {"name":"review","description":"review changes [commit|branch|pr], defaults to uncommitted"}]}),
-        ));
+        list_commands(sid, false);
     }
 
     /// Accepts any model; refuses modes once the model is `OPENCODE_REJECT_MODE`,
@@ -353,19 +432,7 @@ impl OpencodeFixture {
             .find(|block| block["type"] == "text")
             .and_then(|block| block["text"].as_str())
             .unwrap_or("");
-        // Images are echoed so tests can check what was sent.
-        let images: Vec<String> = blocks
-            .iter()
-            .filter(|block| block["type"] == "image")
-            .map(|block| {
-                let mime = block["mimeType"].as_str().unwrap_or("?");
-                let length = block["data"].as_str().map_or(0, str::len);
-                format!("image {mime} {length}")
-            })
-            .collect();
-        if !images.is_empty() {
-            emit(&acp_text(&sid, &images.join(",")));
-            end_turn(id);
+        if echo_images(&sid, id, blocks) {
             return;
         }
         let subtask = format!("/{}", scenario::OPENCODE_SUBTASK);
@@ -390,6 +457,10 @@ impl OpencodeFixture {
                 self.asks_on_cancel = true;
             }
             scenario::OPENCODE_READ_ENV => self.read_env(id),
+            scenario::OPENCODE_RELIST => {
+                list_commands(&sid, true);
+                end_turn(id);
+            }
             scenario::CHATTER => {
                 // The turn goes silent while another session keeps talking.
                 self.held = Some(id.clone());

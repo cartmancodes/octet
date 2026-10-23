@@ -342,13 +342,36 @@ it also shows the running mode when a change is waiting for the next turn.
 `auto` hands approval decisions to the vendor's own reviewer; Octet never
 answers a vendor approval by itself. opencode's `ask` and `accept-edits`
 agents turn subagents (its `task` tool) off: opencode runs a subagent under
-an agent of its own that would not ask. A command opencode runs as a
-subagent (its built-in `/review`, or one of yours with `subtask: true`) does
-not run in those modes either: opencode 1.18.25 never passes a subagent's
-approval requests on to Octet, so the turn would wait unseen. Octet refuses
-`/review` before sending it, and stops the turn, saying why, as soon as
-another command starts a subagent. In `auto`, opencode's own permission
-settings decide. Reading files proceeds in both,
+an agent of its own that would not ask, and opencode 1.18.25 never passes a
+subagent's approval requests on to Octet.
+
+opencode's slash commands and skills run in ways those agents cannot see,
+so in `ask` and `accept-edits` Octet checks each one before it sends it,
+against the definition opencode would run. It reads the definitions with
+`opencode debug config` and `opencode debug skill`, run with the session's own
+launch settings in its workspace, once for each command list opencode
+reports (at most 20 s), so a change opencode reports is read again. Octet does
+not send a command that:
+
+- names an agent other than the mode's (`agent: build`, say), whose
+  permissions would apply instead of the mode's;
+- runs as a subagent (`subtask: true`, an agent that is a subagent, or the
+  built-in `/review`);
+- would run shell before any permission check: opencode runs each
+  `` !`cmd` `` of a command's text in its shell first, so a `` !` `` in its
+  template, in a skill's text, or put there by its arguments refuses it.
+
+It also does not send one it cannot check: a command with no definition it
+can read (an MCP prompt), one opencode lists differently from the
+definition Octet read (an MCP prompt of the same name takes a command's
+place), or any command when the definitions cannot be read. The turn then
+fails with the reason, and nothing reaches opencode; `/compact` (opencode's
+own summary) needs only to not be one of your commands. Should a subagent
+still start (a definition that changed after Octet read it), Octet cancels
+the turn as soon as opencode reports it; by then opencode has started it.
+Plugin code, including a plugin's `command.execute.before` hook, runs
+outside these checks. A plain prompt runs no shell. In `auto`, opencode's
+own permission settings decide. Reading files proceeds in `ask` and `accept-edits`,
 except `.env` files (not `.env.example`), which ask as in opencode's own
 defaults. Codex has no edits-only mode, so
 `accept-edits` is its closest analogue: in-workspace edits already proceed under

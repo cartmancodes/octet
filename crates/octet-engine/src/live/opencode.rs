@@ -21,6 +21,8 @@ use std::{
 };
 use tokio::time::Instant;
 
+mod commands;
+
 /// opencode's row in the provider table.
 pub(super) const PROVIDER: Provider = Provider {
     name: "opencode",
@@ -214,11 +216,10 @@ pub(super) struct OpencodeProtocol {
     /// Why Octet cancelled the running turn: it started a subagent that
     /// cannot ask for approval (see `stop_subtask`).
     subtask_stopped: Option<String>,
+    /// The commands opencode lists, and their definitions as Octet read
+    /// them, to check a command before it is sent while the mode asks.
+    commands: commands::Commands,
 }
-
-/// opencode 1.18.25's commands that always run in a subagent: `review` is
-/// built in with `subtask: true`.
-const SUBTASK_COMMANDS: &[&str] = &["review"];
 
 /// Why opencode's command `name` (`None`: one it did not name) cannot run
 /// as a subagent under `mode`, ending with `done`, what Octet did about it;
@@ -505,6 +506,11 @@ impl Protocol for OpencodeProtocol {
                 if core.config.catalog_only {
                     return self.probe_listed(core, list);
                 }
+                // Read the definitions now, while the mode asks, so the
+                // first command need not wait for them.
+                let launch = matches!(core.mode, Mode::Ask | Mode::AcceptEdits)
+                    .then(|| commands::Launch::of(&core.config));
+                self.commands.listed(list, launch);
                 core.emit(Event::Skills(commands(list)))
             }
             // A resume replays the session's history before any prompt: it
@@ -558,9 +564,9 @@ impl OpencodeProtocol {
 
     /// Sends the prompt `prompt`, with `images` inline as base64 blocks
     /// after it, read now; an image that cannot be read fails the turn, and
-    /// so, while the mode asks, does a command that always runs in a
-    /// subagent (see `subtask_refusal`) or whose arguments hold shell (see
-    /// `shell_refusal`).
+    /// so, while the mode asks, does a command whose arguments hold shell
+    /// (see `shell_refusal`) or that Octet cannot check or would run
+    /// unasked (see `commands::refusal`). Nothing is sent then.
     async fn send_blocks(
         &mut self,
         core: &mut Core,
@@ -568,13 +574,16 @@ impl OpencodeProtocol {
         images: &[ImageAttachment],
     ) -> Result<(), DriverError> {
         if let Some((name, args)) = slash_command(&prompt) {
-            let refusal = shell_refusal(&name, &args, core.mode).or_else(|| {
-                SUBTASK_COMMANDS
-                    .contains(&name.as_str())
-                    .then(|| subtask_refusal(Some(&name), core.mode, "Octet did not send it"))
-                    .flatten()
-            });
-            if let Some(refusal) = refusal {
+            if let Some(refusal) = shell_refusal(&name, &args, core.mode) {
+                return fail_turn(core, refusal);
+            }
+            let launch = commands::Launch::of(&core.config);
+            let limit = core.limits.command_check;
+            if let Some(refusal) = self
+                .commands
+                .check(launch, limit, &name, &args, core.mode)
+                .await
+            {
                 return fail_turn(core, refusal);
             }
         }
@@ -1205,11 +1214,13 @@ fn slash_command(prompt: &[Value]) -> Option<(String, String)> {
         .filter(|block| block["type"] == "text")
         .filter_map(|block| block["text"].as_str())
         .collect();
-    let rest = text.trim().strip_prefix('/')?;
-    if rest.starts_with(char::is_whitespace) {
+    let rest = text.trim_matches(commands::js_space).strip_prefix('/')?;
+    if rest.starts_with(commands::js_space) {
         return None;
     }
-    let mut words = rest.split_whitespace();
+    let mut words = rest
+        .split(commands::js_space)
+        .filter(|word| !word.is_empty());
     let name = words.next()?.to_owned();
     Some((name, words.collect::<Vec<_>>().join(" ")))
 }
@@ -1225,8 +1236,8 @@ const SHELL_MARK: &str = "!`";
 fn shell_refusal(name: &str, args: &str, mode: Mode) -> Option<String> {
     (matches!(mode, Mode::Ask | Mode::AcceptEdits) && args.contains(SHELL_MARK)).then(|| {
         format!(
-            "The arguments of /{} hold `!`…``, which opencode runs in its shell before it asks for any \
-             permission; in {} Octet did not send it. In auto, opencode's own permission settings decide",
+            "The arguments of /{} hold or complete `!`…``, which opencode runs in its shell before it asks \
+             for any permission; in {} Octet did not send it. In auto, opencode's own permission settings decide",
             short(name),
             mode.label()
         )
