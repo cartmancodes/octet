@@ -319,13 +319,14 @@ impl Protocol for ClaudeProtocol {
         if kind == "control_response" && self.control_response(core, &v)? {
             return Ok(());
         }
-        // A SessionStart hook's frames name a new session before the
-        // handshake's reply, but Claude saves it only with its first turn,
-        // whose frames name it again: an ID taken earlier could not be
-        // resumed, and a ready sent then would come before the session is.
+        // A SessionStart hook's frames name a new session, before or after
+        // the handshake's reply, but Claude saves it only with its first
+        // turn, whose frames name it again: an ID taken from a frame outside
+        // a turn could not be resumed, and a ready sent before the reply
+        // would come before the session is.
         if let Some(id) = v["session_id"].as_str()
             && core.session != id
-            && core.phase.is_ready()
+            && core.phase.is_running()
         {
             // The ID goes into the journal and later `--resume` arguments.
             if valid_identifier(id) {

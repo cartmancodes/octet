@@ -316,6 +316,37 @@ fn a_fork_is_announced_when_the_vendor_names_it() {
     );
 }
 #[test]
+fn a_resumed_session_refused_its_model_says_how_to_resume_with_another() {
+    // `/resume N` asks for the journal's model, which opencode may no longer
+    // offer (its free models rotate): the session stops while connecting.
+    let resumed = |model: Option<&str>| {
+        let mut config = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+        config.resume = Some("ses-1".into());
+        config.model = model.map(str::to_owned);
+        App::new(&config, "journal".into())
+    };
+    let hint = "/model opencode <model> resumes the same session with another model";
+    let mut app = resumed(Some("opencode/gone-free"));
+    app.event(octet_core::Event::Error(
+        "opencode refused the model gone-free: Invalid params: model not found".into(),
+    ));
+    app.event(octet_core::Event::Stopped);
+    assert!(app.entries_text().contains(hint), "{}", app.entries_text());
+    // No model was asked for, so none was refused.
+    let mut plain = resumed(None);
+    plain.event(octet_core::Event::Error("opencode exited".into()));
+    plain.event(octet_core::Event::Stopped);
+    assert!(!plain.entries_text().contains(hint));
+    // A session that opened and stopped later did not stop on its model.
+    let mut opened = resumed(Some("opencode/gone-free"));
+    opened.event(octet_core::Event::Ready {
+        session: "ses-1".into(),
+    });
+    opened.event(octet_core::Event::Error("opencode exited".into()));
+    opened.event(octet_core::Event::Stopped);
+    assert!(!opened.entries_text().contains(hint));
+}
+#[test]
 fn browsing_history_keeps_the_drafts_own_images() {
     let dir = image_workspace("octet-image-browse", &["draft.png"]);
     let mut app = app();

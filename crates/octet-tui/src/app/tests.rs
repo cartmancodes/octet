@@ -30,6 +30,37 @@ fn the_goal_marker_shows_neither_on_screen_nor_in_copy() {
     );
 }
 #[test]
+fn a_held_marker_start_shows_before_a_tool_call_or_approval() {
+    use octet_core::ToolPhase::Running;
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    app.event(Event::Started);
+    // `[` may begin the goal marker, but a tool call settles it: it was the
+    // reply's, and belongs before the call.
+    app.event(Event::Text("Look at a[".into()));
+    app.event(crate::test_support::tool("1", "Read", "a", Running));
+    app.event(Event::Text("b]".into()));
+    let assistant: Vec<&str> = app
+        .chat
+        .entries
+        .iter()
+        .filter(|e| e.role == Role::Assistant)
+        .map(|e| e.text.as_str())
+        .collect();
+    assert_eq!(assistant, ["Look at a[", "b]"]);
+    // So does an approval.
+    app.event(Event::Text(" then [[OCTET_".into()));
+    app.event(Event::Approval {
+        id: 1,
+        detail: "{}".into(),
+        summary: octet_core::ApprovalSummary::default(),
+    });
+    app.event(Event::Text("done".into()));
+    app.event(Event::Finished {
+        outcome: octet_core::Outcome::Completed,
+    });
+    assert_eq!(app.last_reply(), Some("Look at a[\n\nb] then [[OCTET_done"));
+}
+#[test]
 fn copy_keeps_the_last_reply_until_new_text_arrives() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.event(Event::Started);
@@ -70,6 +101,7 @@ async fn a_new_connection_settles_the_old_sessions_command_and_popup() {
         kind: crate::composer::Kind::File,
         items: Vec::new(),
         selected: 0,
+        moved: false,
         start: 0,
     });
     let config = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp");

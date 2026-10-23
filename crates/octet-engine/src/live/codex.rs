@@ -100,9 +100,17 @@ pub(super) struct CodexProtocol {
     configured_effort: ConfiguredEffort,
     /// The model Codex opened the thread with.
     thread_model: Option<String>,
-    /// The effort the thread runs at, as Codex reported it or Octet last
-    /// sent it: Codex keeps a turn's effort for the turns after it.
+    /// The effort the thread runs at, as Codex reported it for a new thread
+    /// or Octet last sent it: Codex keeps a turn's effort for the turns
+    /// after it. Unknown after a resume or fork, whatever the reply says.
     thread_effort: Option<String>,
+    /// `config/read` was answered, with its error included.
+    config_answered: bool,
+    /// The model catalog is in, or will not be.
+    catalog_done: bool,
+    /// The open reply of a resumed or forked thread with no effort chosen,
+    /// held until the default is known: its first turn must name it.
+    held_open: Option<Value>,
     /// The agent message whose text was shown last, until a tool call:
     /// another message after it starts a new paragraph.
     last_text_item: Option<String>,
@@ -418,7 +426,8 @@ impl CodexProtocol {
                             None => ConfiguredEffort::Unset,
                         };
                 }
-                Ok(())
+                self.config_answered = true;
+                self.release_ready(core)
             }
             Outstanding::Start => {
                 if v.get("error").is_some() {
@@ -487,27 +496,55 @@ impl CodexProtocol {
             .and_then(Value::as_str)
             .ok_or("Codex could not open the session")?
             .into();
-        core.phase = Phase::Idle;
-        core.emit(Event::Ready {
-            session: core.session.clone(),
-        })?;
-        core.adopt_mode(codex_reported(&v["result"]))?;
-        if let Some(model) = v["result"]["model"]
+        self.thread_model = v["result"]["model"]
             .as_str()
             .filter(|m| valid_identifier(m))
-        {
-            self.thread_model = Some(model.into());
-            core.emit(Event::ModelSelected(model.into()))?;
-        }
+            .map(str::to_owned);
+        // A resumed or forked thread runs at the effort it was left at, which
+        // the reply may not name; with no level chosen, the first turn names
+        // the default, so the session is ready once that is known.
+        let reopened = core.config.resume.is_some();
         self.thread_effort = v["result"]["reasoningEffort"]
             .as_str()
-            .filter(|e| valid_effort(e))
+            .filter(|e| valid_effort(e) && !reopened)
             .map(str::to_owned);
+        if reopened && core.config.effort.is_none() {
+            self.held_open = Some(v["result"].clone());
+        } else {
+            self.announce(core, &v["result"])?;
+        }
         self.request_models(core, None).await?;
         self.request_skills(core, false).await?;
         let params = json!({"cwd": core.config.cwd});
         self.request(core, Outstanding::ConfigRead, "config/read", params)
             .await
+    }
+
+    /// The session is ready, in the mode and with the model of the thread
+    /// open reply's `result`.
+    fn announce(&self, core: &mut Core, result: &Value) -> Result<(), DriverError> {
+        core.phase = Phase::Idle;
+        core.emit(Event::Ready {
+            session: core.session.clone(),
+        })?;
+        core.adopt_mode(codex_reported(result))?;
+        if let Some(model) = &self.thread_model {
+            core.emit(Event::ModelSelected(model.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// Announces a held session once the default effort is known, or cannot
+    /// be: the config was read and names a level, or the catalog is in.
+    fn release_ready(&mut self, core: &mut Core) -> Result<(), DriverError> {
+        let settled = self.config_answered
+            && (!matches!(self.configured_effort, ConfiguredEffort::Unset)
+                || self.catalog_done
+                || self.default_effort(core).is_some());
+        match self.held_open.take_if(|_| settled) {
+            Some(result) => self.announce(core, &result),
+            None => Ok(()),
+        }
     }
 
     /// The effort Codex picks with no override: its config's, else the
@@ -572,16 +609,18 @@ impl CodexProtocol {
             .await
     }
 
-    async fn catalog_page(&mut self, core: &Core, v: &Value) -> Result<(), DriverError> {
+    async fn catalog_page(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
         self.catalog_pages += 1;
         if let Some(error) = v.get("error") {
             if core.config.catalog_only {
                 return Err(format!("Codex did not list its models: {}", error_text(error)).into());
             }
-            return core.emit(Event::Notice(
+            core.emit(Event::Notice(
                 "Model catalog unavailable from this CLI; explicit model IDs remain supported"
                     .into(),
-            ));
+            ))?;
+            self.catalog_done = true;
+            return self.release_ready(core);
         }
         for (model, effort) in default_efforts(&v["result"]["data"]) {
             if self.model_efforts.len() < 256 {
@@ -615,7 +654,8 @@ impl CodexProtocol {
             // The whole list is in; the skills, then `Ready`.
             self.request_skills(core, false).await?;
         }
-        Ok(())
+        self.catalog_done |= !more;
+        self.release_ready(core)
     }
 
     /// A request from Codex: an approval for the running turn is shown to the

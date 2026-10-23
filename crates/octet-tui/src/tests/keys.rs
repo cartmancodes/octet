@@ -90,6 +90,7 @@ async fn the_popup_closes_before_the_editor_and_follows_a_paste() {
         kind: composer::Kind::Command,
         items: vec!["/reconnect".into()],
         selected: 0,
+        moved: false,
         start: 0,
     });
     paste(&mut app, "port the bug");
@@ -605,6 +606,7 @@ fn accepting_a_model_suggestion_inserts_only_the_name() {
         kind: composer::Kind::Model,
         items: vec!["gpt-6-astra · codex".into()],
         selected: 0,
+        moved: false,
         start: 7,
     });
     crate::input::accept_completion(&mut app);
@@ -785,6 +787,48 @@ async fn a_whole_name_after_a_sub_provider_goes_by_the_prefix_rule() {
         selection.model.as_deref(),
         Some("opencode/glm-5.3-flash-free")
     );
+}
+#[tokio::test]
+async fn a_row_arrowed_to_after_a_whole_name_is_the_one_picked() {
+    // `gpt-5.5` alone goes to Codex by its prefix, but a user who arrows to
+    // opencode's row has picked that one.
+    let mut app = codex_picker_app();
+    let m = |s: &str| octet_core::ModelInfo {
+        selection: s.into(),
+        id: Some(s.into()),
+        name: s.into(),
+        description: String::new(),
+    };
+    app.event(octet_core::Event::Models(vec![
+        m("gpt-6-astra"),
+        m("gpt-5.5"),
+    ]));
+    app.models.catalogs.set(
+        octet_core::Engine::OPENCODE,
+        vec![m("openai/gpt-5.5")],
+        std::time::SystemTime::now(),
+    );
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/model gpt-5.5").await;
+    let items = picker(&app).items.clone();
+    let target = items
+        .iter()
+        .position(|item| item.contains("openai/gpt-5.5"))
+        .unwrap_or_else(|| panic!("opencode's row is listed: {items:?}"));
+    for _ in 0..items.len() {
+        key_action(&mut app, &vendor, key(KeyCode::Up)).await;
+    }
+    for _ in 0..target {
+        key_action(&mut app, &vendor, key(KeyCode::Down)).await;
+    }
+    assert_eq!(picker(&app).selected, target);
+    let Action::Exit(Exit::Model(selection)) =
+        key_action(&mut app, &vendor, key(KeyCode::Enter)).await
+    else {
+        panic!("expected a model switch");
+    };
+    assert_eq!(selection.provider, octet_core::Engine::OPENCODE);
+    assert_eq!(selection.model.as_deref(), Some("openai/gpt-5.5"));
 }
 /// A Codex interface whose list has no `default`, beside Claude's that does.
 fn codex_picker_app() -> App {

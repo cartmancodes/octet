@@ -397,7 +397,7 @@ pub(crate) struct App {
     pub(crate) last_width: u16,
     /// The permission mode the user last chose (at launch, Shift+Tab or
     /// `/mode`), which a vendor may have refused: a switch to another
-    /// provider says when that one starts in another.
+    /// provider says when it asks that one for another.
     pub(crate) mode_chosen: octet_core::Mode,
     /// The command running now was refused (`App::refuse`), so its typed
     /// line stays; reset before each command.
@@ -1060,6 +1060,7 @@ impl App {
                 }
             }
             Event::Tool(call) => {
+                self.flush_marker();
                 self.chat.reply_break = true;
                 self.conn.activity = State::tool(&call);
                 self.tool(call);
@@ -1069,6 +1070,7 @@ impl App {
                 detail,
                 summary,
             } => {
+                self.flush_marker();
                 let first = self.overlay.approvals.is_empty();
                 let summary = octet_core::ApprovalSummary {
                     action: clean(&summary.action),
@@ -1096,11 +1098,7 @@ impl App {
             }
             Event::Usage(text) => self.conn.usage = clean(&text),
             Event::Finished { outcome } => {
-                // A tail held as a possible goal marker was not one.
-                let held = self.chat.marker.flush();
-                if !held.is_empty() {
-                    self.reply_text(&held);
-                }
+                self.flush_marker();
                 self.calls_over();
                 self.conn.end_turn();
                 self.clear_status(StatusKind::Cancelling);
@@ -1151,6 +1149,20 @@ impl App {
                 self.conn.activity = State::Error;
             }
             Event::Stopped => {
+                // A resumed session that stops with an error before it opens
+                // may have been refused its model (`/resume N` asks for the
+                // journal's, which opencode's rotating free models may drop);
+                // /model keeps the session, so it can open with another.
+                if self.conn.phase == ConnPhase::Connecting
+                    && self.conn.activity == State::Error
+                    && self.conn.resumes
+                    && self.conn.requested_model.is_some()
+                {
+                    self.note(format!(
+                        "/model {} <model> resumes the same session with another model",
+                        self.conn.engine
+                    ));
+                }
                 // A cancelled connection stops without finishing a turn.
                 self.calls_over();
                 self.clear_status(StatusKind::Cancelling);
@@ -1245,6 +1257,15 @@ impl App {
     /// turn, for `/copy`.
     pub(crate) fn last_reply(&self) -> Option<&str> {
         (!self.chat.reply.is_empty()).then_some(self.chat.reply.as_str())
+    }
+    /// Shows a tail held as a possible start of the goal marker: the turn's
+    /// end, a tool call or an approval shows it was none, and it belongs to
+    /// the reply before them.
+    fn flush_marker(&mut self) {
+        let held = self.chat.marker.flush();
+        if !held.is_empty() {
+            self.reply_text(&held);
+        }
     }
     /// Streamed reply text, the goal marker already out: kept for `/copy`
     /// and appended to the reply on screen.

@@ -86,9 +86,14 @@ pub const REJECT_MODE: &str = "reject-mode";
 /// Claude launch argument: run a `SessionStart` hook before the handshake's
 /// reply, whose frames name the session, as Claude does with a plugin's hook.
 pub const START_HOOK: &str = "start-hook";
+/// Claude launch argument: run a slow `SessionStart` hook whose frames, which
+/// name the session, come after the handshake's reply and before any turn.
+pub const SLOW_START_HOOK: &str = "slow-start-hook";
 
 /// Codex `--model`: refuse to open the thread.
 pub const REFUSE_THREAD: &str = "refuse-thread";
+/// Codex `--model`: refuse to start a compaction.
+pub const REFUSE_COMPACT: &str = "refuse-compact";
 /// Codex `--model`: report a stricter policy than asked for.
 pub const REPORT_STRICTER: &str = "report-stricter";
 

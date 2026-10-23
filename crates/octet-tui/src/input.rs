@@ -83,6 +83,7 @@ pub(crate) fn open_mentions(app: &mut App, start: usize) {
         kind: composer::Kind::File,
         items: Vec::new(),
         selected: 0,
+        moved: false,
         start,
     });
     refresh_completion(app);
@@ -140,6 +141,7 @@ fn refresh_picker(
         return;
     };
     let (items, mut selected) = items(app, query);
+    let mut moved = false;
     // The same list: keep the highlight where the arrows left it.
     if let Some(open) = app
         .composer
@@ -148,11 +150,13 @@ fn refresh_picker(
         .filter(|c| c.kind == kind && c.start == start && c.items == items)
     {
         selected = open.selected;
+        moved = open.moved;
     }
     app.composer.completion = Some(composer::Completion {
         kind,
         items,
         selected,
+        moved,
         start,
     });
 }
@@ -301,13 +305,13 @@ fn send_or_queue(app: &mut App, vendor: &dyn Vendor, prompt: Prompt) -> bool {
 /// `sub/` of one (`gpt-5.5` for `openai/gpt-5.5`). Such a name is resolved
 /// as typed, so a provider's leading word (Codex's `gpt-`) comes before
 /// that `sub/` match, as `/model NAME` decides; the highlighted row would
-/// skip that.
+/// skip that. Once the user has arrowed to a row, that row is the pick.
 fn typed_a_model(app: &App) -> bool {
     if app
         .composer
         .completion
         .as_ref()
-        .is_none_or(|c| c.kind != composer::Kind::Model)
+        .is_none_or(|c| c.kind != composer::Kind::Model || c.moved)
     {
         return false;
     }
@@ -602,10 +606,14 @@ fn completion_key(app: &mut App, key: KeyEvent) -> Option<Action> {
         return None;
     }
     match key.code {
-        KeyCode::Up => completion.selected = completion.selected.saturating_sub(1),
+        KeyCode::Up => {
+            completion.selected = completion.selected.saturating_sub(1);
+            completion.moved = true;
+        }
         KeyCode::Down => {
             completion.selected =
                 (completion.selected + 1).min(completion.items.len().saturating_sub(1));
+            completion.moved = true;
         }
         KeyCode::Tab | KeyCode::Enter => accept_completion(app),
         KeyCode::Esc => app.composer.completion = None,

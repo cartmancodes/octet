@@ -113,7 +113,7 @@ pub(crate) fn ago(now: std::time::SystemTime, then: std::time::SystemTime) -> St
 /// Hides the goal completion marker (`[[OCTET_GOAL_COMPLETE]]`) from
 /// streamed reply text: it is Octet's own signal, not part of the reply.
 /// A tail that may be the marker's start is held until the next text
-/// settles it, or `flush` at the turn's end.
+/// settles it, or `flush` at a tool call, an approval or the turn's end.
 #[derive(Default)]
 pub(crate) struct MarkerFilter {
     held: String,

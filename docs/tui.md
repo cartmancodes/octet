@@ -257,7 +257,9 @@ does not take the level falls back to its default, with a notice.
 Codex takes it with each turn, so a change applies from the next turn.
 Codex keeps a turn's level for the turns after it (and in the thread, for
 `--resume`), so `/effort default` sends the level Codex picks itself: the
-`model_reasoning_effort` of its config, else the model's own default.
+`model_reasoning_effort` of its config, else the model's own default. A
+resumed or forked Codex thread with no level chosen sends that level with its
+first turn too, and is ready once Octet has read it.
 opencode sets it in the open session: `--effort` once the session opens,
 after the model and before the first prompt (a level the model does not
 list is dropped with a notice and the session goes on), and `/effort` at
@@ -325,8 +327,10 @@ is `ask`; the mode is not remembered between launches but is kept across
 `/model`, `/new` and `/reconnect`. It is the mode the last provider confirmed, so
 one that refused your choice (Claude's `auto` on Haiku) passes its own on. A
 switch to another provider (`/model`, or `/resume` of another provider's
-session) notes the mode it starts in, and when that is not the one you last
-chose, says so ("opencode starts in ask, not auto as you last chose"). Full
+session) notes the mode it asks the new provider for, which that provider
+confirms once ready (the header then shows the mode it took), and when that is
+not the one you last chose, says so ("Asking opencode for ask, not auto as you
+last chose"). Full
 access carried to another provider is a warning: "Full access carried to
 Claude: no permission checks. /mode ask to turn them on". `/mode` alone shows
 the table for the current provider. The header shows the selected mode; during a Codex or opencode turn
@@ -451,7 +455,9 @@ Enter is refused with the usual hint and the picker stays open. A name typed
 in full (one a list holds, what follows the `sub/` of a listed ID, or `default`)
 is sent as typed and resolved like any `/model NAME`, so `default` stays the
 current provider's and `gpt-5.5` goes to Codex by its `gpt-` prefix though the
-picker shows opencode's `openai/gpt-5.5`; so is a name that matches nothing. A partial name takes the highlighted line; to send a custom
+picker shows opencode's `openai/gpt-5.5`; so is a name that matches nothing.
+Once you move the highlight with Up/Down, Enter takes that line whatever is
+typed. A partial name takes the highlighted line; to send a custom
 name that begins like a listed one, press Esc, then Enter.
 
 The current provider's list comes live from its CLI with each connection
@@ -606,8 +612,12 @@ vendor context; `--resume VENDOR_SESSION_ID` does the same on a later launch.
 first: provider, session ID, model, age and the session's first prompt (from its
 oldest journal listed), then its latest prompt when that differs. `/resume N` reopens
 entry N, switching provider when it belongs to the other vendor, in a fresh
-view. The list comes from Octet's own journals (at most the first 64 KiB of
-each, skipping a torn last line); reconnects of one session show as one entry.
+view, with the model its journal names; when the provider refuses that model
+(opencode's free models come and go), the session stops and says that
+`/model PROVIDER MODEL` resumes the same session with another. The list comes from Octet's own journals (at most the first 64 KiB of
+each, skipping a torn last line, and the last 256 KiB for the latest prompt,
+which is left out when it is further back); reconnects of one session show as
+one entry.
 Reconnection does not load the earlier local transcript into the viewport yet.
 `/new` starts fresh vendor context without deleting previous journals.
 

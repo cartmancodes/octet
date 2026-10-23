@@ -329,7 +329,10 @@ Claude Code and Codex CLIs.
   keeps the old permissions until a new turn starts.
 - `/effort default` did not reset Codex's reasoning effort: Codex kept the
   last level for later turns. Octet now sends the level Codex picks itself
-  (its config's, else the model's default).
+  (its config's, else the model's default). A resumed or forked thread with
+  no level chosen goes back to it from its first turn: such a session is
+  ready only once Octet has read Codex's config, so a headless `--resume`
+  no longer runs at the level the thread was left at.
 - Consecutive Codex messages ran together ("…complete it.Unable to…"); each
   now starts a paragraph. In `--print`, text after a tool call starts a
   paragraph too, and a denied approval's note starts its own line.
@@ -344,11 +347,13 @@ Claude Code and Codex CLIs.
 - Full access carried to another provider without a word; that switch now
   shows a warning ("Full access carried to Claude: no permission checks.
   /mode ask to turn them on"). Every switch to another provider notes the
-  mode it starts in, and says when that is not the mode you last chose (a
+  mode it asks that provider for ("Asking opencode for auto"; the header
+  shows what it took), and says when that is not the mode you last chose (a
   provider that refused `auto` no longer drops it silently for the rest).
 - `/model gpt-5.5` + Enter switched to opencode's `openai/gpt-5.5`: the
   picker's highlighted row won over the name rules. A whole name after a
-  `sub/` is now resolved as typed, so Codex's `gpt-` prefix comes first.
+  `sub/` is now resolved as typed, so Codex's `gpt-` prefix comes first;
+  once you arrow to a row, Enter takes that row.
 - A command refused with "Finish or cancel the current turn first" (or
   "Wait for the connection") cleared the prompt box; its line now stays.
 - Esc from the `/skills` picker left `/skills ` in the prompt, so the next
@@ -356,10 +361,25 @@ Claude Code and Codex CLIs.
   line, and Enter on a filter that matches nothing says so.
 - The goal completion marker `[[OCTET_GOAL_COMPLETE]]` showed in the
   conversation; it is now hidden there and from `/copy` (the journal keeps
-  the reply as sent).
+  the reply as sent). A reply tail that might have begun it (`[`) shows
+  before a tool call or approval that follows, not after it.
 - `/sessions` labelled a reconnected session with the first prompt of its
   newest journal, neither its first nor its latest. It now shows the
-  session's first prompt, and its latest when that differs.
+  session's first prompt, and its latest when that differs, read from the
+  end of the newest journal (left out when it is further back than 256 KiB).
+- `/resume N` of a session whose model the provider no longer offers
+  (opencode's free models rotate) stopped with only the refusal; it now adds
+  that `/model PROVIDER MODEL` resumes the same session with another model.
+- A Claude plugin's `SessionStart` hook names the new session before Claude
+  has saved it. Octet took that ID: `--print` and `--rpc` hung (their prompt
+  was refused as busy), and the session ID was then wiped, so `/session` said
+  none and every reconnect started a new session. The ID is now taken only
+  from a turn's frames, which name it again once Claude has saved it.
+- A Claude local command (such as `/context`) made the header and
+  `/session` name the model `<synthetic>`; that marker is no model now.
+- A Claude session resumed with no `--model` was labelled with the
+  catalog's default (Opus) until its first turn; the header now names the
+  resumed session's own model, unconfirmed.
 - The offline demo's reply named only `--engine codex` and `--engine
   claude`; it names `--engine opencode` too.
 - The approval dialog had no frame, so on a wide screen the conversation
