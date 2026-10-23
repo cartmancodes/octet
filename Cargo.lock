@@ -716,6 +716,7 @@ dependencies = [
  "futures-util",
  "getrandom",
  "octet-core",
+ "octet-proc",
  "octet-store",
  "octet-testkit",
  "p256",
