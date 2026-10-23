@@ -35,7 +35,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 /// `ACP.prompt` against this file; run the protocol gate's opencode
 /// `command-expansion`, `lockdown` and `subagent` scenarios against it
 /// (`docs/rust/protocol-gate.md`), which must all pass; then add it here.
-pub(super) const VERIFIED_VERSIONS: &[&str] = &["1.18.25"];
+pub const VERIFIED_VERSIONS: &[&str] = &["1.18.25"];
 
 /// The most characters of a reported version Octet shows.
 const MAX_VERSION: usize = 64;
@@ -87,6 +87,18 @@ fn built_ins() -> Book {
             ),
         ),
     ])
+}
+
+/// The built-in commands Octet's check knows, each name and the
+/// description opencode lists it with: what the protocol gate compares the
+/// running opencode's list with.
+pub fn built_in_descriptions() -> Vec<(String, String)> {
+    let mut built_ins: Vec<(String, String)> = built_ins()
+        .into_iter()
+        .map(|(name, definition)| (name, definition.description))
+        .collect();
+    built_ins.sort();
+    built_ins
 }
 
 /// The book from `opencode debug config`'s `config` and `opencode debug
@@ -269,7 +281,7 @@ pub(super) fn js_space(c: char) -> bool {
 /// `$ARGUMENTS` by `args` with JavaScript's replacement patterns, and
 /// `args` appended on a line of its own when the template takes none.
 /// `None` when it would be longer than [`MAX_EXPANDED`].
-pub(super) fn expand(template: &str, args: &str) -> Option<String> {
+pub fn expand(template: &str, args: &str) -> Option<String> {
     let words = words(args);
     // The template as text between `$N`s, each with the number after it.
     let mut pieces: Vec<(&str, Option<u128>)> = Vec::new();

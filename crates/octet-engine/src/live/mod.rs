@@ -25,7 +25,10 @@ pub use image::{
     IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment, ImageError, check_inline, encoded_len,
 };
 pub use mode::Mode;
-pub use opencode::opencode_stray_reply;
+pub use opencode::{
+    OPENCODE_VERIFIED_VERSIONS, opencode_built_in_commands, opencode_command_expansion,
+    opencode_stray_reply,
+};
 
 /// The longest prompt, in bytes, a user may type (or a command may send as
 /// its displayed text).

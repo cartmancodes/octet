@@ -4,8 +4,8 @@
 //! needs, so it checks the contract Octet ships.
 #![forbid(unsafe_code)]
 use octet_engine::live::{
-    Config, Engine, claude_stray_reply, codex_stray_reply, launch_args, launch_env,
-    opencode_stray_reply,
+    Config, Engine, OPENCODE_VERIFIED_VERSIONS, claude_stray_reply, codex_stray_reply, launch_args,
+    launch_env, opencode_built_in_commands, opencode_command_expansion, opencode_stray_reply,
 };
 use octet_gate::{
     Evidence, GateError, GateProcess, claude_fixture_allow, claude_fixture_hook_response,
@@ -25,7 +25,7 @@ use std::{
 use tokio::time::Instant;
 
 /// Every scenario the gate runs.
-const SCENARIOS: [&str; 16] = [
+const SCENARIOS: [&str; 17] = [
     "initialize",
     "simple",
     "interrupt",
@@ -42,9 +42,11 @@ const SCENARIOS: [&str; 16] = [
     "failure",
     "lockdown",
     "subagent",
+    "command-expansion",
 ];
-/// The scenarios opencode runs; `lockdown` and `subagent` are its alone.
-const OPENCODE_SCENARIOS: [&str; 9] = [
+/// The scenarios opencode runs; `lockdown`, `subagent` and
+/// `command-expansion` are its alone.
+const OPENCODE_SCENARIOS: [&str; 10] = [
     "initialize",
     "simple",
     "interrupt",
@@ -54,6 +56,7 @@ const OPENCODE_SCENARIOS: [&str; 9] = [
     "fork",
     "lockdown",
     "subagent",
+    "command-expansion",
 ];
 
 /// Whether `scenario` runs in `lockdown`'s workspace: a project config and
@@ -108,9 +111,13 @@ fn options() -> Result<Opt, &'static str> {
     let supported = if engine == Engine::OPENCODE {
         OPENCODE_SCENARIOS.contains(&scenario.as_str())
     } else if engine == Engine::CODEX {
-        !claude_only.contains(&scenario.as_str()) && !locked_down(&scenario)
+        !claude_only.contains(&scenario.as_str())
+            && !locked_down(&scenario)
+            && scenario != "command-expansion"
     } else {
-        !codex_only.contains(&scenario.as_str()) && !locked_down(&scenario)
+        !codex_only.contains(&scenario.as_str())
+            && !locked_down(&scenario)
+            && scenario != "command-expansion"
     };
     if !supported {
         return Err("scenario is unsupported by selected engine");
@@ -177,7 +184,8 @@ async fn version(binary: &Path) -> String {
 /// Octet's own arguments and environment for this engine, plus what the
 /// scenario needs: Claude's tool list and, for `mcp`, the fixture server;
 /// for opencode's `lockdown` and `subagent`, the user configuration file
-/// that allows the fixture command.
+/// that allows the fixture command; for `command-expansion`, the one that
+/// defines its commands.
 fn vendor_launch(
     opt: &Opt,
     cwd: &Path,
@@ -194,6 +202,12 @@ fn vendor_launch(
         env.push((
             "OPENCODE_CONFIG".into(),
             cwd.join(LOCKDOWN_USER_CONFIG).into_os_string(),
+        ));
+    }
+    if opt.engine == Engine::OPENCODE && opt.scenario == "command-expansion" {
+        env.push((
+            "OPENCODE_CONFIG".into(),
+            cwd.join(EXPANSION_CONFIG).into_os_string(),
         ));
     }
     if opt.engine == Engine::CLAUDE {
@@ -791,6 +805,94 @@ const GATE_COMMAND: &str = "octet-gate-command";
 const GATE_COMMAND_DESCRIPTION: &str = "Octet gate command";
 /// Where in the workspace `lockdown` keeps its user rule.
 const LOCKDOWN_USER_CONFIG: &str = "user-config.json";
+/// Where in the workspace `command-expansion` keeps the user configuration
+/// that defines its commands.
+const EXPANSION_CONFIG: &str = "expansion-config.json";
+/// `command-expansion`'s commands, `octet-gate-NAME`, each with its template
+/// and the arguments it is sent with. Each shell command its expansion runs
+/// touches `marks/NAME`; Octet's emulation of opencode's `command()`
+/// predicts which do. They cover a template's own shell, `$1` (alone, and
+/// with a quoted word), `$ARGUMENTS` with JavaScript's `` $' `` pattern,
+/// arguments appended to a template that takes none, and the highest `$N`
+/// taking every word from there on, which here runs none.
+const EXPANSION_CASES: [(&str, &str, &str); 6] = [
+    ("template", "Gate !`touch marks/template`", ""),
+    ("bang", "Gate !$1", "`touch marks/bang`"),
+    ("quote", "Gate !$1", "'`touch marks/quote`' x"),
+    ("tail", "Gate !$ARGUMENTS`touch marks/tail`", "$'"),
+    ("append", "Gate", "!`touch marks/append`"),
+    ("slice", "Gate $2", "!`touch marks/slice` x"),
+];
+/// How long `command-expansion` waits for a command's turn to show life
+/// before it cancels it anyway.
+const EXPANSION_TURN_WAIT: Duration = Duration::from_secs(20);
+/// How long after a command's turn shows life `command-expansion` lets it
+/// run before cancelling it: its shell has run by then.
+const EXPANSION_GRACE: Duration = Duration::from_millis(500);
+
+/// `command-expansion`'s user configuration: its commands.
+fn expansion_config() -> String {
+    let commands: serde_json::Map<String, Value> = EXPANSION_CASES
+        .iter()
+        .map(|(name, template, _)| {
+            (
+                format!("octet-gate-{name}"),
+                json!({"description": "Octet gate", "template": template}),
+            )
+        })
+        .collect();
+    json!({"command": commands}).to_string()
+}
+
+/// The shell commands opencode runs for `text`: each `` !`cmd` ``, matched
+/// as opencode's ``/!`([^`]+)`/g`` matches them, in order.
+fn shell_commands(text: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(start) = text[at..].find("!`").map(|start| at + start) {
+        let body = start + 2;
+        match text[body..].find('`') {
+            Some(0) | None => at = start + 1,
+            Some(end) => {
+                found.push(&text[body..body + end]);
+                at = body + end + 1;
+            }
+        }
+    }
+    found
+}
+
+/// The markers Octet's emulation predicts `command-expansion` leaves,
+/// sorted.
+fn predicted_markers() -> Vec<String> {
+    let mut markers: Vec<String> = EXPANSION_CASES
+        .iter()
+        .filter_map(|(_, template, args)| opencode_command_expansion(template, args))
+        .flat_map(|text| {
+            shell_commands(&text)
+                .into_iter()
+                .filter_map(|command| command.strip_prefix("touch marks/"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    markers.sort();
+    markers
+}
+
+/// The markers in `cwd`'s `marks` folder, sorted.
+fn markers_left(cwd: &Path) -> Vec<String> {
+    let mut markers: Vec<String> = fs::read_dir(cwd.join("marks"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .take(64)
+        .collect();
+    markers.sort();
+    markers
+}
+
 /// How long one `opencode session` command may run.
 const OPENCODE_SESSION_LIMIT: Duration = Duration::from_secs(15);
 
@@ -859,6 +961,10 @@ struct Opencode<'a> {
     /// The description opencode lists [`GATE_COMMAND`] with, once it lists
     /// its commands.
     gate_command: Option<String>,
+    /// The commands opencode lists, each name and description, bounded.
+    listed: Vec<(String, String)>,
+    /// The version opencode's `initialize` reply reports.
+    version: Option<String>,
 }
 
 impl<'a> Opencode<'a> {
@@ -872,6 +978,8 @@ impl<'a> Opencode<'a> {
             turn: None,
             replayed: 0,
             gate_command: None,
+            listed: Vec::new(),
+            version: None,
         }
     }
 
@@ -922,6 +1030,17 @@ impl<'a> Opencode<'a> {
                         .unwrap_or_default()
                         .to_owned()
                 });
+            self.listed = update["availableCommands"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|command| {
+                    let name = command["name"].as_str()?;
+                    let description = command["description"].as_str().unwrap_or_default();
+                    Some((name.to_owned(), description.to_owned()))
+                })
+                .take(OPENCODE_TOOL_LIMIT)
+                .collect();
         }
         let Some(turn) = self.turn.as_mut() else {
             if update["sessionUpdate"] != "available_commands_update" {
@@ -1008,6 +1127,10 @@ impl<'a> Opencode<'a> {
         {
             return Err(GateError::Protocol("initialize error"));
         }
+        self.version = reply
+            .pointer("/result/agentInfo/version")
+            .and_then(Value::as_str)
+            .map(|version| version.chars().take(64).collect());
         Ok(())
     }
 
@@ -1065,6 +1188,111 @@ impl<'a> Opencode<'a> {
         Ok(())
     }
 
+    /// Sends the slash command `text` and cancels its turn as soon as it
+    /// shows life (its shell has run by then, before the model's reply),
+    /// or after [`EXPANSION_TURN_WAIT`]; waits for the prompt's reply.
+    async fn command_then_cancel(&mut self, text: &str) -> Result<(), GateError> {
+        self.turn = Some(OpencodeTurn::default());
+        self.next_id += 1;
+        let id = self.next_id;
+        let params = json!({"sessionId":self.session,"prompt":[{"type":"text","text":text}]});
+        self.gate
+            .send(&json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":params}))
+            .await?;
+        let mut cancel_at = Instant::now() + EXPANSION_TURN_WAIT;
+        let mut alive = false;
+        let mut cancelled = false;
+        let reply = loop {
+            let frame = if cancelled {
+                self.gate.receive().await?
+            } else {
+                let Ok(frame) = tokio::time::timeout_at(cancel_at, self.gate.receive()).await
+                else {
+                    cancelled = true;
+                    let cancel = json!({"jsonrpc":"2.0","method":"session/cancel",
+                        "params":{"sessionId":self.session}});
+                    self.gate.send(&cancel).await?;
+                    continue;
+                };
+                frame?
+            };
+            if is_reply_to(&frame, id) {
+                break frame;
+            }
+            let this_session =
+                frame.pointer("/params/sessionId").and_then(Value::as_str) == Some(&self.session);
+            if !alive && this_session && method(&frame) == Some("session/update") {
+                alive = true;
+                cancel_at = Instant::now() + EXPANSION_GRACE;
+            }
+            self.other(&frame).await?;
+        };
+        self.turn = None;
+        if reply.get("error").is_some() {
+            return Err(GateError::Protocol("prompt error"));
+        }
+        let stop = reply
+            .pointer("/result/stopReason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.gate.record_stop_reason(stop);
+        Ok(())
+    }
+
+    /// `command-expansion`: sends each of [`EXPANSION_CASES`] as Octet sends
+    /// a command, in opencode's `build` agent so its shell runs, cancelling
+    /// each turn at once. It passes only when the markers left are exactly
+    /// those Octet's emulation predicts, opencode lists every case, and it
+    /// lists its built-in commands as Octet's check knows them. What it saw
+    /// goes in `extra`.
+    async fn expansion(&mut self, cwd: &Path, extra: &mut Value) -> Result<(), GateError> {
+        for (name, _, args) in EXPANSION_CASES {
+            let text = format!("/octet-gate-{name} {args}");
+            self.command_then_cancel(text.trim_end()).await?;
+        }
+        let predicted = predicted_markers();
+        let markers = markers_left(cwd);
+        let listed = |name: &str, description: Option<&str>| {
+            self.listed.iter().any(|(listed, shown)| {
+                listed == name && description.is_none_or(|description| description == shown)
+            })
+        };
+        let built_ins = opencode_built_in_commands();
+        let built_ins_listed = built_ins
+            .iter()
+            .all(|(name, description)| listed(name, Some(description)));
+        let cases_listed = EXPANSION_CASES
+            .iter()
+            .all(|(name, ..)| listed(&format!("octet-gate-{name}"), None));
+        *extra = json!({
+            "version": self.version,
+            "verified": self
+                .version
+                .as_deref()
+                .is_some_and(|version| OPENCODE_VERIFIED_VERSIONS.contains(&version)),
+            "predicted": predicted,
+            "markers": markers,
+            "built_ins": built_ins,
+            "built_ins_listed": built_ins_listed,
+        });
+        if !cases_listed {
+            return Err(GateError::Protocol(
+                "opencode does not list command-expansion's commands",
+            ));
+        }
+        if markers != predicted {
+            return Err(GateError::Protocol(
+                "opencode ran the commands' shell, but not as Octet's emulation predicts",
+            ));
+        }
+        if !built_ins_listed {
+            return Err(GateError::Protocol(
+                "opencode lists its built-in commands otherwise than Octet's check knows them",
+            ));
+        }
+        Ok(())
+    }
+
     /// Runs one prompt to its reply; the reply's stop reason and the turn.
     async fn prompt(&mut self, text: &str) -> Result<(String, OpencodeTurn), GateError> {
         self.turn = Some(OpencodeTurn::default());
@@ -1104,8 +1332,14 @@ fn opencode_prompt(scenario: &str) -> &'static str {
 }
 
 /// Runs the scenario's first connection: a session in Octet's `ask` agent
-/// on the free model, and its one prompt, checked.
-async fn opencode(gate: &mut GateProcess, scenario: &str, cwd: &Path) -> Result<(), GateError> {
+/// on the free model, and its one prompt, checked; for `command-expansion`,
+/// its commands in opencode's `build` agent, with what they did in `extra`.
+async fn opencode(
+    gate: &mut GateProcess,
+    scenario: &str,
+    cwd: &Path,
+    extra: &mut Value,
+) -> Result<(), GateError> {
     let mut acp = Opencode::new(gate, scenario);
     acp.initialize().await?;
     if scenario == "initialize" {
@@ -1113,6 +1347,10 @@ async fn opencode(gate: &mut GateProcess, scenario: &str, cwd: &Path) -> Result<
     }
     acp.open(cwd, None).await?;
     acp.set("model", OPENCODE_MODEL).await?;
+    if scenario == "command-expansion" {
+        acp.set("mode", "build").await?;
+        return acp.expansion(cwd, extra).await;
+    }
     acp.set("mode", OPENCODE_ASK).await?;
     let (stop, turn) = acp.prompt(opencode_prompt(scenario)).await?;
     // A finished prompt ends with `end_turn`. opencode 1.18.25 ends a
@@ -1190,10 +1428,14 @@ async fn opencode_reopen(
     Ok(replayed)
 }
 
+/// What an opencode scenario found: its status, the evidence, the updates a
+/// resume replayed, whether every child stopped, and what
+/// `command-expansion` saw.
+type OpencodeRun = (String, Evidence, u64, bool, Value);
+
 /// Runs an opencode scenario: one connection, and for `resume` and `fork` a
-/// second, in a new process. The status, the evidence, the updates a resume
-/// replayed, and whether every child stopped.
-async fn run_opencode(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evidence, u64, bool) {
+/// second, in a new process.
+async fn run_opencode(opt: &Opt, cwd: &Path, deadline: Instant) -> OpencodeRun {
     let spawn = |resume: Option<&str>| {
         let (args, env) = vendor_launch(opt, cwd, resume);
         GateProcess::spawn(
@@ -1205,11 +1447,20 @@ async fn run_opencode(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evid
             deadline,
         )
     };
+    let mut extra = Value::Null;
     let mut gate = match spawn(None) {
         Ok(gate) => gate,
-        Err(error) => return (format!("failed: {error}"), Evidence::default(), 0, false),
+        Err(error) => {
+            return (
+                format!("failed: {error}"),
+                Evidence::default(),
+                0,
+                false,
+                extra,
+            );
+        }
     };
-    let mut result = opencode(&mut gate, &opt.scenario, cwd).await;
+    let mut result = opencode(&mut gate, &opt.scenario, cwd, &mut extra).await;
     if result.is_ok() && opt.scenario == "lockdown" {
         result = opencode_command_contract(opt, cwd).await;
     }
@@ -1222,7 +1473,7 @@ async fn run_opencode(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evid
         Err(error) => format!("failed: {error}"),
     };
     if outcome != "passed" || !matches!(opt.scenario.as_str(), "resume" | "fork") {
-        return (outcome, evidence, 0, cleaned);
+        return (outcome, evidence, 0, cleaned, extra);
     }
     let Some(first) = evidence.session_id.clone() else {
         return (
@@ -1230,20 +1481,27 @@ async fn run_opencode(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evid
             evidence,
             0,
             cleaned,
+            extra,
         );
     };
     let mut second = match spawn(Some(&first)) {
         Ok(second) => second,
-        Err(error) => return (format!("failed: {error}"), evidence, 0, cleaned),
+        Err(error) => return (format!("failed: {error}"), evidence, 0, cleaned, extra),
     };
     let result = opencode_reopen(&mut second, &opt.scenario, cwd, &first).await;
     evidence.add_resumed(second.evidence());
     let report = second.shutdown().await;
     cleaned &= report.reaped && report.descendants_stopped;
     match result {
-        Ok(_) if !cleaned => ("failed: resumed child cleanup".into(), evidence, 0, cleaned),
-        Ok(replayed) => ("passed".into(), evidence, replayed, cleaned),
-        Err(error) => (format!("failed: {error}"), evidence, 0, cleaned),
+        Ok(_) if !cleaned => (
+            "failed: resumed child cleanup".into(),
+            evidence,
+            0,
+            cleaned,
+            extra,
+        ),
+        Ok(replayed) => ("passed".into(), evidence, replayed, cleaned, extra),
+        Err(error) => (format!("failed: {error}"), evidence, 0, cleaned, extra),
     }
 }
 
@@ -1474,13 +1732,21 @@ async fn run() -> i32 {
             return 2;
         }
     }
+    if opencode && opt.scenario == "command-expansion" {
+        let written = fs::write(cwd.join(EXPANSION_CONFIG), expansion_config())
+            .and_then(|()| fs::create_dir(cwd.join("marks")));
+        if written.is_err() {
+            eprintln!("cannot write the command-expansion configuration");
+            return 2;
+        }
+    }
     let started = Instant::now();
     let deadline = started + opt.timeout;
-    let (mut status, evidence, replayed, cleaned) = if opencode {
+    let (mut status, evidence, replayed, cleaned, extra) = if opencode {
         run_opencode(&opt, &cwd, deadline).await
     } else {
         let (status, evidence, cleaned) = run_scenario(&opt, &cwd, deadline).await;
-        (status, evidence, 0, cleaned)
+        (status, evidence, 0, cleaned, Value::Null)
     };
     let sessions_left = if opencode {
         opencode_cleanup(&opt, &cwd, &evidence.sessions).await
@@ -1510,6 +1776,9 @@ async fn run() -> i32 {
         record["sessions_left"] = json!(sessions_left);
         record["stop_reasons"] = json!(evidence.stop_reasons);
         record["replayed_updates"] = json!(replayed);
+        if opt.scenario == "command-expansion" {
+            record["expansion"] = extra;
+        }
     }
     let serialized = record.to_string();
     let serialized = serde_json::to_string_pretty(&record).unwrap_or(serialized);

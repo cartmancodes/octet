@@ -648,7 +648,7 @@ fn each_engine_runs_only_its_own_scenarios() {
     ] {
         assert!(refused("opencode", scenario), "{scenario}");
     }
-    for scenario in ["lockdown", "subagent"] {
+    for scenario in ["lockdown", "subagent", "command-expansion"] {
         assert!(refused("codex", scenario), "{scenario}");
         assert!(refused("claude", scenario), "{scenario}");
     }
@@ -703,6 +703,122 @@ fn opencode_lockdown_checks_what_octet_reads_of_a_command() {
     ] {
         let script = opencode_lockdown_script(description, &config);
         let (code, evidence) = probe_in(root.path(), "opencode", "lockdown", &script);
+        let evidence = evidence.unwrap();
+        assert_eq!(code, Some(1), "{evidence}");
+        assert!(
+            evidence["status"].as_str().unwrap().contains(why),
+            "{evidence}"
+        );
+    }
+}
+
+/// The markers `command-expansion`'s commands leave when opencode expands
+/// them as Octet's emulation predicts.
+const EXPANSION_MARKERS: [&str; 5] = ["append", "bang", "quote", "tail", "template"];
+
+/// A scripted `opencode` for `command-expansion`: it leaves `marks` in the
+/// workspace's `marks` folder (as the real one's shell would), lists its
+/// built-ins with `init` described as `init`, and the gate's commands, then
+/// ends each of the six prompts.
+fn opencode_expansion_script(marks: &[&str], init: &str) -> String {
+    let mut commands = vec![
+        json!({"name":"init","description":init}),
+        json!({"name":"review","description":"review changes [commit|branch|pr], defaults to uncommitted"}),
+    ];
+    for name in ["append", "bang", "quote", "slice", "tail", "template"] {
+        commands.push(json!({"name":format!("octet-gate-{name}"),"description":"Octet gate"}));
+    }
+    let mut frames = vec![
+        json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.18.25"}}}),
+        json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_a"}}),
+        opencode_update(
+            &json!({"sessionUpdate":"available_commands_update","availableCommands":commands}),
+        ),
+        opencode_confirm(3, "model", "opencode/deepseek-v4.1-flash-free"),
+        opencode_confirm(4, "mode", "build"),
+    ];
+    for id in 5..11 {
+        frames.push(json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}));
+    }
+    let wire = frames
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let touch: String = marks
+        .iter()
+        .map(|mark| [" marks/", mark].concat())
+        .collect();
+    format!(
+        "dir=\"$(dirname \"$0\")\"\n\
+         case \"$1\" in\n\
+         --version) echo 1.18.25; exit ;;\n\
+         session) if [ \"$2\" = delete ]; then echo \"$3\" >> \"$dir/deleted\"; else echo '[]'; fi; exit ;;\n\
+         esac\n\
+         mkdir -p marks; [ -n \"{touch}\" ] && touch{touch}\n\
+         cat <<'WIRE'\n{wire}\nWIRE\ncat > \"$dir/stdin\""
+    )
+}
+
+#[test]
+fn command_expansion_passes_when_opencode_runs_the_shell_octet_predicts() {
+    let root = octet_testkit::TempDir::new("octet-gate-expansion");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let script = opencode_expansion_script(&EXPANSION_MARKERS, "guided AGENTS.md setup");
+    let (code, evidence) = probe_in(root.path(), "opencode", "command-expansion", &script);
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(0), "{evidence}");
+    assert_eq!(evidence["status"], "passed");
+    assert_eq!(evidence["expansion"]["version"], "1.18.25");
+    assert_eq!(evidence["expansion"]["verified"], true);
+    assert_eq!(evidence["expansion"]["markers"], json!(EXPANSION_MARKERS));
+    // In auto (opencode's build agent), with Octet's launch environment,
+    // each command sent as Octet sends one.
+    let sent = std::fs::read_to_string(root.path().join("stdin")).unwrap();
+    let sent: Vec<Value> = sent
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        sent.iter().all(|frame| frame["jsonrpc"] == "2.0"),
+        "{sent:?}"
+    );
+    assert_eq!(sent[3]["params"]["value"], "build");
+    let prompts: Vec<&str> = sent
+        .iter()
+        .filter(|frame| frame["method"] == "session/prompt")
+        .filter_map(|frame| {
+            frame
+                .pointer("/params/prompt/0/text")
+                .and_then(Value::as_str)
+        })
+        .collect();
+    assert_eq!(prompts.len(), 6, "{prompts:?}");
+    assert!(
+        prompts.iter().all(|text| text.starts_with("/octet-gate-")),
+        "{prompts:?}"
+    );
+}
+
+#[test]
+fn command_expansion_fails_when_opencode_runs_other_shell_or_its_built_ins_drift() {
+    let root = octet_testkit::TempDir::new("octet-gate-expansion-drift");
+    std::fs::create_dir_all(root.path()).unwrap();
+    for (marks, init, why) in [
+        (
+            &["append", "bang", "quote", "slice", "tail", "template"][..],
+            "guided AGENTS.md setup",
+            "not as Octet's emulation predicts",
+        ),
+        (
+            &["append", "bang", "quote", "template"][..],
+            "guided AGENTS.md setup",
+            "not as Octet's emulation predicts",
+        ),
+        (&EXPANSION_MARKERS[..], "init", "built-in"),
+    ] {
+        let script = opencode_expansion_script(marks, init);
+        let (code, evidence) = probe_in(root.path(), "opencode", "command-expansion", &script);
         let evidence = evidence.unwrap();
         assert_eq!(code, Some(1), "{evidence}");
         assert!(

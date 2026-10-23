@@ -23,6 +23,11 @@ use tokio::time::Instant;
 
 mod commands;
 
+pub use commands::{
+    VERIFIED_VERSIONS as OPENCODE_VERIFIED_VERSIONS,
+    built_in_descriptions as opencode_built_in_commands, expand as opencode_command_expansion,
+};
+
 /// opencode's row in the provider table.
 pub(super) const PROVIDER: Provider = Provider {
     name: "opencode",
