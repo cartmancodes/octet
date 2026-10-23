@@ -67,16 +67,18 @@ impl GroupLeader {
     /// the group yet, and macOS does not signal it: the member dies and the child lives on. So
     /// once the leader has died (or a second has passed) the group is killed again,
     /// which gets the rest when the leader was the one forking: a dead process forks no more.
-    /// The leader stays unreaped throughout. A leader already reaped is not signalled at all.
-    pub fn kill_group(&self) {
+    /// The leader stays unreaped throughout. A leader already reaped is not signalled at all;
+    /// whether the group was.
+    pub fn kill_group(&self) -> bool {
         if !self.signal_group(libc::SIGKILL) {
-            return;
+            return false;
         }
         let deadline = std::time::Instant::now() + LEADER_DEATH;
         while self.leader() == Leader::Running && std::time::Instant::now() < deadline {
             std::thread::sleep(LOOK);
         }
         self.signal_group(libc::SIGKILL);
+        true
     }
 
     /// Waits, at most `limit`, for the leader to exit, without reaping it; whether it has.
