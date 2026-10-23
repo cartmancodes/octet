@@ -4855,6 +4855,194 @@ async fn a_quiet_opencode_subagent_in_auto_gets_a_notice() {
     wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
     stop(&handle, task).await;
 }
+/// A session in `mode` working in `dir`, ready.
+async fn opencode_session_in(
+    dir: &octet_testkit::TempDir,
+    mode: Mode,
+    limits: Limits,
+) -> (
+    octet_engine::live::Handle,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut c = opencode();
+    c.mode = mode;
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn_with_limits(c, limits);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    (handle, events, task)
+}
+/// What Octet says while a command waits for its check.
+fn checking(name: &str) -> String {
+    format!("Checking /{name} against opencode's definitions…")
+}
+#[tokio::test]
+async fn esc_while_an_opencode_command_waits_for_its_check_cancels_at_once() {
+    // The reading never ends; the session must not wait for it.
+    let dir = opencode_workspace(
+        "octet-opencode-check-esc",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let notice = checking(scenario::OPENCODE_SKILL);
+    timeout(
+        Duration::from_secs(5),
+        wait_for(
+            &mut events,
+            |e| matches!(e, Event::Notice(n) if *n == notice),
+        ),
+    )
+    .await
+    .expect("no notice that the command waits for its check");
+    let cancelled = tokio::time::Instant::now();
+    handle.interrupt();
+    let finished = timeout(
+        Duration::from_secs(25),
+        wait_for(&mut events, |e| matches!(e, Event::Finished { .. })),
+    )
+    .await
+    .expect("the turn never ended");
+    let took = cancelled.elapsed();
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Interrupted
+            }
+        ),
+        "{finished:?} after {took:?}"
+    );
+    assert!(took < Duration::from_millis(500), "Esc took {took:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn quitting_while_an_opencode_command_waits_for_its_check_stops_at_once() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-quit",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let notice = checking(scenario::OPENCODE_SKILL);
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Notice(n) if *n == notice),
+    )
+    .await;
+    let quit = tokio::time::Instant::now();
+    stop(&handle, task).await;
+    assert!(
+        quit.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        quit.elapsed()
+    );
+}
+#[tokio::test]
+async fn opencodes_frames_keep_coming_while_a_command_waits_for_its_check() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-frames",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    std::fs::write(dir.path().join("ticks"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let notice = checking(scenario::OPENCODE_SKILL);
+    timeout(
+        Duration::from_secs(5),
+        wait_for(
+            &mut events,
+            |e| matches!(e, Event::Notice(n) if *n == notice),
+        ),
+    )
+    .await
+    .expect("no notice that the command waits for its check");
+    // The fake lists its commands every 100 ms.
+    for _ in 0..3 {
+        timeout(
+            Duration::from_secs(1),
+            wait_for(&mut events, |e| matches!(e, Event::Skills(_))),
+        )
+        .await
+        .expect("opencode's frames stopped while the command waited");
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencodes_commands_are_read_when_it_lists_them_in_every_mode() {
+    for mode in [Mode::Auto, Mode::FullAccess] {
+        let dir = opencode_workspace(
+            "octet-opencode-read-at-connect",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+        );
+        let (handle, _events, task) = opencode_session_in(&dir, mode, Limits::default()).await;
+        let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !calls().contains("config") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{mode:?}: no reading: {:?}", calls()));
+        stop(&handle, task).await;
+    }
+}
+#[tokio::test]
+async fn a_reading_that_failed_in_the_background_is_tried_again_once() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-retry",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-fails"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    let configs = || calls().matches("config").count();
+    timeout(Duration::from_secs(5), async {
+        while configs() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no reading at connect");
+    // The background reading failed; one that works now is used.
+    std::fs::remove_file(dir.path().join("debug-fails")).unwrap();
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{} go", scenario::OPENCODE_SKILL)
+    );
+    assert_eq!(configs(), 2, "{}", calls());
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn compact_does_not_wait_for_a_reading_when_no_command_is_named_compact() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-compact",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle.send(Command::Compact).unwrap();
+    assert_eq!(turn_text(&mut events).await, "/compact");
+    stop(&handle, task).await;
+}
 #[test]
 fn the_fake_opencode_counts_every_debug_run_though_they_run_at_once() {
     // Octet runs `debug config` and `debug skill` side by side; the fake's

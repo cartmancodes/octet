@@ -119,7 +119,8 @@ pub(crate) fn session_command() {
 /// subagent (a definition that changed after Octet read it); then the
 /// commands in `fixture-commands.json`, when there is one. `skill` prints
 /// `fixture-skills.json`, or no skills. With `debug-fails` present, both
-/// exit 1; with `debug-hangs`, both wait a minute first.
+/// exit 1; with `debug-hangs`, both wait a minute first, and with
+/// `debug-delay-ms`, the milliseconds it holds.
 pub(crate) fn debug_command() {
     let what = env::args().nth(2).unwrap_or_default();
     // Appended in one write: runs side by side must not lose each other's.
@@ -128,6 +129,12 @@ pub(crate) fn debug_command() {
     }
     if fs::exists("debug-hangs").unwrap_or(false) {
         thread::sleep(Duration::from_secs(60));
+    }
+    if let Some(delay) = fs::read_to_string("debug-delay-ms")
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+    {
+        thread::sleep(Duration::from_millis(delay));
     }
     if fs::exists("debug-fails").unwrap_or(false) {
         process::exit(1);
@@ -286,7 +293,9 @@ impl OpencodeFixture {
     }
 
     /// Opens, resumes or forks the session. A resume replays its history
-    /// after its reply, before any prompt, as opencode 1.18.25 does.
+    /// after its reply, before any prompt, as opencode 1.18.25 does. With
+    /// `ticks` in the working directory, the commands are listed again
+    /// every 100 ms.
     fn open(&mut self, method: &str, v: &Value) {
         method.clone_into(&mut self.opened);
         self.session = match method {
@@ -311,6 +320,17 @@ impl OpencodeFixture {
             emit(&tool_call(sid, "replayed-call"));
         }
         list_commands(sid, false);
+        if fs::exists("ticks").unwrap_or(false) {
+            // Frames that keep coming whatever Octet does: the same list,
+            // every 100 ms for ten seconds.
+            let sid = sid.clone();
+            thread::spawn(move || {
+                for _ in 0..100 {
+                    thread::sleep(Duration::from_millis(100));
+                    list_commands(&sid, false);
+                }
+            });
+        }
     }
 
     /// Accepts any model; refuses modes once the model is `OPENCODE_REJECT_MODE`,

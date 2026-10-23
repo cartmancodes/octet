@@ -20,7 +20,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::oneshot, task::JoinHandle};
 
 /// The most commands one reading keeps; the rest are unknown, so refused.
 const MAX_COMMANDS: usize = 4096;
@@ -497,16 +497,46 @@ async fn debug_json(launch: &Launch, what: &str) -> Result<Value, String> {
         .map_err(|error| format!("opencode debug {what} printed no JSON ({error})"))
 }
 
+/// What a command's check decided.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Verdict {
+    /// It may be sent.
+    Send,
+    /// It must not be sent, for this reason.
+    Refuse(String),
+    /// Octet is still reading the definitions it needs: the command waits
+    /// (see [`Commands::finished`]).
+    Wait,
+}
+
+/// Where Octet's reading of opencode's commands is.
+#[derive(Default)]
+enum Reading {
+    /// None has started.
+    #[default]
+    None,
+    /// One is under way: its task, killed with its `opencode debug`
+    /// processes when dropped, and where its result arrives.
+    Running {
+        /// The task that reads.
+        task: JoinHandle<()>,
+        /// Its result, once it has one.
+        result: oneshot::Receiver<Result<Book, String>>,
+    },
+    /// It is done.
+    Done(Result<Book, String>),
+}
+
 /// The commands opencode lists, and what Octet read of them.
 #[derive(Default)]
 pub(super) struct Commands {
     /// The commands opencode last listed: each name and description,
     /// bounded.
     listed: Vec<(String, String)>,
-    /// What Octet read for the current list.
-    book: Option<Book>,
-    /// The reading under way.
-    reading: Option<JoinHandle<Result<Book, String>>>,
+    /// The reading for the current list.
+    reading: Reading,
+    /// A reading that failed has been tried again since the list changed.
+    retried: bool,
 }
 
 impl Drop for Commands {
@@ -517,9 +547,9 @@ impl Drop for Commands {
 
 impl Commands {
     /// opencode listed `list` (`availableCommands`). A list that differs
-    /// from the last drops what was read; with `launch`, a reading of the
-    /// new list starts.
-    pub(super) fn listed(&mut self, list: &Value, launch: Option<Launch>) {
+    /// from the last drops what was read, and a reading of the new list
+    /// starts with `launch`, for at most `limit`.
+    pub(super) fn listed(&mut self, list: &Value, launch: Launch, limit: Duration) {
         let listed: Vec<(String, String)> = list
             .as_array()
             .into_iter()
@@ -536,73 +566,117 @@ impl Commands {
             })
             .take(MAX_COMMANDS)
             .collect();
-        if listed == self.listed && (self.book.is_some() || self.reading.is_some()) {
+        if listed == self.listed && !matches!(self.reading, Reading::None) {
             return;
         }
         self.listed = listed;
-        self.book = None;
-        self.stop_reading();
-        if let Some(launch) = launch {
-            self.reading = Some(tokio::spawn(read(launch)));
-        }
+        self.retried = false;
+        self.start(launch, limit);
     }
 
-    /// Why `name` cannot be sent with `args` under `mode` (see
-    /// [`refusal`]), reading the commands first when nothing read is at
-    /// hand, for at most `limit`.
-    pub(super) async fn check(
+    /// Whether `name` may be sent with `args` under `mode` (see
+    /// [`refusal`]). A command that needs a reading not yet at hand waits;
+    /// one starts with `launch`, for at most `limit`, when none is under
+    /// way, and a reading that failed is tried once more. `compact`, when
+    /// opencode lists no command of that name, is its own summary and
+    /// needs none.
+    pub(super) fn verdict(
         &mut self,
         launch: Launch,
         limit: Duration,
         name: &str,
         args: &str,
         mode: Mode,
-    ) -> Option<String> {
+    ) -> Verdict {
         if !matches!(mode, Mode::Ask | Mode::AcceptEdits) {
-            return None;
-        }
-        if self.book.is_none() {
-            let mut reading = self
-                .reading
-                .take()
-                .unwrap_or_else(|| tokio::spawn(read(launch)));
-            let read = match tokio::time::timeout(limit, &mut reading).await {
-                Ok(Ok(read)) => read,
-                Ok(Err(error)) => Err(format!("the reading stopped: {error}")),
-                Err(_) => {
-                    reading.abort();
-                    Err(format!(
-                        "opencode debug took longer than {}",
-                        crate::live::driver::seconds(limit)
-                    ))
-                }
-            };
-            match read {
-                Ok(book) => self.book = Some(book),
-                Err(why) => {
-                    return Some(format!(
-                        "Octet could not read opencode's commands ({why}), so it cannot check /{}; in {} \
-                         Octet sends only commands it has checked, and did not send it. In auto, opencode's \
-                         own permission settings decide",
-                        short(name),
-                        mode.label()
-                    ));
-                }
-            }
+            return Verdict::Send;
         }
         let listed = self
             .listed
             .iter()
             .find(|(listed, _)| listed == name)
-            .map(|(_, description)| description.as_str());
-        refusal(self.book.as_ref()?, listed, name, args, mode)
+            .map(|(_, description)| description.clone());
+        if name == "compact" && listed.is_none() {
+            return Verdict::Send;
+        }
+        self.poll();
+        match &self.reading {
+            Reading::Running { .. } => Verdict::Wait,
+            Reading::Done(Ok(book)) => refusal(book, listed.as_deref(), name, args, mode)
+                .map_or(Verdict::Send, Verdict::Refuse),
+            Reading::Done(Err(_)) if !self.retried => {
+                self.retried = true;
+                self.start(launch, limit);
+                Verdict::Wait
+            }
+            Reading::Done(Err(why)) => Verdict::Refuse(format!(
+                "Octet could not read opencode's commands ({why}), so it cannot check /{}; in {} \
+                 Octet sends only commands it has checked, and did not send it. In auto, opencode's \
+                 own permission settings decide",
+                short(name),
+                mode.label()
+            )),
+            Reading::None => {
+                self.start(launch, limit);
+                Verdict::Wait
+            }
+        }
+    }
+
+    /// Whether a reading is under way.
+    pub(super) fn reading(&mut self) -> bool {
+        self.poll();
+        matches!(self.reading, Reading::Running { .. })
+    }
+
+    /// Resolves once the reading under way is done; never while none is.
+    pub(super) async fn finished(&mut self) {
+        let Reading::Running { result, .. } = &mut self.reading else {
+            return std::future::pending().await;
+        };
+        let read = result
+            .await
+            .unwrap_or_else(|_| Err("the reading stopped".to_owned()));
+        self.reading = Reading::Done(read);
+    }
+
+    /// Takes the result of a reading that has one.
+    fn poll(&mut self) {
+        if let Reading::Running { result, .. } = &mut self.reading {
+            match result.try_recv() {
+                Ok(read) => self.reading = Reading::Done(read),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.reading = Reading::Done(Err("the reading stopped".to_owned()));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    /// Starts a reading with `launch`, for at most `limit`, in place of
+    /// any under way.
+    fn start(&mut self, launch: Launch, limit: Duration) {
+        self.stop_reading();
+        let (sender, result) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let read = tokio::time::timeout(limit, read(launch))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!(
+                        "opencode debug took longer than {}",
+                        crate::live::driver::seconds(limit)
+                    ))
+                });
+            let _ = sender.send(read);
+        });
+        self.reading = Reading::Running { task, result };
     }
 
     /// Stops the reading under way, if any; its `opencode debug` processes
     /// are killed with it.
     fn stop_reading(&mut self) {
-        if let Some(reading) = self.reading.take() {
-            reading.abort();
+        if let Reading::Running { task, .. } = std::mem::take(&mut self.reading) {
+            task.abort();
         }
     }
 }

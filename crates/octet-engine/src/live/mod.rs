@@ -57,9 +57,10 @@ pub struct Limits {
     /// takes the bytes inline: a file swapped for a FIFO, or on a stalled
     /// mount, must not hold the session.
     pub image_read: Duration,
-    /// Reading a vendor's command definitions before a command is sent
-    /// (opencode's `opencode debug config` and `debug skill`), for a
-    /// provider that checks a command first.
+    /// Reading a vendor's command definitions, for a provider that checks a
+    /// command before it is sent (opencode's `opencode debug config` and
+    /// `debug skill`). The session goes on meanwhile; a command that needs
+    /// the reading waits for it.
     pub command_check: Duration,
     /// Silence in a turn after a subagent starts before Octet says it may
     /// be waiting for a permission the vendor never passes on (opencode in

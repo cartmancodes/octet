@@ -26,19 +26,24 @@ struct Driver<P> {
     /// for the vendor (see `must_hold`): it starts once the switch is
     /// confirmed or refused, so a switch sent while idle lands before the
     /// next prompt, and fails unsent if the switch is reported unconfirmed.
-    /// While one is held no other command is read, so the command queue's
-    /// own bound (and its `Busy` refusal) still applies.
+    /// Or one that waits for the protocol (see `Protocol::must_wait`): it
+    /// is sent once that is done. While one is held no other command is
+    /// read, so the command queue's own bound (and its `Busy` refusal)
+    /// still applies; frames, timers, cancel and stop stay live.
     held: Option<Held>,
     /// The mode of the last switch sent to the vendor.
     switch_target: Option<Mode>,
 }
 
-/// A turn command held until a pending mode switch resolves.
+/// A turn command held until a pending mode switch resolves, or until
+/// what the protocol waits for is done.
 struct Held {
     /// The command, not yet sent.
     command: Command,
     /// Its number among turn commands, which a cancel may cover.
     turn: u64,
+    /// It waits for the protocol (`Protocol::must_wait`), not for a switch.
+    waits: bool,
 }
 
 /// Runs one session with protocol `P` until it stops.
@@ -137,10 +142,14 @@ impl<P: Protocol> Driver<P> {
                         } else if self.must_hold(&command) {
                             self.hold(command)?;
                         } else {
-                            self.on_command(command).await?;
+                            let turn = self.gate.last();
+                            self.dispatch(command, turn, false).await?;
                         }
                     }
                 },
+                // The held command's check (or whatever it waits for) is
+                // done: the loop's top sends or refuses it.
+                () = self.protocol.wait_over(), if self.held.as_ref().is_some_and(|held| held.waits) => {}
                 // Waits for room; the permits are released at once.
                 room = async { tx.reserve_many(HEADROOM + 1).await.map(drop) }, if !roomy => {
                     // The interface has gone: the session is over.
@@ -215,7 +224,11 @@ impl<P: Protocol> Driver<P> {
             _ => "sending your prompt",
         };
         let turn = self.gate.last();
-        self.held = Some(Held { command, turn });
+        self.held = Some(Held {
+            command,
+            turn,
+            waits: false,
+        });
         let target = self.switch_target.map_or("the new mode", Mode::label);
         self.core.emit(Event::Notice(format!(
             "Waiting for {} to confirm the switch to {target} before {what}",
@@ -223,11 +236,48 @@ impl<P: Protocol> Driver<P> {
         )))
     }
 
-    /// Starts the held turn once no switch is pending; one the user
-    /// cancelled meanwhile is recorded as interrupted, and one whose switch
-    /// went unconfirmed fails, neither of them sent.
+    /// Starts `command`, numbered `turn`, unless the protocol says it must
+    /// wait first: then it is held, saying so unless it already `waited`
+    /// (a reading tried again).
+    async fn dispatch(
+        &mut self,
+        command: Command,
+        turn: u64,
+        waited: bool,
+    ) -> Result<(), DriverError> {
+        let waits = if command.starts_turn() && self.core.phase == Phase::Idle {
+            self.protocol.must_wait(&self.core, &command)
+        } else {
+            None
+        };
+        let Some(what) = waits else {
+            return self.on_command(command).await;
+        };
+        self.held = Some(Held {
+            command,
+            turn,
+            waits: true,
+        });
+        if waited {
+            return Ok(());
+        }
+        self.core.emit(Event::Notice(format!(
+            "Checking /{what} against {}'s definitions…",
+            self.core.config.engine.title()
+        )))
+    }
+
+    /// Starts the held turn once no switch is pending, or once what it
+    /// waits for is done; one the user cancelled meanwhile is recorded as
+    /// interrupted, and one whose switch went unconfirmed fails, neither of
+    /// them sent.
     async fn release_held(&mut self, cancel: &watch::Receiver<u64>) -> Result<(), DriverError> {
-        if self.protocol.mode_change_pending() {
+        let still = match &self.held {
+            None => return Ok(()),
+            Some(held) if held.waits => self.protocol.waiting(),
+            Some(_) => self.protocol.mode_change_pending(),
+        };
+        if still {
             return Ok(());
         }
         let Some(held) = self.held.take() else {
@@ -235,10 +285,10 @@ impl<P: Protocol> Driver<P> {
         };
         if TurnGate::covers(held.turn, cancel) {
             self.cancelled_before_start(&held.command)
-        } else if self.protocol.take_switch_timed_out() {
+        } else if !held.waits && self.protocol.take_switch_timed_out() {
             self.unsent_behind_switch(&held.command)
         } else {
-            self.on_command(held.command).await
+            self.dispatch(held.command, held.turn, held.waits).await
         }
     }
 

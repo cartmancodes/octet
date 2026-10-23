@@ -353,9 +353,12 @@ opencode's slash commands and skills run in ways those agents cannot see,
 so in `ask` and `accept-edits` Octet checks each one before it sends it,
 against the definition opencode would run. It reads the definitions with
 `opencode debug config` and `opencode debug skill`, run with the session's own
-launch settings in its workspace, once for each command list opencode
-reports (at most 20 s), so a change opencode reports is read again. Octet does
-not send a command that:
+launch settings in its workspace, in every mode, once for each command list
+opencode reports (at most 20 s), so a change opencode reports is read again. A
+command sent before the reading is done waits for it ("Checking /name against
+opencode's definitions…"); the session goes on meanwhile, and Esc cancels the
+command. A reading that failed is tried once more when a command needs it.
+Octet does not send a command that:
 
 - names an agent other than the mode's (`agent: build`, say), whose
   permissions would apply instead of the mode's;

@@ -3,8 +3,8 @@
 //! permission modes, and the environment that starts it), the handshake, the
 //! model catalog, turns, skills and the probe.
 use super::{
-    ApprovalSummary, BoxFuture, Channels, Config, DriverError, Event, ImageAttachment, Limits,
-    Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
+    ApprovalSummary, BoxFuture, Channels, Command, Config, DriverError, Event, ImageAttachment,
+    Limits, Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
     activity::one_line,
     check_inline, deadline_after, limited,
     protocol::{Core, Phase, Protocol},
@@ -265,6 +265,38 @@ impl Protocol for OpencodeProtocol {
         std::mem::take(&mut self.switch_timed_out)
     }
 
+    /// A slash command waits while Octet reads the definitions its check
+    /// needs (see `commands::Commands::verdict`); it names the command.
+    fn must_wait(&mut self, core: &Core, command: &Command) -> Option<String> {
+        let prompt = match command {
+            Command::Prompt(text) => vec![json!({"type": "text", "text": text})],
+            Command::PromptWithDisplay { wire, .. } => vec![json!({"type": "text", "text": wire})],
+            Command::Skill { name, args, .. } => skill_prompt(name, args),
+            Command::Compact => vec![json!({"type": "text", "text": "/compact"})],
+            _ => return None,
+        };
+        let (name, args) = slash_command(&prompt)?;
+        if shell_refusal(&name, &args, core.mode).is_some() {
+            return None;
+        }
+        let verdict = self.commands.verdict(
+            commands::Launch::of(&core.config),
+            core.limits.command_check,
+            &name,
+            &args,
+            core.mode,
+        );
+        (verdict == commands::Verdict::Wait).then(|| short(&name))
+    }
+
+    fn waiting(&mut self) -> bool {
+        self.commands.reading()
+    }
+
+    fn wait_over(&mut self) -> impl Future<Output = ()> + Send {
+        self.commands.finished()
+    }
+
     fn deadline(&self) -> Option<Instant> {
         let mode = self.mode_request.as_ref().map(|request| request.deadline);
         [mode, self.probe_wait, self.subagent_quiet]
@@ -520,11 +552,11 @@ impl Protocol for OpencodeProtocol {
                 if core.config.catalog_only {
                     return self.probe_listed(core, list);
                 }
-                // Read the definitions now, while the mode asks, so the
-                // first command need not wait for them.
-                let launch = matches!(core.mode, Mode::Ask | Mode::AcceptEdits)
-                    .then(|| commands::Launch::of(&core.config));
-                self.commands.listed(list, launch);
+                // Read the definitions now, in every mode, so a command
+                // need not wait for them.
+                let launch = commands::Launch::of(&core.config);
+                self.commands
+                    .listed(list, launch, core.limits.command_check);
                 core.emit(Event::Skills(commands(list)))
             }
             // A resume replays the session's history before any prompt: it
@@ -631,12 +663,24 @@ impl OpencodeProtocol {
             }
             let launch = commands::Launch::of(&core.config);
             let limit = core.limits.command_check;
-            if let Some(refusal) = self
+            match self
                 .commands
-                .check(launch, limit, &name, &args, core.mode)
-                .await
+                .verdict(launch, limit, &name, &args, core.mode)
             {
-                return fail_turn(core, refusal);
+                commands::Verdict::Send => {}
+                commands::Verdict::Refuse(refusal) => return fail_turn(core, refusal),
+                // The driver holds a command until its check can be made
+                // (`must_wait`); one that reaches here unchecked is not sent.
+                commands::Verdict::Wait => {
+                    return fail_turn(
+                        core,
+                        format!(
+                            "Octet has not finished reading opencode's commands, so it did not send /{}; \
+                             send it again",
+                            short(&name)
+                        ),
+                    );
+                }
             }
         }
         self.turn_mode = Some(core.mode);

@@ -2,8 +2,8 @@
 //! supplies (`Protocol`). The driver loop in `driver.rs` joins the two; a new
 //! vendor implements `Protocol` in its own file and adds a provider row.
 use super::{
-    ApprovalSummary, Config, DriverError, EVENT_BYTES, Event, ImageAttachment, Limits, Mode,
-    Outcome, deadline_after, emit, mode::confirm_mode,
+    ApprovalSummary, Command, Config, DriverError, EVENT_BYTES, Event, ImageAttachment, Limits,
+    Mode, Outcome, deadline_after, emit, mode::confirm_mode,
 };
 use octet_proc::Process;
 use serde_json::Value;
@@ -304,6 +304,24 @@ pub(crate) trait Protocol: Default + Send {
     /// every turn until the vendor answers.
     fn mode_unsettled(&self) -> Option<Mode> {
         None
+    }
+    /// Whether `command`, a turn the session could start now, must wait
+    /// before it is sent, starting what it waits for: for opencode, a slash
+    /// command whose definitions Octet is still reading. `Some` names what
+    /// it waits for, for the notice; the driver holds the command, and the
+    /// session goes on, until [`Protocol::waiting`] is false.
+    fn must_wait(&mut self, _core: &Core, _command: &Command) -> Option<String> {
+        None
+    }
+    /// Whether what a command held by [`Protocol::must_wait`] waits for is
+    /// still under way.
+    fn waiting(&mut self) -> bool {
+        false
+    }
+    /// Resolves once what a held command waits for is done; never while
+    /// nothing is under way. Dropping it loses nothing.
+    fn wait_over(&mut self) -> impl Future<Output = ()> + Send {
+        std::future::pending()
     }
     /// The protocol's own timer, if one is armed.
     fn deadline(&self) -> Option<Instant> {
