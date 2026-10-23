@@ -404,34 +404,40 @@ fn image_word(chars: &[char], at: usize) -> Option<usize> {
 
 /// `text.replaceAll(pattern, replacement)` as JavaScript does it with a
 /// text pattern: `$$`, `$&`, `` $` `` and `$'` in `replacement` are a
-/// dollar, the match, and the text before and after it. `None` past
-/// [`MAX_EXPANDED`].
+/// dollar, the match, and the text before and after it. `None` as soon as
+/// the result would pass [`MAX_EXPANDED`]: every piece is counted before it
+/// is added, so the text never grows past the bound.
 fn replace_all(text: &str, pattern: &str, replacement: &str) -> Option<String> {
+    /// Adds `piece` to `out`, unless that would pass the bound.
+    fn add(out: &mut String, piece: &str) -> Option<()> {
+        (out.len() + piece.len() <= MAX_EXPANDED).then(|| out.push_str(piece))
+    }
     let mut out = String::new();
     let mut last = 0;
     for (at, _) in text.match_indices(pattern) {
-        out.push_str(&text[last..at]);
+        add(&mut out, &text[last..at])?;
         let after = at + pattern.len();
-        let mut chars = replacement.char_indices().peekable();
-        while let Some((_, c)) = chars.next() {
-            match (c, chars.peek().map(|&(_, next)| next)) {
-                ('$', Some('$')) => out.push('$'),
-                ('$', Some('&')) => out.push_str(pattern),
-                ('$', Some('`')) => out.push_str(&text[..at]),
-                ('$', Some('\'')) => out.push_str(&text[after..]),
+        let mut rest = replacement;
+        while let Some(dollar) = rest.find('$') {
+            add(&mut out, &rest[..dollar])?;
+            let piece = match rest[dollar + 1..].chars().next() {
+                Some('$') => "$",
+                Some('&') => pattern,
+                Some('`') => &text[..at],
+                Some('\'') => &text[after..],
                 _ => {
-                    out.push(c);
+                    add(&mut out, "$")?;
+                    rest = &rest[dollar + 1..];
                     continue;
                 }
-            }
-            chars.next();
-            if out.len() > MAX_EXPANDED {
-                return None;
-            }
+            };
+            add(&mut out, piece)?;
+            rest = &rest[dollar + 2..];
         }
+        add(&mut out, rest)?;
         last = after;
     }
-    out.push_str(&text[last..]);
+    add(&mut out, &text[last..])?;
     Some(out)
 }
 
@@ -875,6 +881,22 @@ mod tests {
         assert_eq!(
             expand("<$ARGUMENTS>", "$$ $& $` $'").unwrap(),
             "<$ $ARGUMENTS < >>"
+        );
+    }
+
+    #[test]
+    fn a_replacement_stops_once_its_text_is_too_long() {
+        // Many matches of a long replacement with no pattern in it: plain
+        // text alone passes the bound.
+        let text = "$ARGUMENTS".repeat(2048);
+        let replacement = "a".repeat(4096);
+        assert_eq!(replace_all(&text, "$ARGUMENTS", &replacement), None);
+        // Text between the matches counts too.
+        let text = format!("{}$ARGUMENTS", "t".repeat(MAX_EXPANDED + 1));
+        assert_eq!(replace_all(&text, "$ARGUMENTS", "x"), None);
+        assert_eq!(
+            replace_all("a$ARGUMENTSb", "$ARGUMENTS", "$$").as_deref(),
+            Some("a$b")
         );
     }
 
