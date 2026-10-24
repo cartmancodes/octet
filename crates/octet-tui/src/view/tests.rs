@@ -10,6 +10,62 @@ fn screen(width: u16, height: u16, app: &mut App) -> Vec<String> {
         .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
         .collect()
 }
+/// A Claude interface with a conversation that fills the width.
+fn talkative_app() -> App {
+    let c = octet_core::Config::new(octet_core::Engine::CLAUDE, "claude", "/tmp/project");
+    let mut app = App::new(&c, "journal".into());
+    crate::test_support::idle(&mut app);
+    for n in 0..6 {
+        app.event(Event::User(format!(
+            "prompt {n} with a long line of text that goes on and on to fill the width"
+        )));
+        app.event(Event::Text(format!(
+            "reply {n} with a long line of text that goes on and on to fill the width"
+        )));
+    }
+    app
+}
+#[test]
+fn the_model_picker_is_as_wide_as_its_longest_line() {
+    let mut app = talkative_app();
+    let long = octet_core::ModelInfo {
+        selection: "openai/gpt-5.4-mini-fast".into(),
+        id: Some("openai/gpt-5.4-mini-fast".into()),
+        name: "OpenAI/GPT-5.4 mini Fast (priority tier)".into(),
+        description: String::new(),
+    };
+    app.models.catalogs.set(
+        octet_core::Engine::OPENCODE,
+        vec![long],
+        std::time::SystemTime::now(),
+    );
+    app.composer.editor.set("/model openai/gpt-5.4-mini".into());
+    crate::input::refresh_model_picker(&mut app);
+    let rows = screen(160, 50, &mut app);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("OpenAI/GPT-5.4 mini Fast (priority tier)")),
+        "{}",
+        rows.join("\n")
+    );
+}
+#[test]
+fn the_approval_dialog_is_framed_apart_from_the_conversation() {
+    let mut app = talkative_app();
+    app.event(approval(7, "Write /tmp/project/hello.txt"));
+    let rows = screen(160, 50, &mut app);
+    // Its own border sets it apart from the conversation it covers.
+    let heading = rows
+        .iter()
+        .position(|row| row.contains("Permission required"))
+        .expect("the dialog shows");
+    assert!(
+        rows[heading].contains("│ Permission required"),
+        "{}",
+        rows.join("\n")
+    );
+    assert!(rows[heading - 1].contains("╭─"), "{}", rows.join("\n"));
+}
 #[test]
 fn following_the_latest_cancels_a_pending_catalog_scroll() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
@@ -36,6 +92,7 @@ fn the_popup_keeps_the_selected_row_in_sight_on_a_short_screen() {
         kind: crate::composer::Kind::File,
         items: (0..8).map(|i| format!("file{i}.rs")).collect(),
         selected: 7,
+        moved: false,
         start: 0,
     });
     let rows = screen(80, 14, &mut app);
@@ -52,6 +109,7 @@ fn the_popup_lists_suggestions_above_the_prompt() {
         kind: crate::composer::Kind::File,
         items: vec!["src/main.rs".into(), "src/model.rs".into()],
         selected: 1,
+        moved: false,
         start: 0,
     });
     let rows = screen(100, 30, &mut app);
@@ -280,6 +338,10 @@ fn codex_header_distinguishes_running_permissions_from_next_turn() {
         assert_eq!(mode_chip(&app).content, "ask → auto next");
         assert_eq!(mode_chip(&app).style.fg, Some(MUTED));
         assert!(app.mode_details().contains("running turn still uses ask"));
+        assert!(
+            app.mode_details()
+                .contains("Steering does not start a new turn")
+        );
         let rows = screen(width, 24, &mut app);
         assert!(
             rows.iter().any(|row| row.contains("ask → auto next")),
@@ -302,6 +364,121 @@ fn codex_header_distinguishes_running_permissions_from_next_turn() {
         app.event(Event::Stopped);
         assert_eq!(mode_chip(&app).content, "ask");
     }
+}
+
+#[test]
+fn opencode_header_distinguishes_running_permissions_from_next_turn() {
+    use octet_core::{Engine, Mode, Outcome};
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    app.event(Event::Started);
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    // opencode applies an agent at the next prompt, as Codex does.
+    assert_eq!(mode_chip(&app).content, "ask → accept-edits next");
+    assert!(app.mode_details().contains("running turn still uses ask"));
+    let rows = screen(80, 24, &mut app);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("ask → accept-edits next")),
+        "{rows:?}"
+    );
+    app.event(Event::Finished {
+        outcome: Outcome::Completed,
+    });
+    app.event(Event::Started);
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+    assert_eq!(app.conn.mode_for_turn, None);
+}
+
+#[test]
+fn opencode_switch_sent_while_idle_applies_to_the_prompt_sent_behind_it() {
+    use octet_core::{Engine, Mode};
+    let vendor = crate::vendor::RecordingVendor::default();
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    crate::commands::switch_mode(&mut app, &vendor, Mode::AcceptEdits);
+    // A prompt follows before opencode confirms; the interface marks it
+    // running at once, but the driver holds it until the switch lands.
+    app.conn.start_turn();
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+    assert_eq!(app.conn.mode_for_turn, None);
+    assert!(!app.mode_details().contains("running turn still uses"));
+    app.event(Event::Started);
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+}
+
+#[test]
+fn opencode_switch_sent_mid_turn_waits_for_the_next_turn() {
+    use octet_core::{Engine, Mode};
+    let vendor = crate::vendor::RecordingVendor::default();
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    app.event(Event::Started);
+    crate::commands::switch_mode(&mut app, &vendor, Mode::AcceptEdits);
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    assert_eq!(mode_chip(&app).content, "ask → accept-edits next");
+    assert!(app.mode_details().contains("running turn still uses ask"));
+    // opencode cannot steer, so the details do not talk about steering.
+    assert!(
+        !app.mode_details().contains("Steering"),
+        "{}",
+        app.mode_details()
+    );
+}
+
+#[test]
+fn a_late_confirmation_does_not_reuse_an_answered_switchs_turn_state() {
+    use octet_core::{Engine, Mode};
+    let vendor = crate::vendor::RecordingVendor::default();
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    // Switch A is reported unconfirmed: the header goes back to ask, and
+    // what was recorded for A is spent.
+    crate::commands::switch_mode(&mut app, &vendor, Mode::AcceptEdits);
+    app.event(Event::ModeChanged(Mode::Ask));
+    assert_eq!(app.conn.mode_sent_mid_turn, None);
+    // Switch B is sent while idle, and a prompt follows it.
+    crate::commands::switch_mode(&mut app, &vendor, Mode::Auto);
+    app.conn.start_turn();
+    // A's late confirmation arrives: no "next turn" display.
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+    assert_eq!(app.conn.mode_for_turn, None);
+    assert_eq!(app.conn.mode_sent_mid_turn, None);
+}
+
+#[test]
+fn a_late_confirmation_after_a_refused_prompt_is_a_plain_mode_change() {
+    use octet_core::{Engine, Mode, Outcome};
+    let vendor = crate::vendor::RecordingVendor::default();
+    let mut app = crate::test_support::app_for(Engine::OPENCODE);
+    crate::test_support::idle(&mut app);
+    // The switch times out; the prompt sent next is refused unsent, as
+    // the driver does while the mode is unknown.
+    crate::commands::switch_mode(&mut app, &vendor, Mode::AcceptEdits);
+    app.event(Event::ModeChanged(Mode::Ask));
+    app.conn.start_turn();
+    app.event(Event::User("hello".into()));
+    app.event(Event::Started);
+    app.event(Event::Error("Not sent: the mode is unknown".into()));
+    app.event(Event::Finished {
+        outcome: Outcome::Failed,
+    });
+    // No turn runs when the late confirmation comes: no "next turn".
+    app.event(Event::ModeChanged(Mode::AcceptEdits));
+    assert_eq!(mode_chip(&app).content, "accept-edits");
+    assert_eq!(app.conn.mode_for_turn, None);
+}
+
+#[test]
+fn every_provider_says_whether_a_mode_waits_for_the_next_turn() {
+    use octet_core::Engine;
+    let next_turn = |engine: Engine| engine.provider().mode_applies_next_turn;
+    assert!(next_turn(Engine::CODEX));
+    assert!(next_turn(Engine::OPENCODE));
+    assert!(!next_turn(Engine::CLAUDE));
+    assert!(!next_turn(Engine::DEMO));
 }
 
 #[test]
@@ -413,6 +590,20 @@ fn mascot_tracks_activity_and_keeps_errors_visible_after_disconnect() {
             rows[3]
         );
     }
+}
+#[test]
+fn a_warning_is_labelled_and_on_the_status_line() {
+    let c = octet_core::Config::new(octet_core::Engine::DEMO, "demo", "/tmp/project");
+    let mut app = App::new(&c, "journal".into());
+    app.warn("Full access carried to Claude: no permission checks.");
+    let rows = screen(100, 30, &mut app);
+    let text = rows.join("\n");
+    assert!(text.contains("WARNING"), "{text}");
+    assert!(text.contains("Full access carried to Claude"), "{text}");
+    assert_eq!(
+        app.status_line,
+        "Full access carried to Claude: no permission checks."
+    );
 }
 #[test]
 fn renders_narrow_wide_and_approval_without_panics() {
@@ -984,6 +1175,7 @@ fn the_popup_draws_items_cleaned() {
         kind: crate::composer::Kind::Model,
         items: vec!["evil\u{202e}name · codex · Evil".into()],
         selected: 0,
+        moved: false,
         start: 7,
     });
     let rows = screen(100, 30, &mut app).join("\n");

@@ -176,7 +176,7 @@ use Ty::{Bool, Choice, ChoiceList, Json, List, Null, Object, ObjectList, Str, St
 pub static CHOICES: &[Choices] = &[
     Choices {
         name: "Engine",
-        values: &["claude", "codex", "demo"],
+        values: &["claude", "codex", "demo", "opencode"],
         doc: "A provider.",
     },
     Choices {
@@ -250,6 +250,10 @@ pub static EVENTS: &[EventKind] = &[
     EventKind {
         kind: "model_selected",
         data: Str,
+    },
+    EventKind {
+        kind: "effort",
+        data: Json,
     },
     EventKind {
         kind: "usage",
@@ -2338,7 +2342,7 @@ mod tests {
     fn the_typescript_types_events_closed_sets_and_nulls() {
         let ts = typescript();
         for wanted in [
-            "export type Engine = \"claude\" | \"codex\" | \"demo\";",
+            "export type Engine = \"claude\" | \"codex\" | \"demo\" | \"opencode\";",
             "export type Mode = \"ask\" | \"accept-edits\" | \"auto\" | \"full-access\";",
             "export type Phase = \"connecting\" | \"idle\" | \"running\" | \"stopped\";",
             "export type ToolPhase = \"running\" | \"done\" | \"failed\";",
@@ -2390,6 +2394,8 @@ mod tests {
                 description: String::new(),
             }]),
             Event::ModelSelected("opus".into()),
+            Event::Effort(Some("high".into())),
+            Event::Effort(None),
             Event::ModeChanged(octet_engine::live::Mode::Auto),
             Event::User("hi".into()),
             Event::Started,

@@ -16,6 +16,7 @@ mod demo;
 mod driver;
 mod image;
 mod mode;
+mod opencode;
 mod protocol;
 pub use activity::{APPROVAL_SCOPE, ApprovalSummary, ToolCall, ToolPhase};
 pub use claude::claude_stray_reply;
@@ -24,6 +25,10 @@ pub use image::{
     IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment, ImageError, check_inline, encoded_len,
 };
 pub use mode::Mode;
+pub use opencode::{
+    OPENCODE_VERIFIED_VERSIONS, opencode_built_in_commands, opencode_command_expansion,
+    opencode_stray_reply,
+};
 
 /// The longest prompt, in bytes, a user may type (or a command may send as
 /// its displayed text).
@@ -55,6 +60,15 @@ pub struct Limits {
     /// takes the bytes inline: a file swapped for a FIFO, or on a stalled
     /// mount, must not hold the session.
     pub image_read: Duration,
+    /// Reading a vendor's command definitions, for a provider that checks a
+    /// command before it is sent (opencode's `opencode debug config` and
+    /// `debug skill`). The session goes on meanwhile; a command that needs
+    /// the reading waits for it.
+    pub command_check: Duration,
+    /// Silence in a turn after a subagent starts before Octet says it may
+    /// be waiting for a permission the vendor never passes on (opencode in
+    /// `auto` and `full-access`).
+    pub subagent_quiet: Duration,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -64,6 +78,8 @@ impl Default for Limits {
             interrupt: Duration::from_secs(10),
             mode_confirm: Duration::from_secs(10),
             image_read: Duration::from_secs(10),
+            command_check: Duration::from_secs(20),
+            subagent_quiet: Duration::from_secs(10),
         }
     }
 }
@@ -104,12 +120,20 @@ pub struct Provider {
     pub modes: [&'static str; 4],
     /// Text can be added to a running turn (`/steer`).
     pub steer: bool,
+    /// A live mode switch takes effect from the next turn; the running one
+    /// keeps its mode.
+    pub mode_applies_next_turn: bool,
     /// Images go inside the prompt as base64, so [`check_inline`]'s limits
     /// apply; otherwise the vendor reads the files itself.
     pub inline_images: bool,
     /// Reasoning effort changes take effect from the next turn; otherwise
     /// they need a reconnect (the CLI takes effort at launch).
     pub effort_live: bool,
+    /// The vendor has a reasoning effort setting at all (opencode has none).
+    pub takes_effort: bool,
+    /// Its model IDs can start with its own name, so `NAME/X` keeps the
+    /// whole string as the model.
+    pub ids_carry_name: bool,
     /// The reasoning effort levels the vendor takes; empty passes any word
     /// on (Codex's levels depend on the model).
     pub efforts: &'static [&'static str],
@@ -118,8 +142,17 @@ pub struct Provider {
     pub shutdown_grace: Duration,
     /// The CLI can list its models without opening a session (`probe`).
     pub lists_models: bool,
+    /// A slash command's text (its arguments, and anything sent with them)
+    /// is substituted into the command's template and every `` !`cmd` `` in
+    /// the result runs in the vendor's shell before any permission check
+    /// (opencode). The earlier conversation a provider switch carries must
+    /// then never go with a command: it holds replies and tool output.
+    pub commands_expand_shell: bool,
     /// The vendor CLI's arguments for `config` (none for the demo).
     pub(crate) launch_args: fn(&Config) -> Vec<OsString>,
+    /// The environment variables the vendor CLI is launched with, on top of
+    /// the inherited ones (none for Codex, Claude and the demo).
+    pub(crate) launch_env: fn(&Config) -> Vec<(OsString, OsString)>,
     /// Runs one session until it stops.
     pub(crate) start: StartFn,
 }
@@ -148,17 +181,31 @@ pub fn launch_args(config: &Config) -> Vec<OsString> {
     (config.engine.provider().launch_args)(config)
 }
 
+/// The environment variables Octet launches `config`'s vendor CLI with, on
+/// top of the inherited ones; the driver and the protocol gate share it with
+/// [`launch_args`].
+pub fn launch_env(config: &Config) -> Vec<(OsString, OsString)> {
+    (config.engine.provider().launch_env)(config)
+}
+
+/// A provider that needs no environment variables of its own.
+pub(super) fn no_env(_: &Config) -> Vec<(OsString, OsString)> {
+    Vec::new()
+}
+
 /// How Octet runs `engine`'s CLI: its limits on frames, queued output and
 /// stderr, and its shutdown graces. The protocol gate uses the same.
 pub fn vendor_process(
     engine: Engine,
     executable: PathBuf,
     args: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
     cwd: PathBuf,
 ) -> ProcessConfig {
     ProcessConfig {
         executable,
         args,
+        env,
         cwd: Some(cwd),
         max_frame_bytes: 8 * 1024 * 1024,
         queue_bytes: 16 * 1024 * 1024,
@@ -177,12 +224,19 @@ impl Engine {
     pub const CODEX: Engine = Engine(&codex::PROVIDER);
     /// Claude Code, over its stream-json protocol.
     pub const CLAUDE: Engine = Engine(&claude::PROVIDER);
+    /// opencode, over the Agent Client Protocol (`opencode acp`).
+    pub const OPENCODE: Engine = Engine(&opencode::PROVIDER);
     /// The offline preview; no vendor process.
     pub const DEMO: Engine = Engine(&demo::PROVIDER);
     /// Every provider, in the order help lists them: the provider table.
-    pub const ALL: &'static [Engine] = &[Engine::CODEX, Engine::CLAUDE, Engine::DEMO];
-    /// The engine named `value` (`codex`, `claude` or `demo`), exactly as
-    /// spelled.
+    pub const ALL: &'static [Engine] = &[
+        Engine::CODEX,
+        Engine::CLAUDE,
+        Engine::OPENCODE,
+        Engine::DEMO,
+    ];
+    /// The engine named `value` (`codex`, `claude`, `opencode` or `demo`),
+    /// exactly as spelled.
     ///
     /// ```
     /// use octet_engine::live::Engine;
@@ -212,9 +266,15 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Names the levels the provider takes, when it lists them and `level`
-    /// is not one.
+    /// Says so when the provider takes no effort level at all; else names
+    /// the levels it takes, when it lists them and `level` is not one.
     pub fn check_effort(self, level: &str) -> Result<(), String> {
+        if !self.0.takes_effort {
+            return Err(format!(
+                "{} does not take a reasoning effort level",
+                self.0.title
+            ));
+        }
         let levels = self.0.efforts;
         match levels.split_last() {
             Some((last, rest)) if !levels.contains(&level) => Err(format!(
@@ -340,6 +400,26 @@ pub struct Listing {
     pub models: Vec<ModelInfo>,
     /// The skills, empty when the CLI listed none.
     pub skills: Vec<SkillInfo>,
+}
+
+/// What Octet says when a provider whose mode applies from the next turn,
+/// and that steers (Codex), confirms a switch while a turn runs.
+pub(super) const MODE_NEXT_TURN_NOTICE: &str = "Mode applies from the next turn. \
+    The running turn and steering keep their previous permissions; \
+    wait for it to finish, or interrupt it and send a new prompt";
+/// [`MODE_NEXT_TURN_NOTICE`] for a provider that cannot steer (opencode):
+/// its `/steer` is queued as the next prompt, which runs under the new mode.
+const MODE_NEXT_TURN_NOTICE_NO_STEER: &str = "Mode applies from the next turn. \
+    The running turn keeps its previous permissions; \
+    wait for it to finish, or interrupt it and send a new prompt";
+
+/// The next-turn notice for a provider that can `steer` or not.
+pub(super) fn mode_next_turn_notice(steer: bool) -> &'static str {
+    if steer {
+        MODE_NEXT_TURN_NOTICE
+    } else {
+        MODE_NEXT_TURN_NOTICE_NO_STEER
+    }
 }
 
 /// The most skills one list keeps, live or cached.
@@ -576,6 +656,9 @@ pub enum Event {
     ModelSelected(String),
     /// The permission mode the vendor confirmed.
     ModeChanged(Mode),
+    /// The reasoning effort the vendor confirmed, or went back to after a
+    /// refusal; `None` is its default. Only opencode reports it.
+    Effort(Option<String>),
     /// The user's prompt, as the transcript shows it.
     User(String),
     /// A turn began.
@@ -853,6 +936,12 @@ fn emit(tx: &mpsc::Sender<Event>, event: Event) -> Result<(), DriverError> {
     Ok(())
 }
 
+/// How the error of a turn Octet never sent to the vendor starts: one held
+/// behind, or sent during, a mode switch the vendor has not confirmed. The
+/// interface keeps its queued prompts after such a turn, since they would
+/// only be refused too.
+pub const NOT_SENT: &str = "Not sent: ";
+
 /// The demo prompt that opens its sample approval dialog.
 pub const APPROVAL_DEMO: &str = "/approval-demo";
 /// Refusal: a turn is already running or the session is not ready.
@@ -877,7 +966,15 @@ impl TurnGate {
             return false;
         }
         self.taken += 1;
-        *cancel.borrow() >= self.taken
+        Self::covers(self.taken, cancel)
+    }
+    /// The number of the last turn command counted.
+    fn last(&self) -> u64 {
+        self.taken
+    }
+    /// Whether the user's last cancel covers the turn numbered `turn`.
+    fn covers(turn: u64, cancel: &watch::Receiver<u64>) -> bool {
+        *cancel.borrow() >= turn
     }
 }
 
@@ -1038,7 +1135,8 @@ mod tests {
     }
     #[test]
     fn claude_has_time_to_exit_on_its_own() {
-        let process = |engine| vendor_process(engine, "cli".into(), Vec::new(), ".".into());
+        let process =
+            |engine| vendor_process(engine, "cli".into(), Vec::new(), Vec::new(), ".".into());
         // Claude Code takes about 0.9 s to exit once its input closes.
         assert_eq!(
             process(Engine::CLAUDE).shutdown_grace,
@@ -1047,6 +1145,11 @@ mod tests {
         assert_eq!(
             process(Engine::CODEX).shutdown_grace,
             Duration::from_millis(150)
+        );
+        // opencode takes under 35 ms, idle or mid-turn.
+        assert_eq!(
+            process(Engine::OPENCODE).shutdown_grace,
+            Duration::from_millis(250)
         );
     }
     #[test]
@@ -1229,7 +1332,28 @@ mod tests {
         assert_eq!(format!("{:?}", Engine::CLAUDE), "claude");
     }
     #[test]
+    fn the_next_turn_mode_notice_reads_as_one_sentence_pair() {
+        assert_eq!(
+            MODE_NEXT_TURN_NOTICE,
+            "Mode applies from the next turn. The running turn and steering keep their previous permissions; wait for it to finish, or interrupt it and send a new prompt"
+        );
+        assert_eq!(mode_next_turn_notice(true), MODE_NEXT_TURN_NOTICE);
+        // The interface recognises a turn never sent by this prefix.
+        assert_eq!(NOT_SENT, "Not sent: ");
+        // A provider that cannot steer queues `/steer` as the next prompt,
+        // which does run under the new mode: its notice leaves steering out.
+        assert_eq!(
+            mode_next_turn_notice(false),
+            "Mode applies from the next turn. The running turn keeps its previous permissions; wait for it to finish, or interrupt it and send a new prompt"
+        );
+    }
+    #[test]
     fn effort_levels_are_checked_where_the_provider_lists_them() {
+        /// A provider with no effort setting at all.
+        static NONE: Provider = Provider {
+            takes_effort: false,
+            ..demo::PROVIDER
+        };
         for level in ["low", "medium", "high", "xhigh", "max"] {
             assert_eq!(Engine::CLAUDE.check_effort(level), Ok(()), "{level}");
         }
@@ -1237,14 +1361,21 @@ mod tests {
             Engine::CLAUDE.check_effort("bogus"),
             Err("Claude takes effort low, medium, high, xhigh or max".to_owned())
         );
-        // Codex's levels depend on the model, so any word is passed on.
+        // Codex's and opencode's levels depend on the model, so any word is
+        // passed on.
         assert_eq!(Engine::CODEX.check_effort("minimal"), Ok(()));
+        assert_eq!(Engine::OPENCODE.check_effort("max"), Ok(()));
+        // A provider with no effort setting at all says so.
+        assert_eq!(
+            Engine(&NONE).check_effort("high"),
+            Err("Demo does not take a reasoning effort level".to_owned())
+        );
     }
     #[test]
     fn the_table_is_complete_and_unambiguous() {
         let names: Vec<&str> = Engine::ALL.iter().map(|e| e.as_str()).collect();
-        // New rows go after these three; their order is what help shows.
-        assert_eq!(names[..3], ["codex", "claude", "demo"]);
+        // Vendors first, then the demo; this order is what help shows.
+        assert_eq!(names, ["codex", "claude", "opencode", "demo"]);
         for engine in Engine::ALL {
             assert_eq!(Engine::parse(engine.as_str()), Some(*engine));
             assert!(engine.provider().modes.iter().all(|m| !m.is_empty()));

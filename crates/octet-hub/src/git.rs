@@ -28,10 +28,8 @@
 use octet_core::remote::protocol::{
     ChangesInfo, Code, DiffInfo, FileChange, FileStatus, MAX_MESSAGE,
 };
-use rustix::{
-    fs::OFlags,
-    process::{Pid, Signal, kill_process_group},
-};
+use octet_proc::GroupLeader;
+use rustix::fs::OFlags;
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
@@ -152,20 +150,6 @@ pub(crate) struct Git {
 pub(crate) struct Commit {
     pub(crate) result: Result<String, Refusal>,
     pub(crate) added: bool,
-}
-
-/// Kills git's process group as it drops, unless git was waited for first: a call dropped or
-/// timed out takes the hooks git started with it.
-#[derive(Debug)]
-struct Group(Option<Pid>);
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        // Git has not been waited for, so its pid still names its group.
-        if let Some(group) = self.0.take() {
-            let _ = kill_process_group(group, Signal::KILL);
-        }
-    }
 }
 
 /// One of the two places to run git; given back as it drops.
@@ -710,15 +694,14 @@ impl Git {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .process_group(0);
-        let mut child = command
-            .spawn()
-            .map_err(|_| refusal(Code::Unavailable, NO_GIT))?;
-        let mut group = Group(
-            child
-                .id()
-                .and_then(|id| i32::try_from(id).ok())
-                .and_then(Pid::from_raw),
+        // Git leads its own group, killed whole as `git` drops unless git was waited for first:
+        // a call dropped or timed out takes the hooks git started with it.
+        let mut git = GroupLeader::new(
+            command
+                .spawn()
+                .map_err(|_| refusal(Code::Unavailable, NO_GIT))?,
         );
+        let child = git.child();
         let (stdin, stdout, stderr) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let work = async {
@@ -735,14 +718,11 @@ impl Git {
             };
             let ((), (stdout, clipped), (stderr, _)) =
                 tokio::join!(feed, stdout, read_tail(stderr, WORDS_OUTPUT));
-            let status = child.wait().await;
-            if status.is_ok() {
-                // Waited for: its pid may be another's now.
-                group.0 = None;
-            }
+            // Waited for, git is reaped: its group is no longer signalled.
+            let status = git.child().wait().await;
             (status, stdout, stderr, clipped)
         };
-        // Dropped before git ended, `group` kills git and its hooks. Past the time limit, git is
+        // Dropped before git ended, `git` kills git and its hooks. Past the time limit, git is
         // asked to stop first (SIGTERM, to the whole group), so it takes its lockfiles away, and
         // is killed with the rest only if it has not stopped within `TERM_GRACE`.
         match timeout(self.within, work).await {
@@ -754,12 +734,11 @@ impl Git {
             }),
             Ok((Err(_), ..)) => Err(refusal(Code::Unavailable, NO_GIT)),
             Err(_) => {
-                if let Some(pid) = group.0 {
-                    let _ = kill_process_group(pid, Signal::TERM);
-                    // Reaped or not, the group is killed as `group` drops, straight after: a hook
-                    // that ignored the TERM goes with it. (While a member lives the group's id
-                    // cannot be reused, and git's own pid was freed only an instant before.)
-                    let _ = timeout(TERM_GRACE, child.wait()).await;
+                if git.term_group() {
+                    // Waited for without reaping it, git keeps its group's id while the group is
+                    // killed as `git` drops, straight after: a hook that ignored the TERM goes
+                    // with it.
+                    git.exited_within(TERM_GRACE).await;
                 }
                 Err(refusal(Code::Timeout, GIT_TIMED_OUT))
             }
@@ -1048,6 +1027,7 @@ mod tests {
     use super::*;
     use octet_core::remote::protocol::{MAX_MESSAGE, changes_frame};
     use octet_testkit::TempDir;
+    use rustix::process::{Pid, Signal, kill_process_group};
     use std::fmt::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Instant;
@@ -1103,11 +1083,22 @@ mod tests {
         dir
     }
 
+    /// Writes the hook `name` of the repository at `dir`, a shell script running `body`.
     fn hook(dir: &Path, name: &str, body: &str) {
         let path = dir.join(".git/hooks").join(name);
         std::fs::create_dir_all(path.parent().expect("hooks")).expect("hooks directory");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("hook");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        script(&path, body);
+    }
+
+    /// Writes the shell script `path` running `body` with [`octet_testkit::write_script`],
+    /// which runs it once first: git's first run of a newly written program could otherwise
+    /// wait past a test's limit for macOS to check it, or fail on Linux as "Text file busy".
+    fn script(path: &Path, body: &str) {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            panic!("a script path: {}", path.display());
+        };
+        octet_testkit::write_script(dir, name, body);
     }
 
     /// Commits with the session's turn clear throughout.
@@ -1681,6 +1672,52 @@ mod tests {
         }
     }
 
+    // Multi-threaded: the call makes progress while the test polls for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_forked_as_the_call_drops_dies_too() {
+        // The hook is still forking when git's group is killed. On macOS a child mid-fork is not
+        // yet in the group the kill goes to: the hook dies and the child lives on.
+        let git = Git::new();
+        let dir = committed("octet-git-dropped-forking");
+        let ws = dir.path().to_owned();
+        std::fs::write(ws.join("new.txt"), "new\n").expect("write");
+        let pid_file = dir.path().join(".git/hook.pid");
+        hook(
+            &ws,
+            "pre-commit",
+            &format!(
+                "echo $$ > '{}'\ni=0; while [ $i -lt 100 ]; do sleep 30 & i=$((i+1)); done; wait",
+                pid_file.display()
+            ),
+        );
+        let call = tokio::spawn(async move { commit(&git, &ws, "Forks").await });
+        let hook_pid = |text: String| text.strip_suffix('\n')?.parse::<i32>().ok();
+        assert!(
+            octet_testkit::wait_until(octet_testkit::QUICK, || {
+                std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(hook_pid)
+                    .is_some()
+            }),
+            "the hook never ran"
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(hook_pid)
+            .and_then(Pid::from_raw)
+            .expect("the hook's pid");
+        // Git's group: the hook, alive until the call drops, is in it.
+        let group = rustix::process::getpgid(Some(pid)).expect("the hook's group");
+        call.abort();
+        let _ = call.await;
+        let gone = octet_testkit::wait_until(octet_testkit::QUICK, || {
+            rustix::process::test_kill_process_group(group).is_err()
+        });
+        // A failed run leaves nothing behind.
+        let _ = kill_process_group(group, Signal::KILL);
+        assert!(gone, "a child forked as the call dropped outlived it");
+    }
+
     #[tokio::test]
     async fn commit_refusals_and_hook_failure() {
         let git = Git::new();
@@ -1846,12 +1883,11 @@ mod tests {
         let bin = TempDir::new("octet-git-fake-bin");
         std::fs::create_dir_all(bin.path()).expect("bin");
         let fake = bin.path().join("git");
-        std::fs::write(
+        script(
             &fake,
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 3000 ]; do echo \"warning: could not open directory number $i\" >&2; i=$((i+1)); done\necho listed\n",
-        )
-        .expect("fake git");
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            "i=0\nwhile [ $i -lt 3000 ]; do \
+             echo \"warning: could not open directory number $i\" >&2; i=$((i+1)); done\necho listed",
+        );
         let git = Git::with_environment(vec![("PATH".into(), bin.path().into())]);
         let ws = TempDir::new("octet-git-fake-ws");
         std::fs::create_dir_all(ws.path()).expect("ws");
@@ -1918,13 +1954,18 @@ mod tests {
         let ws = dir.path();
         let vendor = ws.join("vendor");
         std::fs::create_dir_all(&vendor).expect("vendor");
-        for n in 0..20_000 {
+        // Four listings' worth: the listing is cut short, and git still runs once, not per
+        // file. Git's own work grows with the change (per file it opens it twice, maps it,
+        // hashes it and diffs it): 20,000 files took it 2 s alone on a Mac, and past its 10 s
+        // limit with a few such tests at once.
+        let changed = 4 * FILES_LIMIT;
+        for n in 0..changed {
             std::fs::write(vendor.join(format!("f{n:05}.js")), "x\n").expect("write");
         }
         git_in(ws, &["add", "-A"]);
         git_in(ws, &["commit", "-q", "-m", "Vendor"]);
         // A vendored update: every tracked file changed, which numstat diffs one by one.
-        for n in 0..20_000 {
+        for n in 0..changed {
             std::fs::write(vendor.join(format!("f{n:05}.js")), "y\ny\n").expect("write");
         }
         let before = git.calls();
@@ -1933,7 +1974,7 @@ mod tests {
         assert!(began.elapsed() < GIT_WITHIN, "{:?}", began.elapsed());
         assert_eq!(git.calls() - before, 3);
         assert_eq!(changes.info.files.len(), FILES_LIMIT);
-        assert_eq!(changes.info.more, 20_000 - FILES_LIMIT as u64);
+        assert_eq!(changes.info.more, (changed - FILES_LIMIT) as u64);
         assert!(
             changes
                 .info

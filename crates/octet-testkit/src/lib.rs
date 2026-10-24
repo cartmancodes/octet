@@ -44,7 +44,16 @@ pub fn detached_sleep() -> PathBuf {
 }
 
 /// Builds one of this crate's binaries for the profile the calling test runs
-/// in. Release and custom target directories get their own copy.
+/// in, and returns the copy tests run. Release and custom target directories
+/// get their own.
+///
+/// Test processes sharing a target directory each call this as they start.
+/// Cargo replaces its own copy (`<profile>/<name>`) on every build, fresh or
+/// not, removing it first, so a test running that one could find it missing
+/// or half written. Tests run a copy of it in `<profile>/octet-testkit/`
+/// instead, replaced only when cargo's has changed (its length or time), and
+/// then by a rename, so a test sees the old binary or the new one, whole.
+/// Builds and copies take turns, under a lock in that directory.
 fn testkit_bin(name: &str) -> PathBuf {
     // Test executables live in <target>/<profile>/deps/.
     let profile_dir = std::env::current_exe()
@@ -58,6 +67,10 @@ fn testkit_bin(name: &str) -> PathBuf {
         Some("debug") | None => "dev",
         Some(other) => other,
     };
+    let kept_dir = profile_dir.join("octet-testkit");
+    std::fs::create_dir_all(&kept_dir).expect("the test binaries' directory");
+    let lock = std::fs::File::create(kept_dir.join(".lock")).expect("the build lock");
+    lock.lock().expect("the build lock");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let status = Command::new(&cargo)
@@ -75,21 +88,81 @@ fn testkit_bin(name: &str) -> PathBuf {
             )
         });
     assert!(status.success(), "building {name} failed");
-    profile_dir.join(name)
+    let built = profile_dir.join(name);
+    let kept = kept_dir.join(name);
+    if changed(&built, &kept) {
+        let temporary = kept_dir.join(format!(".{name}.{}", std::process::id()));
+        std::fs::copy(&built, &temporary).expect("a copy of the built binary");
+        let time = std::fs::metadata(&built)
+            .and_then(|meta| meta.modified())
+            .expect("the built binary's time");
+        std::fs::File::options()
+            .write(true)
+            .open(&temporary)
+            .and_then(|copy| copy.set_modified(time))
+            .expect("the copy's time");
+        std::fs::rename(&temporary, &kept).expect("the copy in place");
+    }
+    kept
+}
+
+/// Whether `copy` differs from `built` in length or modification time, or
+/// is missing.
+fn changed(built: &Path, copy: &Path) -> bool {
+    let look = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| Ok((meta.len(), meta.modified()?)))
+            .ok()
+    };
+    look(copy).is_none() || look(copy) != look(built)
 }
 
 /// Writes an executable shell script `dir/name` (creating `dir`): a
-/// `#!/bin/sh` line, then `body`. Returns its path.
+/// `#!/bin/sh` line, a line that exits at once when the first argument is
+/// `warm`, then `body`; runs it once with `warm`, and returns its path.
+///
+/// macOS checks a newly written program the first time it runs, one at a
+/// time across the machine, while the process waits before its first
+/// instruction: with the suite writing and running many, a test's first run
+/// of one could wait past its limits. The run here, waited for without a
+/// limit, takes that wait out of the test.
+///
+/// On Linux, a process another thread forks while the script is written
+/// holds it open for writing until that process execs, and running the
+/// script meanwhile fails with ETXTBSY. No new process can inherit it once
+/// it is written and closed, so the warm-up run tries again (for at most
+/// [`QUICK`]) until it starts, and once it has, so do the test's.
 ///
 /// # Panics
 ///
-/// If the script cannot be written.
+/// If the script cannot be written, or its warm-up run fails.
 pub fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).expect("script directory");
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{body}\n"),
+    )
+    .expect("script");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let deadline = std::time::Instant::now() + QUICK;
+    let warm = loop {
+        match Command::new(&path)
+            .arg("warm")
+            .stdin(std::process::Stdio::null())
+            .status()
+        {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            ran => break ran.expect("the script runs"),
+        }
+    };
+    assert!(warm.success(), "the script's warm-up run failed");
     path
 }
 
@@ -261,6 +334,101 @@ mod tests {
             calls == 3
         }));
         assert!(!wait_until(Duration::from_millis(30), || false));
+    }
+    #[test]
+    fn a_build_beside_a_running_test_leaves_its_binary_in_place() {
+        // Test processes sharing a target directory each build the fake vendor as they start;
+        // one that builds must not take away, or rewrite, the binary another is running.
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::atomic::AtomicBool;
+        let path = protocol_child();
+        let inode = std::fs::metadata(&path).expect("the binary").ino();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (path, stop) = (path.clone(), std::sync::Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let now = std::fs::metadata(&path).map(|meta| meta.ino()).ok();
+                    if now != Some(inode) && seen.last() != Some(&now) {
+                        seen.push(now);
+                    }
+                }
+                seen
+            })
+        };
+        let again = testkit_bin("protocol-child");
+        stop.store(true, Ordering::Relaxed);
+        let seen = watcher.join().expect("the watcher");
+        assert_eq!(again, path);
+        assert!(
+            seen.is_empty(),
+            "the binary was replaced or missing during a build: {seen:?}"
+        );
+    }
+    #[test]
+    fn a_written_script_has_run_once_and_runs_its_body_after() {
+        // The first run of a new executable waits for macOS to check it, so
+        // the script is run once, with `warm`, which stops before its body.
+        let dir = TempDir::new("octet-testkit-script");
+        let marks = dir.path().join("marks");
+        let script = write_script(
+            dir.path(),
+            "tool",
+            &format!("echo \"$1\" >> '{}'", marks.display()),
+        );
+        assert!(!marks.exists(), "the warm run reached the body");
+        let ran = Command::new(&script)
+            .arg("go")
+            .status()
+            .expect("the script");
+        assert!(ran.success());
+        assert_eq!(std::fs::read_to_string(&marks).expect("marks"), "go\n");
+        let warm = Command::new(&script)
+            .arg("warm")
+            .status()
+            .expect("the script");
+        assert!(warm.success());
+        assert_eq!(std::fs::read_to_string(&marks).expect("marks"), "go\n");
+    }
+    #[test]
+    fn scripts_are_written_and_run_while_other_threads_start_processes() {
+        // On Linux, a process forked by another thread while a script is
+        // written holds the script open for writing until it execs, and
+        // running the script meanwhile fails with ETXTBSY.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let writers: Vec<_> = (0..4)
+            .map(|n| {
+                std::thread::spawn(move || {
+                    let dir = TempDir::new("octet-testkit-busy");
+                    for m in 0..15 {
+                        write_script(dir.path(), &format!("tool-{n}-{m}"), "exit 0");
+                    }
+                })
+            })
+            .collect();
+        let written = writers
+            .into_iter()
+            .map(std::thread::JoinHandle::join)
+            .collect::<Vec<_>>();
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().expect("a spawner");
+        }
+        assert!(
+            written.iter().all(Result::is_ok),
+            "a script could not be run"
+        );
     }
     #[test]
     fn temp_dirs_are_unique_and_removed() {

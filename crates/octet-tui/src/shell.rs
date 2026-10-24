@@ -96,7 +96,7 @@ async fn run_with(
     };
     // One pipe for stdout and stderr keeps their order.
     let (reader, writer) = std::io::pipe().map_err(fail)?;
-    let mut child = {
+    let mut leader = {
         let mut cmd = Command::new(shell);
         cmd.arg("-c")
             .arg(command)
@@ -110,7 +110,7 @@ async fn run_with(
             .kill_on_drop(true);
         // SAFETY: setsid is async-signal-safe. A new session has no
         // controlling terminal, so opening /dev/tty fails at once instead of
-        // drawing over Octet; its group id is its pid, for kill_group.
+        // drawing over Octet; its group id is its pid, for GroupLeader.
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -119,13 +119,12 @@ async fn run_with(
                 Ok(())
             });
         }
-        cmd.spawn().map_err(fail)?
+        // Leading its own group, the shell is killed with the whole group
+        // on an early drop (a reconnect or quit drops this future):
+        // `kill_on_drop` alone stops only the shell.
+        octet_proc::GroupLeader::new(cmd.spawn().map_err(fail)?)
     };
-    let group = child.id();
-    // Declared after `child`, so on an early drop (a reconnect or quit drops
-    // this future) it runs first, while the shell is unreaped and its pid,
-    // the group's id, still reserved.
-    let guard = Group(group);
+    let group = leader.child().id();
     let tail = std::sync::Arc::new(std::sync::Mutex::new(Tail::default()));
     let reader_tail = std::sync::Arc::clone(&tail);
     // A plain thread, not spawn_blocking: a reader stuck on a pipe held by a
@@ -144,8 +143,8 @@ async fn run_with(
         _ = &mut cancel => Some(Status::Cancelled),
     };
     // Children left in the group would hold the pipe open.
-    drop(guard);
-    let code = child.wait().await.map_err(fail)?.code();
+    leader.kill_group();
+    let code = leader.child().wait().await.map_err(fail)?.code();
     if status.is_none() {
         status = Some(code.map_or(Status::Signalled, Status::Exited));
     }
@@ -168,7 +167,7 @@ async fn run_with(
 
 /// A `!` command running in the background, and whether its output goes
 /// with the next prompt. Dropping it (a session that ends) aborts the run,
-/// whose guard kills the command's whole process group.
+/// whose group leader kills the command's whole process group.
 pub(crate) struct Running {
     task: tokio::task::JoinHandle<Result<Ran, ShellError>>,
     cancel: Option<oneshot::Sender<()>>,
@@ -228,24 +227,6 @@ fn wait_exit(pid: Option<u32>) {
     }
 }
 
-/// Kills a command's process group when dropped, so no path leaves the
-/// pipeline running: `kill_on_drop` alone stops only the shell.
-struct Group(Option<u32>);
-impl Drop for Group {
-    fn drop(&mut self) {
-        kill_group(self.0.take());
-    }
-}
-
-fn kill_group(group: Option<u32>) {
-    if let Some(pid) = group.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-        // SAFETY: signals only the process group this command was started in.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-}
-
 /// The end of the output read so far.
 #[derive(Default)]
 struct Tail {
@@ -300,14 +281,13 @@ fn overstrike(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Multi-threaded: the run makes progress while this test polls for it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropping_a_shell_run_kills_its_group() {
+    /// Runs `echo $$ > <file>; <then>` and drops the run once the shell has written its pid,
+    /// which is its group's id (setsid); true if no process is left in the group after.
+    async fn dropped_mid_run_leaves_nothing(then: &str) -> bool {
         let dir = octet_testkit::TempDir::new("octet-shell-drop");
         std::fs::create_dir_all(dir.path()).unwrap();
         let pidfile = dir.path().join("group");
-        // The shell's pid is its group's id (setsid); the pipeline lives on in it.
-        let command = format!("echo $$ > {}; sleep 30 | cat", pidfile.display());
+        let command = format!("echo $$ > {}; {then}", pidfile.display());
         let run = tokio::spawn(async move {
             let (_keep, cancel) = oneshot::channel();
             run_with("sh", &command, Path::new("."), cancel, TIME_LIMIT).await
@@ -327,7 +307,24 @@ mod tests {
         let gone = octet_testkit::wait_until(octet_testkit::QUICK, || unsafe {
             libc::kill(-group, 0) != 0
         });
+        // SAFETY: signals only the group this test started, so a failed run leaves nothing.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        gone
+    }
+    // Multi-threaded: the run makes progress while these tests poll for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_shell_run_kills_its_group() {
+        // The pipeline lives on in the shell's group.
+        let gone = dropped_mid_run_leaves_nothing("sleep 30 | cat").await;
         assert!(gone, "the command's processes outlived it");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_forked_as_the_run_drops_dies_too() {
+        // The shell is still forking when its group is killed. On macOS a child mid-fork is
+        // not yet in the group the kill goes to: the shell dies and the child lives on.
+        let forks = "i=0; while [ $i -lt 100 ]; do sleep 30 & i=$((i+1)); done; wait";
+        let gone = dropped_mid_run_leaves_nothing(forks).await;
+        assert!(gone, "a child forked as the run dropped outlived it");
     }
     async fn sh(command: &str) -> Ran {
         let (_keep, cancel) = oneshot::channel();
@@ -370,10 +367,12 @@ mod tests {
     }
     #[tokio::test]
     async fn a_process_that_left_the_group_cannot_hold_the_result() {
+        // Built first, and outside the time: the build can wait on another
+        // cargo using the same target directory (rust-analyzer's, say).
+        let escaped = octet_testkit::detached_sleep();
         let started = std::time::Instant::now();
         // Without the fix this waits the full 60 s; the bound leaves room
         // for a machine busy with the rest of the suite.
-        let escaped = octet_testkit::detached_sleep();
         let ran = sh(&format!(
             "'{}' 60 & sleep 0.5; echo started",
             escaped.display()

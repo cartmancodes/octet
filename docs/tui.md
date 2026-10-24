@@ -1,7 +1,7 @@
 # Octet terminal UI
 
-A native terminal application now runs against the official Codex and Claude
-CLIs. The harness uses Rust only: no browser, HTTP server or Python runtime.
+A native terminal application now runs against the official Codex, Claude and
+opencode CLIs. The harness uses Rust only: no browser, HTTP server or Python runtime.
 This is an interactive vertical slice, not the completed feature-parity release.
 
 ## Run
@@ -13,6 +13,7 @@ make rust-build
 ./target/release/octet --engine demo
 ./target/release/octet --engine codex --cwd /path/to/project
 ./target/release/octet --engine claude --cwd /path/to/project
+./target/release/octet --engine opencode --cwd /path/to/project
 ```
 
 `make tui-demo` builds and opens the offline demo. `make tui` opens Codex.
@@ -115,7 +116,7 @@ respected. The minimum usable size is 38 columns by 12 rows.
 | Ctrl+P | Command palette: type to filter it, Backspace edits, Up/Down choose, Enter runs (also offers Ctrl+G, `@`, `!` and Ctrl+O) |
 | `@` | Mention a workspace file; a popup suggests paths as you type (Enter or Tab inserts, Esc closes) |
 | `/model` | Model picker: Up/Down choose, Enter switches, Tab inserts the name, Esc closes |
-| `/skills` | Skills picker: Up/Down choose, Enter or Tab puts `/name ` in the prompt (nothing runs until you send it), Esc closes |
+| `/skills` | Skills picker: Up/Down choose, Enter or Tab puts `/name ` in the prompt (nothing runs until you send it), Esc closes it and clears its `/skills` line |
 | Tab | Complete a path, or a `/command` at the start of the prompt |
 | Ctrl+G | Write the prompt in `$VISUAL` or `$EDITOR` (default `vi`), run by the shell as git runs it: quote a path with spaces |
 | Ctrl+X | Copy the last reply to the clipboard (same as `/copy`) |
@@ -207,7 +208,8 @@ it as a QR code and a link for the phone app (it works once and expires after
 [Phone app (hub)](remote-control.md#phone-app-hub).
 The preview also supports persistent multi-turn goals through `/goal`.
 Changing sessions or exporting requires an idle turn, and `/compact` a
-connected one; a refused command explains why on the status line.
+connected one; a refused command explains why on the status line and its
+line stays in the prompt box, to send again.
 
 `/sessions`, `/export` and `/remote-control` run in the background: the
 status line names the job, and replies, approvals and keys keep working.
@@ -237,33 +239,52 @@ before Esc that the vendor had not started. `/queue` lists it and
 `/queue clear` empties it. An active goal's continuation goes first.
 
 **Steering.** `/steer TEXT` adds TEXT to the running turn. Codex takes it
-into the same turn (`turn/steer`). Claude has no steering request, so the
-text is queued as the next prompt, and Octet says so. While a cancelled turn
-is still stopping, `/steer` text is queued as the next prompt too. With no
-turn running, `/steer` sends the text as a prompt.
+into the same turn (`turn/steer`). Claude and opencode have no steering
+request, so the text is queued as the next prompt, and Octet says so; for
+opencode, that prompt runs under a mode selected meanwhile. While a
+cancelled turn is still stopping, `/steer` text is queued as the next
+prompt too. With no turn running, `/steer` sends the text as a prompt.
 
 **Reasoning effort.** `--effort LEVEL` at launch, or `/effort LEVEL` later;
 `/effort` alone shows it and `/effort default` returns to the vendor's
 default. Claude takes `low`, `medium`, `high`, `xhigh` and `max`, and Octet
 refuses other levels for it. Codex's levels depend on the model, so any
-word is passed on and Codex decides. A `/model` switch to a provider that
+word is passed on and Codex decides. opencode's levels depend on the model
+too (its variants: `opencode/deepseek-v4.1-flash-free` offers `low`, `high`
+and `max`; some models offer none), and Octet refuses a level the model
+does not list, naming the ones it does. A `/model` switch to a provider that
 does not take the level falls back to its default, with a notice.
 Codex takes it with each turn, so a change applies from the next turn.
+Codex keeps a turn's level for the turns after it (and in the thread, for
+`--resume`), so `/effort default` sends the level Codex picks itself: the
+`model_reasoning_effort` of its config, else the model's own default. A
+resumed or forked Codex thread with no level chosen sends that level with its
+first turn too, and is ready once Octet has read it.
+opencode sets it in the open session: `--effort` once the session opens,
+after the model and before the first prompt (a level the model does not
+list is dropped with a notice and the session goes on), and `/effort` at
+once; `/effort default` goes back to the level the model started at. A
+model's level can reset when the model changes, so Octet sets it again at
+connect when the new model lists it.
 Claude takes it at launch, so a change reconnects to the same session. The
 level carries across `/model`, `/new` and `/reconnect`.
 
 **Fork.** `/fork` continues this conversation in a new vendor session and
 leaves the original as it was (Codex `thread/fork`, Claude
-`--resume ID --fork-session`). The transcript stays on screen and the new
-session's ID replaces the old one. "Forking from X…" shows at once;
-"Forked from X into Y" once the vendor names the new session. It
-needs an idle session that the vendor has already named. Claude names the
-fork with its first turn; a reconnect before then (for example `/effort`)
-forks again, so the original is never written to.
+`--resume ID --fork-session`, opencode `session/fork`). The transcript
+stays on screen and the new session's ID replaces the old one. "Forking
+from X…" shows at once; "Forked from X into Y" once the vendor names the
+new session. It needs an idle session that the vendor has already named.
+opencode names the fork as it opens. Claude names the fork with its first
+turn; a reconnect before then (for example `/effort`) forks again, so the
+original is never written to.
 
 **Compaction.** `/compact` asks the vendor to compact its context (Codex
-`thread/compact/start`, Claude's own `/compact`). It runs as a turn: its
-output streams as usual and Esc cancels it.
+`thread/compact/start`, Claude's own `/compact`, and opencode's `/compact`,
+which summarizes the session although opencode does not list it among its
+commands). It runs as a turn: its output streams as usual and Esc cancels it.
+Once it completes Octet notes "Context compacted", as Codex compacts without
+a word.
 
 **Images.** `/image PATH` attaches an image to the next prompt; the prompt
 box's chips row shows `+ image name.png` (or `+N images`). PNG, JPEG, GIF and WebP
@@ -303,27 +324,124 @@ latest output.
 
 `--mode MODE` at launch, `/mode MODE` at runtime, Shift+Tab to cycle. The default
 is `ask`; the mode is not remembered between launches but is kept across
-`/model`, `/new` and `/reconnect`. `/mode` alone shows the table for the current
-provider. The header shows the selected mode; during a Codex turn it also
-shows the running mode when a change is waiting for the next turn.
+`/model`, `/new` and `/reconnect`. It is the mode the last provider confirmed, so
+one that refused your choice (Claude's `auto` on Haiku) passes its own on. A
+switch to another provider (`/model`, or `/resume` of another provider's
+session) notes the mode it asks the new provider for, which that provider
+confirms once ready (the header then shows the mode it took), and when that is
+not the one you last chose, says so ("Asking opencode for ask, not auto as you
+last chose"). Full
+access carried to another provider is a warning: "Full access carried to
+Claude: no permission checks. /mode ask to turn them on". `/mode` alone shows
+the table for the current provider. The header shows the selected mode; during a Codex or opencode turn
+it also shows the running mode when a change is waiting for the next turn.
 
-| Mode | Claude | Codex (sandbox · approval · reviewer) |
-| --- | --- | --- |
-| `ask` | `default` | workspace-write · untrusted · user |
-| `accept-edits` | `acceptEdits` | workspace-write · on-request · user |
-| `auto` | `auto` (Claude's classifier) | workspace-write · on-request · `auto_review` |
-| `full-access` | `bypassPermissions` | danger-full-access · never · user |
+| Mode | Claude | Codex (sandbox · approval · reviewer) | opencode (agent) |
+| --- | --- | --- | --- |
+| `ask` | `default` | workspace-write · untrusted · user | `octet-ask` (subagents off) |
+| `accept-edits` | `acceptEdits` | workspace-write · on-request · user | `octet-accept-edits` (subagents off) |
+| `auto` | `auto` (Claude's classifier) | workspace-write · on-request · `auto_review` | `build` (opencode's own permission settings) |
+| `full-access` | `bypassPermissions` | danger-full-access · never · user | `octet-full-access` |
 
 `auto` hands approval decisions to the vendor's own reviewer; Octet never
-answers a vendor approval by itself. Codex has no edits-only mode, so
+answers a vendor approval by itself. opencode's `ask` and `accept-edits`
+agents turn subagents (its `task` tool) off: opencode runs a subagent under
+an agent of its own that would not ask, and opencode 1.18.25 never passes a
+subagent's approval requests on to Octet.
+
+opencode's slash commands and skills run in ways those agents cannot see,
+so in `ask` and `accept-edits` Octet checks each one before it sends it,
+against the definition opencode would run. opencode 1.18.25 loads its
+commands and skills once, when the session opens, and runs that copy for the
+rest of the process: a command or skill file edited afterwards, by you or by
+opencode's own tools, changes neither what opencode runs nor what it lists.
+So Octet reads the definitions once too, as opencode lists them, in every
+mode, with `opencode debug config` and `opencode debug skill` run with the
+session's own launch settings in its workspace (at most 20 s), and checks
+every command against that reading for the rest of the session; it reads
+them again only if opencode lists different commands, once the list has
+stayed the same for 200 ms (opencode lists them again as MCP servers
+connect). A list that keeps changing restarts the reading for at most 2 s;
+past that the reading under way runs to its end, and is not trusted if the
+list changed meanwhile. A command sent before the reading is done waits for
+it ("Checking /name against opencode's definitions…"); the session goes on
+meanwhile, and Esc cancels the command.
+
+The check emulates how opencode 1.18.25 expands and runs a command, so it
+holds only for the opencode versions Octet has verified (1.18.25). opencode
+updates itself; when it reports another version at connect, Octet says so
+once, and in `ask` and `accept-edits` sends no command or skill at all: plain
+prompts still work, and `/mode auto` runs commands under opencode's own
+settings. The one exception is `/compact` while opencode lists no command of
+that name: opencode then runs its own summary, with no expansion and no
+shell, so Octet still sends it. `docs/rust/protocol-gate.md` says how a new
+version is verified.
+
+Under Octet's launch settings opencode takes commands from your own
+configuration (`~/.config/opencode` and `~/.opencode`: `opencode.json`,
+`command/`, `commands/`, skill folders; `OPENCODE_CONFIG`,
+`OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT`), from plugins and MCP
+prompts, and from skills in `~/.claude/skills`, `~/.agents/skills`, and the
+workspace's own `.claude/skills` and `.agents/skills` (up to the repository
+root). It does not read the workspace's `opencode.json` or `.opencode/`
+folder. Octet does not send a command that:
+
+- names an agent other than the mode's (`agent: build`, say), whose
+  permissions would apply instead of the mode's;
+- runs as a subagent (`subtask: true`, an agent that is a subagent, or the
+  built-in `/review`);
+- would run shell before any permission check: opencode runs each
+  `` !`cmd` `` of a command's text in its shell first, so a `` !` `` in its
+  template, in a skill's text, or put there by its arguments refuses it.
+
+It also does not send one it cannot check: a command with no definition it
+can read (an MCP prompt), one opencode lists differently from the
+definition Octet read (an MCP prompt of the same name takes a command's
+place), or any command when the definitions cannot be read. A reading that
+failed is tried once more when a command needs it, but not after a turn
+has run in `accept-edits`, `auto` or `full-access`, where opencode edits
+files without asking: the files may then differ from what opencode loaded.
+For the same reason a reading made while such a turn was sent is not
+trusted: a prompt sent in `auto` or `full-access` while the reading made at
+connect still runs leaves it untrusted, so after a later switch to `ask` or
+`accept-edits` every command is refused until `/reconnect`. In both cases
+`/reconnect` starts opencode, and the reading, afresh. The turn then fails
+with the reason, and nothing reaches opencode;
+`/compact` (opencode's own summary) needs only to not be one of your
+commands.
+
+What this does not catch: a file changed in the seconds between opencode
+loading it and Octet reading it by anything other than an `accept-edits`,
+`auto` or `full-access` turn (your editor, another program); plugin code,
+including a plugin's `command.execute.before` hook, which runs outside these
+checks; and an MCP prompt with the same name and description as a command.
+Should a subagent still start, Octet cancels the turn as soon as opencode
+reports it; by then opencode has started it. A plain prompt runs no shell. In `auto`, opencode's
+own permission settings decide; a subagent whose own settings ask then waits
+unseen (in `auto` and in `full-access`, where its own agent's settings
+apply), so when a turn goes quiet for 10 s after a subagent starts, a notice
+says it may still be working, or waiting for a permission Octet cannot show
+(Esc cancels).
+Reading files proceeds in `ask` and `accept-edits`,
+except `.env` files (not `.env.example`), which ask as in opencode's own
+defaults. Codex has no edits-only mode, so
 `accept-edits` is its closest analogue: in-workspace edits already proceed under
 workspace-write, and the model asks only to escalate.
 
 `ask`, `accept-edits` and `auto` switch live. Claude applies the change
-immediately, even mid-turn; Codex applies it from the next turn. For example,
-`ask → auto next` means the running Codex turn still uses `ask`. Steering
+immediately, even mid-turn; Codex and opencode apply it from the next turn
+(opencode sets the session's agent at once but runs each prompt under the
+agent it started with). For example, `ask → auto next` means the running
+Codex or opencode turn still uses `ask`. Codex steering
 messages continue that same turn and do not apply the change. Wait for the turn
 to finish, or press Esc and then send a new prompt to use the selected mode.
+With opencode, a prompt sent while a switch made between turns is still
+unconfirmed waits for opencode's answer, with a notice, so it runs under
+the mode the header shows. If opencode does not confirm within 10 seconds,
+the mode opencode runs is unknown: that prompt, and any sent before
+opencode answers, is not sent, with an error saying so. A late answer
+settles it and prompts run again; `/reconnect` resumes the session, with
+its model, in the mode the header shows.
 An already-open approval still needs your answer. A change Claude
 refuses (for example, auto mode unavailable for the account) leaves the previous
 mode in place with a notice; one Claude does not confirm within 10 seconds is
@@ -366,14 +484,20 @@ tools and `!` commands. It is at most 64 KiB: the newest turns are kept, your
 first prompt always stays, and a marker says how many turns between them were
 dropped. It then lives in the new vendor's own history, so `/reconnect`,
 `/effort`, `/fork` and `/compact` keep it. If the first send is refused, the next
-prompt carries it instead. A same-provider switch resumes the vendor session and
+prompt carries it instead. opencode never gets it with a slash command or
+skill: opencode puts a command's text into the command's template and runs
+every `` !`cmd` `` in the result through its shell before any permission check,
+and the transcript holds replies and tool output. The command runs without it,
+a note says so, and your next plain prompt carries it. A same-provider switch resumes the vendor session and
 carries nothing; `/new` starts fresh, and `/resume N` reopens that session's own
 history. Earlier messages and prompt history remain visible, and the previous
 journal is retained; the new connection writes a new journal.
 The header and sidebar show the provider-reported name and full ID where space
 permits. `/session` and `/model` print complete, scrollable details: requested
 selection, catalog ID, confirmed session model ID, name and description. An alias
-or default is marked unconfirmed until the runtime reports the active model.
+or default is marked unconfirmed until the runtime reports the active model. A
+resumed session asked for no model runs on its own, which Claude names only with
+the first turn: until then the header says "the resumed session's model".
 Names unavailable in the catalog are explicitly marked as not reported.
 
 `/model` lists every provider's models in one list, the current provider's
@@ -381,10 +505,15 @@ first; each entry names its provider and the line that selects it. A bare
 `/model NAME` goes to the provider whose list holds NAME (`/model opus` from
 Codex switches to Claude, carrying the conversation as any provider switch
 does); a name in no list goes to the provider whose listed IDs share its
-leading word (`gpt-5.5` to the provider listing `gpt-…` models), else stays
-with the current provider as a custom ID. `default` is always the current
+leading word (`gpt-5.5` to the provider listing `gpt-…` models), else to
+the one listing it after a `sub/` part (`glm-5.3-flash-free` to opencode's
+`opencode/glm-5.3-flash-free`), else stays with the current provider as a
+custom ID. `default` is always the current
 provider's, and the explicit forms (`/model codex X`, `claude/X`) work as
-before.
+before. A model the provider refuses when the session connects (a typo, or
+one opencode does not list) stops the session with an error naming the model
+and the provider's reason, as `--model` does in `--print` and `--rpc` (exit
+1): Octet never runs your prompts on the provider's default instead.
 
 `/model` alone, or typing `/model ` (with the space), opens the model picker
 above the prompt box: every provider's models, the current provider's first,
@@ -397,9 +526,12 @@ another provider), and Esc closes the picker. Without the picker, Tab after
 `/model ` completes from the current provider's names, and after
 `/model PROVIDER ` from that provider's. While a turn runs,
 Enter is refused with the usual hint and the picker stays open. A name typed
-in full (one a list holds, or `default`) is sent as typed and resolved like any
-`/model NAME`, so `default` stays the current provider's; so is a name that
-matches nothing. A partial name takes the highlighted line; to send a custom
+in full (one a list holds, what follows the `sub/` of a listed ID, or `default`)
+is sent as typed and resolved like any `/model NAME`, so `default` stays the
+current provider's and `gpt-5.5` goes to Codex by its `gpt-` prefix though the
+picker shows opencode's `openai/gpt-5.5`; so is a name that matches nothing.
+Once you move the highlight with Up/Down, Enter takes that line whatever is
+typed. A partial name takes the highlighted line; to send a custom
 name that begins like a listed one, press Esc, then Enter.
 
 The current provider's list comes live from its CLI with each connection
@@ -413,8 +545,9 @@ prompt, no tokens, at most 20 seconds. It runs the CLI Octet runs for that
 provider (a `--binary` override, else the one on PATH). Claude Code backs up
 its own settings each time it starts (`~/.claude/backups/`), so a fetch of
 Claude's list adds one such backup. `/model refresh` fetches every other list
-now, and says which are already on their way; a provider whose fetch failed is
-not tried again until then. A save keeps any list another window saved more
+now, and says which are already on their way, then notes each one as it comes
+in ("Fetched claude's model list (12 models)") or fails; a provider whose fetch
+failed is not tried again until then. A save keeps any list another window saved more
 recently. The
 list's header shows each provider's count and freshness (`live`,
 `cached 2 h ago`, `probing…`, `unavailable: …`); `/model list <page>` pages
@@ -504,8 +637,9 @@ bring, and runs them.
 - Enter (or Tab) on a skill puts `/name ` in the prompt, and nothing runs
   until you send it; add arguments first if it takes any. Sending another
   provider's skill switches to that provider (its default model, the
-  conversation carried as for any switch), then runs the skill as the first
-  turn, with its arguments. While the draft names only another provider's
+  conversation carried as for any switch, except to opencode, where it waits
+  for your next prompt), then runs the skill as the first turn, with its
+  arguments. While the draft names only another provider's
   skill, the hint row turns amber: `Enter switches to {provider}, then runs
   /name`. If the switch fails, the skill is not run and a note says so.
   When both providers list the same name, the one you picked is the one that
@@ -533,7 +667,9 @@ bring, and runs them.
 `/goal <objective>` begins a persistent multi-turn goal. After each successful
 turn, Octet asks the same provider to continue. The goal completes only when
 the assistant gives an evidence summary followed by
-`[[OCTET_GOAL_COMPLETE]]` on its final line. This is a model-reported audit,
+`[[OCTET_GOAL_COMPLETE]]` on its final line. The marker is Octet's own signal:
+the conversation and `/copy` leave it out, and the journal keeps the reply as
+sent. This is a model-reported audit,
 not independent verification. `/goal` or `/goal status` shows state; `/goal pause`,
 `/goal resume`, `/goal complete` (request an audit turn), and `/goal clear` manage
 it. Esc/Ctrl+C pauses an active goal while interrupting its current turn. Failed
@@ -548,10 +684,15 @@ See [the goal workflow guide](rust/goals.md).
 `/session` shows the vendor session ID and journal path. `/reconnect` reopens that
 vendor context; `--resume VENDOR_SESSION_ID` does the same on a later launch.
 `/sessions` lists up to 20 recent vendor sessions in this workspace, newest
-first: provider, session ID, model, age and first prompt. `/resume N` reopens
+first: provider, session ID, model, age and the session's first prompt (from its
+oldest journal listed), then its latest prompt when that differs. `/resume N` reopens
 entry N, switching provider when it belongs to the other vendor, in a fresh
-view. The list comes from Octet's own journals (at most the first 64 KiB of
-each, skipping a torn last line); reconnects of one session show as one entry.
+view, with the model its journal names; when the provider refuses that model
+(opencode's free models come and go), the session stops and says that
+`/model PROVIDER MODEL` resumes the same session with another. The list comes from Octet's own journals (at most the first 64 KiB of
+each, skipping a torn last line, and the last 256 KiB for the latest prompt,
+which is left out when it is further back); reconnects of one session show as
+one entry.
 Reconnection does not load the earlier local transcript into the viewport yet.
 `/new` starts fresh vendor context without deleting previous journals.
 
@@ -686,7 +827,10 @@ Under 30 rows the banner gives way to a one-row header with the same facts:
 `◆ Octet · mode · engine / model  workspace   ● status · usage`.
 
 Status and usage stay at the right edge, sized to their text so a narrow
-terminal never cuts them. Below the banner, the conversation
+terminal never cuts them. The usage is what the provider reports: Claude's
+session cost; for Codex, the context the last request used, of the model's
+window (`14.3k/272k context`), which drops after `/compact`; for opencode,
+its token count. Below the banner, the conversation
 area stays empty until the first message; the composer's placeholder says
 what to type.
 

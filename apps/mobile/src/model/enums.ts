@@ -2,7 +2,7 @@
 // generated and has them only as types; the `Missing` checks fail the build if one grows.
 import type { Engine, Mode, Phase } from "../protocol";
 
-export const ENGINES = ["claude", "codex", "demo"] as const satisfies readonly Engine[];
+export const ENGINES = ["claude", "codex", "demo", "opencode"] as const satisfies readonly Engine[];
 export const MODES = ["ask", "accept-edits", "auto", "full-access"] as const satisfies readonly Mode[];
 export const PHASES = ["connecting", "idle", "running", "stopped"] as const satisfies readonly Phase[];
 

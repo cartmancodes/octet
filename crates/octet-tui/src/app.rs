@@ -33,6 +33,8 @@ pub(crate) enum Role {
     Assistant,
     Tool,
     Notice,
+    /// A notice the user must not miss, shown like an error.
+    Warning,
     Error,
     Shell,
     ShellFailed,
@@ -123,9 +125,19 @@ pub(crate) struct Connection {
     pub(crate) mode_pending: Option<octet_core::Mode>,
     /// Codex keeps the running turn's permissions when the next mode changes.
     pub(crate) mode_for_turn: Option<octet_core::Mode>,
+    /// Whether a turn was running when this interface last sent a mode
+    /// switch, until the next mode report (a confirmation, a refusal or a
+    /// timeout all report one). Where a mode applies from the next turn,
+    /// that, not the turn running when the vendor confirms, decides whether
+    /// the running turn keeps its mode: the driver holds a prompt sent
+    /// behind an idle switch until the switch resolves.
+    pub(crate) mode_sent_mid_turn: Option<bool>,
     pub(crate) workspace: String,
     pub(crate) model: String,
     pub(crate) requested_model: Option<String>,
+    /// The connection resumes (or forks) a vendor session. Asked for no
+    /// model, it runs on that session's own, not the provider's default.
+    pub(crate) resumes: bool,
     pub(crate) resolved_model: Option<String>,
     pub(crate) models: Vec<octet_core::ModelInfo>,
     /// The active provider's skills, as it last listed them.
@@ -165,9 +177,11 @@ impl Connection {
             mode: config.mode,
             mode_pending: None,
             mode_for_turn: None,
+            mode_sent_mid_turn: None,
             workspace: clean(&config.cwd.display().to_string()),
             model: "awaiting model metadata".into(),
             requested_model: config.model.clone(),
+            resumes: config.resume.is_some(),
             resolved_model: None,
             models: Vec::new(),
             skills: Vec::new(),
@@ -238,6 +252,8 @@ pub(crate) struct Transcript {
     pub(crate) entries: VecDeque<Entry>,
     pub(crate) bytes: usize,
     pub(crate) sanitizer: Sanitizer,
+    /// Hides the goal completion marker from the reply as shown and copied.
+    pub(crate) marker: crate::text::MarkerFilter,
     pub(crate) scroll: usize,
     pub(crate) catalog_focus: Option<usize>,
     /// The current turn's reply as sent, tabs and all, for `/copy`.
@@ -370,12 +386,22 @@ pub(crate) struct App {
     /// Another provider's skill, picked in `/skills`: it runs once the
     /// switch to that provider is ready.
     pub(crate) pending_skill: Option<SkillRun>,
+    /// The turn ending now was never sent (its error starts with
+    /// `NOT_SENT`): the queue waits instead of draining into refusals.
+    pub(crate) turn_not_sent: bool,
     /// Why the bridge to a hub is off, when it could not start or broke; `/remote-control` says it.
     pub(crate) remote_off: Option<String>,
     /// Whether the Task sidebar shows on wide terminals; F2 flips it.
     pub(crate) sidebar: bool,
     /// The terminal's width at the last frame, for F2 to say when the sidebar can show.
     pub(crate) last_width: u16,
+    /// The permission mode the user last chose (at launch, Shift+Tab or
+    /// `/mode`), which a vendor may have refused: a switch to another
+    /// provider says when it asks that one for another.
+    pub(crate) mode_chosen: octet_core::Mode,
+    /// The command running now was refused (`App::refuse`), so its typed
+    /// line stays; reset before each command.
+    pub(crate) refused: bool,
 }
 /// A skill to run on a provider the interface is switching to.
 #[derive(Debug, Clone)]
@@ -392,6 +418,7 @@ impl App {
                 entries: VecDeque::new(),
                 bytes: 0,
                 sanitizer: Sanitizer::default(),
+                marker: crate::text::MarkerFilter::default(),
                 scroll: 0,
                 catalog_focus: None,
                 reply: String::new(),
@@ -438,9 +465,12 @@ impl App {
             models: crate::models::Models::default(),
             pending_handoff: None,
             pending_skill: None,
+            turn_not_sent: false,
             remote_off: None,
             sidebar: true,
             last_width: 0,
+            mode_chosen: config.mode,
+            refused: false,
         }
     }
     pub(crate) fn connection(&mut self, config: &octet_core::Config, journal: PathBuf) {
@@ -512,7 +542,11 @@ impl App {
                         self.conn
                             .requested_model
                             .as_deref()
-                            .unwrap_or("provider default")
+                            .unwrap_or(if self.conn.resumes {
+                                "the resumed session's model"
+                            } else {
+                                "provider default"
+                            })
                     )
                 },
                 |m| {
@@ -533,6 +567,10 @@ impl App {
     fn catalog_selection(&self) -> Option<&octet_core::ModelInfo> {
         if let Some(id) = &self.conn.resolved_model {
             self.conn.models.iter().find(|m| m.id.as_ref() == Some(id))
+        } else if self.conn.requested_model.is_none() && self.conn.resumes {
+            // A resumed session keeps its own model, which the vendor names
+            // only with its first turn (Claude); the default is not it.
+            None
         } else {
             self.conn
                 .models
@@ -549,9 +587,14 @@ impl App {
         {
             let _ = write!(
                 text,
-                " (next turn; running turn still uses {}). Steering does not start a new turn",
+                " (next turn; running turn still uses {})",
                 active.label()
             );
+            // Only a provider that steers adds to the running turn; elsewhere
+            // `/steer` is the next prompt, which takes the new mode.
+            if self.conn.engine.provider().steer {
+                text.push_str(". Steering does not start a new turn");
+            }
         }
         if let Some(pending) = self.conn.mode_pending {
             let _ = write!(text, " (switching to {})", pending.label());
@@ -695,14 +738,19 @@ impl App {
                 counts.join(" · ")
             ));
             // Page the list so large lists do not evict current details from scrollback.
+            let labels = crate::clash::labels(&entries);
             let shown: Vec<String> = entries
                 .iter()
+                .zip(&labels)
                 .skip((page - 1) * CATALOG_PAGE)
                 .take(CATALOG_PAGE)
-                .map(|(engine, model)| {
+                .map(|((engine, model), label)| {
+                    // A model another provider also lists is named with its provider in brackets.
+                    let title = label.clone().unwrap_or_else(|| {
+                        format!("{} · {engine}", crate::text::clean(&model.name))
+                    });
                     format!(
-                        "{} · {engine}\nModel ID: {}\n{}\nSelect: {}",
-                        model.name,
+                        "{title}\nModel ID: {}\n{}\nSelect: {}",
                         model.id.as_deref().unwrap_or("unresolved alias"),
                         model.description,
                         self.select_line(*engine, &model.selection)
@@ -840,6 +888,13 @@ impl App {
     pub(crate) fn last_role(&self) -> Option<Role> {
         self.chat.entries.back().map(|entry| entry.role)
     }
+    /// Something the user must not miss, such as permission checks being
+    /// off: a transcript warning and the status line.
+    pub(crate) fn warn(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.status(StatusKind::Plain, &text);
+        self.add(Role::Warning, &text);
+    }
     /// Information, as a transcript note and on the status line.
     pub(crate) fn note(&mut self, text: impl Into<String>) {
         let text = text.into();
@@ -897,6 +952,12 @@ impl App {
     pub(crate) fn hint(&mut self, text: impl Into<String>) {
         self.status(StatusKind::Plain, &text.into());
     }
+    /// A command that would reconnect cannot now (`TURN_OPEN`,
+    /// `NOT_CONNECTED`): says why, and keeps a typed line in the prompt box.
+    pub(crate) fn refuse(&mut self, refusal: &'static str) {
+        self.hint(refusal);
+        self.refused = true;
+    }
     /// Shows `text` on the status line as a `kind` of message.
     pub(crate) fn status(&mut self, kind: StatusKind, text: &str) {
         self.status_line = clean(text);
@@ -927,8 +988,23 @@ impl App {
                 self.conn.resolved_model = Some(id);
                 self.refresh_model_label();
             }
+            // opencode confirms a level, or puts back the one in force after
+            // refusing another: what a reconnect asks for follows it.
+            Event::Effort(level) => self.conn.effort = level,
             Event::ModeChanged(mode) => {
-                if self.conn.engine == octet_core::Engine::CODEX && self.conn.is_running() {
+                // Every mode report answers the last switch sent (confirmed,
+                // refused or timed out), so it is spent here. A report with
+                // no switch outstanding (Codex's own, or a late confirmation
+                // after a timeout) goes by the turn running now.
+                let mid_turn = self
+                    .conn
+                    .mode_sent_mid_turn
+                    .take()
+                    .unwrap_or_else(|| self.conn.is_running());
+                if self.conn.engine.provider().mode_applies_next_turn
+                    && mid_turn
+                    && self.conn.is_running()
+                {
                     self.conn.mode_for_turn.get_or_insert(self.conn.mode);
                 }
                 self.conn.mode = mode;
@@ -977,35 +1053,14 @@ impl App {
             }
             Event::Text(text) => {
                 self.conn.activity = State::Thinking;
-                self.keep_reply(&text);
-                let text = self.chat.sanitizer.push(&text);
-                if self
-                    .chat
-                    .entries
-                    .back()
-                    .is_none_or(|e| e.role != Role::Assistant)
-                {
-                    self.add(Role::Assistant, "");
+                let shown = self.chat.marker.push(&text);
+                // All of it held (a possible start of the goal marker): nothing yet.
+                if !shown.is_empty() || text.is_empty() {
+                    self.reply_text(&shown);
                 }
-                let e = self
-                    .chat
-                    .entries
-                    .back_mut()
-                    .expect("an assistant entry was just ensured");
-                e.append(&text);
-                self.chat.bytes += text.len();
-                if e.text.len() > BLOCK_BYTES + BLOCK_SLACK {
-                    let remove = e.text.ceil_char_boundary(e.text.len() - BLOCK_BYTES);
-                    e.text.drain(..remove);
-                    self.chat.bytes -= remove;
-                    // Its start moved: the next paint wraps it whole, and a
-                    // scrolled-up reader re-anchors there without moving.
-                    e.invalidate();
-                    self.chat.anchor = None;
-                }
-                self.trim();
             }
             Event::Tool(call) => {
+                self.flush_marker();
                 self.chat.reply_break = true;
                 self.conn.activity = State::tool(&call);
                 self.tool(call);
@@ -1015,6 +1070,7 @@ impl App {
                 detail,
                 summary,
             } => {
+                self.flush_marker();
                 let first = self.overlay.approvals.is_empty();
                 let summary = octet_core::ApprovalSummary {
                     action: clean(&summary.action),
@@ -1042,6 +1098,7 @@ impl App {
             }
             Event::Usage(text) => self.conn.usage = clean(&text),
             Event::Finished { outcome } => {
+                self.flush_marker();
                 self.calls_over();
                 self.conn.end_turn();
                 self.clear_status(StatusKind::Cancelling);
@@ -1092,6 +1149,20 @@ impl App {
                 self.conn.activity = State::Error;
             }
             Event::Stopped => {
+                // A resumed session that stops with an error before it opens
+                // may have been refused its model (`/resume N` asks for the
+                // journal's, which opencode's rotating free models may drop);
+                // /model keeps the session, so it can open with another.
+                if self.conn.phase == ConnPhase::Connecting
+                    && self.conn.activity == State::Error
+                    && self.conn.resumes
+                    && self.conn.requested_model.is_some()
+                {
+                    self.note(format!(
+                        "/model {} <model> resumes the same session with another model",
+                        self.conn.engine
+                    ));
+                }
                 // A cancelled connection stops without finishing a turn.
                 self.calls_over();
                 self.clear_status(StatusKind::Cancelling);
@@ -1186,6 +1257,46 @@ impl App {
     /// turn, for `/copy`.
     pub(crate) fn last_reply(&self) -> Option<&str> {
         (!self.chat.reply.is_empty()).then_some(self.chat.reply.as_str())
+    }
+    /// Shows a tail held as a possible start of the goal marker: the turn's
+    /// end, a tool call or an approval shows it was none, and it belongs to
+    /// the reply before them.
+    fn flush_marker(&mut self) {
+        let held = self.chat.marker.flush();
+        if !held.is_empty() {
+            self.reply_text(&held);
+        }
+    }
+    /// Streamed reply text, the goal marker already out: kept for `/copy`
+    /// and appended to the reply on screen.
+    fn reply_text(&mut self, text: &str) {
+        self.keep_reply(text);
+        let text = self.chat.sanitizer.push(text);
+        if self
+            .chat
+            .entries
+            .back()
+            .is_none_or(|e| e.role != Role::Assistant)
+        {
+            self.add(Role::Assistant, "");
+        }
+        let e = self
+            .chat
+            .entries
+            .back_mut()
+            .expect("an assistant entry was just ensured");
+        e.append(&text);
+        self.chat.bytes += text.len();
+        if e.text.len() > BLOCK_BYTES + BLOCK_SLACK {
+            let remove = e.text.ceil_char_boundary(e.text.len() - BLOCK_BYTES);
+            e.text.drain(..remove);
+            self.chat.bytes -= remove;
+            // Its start moved: the next paint wraps it whole, and a
+            // scrolled-up reader re-anchors there without moving.
+            e.invalidate();
+            self.chat.anchor = None;
+        }
+        self.trim();
     }
     /// Adds streamed text to the reply `/copy` takes, up to just over the
     /// clipboard limit so a cut can still be reported.

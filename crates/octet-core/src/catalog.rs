@@ -134,6 +134,23 @@ impl Catalogs {
             .collect()
     }
 
+    /// The providers listing an ID of the form `sub/<name>`, with that full
+    /// ID: `opencode/glm-5.3-flash-free` for `glm-5.3-flash-free`. The match
+    /// is exact and case-sensitive, on what follows the ID's last `/`.
+    pub fn suffix_owners(&self, name: &str) -> Vec<(Engine, String)> {
+        vendors()
+            .flat_map(|engine| {
+                self.get(engine).into_iter().flat_map(move |listed| {
+                    listed.models.iter().filter_map(move |m| {
+                        let id = m.id.as_deref().unwrap_or(&m.selection);
+                        let (_, suffix) = id.rsplit_once('/')?;
+                        (!name.is_empty() && suffix == name).then(|| (engine, id.to_owned()))
+                    })
+                })
+            })
+            .collect()
+    }
+
     /// The providers whose listed IDs share `name`'s leading word (up to its
     /// first `-`): `gpt` for `gpt-5.5` when a provider lists `gpt-6-astra`.
     pub fn prefix_owners(&self, name: &str) -> Vec<Engine> {
@@ -301,6 +318,37 @@ mod tests {
             c.prefix_owners("opus").is_empty(),
             "a name without a leading word"
         );
+    }
+
+    #[test]
+    fn suffixes_are_matched_after_the_last_slash() {
+        let mut c = sample();
+        let at = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        c.set(
+            Engine::OPENCODE,
+            vec![
+                model("opencode/glm-fixture", None),
+                model("openai/gpt-fixture", Some("openai/gpt-fixture")),
+                model("a/b/deep", None),
+            ],
+            at,
+        );
+        assert_eq!(
+            c.suffix_owners("glm-fixture"),
+            [(Engine::OPENCODE, "opencode/glm-fixture".to_owned())]
+        );
+        assert_eq!(
+            c.suffix_owners("gpt-fixture"),
+            [(Engine::OPENCODE, "openai/gpt-fixture".to_owned())]
+        );
+        assert_eq!(
+            c.suffix_owners("deep"),
+            [(Engine::OPENCODE, "a/b/deep".to_owned())]
+        );
+        assert!(c.suffix_owners("GLM-fixture").is_empty(), "case matters");
+        assert!(c.suffix_owners("glm").is_empty(), "the whole suffix only");
+        assert!(c.suffix_owners("opus").is_empty(), "an ID without a slash");
+        assert!(c.suffix_owners("").is_empty());
     }
 
     #[test]

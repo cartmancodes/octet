@@ -19,7 +19,7 @@ const LABEL: &str = "dev.octet.hub";
 /// The systemd unit's name.
 const UNIT: &str = "octet-hub.service";
 /// The tools the hub starts, in the order their directories lead the service's `PATH`.
-const TOOLS: [&str; 3] = ["tmux", "claude", "codex"];
+const TOOLS: [&str; 4] = ["tmux", "claude", "codex", "opencode"];
 /// Directories a bare launchd or systemd `PATH` lacks, after the ones the [`TOOLS`] were found in.
 const DEFAULT_PATH: [&str; 4] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
 /// How many times `launchctl bootstrap` is tried: it can fail just after a `bootout`.
@@ -282,9 +282,10 @@ pub(crate) fn find_on_path(search: &OsStr, name: &str) -> Option<PathBuf> {
         })
 }
 
-/// The directories on `search` where `tmux`, `claude` and `codex` were found, in that order, each
-/// once; a tool that isn't there adds nothing. The service's own `PATH` lacks the directories a
-/// shell adds (`claude` is often in `~/.local/bin`), so a session started from the phone needs these.
+/// The directories on `search` where `tmux`, `claude`, `codex` and `opencode` were found, in that
+/// order, each once; a tool that isn't there adds nothing. The service's own `PATH` lacks the
+/// directories a shell adds (`claude` is often in `~/.local/bin`, `opencode` in `~/.opencode/bin`),
+/// so a session started from the phone needs these.
 pub(crate) fn tool_dirs(search: &OsStr) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for dir in TOOLS.iter().filter_map(|tool| find_on_path(search, tool)) {
@@ -714,11 +715,19 @@ mod tests {
         write_script(&brew, "tmux", "exit 0");
         write_script(&local, "claude", "exit 0");
         write_script(&brew, "codex", "exit 0");
-        let search =
-            std::env::join_paths([empty.as_path(), local.as_path(), brew.as_path()]).unwrap();
-        // tmux, claude, codex in that order, each directory once.
+        // opencode's installer puts it in its own `~/.opencode/bin`.
+        let opencode = dir.path().join(".opencode").join("bin");
+        write_script(&opencode, "opencode", "exit 0");
+        let search = std::env::join_paths([
+            empty.as_path(),
+            opencode.as_path(),
+            local.as_path(),
+            brew.as_path(),
+        ])
+        .unwrap();
+        // tmux, claude, codex, opencode in that order, each directory once.
         let found = tool_dirs(&search);
-        assert_eq!(found, [brew.clone(), local.clone()]);
+        assert_eq!(found, [brew.clone(), local.clone(), opencode.clone()]);
         let rig = Rig::new("");
         let plan = ServicePlan::new(
             Manager::Launchd,
@@ -728,7 +737,12 @@ mod tests {
             &found,
         )
         .unwrap();
-        let expected = format!("{}:{}:{DEFAULTS}", brew.display(), local.display());
+        let expected = format!(
+            "{}:{}:{}:{DEFAULTS}",
+            brew.display(),
+            local.display(),
+            opencode.display()
+        );
         let text = plan.text();
         assert!(
             text.contains(&format!("<key>PATH</key>\n    <string>{expected}</string>")),

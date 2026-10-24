@@ -15,6 +15,8 @@ pub(crate) struct Ended<'a> {
     pub(crate) journal: &'a Path,
     /// The last mode the vendor confirmed.
     pub(crate) mode: Mode,
+    /// The mode the user last chose, which a vendor may not have taken.
+    pub(crate) chosen: Mode,
     pub(crate) effort: Option<String>,
 }
 
@@ -30,6 +32,9 @@ pub(crate) struct Plan {
     pub(crate) notes: Vec<String>,
     /// A note to open a fresh interface with.
     pub(crate) opening: Option<String>,
+    /// A warning for the next interface, kept or fresh: full access carried
+    /// to another provider.
+    pub(crate) warning: Option<String>,
     /// Another provider takes over: the conversation goes with the next
     /// prompt, as a rendered transcript.
     pub(crate) carry_conversation: bool,
@@ -66,6 +71,7 @@ pub(crate) fn plan(
         pause,
         notes,
         opening: None,
+        warning: None,
         carry_conversation: false,
     };
     let resume = resume_id(ended.session, config.engine);
@@ -94,8 +100,16 @@ pub(crate) fn plan(
                 },
                 ended.journal.display()
             ));
+            let mut warning = None;
+            if cross_provider {
+                match provider_mode(next.engine, next.mode, ended.chosen) {
+                    StartMode::Warning(text) => warning = Some(text),
+                    StartMode::Note(text) => notes.push(text),
+                }
+            }
             Plan {
                 carry_conversation: cross_provider,
+                warning,
                 ..kept(next, Some("model switch"), notes)
             }
         }
@@ -134,20 +148,31 @@ pub(crate) fn plan(
                 .cloned()
                 .unwrap_or_else(|| PathBuf::from(engine.provider().default_binary));
             binaries.insert(engine, binary.clone());
-            let resumed = format!(
+            let mut opening = format!(
                 "Resumed {engine} session {session}. Previous journal: {}",
                 ended.journal.display()
             );
-            let effort = resume_into(&mut config, engine, session, model, binary);
+            let mut warning = None;
+            if engine != config.engine {
+                match provider_mode(engine, config.mode, ended.chosen) {
+                    StartMode::Warning(text) => warning = Some(text),
+                    StartMode::Note(text) => {
+                        opening.push('\n');
+                        opening.push_str(&text);
+                    }
+                }
+            }
+            if let Some(effort) = resume_into(&mut config, engine, session, model, binary) {
+                opening.push('\n');
+                opening.push_str(&effort);
+            }
             Plan {
                 config,
                 keep_app: false,
                 pause: Some("resume"),
                 notes: Vec::new(),
-                opening: Some(match effort {
-                    Some(effort) => format!("{resumed}\n{effort}"),
-                    None => resumed,
-                }),
+                opening: Some(opening),
+                warning,
                 carry_conversation: false,
             }
         }
@@ -160,6 +185,7 @@ pub(crate) fn plan(
                 pause: None,
                 notes: Vec::new(),
                 opening: None,
+                warning: None,
                 carry_conversation: false,
             }
         }
@@ -170,6 +196,38 @@ pub(crate) fn plan(
             let note = reconnect_notice(config.resume.is_some(), ended.journal);
             kept(config, Some("reconnect"), vec![note])
         }
+    })
+}
+
+/// What a switch to another provider says about the mode it asks for, which
+/// the provider confirms (or not) once it is ready.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartMode {
+    /// Full access: shown as a warning, since nothing asks any more.
+    Warning(String),
+    /// Any other mode, and whether it is not the one the user last chose.
+    Note(String),
+}
+
+/// How `engine`, starting in `mode` (carried from the last provider), says
+/// so; `chosen` is the mode the user last chose, which the last provider
+/// may have refused.
+pub(crate) fn provider_mode(engine: Engine, mode: Mode, chosen: Mode) -> StartMode {
+    let title = engine.title();
+    if mode == Mode::FullAccess {
+        return StartMode::Warning(format!(
+            "Full access carried to {title}: no permission checks. /mode ask to turn them on"
+        ));
+    }
+    // A request: the provider confirms the mode it takes once it is ready.
+    let mode = mode.label();
+    StartMode::Note(if chosen.label() == mode {
+        format!("Asking {title} for {mode}")
+    } else {
+        let chosen = chosen.label();
+        format!(
+            "Asking {title} for {mode}, not {chosen} as you last chose. /mode {chosen} to ask for it again"
+        )
     })
 }
 
@@ -271,11 +329,111 @@ mod tests {
             session,
             journal: Path::new("/j/old.jsonl"),
             mode: Mode::Auto,
+            chosen: Mode::Auto,
             effort: Some("minimal".into()),
         }
     }
     fn plan_for(exit: Exit, config: &Config, session: &str) -> Plan {
         plan(exit, config, &ended(session), &mut HashMap::new()).unwrap()
+    }
+    /// The plan for a switch to `provider`'s default model after a session
+    /// that ended in `mode`, the user having last chosen `chosen`.
+    fn switch_in(provider: Engine, mode: Mode, chosen: Mode) -> Plan {
+        let ended = Ended {
+            mode,
+            chosen,
+            ..ended("t-1")
+        };
+        let exit = Exit::Model(Selection {
+            provider,
+            model: None,
+        });
+        plan(exit, &codex(), &ended, &mut HashMap::new()).unwrap()
+    }
+
+    #[test]
+    fn another_model_after_a_resume_that_did_not_open_resumes_the_same_session() {
+        // `/resume N` was refused its model before opencode named the
+        // session: the hint's `/model opencode <model>` must resume it.
+        let mut config = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+        config.resume = Some("ses-1".into());
+        config.model = Some("opencode/gone-free".into());
+        let exit = Exit::Model(Selection {
+            provider: Engine::OPENCODE,
+            model: Some("opencode/glm-5.3-flash-free".into()),
+        });
+        let next = plan_for(exit, &config, "").config;
+        assert_eq!(next.resume.as_deref(), Some("ses-1"));
+        assert_eq!(next.model.as_deref(), Some("opencode/glm-5.3-flash-free"));
+    }
+
+    #[test]
+    fn full_access_carried_to_another_provider_is_a_warning() {
+        let plan = switch_in(Engine::CLAUDE, Mode::FullAccess, Mode::FullAccess);
+        assert_eq!(plan.config.mode, Mode::FullAccess);
+        assert_eq!(
+            plan.warning.as_deref(),
+            Some("Full access carried to Claude: no permission checks. /mode ask to turn them on")
+        );
+        // The same provider's model change is no provider switch.
+        let same = switch_in(Engine::CODEX, Mode::FullAccess, Mode::FullAccess);
+        assert_eq!(same.warning, None);
+        assert!(
+            !same.notes.iter().any(|n| n.starts_with("Asking")),
+            "{:?}",
+            same.notes
+        );
+    }
+
+    #[test]
+    fn another_provider_names_the_mode_it_is_asked_for() {
+        // The provider has not confirmed it yet (Claude may report ask).
+        let plan = switch_in(Engine::OPENCODE, Mode::Auto, Mode::Auto);
+        assert_eq!(plan.warning, None);
+        assert_eq!(
+            plan.notes.last().map(String::as_str),
+            Some("Asking opencode for auto")
+        );
+    }
+
+    #[test]
+    fn a_mode_the_last_provider_did_not_take_is_named_at_the_next_switch() {
+        // The user chose auto; Claude reported ask, and ask carries on.
+        let plan = switch_in(Engine::OPENCODE, Mode::Ask, Mode::Auto);
+        assert_eq!(plan.config.mode, Mode::Ask);
+        assert_eq!(
+            plan.notes.last().map(String::as_str),
+            Some(
+                "Asking opencode for ask, not auto as you last chose. /mode auto to ask for it again"
+            )
+        );
+    }
+
+    #[test]
+    fn resuming_another_providers_session_names_its_mode() {
+        let ended = Ended {
+            mode: Mode::FullAccess,
+            chosen: Mode::FullAccess,
+            ..ended("t-1")
+        };
+        let exit = Exit::Resume {
+            engine: Engine::CLAUDE,
+            session: "c-1".into(),
+            model: None,
+        };
+        let other = plan(exit, &codex(), &ended, &mut HashMap::new()).unwrap();
+        let warning = other.warning.unwrap_or_default();
+        assert!(
+            warning.starts_with("Full access carried to Claude"),
+            "{warning}"
+        );
+        let same = Exit::Resume {
+            engine: Engine::CODEX,
+            session: "t-0".into(),
+            model: None,
+        };
+        let same = plan(same, &codex(), &ended, &mut HashMap::new()).unwrap();
+        assert_eq!(same.warning, None);
     }
 
     #[test]
@@ -345,6 +503,41 @@ mod tests {
     #[test]
     fn quit_has_no_plan() {
         assert!(plan(Exit::Quit, &codex(), &ended("t-1"), &mut HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn reconnect_keeps_opencodes_model_and_takes_the_headers_mode() {
+        // The way out of a mode opencode left unknown: `/reconnect` resumes
+        // the session with its model, and its handshake sets the header's
+        // mode.
+        let mut opencode = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+        opencode.model = Some("opencode/deepseek-v4.1-flash-free".into());
+        let plan = plan_for(Exit::Reconnect, &opencode, "ses-1");
+        assert_eq!(plan.config.engine, Engine::OPENCODE);
+        assert_eq!(
+            plan.config.model.as_deref(),
+            Some("opencode/deepseek-v4.1-flash-free")
+        );
+        assert_eq!(plan.config.mode, Mode::Auto);
+        assert_eq!(plan.config.resume.as_deref(), Some("ses-1"));
+    }
+
+    #[test]
+    fn model_opencode_reconnects_in_the_headers_mode() {
+        // The way out of a mode opencode left unknown: `/model opencode`
+        // resumes the session and its handshake sets the header's mode.
+        let opencode = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+        let plan = plan_for(
+            Exit::Model(Selection {
+                provider: Engine::OPENCODE,
+                model: None,
+            }),
+            &opencode,
+            "ses-1",
+        );
+        assert_eq!(plan.config.engine, Engine::OPENCODE);
+        assert_eq!(plan.config.mode, Mode::Auto);
+        assert_eq!(plan.config.resume.as_deref(), Some("ses-1"));
     }
 
     #[test]

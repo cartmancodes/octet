@@ -31,14 +31,18 @@ pub(super) const PROVIDER: Provider = Provider {
         "…ask…", "…accept-edits…", "…auto…", "…full-access…",
     ],
     steer: false,                   // true if a running turn takes more input
+    mode_applies_next_turn: false,  // true if a live /mode switch reaches only the next turn
     inline_images: false,           // true if images go in the prompt as base64
-    effort_live: false,             // true if effort is sent per turn, not at launch
+    effort_live: false,             // true if effort changes in the open session, not at launch
+    takes_effort: true,             // false if the vendor has no reasoning effort setting
+    ids_carry_name: false,          // true if model IDs can start with the provider's own name (opencode/X)
     efforts: &[],                   // the effort levels it takes; empty passes any word
     // How long the CLI may take to exit once its input closes, before
     // SIGTERM: time how long it really takes and allow some margin.
     shutdown_grace: Duration::from_millis(150),
     lists_models: false,            // true if the CLI can list its models without opening a session
     launch_args: <GeminiProtocol as Protocol>::launch_args, // shared with the protocol gate
+    launch_env: super::no_env,      // extra env vars for the CLI, on top of the inherited ones
     start,
 };
 
@@ -49,6 +53,17 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
 
 Write `start` for the concrete type, as shown. That lets the compiler prove
 the session can move between threads.
+
+Three fields change how the rest of Octet treats the vendor.
+`takes_effort: false` makes `/effort` say the vendor takes no level and change
+nothing. A live vendor that sets effort by request (opencode's `effort`
+session option) implements `Protocol::set_effort`; without it the driver
+records the level for the next turn (Codex). `ids_carry_name: true` is for a vendor whose model
+IDs are `provider/model` and can start with the vendor's own name (opencode
+has an `opencode` provider): `/model opencode/big-pickle` keeps
+`opencode/big-pickle` whole as the model, where other vendors have the leading
+`NAME/` stripped as Octet's own prefix. `launch_env` is the environment the CLI
+starts with on top of the inherited one (see the table below).
 
 **The protocol and its state.** Keep only this vendor's state here; the
 shared state is in `Core`.
@@ -67,7 +82,8 @@ impl Protocol for GeminiProtocol {
     async fn set_mode(&mut self, core: &mut Core, target: Mode) -> Result<(), DriverError> { … }
     async fn on_frame(&mut self, core: &mut Core, frame: Value) -> Result<(), DriverError> { … }
     fn answer(wire: &Value, allow: bool) -> Value { … }
-    // Optional: deny, is_progress, mode_change_pending, deadline, on_deadline, turn_started, steer.
+    // Optional: deny, is_progress, mode_change_pending, mode_unsettled, take_switch_timed_out,
+    // deadline, on_deadline, turn_started, stopping, set_effort, steer.
 }
 ```
 
@@ -77,8 +93,8 @@ format, built on `model_catalog_with`.
 ### 2. Add the row to the table
 
 ```rust
-pub const ALL: &'static [Engine] = &[Engine::CODEX, Engine::CLAUDE, Engine::DEMO,
-    Engine(&gemini::PROVIDER)];
+pub const ALL: &'static [Engine] = &[Engine::CODEX, Engine::CLAUDE, Engine::OPENCODE,
+    Engine::DEMO, Engine(&gemini::PROVIDER)];
 ```
 
 `ALL` lives in the same module as `Engine`, so it can build the row
@@ -113,6 +129,7 @@ scenarios are per vendor.
 | `launch_args` | The CLI's arguments for `config`: model, resume ID, the permission mode at launch. |
 | `initialize` | Send the handshake. When its reply arrives (in `on_frame`): set `core.phase = Phase::Idle`, emit `Event::Ready` with the session ID, and pass the mode the vendor reports to `core.adopt_mode`, which notes a mismatch and emits `Event::ModeChanged`. A two-step handshake passes through `Phase::Handshaken`. **Only move the phase forward**: ignore a repeated reply, and treat a step that arrives early as a protocol error, as Codex and Claude do. |
 | `launch_args` (more) | Also: `config.effort` when the vendor takes effort at launch, and `config.fork` (open `resume` as a new session). |
+| `launch_env` (the row's function, not a method) | The environment variables the CLI starts with, on top of the inherited ones. `super::no_env` for a vendor that needs none; opencode passes its agents and permission rules this way (`OPENCODE_CONFIG_CONTENT`). The driver and the protocol gate both call it, so the gate checks what ships. |
 | `send_prompt` | Send the user's text, then its images (`ImageAttachment`: path, media type, name; `read_base64` reads the bytes). The driver has already set `Phase::InTurn` and emitted `User` and `Started`. If an image cannot be read, fail the turn with `core.finish_turn(Outcome::Failed, Some(message))`. |
 | `compact` | Ask the vendor to compact its context, as a turn: the driver has set `Phase::InTurn` and emitted `User("/compact")` and `Started`. |
 | `steer` | Add text to the running turn; `Ok(false)` (the default) means the vendor cannot, and the interface queues the text instead. Set the row's `steer` to match. |
@@ -121,10 +138,13 @@ scenarios are per vendor.
 | `on_frame` | Turn vendor output into `Text`, `Tool`, `Usage`, `Approval` (through `core.queue_approval`, which denies a request too large to show or beyond the 8 already waiting) and, at the turn's end, `core.finish_turn(outcome, error)`, which closes the turn's approvals and makes the session idle. Ignore output for other sessions or turns. |
 | `answer` | The reply that allows or denies an approval request. The driver uses it for user answers, timeouts and oversized requests. |
 | `deny` | The reply denying an approval with a reason (the user's refusal, a timeout, the cap, a cancelled turn). Override it if the vendor passes a message on to the model, as Claude does; the default is `answer(wire, false)`. |
-| `mode_change_pending` | True while a mode switch waits for the vendor to confirm it. The driver then refuses another switch. |
+| `mode_change_pending` | True while a mode switch waits for the vendor to confirm it. The driver then refuses another switch. Where `mode_applies_next_turn` is set, it also holds a prompt sent while idle until the switch is confirmed or refused, so the prompt runs under the mode the header shows; a prompt held behind a switch that `take_switch_timed_out` reports unconfirmed fails unsent. |
 | `is_progress` | Whether a frame shows the turn is alive. Return false for another thread's output. |
 | `deadline` / `on_deadline` | An optional protocol timer, such as Claude's mode confirmation. |
+| `mode_unsettled` | The target of a timed-out switch the vendor has not answered yet, while it is unanswered: the vendor's mode is unknown, so a provider whose mode applies from the next turn has every turn refused unsent. |
+| `take_switch_timed_out` | Whether the last switch was reported unconfirmed since it was sent (reading clears it), so the driver does not send a prompt held behind it. |
 | `turn_started` | Clear per-turn state. |
+| `stopping` | The session is ending, however it ends, before the vendor process is stopped: clean up after it (opencode deletes a probe's session here when the probe ended early). |
 
 Requests Octet will not show the user (a permission outside a turn, a
 method it does not know) get a reply from a plain function in the vendor's

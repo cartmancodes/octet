@@ -316,6 +316,37 @@ fn a_fork_is_announced_when_the_vendor_names_it() {
     );
 }
 #[test]
+fn a_resumed_session_refused_its_model_says_how_to_resume_with_another() {
+    // `/resume N` asks for the journal's model, which opencode may no longer
+    // offer (its free models rotate): the session stops while connecting.
+    let resumed = |model: Option<&str>| {
+        let mut config = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+        config.resume = Some("ses-1".into());
+        config.model = model.map(str::to_owned);
+        App::new(&config, "journal".into())
+    };
+    let hint = "/model opencode <model> resumes the same session with another model";
+    let mut app = resumed(Some("opencode/gone-free"));
+    app.event(octet_core::Event::Error(
+        "opencode refused the model gone-free: Invalid params: model not found".into(),
+    ));
+    app.event(octet_core::Event::Stopped);
+    assert!(app.entries_text().contains(hint), "{}", app.entries_text());
+    // No model was asked for, so none was refused.
+    let mut plain = resumed(None);
+    plain.event(octet_core::Event::Error("opencode exited".into()));
+    plain.event(octet_core::Event::Stopped);
+    assert!(!plain.entries_text().contains(hint));
+    // A session that opened and stopped later did not stop on its model.
+    let mut opened = resumed(Some("opencode/gone-free"));
+    opened.event(octet_core::Event::Ready {
+        session: "ses-1".into(),
+    });
+    opened.event(octet_core::Event::Error("opencode exited".into()));
+    opened.event(octet_core::Event::Stopped);
+    assert!(!opened.entries_text().contains(hint));
+}
+#[test]
 fn browsing_history_keeps_the_drafts_own_images() {
     let dir = image_workspace("octet-image-browse", &["draft.png"]);
     let mut app = app();
@@ -495,6 +526,85 @@ fn a_skill_after_a_switch_carries_the_handoff_as_context() {
     );
 }
 #[test]
+fn an_opencode_command_after_a_switch_leaves_the_handoff_for_the_next_prompt() {
+    // opencode substitutes a command's text into its template and runs every
+    // `!`cmd`` in the result through its shell: the earlier conversation
+    // (replies, tool output) must never become a command's text.
+    let mut app = switched_to_codex();
+    app.conn.engine = Engine::OPENCODE;
+    let vendor = RecordingVendor::default();
+    app.begin_turn(
+        &vendor,
+        Command::Skill {
+            name: "review".into(),
+            path: None,
+            args: "go".into(),
+            display: "/review go".into(),
+            context: None,
+        },
+        By::User,
+        "sending",
+    )
+    .unwrap();
+    match &vendor.sent.borrow()[..] {
+        [Command::Skill { context, args, .. }] => {
+            assert_eq!(context.as_deref(), None);
+            assert_eq!(args, "go");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(app.pending_handoff.is_some());
+    assert!(
+        app.entries_text()
+            .contains("The earlier conversation goes with your next prompt, not with /review"),
+        "{}",
+        app.entries_text()
+    );
+    crate::test_support::idle(&mut app);
+    app.begin_turn(&vendor, Command::Prompt("next".into()), By::User, "sending")
+        .unwrap();
+    match &vendor.sent.borrow()[1] {
+        Command::PromptWithDisplay { wire, display, .. } => {
+            assert!(wire.starts_with("[Octet handoff]"), "{wire}");
+            assert_eq!(display, "next");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(app.pending_handoff.is_none());
+}
+#[test]
+fn the_handoff_waits_for_the_next_prompt_saying_so_once() {
+    // Several opencode commands after a switch: the note that the earlier
+    // conversation waits comes with the first only.
+    let mut app = switched_to_codex();
+    app.conn.engine = Engine::OPENCODE;
+    let vendor = RecordingVendor::default();
+    for name in ["review", "init", "review"] {
+        app.begin_turn(
+            &vendor,
+            Command::Skill {
+                name: name.into(),
+                path: None,
+                args: String::new(),
+                display: format!("/{name}"),
+                context: None,
+            },
+            By::User,
+            "sending",
+        )
+        .unwrap();
+        crate::test_support::idle(&mut app);
+    }
+    let text = app.entries_text();
+    assert_eq!(
+        text.matches("The earlier conversation goes with your next prompt")
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(app.pending_handoff.is_some());
+}
+#[test]
 fn a_refused_send_keeps_the_handoff() {
     let mut app = switched_to_codex();
     let vendor = RecordingVendor::default();
@@ -529,4 +639,52 @@ fn new_drops_the_handoff_and_an_empty_conversation_carries_nothing() {
     assert!(fresh.pending_handoff.is_none());
     assert!(!fresh.carry_conversation());
     assert!(fresh.pending_handoff.is_none());
+}
+#[tokio::test]
+async fn a_turn_never_sent_keeps_the_queued_prompts() {
+    let config = Config::new(Engine::OPENCODE, "opencode", "/tmp");
+    let mut app = App::new(&config, "journal".into());
+    crate::test_support::idle(&mut app);
+    let vendor = RecordingVendor::default();
+    app.conn.start_turn();
+    for text in ["queued one", "queued two"] {
+        app.composer.queue.push_back(Prompt::plain(text.into()));
+    }
+    // The driver refused the turn unsent: sending the queue now would only
+    // have each prompt refused and lost.
+    for event in [
+        octet_core::Event::Error(format!(
+            "{}opencode has not confirmed the switch to accept-edits",
+            octet_core::NOT_SENT
+        )),
+        octet_core::Event::Finished {
+            outcome: octet_core::Outcome::Failed,
+        },
+    ] {
+        session_event(&mut app, &vendor, event).await;
+    }
+    assert!(
+        vendor.sent.borrow().is_empty(),
+        "{:?}",
+        vendor.sent.borrow()
+    );
+    assert_eq!(app.composer.queue.len(), 2);
+    assert!(
+        app.entries_text()
+            .contains("Kept 2 queued prompts; send them again once opencode confirms its mode"),
+        "{}",
+        app.entries_text()
+    );
+    // An ordinary failed turn still goes on with the queue.
+    app.conn.start_turn();
+    session_event(
+        &mut app,
+        &vendor,
+        octet_core::Event::Finished {
+            outcome: octet_core::Outcome::Failed,
+        },
+    )
+    .await;
+    assert_eq!(vendor.sent.borrow().len(), 1);
+    assert_eq!(app.composer.queue.len(), 1);
 }

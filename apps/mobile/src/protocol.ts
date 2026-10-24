@@ -8,7 +8,7 @@ export const MAX_MESSAGE = 98304;
 export const MAX_SESSION_ROWS = 200;
 
 /** A provider. */
-export type Engine = "claude" | "codex" | "demo";
+export type Engine = "claude" | "codex" | "demo" | "opencode";
 
 /** A permission mode. */
 export type Mode = "ask" | "accept-edits" | "auto" | "full-access";
@@ -38,6 +38,7 @@ export type KnownJournalEvent =
   | { type: "finished"; data: string }
   | { type: "mode"; data: string }
   | { type: "model_selected"; data: string }
+  | { type: "effort"; data: unknown }
   | { type: "usage"; data: string }
   | { type: "notice"; data: string }
   | { type: "error"; data: string }
@@ -62,7 +63,7 @@ export interface UnknownJournalEvent {
 export type JournalEvent = KnownJournalEvent | UnknownJournalEvent;
 
 /** Every record kind `KnownJournalEvent` types. */
-export const KNOWN_JOURNAL_KINDS: readonly string[] = ["text", "user", "finished", "mode", "model_selected", "usage", "notice", "error", "tool", "approval", "approval_closed", "started", "stopped", "hook", "ready", "session", "models", "skills"];
+export const KNOWN_JOURNAL_KINDS: readonly string[] = ["text", "user", "finished", "mode", "model_selected", "effort", "usage", "notice", "error", "tool", "approval", "approval_closed", "started", "stopped", "hook", "ready", "session", "models", "skills"];
 
 /** Whether `e` is a record of a kind this version knows. */
 export function isKnownEvent(e: JournalEvent): e is KnownJournalEvent {

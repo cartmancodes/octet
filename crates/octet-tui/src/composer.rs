@@ -1,5 +1,6 @@
 //! The prompt box's attachment and completion logic, free of terminal I/O.
 use crate::shell::{CUT, Ran};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -8,7 +9,11 @@ pub(crate) enum Kind {
     File,
     Path,
     Command,
-    /// A model name; items read `name · provider`.
+    /// A model name. Tab completion's items read `name · provider`, or
+    /// `name (provider)` for a name another provider also lists; the
+    /// `/model` picker's read `selection · provider · Name`, or
+    /// `selection · Name (provider…)` for a model another provider also
+    /// serves.
     Model,
     /// A skill; items read `name · provider · description`.
     Skill,
@@ -20,6 +25,8 @@ pub(crate) struct Completion {
     pub kind: Kind,
     pub items: Vec<String>,
     pub selected: usize,
+    /// The user moved the highlight with the arrows: Enter takes that row.
+    pub moved: bool,
     /// Where the word being completed starts in the draft.
     pub start: usize,
 }
@@ -117,6 +124,24 @@ pub(crate) fn argument_query<'a>(
     .then(|| (start, &text[start..cursor]))
 }
 
+/// The word the cursor ends in `command PROVIDER <word>` (a vendor named),
+/// with where it starts: the provider form of `/model`, which Tab
+/// completes from that provider's names. `None` for any other draft.
+pub(crate) fn provider_argument_query<'a>(
+    text: &'a str,
+    cursor: usize,
+    command: &str,
+) -> Option<(usize, &'a str)> {
+    let start = word_start(text, cursor);
+    let provider = text[..start]
+        .strip_prefix(command)?
+        .strip_prefix(' ')?
+        .trim();
+    let named = octet_core::Engine::parse(provider).is_some_and(octet_core::Engine::is_vendor);
+    (named && text[..start].ends_with(char::is_whitespace) && text[cursor..].trim().is_empty())
+        .then(|| (start, &text[start..cursor]))
+}
+
 /// The skills picker's lines for `query`: `name · provider · description`.
 /// A name or alias that is `query` comes first, then one that starts with it,
 /// then one that contains it, then a description that does; within each, the
@@ -174,25 +199,31 @@ pub(crate) fn picker_items(
 ) -> (Vec<String>, usize) {
     let lower = query.to_lowercase();
     let mut selected = 0;
+    let labels = crate::clash::labels(entries);
     let items = entries
         .iter()
-        .filter(|(_, m)| {
+        .zip(&labels)
+        .filter(|((_, m), _)| {
             m.selection.starts_with(query)
                 || m.id.as_deref().is_some_and(|id| id.starts_with(query))
                 || m.name.to_lowercase().contains(&lower)
         })
         .enumerate()
-        .map(|(index, (engine, m))| {
+        .map(|(index, ((engine, m), label))| {
             let here = current == Some((*engine, m.selection.as_str()));
             if here && query.is_empty() {
                 selected = index;
             }
-            format!(
-                "{} · {engine} · {}{}",
-                m.selection,
-                crate::text::clean(&m.name),
-                if here { " ●" } else { "" }
-            )
+            let mark = if here { " ●" } else { "" };
+            match label {
+                // The same model through another provider: the label names this one.
+                Some(label) => format!("{} · {label}{mark}", m.selection),
+                None => format!(
+                    "{} · {engine} · {}{mark}",
+                    m.selection,
+                    crate::text::clean(&m.name)
+                ),
+            }
         })
         .collect();
     (items, selected)
@@ -200,12 +231,14 @@ pub(crate) fn picker_items(
 
 /// Tab after `/model `: completes a model name from every provider's list
 /// (`names`, the current provider's first). `None` when the draft is not a
-/// `/model` argument.
+/// `/model` argument. A name in `clashing` (the selections and IDs another
+/// provider also lists) shows as `name (provider)` in the popup.
 pub(crate) fn model_tab(
     text: &str,
     cursor: usize,
     names: &[(String, octet_core::Engine)],
     active: octet_core::Engine,
+    clashing: &HashSet<String>,
 ) -> Option<Tab> {
     // Only a word the cursor ends: completing inside one would mangle it.
     if text[cursor..]
@@ -251,9 +284,10 @@ pub(crate) fn model_tab(
                 items: matches
                     .iter()
                     .take(crate::files::SHOWN)
-                    .map(|(name, engine)| format!("{name} · {engine}"))
+                    .map(|(name, engine)| model_item(name, *engine, clashing))
                     .collect(),
                 selected: 0,
+                moved: false,
                 start,
             };
             if prefix.len() > word.len() {
@@ -267,6 +301,37 @@ pub(crate) fn model_tab(
             }
         }
     })
+}
+
+/// Tab's popup line for the model `name` of `engine`: `name (engine)` for
+/// a name in `clashing`, else `name · engine`.
+fn model_item(name: &str, engine: octet_core::Engine, clashing: &HashSet<String>) -> String {
+    if clashing.contains(name) {
+        format!("{name} ({engine})")
+    } else {
+        format!("{name} · {engine}")
+    }
+}
+
+/// Tab's popup lines for `/model PROVIDER <word>` as the draft now is:
+/// where the word starts, and that provider's names in `names` that start
+/// with it, from the whole list each time. `None` for any other draft.
+pub(crate) fn provider_model_items(
+    text: &str,
+    cursor: usize,
+    names: &[(String, octet_core::Engine)],
+    clashing: &HashSet<String>,
+) -> Option<(usize, Vec<String>)> {
+    let (start, word) = provider_argument_query(text, cursor, "/model")?;
+    let provider = text[..start].trim_end().strip_prefix("/model ")?.trim();
+    let provider = octet_core::Engine::parse(provider)?;
+    let items = names
+        .iter()
+        .filter(|(name, engine)| *engine == provider && name.starts_with(word))
+        .take(crate::files::SHOWN)
+        .map(|(name, engine)| model_item(name, *engine, clashing))
+        .collect();
+    Some((start, items))
 }
 
 /// One candidate fills in; several fill their common prefix and open the
@@ -289,6 +354,7 @@ fn choose(start: usize, word: &str, items: Vec<String>, kind: Kind, suffix: &str
                 kind,
                 items: items.into_iter().take(crate::files::SHOWN).collect(),
                 selected: 0,
+                moved: false,
                 start,
             };
             if prefix.len() > word.len() {
@@ -505,7 +571,15 @@ mod tests {
             ("gpt-6-astra".to_owned(), octet_core::Engine::CODEX),
             ("gpt-5.6-sol".to_owned(), octet_core::Engine::CODEX),
         ];
-        let tab = |text: &str| model_tab(text, text.len(), &names, octet_core::Engine::CLAUDE);
+        let tab = |text: &str| {
+            model_tab(
+                text,
+                text.len(),
+                &names,
+                octet_core::Engine::CLAUDE,
+                &HashSet::new(),
+            )
+        };
         assert!(matches!(
             tab("/model op"),
             Some(Tab::Replace { start: 7, ref text, popup: None }) if text == "opus "
@@ -525,6 +599,58 @@ mod tests {
         ));
     }
     #[test]
+    fn a_clash_row_in_the_picker_carries_the_label_and_the_current_marker() {
+        let model = |selection: &str, name: &str| octet_core::ModelInfo {
+            selection: selection.into(),
+            id: Some(selection.into()),
+            name: name.into(),
+            description: String::new(),
+        };
+        let entries = [
+            (octet_core::Engine::CODEX, model("gpt-5.5", "GPT-5.5")),
+            (octet_core::Engine::CODEX, model("gpt-5.4", "GPT-5.4")),
+            (
+                octet_core::Engine::OPENCODE,
+                model("openai/gpt-5.5", "OpenAI/GPT-5.5"),
+            ),
+        ];
+        let current = Some((octet_core::Engine::CODEX, "gpt-5.5"));
+        let (items, selected) = picker_items(&entries, current, "");
+        assert_eq!(
+            items,
+            [
+                "gpt-5.5 · GPT-5.5 (codex) ●",
+                "gpt-5.4 · codex · GPT-5.4",
+                "openai/gpt-5.5 · GPT-5.5 (opencode · openai)"
+            ]
+        );
+        assert_eq!(selected, 0);
+    }
+    #[test]
+    fn a_clash_row_in_the_popup_names_its_provider_in_brackets() {
+        let names = vec![
+            ("gpt-5.5".to_owned(), octet_core::Engine::CODEX),
+            ("gpt-5.4".to_owned(), octet_core::Engine::CODEX),
+            ("openai/gpt-5.5".to_owned(), octet_core::Engine::OPENCODE),
+        ];
+        let clashing: HashSet<String> = ["gpt-5.5", "openai/gpt-5.5"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let tab = model_tab(
+            "/model gpt",
+            10,
+            &names,
+            octet_core::Engine::CODEX,
+            &clashing,
+        );
+        assert!(matches!(
+            tab,
+            Some(Tab::Replace { popup: Some(Completion { ref items, .. }), .. })
+                if items == &["gpt-5.5 (codex)", "gpt-5.4 · codex"]
+        ));
+    }
+    #[test]
     fn model_tab_uses_the_active_provider_and_the_named_one() {
         let names = vec![
             ("gpt-6-astra".to_owned(), octet_core::Engine::CODEX),
@@ -533,8 +659,15 @@ mod tests {
         ];
         // Claude is active but listed nothing first: `/model ` + Tab offers
         // Claude's names only, not Codex's.
-        let tab =
-            |text: &str, cursor: usize| model_tab(text, cursor, &names, octet_core::Engine::CLAUDE);
+        let tab = |text: &str, cursor: usize| {
+            model_tab(
+                text,
+                cursor,
+                &names,
+                octet_core::Engine::CLAUDE,
+                &HashSet::new(),
+            )
+        };
         assert!(matches!(
             tab("/model ", 7),
             Some(Tab::Replace { ref text, .. }) if text == "gpt-claude-x "

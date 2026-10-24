@@ -16,6 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use octet_core::Command;
 use std::fmt::Write as _;
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -82,6 +83,7 @@ pub(crate) fn open_mentions(app: &mut App, start: usize) {
         kind: composer::Kind::File,
         items: Vec::new(),
         selected: 0,
+        moved: false,
         start,
     });
     refresh_completion(app);
@@ -124,17 +126,22 @@ fn refresh_picker(
         app.composer.editor.cursor(),
         command,
     ) else {
-        if app
-            .composer
-            .completion
-            .as_ref()
-            .is_some_and(|c| c.kind == kind)
+        // Tab's popup of one provider's names (`/model PROVIDER <word>`)
+        // stays, narrowed as the word grows; any other draft closes it.
+        let narrowed = kind == composer::Kind::Model && narrow_provider_popup(app);
+        if !narrowed
+            && app
+                .composer
+                .completion
+                .as_ref()
+                .is_some_and(|c| c.kind == kind)
         {
             app.composer.completion = None;
         }
         return;
     };
     let (items, mut selected) = items(app, query);
+    let mut moved = false;
     // The same list: keep the highlight where the arrows left it.
     if let Some(open) = app
         .composer
@@ -143,13 +150,49 @@ fn refresh_picker(
         .filter(|c| c.kind == kind && c.start == start && c.items == items)
     {
         selected = open.selected;
+        moved = open.moved;
     }
     app.composer.completion = Some(composer::Completion {
         kind,
         items,
         selected,
+        moved,
         start,
     });
+}
+/// Refills the open popup with the names that start with the word of
+/// `/model PROVIDER <word>`, from that provider's whole list, so it narrows
+/// as the word grows and widens again on Backspace; whether one is left.
+fn narrow_provider_popup(app: &mut App) -> bool {
+    let (text, cursor) = (app.composer.editor.text(), app.composer.editor.cursor());
+    let open = app
+        .composer
+        .completion
+        .as_ref()
+        .filter(|popup| popup.kind == composer::Kind::Model)
+        .map(|popup| popup.start);
+    // Only Tab's own popup on this form is kept; checked before the lists
+    // are built, since this runs after every key.
+    if open.is_none()
+        || composer::provider_argument_query(text, cursor, "/model").map(|q| q.0) != open
+    {
+        return false;
+    }
+    let (names, clashing) = tab_names(app);
+    let Some((_, items)) = composer::provider_model_items(
+        app.composer.editor.text(),
+        app.composer.editor.cursor(),
+        &names,
+        &clashing,
+    ) else {
+        return false;
+    };
+    let Some(popup) = app.composer.completion.as_mut() else {
+        return false;
+    };
+    popup.items = items;
+    popup.selected = popup.selected.min(popup.items.len().saturating_sub(1));
+    !popup.items.is_empty()
 }
 /// The model picker, as the draft is or stops being `/model <word>`.
 pub(crate) fn refresh_model_picker(app: &mut App) {
@@ -257,14 +300,18 @@ fn send_or_queue(app: &mut App, vendor: &dyn Vendor, prompt: Prompt) -> bool {
     }
     true
 }
-/// The model picker is open on a draft that already names a model exactly:
-/// `default`, or a name or full ID some provider lists.
+/// The model picker is open on a draft that already names a model whole:
+/// `default`, a name or full ID some provider lists, or what follows the
+/// `sub/` of one (`gpt-5.5` for `openai/gpt-5.5`). Such a name is resolved
+/// as typed, so a provider's leading word (Codex's `gpt-`) comes before
+/// that `sub/` match, as `/model NAME` decides; the highlighted row would
+/// skip that. Once the user has arrowed to a row, that row is the pick.
 fn typed_a_model(app: &App) -> bool {
     if app
         .composer
         .completion
         .as_ref()
-        .is_none_or(|c| c.kind != composer::Kind::Model)
+        .is_none_or(|c| c.kind != composer::Kind::Model || c.moved)
     {
         return false;
     }
@@ -275,19 +322,19 @@ fn typed_a_model(app: &App) -> bool {
     ) else {
         return false;
     };
+    let after_sub = |id: &str| id.rsplit_once('/').is_some_and(|(_, name)| name == query);
     query == "default"
-        || app
-            .model_entries()
-            .iter()
-            .any(|(_, m)| m.selection == query || m.id.as_deref() == Some(query))
+        || app.model_entries().iter().any(|(_, m)| {
+            m.selection == query
+                || m.id.as_deref() == Some(query)
+                || after_sub(m.id.as_deref().unwrap_or(&m.selection))
+        })
 }
 /// The command a picked model line sends: the explicit form, so the line's
 /// provider is the one used.
 fn picked(item: &str) -> Option<String> {
-    let mut parts = item.split(" · ");
-    let selection = parts.next()?;
-    let provider = parts.next()?;
-    Some(format!("/model {provider} {selection}"))
+    let (selection, provider) = crate::clash::row_route(item);
+    Some(format!("/model {} {selection}", provider?))
 }
 /// Puts the selected suggestion into the draft and closes the popup.
 pub(crate) fn accept_completion(app: &mut App) {
@@ -310,15 +357,19 @@ pub(crate) fn accept_completion(app: &mut App) {
     };
     app.replace_or_warn(completion.start, &text);
 }
-/// What Tab puts in the draft for a model line (`name · provider …`): the
-/// name, or `provider name` when the name alone would go to another provider.
+/// What Tab puts in the draft for a model line (`name · provider …` or the
+/// clash form `name (provider)`): the name, or `provider name` when the name
+/// alone would go to another provider, unless the draft already names the
+/// provider (`/model PROVIDER <word>`).
 fn model_text(app: &App, item: &str) -> String {
-    let mut parts = item.split(" · ");
-    let name = parts.next().unwrap_or(item);
-    let line_provider = parts
-        .next()
-        .and_then(octet_core::Engine::parse)
-        .filter(|engine| engine.is_vendor());
+    let (name, line_provider) = crate::clash::row_route(item);
+    let named = composer::provider_argument_query(
+        app.composer.editor.text(),
+        app.composer.editor.cursor(),
+        "/model",
+    )
+    .is_some();
+    let line_provider = line_provider.filter(|engine| engine.is_vendor() && !named);
     let resolves_there = |provider| {
         octet_core::model::Selection::resolve(name, app.conn.engine, &app.models.catalogs)
             .is_ok_and(|resolved| resolved.selection.provider == provider)
@@ -517,7 +568,25 @@ fn completion_key(app: &mut App, key: KeyEvent) -> Option<Action> {
     let completion = app.composer.completion.as_mut()?;
     if key.code == KeyCode::Enter && completion.kind == composer::Kind::Skill {
         let item = completion.items.get(completion.selected).cloned();
+        if item.is_none() {
+            // Nothing to pick: say so, rather than take the key silently.
+            let filter = composer::argument_query(
+                app.composer.editor.text(),
+                app.composer.editor.cursor(),
+                "/skills",
+            )
+            .map_or_else(String::new, |(_, query)| query.to_owned());
+            app.hint(format!("No skill matches {filter}; Esc clears the line"));
+            return Some(Action::Continue);
+        }
         choose_skill(app, item);
+        return Some(Action::Continue);
+    }
+    if key.code == KeyCode::Esc && completion.kind == composer::Kind::Skill {
+        // The `/skills …` line only drives the picker, so it goes with it:
+        // what is typed next is a prompt again, not a filter.
+        app.composer.completion = None;
+        app.composer.editor.take();
         return Some(Action::Continue);
     }
     if key.code == KeyCode::Enter && completion.kind == composer::Kind::Model {
@@ -537,10 +606,14 @@ fn completion_key(app: &mut App, key: KeyEvent) -> Option<Action> {
         return None;
     }
     match key.code {
-        KeyCode::Up => completion.selected = completion.selected.saturating_sub(1),
+        KeyCode::Up => {
+            completion.selected = completion.selected.saturating_sub(1);
+            completion.moved = true;
+        }
         KeyCode::Down => {
             completion.selected =
                 (completion.selected + 1).min(completion.items.len().saturating_sub(1));
+            completion.moved = true;
         }
         KeyCode::Tab | KeyCode::Enter => accept_completion(app),
         KeyCode::Esc => app.composer.completion = None,
@@ -664,14 +737,29 @@ async fn submit_draft(app: &mut App, vendor: &dyn Vendor) -> Action {
     refresh_completion(app);
     Action::Continue
 }
+/// The model names Tab completes (the current provider's first), and the
+/// selections and IDs another provider also lists.
+fn tab_names(app: &App) -> (Vec<(String, octet_core::Engine)>, HashSet<String>) {
+    let names = app.models.names(app.conn.engine);
+    let entries = app.model_entries();
+    let clashing: HashSet<String> = entries
+        .iter()
+        .zip(crate::clash::labels(&entries))
+        .filter(|(_, label)| label.is_some())
+        .flat_map(|((_, model), _)| [Some(model.selection.clone()), model.id.clone()])
+        .flatten()
+        .collect();
+    (names, clashing)
+}
 /// Tab: completes a path or a command, off the loop.
 async fn tab_key(app: &mut App) {
-    let names = app.models.names(app.conn.engine);
+    let (names, clashing) = tab_names(app);
     if let Some(tab) = composer::model_tab(
         app.composer.editor.text(),
         app.composer.editor.cursor(),
         &names,
         app.conn.engine,
+        &clashing,
     ) {
         apply_tab(app, tab);
         return;

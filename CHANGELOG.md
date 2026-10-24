@@ -289,6 +289,13 @@ Claude Code and Codex CLIs.
 - `--print` takes a prompt that starts with dashes, and `--print=TEXT`.
 - The protocol gate launches the vendor with Octet's own arguments and
   limits.
+- The protocol gate's opencode lockdown checks that `opencode debug config`
+  shows a command's agent, subtask and template, as Octet's command check
+  needs.
+- The protocol gate's new opencode scenario, `command-expansion`, checks
+  Octet's emulation of opencode's command expansion and built-in commands
+  against the running CLI; `docs/rust/protocol-gate.md` says how to verify a
+  new opencode version.
 - Edition 2024; clippy pedantic, `#[expect(lint, reason)]` for every
   exception, `Debug` on every public type; a `cargo doc` build and a
   `cargo-deny` licence check in CI.
@@ -327,6 +334,120 @@ Claude Code and Codex CLIs.
 - A mid-turn Codex permission change now shows both the running and next mode
   in the terminal header and `/mode` details. The notice explains that steering
   keeps the old permissions until a new turn starts.
+- `/effort default` did not reset Codex's reasoning effort: Codex kept the
+  last level for later turns. Octet now sends the level Codex picks itself
+  (its config's, else the model's default). A resumed or forked thread with
+  no level chosen goes back to it from its first turn: such a session is
+  ready only once Octet has read Codex's config, so a headless `--resume`
+  no longer runs at the level the thread was left at.
+- Consecutive Codex messages ran together ("…complete it.Unable to…"); each
+  now starts a paragraph. In `--print`, text after a tool call starts a
+  paragraph too, and a denied approval's note starts its own line.
+- `/compact` on Codex finished without a word; a completed compaction now
+  notes "Context compacted" (every provider).
+- Codex's header figure was a running total of every turn's tokens (14k
+  for a one-word reply, ~1M after 70 turns, never dropping after
+  `/compact`). It now shows the context in use of the model's window, such
+  as `14.3k/272k context`.
+- `/model refresh` said only "Fetching…"; it now notes each list as it
+  comes in or fails.
+- Full access carried to another provider without a word; that switch now
+  shows a warning ("Full access carried to Claude: no permission checks.
+  /mode ask to turn them on"). Every switch to another provider notes the
+  mode it asks that provider for ("Asking opencode for auto"; the header
+  shows what it took), and says when that is not the mode you last chose (a
+  provider that refused `auto` no longer drops it silently for the rest).
+- `/model gpt-5.5` + Enter switched to opencode's `openai/gpt-5.5`: the
+  picker's highlighted row won over the name rules. A whole name after a
+  `sub/` is now resolved as typed, so Codex's `gpt-` prefix comes first;
+  once you arrow to a row, Enter takes that row.
+- A command refused with "Finish or cancel the current turn first" (or
+  "Wait for the connection") cleared the prompt box; its line now stays.
+- Esc from the `/skills` picker left `/skills ` in the prompt, so the next
+  prompt reopened the picker and Enter did nothing. Esc now clears that
+  line, and Enter on a filter that matches nothing says so.
+- The goal completion marker `[[OCTET_GOAL_COMPLETE]]` showed in the
+  conversation; it is now hidden there and from `/copy` (the journal keeps
+  the reply as sent). A reply tail that might have begun it (`[`) shows
+  before a tool call or approval that follows, not after it.
+- `/sessions` labelled a reconnected session with the first prompt of its
+  newest journal, neither its first nor its latest. It now shows the
+  session's first prompt, and its latest when that differs, read from the
+  end of the newest journal (left out when it is further back than 256 KiB).
+- `/resume N` of a session whose model the provider no longer offers
+  (opencode's free models rotate) stopped with only the refusal; it now adds
+  that `/model PROVIDER MODEL` resumes the same session with another model.
+- A Claude plugin's `SessionStart` hook names the new session before Claude
+  has saved it. Octet took that ID: `--print` and `--rpc` hung (their prompt
+  was refused as busy), and the session ID was then wiped, so `/session` said
+  none and every reconnect started a new session. The ID is now taken only
+  from a turn's frames, which name it again once Claude has saved it.
+- A Claude local command (such as `/context`) made the header and
+  `/session` name the model `<synthetic>`; that marker is no model now.
+- A Claude session resumed with no `--model` was labelled with the
+  catalog's default (Opus) until its first turn; the header now names the
+  resumed session's own model, unconfirmed.
+- The offline demo's reply named only `--engine codex` and `--engine
+  claude`; it names `--engine opencode` too.
+- The approval dialog had no frame, so on a wide screen the conversation
+  around it read as a narrow column beside it; it is framed now (where
+  there is room). The model picker cut long lines at 64 columns; it widens
+  to its longest line while the screen has room.
+- After a provider switch, an opencode slash command or skill carried the
+  earlier conversation, and opencode ran any `` !`cmd` `` found in it
+  through its shell, in every mode. A command or skill now never carries
+  it; the conversation waits for your next prompt. After a switch to
+  opencode, the note saying so is shown once.
+- In ask and accept-edits, Octet checks each opencode command and skill
+  against its definition (`opencode debug config` / `debug skill`) before
+  sending it. It refuses one that names another agent, runs as a subagent,
+  or would run shell (`` !`…` ``) from its template, skill text or
+  arguments, and one it cannot check: an MCP prompt, a changed definition,
+  or no reading. In those modes Octet sends opencode only text and image
+  blocks, and a command too long to check is refused with its own reason.
+- Octet reads opencode's command definitions once, when opencode lists them,
+  in every mode, as opencode 1.18.25 loads them once per process and never
+  reloads them; a burst of command-list changes is read once. It does not
+  read them again after a turn that could have edited them unasked
+  (accept-edits, auto, full access), so a command rewritten on disk cannot
+  pass the check while opencode runs the old copy.
+- The command check runs only on verified opencode versions (1.18.25). On
+  any other, Octet says so at connect and sends no command or skill in ask
+  and accept-edits (plain prompts work; `/mode auto` runs them under
+  opencode's settings; `/compact`, opencode's own summary, still goes).
+- An opencode command or skill waiting for Octet's check froze the session
+  (Esc took ~20 s). It now waits ("Checking /name against opencode's
+  definitions…") while Esc, quit and opencode's output stay live, and Esc
+  cancels it at once.
+- A command list opencode kept changing held a command waiting for its
+  check until the list settled. Changes now restart the reading for at
+  most 2 s; past that the reading under way runs to its end, and if the
+  list changed meanwhile the command is refused with that reason.
+- `opencode debug`'s output file had a name while it was written, and no
+  size limit; it is now unnamed until read, and stopped past 16 MiB. It
+  was stopped by its pid alone, so a process it started (a plugin's)
+  outlived it; it now runs in a process group of its own, killed whole
+  when it ends or is stopped.
+- In auto and full access, an opencode turn that goes quiet after a
+  subagent starts now says the subagent may be waiting for a permission
+  Octet cannot show, without claiming it is stuck.
+- On macOS, a `!` command dropped by a reconnect or quit while its shell
+  was starting a process left that process running: it was not yet in the
+  group Octet killed. Octet now kills the group again once the shell has
+  died, and only while the shell is unreaped, so the group's id is still
+  its own.
+- The same held for the phone's git calls: one dropped or timed out while a
+  hook was starting a process left that process running. The hub now kills
+  git's group again once git has died, git still unreaped.
+- And for the vendor CLIs: a session ended while the CLI was starting a
+  process left that process running. Octet now kills the CLI's group
+  again once the CLI has died, and kills any member still seen while it
+  waits for the group to go.
+- A storm of session state changes (hundreds of sessions, each changing
+  its NOW line several times a second) made the hub snapshot every
+  session for each change; short of CPU, it fell seconds behind and the
+  phones' lists came late and stale. A change that touches only a row's
+  text no longer does.
 
 - A session's error push, question or usage could wait until another session
   changed, when the hub's tail pass was cut short.

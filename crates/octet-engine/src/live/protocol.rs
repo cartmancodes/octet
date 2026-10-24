@@ -2,8 +2,8 @@
 //! supplies (`Protocol`). The driver loop in `driver.rs` joins the two; a new
 //! vendor implements `Protocol` in its own file and adds a provider row.
 use super::{
-    ApprovalSummary, Config, DriverError, EVENT_BYTES, Event, ImageAttachment, Limits, Mode,
-    Outcome, deadline_after, emit, mode::confirm_mode,
+    ApprovalSummary, Command, Config, DriverError, EVENT_BYTES, Event, ImageAttachment, Limits,
+    Mode, Outcome, deadline_after, emit, mode::confirm_mode,
 };
 use octet_proc::Process;
 use serde_json::Value;
@@ -44,6 +44,9 @@ impl Phase {
     }
 }
 
+/// What Octet says once a compaction turn completes.
+pub(super) const COMPACTED: &str = "Context compacted";
+
 /// The most approvals waiting on the user at once; more are denied.
 pub(super) const MAX_PENDING_APPROVALS: usize = 8;
 
@@ -69,6 +72,9 @@ pub(crate) struct Core {
     /// wire requests.
     pub(super) approval_id: u64,
     pub(super) pending: HashMap<u64, Pending>,
+    /// The running turn is a compaction: its completion is announced, as
+    /// vendors compact without a word.
+    pub(super) compacting: bool,
     /// The protocol's approval reply, for approvals denied here. `Core`
     /// keeps the protocol's functions as pointers rather than being generic
     /// over it, so the driver, `Core` and every protocol share one
@@ -96,6 +102,7 @@ impl Core {
             deadline: deadline_after(limits.connect),
             approval_id: 0,
             pending: HashMap::new(),
+            compacting: false,
             answer: P::answer,
             deny: P::deny,
         }
@@ -200,6 +207,9 @@ impl Core {
         if let Some(error) = error {
             self.emit(Event::Error(error))?;
         }
+        if std::mem::take(&mut self.compacting) && outcome == Outcome::Completed {
+            self.emit(Event::Notice(COMPACTED.into()))?;
+        }
         self.emit(Event::Finished { outcome })
     }
 
@@ -274,9 +284,44 @@ pub(crate) trait Protocol: Default + Send {
     fn is_progress(&self, _core: &Core, _frame: &Value) -> bool {
         true
     }
-    /// A mode change is waiting for the vendor to confirm it.
+    /// A mode change is waiting for the vendor to confirm it. The driver
+    /// then refuses another switch and, for a provider whose mode applies
+    /// from the next turn, holds a turn sent while idle until this is false,
+    /// so the turn runs under the mode the header shows.
     fn mode_change_pending(&self) -> bool {
         false
+    }
+    /// Whether the last mode switch was reported unconfirmed (its
+    /// confirmation window passed) since it was sent; reading it clears it.
+    /// A turn held behind that switch is then not sent: the vendor may
+    /// already apply the new mode while the header shows the old one.
+    fn take_switch_timed_out(&mut self) -> bool {
+        false
+    }
+    /// A switch that timed out is still unanswered, so the mode the vendor
+    /// runs is unknown: the target of the latest such switch. For a
+    /// provider whose mode applies from the next turn, the driver refuses
+    /// every turn until the vendor answers.
+    fn mode_unsettled(&self) -> Option<Mode> {
+        None
+    }
+    /// Whether `command`, a turn the session could start now, must wait
+    /// before it is sent, starting what it waits for: for opencode, a slash
+    /// command whose definitions Octet is still reading. `Some` names what
+    /// it waits for, for the notice; the driver holds the command, and the
+    /// session goes on, until [`Protocol::waiting`] is false.
+    fn must_wait(&mut self, _core: &Core, _command: &Command) -> Option<String> {
+        None
+    }
+    /// Whether what a command held by [`Protocol::must_wait`] waits for is
+    /// still under way.
+    fn waiting(&mut self) -> bool {
+        false
+    }
+    /// Resolves once what a held command waits for is done; never while
+    /// nothing is under way. Dropping it loses nothing.
+    fn wait_over(&mut self) -> impl Future<Output = ()> + Send {
+        std::future::pending()
     }
     /// The protocol's own timer, if one is armed.
     fn deadline(&self) -> Option<Instant> {
@@ -291,6 +336,20 @@ pub(crate) trait Protocol: Default + Send {
     }
     /// A turn is starting: clears per-turn protocol state.
     fn turn_started(&mut self) {}
+    /// The session is ending, for whatever reason, and the vendor process
+    /// is about to be stopped: the last chance to clean up after it.
+    fn stopping(&mut self, _core: &Core) {}
+    /// Sets the reasoning effort (`None`: the vendor's default) on a
+    /// provider that takes it live. `Ok(false)` means the protocol has no
+    /// request for it: the driver records the level for the next turn and
+    /// says so.
+    fn set_effort(
+        &mut self,
+        _core: &mut Core,
+        _effort: Option<String>,
+    ) -> impl Future<Output = Result<bool, DriverError>> + Send {
+        async { Ok(false) }
+    }
     /// Adds `text` to the running turn. `Ok(false)` means the protocol cannot
     /// steer; the driver says so.
     fn steer(

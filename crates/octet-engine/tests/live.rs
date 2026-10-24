@@ -24,6 +24,12 @@ fn claude() -> Config {
     c.engine = Engine::CLAUDE;
     c
 }
+/// The fake opencode, otherwise as `config()`.
+fn opencode() -> Config {
+    let mut c = config();
+    c.engine = Engine::OPENCODE;
+    c
+}
 /// Shuts the session down and waits for it, failing instead of hanging.
 async fn stop(handle: &octet_engine::live::Handle, task: tokio::task::JoinHandle<()>) {
     handle.shutdown();
@@ -632,6 +638,23 @@ async fn unconfirmed_claude_switch_times_out_then_applies_a_late_confirmation() 
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn a_claude_prompt_right_after_a_switch_is_not_held() {
+    // Claude reads its input in order, so the switch reaches it before the
+    // prompt: nothing waits for the (here 2.5 s late) confirmation.
+    let mut c = claude();
+    c.model = Some(scenario::LATE_MODE.into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::Auto)).unwrap();
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let first = wait_for(&mut events, |e| {
+        matches!(e, Event::Started | Event::ModeChanged(_) | Event::Notice(_))
+    })
+    .await;
+    assert!(matches!(first, Event::Started), "{first:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn demo_mode_switch_during_approval_keeps_the_dialog_open() {
     let mut c = config();
     c.engine = Engine::DEMO;
@@ -1057,6 +1080,133 @@ async fn codex_sends_effort_on_each_turn_and_takes_changes_live() {
     assert!(turn_text(&mut events).await.contains("\"effort\":\"low\""));
     stop(&handle, task).await;
 }
+/// The effort a Codex `PARAMS` turn asked for, after `/effort` set `effort`;
+/// `Null` when the turn named none.
+async fn codex_turn_effort(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+    effort: Option<&str>,
+) -> serde_json::Value {
+    if let Some(effort) = effort {
+        handle
+            .send(Command::SetEffort(Some(effort.into())))
+            .unwrap();
+    } else {
+        handle.send(Command::SetEffort(None)).unwrap();
+    }
+    wait_for(
+        events,
+        |e| matches!(e, Event::Notice(n) if n.starts_with("Reasoning effort")),
+    )
+    .await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(events).await).unwrap();
+    echo["turn"]["effort"].clone()
+}
+/// A Codex session in `dir`, its catalog and config read.
+async fn codex_settled(
+    dir: &octet_testkit::TempDir,
+) -> (
+    octet_engine::live::Handle,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut c = config();
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn(c);
+    // The second catalog page is asked for after the config.
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Models(m) if m.len() == 2),
+    )
+    .await;
+    (handle, events, task)
+}
+#[tokio::test]
+async fn codex_effort_default_goes_back_to_the_configured_level() {
+    // Codex keeps a turn's effort for the turns after it, so "default" has
+    // to name the level Codex would pick: here its config's.
+    let dir = octet_testkit::TempDir::new("octet-live-codex-effort-config");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(dir.path().join("config-effort"), "high").unwrap();
+    let (handle, mut events, task) = codex_settled(&dir).await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    // A new thread already runs at the configured level.
+    assert_eq!(echo["turn"]["effort"], serde_json::Value::Null, "{echo}");
+    let low = codex_turn_effort(&handle, &mut events, Some("low")).await;
+    assert_eq!(low, "low");
+    let default = codex_turn_effort(&handle, &mut events, None).await;
+    assert_eq!(default, "high");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn codex_effort_default_without_a_configured_level_is_the_models() {
+    let dir = octet_testkit::TempDir::new("octet-live-codex-effort-model");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let (handle, mut events, task) = codex_settled(&dir).await;
+    let low = codex_turn_effort(&handle, &mut events, Some("low")).await;
+    assert_eq!(low, "low");
+    let default = codex_turn_effort(&handle, &mut events, None).await;
+    assert_eq!(default, "medium");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn codex_effort_default_on_a_resumed_thread_is_sent_whatever_the_reply_says() {
+    // The resume reply may name the configured level rather than the one
+    // the thread was left at: after a resume the thread's level is unknown.
+    let dir = octet_testkit::TempDir::new("octet-live-codex-effort-resume");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(dir.path().join("config-effort"), "high").unwrap();
+    let mut c = config();
+    c.cwd = dir.path().to_path_buf();
+    c.resume = Some("fixture-thread".into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Models(m) if m.len() == 2),
+    )
+    .await;
+    let default = codex_turn_effort(&handle, &mut events, None).await;
+    assert_eq!(default, "high");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn codex_resumed_prompt_sent_at_ready_goes_back_to_the_default() {
+    // A headless run sends its prompt on ready, so a resumed thread is ready
+    // only once Codex's config says what the default is.
+    let dir = octet_testkit::TempDir::new("octet-live-codex-effort-ready");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(dir.path().join("config-effort"), "high").unwrap();
+    std::fs::write(dir.path().join("config-slow"), "").unwrap();
+    let mut c = config();
+    c.cwd = dir.path().to_path_buf();
+    c.resume = Some("fixture-thread".into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    assert_eq!(echo["turn"]["effort"], "high", "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn codex_agent_messages_back_to_back_are_separate_paragraphs() {
+    let (handle, mut events, task) = spawn(config());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::MESSAGES.into()))
+        .unwrap();
+    // Deltas of one message join; the next message starts a paragraph. A
+    // tool call between messages already separates them.
+    assert_eq!(turn_text(&mut events).await, "First.\n\nSecond.Third.");
+    stop(&handle, task).await;
+}
 #[tokio::test]
 async fn claude_launches_with_effort() {
     let mut c = claude();
@@ -1130,15 +1280,67 @@ async fn codex_compact_runs_as_a_turn() {
     )
     .await;
     wait_for(&mut events, |e| matches!(e, Event::Started)).await;
-    wait_for(&mut events, |e| {
+    // Codex compacts without a word, so Octet says it is done.
+    let done = wait_for(&mut events, |e| {
+        matches!(e, Event::Notice(_) | Event::Finished { .. })
+    })
+    .await;
+    assert!(
+        matches!(&done, Event::Notice(n) if n == "Context compacted"),
+        "{done:?}"
+    );
+    let finished = next(&mut events).await;
+    assert!(
         matches!(
-            e,
+            finished,
             Event::Finished {
                 outcome: Outcome::Completed
             }
-        )
-    })
-    .await;
+        ),
+        "{finished:?}"
+    );
+    // A later turn is not a compaction.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let mut notices = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Notice(n) => notices.push(n),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        !notices.iter().any(|n| n.contains("compacted")),
+        "{notices:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn codex_compaction_that_fails_to_start_is_not_compacted() {
+    let mut c = config();
+    c.model = Some(scenario::REFUSE_COMPACT.into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(Command::Compact).unwrap();
+    let mut notices = Vec::new();
+    let mut errors = Vec::new();
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Notice(n) => notices.push(n),
+            Event::Error(e) => errors.push(e),
+            Event::Finished { outcome } => break outcome,
+            _ => {}
+        }
+    };
+    assert_eq!(outcome, Outcome::Failed, "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("compaction refused")),
+        "{errors:?}"
+    );
+    assert!(
+        !notices.iter().any(|n| n.contains("compacted")),
+        "{notices:?}"
+    );
     stop(&handle, task).await;
 }
 #[tokio::test]
@@ -1258,6 +1460,100 @@ async fn claude_fork_names_the_new_session_only_after_the_first_prompt() {
     stop(&handle, task).await;
 }
 #[tokio::test]
+async fn claude_named_by_a_start_hook_is_ready_once_and_resumable_after_its_first_turn() {
+    let mut c = claude();
+    c.model = Some(scenario::START_HOOK.into());
+    let (handle, mut events, task) = spawn(c);
+    // A SessionStart hook names the session before the handshake's reply,
+    // but Claude saves the session only with its first turn: until then
+    // there is none to resume, so the session is ready once, with no ID.
+    let mut readies = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Ready { session } => readies.push(session),
+            Event::ModeChanged(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(readies, [""]);
+    // The first turn names it again, and now it is kept.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Ready { session } if session == "claude-fixture"),
+    )
+    .await;
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn claude_named_by_a_slow_start_hook_after_its_reply_is_not_ready_with_that_id() {
+    let mut c = claude();
+    c.model = Some(scenario::SLOW_START_HOOK.into());
+    let (handle, mut events, task) = spawn(c);
+    // A slow SessionStart hook's frames come after the handshake's reply,
+    // still before the first turn saves the session they name: a ready with
+    // that ID would send a reconnect to a session Claude cannot resume.
+    let mut readies = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Ready { session } => readies.push(session),
+            Event::Hook { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(readies, [""]);
+    // Only the first turn names the session.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Ready { session } if session == "claude-fixture"),
+    )
+    .await;
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn claude_takes_a_prompt_sent_at_ready_after_a_start_hook() {
+    let mut c = claude();
+    c.model = Some(scenario::START_HOOK.into());
+    let (handle, mut events, task) = spawn(c);
+    // Headless runs send their prompt on the first ready.
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let event = wait_for(&mut events, |e| {
+        matches!(e, Event::Finished { .. } | Event::Notice(_))
+    })
+    .await;
+    assert!(
+        matches!(
+            event,
+            Event::Finished {
+                outcome: Outcome::Completed
+            }
+        ),
+        "{event:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn claude_local_command_keeps_the_session_model() {
+    let (handle, mut events, task) = spawn(claude());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::SYNTHETIC.into()))
+        .unwrap();
+    let mut models = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::ModelSelected(model) => models.push(model),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    // `<synthetic>` marks a reply no model wrote; it names no model.
+    assert_eq!(models, ["claude-fixture-full-id"]);
+    stop(&handle, task).await;
+}
+#[tokio::test]
 async fn codex_rejected_steer_is_reported_with_its_text() {
     let (handle, mut events, task) = spawn(config());
     wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
@@ -1348,6 +1644,19 @@ async fn a_prompt_cancelled_before_it_starts_is_not_run() {
     // A later prompt is not affected.
     handle.send(Command::Prompt("hello".into())).unwrap();
     assert_eq!(turn_text(&mut events).await, scenario::CODEX_REPLY);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn the_demo_names_every_provider_to_start_with() {
+    let mut c = config();
+    c.engine = Engine::DEMO;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let text = turn_text(&mut events).await;
+    for engine in ["--engine codex", "--engine claude", "--engine opencode"] {
+        assert!(text.contains(engine), "{text}");
+    }
     stop(&handle, task).await;
 }
 #[tokio::test]
@@ -2281,4 +2590,2801 @@ async fn a_codex_skill_is_sent_as_a_skill_item_with_its_context() {
             {"type":"text","text":"EARLIER\n\ngo"}
         ])
     );
+}
+
+#[tokio::test]
+async fn opencode_connects_lists_models_and_skills() {
+    let (handle, mut events, task) = spawn(opencode());
+    let (mut ready, mut models, mut skills, mut mode) = (None, None, None, None);
+    while ready.is_none() || models.is_none() || skills.is_none() || mode.is_none() {
+        match next(&mut events).await {
+            Event::Ready { session } => ready = Some(session),
+            Event::Models(list) => models = Some(list),
+            Event::Skills(list) => skills = Some(list),
+            Event::ModeChanged(changed) => mode = Some(changed),
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(ready.as_deref(), Some("fixture-ses"));
+    let models = models.unwrap();
+    let free = models
+        .iter()
+        .find(|m| m.selection == "opencode/fixture-free")
+        .unwrap_or_else(|| panic!("{models:?}"));
+    assert_eq!(free.name, "OpenCode/Fixture Free");
+    assert_eq!(free.id.as_deref(), Some("opencode/fixture-free"));
+    assert!(free.description.is_empty());
+    let skills = skills.unwrap();
+    assert!(
+        skills.iter().any(|s| s.name == scenario::OPENCODE_SKILL),
+        "{skills:?}"
+    );
+    assert_eq!(mode, Some(Mode::Ask));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_turn_streams_text_and_usage() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    for _ in 0..2 {
+        handle.send(Command::Prompt("hello".into())).unwrap();
+        let (mut text, mut usage) = (String::new(), Vec::new());
+        loop {
+            match next(&mut events).await {
+                Event::Text(t) => text.push_str(&t),
+                Event::Usage(u) => usage.push(u),
+                Event::Finished { outcome } => {
+                    assert_eq!(outcome, Outcome::Completed);
+                    break;
+                }
+                Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(text, scenario::OPENCODE_REPLY);
+        assert_eq!(usage, ["42 tokens"]);
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_launches_acp_with_octet_agents() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    assert_eq!(echo["argv"][0], "acp", "{echo}");
+    let content = echo["env"]["OPENCODE_CONFIG_CONTENT"].as_str().unwrap();
+    assert!(content.contains("octet-ask"), "{content}");
+    assert_eq!(echo["modes"], serde_json::json!(["octet-ask"]));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_requested_model_is_set_and_confirmed() {
+    let mut c = opencode();
+    c.model = Some("openai/gpt-fixture".into());
+    let (handle, mut events, task) = spawn(c);
+    let selected = wait_for(&mut events, |e| matches!(e, Event::ModelSelected(_))).await;
+    assert!(
+        matches!(&selected, Event::ModelSelected(model) if model == "openai/gpt-fixture"),
+        "{selected:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn an_opencode_model_refused_at_connect_stops_the_session() {
+    // Running on opencode's own default instead would be a model, and
+    // perhaps a bill, the user never chose.
+    let mut c = opencode();
+    c.model = Some(scenario::OPENCODE_UNKNOWN_MODEL.into());
+    let (_handle, mut events, task) = spawn(c);
+    loop {
+        match next(&mut events).await {
+            Event::Ready { session } => panic!("the session opened: {session}"),
+            Event::Error(error) => {
+                assert_eq!(
+                    error,
+                    format!(
+                        "opencode refused the model {}: Invalid params: model not found",
+                        scenario::OPENCODE_UNKNOWN_MODEL
+                    )
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    ended(task).await;
+}
+#[tokio::test]
+async fn opencode_resume_ignores_the_replayed_history() {
+    let mut c = opencode();
+    c.resume = Some("ses-old".into());
+    let (handle, mut events, task) = spawn(c);
+    let mut before = Vec::new();
+    let session = loop {
+        match next(&mut events).await {
+            Event::Ready { session } => break session,
+            Event::Error(error) => panic!("{error}"),
+            event => before.push(event),
+        }
+    };
+    assert_eq!(session, "ses-old");
+    // The rest of the handshake, then the turn.
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    loop {
+        match next(&mut events).await {
+            Event::Started => break,
+            Event::Error(error) => panic!("{error}"),
+            event => before.push(event),
+        }
+    }
+    for event in &before {
+        assert!(
+            !matches!(event, Event::Tool(_) | Event::Text(_)),
+            "replayed: {event:?}"
+        );
+    }
+    let text = turn_text(&mut events).await;
+    assert_eq!(text, scenario::OPENCODE_REPLY);
+    assert!(!text.contains("REPLAYED"));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_fork_opens_a_new_session() {
+    let mut c = opencode();
+    c.resume = Some("ses-old".into());
+    c.fork = true;
+    let (handle, mut events, task) = spawn(c);
+    let ready = wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    assert!(
+        matches!(&ready, Event::Ready { session } if session == "fixture-fork"),
+        "{ready:?}"
+    );
+    stop(&handle, task).await;
+}
+/// A 1×1 PNG.
+const PIXEL_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+#[tokio::test]
+async fn opencode_image_goes_inline() {
+    let dir = octet_testkit::TempDir::new("octet-image-opencode");
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let (command, _) = image_prompt(&dir, PIXEL_PNG);
+    handle.send(command).unwrap();
+    let length = octet_engine::live::encoded_len(PIXEL_PNG.len() as u64);
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("image image/png {length}")
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_handshake_out_of_order_is_an_error() {
+    // opencode answers session/new (id 2) before initialize (id 1).
+    let (_dir, vendor) = script_vendor(
+        "octet-live-opencode-out-of-order",
+        "read line\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"s1\",\"configOptions\":[]}}'\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n\
+         exec sleep 30\n",
+    );
+    let (_handle, mut events, task) =
+        spawn(Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()));
+    loop {
+        match next(&mut events).await {
+            Event::Error(error) => {
+                assert_eq!(error, "Unexpected protocol initialization order");
+                break;
+            }
+            Event::Ready { session } => panic!("a session opened: {session}"),
+            _ => {}
+        }
+    }
+    ended(task).await;
+}
+/// What an `ask` session stops with when opencode opens it with the mode
+/// option `opened` and answers the handshake's agent switch with `reply`
+/// (the reply's `result` or `error` member). The header must never have
+/// claimed `ask` first.
+async fn opencode_agent_refusal(opened: serde_json::Value, reply: serde_json::Value) -> String {
+    use serde_json::json;
+    let mut third = json!({"jsonrpc": "2.0", "id": 3});
+    third
+        .as_object_mut()
+        .unwrap()
+        .extend(reply.as_object().unwrap().clone());
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": [opened]}}),
+        third,
+    ];
+    let mut body = String::new();
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    body.push_str("exec sleep 30\n");
+    let (_dir, vendor) = script_vendor("octet-live-opencode-agent-refused", &body);
+    let (_handle, mut events, task) =
+        spawn(Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()));
+    let error = loop {
+        match next(&mut events).await {
+            Event::Error(error) => break error,
+            Event::ModeChanged(Mode::Ask) => panic!("the header claimed ask"),
+            Event::Stopped => panic!("stopped without an error"),
+            _ => {}
+        }
+    };
+    ended(task).await;
+    error
+}
+/// The error that stops a session whose agent opencode would not switch to.
+fn agent_refused(reason: &str) -> String {
+    format!(
+        "opencode would not switch to agent octet-ask ({reason}); Octet stopped the session so opencode never acts outside the mode you chose"
+    )
+}
+#[tokio::test]
+async fn opencode_refused_agent_stops_the_session_though_build_is_kept() {
+    let opened = serde_json::json!({"id": "mode", "currentValue": "build"});
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    assert_eq!(
+        opencode_agent_refusal(opened, refused).await,
+        agent_refused("unknown agent")
+    );
+}
+#[tokio::test]
+async fn opencode_refused_agent_stops_the_session_when_no_agent_was_reported() {
+    let opened = serde_json::json!({"id": "model", "currentValue": "a/b"});
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    assert_eq!(
+        opencode_agent_refusal(opened, refused).await,
+        agent_refused("unknown agent")
+    );
+}
+#[tokio::test]
+async fn opencode_refused_agent_stops_the_session_when_an_unmapped_agent_is_kept() {
+    let opened = serde_json::json!({"id": "mode", "currentValue": "plan"});
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    assert_eq!(
+        opencode_agent_refusal(opened, refused).await,
+        agent_refused("unknown agent")
+    );
+}
+#[tokio::test]
+async fn opencode_switch_reporting_another_agent_stops_the_session() {
+    let opened = serde_json::json!({"id": "mode", "currentValue": "build"});
+    let other = serde_json::json!({"result": {"configOptions": [opened.clone()]}});
+    assert_eq!(
+        opencode_agent_refusal(opened, other).await,
+        agent_refused("opencode reported agent build instead of octet-ask")
+    );
+}
+#[tokio::test]
+async fn opencode_approval_allowed_sends_allow_once() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::APPROVAL.into()))
+        .unwrap();
+    let Event::Approval {
+        id,
+        detail,
+        summary,
+    } = wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    assert!(detail.starts_with("execute · echo fixture"), "{detail}");
+    assert!(detail.contains("\"command\": \"echo fixture\""), "{detail}");
+    assert_eq!(summary.action, "Run a shell command");
+    assert_eq!(summary.command.as_deref(), Some("echo fixture"));
+    handle.send(Command::Answer { id, allow: true }).unwrap();
+    let text = turn_text(&mut events).await;
+    assert!(text.contains("once"), "{text}");
+    assert!(!text.contains("always"), "{text}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn an_opencode_read_approval_names_the_file_its_tool_call_named() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_READ_ENV.into()))
+        .unwrap();
+    let Event::Approval { id, summary, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(summary.action, "Read .env");
+    assert_eq!(summary.files, ["/w/.env"]);
+    handle.send(Command::Answer { id, allow: false }).unwrap();
+    assert_eq!(turn_text(&mut events).await, "reject");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_approval_denied_sends_reject() {
+    let text = answer_first_approval(opencode(), scenario::APPROVAL, false).await;
+    assert!(text.contains("reject"), "{text}");
+}
+#[tokio::test]
+async fn opencode_approval_times_out_as_denied() {
+    // A second's window and the default limits: under load, neither a slow
+    // start nor a slow reply may end the session before the timeout does.
+    let mut c = opencode();
+    c.approval_timeout = Duration::from_secs(1);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::APPROVAL.into()))
+        .unwrap();
+    let Event::Approval { id, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    let shown = tokio::time::Instant::now();
+    // Unanswered, it is closed and denied by the timeout, which says so,
+    // and opencode is told `reject`.
+    let (mut seen, mut text) = (Vec::new(), String::new());
+    loop {
+        match wait_for_within(&mut events, 30, |_| true).await {
+            Event::ApprovalClosed(done) if done == id => {
+                assert!(
+                    shown.elapsed() >= Duration::from_millis(900),
+                    "{:?}",
+                    shown.elapsed()
+                );
+                seen.push("closed".to_owned());
+            }
+            Event::Notice(notice) => seen.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(seen, ["closed", "Approval timed out and was denied"]);
+    assert_eq!(text, "reject");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_nine_approvals_deny_the_ninth() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::APPROVALS_9.into()))
+        .unwrap();
+    let (mut shown, mut notices) = (Vec::new(), 0);
+    loop {
+        match next(&mut events).await {
+            Event::Approval { id, .. } => shown.push(id),
+            Event::Notice(text) if text.contains("Too many approvals are waiting") => {
+                notices += 1;
+            }
+            // The ninth request was denied: opencode echoes the answer.
+            Event::Text(text) if text == "answered 8:reject" => break,
+            Event::Text(text) => panic!("unexpected answer: {text}"),
+            Event::Finished { .. } | Event::Stopped => panic!("no ninth denial"),
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!((shown.len(), notices), (8, 1));
+    // The eight shown still wait for the user.
+    handle
+        .send(Command::Answer {
+            id: shown[0],
+            allow: true,
+        })
+        .unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Text(t) if t == "answered 0:once"),
+    )
+    .await;
+    handle.interrupt();
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_cancel_is_interrupted_though_it_says_end_turn() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Prompt(scenario::HOLD.into())).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Started)).await;
+    handle.interrupt();
+    let finished = wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Interrupted
+            }
+        ),
+        "{finished:?}"
+    );
+    // The next turn is not taken for a cancelled one.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let finished = wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Completed
+            }
+        ),
+        "{finished:?}"
+    );
+    stop(&handle, task).await;
+}
+/// The agents opencode has accepted so far, after a live switch to `target`.
+async fn opencode_agents_after_switching_to(target: Mode) -> serde_json::Value {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(target)).unwrap();
+    let changed = wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(_) | Event::Notice(_))
+    })
+    .await;
+    assert!(
+        matches!(&changed, Event::ModeChanged(mode) if *mode == target),
+        "{changed:?}"
+    );
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    stop(&handle, task).await;
+    echo["modes"].clone()
+}
+#[tokio::test]
+async fn opencode_live_switch_sets_the_agent() {
+    let modes = opencode_agents_after_switching_to(Mode::AcceptEdits).await;
+    assert_eq!(
+        modes.as_array().unwrap().last().unwrap(),
+        "octet-accept-edits",
+        "{modes}"
+    );
+}
+#[tokio::test]
+async fn opencode_switch_during_a_turn_applies_from_the_next_turn() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::Prompt(scenario::HOLD.into())).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Started)).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    // opencode applies an agent at the next prompt: the running turn keeps
+    // octet-ask, and Octet says so as it does for Codex.
+    let notice = next(&mut events).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t.starts_with("Mode applies from the next turn")),
+        "{notice:?}"
+    );
+    // opencode cannot steer: its `/steer` is the next prompt, under the new mode.
+    assert!(
+        matches!(&notice, Event::Notice(t) if !t.contains("steering")),
+        "{notice:?}"
+    );
+    handle.interrupt();
+    wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-ask", "octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_switch_between_turns_gives_no_next_turn_notice() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let mut text = String::new();
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => panic!("unexpected notice: {notice}"),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    let echo: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_prompt_sent_right_after_an_idle_switch_runs_under_the_new_agent() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    // Back to back, before opencode can confirm: the driver holds the
+    // prompt until it does, so the header never shows ask over a turn
+    // that runs under octet-accept-edits.
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let (mut seen, mut text) = (Vec::new(), String::new());
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => seen.push(notice),
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            Event::Started => seen.push("started".into()),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    // Held, the prompt says what it waits for; no next-turn notice follows.
+    assert_eq!(
+        seen,
+        [
+            "Waiting for opencode to confirm the switch to accept-edits before sending your prompt",
+            "mode accept-edits",
+            "started"
+        ]
+    );
+    let echo: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_compaction_held_for_a_switch_says_it_waits_to_start() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    handle.send(Command::Compact).unwrap();
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "Waiting for opencode to confirm the switch to accept-edits before starting the turn"),
+        "{notice:?}"
+    );
+    assert_eq!(turn_text(&mut events).await, "/compact");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_turn_held_for_a_switch_never_starts_once_cancelled() {
+    let confirmed = serde_json::json!({"result": {"configOptions": [
+        {"id": "mode", "currentValue": "octet-accept-edits"}]}});
+    let (dir, handle, mut events, task) =
+        opencode_switching_then(confirmed, "0.8", PROMPT_LOGGED).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    // Time for the driver to take the prompt and hold it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    handle.interrupt();
+    let mut seen = Vec::new();
+    while !seen.iter().any(|e: &String| e == "mode accept-edits") {
+        match next(&mut events).await {
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            Event::Started => seen.push("started".into()),
+            Event::Finished { outcome } => seen.push(format!("finished {outcome:?}")),
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        seen,
+        ["started", "finished Interrupted", "mode accept-edits"]
+    );
+    // Nothing starts after the switch resolves, and opencode got no prompt.
+    let started = timeout(
+        Duration::from_millis(500),
+        wait_for(&mut events, |e| matches!(e, Event::Started)),
+    )
+    .await;
+    assert!(started.is_err(), "{started:?}");
+    stop(&handle, task).await;
+    assert!(!dir.path().join("prompt").exists());
+}
+/// What a held prompt's session shows until its turn ends, as text:
+/// notices, header modes, turn starts, errors and the outcome.
+async fn held_turn_events(events: &mut mpsc::Receiver<Event>) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        match wait_for_within(events, 8, |_| true).await {
+            Event::Notice(text) => seen.push(text),
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            Event::Started => seen.push("started".into()),
+            Event::Finished { outcome } => {
+                seen.push(format!("finished {outcome:?}"));
+                return seen;
+            }
+            _ => {}
+        }
+    }
+}
+#[tokio::test]
+async fn opencode_turn_held_for_a_switch_that_times_out_is_not_sent() {
+    let confirmed = serde_json::json!({"result": {"configOptions": [
+        {"id": "mode", "currentValue": "octet-accept-edits"}]}});
+    let (dir, handle, mut events, task) =
+        opencode_switching_then(confirmed, "1.6", PROMPT_LOGGED).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let mut seen = Vec::new();
+    let error = loop {
+        match next(&mut events).await {
+            Event::Notice(text) => seen.push(text),
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            Event::Started => seen.push("started".into()),
+            Event::Error(error) => break error,
+            _ => {}
+        }
+    };
+    // opencode already has the switch, so the prompt could run under the
+    // new agent while the header shows ask: it is not sent.
+    assert_eq!(
+        seen,
+        [
+            "Waiting for opencode to confirm the switch to accept-edits before sending your prompt",
+            "opencode has not confirmed the switch to accept-edits",
+            "mode ask",
+            "started",
+        ]
+    );
+    assert_eq!(
+        error,
+        "Not sent: opencode has not confirmed the switch to accept-edits; send it again once it does"
+    );
+    let finished = next(&mut events).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Failed
+            }
+        ),
+        "{finished:?}"
+    );
+    // The late confirmation, while idle, is a plain mode change.
+    let mut late = Vec::new();
+    while !late.iter().any(|e: &String| e.starts_with("mode ")) {
+        match wait_for_within(&mut events, 5, |_| true).await {
+            Event::Notice(text) => late.push(text),
+            Event::ModeChanged(mode) => late.push(format!("mode {}", mode.label())),
+            Event::Started => panic!("the held prompt started"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        late,
+        [
+            "opencode confirmed the switch to accept-edits late",
+            "mode accept-edits"
+        ]
+    );
+    stop(&handle, task).await;
+    assert!(!dir.path().join("prompt").exists());
+}
+#[tokio::test]
+async fn opencode_turn_held_for_a_refused_switch_is_sent_under_the_old_mode() {
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    let (dir, handle, mut events, task) =
+        opencode_switching_then(refused, "0.3", PROMPT_LOGGED).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    // The mode is known, unchanged: the prompt goes out.
+    assert_eq!(
+        held_turn_events(&mut events).await,
+        [
+            "Waiting for opencode to confirm the switch to accept-edits before sending your prompt",
+            "opencode did not switch to accept-edits: unknown agent",
+            "mode ask",
+            "started",
+            "finished Completed",
+        ]
+    );
+    assert!(dir.path().join("prompt").exists());
+    stop(&handle, task).await;
+}
+/// The events of one refused or finished turn, as text, up to its end.
+async fn turn_events(events: &mut mpsc::Receiver<Event>) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        match next(events).await {
+            Event::User(text) => seen.push(format!("user {text}")),
+            Event::Started => seen.push("started".into()),
+            Event::Error(error) => seen.push(format!("error {error}")),
+            Event::Notice(text) => seen.push(text),
+            Event::Finished { outcome } => {
+                seen.push(format!("finished {outcome:?}"));
+                return seen;
+            }
+            _ => {}
+        }
+    }
+}
+/// The refusal of a prompt sent while the switch to accept-edits is
+/// unanswered.
+const UNKNOWN_MODE: &str = "error Not sent: opencode has not confirmed the switch to accept-edits, \
+     so its mode is unknown. Wait for it, or use /reconnect to start again in ask";
+#[tokio::test]
+async fn opencode_prompts_wait_for_a_timed_out_switch_then_run_under_its_agent() {
+    // The gated fake answers the live switch only once the test releases it.
+    let dir = octet_testkit::TempDir::new("octet-live-opencode-unknown-mode");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    c.model = Some(scenario::OPENCODE_GATED.into());
+    let release = dir.path().join("release-mode");
+    std::fs::write(&release, "").unwrap();
+    let limits = Limits {
+        mode_confirm: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (handle, mut events, task) = spawn_with_limits(c, limits);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    std::fs::remove_file(&release).unwrap();
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Notice(t) if t.contains("has not confirmed")),
+    )
+    .await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    // opencode may already run the new agent: nothing is sent.
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    assert_eq!(
+        turn_events(&mut events).await,
+        ["user hello", "started", UNKNOWN_MODE, "finished Failed"]
+    );
+    std::fs::write(&release, "").unwrap();
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    // Settled: prompts flow again, under the confirmed agent, and the
+    // refused one never reached opencode.
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_prompts_run_under_the_old_agent_once_a_timed_out_switch_is_refused() {
+    let refused = serde_json::json!({"error": {"code": -32602, "message": "unknown agent"}});
+    let (dir, handle, mut events, task) =
+        opencode_switching_then(refused, "1.6", PROMPT_LOGGED).await;
+    wait_for_within(
+        &mut events,
+        5,
+        |e| matches!(e, Event::Notice(t) if t.contains("has not confirmed")),
+    )
+    .await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    assert_eq!(
+        turn_events(&mut events).await,
+        ["user hello", "started", UNKNOWN_MODE, "finished Failed"]
+    );
+    // The late refusal settles it: the mode is still ask.
+    wait_for_within(
+        &mut events,
+        5,
+        |e| matches!(e, Event::Notice(t) if t.starts_with("opencode did not switch")),
+    )
+    .await;
+    handle.send(Command::Prompt("again".into())).unwrap();
+    assert_eq!(
+        turn_events(&mut events).await,
+        ["user again", "started", "finished Completed"]
+    );
+    let sent = std::fs::read_to_string(dir.path().join("prompt")).unwrap();
+    assert!(sent.contains("again"), "{sent}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_reconnect_sets_the_agent_of_the_headers_mode() {
+    // `/reconnect` resumes the session with its model, in the mode the
+    // header shows; the handshake sets that mode's agent, so a mode left
+    // unknown by an unanswered switch is known again.
+    let mut c = opencode();
+    c.resume = Some("ses-before".into());
+    c.mode = Mode::AcceptEdits;
+    c.model = Some("openai/gpt-fixture".into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["opened"], "session/resume", "{echo}");
+    assert_eq!(echo["model"], "openai/gpt-fixture", "{echo}");
+    assert_eq!(
+        echo["modes"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    assert_eq!(
+        echo["agents"],
+        serde_json::json!(["octet-accept-edits"]),
+        "{echo}"
+    );
+    stop(&handle, task).await;
+}
+/// The fake opencode's `PARAMS` echo, from a session `config` opens.
+async fn opencode_params(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+) -> serde_json::Value {
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    serde_json::from_str(&turn_text(events).await).unwrap()
+}
+#[tokio::test]
+async fn opencode_launch_effort_is_set_before_the_agent() {
+    let mut c = opencode();
+    c.effort = Some("high".into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["effort"], "high", "{echo}");
+    assert_eq!(echo["efforts"], serde_json::json!(["high"]), "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_changes_live() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetEffort(Some("max".into()))).unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Effort(Some(l)) if l == "max"),
+    )
+    .await;
+    let notice = next(&mut events).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "Reasoning effort: max (from now on)"),
+        "{notice:?}"
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["effort"], "max", "{echo}");
+    // `/effort default` goes back to the model's own level.
+    handle.send(Command::SetEffort(None)).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Effort(None))).await;
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["effort"], "low", "{echo}");
+    stop(&handle, task).await;
+}
+/// Waits up to five seconds for `path` to exist.
+async fn wait_for_file(path: &std::path::Path) {
+    timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} did not appear", path.display()));
+}
+/// An opencode session on the gated model (see `scenario::OPENCODE_GATED`)
+/// asking for effort `high` at launch, in a fresh directory.
+fn opencode_gated(name: &str) -> (octet_testkit::TempDir, Config) {
+    let dir = octet_testkit::TempDir::new(name);
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    c.model = Some(scenario::OPENCODE_GATED.into());
+    c.effort = Some("high".into());
+    (dir, c)
+}
+/// The effort levels shown up to the session's first `ModeChanged`, which
+/// ends the handshake, and then up to the next `Effort` event.
+async fn efforts_shown(events: &mut mpsc::Receiver<Event>) -> Vec<Option<String>> {
+    let mut shown = Vec::new();
+    loop {
+        match next(events).await {
+            Event::Effort(level) => shown.push(level),
+            Event::ModeChanged(_) => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let Event::Effort(level) = wait_for(events, |e| matches!(e, Event::Effort(_))).await else {
+        unreachable!()
+    };
+    shown.push(level);
+    shown
+}
+#[tokio::test]
+async fn opencode_effort_asked_while_the_handshake_sets_one_wins() {
+    let (dir, c) = opencode_gated("octet-live-opencode-effort-in-flight");
+    let (handle, mut events, task) = spawn(c);
+    // The handshake's `high` is in flight when the user asks for `max`.
+    wait_for_file(&dir.path().join("asked-effort")).await;
+    handle.send(Command::SetEffort(Some("max".into()))).unwrap();
+    std::fs::write(dir.path().join("release-effort"), "").unwrap();
+    std::fs::write(dir.path().join("release-mode"), "").unwrap();
+    // Its confirmation of `high` never shows over the newer `max`.
+    assert_eq!(efforts_shown(&mut events).await, [Some("max".to_owned())]);
+    let notice = next(&mut events).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "Reasoning effort: max (from now on)"),
+        "{notice:?}"
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(
+        echo["efforts"],
+        serde_json::json!(["high", "max"]),
+        "{echo}"
+    );
+    assert_eq!(echo["effort"], "max", "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_asked_after_the_handshake_set_one_is_still_sent() {
+    let (dir, c) = opencode_gated("octet-live-opencode-effort-after-step");
+    let (handle, mut events, task) = spawn(c);
+    // The handshake has set `high` and waits on the agent.
+    wait_for_file(&dir.path().join("asked-effort")).await;
+    std::fs::write(dir.path().join("release-effort"), "").unwrap();
+    wait_for_file(&dir.path().join("asked-mode")).await;
+    handle.send(Command::SetEffort(Some("max".into()))).unwrap();
+    std::fs::write(dir.path().join("release-mode"), "").unwrap();
+    assert_eq!(
+        efforts_shown(&mut events).await,
+        [Some("high".to_owned()), Some("max".to_owned())]
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(
+        echo["efforts"],
+        serde_json::json!(["high", "max"]),
+        "{echo}"
+    );
+    assert_eq!(echo["effort"], "max", "{echo}");
+    stop(&handle, task).await;
+}
+/// A scripted opencode that answers its requests with `frames` in turn,
+/// writing every line it reads to `sent` in its directory.
+fn opencode_logging(name: &str, frames: &[serde_json::Value]) -> (octet_testkit::TempDir, Config) {
+    let mut body = String::from("log=\"$(dirname \"$0\")/sent\"\n");
+    for frame in frames {
+        let _ = write!(
+            body,
+            "read line\necho \"$line\" >> \"$log\"\necho '{frame}'\n"
+        );
+    }
+    body.push_str("while read line; do echo \"$line\" >> \"$log\"; done\n");
+    let (dir, vendor) = script_vendor(name, &body);
+    (
+        dir,
+        Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()),
+    )
+}
+/// The requests a `opencode_logging` script has read, after a moment for
+/// any still on their way.
+async fn requests_sent(dir: &octet_testkit::TempDir) -> Vec<serde_json::Value> {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::read_to_string(dir.path().join("sent"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+#[tokio::test]
+async fn opencode_effort_default_after_a_bare_confirmation_goes_back() {
+    use serde_json::json;
+    let options = json!([{"id": "effort", "currentValue": "low",
+        "options": [{"value": "low"}, {"value": "high"}]}]);
+    // opencode confirms `high` without reporting its options again.
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": options}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 5, "result": {}}),
+    ];
+    let (dir, c) = opencode_logging("octet-live-opencode-bare-effort", &frames);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::SetEffort(Some("high".into())))
+        .unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Effort(Some(l)) if l == "high"),
+    )
+    .await;
+    handle.send(Command::SetEffort(None)).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Effort(None))).await;
+    let sent = requests_sent(&dir).await;
+    let values: Vec<&serde_json::Value> = sent
+        .iter()
+        .filter(|frame| frame["params"]["configId"] == "effort")
+        .map(|frame| &frame["params"]["value"])
+        .collect();
+    assert_eq!(values, [&json!("high"), &json!("low")], "{sent:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_default_with_unknown_levels_is_not_claimed() {
+    use serde_json::json;
+    // opencode never reports its options: the levels stay unknown.
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
+    ];
+    let (dir, c) = opencode_logging("octet-live-opencode-unknown-effort", &frames);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::SetEffort(Some("high".into())))
+        .unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Effort(Some(l)) if l == "high"),
+    )
+    .await;
+    handle.send(Command::SetEffort(None)).unwrap();
+    let notice = wait_for(
+        &mut events,
+        |e| matches!(e, Event::Notice(t) if !t.contains("high (from")),
+    )
+    .await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode keeps effort high: it has not reported its model's default level"),
+        "{notice:?}"
+    );
+    // The interface goes back to the level in force.
+    let effort = next(&mut events).await;
+    assert!(
+        matches!(&effort, Event::Effort(Some(l)) if l == "high"),
+        "{effort:?}"
+    );
+    let sent = requests_sent(&dir).await;
+    assert_eq!(sent.len(), 4, "{sent:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_the_model_does_not_list_is_not_sent() {
+    let mut c = opencode();
+    c.effort = Some("high".into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::SetEffort(Some("bogus".into())))
+        .unwrap();
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode's model opencode/fixture-free takes effort low, high or max"),
+        "{notice:?}"
+    );
+    // The interface goes back to the level opencode is at.
+    let effort = next(&mut events).await;
+    assert!(
+        matches!(&effort, Event::Effort(Some(l)) if l == "high"),
+        "{effort:?}"
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["efforts"], serde_json::json!(["high"]), "{echo}");
+    assert_eq!(echo["effort"], "high", "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_model_without_effort_levels_says_so() {
+    let mut c = opencode();
+    c.model = Some("openai/gpt-fixture".into());
+    c.effort = Some("high".into());
+    let (handle, mut events, task) = spawn(c);
+    // At connect: nothing is sent, and the level is dropped.
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode's model openai/gpt-fixture has no effort levels"),
+        "{notice:?}"
+    );
+    wait_for(&mut events, |e| matches!(e, Event::Effort(None))).await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::SetEffort(Some("high".into())))
+        .unwrap();
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode's model openai/gpt-fixture has no effort levels"),
+        "{notice:?}"
+    );
+    let echo = opencode_params(&handle, &mut events).await;
+    assert_eq!(echo["efforts"], serde_json::json!([]), "{echo}");
+    assert_eq!(echo["effort"], serde_json::Value::Null, "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_effort_refused_at_connect_is_reported_and_the_session_goes_on() {
+    use serde_json::json;
+    // No options reported, so the level is sent; opencode refuses it.
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32602, "message": "Invalid params: effort not found: high"}}),
+        json!({"jsonrpc": "2.0", "id": 4, "result": {}}),
+    ];
+    let mut body = String::new();
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    body.push_str("exec sleep 30\n");
+    let (_dir, vendor) = script_vendor("octet-live-opencode-effort-refused", &body);
+    let mut c = Config::new(Engine::OPENCODE, vendor, std::env::temp_dir());
+    c.effort = Some("high".into());
+    let (handle, mut events, task) = spawn(c);
+    let notice = wait_for(&mut events, |e| matches!(e, Event::Notice(_))).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode did not set effort high: Invalid params: effort not found: high"),
+        "{notice:?}"
+    );
+    wait_for(&mut events, |e| matches!(e, Event::Effort(None))).await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_auto_is_the_build_agent() {
+    let modes = opencode_agents_after_switching_to(Mode::Auto).await;
+    assert_eq!(
+        modes.as_array().unwrap().last().unwrap(),
+        "build",
+        "{modes}"
+    );
+}
+#[tokio::test]
+async fn opencode_refused_switch_keeps_the_mode() {
+    let mut c = opencode();
+    c.model = Some(scenario::OPENCODE_REJECT_MODE.into());
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let notice = wait_for(&mut events, |e| {
+        matches!(e, Event::Notice(_) | Event::ModeChanged(_))
+    })
+    .await;
+    assert!(
+        matches!(&notice, Event::Notice(text) if text.starts_with("opencode did not switch to accept-edits")),
+        "{notice:?}"
+    );
+    let switched = timeout(
+        Duration::from_secs(1),
+        wait_for(&mut events, |e| {
+            matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+        }),
+    )
+    .await;
+    assert!(switched.is_err(), "{switched:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_full_access_launches_with_its_agent() {
+    let mut c = opencode();
+    c.mode = Mode::FullAccess;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::FullAccess))
+    })
+    .await;
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let echo: serde_json::Value = serde_json::from_str(&turn_text(&mut events).await).unwrap();
+    assert_eq!(echo["modes"], serde_json::json!(["octet-full-access"]));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn an_opencode_command_is_shown_by_its_command_not_its_folder() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::TOOL_FAIL.into()))
+        .unwrap();
+    let mut tools = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Tool(call) => tools.push((call.name, call.target, call.phase)),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    // The first frame names no command yet, only the working directory.
+    assert_eq!(
+        tools,
+        [
+            ("bash".to_owned(), String::new(), ToolPhase::Running),
+            ("bash".to_owned(), "false".to_owned(), ToolPhase::Failed),
+        ]
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_failed_turn_shows_the_message() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Prompt(scenario::FAIL.into())).unwrap();
+    let error = expect_error(&mut events).await;
+    assert_eq!(error, "Internal error: fixture failure");
+    let finished = next(&mut events).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Failed
+            }
+        ),
+        "{finished:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_other_session_updates_are_neither_progress_nor_output() {
+    let (handle, mut events, task) = spawn_with_limits(opencode(), quick());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let sent = tokio::time::Instant::now();
+    // Another session talks for about 2.4 seconds; ours is silent.
+    handle
+        .send(Command::Prompt(scenario::CHATTER.into()))
+        .unwrap();
+    let error = loop {
+        match next(&mut events).await {
+            Event::Error(error) => break error,
+            Event::Text(text) => panic!("another session's text shown: {text}"),
+            Event::Tool(tool) => panic!("another session's tool shown: {tool:?}"),
+            Event::Stopped => panic!("stopped without an error"),
+            _ => {}
+        }
+    };
+    assert!(error.contains("sent nothing for 1 second"), "{error}");
+    // Had the chatter reset the 1 s limit, the error would come after 3.4 s.
+    assert!(
+        sent.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        sent.elapsed()
+    );
+    let _ = handle;
+    ended(task).await;
+}
+/// What a scripted opencode (see `opencode_switching_then`) does after
+/// its switch reply: write the next request, a prompt, to `prompt` in its
+/// directory and end it.
+const PROMPT_LOGGED: &str = "if read line; then echo \"$line\" > \"$(dirname \"$0\")/prompt\"; \
+     echo '{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"stopReason\":\"end_turn\"}}'; fi\n\
+     exec sleep 30\n";
+/// A scripted session, the handle, its events and its task.
+type Scripted = (
+    octet_testkit::TempDir,
+    octet_engine::live::Handle,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<()>,
+);
+/// An `ask` session with a scripted opencode that, asked to switch to
+/// accept-edits, answers `delay` seconds later with `reply` (the reply's
+/// `result` or `error` member). The switch has been sent.
+async fn opencode_switching(reply: serde_json::Value, delay: &str) -> Scripted {
+    opencode_switching_then(reply, delay, "exec sleep 30\n").await
+}
+/// As `opencode_switching`, the script going on with `after` once it has
+/// replied.
+async fn opencode_switching_then(reply: serde_json::Value, delay: &str, after: &str) -> Scripted {
+    use serde_json::json;
+    let mode = |agent: &str| json!([{"id": "mode", "currentValue": agent}]);
+    let mut fourth = json!({"jsonrpc": "2.0", "id": 4});
+    fourth
+        .as_object_mut()
+        .unwrap()
+        .extend(reply.as_object().unwrap().clone());
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": mode("build")}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {"configOptions": mode("octet-ask")}}),
+    ];
+    let mut body = String::new();
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    let _ = write!(body, "read line\nsleep {delay}\necho '{fourth}'\n{after}");
+    let (dir, vendor) = script_vendor("octet-live-opencode-switch", &body);
+    let config = Config::new(Engine::OPENCODE, vendor, std::env::temp_dir());
+    // A short confirmation window, and the usual connect limit: a shell
+    // vendor can be slow to start while the other tests run.
+    let limits = Limits {
+        mode_confirm: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let (handle, mut events, task) = spawn_with_limits(config, limits);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    (dir, handle, events, task)
+}
+/// What an `ask` session shows after asking a scripted opencode to switch
+/// to accept-edits (see `opencode_switching`): its notices and header
+/// modes, up to the `modes`th mode.
+async fn opencode_scripted_switch(
+    reply: serde_json::Value,
+    delay: &str,
+    modes: usize,
+) -> Vec<String> {
+    let (_dir, handle, mut events, task) = opencode_switching(reply, delay).await;
+    let mut seen = Vec::new();
+    while seen
+        .iter()
+        .filter(|e: &&String| e.starts_with("mode "))
+        .count()
+        < modes
+    {
+        match wait_for_within(&mut events, 5, |e| {
+            matches!(e, Event::Notice(_) | Event::ModeChanged(_))
+        })
+        .await
+        {
+            Event::Notice(text) => seen.push(text),
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            _ => unreachable!(),
+        }
+    }
+    stop(&handle, task).await;
+    seen
+}
+/// The error that stops a session after a scripted switch (see
+/// `opencode_switching`); the header must never have shown accept-edits.
+async fn opencode_switch_error(reply: serde_json::Value, delay: &str) -> String {
+    let (_dir, _handle, mut events, task) = opencode_switching(reply, delay).await;
+    let error = loop {
+        match next(&mut events).await {
+            Event::Error(error) => break error,
+            Event::ModeChanged(Mode::AcceptEdits) => panic!("the header claimed accept-edits"),
+            Event::Stopped => panic!("stopped without an error"),
+            _ => {}
+        }
+    };
+    ended(task).await;
+    error
+}
+#[tokio::test]
+async fn opencode_unconfirmed_switch_times_out_then_applies_a_late_confirmation() {
+    let confirmed = serde_json::json!({"result": {"configOptions": [
+        {"id": "mode", "currentValue": "octet-accept-edits"}]}});
+    assert_eq!(
+        opencode_scripted_switch(confirmed, "1.6", 2).await,
+        [
+            "opencode has not confirmed the switch to accept-edits",
+            "mode ask",
+            "opencode confirmed the switch to accept-edits late",
+            "mode accept-edits",
+        ]
+    );
+}
+#[tokio::test]
+async fn opencode_refuses_a_switch_while_eight_wait_for_confirmation() {
+    use serde_json::json;
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+    ];
+    // opencode answers nothing after the handshake.
+    let (dir, c) = opencode_logging("octet-live-opencode-late-switches", &frames);
+    let limits = Limits {
+        mode_confirm: Duration::from_millis(100),
+        ..Limits::default()
+    };
+    let (handle, mut events, task) = spawn_with_limits(c, limits);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    for _ in 0..8 {
+        handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+        wait_for(
+            &mut events,
+            |e| matches!(e, Event::Notice(t) if t.contains("has not confirmed")),
+        )
+        .await;
+        wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    }
+    // A late reply to a ninth could no longer be matched: it is not sent.
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let notice = next(&mut events).await;
+    assert!(
+        matches!(&notice, Event::Notice(t) if t == "opencode has not confirmed 8 earlier mode switches; wait or reconnect"),
+        "{notice:?}"
+    );
+    let mode = next(&mut events).await;
+    assert!(matches!(mode, Event::ModeChanged(Mode::Ask)), "{mode:?}");
+    let switches = requests_sent(&dir)
+        .await
+        .iter()
+        .filter(|frame| frame["params"]["configId"] == "mode")
+        .count();
+    // The handshake's agent and the eight live switches.
+    assert_eq!(switches, 9);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_switch_reporting_another_agent_stops_or_keeps_the_mode() {
+    // opencode ignored the switch: it still reports the agent in force.
+    let ignored = serde_json::json!({"result": {"configOptions": [
+        {"id": "mode", "currentValue": "octet-ask"}]}});
+    assert_eq!(
+        opencode_scripted_switch(ignored, "0", 1).await,
+        [
+            "opencode did not switch to accept-edits: opencode reported agent octet-ask",
+            "mode ask",
+        ]
+    );
+    // opencode moved to an agent nobody asked for: the session stops.
+    for delay in ["0", "1.6"] {
+        let other = serde_json::json!({"result": {"configOptions": [
+            {"id": "mode", "currentValue": "build"}]}});
+        assert_eq!(
+            opencode_switch_error(other, delay).await,
+            "opencode switched to agent build instead of octet-accept-edits; Octet stopped the session so opencode never acts outside the mode you chose",
+            "after {delay} s"
+        );
+    }
+}
+#[tokio::test]
+async fn opencode_permission_outside_a_turn_is_rejected_with_a_notice() {
+    use serde_json::json;
+    let dir = octet_testkit::TempDir::new("octet-live-opencode-stray-permission");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let reply_file = dir.path().join("reply");
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": []}}),
+    ];
+    let mut body = String::new();
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    // The handshake's agent switch, then a permission request while idle.
+    let permission = json!({"jsonrpc": "2.0", "id": 0, "method": "session/request_permission",
+        "params": {"sessionId": "s1", "toolCall": {"kind": "execute", "title": "rm -rf /"},
+        "options": [{"optionId": "once", "kind": "allow_once"},
+                    {"optionId": "reject", "kind": "reject_once"}]}});
+    let _ = write!(
+        body,
+        "read line\necho '{}'\necho '{permission}'\nread reply\necho \"$reply\" > '{}'\nexec sleep 30\n",
+        json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+        reply_file.display()
+    );
+    let vendor = octet_testkit::write_script(dir.path(), "vendor", &body);
+    let (handle, mut events, task) =
+        spawn(Config::new(Engine::OPENCODE, vendor, std::env::temp_dir()));
+    let notice = wait_for(&mut events, |e| {
+        matches!(e, Event::Notice(_) | Event::Approval { .. })
+    })
+    .await;
+    assert!(
+        matches!(&notice, Event::Notice(text) if text == "opencode asked for a permission outside this session's running turn; Octet rejected it"),
+        "{notice:?}"
+    );
+    // Octet replied before the notice; the vendor writes the reply down.
+    timeout(Duration::from_secs(3), async {
+        while !std::fs::read_to_string(&reply_file).is_ok_and(|reply| reply.ends_with("}\n")) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the vendor got no reply");
+    let reply: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&reply_file).unwrap()).unwrap();
+    assert_eq!(
+        reply,
+        json!({"jsonrpc": "2.0", "id": 0, "result": {"outcome": {"outcome": "selected", "optionId": "reject"}}})
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_permission_for_another_session_during_a_turn_is_rejected() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_OTHER_PERMISSION.into()))
+        .unwrap();
+    let (mut notices, mut text) = (Vec::new(), String::new());
+    loop {
+        match next(&mut events).await {
+            Event::Approval { detail, .. } => panic!("another session's request shown: {detail}"),
+            Event::Notice(notice) => notices.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        notices,
+        ["opencode asked for a permission outside this session's running turn; Octet rejected it"]
+    );
+    // The fake echoes the answer it got.
+    assert_eq!(text, "reject");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_file_writes_after_an_allowed_edit_are_refused_quietly() {
+    // opencode 1.18.25 also asks the client to write an edit it was allowed,
+    // although Octet offers no file system: refused, with nothing to show.
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_EDIT.into()))
+        .unwrap();
+    let Event::Approval { id, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    handle.send(Command::Answer { id, allow: true }).unwrap();
+    let (mut notices, mut text) = (Vec::new(), String::new());
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => notices.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    // The fake echoes the error code of Octet's reply to its write.
+    assert_eq!(text, "oncefs -32601");
+    assert!(notices.is_empty(), "{notices:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_permission_while_cancelling_is_rejected_and_says_so() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::Prompt(
+            scenario::OPENCODE_PERMISSION_ON_CANCEL.into(),
+        ))
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Started)).await;
+    handle.interrupt();
+    let (mut notices, mut text) = (Vec::new(), String::new());
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Approval { detail, .. } => panic!("shown while cancelling: {detail}"),
+            Event::Notice(notice) => notices.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { outcome } => break outcome,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert_eq!(
+        notices,
+        ["opencode asked for a permission while its turn is being cancelled; Octet rejected it"]
+    );
+    assert_eq!(text, "reject");
+    assert_eq!(outcome, Outcome::Interrupted);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencode_probe_lists_models_and_skills() {
+    let listing = probe(opencode(), PROBE_LIMIT).await.unwrap();
+    assert_eq!(listing.models.len(), 2, "{:?}", listing.models);
+    assert!(
+        listing
+            .skills
+            .iter()
+            .any(|s| s.name == scenario::OPENCODE_SKILL),
+        "{:?}",
+        listing.skills
+    );
+}
+#[tokio::test]
+async fn opencode_probe_deletes_its_session() {
+    // The fake's `session delete <id>` leaves `deleted-<id>` in its working
+    // directory, which is the probe's.
+    let dir = octet_testkit::TempDir::new("octet-opencode-probe-delete");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    probe(c, PROBE_LIMIT).await.unwrap();
+    let marker = dir.path().join("deleted-fixture-ses");
+    let started = tokio::time::Instant::now();
+    while !marker.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the probe's session was not deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+#[tokio::test]
+async fn opencode_real_sessions_are_not_deleted() {
+    let dir = octet_testkit::TempDir::new("octet-opencode-keep");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    stop(&handle, task).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!dir.path().join("deleted-fixture-ses").exists());
+}
+#[tokio::test]
+async fn opencode_skill_runs_as_a_slash_prompt() {
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Skill {
+            name: scenario::OPENCODE_SKILL.into(),
+            path: None,
+            args: "go".into(),
+            display: format!("/{} go", scenario::OPENCODE_SKILL),
+            context: None,
+        })
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{} go", scenario::OPENCODE_SKILL)
+    );
+    stop(&handle, task).await;
+}
+/// An opencode skill `name` with `args`, as the interface sends it.
+fn opencode_skill(name: &str, args: &str) -> Command {
+    Command::Skill {
+        name: name.into(),
+        path: None,
+        args: args.into(),
+        display: format!("/{name} {args}"),
+        context: None,
+    }
+}
+/// The error and outcome that end the turn `command` starts in a session
+/// in `mode`, and the text it streamed; it must end by itself.
+async fn opencode_turn_ending(mode: Mode, command: Command) -> (Option<String>, Outcome, String) {
+    let mut c = opencode();
+    c.mode = mode;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(command).unwrap();
+    let (mut error, mut text) = (None, String::new());
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Error(message) => error = Some(message),
+            Event::Text(t) => text.push_str(&t),
+            Event::Approval { detail, .. } => panic!("an approval was shown: {detail}"),
+            Event::Finished { outcome } => break outcome,
+            _ => {}
+        }
+    };
+    stop(&handle, task).await;
+    (error, outcome, text)
+}
+#[tokio::test]
+async fn opencodes_review_is_not_sent_while_the_mode_asks() {
+    // `/review` runs as a subagent, whose approvals opencode never passes on:
+    // in ask or accept-edits the turn would wait for ever.
+    for (mode, command) in [
+        (Mode::Ask, opencode_skill("review", "HEAD")),
+        (Mode::AcceptEdits, opencode_skill("review", "")),
+        (Mode::Ask, Command::Prompt("/review HEAD".into())),
+    ] {
+        let (error, outcome, text) = opencode_turn_ending(mode, command).await;
+        assert_eq!(
+            error.as_deref(),
+            Some(subtask_refusal("/review", mode, "Octet did not send it").as_str())
+        );
+        assert_eq!(outcome, Outcome::Failed);
+        // The fake echoes a command it is sent.
+        assert_eq!(text, "");
+    }
+}
+/// What Octet says when opencode's subagent command `command` cannot run
+/// in `mode`, ending with what Octet did about it.
+fn subtask_refusal(command: &str, mode: Mode, done: &str) -> String {
+    format!(
+        "opencode runs {command} in a subagent, whose approval requests it never passes on to Octet; \
+         subagents are off in {}, so {done}. In auto, opencode's own permission settings decide",
+        mode.label()
+    )
+}
+#[tokio::test]
+async fn opencodes_review_is_sent_in_auto() {
+    let (error, outcome, text) =
+        opencode_turn_ending(Mode::Auto, opencode_skill("review", "HEAD")).await;
+    assert_eq!(error, None);
+    assert_eq!(outcome, Outcome::Completed);
+    assert_eq!(text, "/review HEAD");
+}
+#[tokio::test]
+async fn an_opencode_subagent_started_while_the_mode_asks_stops_the_turn() {
+    // A command opencode runs as a subagent although the definition Octet
+    // read says otherwise (it changed since): its `task` call is the sign,
+    // and the turn is cancelled.
+    let (error, outcome, _) =
+        opencode_turn_ending(Mode::Ask, opencode_skill(scenario::OPENCODE_SUBTASK, "")).await;
+    let command = format!("/{}", scenario::OPENCODE_SUBTASK);
+    assert_eq!(
+        error.as_deref(),
+        Some(subtask_refusal(&command, Mode::Ask, "Octet stopped the turn").as_str())
+    );
+    assert_eq!(outcome, Outcome::Failed);
+}
+#[tokio::test]
+async fn an_opencode_subagent_in_auto_runs_until_cancelled() {
+    let mut c = opencode();
+    c.mode = Mode::Auto;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SUBTASK, ""))
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Tool(_))).await;
+    // Nothing stops it: the subagent's approvals are opencode's to decide.
+    let quiet = timeout(Duration::from_millis(500), async {
+        loop {
+            if let Event::Finished { .. } | Event::Error(_) = next(&mut events).await {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "the turn ended by itself");
+    handle.interrupt();
+    let finished = wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Interrupted
+            }
+        ),
+        "{finished:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn an_opencode_skill_never_carries_context() {
+    // opencode joins a prompt's text blocks into a command's arguments and
+    // runs every `!`cmd`` of the expanded template in its shell: earlier
+    // conversation must never go with a command. The fake echoes every block.
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Skill {
+            name: scenario::OPENCODE_SKILL.into(),
+            path: None,
+            args: "go".into(),
+            display: format!("/{} go", scenario::OPENCODE_SKILL),
+            context: Some("earlier !`touch pwned` conversation".into()),
+        })
+        .unwrap();
+    let mut notices = Vec::new();
+    let mut text = String::new();
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => notices.push(notice),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { outcome } => {
+                assert_eq!(outcome, Outcome::Completed);
+                break;
+            }
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(text, format!("/{} go", scenario::OPENCODE_SKILL));
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.contains("Octet did not send the earlier conversation with it")),
+        "{notices:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn an_opencode_command_whose_arguments_run_shell_is_not_sent_while_the_mode_asks() {
+    // opencode runs every `!`cmd`` of a command's expanded text in its shell
+    // before any permission check.
+    for (mode, command) in [
+        (
+            Mode::Ask,
+            opencode_skill(scenario::OPENCODE_SKILL, "a !`touch pwned` b"),
+        ),
+        (
+            Mode::AcceptEdits,
+            opencode_skill(scenario::OPENCODE_SKILL, "!`id`"),
+        ),
+        (
+            Mode::Ask,
+            Command::Prompt(format!("/{} !`touch pwned`", scenario::OPENCODE_SKILL)),
+        ),
+    ] {
+        let (error, outcome, text) = opencode_turn_ending(mode, command).await;
+        let error = error.expect("the turn was refused");
+        assert!(
+            error.contains("which opencode runs in its shell before it asks for any permission"),
+            "{error}"
+        );
+        assert!(error.contains(mode.label()), "{error}");
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(text, "", "it was sent");
+    }
+    // In auto, opencode's own settings decide.
+    let (error, outcome, text) = opencode_turn_ending(
+        Mode::Auto,
+        opencode_skill(scenario::OPENCODE_SKILL, "!`true`"),
+    )
+    .await;
+    assert_eq!(error, None);
+    assert_eq!(outcome, Outcome::Completed);
+    assert_eq!(text, format!("/{} !`true`", scenario::OPENCODE_SKILL));
+}
+#[tokio::test]
+async fn opencode_compact_is_sent_though_opencode_does_not_list_it() {
+    // opencode 1.18.25 summarizes the session for a `/compact` prompt
+    // although its command list never names `compact`.
+    let (handle, mut events, task) = spawn(opencode());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Compact).unwrap();
+    assert_eq!(turn_text(&mut events).await, "/compact");
+    stop(&handle, task).await;
+}
+/// An opencode that opens its session and never lists any commands, then
+/// answers the mode switch if one comes. Its `session delete ID` leaves
+/// `deleted-ID` in its working directory.
+fn opencode_without_commands() -> (octet_testkit::TempDir, Config) {
+    use serde_json::json;
+    let options = json!([
+        {"id": "model", "currentValue": "a/b", "options": [{"value": "a/b", "name": "A B"}]},
+        {"id": "mode", "currentValue": "build", "options": [{"value": "build", "name": "build"}]},
+    ]);
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "configOptions": options}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+    ];
+    let mut body = String::from("if [ \"$1\" = session ]; then touch \"deleted-$3\"; exit 0; fi\n");
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    body.push_str("exec sleep 30\n");
+    let (dir, vendor) = script_vendor("octet-live-opencode-no-commands", &body);
+    let config = Config::new(Engine::OPENCODE, vendor, dir.path());
+    (dir, config)
+}
+#[tokio::test]
+async fn opencode_probe_settles_for_the_models_when_no_commands_come() {
+    let (_dir, config) = opencode_without_commands();
+    let started = tokio::time::Instant::now();
+    let listing = probe(config, PROBE_LIMIT).await.unwrap();
+    assert_eq!(listing.models.len(), 1);
+    assert!(listing.skills.is_empty());
+    assert!(
+        started.elapsed() >= Duration::from_millis(1900),
+        "{:?}",
+        started.elapsed()
+    );
+}
+/// Waits up to five seconds for the probe vendor in `dir` to have been
+/// asked to delete session `s1`.
+async fn probe_session_deleted(dir: &octet_testkit::TempDir) {
+    let marker = dir.path().join("deleted-s1");
+    timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the probe's session was not deleted");
+}
+#[tokio::test]
+async fn opencode_probe_that_gives_up_still_deletes_its_session() {
+    let (dir, config) = opencode_without_commands();
+    // Run the new script once first: its first start can take seconds
+    // while macOS scans it, and the probe must have opened its session
+    // before it gives up.
+    let warm = std::process::Command::new(&config.binary)
+        .args(["session", "delete", "warm"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(warm.success());
+    // The probe gives up shortly before its two-second wait for the
+    // commands would end; the session opened well before that.
+    let error = probe(config, Duration::from_millis(1900))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "opencode did not list its models within 1 s");
+    probe_session_deleted(&dir).await;
+}
+#[tokio::test]
+async fn opencode_probe_that_fails_still_deletes_its_session() {
+    use serde_json::json;
+    // opencode opens the session, then exits before listing anything.
+    let frames = [
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"agentInfo": {"version": "1.18.25"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}),
+    ];
+    let mut body = String::from("if [ \"$1\" = session ]; then touch \"deleted-$3\"; exit 0; fi\n");
+    for frame in &frames {
+        let _ = write!(body, "read line\necho '{frame}'\n");
+    }
+    let (dir, vendor) = script_vendor("octet-live-opencode-probe-fails", &body);
+    let config = Config::new(Engine::OPENCODE, vendor, dir.path());
+    let error = probe(config, PROBE_LIMIT).await.unwrap_err();
+    assert!(error.starts_with("Vendor disconnected"), "{error}");
+    probe_session_deleted(&dir).await;
+}
+/// A workspace for the fake opencode, with `commands` as the extra command
+/// definitions its `debug config` shows (`fixture-commands.json`) and
+/// `skills` as what its `debug skill` shows, and an empty `debug-calls`.
+fn opencode_workspace(
+    name: &str,
+    commands: &serde_json::Value,
+    skills: &serde_json::Value,
+) -> octet_testkit::TempDir {
+    let dir = octet_testkit::TempDir::new(name);
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(
+        dir.path().join("fixture-commands.json"),
+        commands.to_string(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("fixture-skills.json"), skills.to_string()).unwrap();
+    std::fs::write(dir.path().join("debug-calls"), "").unwrap();
+    dir
+}
+/// The error, outcome and text of the turn `command` starts in a session in
+/// `mode` working in `dir`, with `limits`; it must end by itself.
+async fn opencode_turn_in(
+    dir: &octet_testkit::TempDir,
+    mode: Mode,
+    limits: Limits,
+    command: Command,
+) -> (Option<String>, Outcome, String) {
+    let mut c = opencode();
+    c.mode = mode;
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn_with_limits(c, limits);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle.send(command).unwrap();
+    let (mut error, mut text) = (None, String::new());
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Error(message) => error = Some(message),
+            Event::Text(t) => text.push_str(&t),
+            Event::Approval { detail, .. } => panic!("an approval was shown: {detail}"),
+            Event::Finished { outcome } => break outcome,
+            _ => {}
+        }
+    };
+    stop(&handle, task).await;
+    (error, outcome, text)
+}
+/// Asserts that `command`, sent in `mode` in `dir`, ended Failed unsent
+/// with an error that contains `why` and names the mode.
+async fn assert_opencode_refuses(
+    dir: &octet_testkit::TempDir,
+    mode: Mode,
+    command: Command,
+    why: &str,
+) {
+    let (error, outcome, text) = opencode_turn_in(dir, mode, Limits::default(), command).await;
+    let error = error.expect("the turn was refused");
+    assert!(error.contains(why), "{error}");
+    assert!(error.contains(mode.label()), "{error}");
+    assert_eq!(outcome, Outcome::Failed);
+    assert_eq!(text, "", "it was sent");
+}
+#[tokio::test]
+async fn an_opencode_command_under_another_agent_is_not_sent_while_the_mode_asks() {
+    // A command's own `agent` replaces the mode's: under `build` its edits
+    // and commands would follow the user's own permissions, unasked.
+    let dir = opencode_workspace(
+        "octet-opencode-agent",
+        &serde_json::json!({
+            "fixture-build": {"agent": "build", "template": "Edit it"},
+            "fixture-general": {"agent": "general", "template": "Edit it"},
+            "fixture-own": {"agent": "octet-ask", "template": "Say hi"},
+        }),
+        &serde_json::json!([]),
+    );
+    for (mode, name) in [
+        (Mode::Ask, "fixture-build"),
+        (Mode::AcceptEdits, "fixture-build"),
+        (Mode::Ask, "fixture-general"),
+        (Mode::AcceptEdits, "fixture-own"),
+    ] {
+        let why = if name == "fixture-general" {
+            "agent general"
+        } else if name == "fixture-own" {
+            "agent octet-ask"
+        } else {
+            "agent build"
+        };
+        assert_opencode_refuses(&dir, mode, opencode_skill(name, ""), why).await;
+    }
+    // The mode's own agent changes nothing.
+    let (error, outcome, text) = opencode_turn_in(
+        &dir,
+        Mode::Ask,
+        Limits::default(),
+        opencode_skill("fixture-own", ""),
+    )
+    .await;
+    assert_eq!((error, outcome), (None, Outcome::Completed));
+    assert_eq!(text, "/fixture-own");
+    // In auto, opencode's own settings decide.
+    let (error, outcome, text) = opencode_turn_in(
+        &dir,
+        Mode::Auto,
+        Limits::default(),
+        opencode_skill("fixture-build", ""),
+    )
+    .await;
+    assert_eq!((error, outcome), (None, Outcome::Completed));
+    assert_eq!(text, "/fixture-build");
+}
+#[tokio::test]
+async fn an_opencode_subtask_command_is_not_sent_while_the_mode_asks() {
+    let dir = opencode_workspace(
+        "octet-opencode-subtask",
+        &serde_json::json!({"fixture-sub": {"subtask": true, "template": "Edit it"}}),
+        &serde_json::json!([]),
+    );
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        Command::Prompt("/fixture-sub now".into()),
+        &subtask_refusal("/fixture-sub", Mode::Ask, "Octet did not send it"),
+    )
+    .await;
+}
+#[tokio::test]
+async fn an_opencode_command_whose_text_runs_shell_is_not_sent_while_the_mode_asks() {
+    // opencode runs each `!`cmd`` of a command's expanded template in its
+    // shell before any permission check: a template's own, one its
+    // arguments complete, and a skill's.
+    let dir = opencode_workspace(
+        "octet-opencode-template-shell",
+        &serde_json::json!({
+            "fixture-date": {"template": "Today: !`date`"},
+            "fixture-bang": {"template": "Run !$1 now"},
+            "fixture-plain": {"template": "Say $ARGUMENTS"},
+        }),
+        &serde_json::json!([
+            {"name": "fixture-shell-skill", "description": "", "location": "/s/SKILL.md", "content": "x !`id` y"}
+        ]),
+    );
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        opencode_skill("fixture-date", ""),
+        "its template runs",
+    )
+    .await;
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        opencode_skill("fixture-shell-skill", ""),
+        "its template runs",
+    )
+    .await;
+    assert_opencode_refuses(
+        &dir,
+        Mode::AcceptEdits,
+        opencode_skill("fixture-bang", "`touch pwned`"),
+        "which opencode runs in its shell before it asks for any permission",
+    )
+    .await;
+    let (error, outcome, text) = opencode_turn_in(
+        &dir,
+        Mode::Ask,
+        Limits::default(),
+        opencode_skill("fixture-plain", "hi `x`"),
+    )
+    .await;
+    assert_eq!((error, outcome), (None, Outcome::Completed));
+    assert_eq!(text, "/fixture-plain hi `x`");
+}
+#[tokio::test]
+async fn an_opencode_command_octet_cannot_check_is_not_sent_while_the_mode_asks() {
+    // Fail closed: what Octet cannot read, it does not send.
+    let dir = opencode_workspace(
+        "octet-opencode-unknown",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        Command::Prompt("/nowhere x".into()),
+        "no definition",
+    )
+    .await;
+    // A listed command whose definition differs from the list (an MCP
+    // prompt of the same name takes the command's place in opencode).
+    std::fs::write(
+        dir.path().join("fixture-commands.json"),
+        serde_json::json!({scenario::OPENCODE_SKILL: {"description": "Another", "template": "x"}})
+            .to_string(),
+    )
+    .unwrap();
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        opencode_skill(scenario::OPENCODE_SKILL, ""),
+        "another description",
+    )
+    .await;
+    std::fs::write(dir.path().join("fixture-commands.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("debug-fails"), "").unwrap();
+    assert_opencode_refuses(
+        &dir,
+        Mode::Ask,
+        opencode_skill(scenario::OPENCODE_SKILL, ""),
+        "could not read",
+    )
+    .await;
+    std::fs::remove_file(dir.path().join("debug-fails")).unwrap();
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let limits = Limits {
+        command_check: Duration::from_millis(500),
+        ..Limits::default()
+    };
+    let started = tokio::time::Instant::now();
+    let (error, outcome, text) = opencode_turn_in(
+        &dir,
+        Mode::Ask,
+        limits,
+        opencode_skill(scenario::OPENCODE_SKILL, ""),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        error.as_deref().unwrap_or("").contains("could not read"),
+        "{error:?}"
+    );
+    assert_eq!((outcome, text.as_str()), (Outcome::Failed, ""));
+}
+#[tokio::test]
+async fn opencodes_commands_are_read_once_and_again_when_the_list_changes() {
+    let dir = opencode_workspace(
+        "octet-opencode-relist",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    let mut c = opencode();
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    for _ in 0..2 {
+        handle
+            .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+            .unwrap();
+        assert_eq!(
+            turn_text(&mut events).await,
+            format!("/{} go", scenario::OPENCODE_SKILL)
+        );
+    }
+    let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    assert_eq!(calls().matches("config").count(), 1, "{}", calls());
+    std::fs::write(
+        dir.path().join("fixture-commands.json"),
+        serde_json::json!({scenario::OPENCODE_LATE: {"description": "A late fixture command", "template": "x"}})
+            .to_string(),
+    )
+    .unwrap();
+    handle
+        .send(Command::Prompt(scenario::OPENCODE_RELIST.into()))
+        .unwrap();
+    turn_text(&mut events).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_LATE, ""))
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{}", scenario::OPENCODE_LATE)
+    );
+    assert_eq!(calls().matches("config").count(), 2, "{}", calls());
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn a_quiet_opencode_subagent_gets_a_notice_where_opencode_decides() {
+    // In auto and full access, a subagent whose own settings ask waits for
+    // a permission opencode never passes on: once the turn goes quiet,
+    // Octet says so, without claiming it is stuck.
+    for mode in [Mode::Auto, Mode::FullAccess] {
+        let mut c = opencode();
+        c.mode = mode;
+        let limits = Limits {
+            subagent_quiet: Duration::from_millis(300),
+            ..Limits::default()
+        };
+        let (handle, mut events, task) = spawn_with_limits(c, limits);
+        wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+        handle
+            .send(opencode_skill(scenario::OPENCODE_SUBTASK, ""))
+            .unwrap();
+        let notice = timeout(
+            Duration::from_secs(3),
+            wait_for(&mut events, |e| {
+                matches!(e, Event::Notice(_) | Event::Finished { .. })
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{mode:?}: no notice"));
+        match notice {
+            Event::Notice(notice) => assert_eq!(
+                notice,
+                "opencode's subagent has gone quiet: it may still be working, or waiting for a \
+                 permission Octet cannot show; Esc cancels",
+                "{mode:?}"
+            ),
+            other => panic!("{mode:?}: {other:?}"),
+        }
+        // Once is enough.
+        let again = timeout(Duration::from_millis(800), async {
+            loop {
+                if let Event::Notice(_) | Event::Finished { .. } = next(&mut events).await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(again.is_err(), "another notice, or the turn ended");
+        handle.interrupt();
+        wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+        stop(&handle, task).await;
+    }
+}
+/// A session in `mode` working in `dir`, ready.
+async fn opencode_session_in(
+    dir: &octet_testkit::TempDir,
+    mode: Mode,
+    limits: Limits,
+) -> (
+    octet_engine::live::Handle,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut c = opencode();
+    c.mode = mode;
+    c.cwd = dir.path().to_path_buf();
+    let (handle, mut events, task) = spawn_with_limits(c, limits);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    (handle, events, task)
+}
+/// What Octet says while a command waits for its check.
+fn checking(name: &str) -> String {
+    format!("Checking /{name} against opencode's definitions…")
+}
+#[tokio::test]
+async fn esc_while_an_opencode_command_waits_for_its_check_cancels_at_once() {
+    // The reading never ends; the session must not wait for it.
+    let dir = opencode_workspace(
+        "octet-opencode-check-esc",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let notice = checking(scenario::OPENCODE_SKILL);
+    timeout(
+        Duration::from_secs(5),
+        wait_for(
+            &mut events,
+            |e| matches!(e, Event::Notice(n) if *n == notice),
+        ),
+    )
+    .await
+    .expect("no notice that the command waits for its check");
+    let cancelled = tokio::time::Instant::now();
+    handle.interrupt();
+    let finished = timeout(
+        Duration::from_secs(25),
+        wait_for(&mut events, |e| matches!(e, Event::Finished { .. })),
+    )
+    .await
+    .expect("the turn never ended");
+    let took = cancelled.elapsed();
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Interrupted
+            }
+        ),
+        "{finished:?} after {took:?}"
+    );
+    assert!(took < Duration::from_millis(500), "Esc took {took:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn quitting_while_an_opencode_command_waits_for_its_check_stops_at_once() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-quit",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let notice = checking(scenario::OPENCODE_SKILL);
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Notice(n) if *n == notice),
+    )
+    .await;
+    let quit = tokio::time::Instant::now();
+    stop(&handle, task).await;
+    assert!(
+        quit.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        quit.elapsed()
+    );
+}
+#[tokio::test]
+async fn opencodes_frames_keep_coming_while_a_command_waits_for_its_check() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-frames",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    std::fs::write(dir.path().join("ticks"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let notice = checking(scenario::OPENCODE_SKILL);
+    timeout(
+        Duration::from_secs(5),
+        wait_for(
+            &mut events,
+            |e| matches!(e, Event::Notice(n) if *n == notice),
+        ),
+    )
+    .await
+    .expect("no notice that the command waits for its check");
+    // The fake lists its commands every 100 ms.
+    for _ in 0..3 {
+        timeout(
+            Duration::from_secs(1),
+            wait_for(&mut events, |e| matches!(e, Event::Skills(_))),
+        )
+        .await
+        .expect("opencode's frames stopped while the command waited");
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn opencodes_commands_are_read_when_it_lists_them_in_every_mode() {
+    for mode in [Mode::Auto, Mode::FullAccess] {
+        let dir = opencode_workspace(
+            "octet-opencode-read-at-connect",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+        );
+        let (handle, _events, task) = opencode_session_in(&dir, mode, Limits::default()).await;
+        let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !calls().contains("config") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{mode:?}: no reading: {:?}", calls()));
+        stop(&handle, task).await;
+    }
+}
+#[tokio::test]
+async fn a_reading_that_failed_in_the_background_is_tried_again_once() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-retry",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-fails"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    let configs = || calls().matches("config").count();
+    timeout(Duration::from_secs(5), async {
+        while configs() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no reading at connect");
+    // The background reading failed; one that works now is used.
+    std::fs::remove_file(dir.path().join("debug-fails")).unwrap();
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{} go", scenario::OPENCODE_SKILL)
+    );
+    assert_eq!(configs(), 2, "{}", calls());
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn compact_does_not_wait_for_a_reading_when_no_command_is_named_compact() {
+    let dir = opencode_workspace(
+        "octet-opencode-check-compact",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle.send(Command::Compact).unwrap();
+    assert_eq!(turn_text(&mut events).await, "/compact");
+    stop(&handle, task).await;
+}
+/// The fixture skill's definition, as `debug config` shows it, running
+/// `template`.
+fn fixture_skill_running(template: &str) -> serde_json::Value {
+    serde_json::json!({scenario::OPENCODE_SKILL: {
+        "description": "An opencode fixture skill", "template": template}})
+}
+/// Switches the session to `mode` and waits for the switch.
+async fn switch_to(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+    mode: Mode,
+) {
+    handle.send(Command::SetMode(mode)).unwrap();
+    wait_for(events, |e| matches!(e, Event::ModeChanged(m) if *m == mode)).await;
+}
+/// The error and outcome of the turn `command` starts, and its text.
+async fn turn_end(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+    command: Command,
+) -> (Option<String>, Outcome, String) {
+    handle.send(command).unwrap();
+    let (mut error, mut text) = (None, String::new());
+    let outcome = loop {
+        match next(events).await {
+            Event::Error(message) => error = Some(message),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { outcome } => break outcome,
+            _ => {}
+        }
+    };
+    (error, outcome, text)
+}
+#[tokio::test]
+async fn opencodes_commands_are_not_read_again_once_a_turn_may_have_changed_them() {
+    // opencode 1.18.25 loads its commands once per process and runs that
+    // copy whatever its files say later. When the first reading failed and
+    // a turn has since run in auto, the files may no longer be what
+    // opencode loaded: here the model "rewrote" a command that runs shell
+    // into a harmless one. Octet must not read the new text and send it.
+    let dir = opencode_workspace(
+        "octet-opencode-no-reread",
+        &fixture_skill_running("Run !`touch pwned`"),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-fails"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Auto, Limits::default()).await;
+    let calls = || std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    timeout(Duration::from_secs(5), async {
+        while !calls().contains("config") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no reading at connect");
+    let (error, _, _) = turn_end(&handle, &mut events, Command::Prompt("hello".into())).await;
+    assert_eq!(error, None);
+    std::fs::write(
+        dir.path().join("fixture-commands.json"),
+        fixture_skill_running("Say $ARGUMENTS").to_string(),
+    )
+    .unwrap();
+    std::fs::remove_file(dir.path().join("debug-fails")).unwrap();
+    switch_to(&handle, &mut events, Mode::Ask).await;
+    let (error, outcome, text) = turn_end(
+        &handle,
+        &mut events,
+        opencode_skill(scenario::OPENCODE_SKILL, "go"),
+    )
+    .await;
+    let error = error.expect("the command was sent");
+    assert!(
+        error.contains("could not read opencode's commands"),
+        "{error}"
+    );
+    assert!(error.contains("/reconnect"), "{error}");
+    assert_eq!((outcome, text.as_str()), (Outcome::Failed, ""));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn a_reading_made_while_a_turn_ran_unasked_is_not_trusted() {
+    // A turn in auto that edits a command while Octet reads them leaves a
+    // book that may differ from what opencode loaded.
+    let dir = opencode_workspace(
+        "octet-opencode-tainted",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-delay-ms"), "1500").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Auto, Limits::default()).await;
+    let (error, _, _) = turn_end(&handle, &mut events, Command::Prompt("hello".into())).await;
+    assert_eq!(error, None);
+    switch_to(&handle, &mut events, Mode::Ask).await;
+    let (error, outcome, text) = turn_end(
+        &handle,
+        &mut events,
+        opencode_skill(scenario::OPENCODE_SKILL, "go"),
+    )
+    .await;
+    let error = error.expect("the command was sent");
+    assert!(error.contains("while Octet read them"), "{error}");
+    assert_eq!((outcome, text.as_str()), (Outcome::Failed, ""));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn a_turn_that_asks_during_the_reading_leaves_it_trusted() {
+    // In ask, opencode asks before every edit, so the reading still holds.
+    let dir = opencode_workspace(
+        "octet-opencode-untainted",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("debug-delay-ms"), "1500").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    let (error, _, _) = turn_end(&handle, &mut events, Command::Prompt("hello".into())).await;
+    assert_eq!(error, None);
+    let (error, outcome, text) = turn_end(
+        &handle,
+        &mut events,
+        opencode_skill(scenario::OPENCODE_SKILL, "go"),
+    )
+    .await;
+    assert_eq!((error, outcome), (None, Outcome::Completed));
+    assert_eq!(text, format!("/{} go", scenario::OPENCODE_SKILL));
+    stop(&handle, task).await;
+}
+/// What Octet says of an opencode `version` its command check is not
+/// verified against.
+fn unverified(version: &str) -> String {
+    format!(
+        "opencode {version} is not verified for Octet's command check; commands are off in ask and \
+         accept-edits — plain prompts work; /mode auto runs them under opencode's own settings"
+    )
+}
+#[tokio::test]
+async fn an_unverified_opencode_runs_no_command_while_the_mode_asks() {
+    // The check emulates opencode 1.18.25's internals; another version may
+    // run a command otherwise.
+    for (reported, shown) in [("1.99.0", "1.99.0"), ("none", "(version not reported)")] {
+        let dir = opencode_workspace(
+            "octet-opencode-unverified",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+        );
+        std::fs::write(dir.path().join("fixture-version"), reported).unwrap();
+        let mut c = opencode();
+        c.mode = Mode::Ask;
+        c.cwd = dir.path().to_path_buf();
+        let (handle, mut events, task) = spawn(c);
+        let mut notices = Vec::new();
+        loop {
+            match next(&mut events).await {
+                Event::Notice(notice) => notices.push(notice),
+                Event::Ready { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(notices, [unverified(shown)], "at connect");
+        for command in [
+            opencode_skill(scenario::OPENCODE_SKILL, "go"),
+            Command::Prompt("/init".into()),
+        ] {
+            let (error, outcome, text) = turn_end(&handle, &mut events, command).await;
+            let error = error.expect("the command was sent");
+            assert!(error.ends_with(&unverified(shown)), "{error}");
+            assert_eq!((outcome, text.as_str()), (Outcome::Failed, ""));
+        }
+        // Plain prompts work, and so does opencode's own summary.
+        let (error, outcome, _) =
+            turn_end(&handle, &mut events, Command::Prompt("hello".into())).await;
+        assert_eq!((error, outcome), (None, Outcome::Completed));
+        let (error, outcome, _) = turn_end(&handle, &mut events, Command::Compact).await;
+        assert_eq!((error, outcome), (None, Outcome::Completed));
+        // In auto, opencode's own settings decide.
+        switch_to(&handle, &mut events, Mode::Auto).await;
+        let (error, outcome, text) = turn_end(
+            &handle,
+            &mut events,
+            opencode_skill(scenario::OPENCODE_SKILL, "go"),
+        )
+        .await;
+        assert_eq!((error, outcome), (None, Outcome::Completed));
+        assert_eq!(text, format!("/{} go", scenario::OPENCODE_SKILL));
+        stop(&handle, task).await;
+    }
+}
+#[tokio::test]
+async fn a_verified_opencode_says_nothing_of_its_version() {
+    let (handle, mut events, task) = spawn(opencode());
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => panic!("{notice}"),
+            Event::Ready { .. } => break,
+            _ => {}
+        }
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn lists_that_change_in_a_burst_are_read_once() {
+    // Each `opencode debug` run starts opencode, plugins included; lists
+    // that change within moments of each other need one reading.
+    let dir = opencode_workspace(
+        "octet-opencode-burst",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("relist-burst"), "").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let calls = std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    assert_eq!(calls.matches("config").count(), 1, "{calls}");
+    // The reading is of the last list.
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("/{} go", scenario::OPENCODE_SKILL)
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn an_opencode_debug_runs_processes_go_with_it() {
+    // `opencode debug` starts opencode, plugins included: a process one
+    // starts must not outlive the run, whether it ends or is stopped (here
+    // past the check's limit).
+    for hangs in [false, true] {
+        let dir = opencode_workspace(
+            "octet-opencode-debug-children",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+        );
+        std::fs::write(dir.path().join("debug-grandchild"), "").unwrap();
+        if hangs {
+            std::fs::write(dir.path().join("debug-hangs"), "").unwrap();
+        }
+        let limits = Limits {
+            command_check: Duration::from_millis(500),
+            ..Limits::default()
+        };
+        let (error, outcome, _) = opencode_turn_in(
+            &dir,
+            Mode::Ask,
+            limits,
+            opencode_skill(scenario::OPENCODE_SKILL, ""),
+        )
+        .await;
+        let expected = if hangs {
+            Outcome::Failed
+        } else {
+            Outcome::Completed
+        };
+        assert_eq!(outcome, expected, "hangs: {hangs}: {error:?}");
+        let pids: Vec<libc::pid_t> =
+            std::fs::read_to_string(dir.path().join("debug-grandchildren"))
+                .unwrap()
+                .lines()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+        assert!(!pids.is_empty());
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = |pid: &libc::pid_t| unsafe { libc::kill(*pid, 0) == 0 };
+        let gone = octet_testkit::wait_until(octet_testkit::QUICK, || !pids.iter().any(alive));
+        for pid in &pids {
+            // SAFETY: signals only the sleeps this test's fake started.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        assert!(gone, "hangs: {hangs}: a debug run's process outlived it");
+    }
+}
+#[tokio::test]
+async fn lists_that_never_settle_do_not_hold_a_command_forever() {
+    // A changed list restarts the reading's settle; lists that change for
+    // good must not keep a command waiting for good. Past the bound, the
+    // reading under way runs to its end, and is untrusted when the list
+    // changed meanwhile.
+    let dir = opencode_workspace(
+        "octet-opencode-storm",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    std::fs::write(dir.path().join("relist-storm"), "").unwrap();
+    std::fs::write(dir.path().join("debug-delay-ms"), "300").unwrap();
+    let (handle, mut events, task) = opencode_session_in(&dir, Mode::Ask, Limits::default()).await;
+    handle
+        .send(opencode_skill(scenario::OPENCODE_SKILL, "go"))
+        .unwrap();
+    let ended = timeout(Duration::from_secs(8), async {
+        let mut error = None;
+        loop {
+            match events.recv().await {
+                Some(Event::Error(message)) => error = Some(message),
+                Some(Event::Finished { outcome }) => break (error, outcome),
+                Some(_) => {}
+                None => panic!("the session ended"),
+            }
+        }
+    })
+    .await;
+    let (error, outcome) = ended.expect("the command was still held");
+    assert_eq!(outcome, Outcome::Failed);
+    assert!(
+        error
+            .as_deref()
+            .unwrap_or("")
+            .contains("command list changed while Octet read"),
+        "{error:?}"
+    );
+    stop(&handle, task).await;
+}
+#[test]
+fn the_fake_opencode_counts_every_debug_run_though_they_run_at_once() {
+    // Octet runs `debug config` and `debug skill` side by side; the fake's
+    // count of them must not lose one to the other.
+    let dir = opencode_workspace(
+        "octet-fake-debug-calls",
+        &serde_json::json!({}),
+        &serde_json::json!([]),
+    );
+    let runs: Vec<_> = (0..16)
+        .map(|n| {
+            std::process::Command::new(octet_testkit::protocol_child())
+                .args(["debug", if n % 2 == 0 { "config" } else { "skill" }])
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut run in runs {
+        assert!(run.wait().unwrap().success());
+    }
+    let calls = std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
+    assert_eq!(calls.lines().count(), 16, "{calls}");
 }

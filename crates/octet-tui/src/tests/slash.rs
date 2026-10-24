@@ -336,6 +336,17 @@ async fn full_access_requires_idle_ready_session() {
     ));
 }
 #[tokio::test]
+async fn a_live_mode_switch_is_remembered_as_the_users_choice() {
+    let mut app = app();
+    crate::test_support::idle(&mut app);
+    command(&mut app, "/mode auto").await;
+    assert_eq!(app.mode_chosen, octet_core::Mode::Auto);
+    // A vendor that refuses it reports another mode; the choice stays.
+    app.event(octet_core::Event::ModeChanged(octet_core::Mode::Ask));
+    assert_eq!(app.conn.mode, octet_core::Mode::Ask);
+    assert_eq!(app.mode_chosen, octet_core::Mode::Auto);
+}
+#[tokio::test]
 async fn cycle_is_ignored_while_a_switch_is_pending() {
     let mut app = app();
     app.conn.mode_pending = Some(octet_core::Mode::AcceptEdits);
@@ -510,6 +521,38 @@ async fn oversized_or_unknown_images_are_refused() {
     key_action(&mut app, &vendor, key(KeyCode::Esc)).await;
     assert!(app.composer.images.is_empty());
 }
+#[test]
+fn sessions_show_the_first_prompt_and_the_latest_when_it_differs() {
+    let mut app = app();
+    let summary = |first: &str, last: &str| octet_core::JournalSummary {
+        started: std::time::SystemTime::now(),
+        engine: "codex".into(),
+        cwd: "/work".into(),
+        model: None,
+        session: format!("t-{first}"),
+        first_prompt: Some(first.into()),
+        last_prompt: Some(last.into()),
+    };
+    let listed = [
+        summary("Reply OK1.", "Reply OK39."),
+        summary("Only one.", "Only one."),
+    ]
+    .into_iter()
+    .map(|summary| octet_core::RecentSession {
+        engine: Engine::CODEX,
+        journal: "/j/session-1-1.jsonl".into(),
+        summary,
+    })
+    .collect();
+    crate::commands::show_sessions(&mut app, listed);
+    let text = app.entries_text();
+    assert!(
+        text.contains("   Reply OK1.\n   latest: Reply OK39."),
+        "{text}"
+    );
+    assert!(text.contains("   Only one."), "{text}");
+    assert!(!text.contains("latest: Only one."), "{text}");
+}
 #[tokio::test]
 async fn resume_picks_the_listed_session() {
     let temp = octet_testkit::TempDir::new("octet-tui-sessions");
@@ -632,6 +675,30 @@ async fn effort_refuses_a_level_claude_does_not_take() {
     );
 }
 #[tokio::test]
+async fn opencode_takes_effort_live() {
+    let mut opencode = crate::test_support::app_for(octet_core::Engine::OPENCODE);
+    crate::test_support::idle(&mut opencode);
+    // opencode sets the level in the open session: no reconnect.
+    assert_eq!(
+        sends(&mut opencode, "/effort high").await,
+        [Command::SetEffort(Some("high".into()))]
+    );
+    assert_eq!(opencode.conn.effort.as_deref(), Some("high"));
+    command(&mut opencode, "/effort").await;
+    assert!(
+        opencode
+            .entries_text()
+            .contains("Reasoning effort: high. Use /effort <level> (the levels your model offers)")
+    );
+    // A level opencode refuses puts back the one in force.
+    opencode.event(octet_core::Event::Effort(None));
+    assert_eq!(opencode.conn.effort, None);
+    assert_eq!(
+        sends(&mut opencode, "/effort default").await,
+        [Command::SetEffort(None)]
+    );
+}
+#[tokio::test]
 async fn every_command_needing_no_open_turn_refuses_the_same_way() {
     let guarded: Vec<&Spec> = COMMANDS
         .iter()
@@ -688,6 +755,24 @@ fn exported() -> crate::jobs::Done {
         path: "out.jsonl".into(),
         result: Ok(()),
     }
+}
+#[tokio::test]
+async fn a_command_refused_while_a_turn_runs_keeps_the_draft() {
+    let mut app = app();
+    crate::test_support::idle(&mut app);
+    app.conn.start_turn();
+    let vendor = RecordingVendor::default();
+    // Refused by the command table, by /model's own check, and by /mode's.
+    for line in ["/new", "/model claude-sonnet-4-6", "/mode full-access"] {
+        app.composer.editor.set(line.into());
+        key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+        assert_eq!(app.composer.editor.text(), line);
+        assert_eq!(app.status_line, crate::registry::TURN_OPEN, "{line}");
+    }
+    // A command that ran still takes its line.
+    app.composer.editor.set("/session".into());
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert_eq!(app.composer.editor.text(), "");
 }
 #[tokio::test]
 async fn a_second_job_keeps_the_draft() {

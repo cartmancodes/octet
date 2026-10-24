@@ -110,9 +110,56 @@ pub(crate) fn ago(now: std::time::SystemTime, then: std::time::SystemTime) -> St
     }
 }
 
+/// Hides the goal completion marker (`[[OCTET_GOAL_COMPLETE]]`) from
+/// streamed reply text: it is Octet's own signal, not part of the reply.
+/// A tail that may be the marker's start is held until the next text
+/// settles it, or `flush` at a tool call, an approval or the turn's end.
+#[derive(Default)]
+pub(crate) struct MarkerFilter {
+    held: String,
+}
+impl MarkerFilter {
+    /// `text` as shown: without the marker, less any held tail.
+    pub(crate) fn push(&mut self, text: &str) -> String {
+        const MARKER: &str = octet_core::goal::COMPLETION_MARKER;
+        let mut all = std::mem::take(&mut self.held);
+        all.push_str(text);
+        let mut shown = all.replace(MARKER, "");
+        // The longest tail that begins the marker waits for more text.
+        if let Some(start) = (1..MARKER.len())
+            .rev()
+            .filter(|&len| len <= shown.len())
+            .map(|len| shown.len() - len)
+            .find(|&start| shown.is_char_boundary(start) && MARKER.starts_with(&shown[start..]))
+        {
+            self.held = shown.split_off(start);
+        }
+        shown
+    }
+    /// The held tail, at the end of a turn: it was not the marker.
+    pub(crate) fn flush(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_goal_marker_is_hidden_even_across_deltas() {
+        let mut hide = MarkerFilter::default();
+        assert_eq!(hide.push("DONE [[OCTET_GOAL_COMPLETE]]"), "DONE ");
+        assert_eq!(hide.push("Done.\n[[OCTET_"), "Done.\n");
+        assert_eq!(hide.push("GOAL_COMPLETE]]"), "");
+        // A start of the marker that turns out not to be one is shown.
+        assert_eq!(hide.push("a [[O"), "a ");
+        assert_eq!(hide.push("k]]"), "[[Ok]]");
+        // What is held at the end of a turn is shown then.
+        assert_eq!(hide.push("x [["), "x ");
+        assert_eq!(hide.flush(), "[[");
+        assert_eq!(hide.flush(), "");
+        assert_eq!(hide.push("plain"), "plain");
+    }
     #[test]
     fn ago_says_the_largest_whole_unit() {
         let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);

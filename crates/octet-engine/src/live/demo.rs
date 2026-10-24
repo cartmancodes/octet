@@ -19,13 +19,18 @@ pub(super) const PROVIDER: Provider = Provider {
         "Offline demo: /approval-demo is allowed without a dialog",
     ],
     steer: false,
+    mode_applies_next_turn: false,
     inline_images: false,
     effort_live: false,
+    takes_effort: true,
+    ids_carry_name: false,
     efforts: &[],
     // No process to stop.
     shutdown_grace: Duration::ZERO,
     lists_models: false,
+    commands_expand_shell: false,
     launch_args: |_| Vec::new(),
+    launch_env: super::no_env,
     start,
 };
 
@@ -187,7 +192,7 @@ impl DemoTurn<'_> {
                 format!("\n\nA model would receive:\n\n{text}")
             };
             format!(
-                "This is an offline demo. Your prompt was:\n\n{display}{sent}\n\nThe editor, streaming transcript, approval dialog, history, and cancellation are live. Start with --engine codex or --engine claude to work with a model.\n\nTry /approval-demo to preview a permission request."
+                "This is an offline demo. Your prompt was:\n\n{display}{sent}\n\nThe editor, streaming transcript, approval dialog, history, and cancellation are live. Start with --engine codex, --engine claude or --engine opencode to work with a model.\n\nTry /approval-demo to preview a permission request."
             )
         } else if !matches!(*self.mode, Mode::Ask | Mode::AcceptEdits) {
             emit(

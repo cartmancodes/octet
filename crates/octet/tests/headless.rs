@@ -59,6 +59,36 @@ fn print_writes_the_reply_and_exits_zero() {
 }
 
 #[test]
+fn print_runs_on_a_claude_session_a_start_hook_named() {
+    // A plugin's SessionStart hook names the session before Claude is ready.
+    let start_hook = octet_testkit::scenario::START_HOOK;
+    let args = [
+        "--engine", "claude", "--model", start_hook, "--print", "hello",
+    ];
+    let (code, stdout, stderr) = run(&args, "");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        format!("{}\n", octet_testkit::scenario::CLAUDE_REPLY)
+    );
+}
+
+#[test]
+fn print_separates_the_messages_of_a_reply() {
+    let (code, stdout, stderr) = run(&["--print", octet_testkit::scenario::MESSAGES], "");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "First.\n\nSecond.\n\nThird.\n");
+}
+
+#[test]
+fn print_starts_no_paragraph_before_the_first_text() {
+    let (code, stdout, stderr) = run(&["--print", octet_testkit::scenario::FILE_APPROVAL], "");
+    assert_eq!(code, 0, "{stderr}");
+    // A tool call before any text leaves no blank line.
+    assert_eq!(stdout, "decline\n", "{stdout}");
+}
+
+#[test]
 fn print_reads_the_prompt_from_stdin() {
     let (code, stdout, stderr) = run(&["-p", "-"], "params\n");
     assert_eq!(code, 0, "{stderr}");
@@ -105,6 +135,23 @@ fn print_failed_turn_exits_one() {
     let (code, _, stderr) = run(&["--print", "fail"], "");
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("You've hit your usage limit."), "{stderr}");
+}
+
+#[test]
+fn print_exits_one_when_opencode_refuses_the_model() {
+    let model = octet_testkit::scenario::OPENCODE_UNKNOWN_MODEL;
+    let (code, stdout, stderr) = run(
+        &["--engine", "opencode", "--model", model, "--print", "hello"],
+        "",
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stdout, "", "the prompt ran");
+    assert!(
+        stderr.contains(&format!(
+            "opencode refused the model {model}: Invalid params: model not found"
+        )),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -328,6 +375,26 @@ fn last_journal_record(directory: &std::path::Path) -> String {
     text.lines().last().unwrap_or_default().to_owned()
 }
 
+/// Waits, up to [`LIMIT`], for a journal in `directory` to hold `text`.
+fn wait_for_journal(directory: &std::path::Path, text: &str) {
+    let deadline = std::time::Instant::now() + LIMIT;
+    loop {
+        let found = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
+            .any(|path| std::fs::read_to_string(path).is_ok_and(|journal| journal.contains(text)));
+        if found {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no journal says {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn print_shuts_down_when_stdout_closes() {
     let (mut child, temp) = octet(&["--print", "hello", "--output", "json"]);
@@ -423,7 +490,7 @@ fn rpc_quits_while_stdin_stays_open() {
 
 #[test]
 fn print_says_when_the_session_ends_unfinished() {
-    let (mut child, _temp) = octet(&[
+    let (mut child, temp) = octet(&[
         "--engine",
         "claude",
         "--print",
@@ -432,9 +499,11 @@ fn print_says_when_the_session_ends_unfinished() {
         "json",
     ]);
     drop(child.stdin.take());
-    // Nobody reads the replies for a while: the session gives up on us.
+    // Nobody reads the replies until the session gives up on us. Its 2 s limit
+    // runs from when the flood fills the pipes, not from launch, so a fixed wait
+    // can end before it does on a slow machine: wait for the journal to say so.
     let stdout = child.stdout.take().unwrap();
-    std::thread::sleep(Duration::from_secs(4));
+    wait_for_journal(temp.path(), "did not keep up");
     let drain = std::thread::spawn(move || std::io::read_to_string(stdout).unwrap_or_default());
     let output = octet_testkit::wait_child(child, LIMIT);
     let _ = drain.join();

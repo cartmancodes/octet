@@ -25,7 +25,7 @@ const LOADING_FOLDERS = "Loading the Mac's folders…";
 const KEPT_TEXT = "Your text is in the prompt.";
 const ARMED_HINT = `Type ${FULL_ACCESS_WORDS} below to start.`;
 
-const ENGINES: readonly Engine[] = ["claude", "codex"];
+const ENGINES: readonly Engine[] = ["claude", "codex", "opencode"];
 /** What a tap on the mode chip cycles through, null (the Mac's default) first: full access is
  * never one of these. */
 const MODES: readonly (Mode | null)[] = [null, "ask", "accept-edits", "auto"];

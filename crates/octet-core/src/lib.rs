@@ -4,8 +4,8 @@
 pub use octet_engine::live::{
     APPROVAL_DEMO, APPROVAL_SCOPE, ApprovalSummary, Command, Config, DEFAULT_APPROVAL_TIMEOUT,
     Engine, Event, Handle, HookOutcome, IMAGE_LIMIT, IMAGES_PER_PROMPT, ImageAttachment,
-    ImageError, Listing, Mode, Outcome, PROBE_LIMIT, PROMPT_LIMIT, Plugins, SendError, ToolCall,
-    ToolPhase, WIRE_LIMIT, check_inline, encoded_len, home_dir, probe, valid_effort,
+    ImageError, Listing, Mode, NOT_SENT, Outcome, PROBE_LIMIT, PROMPT_LIMIT, Plugins, SendError,
+    ToolCall, ToolPhase, WIRE_LIMIT, check_inline, encoded_len, home_dir, probe, valid_effort,
 };
 use octet_store::Journal;
 use serde_json::{Value, json};
@@ -188,6 +188,7 @@ fn record(event: &Event) -> (&'static str, Value) {
         }
         Event::ModelSelected(id) => ("model_selected", json!(id)),
         Event::ModeChanged(mode) => ("mode", json!(mode.label())),
+        Event::Effort(level) => ("effort", json!(level)),
         Event::Ready { session } => ("ready", json!(session)),
         Event::User(text) => ("user", json!(text)),
         Event::Started => ("started", Value::Null),

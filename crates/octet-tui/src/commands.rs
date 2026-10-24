@@ -26,6 +26,13 @@ pub(crate) async fn goal_send_failed(app: &mut App, error: octet_core::SendError
         app.goal_save_failed(error, false);
     }
 }
+/// What `run`, a command that may refuse to reconnect, returned; `None`,
+/// which keeps the draft, when it refused (`App::refuse`).
+fn unless_refused(app: &mut App, run: impl FnOnce(&mut App) -> Action) -> Option<Action> {
+    app.refused = false;
+    let action = run(app);
+    (!std::mem::take(&mut app.refused)).then_some(action)
+}
 /// Runs a slash command. `None` means the caller keeps the draft: the name is
 /// not a command (it may be a prompt that merely starts with a slash), or the
 /// command failed on input worth correcting (a `/image` path).
@@ -42,14 +49,15 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
         _ => None,
     };
     if let Some(refusal) = refusal {
+        // Nothing ran: the line stays in the prompt box to send again.
         app.hint(refusal);
-        return Some(Action::Continue);
+        return None;
     }
     match cmd {
         Cmd::Quit => return Some(Action::Exit(Exit::Quit)),
         Cmd::Help => app.overlay.help = true,
         Cmd::Queue => queue_command(app, argument),
-        Cmd::Effort => return Some(effort_command(app, vendor, argument)),
+        Cmd::Effort => return unless_refused(app, |app| effort_command(app, vendor, argument)),
         Cmd::Fork => return Some(fork_command(app)),
         Cmd::Compact => compact_command(app, vendor),
         // A failed /image leaves the line in the prompt box to correct.
@@ -62,14 +70,14 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
             steer(app, vendor, argument.to_owned());
         }
         Cmd::Copy => copy_reply(app),
-        Cmd::Model => return Some(model_command(app, argument)),
+        Cmd::Model => return unless_refused(app, |app| model_command(app, argument)),
         Cmd::Skills => {
             // The picker, filtered by the argument; the draft stays for it.
             app.composer.editor.set(format!("/skills {argument}"));
             crate::input::refresh_skill_picker(app);
             return None;
         }
-        Cmd::Mode => return Some(mode_command(app, vendor, argument)),
+        Cmd::Mode => return unless_refused(app, |app| mode_command(app, vendor, argument)),
         Cmd::New => return Some(Action::Exit(Exit::New)),
         Cmd::Reconnect => return Some(Action::Exit(Exit::Reconnect)),
         Cmd::Session => app.note(session_text(app)),
@@ -172,8 +180,16 @@ fn skill_command(app: &mut App, vendor: &dyn Vendor, name: &str, argument: &str)
     }
 }
 /// `/effort`: show the reasoning effort, or change it. Codex takes it per
-/// turn; Claude takes it at launch, so a change reconnects there.
+/// turn and opencode in the open session; Claude takes it at launch, so a
+/// change reconnects there; a provider with no effort setting says so and
+/// changes nothing.
 fn effort_command(app: &mut App, vendor: &dyn Vendor, argument: &str) -> Action {
+    if !app.conn.engine.provider().takes_effort {
+        if let Err(error) = app.conn.engine.check_effort(argument) {
+            app.note(error);
+        }
+        return Action::Continue;
+    }
     if argument.is_empty() {
         let current = app.conn.effort.as_deref().unwrap_or("vendor default");
         let levels = match app.conn.engine.provider().efforts {
@@ -208,7 +224,7 @@ fn effort_command(app: &mut App, vendor: &dyn Vendor, argument: &str) -> Action 
         }
         Action::Continue
     } else if let Err(refusal) = can_reconnect(app) {
-        app.hint(refusal);
+        app.refuse(refusal);
         Action::Continue
     } else {
         Action::Exit(Exit::Effort(level))
@@ -286,10 +302,15 @@ pub(crate) fn steer_with(
     true
 }
 
-/// Switches the permission mode live; the vendor confirms it later.
+/// Switches the permission mode live; the vendor confirms it later. Whether
+/// a turn runs now is recorded with it (see `mode_sent_mid_turn`).
 pub(crate) fn switch_mode(app: &mut App, vendor: &dyn Vendor, target: Mode) {
     match vendor.send(Command::SetMode(target)) {
-        Ok(()) => app.conn.mode_pending = Some(target),
+        Ok(()) => {
+            app.mode_chosen = target;
+            app.conn.mode_pending = Some(target);
+            app.conn.mode_sent_mid_turn = Some(app.conn.is_running());
+        }
         Err(error) => app.error(error.to_string()),
     }
 }
@@ -466,10 +487,19 @@ pub(crate) fn show_sessions(app: &mut App, listed: Vec<octet_core::RecentSession
             } else {
                 ""
             };
-            let prompt = summary
+            let mut prompt = summary
                 .first_prompt
                 .as_deref()
                 .map_or_else(|| "(no prompt)".to_owned(), |p| cut(p, 60));
+            // The first prompt names the session; the latest says where it got to.
+            if let Some(last) = summary
+                .last_prompt
+                .as_deref()
+                .filter(|last| summary.first_prompt.as_deref() != Some(*last))
+            {
+                prompt.push_str("\n   latest: ");
+                prompt.push_str(&cut(last, 60));
+            }
             format!(
                 "{}. {} · {}{this} · {} · {}\n   {prompt}",
                 index + 1,
@@ -604,7 +634,7 @@ pub(crate) fn model_command(app: &mut App, argument: &str) -> Action {
             app.note("No other provider's model list to fetch");
         }
     } else if let Err(refusal) = can_reconnect(app) {
-        app.hint(refusal);
+        app.refuse(refusal);
     } else {
         match octet_core::model::Selection::resolve(argument, app.conn.engine, &app.models.catalogs)
         {
@@ -658,9 +688,9 @@ pub(crate) fn mode_command(app: &mut App, vendor: &dyn Vendor, argument: &str) -
                 let can_switch =
                     app.conn.is_ready() || (app.conn.is_stopped() && target != Mode::FullAccess);
                 if let Err(refusal @ TURN_OPEN) = can_reconnect(app) {
-                    app.hint(refusal);
+                    app.refuse(refusal);
                 } else if !can_switch {
-                    app.hint(NOT_CONNECTED);
+                    app.refuse(NOT_CONNECTED);
                 } else {
                     return Action::Exit(Exit::Mode(target));
                 }

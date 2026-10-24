@@ -2,6 +2,7 @@
 //! `!` commands and the screen.
 mod app;
 mod bridge;
+mod clash;
 mod clipboard;
 mod commands;
 mod composer;
@@ -118,6 +119,8 @@ pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io
     let mut bridge = Bridge::start(&directory, options.remote, options.tmux).await;
     // Shown in a fresh interface, after a switch that drops the transcript.
     let mut opening_notice: Option<String> = bridge.take_note();
+    // Shown in the next interface, kept or fresh: full access carried on.
+    let mut warning: Option<String> = None;
     loop {
         stopping.retain(|stop| !stop.is_finished());
         if signals.stop_pending().await {
@@ -138,9 +141,8 @@ pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io
         let mut app = retained_app
             .take()
             .unwrap_or_else(|| App::new(&config, session.journal().to_path_buf()));
-        for notice in opening_notice.take().into_iter().chain(started.take()) {
-            app.note(notice);
-        }
+        let notices = opening_notice.take().into_iter().chain(started.take());
+        greet(&mut app, notices, warning.take());
         carried.give(&mut app);
         attach_models(&mut app, &directory, &config, &binaries);
         if !app.goals.is_attached() {
@@ -166,12 +168,7 @@ pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io
                 return Err(error);
             }
         };
-        let ended = reconnect::Ended {
-            session: &app.conn.session,
-            journal: &app.conn.journal,
-            mode: app.conn.mode,
-            effort: app.conn.effort.clone(),
-        };
+        let ended = ended_session(&mut app, &exit);
         let Some(plan) = reconnect::plan(exit, &config, &ended, &mut binaries) else {
             session.shutdown().await;
             jobs::on_quit(app.job.take()).await;
@@ -196,6 +193,7 @@ pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io
             app.note("The earlier conversation goes with your next prompt.");
         }
         opening_notice = plan.opening;
+        warning = plan.warning;
         config = plan.config;
         // A job and the model lists move with the interface: a fresh one
         // takes them over.
@@ -209,6 +207,29 @@ pub async fn run(mut config: Config, directory: PathBuf, options: Options) -> io
     drop(terminal);
     drop(guard);
     Ok(())
+}
+/// Shows a connection's opening `notices`, then its `warning`.
+fn greet(app: &mut App, notices: impl Iterator<Item = String>, warning: Option<String>) {
+    for notice in notices {
+        app.note(notice);
+    }
+    if let Some(warning) = warning {
+        app.warn(warning);
+    }
+}
+/// What `app` knew about the session that `exit` ended. A mode that
+/// reconnects (into or out of full access) is the user's choice too.
+fn ended_session<'a>(app: &'a mut App, exit: &Exit) -> reconnect::Ended<'a> {
+    if let Exit::Mode(mode) = exit {
+        app.mode_chosen = *mode;
+    }
+    reconnect::Ended {
+        session: &app.conn.session,
+        journal: &app.conn.journal,
+        mode: app.conn.mode,
+        chosen: app.mode_chosen,
+        effort: app.conn.effort.clone(),
+    }
 }
 /// The desk note for an interface a phone started in full access, if this is one.
 fn started_note(options: &Options, config: &Config) -> Option<String> {
@@ -255,17 +276,23 @@ async fn stopped(stopping: Vec<tokio::task::JoinHandle<()>>) {
 struct Carried {
     job: Option<jobs::Running>,
     models: Option<models::Models>,
+    /// The mode the user last chose (`App::mode_chosen`).
+    mode_chosen: Option<octet_core::Mode>,
 }
 impl Carried {
     /// Takes what moves on from `app`, which is about to be replaced.
     fn take(&mut self, app: &mut App) {
         self.job = app.job.take();
         self.models = Some(std::mem::take(&mut app.models));
+        self.mode_chosen = Some(app.mode_chosen);
     }
     /// Hands it all to the new `app`.
     fn give(&mut self, app: &mut App) {
         if let Some(job) = self.job.take() {
             app.job = Some(job);
+        }
+        if let Some(mode) = self.mode_chosen.take() {
+            app.mode_chosen = mode;
         }
         if let Some(models) = self.models.take() {
             app.models = models;
@@ -359,6 +386,11 @@ async fn session_event(app: &mut App, vendor: &dyn Vendor, event: octet_core::Ev
         _ => None,
     };
     let failed = matches!(event, octet_core::Event::Error(_));
+    if let octet_core::Event::Error(error) = &event
+        && error.starts_with(octet_core::NOT_SENT)
+    {
+        app.turn_not_sent = true;
+    }
     let ready = matches!(event, octet_core::Event::Ready { .. });
     let stopped = matches!(event, octet_core::Event::Stopped);
     if should_alert(app, &event) {
@@ -390,11 +422,12 @@ async fn session_event(app: &mut App, vendor: &dyn Vendor, event: octet_core::Ev
     let Some(outcome) = outcome else {
         return;
     };
+    let not_sent = std::mem::take(&mut app.turn_not_sent);
     match app.goals.turn_finished(&outcome).await {
-        Ok(Next::Idle) => send_queued(app, vendor),
+        Ok(Next::Idle) => after_turn(app, vendor, not_sent),
         Ok(Next::Stopped(summary)) => {
             app.note(summary);
-            send_queued(app, vendor);
+            after_turn(app, vendor, not_sent);
         }
         Ok(Next::Continue { prompt, display }) => {
             let command = Command::PromptWithDisplay {
@@ -404,13 +437,30 @@ async fn session_event(app: &mut App, vendor: &dyn Vendor, event: octet_core::Ev
             };
             if let Err(error) = app.begin_turn(vendor, command, By::Goal, "continuing goal") {
                 goal_send_failed(app, error).await;
-                send_queued(app, vendor);
+                after_turn(app, vendor, not_sent);
             }
         }
         Err(error) => {
             app.goal_save_failed(error, true);
-            send_queued(app, vendor);
+            after_turn(app, vendor, not_sent);
         }
+    }
+}
+/// After a turn ends: the next queued prompt goes out, unless the turn was
+/// never sent (the vendor's mode is unknown), when the queue is kept, since
+/// each prompt would only be refused too.
+fn after_turn(app: &mut App, vendor: &dyn Vendor, not_sent: bool) {
+    if !not_sent {
+        send_queued(app, vendor);
+        return;
+    }
+    let kept = app.composer.queue.len();
+    if kept > 0 {
+        app.note(format!(
+            "Kept {kept} queued prompt{}; send them again once {} confirms its mode",
+            if kept == 1 { "" } else { "s" },
+            app.conn.engine.title()
+        ));
     }
 }
 /// Sends the next prompt queued behind the turn that just ended.

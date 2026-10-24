@@ -3,7 +3,8 @@
 //! approvals and commands, and calls the protocol for the rest.
 use super::{
     BUSY, Channels, Command, Config, DriverError, Engine, Event, FULL_ACCESS_RECONNECTS, HEADROOM,
-    ImageAttachment, Limits, Mode, NO_TURN, Outcome, TurnGate, deadline_after,
+    ImageAttachment, Limits, Mode, NO_TURN, NOT_SENT, Outcome, TurnGate, deadline_after,
+    launch_env,
     protocol::{Core, Phase, Protocol},
     vendor_process,
 };
@@ -21,6 +22,28 @@ struct Driver<P> {
     protocol: P,
     /// Turn commands the user cancelled before they started.
     gate: TurnGate,
+    /// A turn command that arrived, while idle, with a mode switch waiting
+    /// for the vendor (see `must_hold`): it starts once the switch is
+    /// confirmed or refused, so a switch sent while idle lands before the
+    /// next prompt, and fails unsent if the switch is reported unconfirmed.
+    /// Or one that waits for the protocol (see `Protocol::must_wait`): it
+    /// is sent once that is done. While one is held no other command is
+    /// read, so the command queue's own bound (and its `Busy` refusal)
+    /// still applies; frames, timers, cancel and stop stay live.
+    held: Option<Held>,
+    /// The mode of the last switch sent to the vendor.
+    switch_target: Option<Mode>,
+}
+
+/// A turn command held until a pending mode switch resolves, or until
+/// what the protocol waits for is done.
+struct Held {
+    /// The command, not yet sent.
+    command: Command,
+    /// Its number among turn commands, which a cancel may cover.
+    turn: u64,
+    /// It waits for the protocol (`Protocol::must_wait`), not for a switch.
+    waits: bool,
 }
 
 /// Runs one session with protocol `P` until it stops.
@@ -40,6 +63,7 @@ pub(super) async fn run<P: Protocol>(
         engine,
         config.binary.clone(),
         P::launch_args(&config),
+        launch_env(&config),
         config.cwd.clone(),
     ))
     .map_err(|e| format!("Cannot start {engine}: {e}. Install the CLI and sign in first."))?;
@@ -47,8 +71,11 @@ pub(super) async fn run<P: Protocol>(
         core: Core::new::<P>(config, limits, process, events),
         protocol: P::default(),
         gate: TurnGate::default(),
+        held: None,
+        switch_target: None,
     };
     let result = driver.run(&mut commands, &mut cancel, &mut stopping).await;
+    driver.protocol.stopping(&driver.core);
     let report = driver.core.process.shutdown().await;
     let verified = report.reaped && report.descendants_stopped;
     finish(result, verified, engine, &report.stderr_tail)
@@ -84,6 +111,7 @@ impl<P: Protocol> Driver<P> {
         self.protocol.initialize(&mut self.core).await?;
         self.core.deadline = deadline_after(self.core.limits.connect);
         loop {
+            self.release_held(cancel).await?;
             let wake = self.next_wake();
             // Backpressure: while the interface is behind, leave the vendor's
             // output in the transport's queue (and then the pipe) instead of
@@ -100,19 +128,28 @@ impl<P: Protocol> Driver<P> {
                     if changed.is_err() {
                         break;
                     }
+                    self.cancel_held(cancel)?;
                     self.on_cancel().await?;
                 }
                 () = tokio::time::sleep_until(wake), if self.timers_armed() => self.on_timer().await?,
-                command = commands.recv() => match command {
+                command = commands.recv(), if self.held.is_none() => match command {
                     None => break,
                     Some(command) => {
                         if self.gate.cancelled(&command, cancel) {
                             self.cancelled_before_start(&command)?;
+                        } else if let Some(target) = self.mode_unknown_for(&command) {
+                            self.refuse_while_mode_unknown(&command, target)?;
+                        } else if self.must_hold(&command) {
+                            self.hold(command)?;
                         } else {
-                            self.on_command(command).await?;
+                            let turn = self.gate.last();
+                            self.dispatch(command, turn, false).await?;
                         }
                     }
                 },
+                // The held command's check (or whatever it waits for) is
+                // done: the loop's top sends or refuses it.
+                () = self.protocol.wait_over(), if self.held.as_ref().is_some_and(|held| held.waits) => {}
                 // Waits for room; the permits are released at once.
                 room = async { tx.reserve_many(HEADROOM + 1).await.map(drop) }, if !roomy => {
                     // The interface has gone: the session is over.
@@ -129,6 +166,144 @@ impl<P: Protocol> Driver<P> {
             }
         }
         Ok(())
+    }
+
+    /// Whether `command` waits for the pending mode switch: a turn the
+    /// session could start now, sent while the vendor has not answered a
+    /// switch, on a provider whose switch reaches only the next turn
+    /// (opencode applies it at the next prompt). Claude reads its input in
+    /// order, so its switch is applied before a prompt sent after it. A busy
+    /// session refuses the turn at once, as it would anyway.
+    fn must_hold(&self, command: &Command) -> bool {
+        command.starts_turn()
+            && self.core.phase == Phase::Idle
+            && self.core.config.engine.provider().mode_applies_next_turn
+            && self.protocol.mode_change_pending()
+    }
+
+    /// The target of an unanswered, timed-out switch when `command` is a
+    /// turn the session could start now on a provider whose switch reaches
+    /// only the next turn: the vendor may run either mode, so the turn must
+    /// not be sent.
+    fn mode_unknown_for(&self, command: &Command) -> Option<Mode> {
+        (command.starts_turn()
+            && self.core.phase == Phase::Idle
+            && self.core.config.engine.provider().mode_applies_next_turn)
+            .then(|| self.protocol.mode_unsettled())
+            .flatten()
+    }
+
+    /// A turn sent while the vendor's mode is unknown: recorded as failed,
+    /// never sent, saying how to get out (wait, or `/reconnect`, which
+    /// resumes the session with its model and sets the header's mode).
+    fn refuse_while_mode_unknown(
+        &self,
+        command: &Command,
+        target: Mode,
+    ) -> Result<(), DriverError> {
+        let display = command.turn_display().unwrap_or_default().to_owned();
+        self.core.emit(Event::User(display))?;
+        self.core.emit(Event::Started)?;
+        self.core.emit(Event::Error(format!(
+            "{NOT_SENT}{} has not confirmed the switch to {}, so its mode is unknown. \
+             Wait for it, or use /reconnect to start again in {}",
+            self.core.config.engine.title(),
+            target.label(),
+            self.core.mode.label()
+        )))?;
+        self.core.emit(Event::Finished {
+            outcome: Outcome::Failed,
+        })
+    }
+
+    /// Holds `command` until the pending switch resolves, saying so: a
+    /// compaction or a skill is a turn, not the user's prompt.
+    fn hold(&mut self, command: Command) -> Result<(), DriverError> {
+        let what = match command {
+            Command::Compact | Command::Skill { .. } => "starting the turn",
+            _ => "sending your prompt",
+        };
+        let turn = self.gate.last();
+        self.held = Some(Held {
+            command,
+            turn,
+            waits: false,
+        });
+        let target = self.switch_target.map_or("the new mode", Mode::label);
+        self.core.emit(Event::Notice(format!(
+            "Waiting for {} to confirm the switch to {target} before {what}",
+            self.core.config.engine.title()
+        )))
+    }
+
+    /// Starts `command`, numbered `turn`, unless the protocol says it must
+    /// wait first: then it is held, saying so unless it already `waited`
+    /// (a reading tried again).
+    async fn dispatch(
+        &mut self,
+        command: Command,
+        turn: u64,
+        waited: bool,
+    ) -> Result<(), DriverError> {
+        let waits = if command.starts_turn() && self.core.phase == Phase::Idle {
+            self.protocol.must_wait(&self.core, &command)
+        } else {
+            None
+        };
+        let Some(what) = waits else {
+            return self.on_command(command).await;
+        };
+        self.held = Some(Held {
+            command,
+            turn,
+            waits: true,
+        });
+        if waited {
+            return Ok(());
+        }
+        self.core.emit(Event::Notice(format!(
+            "Checking /{what} against {}'s definitions…",
+            self.core.config.engine.title()
+        )))
+    }
+
+    /// Starts the held turn once no switch is pending, or once what it
+    /// waits for is done; one the user cancelled meanwhile is recorded as
+    /// interrupted, and one whose switch went unconfirmed fails, neither of
+    /// them sent.
+    async fn release_held(&mut self, cancel: &watch::Receiver<u64>) -> Result<(), DriverError> {
+        let still = match &self.held {
+            None => return Ok(()),
+            Some(held) if held.waits => self.protocol.waiting(),
+            Some(_) => self.protocol.mode_change_pending(),
+        };
+        if still {
+            return Ok(());
+        }
+        let Some(held) = self.held.take() else {
+            return Ok(());
+        };
+        if TurnGate::covers(held.turn, cancel) {
+            self.cancelled_before_start(&held.command)
+        } else if !held.waits && self.protocol.take_switch_timed_out() {
+            self.unsent_behind_switch(&held.command)
+        } else {
+            self.dispatch(held.command, held.turn, held.waits).await
+        }
+    }
+
+    /// A cancel that covers the held turn ends it now, unsent, instead of
+    /// when the switch resolves.
+    fn cancel_held(&mut self, cancel: &watch::Receiver<u64>) -> Result<(), DriverError> {
+        match self.held.take() {
+            Some(held) if TurnGate::covers(held.turn, cancel) => {
+                self.cancelled_before_start(&held.command)
+            }
+            held => {
+                self.held = held;
+                Ok(())
+            }
+        }
     }
 
     /// The earliest timer. The connect/turn deadline is stale when idle;
@@ -239,6 +414,24 @@ impl<P: Protocol> Driver<P> {
         })
     }
 
+    /// A turn held behind a switch the vendor did not confirm in time:
+    /// recorded as failed, never sent. The vendor may already have applied
+    /// the switch, so the turn could run under a mode the header does not
+    /// show.
+    fn unsent_behind_switch(&self, command: &Command) -> Result<(), DriverError> {
+        let display = command.turn_display().unwrap_or_default().to_owned();
+        let target = self.switch_target.map_or("the new mode", Mode::label);
+        self.core.emit(Event::User(display))?;
+        self.core.emit(Event::Started)?;
+        self.core.emit(Event::Error(format!(
+            "{NOT_SENT}{} has not confirmed the switch to {target}; send it again once it does",
+            self.core.config.engine.title()
+        )))?;
+        self.core.emit(Event::Finished {
+            outcome: Outcome::Failed,
+        })
+    }
+
     async fn on_command(&mut self, command: Command) -> Result<(), DriverError> {
         match command {
             Command::Prompt(text) => self.start_turn(text.clone(), text, Vec::new()).await,
@@ -250,7 +443,7 @@ impl<P: Protocol> Driver<P> {
             Command::Answer { id, allow } => self.answer_approval(id, allow).await,
             Command::SetMode(target) => self.set_mode(target).await,
             Command::Steer(text) => self.steer(text).await,
-            Command::SetEffort(effort) => self.set_effort(effort),
+            Command::SetEffort(effort) => self.set_effort(effort).await,
             Command::Compact => self.compact().await,
             Command::Skill {
                 name,
@@ -289,9 +482,11 @@ impl<P: Protocol> Driver<P> {
         Ok(())
     }
 
-    /// Compaction runs as a turn, so Esc cancels it and its events stream.
+    /// Compaction runs as a turn, so Esc cancels it and its events stream;
+    /// its completion is announced.
     async fn compact(&mut self) -> Result<(), DriverError> {
         if self.begin_turn("/compact".into())? {
+            self.core.compacting = true;
             self.protocol.compact(&mut self.core).await?;
         }
         Ok(())
@@ -305,6 +500,7 @@ impl<P: Protocol> Driver<P> {
             return Ok(false);
         }
         self.core.phase = Phase::InTurn;
+        self.core.compacting = false;
         self.protocol.turn_started();
         self.core.deadline = deadline_after(self.core.limits.turn_idle);
         self.core.emit(Event::User(display))?;
@@ -312,9 +508,9 @@ impl<P: Protocol> Driver<P> {
         Ok(true)
     }
 
-    /// Live where the provider takes effort per turn; otherwise the
-    /// interface reconnects instead of sending this.
-    fn set_effort(&mut self, effort: Option<String>) -> Result<(), DriverError> {
+    /// Live where the provider takes effort per turn or by request;
+    /// otherwise the interface reconnects instead of sending this.
+    async fn set_effort(&mut self, effort: Option<String>) -> Result<(), DriverError> {
         let provider = self.core.config.engine.provider();
         if !provider.effort_live {
             return self.core.emit(Event::Notice(format!(
@@ -322,15 +518,16 @@ impl<P: Protocol> Driver<P> {
                 provider.title
             )));
         }
-        let shown = effort.as_deref().unwrap_or("vendor default").to_owned();
+        if self
+            .protocol
+            .set_effort(&mut self.core, effort.clone())
+            .await?
+        {
+            return Ok(());
+        }
+        let notice = effort_notice(effort.as_deref(), self.core.phase.is_running());
         self.core.config.effort = effort;
-        let when = if self.core.phase.is_running() {
-            "from the next turn"
-        } else {
-            "from now on"
-        };
-        self.core
-            .emit(Event::Notice(format!("Reasoning effort: {shown} ({when})")))
+        self.core.emit(Event::Notice(notice))
     }
 
     async fn steer(&mut self, text: String) -> Result<(), DriverError> {
@@ -383,6 +580,7 @@ impl<P: Protocol> Driver<P> {
         } else if target == core.mode {
             core.emit(Event::ModeChanged(core.mode))
         } else {
+            self.switch_target = Some(target);
             self.protocol.set_mode(&mut self.core, target).await
         }
     }
@@ -420,6 +618,19 @@ pub(super) fn with_stderr(error: DriverError, engine: Engine, tail: &[u8]) -> St
         format!("{error}\n{engine} stderr: {text}")
     }
 }
+/// What Octet says once the reasoning effort is `effort` (`None`: the
+/// vendor's default), from the next turn when one is `running`.
+pub(super) fn effort_notice(effort: Option<&str>, running: bool) -> String {
+    let shown = effort.unwrap_or("vendor default");
+    let when = if running {
+        "from the next turn"
+    } else {
+        "from now on"
+    };
+    format!("Reasoning effort: {shown} ({when})")
+}
+
+/// `limit` as a person reads it: milliseconds below a second.
 pub(super) fn seconds(limit: Duration) -> String {
     match limit.as_secs() {
         0 => format!("{} ms", limit.as_millis()),

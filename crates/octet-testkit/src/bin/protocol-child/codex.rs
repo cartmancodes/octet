@@ -35,6 +35,14 @@ pub(crate) fn run() {
                 &json!({"id":v["id"],"result":{"data":[{"cwd":".","errors":[],"skills":[{"name":"fixture-codex-skill","description":"A Codex fixture skill","enabled":true,"path":"/tmp/fixture-codex-skill/SKILL.md","scope":"user"}]}]}}),
             ),
             Some("initialize") => emit(&json!({"id":v["id"],"result":{}})),
+            Some("config/read") => {
+                let effort = configured_effort(&v["params"]["cwd"]);
+                if workspace_has(&v["params"]["cwd"], "config-slow") {
+                    // The answer comes after a prompt sent at ready would.
+                    thread::sleep(Duration::from_millis(300));
+                }
+                emit(&json!({"id":v["id"],"result":{"config":{"model_reasoning_effort":effort}}}));
+            }
             Some("thread/start" | "thread/resume" | "thread/fork") => codex.open_thread(&v),
             Some("thread/compact/start") => codex.compact(&v),
             Some("turn/start") => codex.start_turn(&v),
@@ -46,7 +54,23 @@ pub(crate) fn run() {
     }
 }
 
-/// Two catalog pages: `picker-fixture`, then `picker-other`.
+/// The `model_reasoning_effort` of the fake's config: the text of
+/// `config-effort` in the working directory `cwd`, or none.
+fn configured_effort(cwd: &Value) -> Value {
+    cwd.as_str()
+        .and_then(|cwd| {
+            std::fs::read_to_string(std::path::Path::new(cwd).join("config-effort")).ok()
+        })
+        .map_or(Value::Null, |effort| json!(effort.trim()))
+}
+
+/// Whether the working directory `cwd` holds a file `name`.
+fn workspace_has(cwd: &Value, name: &str) -> bool {
+    cwd.as_str()
+        .is_some_and(|cwd| std::path::Path::new(cwd).join(name).exists())
+}
+
+/// Two catalog pages: `picker-fixture` (default effort `medium`), then `picker-other`.
 fn model_list(v: &Value) {
     if v["params"]["cursor"].as_str() == Some("page-two") {
         emit(
@@ -54,7 +78,7 @@ fn model_list(v: &Value) {
         );
     } else {
         emit(
-            &json!({"id":v["id"],"result":{"data":[{"id":"picker-fixture","model":"fixture","displayName":"Fixture Model","description":"Runtime metadata"}],"nextCursor":"page-two"}}),
+            &json!({"id":v["id"],"result":{"data":[{"id":"picker-fixture","model":"fixture","displayName":"Fixture Model","description":"Runtime metadata","defaultReasoningEffort":"medium"}],"nextCursor":"page-two"}}),
         );
     }
 }
@@ -95,8 +119,10 @@ impl CodexFixture {
         } else {
             "fixture-thread"
         };
+        // A new thread takes the configured effort, and Codex reports it.
+        let effort = configured_effort(&p["cwd"]);
         emit(
-            &json!({"id":v["id"],"result":{"thread":{"id":thread},"model":"fixture","sandbox":sandbox,"approvalPolicy":policy,"approvalsReviewer":reviewer}}),
+            &json!({"id":v["id"],"result":{"thread":{"id":thread},"model":"fixture","sandbox":sandbox,"approvalPolicy":policy,"approvalsReviewer":reviewer,"reasoningEffort":effort}}),
         );
     }
 
@@ -107,6 +133,10 @@ impl CodexFixture {
 
     /// Codex runs compaction as a turn on the thread.
     fn compact(&mut self, v: &Value) {
+        if self.thread_params["model"] == scenario::REFUSE_COMPACT {
+            emit(&json!({"id":v["id"],"error":{"code":-32600,"message":"compaction refused"}}));
+            return;
+        }
         self.next_turn();
         let active = &self.active;
         emit(&json!({"id":v["id"],"result":{}}));
@@ -169,6 +199,21 @@ impl CodexFixture {
             scenario::APPROVAL => emit(
                 &json!({"id":"permission","method":"item/commandExecution/requestApproval","params":{"threadId":"fixture-thread","turnId":active,"command":"echo fixture"}}),
             ),
+            scenario::MESSAGES => {
+                emit(&codex_delta("fixture-thread", &active, "m1", "Fir"));
+                emit(&codex_delta("fixture-thread", &active, "m1", "st."));
+                emit(
+                    &json!({"method":"item/completed","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"m1","type":"agentMessage","text":"First."}}}),
+                );
+                emit(
+                    &json!({"method":"item/completed","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"m2","type":"agentMessage","text":"Second."}}}),
+                );
+                emit(
+                    &json!({"method":"item/completed","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"cmd-1","type":"commandExecution","command":"true","status":"completed","exitCode":0}}}),
+                );
+                emit(&codex_delta("fixture-thread", &active, "m3", "Third."));
+                done();
+            }
             scenario::TOOL_FAIL => {
                 emit(
                     &json!({"method":"item/started","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"cmd-9","type":"commandExecution","command":"false","status":"inProgress"}}}),

@@ -90,6 +90,7 @@ async fn the_popup_closes_before_the_editor_and_follows_a_paste() {
         kind: composer::Kind::Command,
         items: vec!["/reconnect".into()],
         selected: 0,
+        moved: false,
         start: 0,
     });
     paste(&mut app, "port the bug");
@@ -605,6 +606,7 @@ fn accepting_a_model_suggestion_inserts_only_the_name() {
         kind: composer::Kind::Model,
         items: vec!["gpt-6-astra · codex".into()],
         selected: 0,
+        moved: false,
         start: 7,
     });
     crate::input::accept_completion(&mut app);
@@ -742,6 +744,92 @@ async fn an_unlisted_name_is_sent_as_typed() {
     );
     assert_eq!(selection.model.as_deref(), Some("gpt-5.5"));
 }
+#[tokio::test]
+async fn a_whole_name_after_a_sub_provider_goes_by_the_prefix_rule() {
+    // opencode lists openai/gpt-5.5, so the picker shows it for `gpt-5.5`;
+    // Enter must still resolve the name as typed, where Codex's `gpt-`
+    // prefix comes before the match after `openai/`.
+    let mut app = codex_picker_app();
+    let m = |s: &str| octet_core::ModelInfo {
+        selection: s.into(),
+        id: Some(s.into()),
+        name: s.into(),
+        description: String::new(),
+    };
+    app.models.catalogs.set(
+        octet_core::Engine::OPENCODE,
+        vec![m("openai/gpt-5.5"), m("opencode/glm-5.3-flash-free")],
+        std::time::SystemTime::now(),
+    );
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/model gpt-5.5").await;
+    assert!(
+        !picker(&app).items.is_empty(),
+        "the picker shows openai/gpt-5.5"
+    );
+    let Action::Exit(Exit::Model(selection)) =
+        key_action(&mut app, &vendor, key(KeyCode::Enter)).await
+    else {
+        panic!("expected a model switch");
+    };
+    assert_eq!(selection.provider, octet_core::Engine::CODEX);
+    assert_eq!(selection.model.as_deref(), Some("gpt-5.5"));
+    // A whole name no prefix claims still goes to the one ID ending in it.
+    app.composer.editor.set(String::new());
+    type_keys(&mut app, &vendor, "/model glm-5.3-flash-free").await;
+    let Action::Exit(Exit::Model(selection)) =
+        key_action(&mut app, &vendor, key(KeyCode::Enter)).await
+    else {
+        panic!("expected a model switch");
+    };
+    assert_eq!(selection.provider, octet_core::Engine::OPENCODE);
+    assert_eq!(
+        selection.model.as_deref(),
+        Some("opencode/glm-5.3-flash-free")
+    );
+}
+#[tokio::test]
+async fn a_row_arrowed_to_after_a_whole_name_is_the_one_picked() {
+    // `gpt-5.5` alone goes to Codex by its prefix, but a user who arrows to
+    // opencode's row has picked that one.
+    let mut app = codex_picker_app();
+    let m = |s: &str| octet_core::ModelInfo {
+        selection: s.into(),
+        id: Some(s.into()),
+        name: s.into(),
+        description: String::new(),
+    };
+    app.event(octet_core::Event::Models(vec![
+        m("gpt-6-astra"),
+        m("gpt-5.5"),
+    ]));
+    app.models.catalogs.set(
+        octet_core::Engine::OPENCODE,
+        vec![m("openai/gpt-5.5")],
+        std::time::SystemTime::now(),
+    );
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/model gpt-5.5").await;
+    let items = picker(&app).items.clone();
+    let target = items
+        .iter()
+        .position(|item| item.contains("openai/gpt-5.5"))
+        .unwrap_or_else(|| panic!("opencode's row is listed: {items:?}"));
+    for _ in 0..items.len() {
+        key_action(&mut app, &vendor, key(KeyCode::Up)).await;
+    }
+    for _ in 0..target {
+        key_action(&mut app, &vendor, key(KeyCode::Down)).await;
+    }
+    assert_eq!(picker(&app).selected, target);
+    let Action::Exit(Exit::Model(selection)) =
+        key_action(&mut app, &vendor, key(KeyCode::Enter)).await
+    else {
+        panic!("expected a model switch");
+    };
+    assert_eq!(selection.provider, octet_core::Engine::OPENCODE);
+    assert_eq!(selection.model.as_deref(), Some("openai/gpt-5.5"));
+}
 /// A Codex interface whose list has no `default`, beside Claude's that does.
 fn codex_picker_app() -> App {
     let mut app = crate::test_support::app_for(octet_core::Engine::CODEX);
@@ -855,6 +943,46 @@ async fn enter_in_the_skills_picker_prepares_the_skill() {
         &vendor.sent.borrow()[0],
         Command::Skill { name, args, .. } if name == "imagegen" && args == "a cat"
     ));
+}
+#[tokio::test]
+async fn esc_from_the_skills_picker_leaves_an_empty_prompt() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills").await;
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(app.composer.completion.is_some(), "picker open");
+    key_action(&mut app, &vendor, key(KeyCode::Esc)).await;
+    // The `/skills ` line was only the picker's: it goes with it, so what
+    // is typed next is a prompt, not a filter.
+    assert_eq!(app.composer.editor.text(), "");
+    assert!(app.composer.completion.is_none());
+    type_keys(&mut app, &vendor, "Reply RED.").await;
+    assert!(app.composer.completion.is_none());
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert!(
+        matches!(vendor.sent.borrow().first(), Some(Command::Prompt(text)) if text == "Reply RED."),
+        "{:?}",
+        vendor.sent.borrow()
+    );
+}
+#[tokio::test]
+async fn enter_on_a_skills_filter_that_matches_nothing_says_so() {
+    let mut app = skills_app();
+    let vendor = RecordingVendor::default();
+    type_keys(&mut app, &vendor, "/skills zzz").await;
+    assert!(picker_items(&app).is_empty());
+    key_action(&mut app, &vendor, key(KeyCode::Enter)).await;
+    assert_eq!(app.composer.editor.text(), "/skills zzz");
+    assert_eq!(app.status_line, "No skill matches zzz; Esc clears the line");
+    assert!(vendor.sent.borrow().is_empty());
+}
+/// The open popup's lines.
+fn picker_items(app: &App) -> Vec<String> {
+    app.composer
+        .completion
+        .as_ref()
+        .map(|c| c.items.clone())
+        .unwrap_or_default()
 }
 #[tokio::test]
 async fn the_skills_picker_filters_and_tab_inserts() {
@@ -1223,4 +1351,77 @@ async fn a_picked_skill_shows_its_switch_and_is_forgotten_when_the_draft_changes
         None,
         "typed again by hand, the current provider's runs"
     );
+}
+#[tokio::test]
+async fn tab_on_a_name_two_providers_list_shows_the_bracketed_row() {
+    // Codex lists gpt-5.5 and opencode lists openai/gpt-5.5, the same model.
+    let mut app = crate::test_support::app_for(Engine::CODEX);
+    crate::test_support::idle(&mut app);
+    let m = |s: &str, name: &str| octet_core::ModelInfo {
+        selection: s.into(),
+        id: Some(s.into()),
+        name: name.into(),
+        description: String::new(),
+    };
+    app.event(octet_core::Event::Models(vec![
+        m("gpt-5.5", "GPT-5.5"),
+        m("gpt-5.4", "GPT-5.4"),
+    ]));
+    app.models.catalogs.set(
+        Engine::OPENCODE,
+        vec![m("openai/gpt-5.5", "OpenAI/GPT-5.5")],
+        std::time::SystemTime::now(),
+    );
+    let vendor = RecordingVendor::default();
+    // The provider form has no picker: Tab offers that provider's names.
+    app.insert_or_warn("/model codex gpt-5.");
+    assert!(app.composer.completion.is_none());
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    let popup = app.composer.completion.as_ref().expect("Tab offers names");
+    assert_eq!(popup.items, ["gpt-5.5 (codex)", "gpt-5.4 · codex"]);
+    // Typing on narrows it; a draft that leaves the form closes it.
+    key_action(&mut app, &vendor, key(KeyCode::Char('5'))).await;
+    let popup = app.composer.completion.as_ref().expect("still open");
+    assert_eq!(popup.items, ["gpt-5.5 (codex)"]);
+    // Backspace widens it again, from the provider's whole list.
+    key_action(&mut app, &vendor, key(KeyCode::Backspace)).await;
+    let popup = app.composer.completion.as_ref().expect("still open");
+    assert_eq!(popup.items, ["gpt-5.5 (codex)", "gpt-5.4 · codex"]);
+    key_action(&mut app, &vendor, key(KeyCode::Char('5'))).await;
+    key_action(&mut app, &vendor, key(KeyCode::Char(' '))).await;
+    assert!(app.composer.completion.is_none());
+}
+#[tokio::test]
+async fn a_tab_line_in_the_provider_form_never_names_the_provider_twice() {
+    // Codex and opencode both list shared-x, so the name alone is
+    // ambiguous from Claude; the draft already names Codex.
+    let mut app = crate::test_support::app_for(Engine::CLAUDE);
+    crate::test_support::idle(&mut app);
+    let m = |s: &str| octet_core::ModelInfo {
+        selection: s.into(),
+        id: Some(s.into()),
+        name: s.into(),
+        description: String::new(),
+    };
+    app.event(octet_core::Event::Models(vec![m("opus")]));
+    let now = std::time::SystemTime::now();
+    app.models
+        .catalogs
+        .set(Engine::CODEX, vec![m("shared-x"), m("shared-y")], now);
+    app.models
+        .catalogs
+        .set(Engine::OPENCODE, vec![m("shared-x")], now);
+    let vendor = RecordingVendor::default();
+    app.insert_or_warn("/model codex shared-");
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    assert_eq!(
+        app.composer
+            .completion
+            .as_ref()
+            .expect("Tab offers names")
+            .items,
+        ["shared-x (codex)", "shared-y · codex"]
+    );
+    key_action(&mut app, &vendor, key(KeyCode::Tab)).await;
+    assert_eq!(app.composer.editor.text(), "/model codex shared-x ");
 }

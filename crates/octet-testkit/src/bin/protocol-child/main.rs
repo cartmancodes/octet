@@ -1,4 +1,4 @@
-//! A fake Codex/Claude vendor for tests: it speaks just enough of each
+//! A fake Codex/Claude/opencode vendor for tests: it speaks just enough of each
 //! protocol to drive Octet through scripted scenarios (`scenario`), and has
 //! transport modes for octet-proc's tests.
 #![expect(
@@ -7,6 +7,7 @@
 )]
 mod claude;
 mod codex;
+mod opencode;
 mod wire;
 
 use serde_json::{Value, json};
@@ -24,6 +25,9 @@ fn main() {
     match mode.as_str() {
         "app-server" => codex::run(),
         "--print" => claude::run(),
+        "acp" => opencode::run(),
+        "session" => opencode::session_command(),
+        "debug" => opencode::debug_command(),
         "split" => {
             let mut stdout = io::stdout().lock();
             stdout.write_all(b"{\"part\":").unwrap();
@@ -37,6 +41,7 @@ fn main() {
             stdout.write_all(&vec![b'x'; 8192]).unwrap();
             stdout.write_all(b"\"}\n").unwrap();
         }
+        "env" => emit(&json!({"env": env::var("OCTET_TEST_ENV").ok()})),
         "malformed" => println!("{{invalid\n{{\"valid\":true}}"),
         "blank-lines" => print!("{{\"a\":1}}\n\n  \r\n{{\"b\":2}}\n"),
         "valid-then-invalid" => print!("{{\"a\":1}}\n{{\"b\":2}}\nnot json\n{{\"c\":3}}\n"),
