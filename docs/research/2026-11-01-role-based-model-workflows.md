@@ -144,7 +144,10 @@ Rules:
   and Octet refuses the role if the adapter cannot provide it.
 - **Each step gets a fresh vendor session by default.** A warm session is allowed only
   for an adapter and mode where conversation isolation has been verified (Phase 0). For
-  now, that means none.
+  now, that means none. Reusing sessions to save cost
+  ([cross-provider session reuse](2026-11-01-cross-provider-session-reuse.md)) applies
+  only to the conversation lane and to continuity steps that opt in, never to isolation
+  roles.
 - Access levels, from weakest to strongest:
   1. `workspace`: the live working tree.
   2. `candidate-copy`: a disposable checkout of the captured candidate (§3), with
