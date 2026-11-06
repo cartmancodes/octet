@@ -529,3 +529,51 @@ fn a_relative_home_is_ignored() {
     assert_eq!(output.status.code(), Some(2), "a usage error");
     assert!(!temp.path().join("relative-home").exists());
 }
+
+#[test]
+fn print_waits_for_the_turn_claude_starts_when_its_background_task_ends() {
+    let (code, stdout, stderr) = run(
+        &[
+            "--engine",
+            "claude",
+            "--print",
+            octet_testkit::scenario::BACKGROUND,
+        ],
+        "",
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("waiting"), "{stdout}");
+    assert!(
+        stdout.contains(octet_testkit::scenario::BACKGROUND_REPLY),
+        "the run ended before Claude's own turn: {stdout}"
+    );
+}
+
+#[test]
+fn print_exits_when_no_turn_follows_a_background_task() {
+    let (code, stdout, stderr) = run(
+        &[
+            "--engine",
+            "claude",
+            "--print",
+            octet_testkit::scenario::BACKGROUND_QUIET,
+        ],
+        "",
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "waiting\n");
+}
+
+#[test]
+fn rpc_waits_at_the_end_of_stdin_for_the_turn_after_a_background_task() {
+    let (code, stdout, stderr) = run(
+        &["--engine", "claude", "--rpc"],
+        "{\"type\":\"prompt\",\"text\":\"background\"}\n",
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let finished = stdout
+        .lines()
+        .filter(|line| line.contains(r#""type":"finished""#))
+        .count();
+    assert_eq!(finished, 2, "{stdout}");
+}

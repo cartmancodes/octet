@@ -331,6 +331,15 @@ Claude Code and Codex CLIs.
 
 ### Fixed
 
+- A turn Claude starts of its own was lost. When a background task (a
+  backgrounded shell, a wait loop) ends after Claude's turn did, Claude
+  starts a new turn with no prompt; Octet ignored its frames, and `--print`
+  had already exited, so the reply and any work it went on to do never
+  showed. Octet now opens that turn with the notice "Claude continued: a
+  background task finished" and journals the running task count as
+  `background` records. `--print` and `--rpc` (at the end of stdin) wait
+  while a background task runs, and up to 5 seconds after the last one ends
+  for the turn that follows; `--print` says so on stderr, and Ctrl+C stops it.
 - A mid-turn Codex permission change now shows both the running and next mode
   in the terminal header and `/mode` details. The notice explains that steering
   keeps the old permissions until a new turn starts.

@@ -211,6 +211,7 @@ fn record(event: &Event) -> (&'static str, Value) {
         ),
         Event::ApprovalClosed(id) => ("approval_closed", json!(id)),
         Event::Usage(text) => ("usage", json!(text)),
+        Event::Background(tasks) => ("background", json!(tasks)),
         Event::Finished { outcome } => ("finished", json!(outcome.as_str())),
         Event::Hook {
             name,

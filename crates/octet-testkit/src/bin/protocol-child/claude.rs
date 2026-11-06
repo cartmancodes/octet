@@ -276,6 +276,7 @@ impl ClaudeFixture {
                 );
                 emit(&claude_result(sid, ""));
             }
+            scenario::BACKGROUND | scenario::BACKGROUND_QUIET => background(sid, text),
             scenario::ERRORS => fail(sid),
             _ if scenario::is_goal_prompt(text, scenario::GOAL_FAIL) => fail(sid),
             // Stay mid-turn until the driver interrupts.
@@ -336,6 +337,33 @@ impl ClaudeFixture {
         emit(&claude_delta(&reply));
         emit(&json!({"type":"assistant","message":{"content":[{"type":"text","text":reply}]}}));
         emit(&claude_result(self.sid, &reply));
+    }
+}
+
+/// A turn that leaves a background task running, as Claude Code 2.1.289
+/// reports it: when the task ends after the turn, Claude says so and, for
+/// [`scenario::BACKGROUND`] (not its quiet form), starts a turn of its own
+/// with a fresh `init`.
+fn background(sid: &str, script: &str) {
+    let follow = script == scenario::BACKGROUND;
+    let tasks = |running: bool| {
+        let task = json!({"task_id":"bg1","task_type":"local_bash","description":"sleep"});
+        let tasks = if running { vec![task] } else { Vec::new() };
+        json!({"type":"system","subtype":"background_tasks_changed","tasks":tasks,"session_id":sid})
+    };
+    emit(&claude_init(sid));
+    emit(&tasks(true));
+    emit(&claude_delta("waiting"));
+    emit(&claude_result(sid, "waiting"));
+    thread::sleep(Duration::from_millis(300));
+    emit(&tasks(false));
+    emit(
+        &json!({"type":"system","subtype":"task_notification","task_id":"bg1","status":"completed","session_id":sid}),
+    );
+    if follow {
+        emit(&claude_init(sid));
+        emit(&claude_delta(scenario::BACKGROUND_REPLY));
+        emit(&claude_result(sid, scenario::BACKGROUND_REPLY));
     }
 }
 

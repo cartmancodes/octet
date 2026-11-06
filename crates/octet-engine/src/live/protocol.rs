@@ -195,6 +195,16 @@ impl Core {
         Ok(())
     }
 
+    /// Opens a turn the vendor started without a prompt, saying why in
+    /// `notice`.
+    pub(super) fn begin_vendor_turn(&mut self, notice: &str) -> Result<(), DriverError> {
+        self.phase = Phase::InTurn;
+        self.compacting = false;
+        self.deadline = deadline_after(self.limits.turn_idle);
+        self.emit(Event::Notice(notice.into()))?;
+        self.emit(Event::Started)
+    }
+
     /// Ends the running turn: the session is idle again, its approvals are
     /// closed, and `error` (if any) is reported before the outcome.
     pub(super) fn finish_turn(

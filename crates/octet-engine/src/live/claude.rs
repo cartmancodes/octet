@@ -50,6 +50,8 @@ pub(super) const PROVIDER: Provider = Provider {
 /// The model Claude puts on a message no model wrote, such as a local
 /// command's reply.
 const SYNTHETIC_MODEL: &str = "<synthetic>";
+/// The notice before a turn Claude starts itself.
+const BACKGROUND_TURN: &str = "Claude continued: a background task finished";
 
 fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result<(), String>> {
     Box::pin(async move { super::driver::run::<ClaudeProtocol>(config, limits, channels).await })
@@ -378,10 +380,8 @@ impl Protocol for ClaudeProtocol {
             cancel_approvals(core, &v)?;
         }
         // Hooks run during the handshake too, so before the phase check.
-        if kind == "system"
-            && let Some(hook) = hook_event(&v)
-        {
-            core.emit(hook)?;
+        if kind == "system" {
+            self.system(core, &v, subagent)?;
         }
         if !core.phase.is_running() {
             return Ok(());
@@ -429,6 +429,28 @@ impl Protocol for ClaudeProtocol {
 }
 
 impl ClaudeProtocol {
+    /// A `system` frame: a hook that ran, the count of background tasks,
+    /// and the turn Claude starts of its own (a fresh `init` and no prompt)
+    /// when a task ends after its turn did. A subagent's frames start none.
+    fn system(&mut self, core: &mut Core, v: &Value, subagent: bool) -> Result<(), DriverError> {
+        if let Some(hook) = hook_event(v) {
+            core.emit(hook)?;
+        }
+        if subagent {
+            return Ok(());
+        }
+        if v["subtype"] == "background_tasks_changed" && core.phase.is_ready() {
+            let tasks = v["tasks"].as_array().map_or(0, Vec::len);
+            core.emit(Event::Background(tasks))?;
+        }
+        if v["subtype"] == "init" && core.phase == Phase::Idle {
+            self.tools.clear();
+            self.turn_started();
+            core.begin_vendor_turn(BACKGROUND_TURN)?;
+        }
+        Ok(())
+    }
+
     /// A `tool_use` block: announces the call and remembers it for its result.
     fn tool_started(&mut self, core: &Core, block: &Value) -> Result<(), DriverError> {
         let name = one_line(block["name"].as_str().unwrap_or("tool"));

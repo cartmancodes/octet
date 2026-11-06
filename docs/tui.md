@@ -62,6 +62,10 @@ octet --rpc                                              # JSON-line commands on
   or non-UTF-8 prompt, a `--cwd` path that is not UTF-8), and 130 after
   Ctrl+C (SIGINT), which cancels the turn first (also if the vendor then
   stops). SIGTERM stops the session and exits 143.
+  When Claude's turn ends with a background task still running, the run
+  waits: Claude starts a turn of its own when the task ends, and the run
+  exits after that turn (or 5 seconds after the last task ends, if none
+  starts). Ctrl+C stops the wait.
 - **`--output json`** writes every event as one JSON line in the journal's
   shape, `{"type": …, "data": …}`. A turn that runs ends with
   `{"type":"finished",…}`; a session that stops ends with `stopped`.
