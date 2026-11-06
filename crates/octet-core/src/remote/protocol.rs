@@ -260,6 +260,10 @@ pub static EVENTS: &[EventKind] = &[
         data: Str,
     },
     EventKind {
+        kind: "background",
+        data: U64,
+    },
+    EventKind {
         kind: "notice",
         data: Str,
     },
@@ -2414,6 +2418,7 @@ mod tests {
             },
             Event::ApprovalClosed(3),
             Event::Usage("1k tokens".into()),
+            Event::Background(1),
             Event::Finished {
                 outcome: Outcome::Completed,
             },

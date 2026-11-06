@@ -43,6 +43,14 @@ pub const PARAMS: &str = "params";
 pub const TOOL: &str = "tool";
 /// Codex, Claude and opencode: one tool whose result is an error.
 pub const TOOL_FAIL: &str = "tool-fail";
+/// Claude: a turn that ends with a background task running; when the task
+/// finishes, Claude starts a turn of its own that replies
+/// [`BACKGROUND_REPLY`].
+pub const BACKGROUND: &str = "background";
+/// Claude: like [`BACKGROUND`], but no turn follows the task's end.
+pub const BACKGROUND_QUIET: &str = "background-quiet";
+/// The reply of the turn Claude starts after [`BACKGROUND`]'s task.
+pub const BACKGROUND_REPLY: &str = "saw BGDONE";
 /// Claude: a failed result with error details.
 pub const ERRORS: &str = "errors";
 /// Claude: echo the launch arguments.

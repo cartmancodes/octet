@@ -3,11 +3,12 @@
 use crate::args::{CliError, check_prompt_size};
 use octet_core::{Command, Config, Event, Mode, Outcome, Session, event_json};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     signal::unix::{Signal, SignalKind, signal},
     sync::mpsc,
+    time::{Instant, sleep_until},
 };
 
 /// The longest RPC command line: a full prompt, JSON-escaped, with room.
@@ -16,6 +17,51 @@ const LINE_LIMIT: usize = 4 * octet_core::PROMPT_LIMIT;
 const INTERRUPTED: i32 = 130;
 /// Exit code after SIGTERM, as shells report it.
 const TERMINATED: i32 = 143;
+/// How long a run waits, after the vendor's last background task ends
+/// between turns, for the turn Claude then starts of its own.
+const BACKGROUND_GRACE: Duration = Duration::from_secs(5);
+
+/// The vendor's background tasks. Claude starts a turn of its own when one
+/// ends after its turn did, so a headless run must not end while one runs,
+/// nor just after the last one ended.
+#[derive(Default)]
+struct Background {
+    /// Tasks running.
+    tasks: usize,
+    /// The last task ended between turns: until then a turn may follow.
+    grace: Option<Instant>,
+}
+impl Background {
+    /// Follows the session's events; `idle` when no turn runs.
+    fn track(&mut self, event: &Event, idle: bool) {
+        match event {
+            Event::Background(tasks) => {
+                if *tasks == 0 && self.tasks > 0 && idle {
+                    self.grace = Some(Instant::now() + BACKGROUND_GRACE);
+                }
+                self.tasks = *tasks;
+            }
+            Event::Started => self.grace = None,
+            _ => {}
+        }
+    }
+
+    /// A task runs, or one ended so recently that a turn may still follow.
+    fn pending(&self) -> bool {
+        self.tasks > 0 || self.grace.is_some()
+    }
+
+    /// Ends the grace once it passes; never, when there is none.
+    async fn grace_over(&mut self) {
+        match self.grace {
+            Some(at) => {
+                sleep_until(at).await;
+                self.grace = None;
+            }
+            None => std::future::pending().await,
+        }
+    }
+}
 
 /// Writes `octet: text` to stderr. A closed stderr is not worth a panic:
 /// the session must still shut down.
@@ -88,12 +134,22 @@ async fn drive_print(
     let mut out = Reply::default();
     let mut sent = false;
     let mut interrupted = false;
+    let mut background = Background::default();
+    // A finished turn's exit code, held while background work may still
+    // start another turn.
+    let mut held: Option<i32> = None;
     let code = loop {
         let event = tokio::select! {
             event = session.events.recv() => event,
+            () = background.grace_over(), if held.is_some() => {
+                match held {
+                    Some(code) if !background.pending() => break code,
+                    _ => continue,
+                }
+            }
             _ = signals.interrupt.recv() => {
                 // The first ^C cancels a running turn; otherwise stop now.
-                if sent && !interrupted {
+                if sent && !interrupted && held.is_none() {
                     interrupted = true;
                     session.handle.interrupt();
                     continue;
@@ -114,6 +170,7 @@ async fn drive_print(
         if json {
             write_line(&event_json(&event)).await?;
         }
+        background.track(&event, held.is_some());
         match event {
             Event::Ready { .. } if !sent => {
                 sent = true;
@@ -136,12 +193,23 @@ async fn drive_print(
                     .map_err(|e| e.to_string())?;
             }
             Event::Notice(text) | Event::Error(text) if !json => warn(&text),
+            Event::Started => held = None,
             Event::Finished { outcome } => {
-                break match outcome {
+                let code = match outcome {
                     Outcome::Completed => 0,
                     Outcome::Interrupted => INTERRUPTED,
                     Outcome::Failed | Outcome::Other(_) => 1,
                 };
+                if interrupted || !background.pending() {
+                    break code;
+                }
+                if !json {
+                    warn(&format!(
+                        "waiting for {} background task(s); Ctrl+C stops",
+                        background.tasks
+                    ));
+                }
+                held = Some(code);
             }
             Event::Stopped => break stopped,
             _ => {}
@@ -169,11 +237,13 @@ pub(crate) async fn rpc(config: Config, directory: PathBuf) -> Result<i32, Strin
 async fn drive_rpc(session: &mut Session, signals: &mut Signals) -> Result<i32, String> {
     let mut requests = read_lines(BufReader::new(stdin_on_a_thread()));
     let mut state = RpcState::default();
+    let mut background = Background::default();
     let code = loop {
-        if state.input_closed && !state.busy && state.waiting.is_empty() {
+        if state.input_closed && !state.busy && state.waiting.is_empty() && !background.pending() {
             break i32::from(state.failed);
         }
         tokio::select! {
+            () = background.grace_over() => {}
             // A signal stops the session cleanly: the vendor is stopped and
             // the journal finished before exit.
             _ = signals.interrupt.recv() => break INTERRUPTED,
@@ -208,8 +278,11 @@ async fn drive_rpc(session: &mut Session, signals: &mut Signals) -> Result<i32, 
                     break 1;
                 };
                 write_line(&event_json(&event)).await?;
+                background.track(&event, !state.busy);
                 match event {
                     Event::Ready { .. } => state.ready = true,
+                    // A turn Claude started of its own runs like a prompt.
+                    Event::Started => state.busy = true,
                     Event::Finished { outcome } => {
                         state.busy = false;
                         state.failed |= matches!(outcome, Outcome::Failed | Outcome::Other(_));

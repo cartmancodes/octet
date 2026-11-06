@@ -680,6 +680,9 @@ pub enum Event {
     ApprovalClosed(u64),
     /// Token or cost usage, ready to display.
     Usage(String),
+    /// How many of the vendor's background tasks are running. Claude starts
+    /// a turn of its own when one ends after its turn did.
+    Background(usize),
     /// The turn ended.
     Finished {
         /// How it ended.

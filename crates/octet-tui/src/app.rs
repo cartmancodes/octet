@@ -1142,6 +1142,8 @@ impl App {
                 };
                 self.note(what);
             }
+            // The turn Claude starts when a task ends announces itself.
+            Event::Background(_) => {}
             Event::Notice(text) => self.note(text),
             Event::Error(text) => {
                 self.add(Role::Error, &text);

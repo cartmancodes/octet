@@ -5388,3 +5388,40 @@ fn the_fake_opencode_counts_every_debug_run_though_they_run_at_once() {
     let calls = std::fs::read_to_string(dir.path().join("debug-calls")).unwrap();
     assert_eq!(calls.lines().count(), 16, "{calls}");
 }
+
+#[tokio::test]
+async fn a_turn_claude_starts_after_a_background_task_is_reported() {
+    let (handle, mut events, task) = spawn(claude());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    handle
+        .send(Command::Prompt(scenario::BACKGROUND.into()))
+        .unwrap();
+    let first = until_finished(&mut events).await;
+    assert_eq!(text_of(&first), "waiting");
+    assert!(
+        first.iter().any(|e| matches!(e, Event::Background(1))),
+        "the running task is reported: {first:?}"
+    );
+    // Claude's own turn, after the task ends: it streams like any other.
+    let second = until_finished(&mut events).await;
+    assert!(
+        second.iter().any(|e| matches!(e, Event::Background(0))),
+        "the task's end is reported: {second:?}"
+    );
+    assert!(
+        second.iter().any(|e| matches!(e, Event::Started)),
+        "{second:?}"
+    );
+    assert!(
+        !second.iter().any(|e| matches!(e, Event::User(_))),
+        "nobody typed this turn: {second:?}"
+    );
+    assert_eq!(text_of(&second), scenario::BACKGROUND_REPLY);
+    assert!(matches!(
+        second.last(),
+        Some(Event::Finished {
+            outcome: Outcome::Completed
+        })
+    ));
+    stop(&handle, task).await;
+}
