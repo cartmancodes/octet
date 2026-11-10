@@ -193,6 +193,27 @@ workspace. The account's tier is reported as "Google AI Plus".
 - Google's hook documentation says a `PreToolUse` hook may answer
   `auto_approve`, which approves a tool call that would otherwise ask.
 
+**Checked while planning (2026-11-11)**
+
+All under `--gemini-dir` (a scratch folder) and `--cli_dir_name` (Octet-style
+settings saying `request-review`) together, which work in one launch.
+
+- In mode `default`, `ls`, `pwd` and `git status` each sent a permission
+  request. No shell command ran unasked.
+- **A live mode switch reaches the running turn.** A turn was started in
+  `default`; while its first command ran, the mode was set to
+  `accept-edits`; the file write that followed ran with no request. Its
+  status still went `in_progress` → `pending` → `in_progress` →
+  `completed`, so `pending` does not mean a request was sent.
+- **Subagents wait unseen.** Asked to delegate, the model called
+  `invoke_subagent` (kind `other`), which completed at once with no
+  request, and the turn ended. The subagent runs as its own conversation.
+  Its command did not run: `manage_subagents` reported it
+  `waiting_for_input`, waiting for an approval. That request never arrived
+  on Octet's connection in 60 s.
+- `agy acp` exits 11 ms after its input closes before a session is open,
+  and 375 ms after with one open.
+
 **From Google's documentation, not tested here**
 
 - Hooks, MCP servers and plugins can also come from the workspace:
@@ -363,6 +384,39 @@ workspace. The account's tier is reported as "Google AI Plus".
       mode back. A move to `plan` is let run to the turn's end, with a
       notice.
 
+### Claude's calls while planning (2026-11-11)
+
+22. **Subagents are reported, not stopped.** A subagent cannot act unasked
+    in `ask` or `accept-edits`: it waits for an approval Octet never sees.
+    When a turn starts one in those modes, Octet says so once: its approval
+    requests never reach Octet, so what it must ask for waits and does not
+    run. Cancelling the turn would not end the subagent, so Octet does not.
+
+23. **A mode switch applies to the running turn**, so the provider row says
+    `mode_applies_next_turn: false`. A prompt sent while a switch is
+    unconfirmed is still held until the switch is confirmed or refused
+    (decision 5), through a new hook on the protocol.
+
+24. **The tripwire reads requests, not statuses.** A command or an edit
+    trips it when it ends (`completed` or `failed`) and no permission
+    request named its tool call. It is judged against the loosest mode in
+    force during the turn, so an edit begun under `accept-edits` does not
+    trip it after a switch to `ask`.
+
+25. **A shared model name goes to the provider that owns it.** Antigravity
+    lists Claude and GPT models under the same bare IDs their own providers
+    use, and its `gpt-oss` and `claude` IDs share a leading word with
+    Codex's and Claude's. So that `/model claude-sonnet-4-6` and
+    `/model gpt-6-astra` keep reaching Claude and Codex (decision 15),
+    Antigravity is set aside when another provider also matches a bare
+    name, unless Antigravity is the current provider or is named
+    (`/model antigravity/claude-sonnet-4-6`).
+
+26. **How the trust question is asked.** An untrusted workspace's session
+    does not start; the message lists the files and says to type `/trust`
+    (which records the trust and connects) or to pass
+    `--trust-workspace-config` for one run. The phone has no `/trust`.
+
 ## Parity table
 
 What the user gets, feature by feature.
@@ -435,12 +489,10 @@ What the user gets, feature by feature.
 
 ## Left to the builder
 
-- Whether a live mode switch reaches a running turn or only the next one
-  (`mode_applies_next_turn`).
-- How the daily model probe lists models without leaving a session:
-  `agy models` prints level-suffixed IDs (`gemini-3.8-flash-high`), which
-  differ from the `model` option's family values; a `session/new` under a
-  temporary `--gemini-dir` is the other route.
+The implementation plan
+(`docs/superpowers/plans/2026-11-11-antigravity-provider.md`) settles most
+of these; what it leaves open it marks as a check against the real CLI.
+
 - Which of the user's settings keys are safe to copy into Octet's file, and
   whether `trustedWorkspaces` matters over ACP. The `lockdown` scenario
   decides.
@@ -448,17 +500,7 @@ What the user gets, feature by feature.
   for decision 14.
 - Whether plugins can be turned off for `--no-plugins`
   (`--include-default-customizations=false` did not stop workspace hooks).
-- The trust flag's name for headless runs, where the trust record lives,
-  and how a change to the `.agents/` files is detected.
-- Where the tripwire reads "a request was sent": a tool call that reaches
-  `completed` without having passed through `pending` is the likely signal,
-  to be confirmed against the real CLI.
-- How `full-access` at launch is expressed: the settings key (tested) or
-  `--dangerously-skip-permissions` (documented as equal).
-- Mapping `tool_call` names, kinds and titles to Octet's `ToolCall`, and
-  whether `agent_thought_chunk` is shown.
-- How a provider says it cannot fork (a new field on the provider row is
-  likely), and the wording.
-- The `shutdown_grace`, timed against the real CLI.
+- The `shutdown_grace` in the middle of a turn (idle is timed above).
+- Whether MCP tools ask in `ask`, if the CLI makes that testable.
 - Whether Antigravity's `goal` command clashes with Octet's `/goal`; Octet's
   own wins.
