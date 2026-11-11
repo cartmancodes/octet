@@ -15,11 +15,38 @@ use std::{
 /// How long any one process or line may take.
 const LIMIT: Duration = Duration::from_secs(20);
 
+/// A folder of vendor stand-ins (`octet_testkit::vendor_stand_ins`), kept
+/// apart from the journal folder: first on a run's `PATH`, nothing it starts
+/// by name is an installed vendor CLI.
+fn stand_ins() -> octet_testkit::TempDir {
+    let bin = octet_testkit::TempDir::new("octet-headless-bin");
+    octet_testkit::vendor_stand_ins(bin.path());
+    bin
+}
+
+/// A run's journal folder (also its workspace), and its stand-ins; both go
+/// when it is dropped.
+struct Run {
+    /// The journal folder.
+    dir: octet_testkit::TempDir,
+    /// The vendor stand-ins first on its `PATH`.
+    _stand_ins: octet_testkit::TempDir,
+}
+
+impl Run {
+    /// The journal folder.
+    fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+}
+
 /// `octet` against the fake Codex, journaling into its own directory.
-fn octet(args: &[&str]) -> (Child, octet_testkit::TempDir) {
+fn octet(args: &[&str]) -> (Child, Run) {
     let temp = octet_testkit::TempDir::new("octet-headless");
     std::fs::create_dir_all(temp.path()).unwrap();
+    let bin = stand_ins();
     let child = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .env("PATH", octet_testkit::path_with(bin.path()))
         .arg("--binary")
         .arg(octet_testkit::protocol_child())
         .arg("--journal-dir")
@@ -32,7 +59,13 @@ fn octet(args: &[&str]) -> (Child, octet_testkit::TempDir) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    (child, temp)
+    (
+        child,
+        Run {
+            dir: temp,
+            _stand_ins: bin,
+        },
+    )
 }
 
 /// Runs `octet args` with `input` on stdin; its exit code, stdout and stderr.
@@ -166,7 +199,7 @@ struct Rpc {
     child: Child,
     stdin: Option<ChildStdin>,
     lines: mpsc::Receiver<String>,
-    _temp: octet_testkit::TempDir,
+    _temp: Run,
 }
 impl Rpc {
     fn start() -> Self {
@@ -299,7 +332,7 @@ fn rpc_denies_approvals_once_stdin_closes() {
 }
 
 /// Starts `octet args` with its JSON event lines on a channel.
-fn with_lines(args: &[&str]) -> (Child, mpsc::Receiver<String>, octet_testkit::TempDir) {
+fn with_lines(args: &[&str]) -> (Child, mpsc::Receiver<String>, Run) {
     let (mut child, temp) = octet(args);
     let stdout = child.stdout.take().unwrap();
     let lines = octet_testkit::line_reader(stdout);
@@ -438,7 +471,9 @@ fn a_prompt_that_cannot_be_read_is_a_run_failure() {
     std::fs::create_dir_all(temp.path()).unwrap();
     // A directory opens, but reading it fails.
     let directory = std::fs::File::open(temp.path()).unwrap();
+    let bin = stand_ins();
     let child = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .env("PATH", octet_testkit::path_with(bin.path()))
         .args(["--binary"])
         .arg(octet_testkit::protocol_child())
         .arg("--journal-dir")
@@ -516,7 +551,9 @@ fn print_says_when_the_session_ends_unfinished() {
 fn a_relative_home_is_ignored() {
     let temp = octet_testkit::TempDir::new("octet-relative-home");
     std::fs::create_dir_all(temp.path()).unwrap();
+    let bin = stand_ins();
     let output = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .env("PATH", octet_testkit::path_with(bin.path()))
         .arg("--binary")
         .arg(octet_testkit::protocol_child())
         .args(["--print", "hello"])

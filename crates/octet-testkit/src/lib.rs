@@ -166,6 +166,36 @@ pub fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// The vendor CLIs Octet starts by name when no `--binary` names them.
+pub const VENDOR_CLIS: [&str; 4] = ["agy", "claude", "codex", "opencode"];
+
+/// The file in a stand-in folder where each stand-in records that it ran.
+pub const STARTED_LOG: &str = "started.log";
+
+/// Writes into `dir` a stand-in for each of [`VENDOR_CLIS`] that appends a
+/// line (its name, then its arguments) to `dir/started.log` and exits at once
+/// with status 1, and returns `dir`. First on a child's `PATH`, they are what
+/// an interface starts when it probes another provider by its default name,
+/// so no test starts a vendor CLI installed on the machine.
+///
+/// # Panics
+///
+/// If a stand-in cannot be written.
+pub fn vendor_stand_ins(dir: &Path) -> PathBuf {
+    let log = dir.join(STARTED_LOG);
+    for name in VENDOR_CLIS {
+        write_script(
+            dir,
+            name,
+            &format!(
+                "printf '%s %s\\n' {name} \"$*\" >> '{}'\nexit 1",
+                log.display()
+            ),
+        );
+    }
+    dir.to_owned()
+}
+
 /// `PATH` with `dir` first, so programs written there shadow real ones.
 pub fn path_with(dir: &Path) -> String {
     format!(

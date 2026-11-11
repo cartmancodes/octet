@@ -70,8 +70,11 @@ impl World {
         let hub_log = PathBuf::from("/tmp").join(format!("{id}.hub.log"));
         let bin = PathBuf::from("/tmp").join(format!("{id}.bin"));
         std::fs::create_dir_all(&bin).expect("fake tailscale directory");
+        // The interface probes the other providers by name: stand-ins, never
+        // the installed CLIs.
+        octet_testkit::vendor_stand_ins(&bin);
         let (hub, port) = spawn_hub(&dir, &hub_log, &bin).await;
-        let (tui, screen, master, slave) = spawn_interface(&dir);
+        let (tui, screen, master, slave) = spawn_interface(&dir, &bin);
         let mut world = Self {
             dir,
             hub_log,
@@ -471,7 +474,7 @@ async fn hub_status(dir: &Path) -> Option<Value> {
     timeout(Duration::from_secs(1), ask).await.ok().flatten()
 }
 
-fn spawn_interface(dir: &Path) -> (Child, Arc<Mutex<Vec<u8>>>, File, File) {
+fn spawn_interface(dir: &Path, bin: &Path) -> (Child, Arc<Mutex<Vec<u8>>>, File, File) {
     let mut master = -1;
     let mut slave = -1;
     let mut size = libc::winsize {
@@ -506,6 +509,7 @@ fn spawn_interface(dir: &Path) -> (Child, Arc<Mutex<Vec<u8>>>, File, File) {
         .arg(dir)
         .arg("--cwd")
         .arg(dir)
+        .env("PATH", octet_testkit::path_with(bin))
         .env("TERM", "xterm-256color")
         .env_remove("NO_COLOR")
         .stdin(Stdio::from(slave.try_clone().expect("slave handle")))

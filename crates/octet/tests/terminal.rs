@@ -23,6 +23,10 @@ struct Pty {
     _slave: File,
     child: Child,
     directory: PathBuf,
+    /// The folder of vendor stand-ins first on the interface's `PATH`
+    /// (`octet_testkit::vendor_stand_ins`); `None` for a run that uses the
+    /// installed CLIs on purpose.
+    stand_ins: Option<PathBuf>,
     original: libc::tcflag_t,
     output: Vec<u8>,
 }
@@ -34,12 +38,27 @@ impl Pty {
         Self::spawn_with_env(args, &[])
     }
     fn spawn_with_env(args: &[&str], env: &[(&str, &str)]) -> Self {
+        Self::spawn_inner(args, env, true)
+    }
+    /// For the ignored tests that drive the installed vendor CLIs: no
+    /// stand-ins on the `PATH`.
+    fn spawn_installed(args: &[&str]) -> Self {
+        Self::spawn_inner(args, &[], false)
+    }
+    /// The interface on a new terminal. With `stand_ins`, a folder of vendor
+    /// stand-ins comes first on its `PATH` (before one `env` gives), so the
+    /// probes of other providers never start an installed CLI.
+    fn spawn_inner(args: &[&str], env: &[(&str, &str)], stand_ins: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let directory = std::env::temp_dir().join(format!(
+        let name = format!(
             "octet-pty-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        );
+        let directory = std::env::temp_dir().join(&name);
+        let stand_ins = stand_ins.then(|| {
+            octet_testkit::vendor_stand_ins(&std::env::temp_dir().join(format!("{name}-bin")))
+        });
         let mut master = -1;
         let mut slave = -1;
         let mut size = libc::winsize {
@@ -84,6 +103,13 @@ impl Pty {
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()));
+        if let Some(stand_ins) = &stand_ins {
+            let rest = env.iter().find(|(key, _)| *key == "PATH").map_or_else(
+                || std::env::var("PATH").unwrap_or_default(),
+                |(_, path)| (*path).to_owned(),
+            );
+            command.env("PATH", format!("{}:{rest}", stand_ins.display()));
+        }
         // SAFETY: the closure runs in the child before exec and calls only async-signal-safe functions (setsid, ioctl).
         unsafe {
             command.pre_exec(|| {
@@ -108,6 +134,7 @@ impl Pty {
             _slave: slave,
             child,
             directory,
+            stand_ins,
             original,
             output: Vec::new(),
         }
@@ -324,6 +351,9 @@ impl Drop for Pty {
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = fs::remove_dir_all(&self.directory);
+        if let Some(stand_ins) = &self.stand_ins {
+            let _ = fs::remove_dir_all(stand_ins);
+        }
     }
 }
 #[test]
@@ -466,6 +496,39 @@ fn provider_fixture() -> PathBuf {
 }
 
 #[test]
+fn probes_of_the_other_providers_reach_only_the_stand_ins() {
+    // Once ready, the interface probes every other provider by its default
+    // name on the PATH; the stand-ins first there are what it starts.
+    let binary = provider_fixture();
+    let mut p = Pty::spawn_with(&["--engine", "codex", "--binary", binary.to_str().unwrap()]);
+    p.wait(|p| p.shows("● ready"));
+    let log = p
+        .stand_ins
+        .clone()
+        .unwrap()
+        .join(octet_testkit::STARTED_LOG);
+    let started = |name: &str| {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.starts_with(&format!("{name} ")))
+    };
+    p.wait(|_| started("agy") && started("claude") && started("opencode"));
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(text.contains("agy acp --cli_dir_name "), "{text}");
+    assert!(
+        text.contains(" --gemini-dir "),
+        "the probe has a scratch home: {text}"
+    );
+    assert!(
+        !started("codex"),
+        "the session's own CLI is the fake: {text}"
+    );
+    p.quit();
+    p.finish();
+}
+
+#[test]
 fn goals_continue_complete_and_reload_for_both_providers_in_every_mode() {
     let binary = provider_fixture();
     for engine in ["codex", "claude"] {
@@ -591,7 +654,7 @@ fn installed_providers_complete_a_goal_in_auto_mode() {
         if let Some(model) = &model {
             args.extend(["--model", model.as_str()]);
         }
-        let mut p = Pty::spawn_with(&args);
+        let mut p = Pty::spawn_installed(&args);
         p.wait_for(Duration::from_secs(45), |p| {
             p.count("ready") == 1 || p.count("error") > 0
         });
@@ -640,7 +703,7 @@ fn installed_providers_receive_shell_attachments_and_copy_the_reply() {
         if let Some(model) = &model {
             args.extend(["--model", model.as_str()]);
         }
-        let mut p = Pty::spawn_with(&args);
+        let mut p = Pty::spawn_installed(&args);
         p.wait_for(Duration::from_secs(45), |p| {
             p.shows("● ready") || p.count("error") > 0
         });
