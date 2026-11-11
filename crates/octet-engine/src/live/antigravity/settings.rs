@@ -11,50 +11,64 @@ use std::{
     io::{ErrorKind, Read as _, Write as _},
     os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// What Octet says when the user's Antigravity settings could not be used.
-const USER_SETTINGS_NOTICE: &str = concat!(
+pub(super) const USER_SETTINGS_NOTICE: &str = concat!(
     "Octet could not read your Antigravity settings file, ",
     "so this session runs without your own Antigravity settings"
 );
 /// The most bytes of the user's settings file Octet reads.
-const USER_SETTINGS_LIMIT: u64 = 1024 * 1024;
+pub(super) const USER_SETTINGS_LIMIT: u64 = 1024 * 1024;
 /// The settings file's name, in the user's folder and in Octet's.
 const FILE: &str = "settings.json";
+/// Numbers the temporary files of this process, so no two calls share a name.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// The folder Octet launches Antigravity with: one for `FullAccess` (the
 /// `always-proceed` pin) and one for the other modes, so sessions in
 /// different modes never share a file.
 pub(super) fn cli_dir(data_dir: &Path, mode: Mode) -> PathBuf {
-    let pin = if mode == Mode::FullAccess {
+    data_dir.join("antigravity").join(pin_folder(mode))
+}
+
+/// The name of `mode`'s folder inside `<data_dir>/antigravity`.
+fn pin_folder(mode: Mode) -> &'static str {
+    if mode == Mode::FullAccess {
         "proceed"
     } else {
         "review"
-    };
-    data_dir.join("antigravity").join(pin)
+    }
 }
 
 /// The JSON text of Octet's settings file for `mode`, built from the user's
 /// settings `user`, and a notice when `user` could not be used. The user's
-/// request-skipping settings are dropped (`agentMode`, `permissions.allow`)
-/// and `toolPermission` is pinned; every other key is kept.
+/// request-skipping settings are dropped (`agentMode`, `permissions.allow`,
+/// whatever the letter case of the keys, since Octet cannot see how
+/// Antigravity matches them) and `toolPermission` is pinned; every other key
+/// is kept as it was.
 pub(super) fn merged(user: Option<&str>, mode: Mode) -> (String, Option<&'static str>) {
     let (mut settings, notice) = match user.map(serde_json::from_str::<Value>) {
         None => (Map::new(), None),
         Some(Ok(Value::Object(map))) => (map, None),
         Some(_) => (Map::new(), Some(USER_SETTINGS_NOTICE)),
     };
-    settings.remove("agentMode");
-    match settings.get_mut("permissions") {
-        Some(Value::Object(permissions)) => {
-            permissions.remove("allow");
+    settings.retain(|key, _| {
+        !key.eq_ignore_ascii_case("toolPermission") && !key.eq_ignore_ascii_case("agentMode")
+    });
+    settings.retain(|key, value| {
+        if !key.eq_ignore_ascii_case("permissions") {
+            return true;
         }
-        Some(_) => {
-            settings.remove("permissions");
+        match value {
+            Value::Object(permissions) => {
+                permissions.retain(|name, _| !name.eq_ignore_ascii_case("allow"));
+                true
+            }
+            _ => false,
         }
-        None => {}
-    }
+    });
     let pin = if mode == Mode::FullAccess {
         "always-proceed"
     } else {
@@ -134,16 +148,16 @@ fn write_error(path: &Path, error: impl Display) -> String {
     )
 }
 
-/// Refuses `folder` when it is, or is under, the resolved vendor home
-/// `home` (links resolved). Nothing is created.
-fn keep_out_of(folder: &Path, home: Option<&Path>) -> Result<(), String> {
+/// `folder` resolved, unless that is the resolved vendor home `home` or is
+/// under it. Nothing is created.
+fn keep_out_of(folder: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
     let resolved = resolve(folder).map_err(|error| write_error(folder, error))?;
     match home {
         Some(home) if resolved.starts_with(home) => Err(format!(
             "Octet will not keep its Antigravity settings inside Antigravity's own folder ({}); choose another --journal-dir",
             resolved.display()
         )),
-        _ => Ok(()),
+        _ => Ok(resolved),
     }
 }
 
@@ -159,13 +173,11 @@ pub(super) fn write(
     mode: Mode,
     vendor_home: Option<&Path>,
 ) -> Result<Vec<String>, String> {
-    // A vendor home that does not exist forbids nothing.
-    let home = match vendor_home.map(Path::canonicalize) {
-        None => None,
-        Some(Ok(home)) => Some(home),
-        Some(Err(error)) if error.kind() == ErrorKind::NotFound => None,
-        Some(Err(error)) => return Err(write_error(data_dir, error)),
-    };
+    // The vendor home is resolved as far as it exists, so a folder inside one
+    // that is not there yet (or is a dangling link) is still refused.
+    let home = vendor_home
+        .map(|home| resolve(home).map_err(|error| write_error(home, error)))
+        .transpose()?;
     let dir = cli_dir(data_dir, mode);
     // Everything is checked before anything is created.
     keep_out_of(data_dir, home.as_deref())?;
@@ -187,35 +199,39 @@ pub(super) fn write(
         .mode(0o700)
         .create(&dir)
         .map_err(|error| write_error(&dir, error))?;
-    // A link made since the first check is caught here.
-    keep_out_of(&dir, home.as_deref())?;
-    let file = dir.join(FILE);
-    let temp = dir.join(format!("{FILE}.{}.tmp", std::process::id()));
-    let written = write_new(&temp, text.as_bytes())
-        .or_else(|error| {
-            if error.kind() != ErrorKind::AlreadyExists {
-                return Err(error);
-            }
-            // Left by a run that crashed.
-            std::fs::remove_file(&temp)?;
-            write_new(&temp, text.as_bytes())
-        })
-        .and_then(|()| std::fs::rename(&temp, &file));
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&temp);
-        return Err(write_error(&file, error));
+    // The folder must be the one meant, not a link made since the first
+    // check, nor a link from one pin's folder to the other's.
+    let real_data = keep_out_of(data_dir, home.as_deref())?;
+    let real_dir = keep_out_of(&dir, home.as_deref())?;
+    if real_dir != real_data.join("antigravity").join(pin_folder(mode)) {
+        return Err(write_error(&dir, "the folder is a link to another place"));
     }
+    let file = dir.join(FILE);
+    // Named for this call alone, so another launch in this process (a probe
+    // beside a session) never meets, or removes, this file.
+    let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!("{FILE}.{}.{n}.tmp", std::process::id()));
+    write_new(&temp, text.as_bytes())
+        .and_then(|()| {
+            std::fs::rename(&temp, &file).inspect_err(|_| {
+                let _ = std::fs::remove_file(&temp);
+            })
+        })
+        .map_err(|error| write_error(&file, error))?;
     Ok(notices)
 }
 
-/// Writes `bytes` to a file `path` that does not exist yet, owner-only.
+/// Writes `bytes` to a file `path` that does not exist yet, owner-only. A
+/// file this call made and could not fill is removed.
 fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    file.write_all(bytes)
+    file.write_all(bytes).inspect_err(|_| {
+        let _ = std::fs::remove_file(path);
+    })
 }
 
 #[cfg(test)]
@@ -264,6 +280,29 @@ mod tests {
             assert_eq!(parsed(&text), json!({"toolPermission": "request-review"}));
             assert_eq!(notice, Some(USER_SETTINGS_NOTICE));
         }
+    }
+
+    #[test]
+    fn the_users_keys_are_dropped_whatever_their_letter_case() {
+        let user = r#"{"ToolPermission":"always-proceed","TOOLPERMISSION":"always-proceed",
+            "AgentMode":"auto","Permissions":{"Allow":["command(*)"],"deny":["command(rm)"]},
+            "PERMISSIONS":"all","modelProvider":"x"}"#;
+        let (text, notice) = merged(Some(user), Mode::Ask);
+        let settings = parsed(&text);
+        let keys: Vec<&String> = settings.as_object().unwrap().keys().collect();
+        let like = |name: &str| -> Vec<&String> {
+            keys.iter()
+                .copied()
+                .filter(|key| key.eq_ignore_ascii_case(name))
+                .collect()
+        };
+        assert_eq!(like("toolpermission"), ["toolPermission"]);
+        assert_eq!(settings["toolPermission"], "request-review");
+        assert!(like("agentmode").is_empty());
+        assert_eq!(settings["Permissions"], json!({"deny": ["command(rm)"]}));
+        assert!(settings.get("PERMISSIONS").is_none());
+        assert_eq!(settings["modelProvider"], "x");
+        assert_eq!(notice, None);
     }
 
     #[test]
@@ -317,7 +356,12 @@ mod tests {
     #[test]
     fn an_oversized_or_unreadable_users_file_gives_the_notice_and_the_pin() {
         let root = TempDir::new("octet-agy-settings-unusable");
-        let big = "a".repeat(usize::try_from(USER_SETTINGS_LIMIT).unwrap() + 1);
+        // A valid settings object, padded to one byte over the limit.
+        let (open, close) = (r#"{"modelProvider":""#, r#""}"#);
+        let padding = usize::try_from(USER_SETTINGS_LIMIT).unwrap() + 1 - open.len() - close.len();
+        let big = format!("{open}{}{close}", "a".repeat(padding));
+        assert_eq!(big.len() as u64, USER_SETTINGS_LIMIT + 1);
+        assert!(serde_json::from_str::<Value>(&big).is_ok());
         let home = vendor_with(root.path(), &big);
         let data = root.path().join("data-big");
         let notices = write(&data, Mode::FullAccess, Some(&home)).unwrap();
@@ -327,6 +371,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(ours, json!({"toolPermission": "always-proceed"}));
+        assert!(ours.get("modelProvider").is_none());
         // A directory where the file should be.
         let home = root.path().join("home2/.gemini");
         std::fs::create_dir_all(home.join("antigravity-cli/settings.json")).unwrap();
@@ -401,5 +446,95 @@ mod tests {
         );
         assert!(!data.join("antigravity").exists());
         assert!(!data.exists());
+    }
+
+    #[test]
+    fn a_data_directory_inside_a_vendor_home_that_does_not_exist_yet_is_refused() {
+        let root = TempDir::new("octet-agy-settings-nohome");
+        std::fs::create_dir_all(root.path().join("home")).unwrap();
+        let home = root.path().join("home/.gemini");
+        let data = home.join("octet");
+        let error = write(&data, Mode::Ask, Some(&home)).unwrap_err();
+        assert!(
+            error.starts_with("Octet will not keep its Antigravity settings inside"),
+            "{error}"
+        );
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn a_pin_folder_linked_to_the_other_pins_folder_is_refused() {
+        let root = TempDir::new("octet-agy-settings-pinlink");
+        let data = root.path().join("data");
+        write(&data, Mode::Ask, None).unwrap();
+        let review = cli_dir(&data, Mode::Ask);
+        let proceed = cli_dir(&data, Mode::FullAccess);
+        symlink(&review, &proceed).unwrap();
+        let error = write(&data, Mode::FullAccess, None).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "Octet could not write its Antigravity settings ({}): \
+                 the folder is a link to another place",
+                proceed.display()
+            )
+        );
+        let ours = parsed(&std::fs::read_to_string(review.join("settings.json")).unwrap());
+        assert_eq!(ours["toolPermission"], "request-review");
+    }
+
+    #[test]
+    fn a_data_directory_that_is_itself_a_link_is_fine() {
+        let root = TempDir::new("octet-agy-settings-datalink");
+        std::fs::create_dir_all(root.path().join("real")).unwrap();
+        symlink(root.path().join("real"), root.path().join("data")).unwrap();
+        let data = root.path().join("data");
+        write(&data, Mode::Ask, None).unwrap();
+        assert!(cli_dir(&data, Mode::Ask).join("settings.json").exists());
+    }
+
+    #[test]
+    fn a_missing_users_file_is_no_settings_and_no_notice() {
+        let root = TempDir::new("octet-agy-settings-nouser");
+        let home = root.path().join("home/.gemini");
+        std::fs::create_dir_all(home.join("antigravity-cli")).unwrap();
+        let data = root.path().join("data");
+        assert!(write(&data, Mode::Ask, Some(&home)).unwrap().is_empty());
+        let ours = parsed(
+            &std::fs::read_to_string(cli_dir(&data, Mode::Ask).join("settings.json")).unwrap(),
+        );
+        assert_eq!(ours, json!({"toolPermission": "request-review"}));
+    }
+
+    #[test]
+    fn a_fresh_folder_and_file_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new("octet-agy-settings-modes");
+        let data = root.path().join("data");
+        write(&data, Mode::Ask, None).unwrap();
+        let dir = cli_dir(&data, Mode::Ask);
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("settings.json")), 0o600);
+    }
+
+    #[test]
+    fn two_writes_at_once_do_not_disturb_each_other() {
+        let root = TempDir::new("octet-agy-settings-twice");
+        let data = root.path().join("data");
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| write(&data, Mode::Ask, None)))
+                .collect();
+            for writer in writers {
+                writer.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            std::fs::read_dir(cli_dir(&data, Mode::Ask))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 }
