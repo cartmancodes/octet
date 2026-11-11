@@ -1080,12 +1080,15 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": "2", "method": "session/request_permission",
                 "params": {"sessionId": "s", "toolCall": {}, "options": options}})
         };
-        for options in [
-            json!([{"optionId": "allow", "kind": "allow_once"}, {"optionId": "deny", "kind": "reject_once"}]),
-            json!([]),
+        for (options, chosen) in [
+            (
+                json!([{"optionId": "yes", "kind": "allow_once"}, {"optionId": "no", "kind": "reject_once"}]),
+                "no",
+            ),
+            (json!([]), "deny"),
         ] {
             let reply = antigravity_stray_reply(&asked(options)).unwrap();
-            assert_eq!(reply["result"]["outcome"]["optionId"], "deny");
+            assert_eq!(reply["result"]["outcome"]["optionId"], chosen);
             assert_eq!(reply["id"], "2", "a string ID comes back a string");
         }
         // A notification is no request.

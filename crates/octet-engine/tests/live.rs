@@ -6305,17 +6305,53 @@ async fn antigravity_cancel_is_interrupted() {
     );
     stop(&handle, task).await;
 }
+/// The steps of a scripted Antigravity's handshake: it opens session `s1`
+/// and confirms the first mode, `default`.
+fn agy_handshake() -> Vec<String> {
+    vec![
+        agy_reply(1, &serde_json::json!({"agentInfo": {"version": "1.5.5"}})),
+        agy_reply(
+            2,
+            &serde_json::json!({"sessionId": "s1", "configOptions": agy_options("high", Some("default"))}),
+        ),
+        agy_reply(
+            3,
+            &serde_json::json!({"configOptions": agy_options("high", Some("default"))}),
+        ),
+    ]
+}
+/// The shell line that sends the permission request `id` for `session`, as
+/// Antigravity asks to run `echo fixture`, with its two options.
+fn agy_permission(session: &str, id: &str) -> String {
+    let request = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+        "params": {"sessionId": session,
+            "toolCall": {"toolCallId": "call-1", "name": "run_command", "kind": "execute",
+                "title": "echo fixture", "rawInput": {"command": "echo fixture"}, "status": "pending"},
+            "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]}});
+    format!("echo '{request}'")
+}
+/// The reply rejecting request `id`, as Octet sends it.
+fn agy_denial(id: &str) -> serde_json::Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": id,
+        "result": {"outcome": {"outcome": "selected", "optionId": "deny"}}})
+}
 #[tokio::test]
 async fn antigravity_cancel_denies_a_waiting_approval() {
-    // Octet sends `session/cancel` first, then denies the waiting approval:
-    // the fake ends the prompt `cancelled`, with no text, on the cancel, and
-    // ignores the denial that follows, which no prompt waits for any more.
-    let (_dir, c) = antigravity(serde_json::Value::Null);
-    let (handle, mut events, task) = spawn(c);
+    // The scripted Antigravity asks, then reads the next two frames before it
+    // ends the prompt `cancelled`: Octet's cancel and its denial, in order.
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let mut steps = agy_handshake();
+    steps.extend([
+        agy_permission("s1", "1"),
+        ":".to_owned(),
+        agy_reply(4, &serde_json::json!({"stopReason": "cancelled"})),
+        agy_reply(5, &serde_json::json!({"stopReason": "end_turn"})),
+    ]);
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn(c.clone());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
-    handle
-        .send(Command::Prompt(scenario::APPROVAL.into()))
-        .unwrap();
+    handle.send(Command::Prompt("hello".into())).unwrap();
     let Event::Approval { id, .. } =
         wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
     else {
@@ -6334,7 +6370,17 @@ async fn antigravity_cancel_denies_a_waiting_approval() {
     };
     assert!(closed, "the approval was closed");
     assert_eq!(outcome, Outcome::Interrupted);
-    assert_eq!(text, "", "the denial reached no waiting prompt");
+    assert_eq!(text, "");
+    let sent = agy_sent(&c);
+    assert_eq!(
+        sent[4..6],
+        [
+            serde_json::json!({"jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": "s1"}}),
+            agy_denial("1"),
+        ],
+        "{sent:?}"
+    );
     assert_eq!(
         agy_turn(&handle, &mut events).await,
         (None, Outcome::Completed)
@@ -6482,17 +6528,10 @@ async fn antigravity_a_prompt_waits_for_an_unanswered_switch_and_is_not_sent() {
 #[tokio::test]
 async fn antigravity_a_late_confirmation_is_applied() {
     let (_dir, mut c) = antigravity(serde_json::Value::Null);
-    let options =
-        |mode: &str| serde_json::json!({"configOptions": agy_options("high", Some(mode))});
-    let steps = [
-        agy_reply(1, &serde_json::json!({"agentInfo": {"version": "1.5.5"}})),
-        agy_reply(
-            2,
-            &serde_json::json!({"sessionId": "s1", "configOptions": agy_options("high", Some("default"))}),
-        ),
-        agy_reply(3, &options("default")),
-        format!("sleep 1.5\n{}", agy_reply(4, &options("accept-edits"))),
-    ];
+    // The confirmation comes 1.5 s after the 1 s window closes.
+    let confirmed = serde_json::json!({"configOptions": agy_options("high", Some("accept-edits"))});
+    let mut steps = agy_handshake();
+    steps.push(format!("sleep 2.5\n{}", agy_reply(4, &confirmed)));
     let (_script, _) = agy_script(&mut c, &steps);
     let (handle, mut events, task) = spawn_with_limits(c, quick());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
@@ -6518,12 +6557,18 @@ async fn antigravity_a_late_confirmation_is_applied() {
 }
 #[tokio::test]
 async fn antigravity_another_sessions_permission_is_rejected_not_shown() {
-    let (_dir, c) = antigravity(serde_json::Value::Null);
-    let (handle, mut events, task) = spawn(c);
+    // The scripted Antigravity asks for another session, then reads Octet's
+    // reply before it ends the prompt.
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let mut steps = agy_handshake();
+    steps.extend([
+        agy_permission("other-ses", "other-1"),
+        agy_reply(4, &serde_json::json!({"stopReason": "end_turn"})),
+    ]);
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn(c.clone());
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
-    handle
-        .send(Command::Prompt(scenario::AGY_OTHER_SESSION.into()))
-        .unwrap();
+    handle.send(Command::Prompt("hello".into())).unwrap();
     let mut notices = Vec::new();
     loop {
         match next(&mut events).await {
@@ -6545,6 +6590,8 @@ async fn antigravity_another_sessions_permission_is_rejected_not_shown() {
         ],
         "{notices:?}"
     );
+    let sent = agy_sent(&c);
+    assert_eq!(sent.get(4), Some(&agy_denial("other-1")), "{sent:?}");
     stop(&handle, task).await;
 }
 /// A scripted Antigravity that opens session `s1` (listing `commands` after
@@ -6555,10 +6602,7 @@ fn agy_scripted_turns(
     commands: &[&str],
     turns: u64,
 ) -> (octet_testkit::TempDir, std::path::PathBuf) {
-    let mut opened = agy_reply(
-        2,
-        &serde_json::json!({"sessionId": "s1", "configOptions": agy_options("high", Some("default"))}),
-    );
+    let mut steps = agy_handshake();
     if !commands.is_empty() {
         let listed: Vec<serde_json::Value> = commands
             .iter()
@@ -6567,16 +6611,8 @@ fn agy_scripted_turns(
         let update = serde_json::json!({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": "s1",
             "update": {"sessionUpdate": "available_commands_update", "availableCommands": listed}}});
-        let _ = write!(opened, "\necho '{update}'");
+        let _ = write!(steps[1], "\necho '{update}'");
     }
-    let mut steps = vec![
-        agy_reply(1, &serde_json::json!({"agentInfo": {"version": "1.5.5"}})),
-        opened,
-        agy_reply(
-            3,
-            &serde_json::json!({"configOptions": agy_options("high", Some("default"))}),
-        ),
-    ];
     steps.extend(
         (4..4 + turns).map(|id| agy_reply(id, &serde_json::json!({"stopReason": "end_turn"}))),
     );
