@@ -10,6 +10,7 @@ use tokio::{
 
 mod acp;
 mod activity;
+mod antigravity;
 mod claude;
 mod claude_settings;
 mod codex;
