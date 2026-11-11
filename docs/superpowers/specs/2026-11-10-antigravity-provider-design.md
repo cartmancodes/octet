@@ -400,8 +400,11 @@ settings saying `request-review`) together, which work in one launch.
 24. **The tripwire reads requests, not statuses.** A command or an edit
     trips it when it ends (`completed` or `failed`) and no permission
     request named its tool call. It is judged against the loosest mode in
-    force during the turn, so an edit begun under `accept-edits` does not
-    trip it after a switch to `ask`.
+    force while that tool call ran, from its first frame to its end. So an
+    edit begun under `accept-edits` does not trip it after a switch to
+    `ask`, and a command begun after a switch from `auto` to `ask` does.
+    (Amended after Astra's review: the first wording judged by the whole
+    turn, which let a command begun after tightening run unnoticed.)
 
 25. **A shared model name goes to the provider that owns it.** Antigravity
     lists Claude and GPT models under the same bare IDs their own providers
@@ -416,6 +419,40 @@ settings saying `request-review`) together, which work in one launch.
     does not start; the message lists the files and says to type `/trust`
     (which records the trust and connects) or to pass
     `--trust-workspace-config` for one run. The phone has no `/trust`.
+
+### After Astra's review of the plan (2026-11-11)
+
+27. **The `.agents/` configuration is checked again before every prompt.**
+    Octet records what the workspace held when the session started. A
+    prompt, skill or compaction is not sent when that has changed or
+    configuration has appeared; the message names the files and points to
+    `/trust`. The reason: in `accept-edits` Antigravity may itself write
+    `.agents/hooks.json` without asking, and a hook runs a command with the
+    next prompt. `--trust-workspace-config` trusts what was there at the
+    start, not later changes.
+    - **Not closed:** a file that changes in the moment between Octet's
+      check and Antigravity reading it. Closing it would need Antigravity
+      to load a copy Octet controls, and it reads `<workspace>/.agents`
+      only. Whoever can time such a change can already change any file the
+      user's tools run.
+
+28. **Only a reply naming the mode confirms a switch.** A reply to a mode
+    switch that names no mode stops the session, like one naming another
+    mode: Octet no longer knows the mode (decision 5).
+
+29. **Octet's settings folder is never inside `~/.gemini`,** not through a
+    link and not through `--journal-dir`. Octet resolves the folder before
+    writing and refuses to start otherwise (decision 4).
+
+30. **The tripwire's memory is bounded and fails safe.** Octet remembers
+    1,024 tool calls a turn. In `ask` and `accept-edits`, a turn that makes
+    more is cancelled with a message; the session goes on. When Octet
+    itself cancels a turn, the turn ends only with Antigravity's reply to
+    it, so a later prompt cannot be ended by that reply.
+
+Declined from that review: carrying a model Antigravity moved to by itself
+into a reconnect. A reconnect asks for the model the user chose, as for
+every provider.
 
 ## Parity table
 

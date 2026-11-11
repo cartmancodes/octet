@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (crates `octet-engine`, `octet-core`, `octet-tui`, `octet`, `octet-testkit`, `octet-gate`), tokio, serde_json, sha2; the Expo phone app (`apps/mobile`, TypeScript).
 
-**Spec:** `docs/superpowers/specs/2026-11-10-antigravity-provider-design.md` (amended 2026-11-11: the "Checked while planning" facts and decisions 22–24).
+**Spec:** `docs/superpowers/specs/2026-11-10-antigravity-provider-design.md` (amended 2026-11-11: the "Checked while planning" facts and decisions 22–30). Astra reviewed this plan on 2026-11-11; decisions 27–30 and the amended decision 24 came from that review.
 
 ## Global Constraints
 
@@ -35,7 +35,7 @@
 - **A trusted workspace's `.agents/` changes** (a file edited, a file added under `plugins/`, a file behind a link): Octet asks again. Test in Task 4.
 - **`--effort high` with a model that has no thinking level:** a notice, no level sent, and the session connects. Test in Task 6.
 - **Antigravity changes the model by itself** (a `config_option_update` naming another model, as on a quota fallback): the header follows it (`Event::ModelSelected`). Test in Task 8.
-- **An edit begun under `accept-edits` ends after the user switched to `ask`:** the tripwire must not fire. Test in Task 8.
+- **An edit begun under `accept-edits` ends after the user switched to `ask`:** the tripwire must not fire; a command begun after a switch from `auto` to `ask` that runs unasked must. Tests in Task 8.
 
 ---
 
@@ -68,23 +68,24 @@
 **Files:**
 - Modify: `crates/octet-engine/src/live/mod.rs` (`Provider`, `Config`, `no_prepare`, `prepare`), `protocol.rs` (`Protocol::holds_turn_for_switch`), `driver.rs` (`run`, `must_hold`, `mode_unknown_for`)
 - Modify: `crates/octet-engine/src/live/{codex,claude,opencode,demo}.rs` (rows)
-- Modify: `crates/octet-core/src/model.rs` (`Selection::configure`), `crates/octet/src/main.rs` (`run`), `crates/octet-tui/src/models.rs` (`Prober`), `crates/octet-tui/src/lib.rs` (`attach_models`)
+- Modify: `crates/octet-core/src/model.rs` (`Selection::configure`), `crates/octet/src/main.rs` (`run`), `crates/octet-tui/src/models.rs` (`Prober`), `crates/octet-tui/src/lib.rs` (`attach_models`), `crates/octet-tui/src/tests/slash.rs:984` (the `Prober` literal)
 
 **Interfaces:**
 - Produces:
   - `Provider.forks: bool` (doc: "The vendor can open a session as a copy of another (`/fork`)"): `true` for Codex, Claude and opencode, `false` for the demo.
   - `Provider.carries_others_models: bool` (doc: "Lists models that are other providers' own, under the same bare IDs (Antigravity lists Claude and GPT models); a name another provider also matches goes to that provider"): `false` for all four existing rows. Task 9 reads it.
-  - `Provider.prepare: fn(&Config) -> Result<Vec<String>, String>` (doc: "Runs before the CLI starts: `Ok` lists notices to show; `Err` is why the session cannot start"). `pub(super) fn no_prepare(_: &Config) -> Result<Vec<String>, String>` for the four existing rows.
-  - `pub fn prepare(config: &Config) -> Result<Vec<String>, String>` in `live`, calling the row's function: the gate shares it with `launch_args` and `launch_env`.
+  - `pub struct Prepared { pub notices: Vec<String>, pub scratch: Option<PathBuf> }` (`Debug, Default, PartialEq, Eq`; doc on `scratch`: "A folder made for this launch alone; the driver removes it once the CLI has stopped").
+  - `Provider.prepare: fn(&Config) -> Result<Prepared, String>` (doc: "Runs before the CLI starts: `Ok` holds notices to show; `Err` is why the session cannot start"). `pub(super) fn no_prepare(_: &Config) -> Result<Prepared, String>` for the four existing rows.
+  - `pub fn prepare(config: &Config) -> Result<Prepared, String>` in `live`, calling the row's function: the gate shares it with `launch_args` and `launch_env`.
   - `Config.data_dir: Option<PathBuf>` (doc: "Octet's data directory, for a provider that keeps files of its own there (Antigravity: its settings, and the workspaces the user trusted)") and `Config.trust_workspace: bool` (doc: "Start although the workspace's own vendor configuration is not trusted (`--trust-workspace-config`)"). `Config::new` sets `None` and `false`.
   - `Protocol::holds_turn_for_switch(&self) -> bool`, default `false` (doc: "A turn sent while a mode change is pending waits for it although the provider's switch reaches a running turn: the vendor answers requests in no fixed order").
 - Driver:
   - `run` returns `Err(format!("{title} cannot fork a session"))` when `config.fork && !provider.forks`, before anything starts.
-  - `run` calls the row's `prepare` before `Process::spawn` (`Err` ends the session with that text) and emits each notice as `Event::Notice` before `initialize`.
+  - `run` calls the row's `prepare` before `Process::spawn` (`Err` ends the session with that text) and emits each notice as `Event::Notice` before `initialize`. It removes `Prepared.scratch` (the folder and what is in it; a failure is ignored) on every way out: after `process.shutdown()` has returned, never before, and when the spawn fails. A guard that removes on drop, declared before the process, does both.
   - `must_hold` and `mode_unknown_for` replace `provider.mode_applies_next_turn` with `provider.mode_applies_next_turn || self.protocol.holds_turn_for_switch()`.
-- `Selection::configure` copies `data_dir` and `trust_workspace` from `current`. `main.rs` sets `config.data_dir = Some(directory.clone())` once `directory` is known. `Prober` gains `data_dir: Option<PathBuf>`, filled from `config.data_dir` in `attach_models` and put in the probe's `Config`.
+- `Selection::configure` copies `data_dir` and `trust_workspace` from `current`. `main.rs` sets `config.data_dir = Some(directory.clone())` once `directory` is known. `Prober` gains `data_dir: Option<PathBuf>` and `trust_workspace: bool`, filled from the session's `Config` in `attach_models` and put in the probe's `Config`, so a probe may run wherever the session itself may.
 
-- [ ] **Step 1: Write the failing tests.** In `live/mod.rs` tests: `every_vendor_but_the_demo_forks` (`forks` is true for Codex, Claude, opencode; false for the demo) and `a_provider_with_nothing_to_prepare_has_no_notices` (`prepare(&Config::new(Engine::CODEX, "codex", "/w")) == Ok(vec![])`). In `octet-core/src/model.rs` tests: `configure_keeps_the_data_directory_and_the_trust_flag` (a `current` with `data_dir: Some("/d")`, `trust_workspace: true` gives the same two in the result, for the same provider and for another).
+- [ ] **Step 1: Write the failing tests.** In `live/mod.rs` tests: `every_vendor_but_the_demo_forks` (`forks` is true for Codex, Claude, opencode; false for the demo) and `a_provider_with_nothing_to_prepare_has_no_notices` (`prepare(&Config::new(Engine::CODEX, "codex", "/w")) == Ok(Prepared::default())`). In `octet-core/src/model.rs` tests: `configure_keeps_the_data_directory_and_the_trust_flag` (a `current` with `data_dir: Some("/d")`, `trust_workspace: true` gives the same two in the result, for the same provider and for another). In `octet-tui/src/models.rs` tests: `a_probe_carries_the_data_directory_and_the_trust_flag` (the `Config` a probe is given holds the `Prober`'s two values; split the `Config` literal in `probe` into a function the test can call).
 - [ ] **Step 2: Run** `scripts/rust-env.sh cargo test -p octet-engine --lib every_vendor_but` → FAIL: no field `forks`.
 - [ ] **Step 3: Implement** the fields, the hook and the driver changes above.
 - [ ] **Step 4: Run** `make rust-check` → PASS.
@@ -101,8 +102,8 @@
 - Produces (in `settings.rs`, `pub(super)`):
   - `fn cli_dir(data_dir: &Path, mode: Mode) -> PathBuf`: `<data_dir>/antigravity/proceed` for `Mode::FullAccess`, `<data_dir>/antigravity/review` for the other three. Two folders, so sessions in different modes never share a file.
   - `fn merged(user: Option<&str>, mode: Mode) -> (String, Option<&'static str>)`: the JSON text of Octet's file, and a notice when `user` could not be used.
-  - `fn user_file() -> Option<PathBuf>`: `home_dir()` joined with `.gemini/antigravity-cli/settings.json`.
-  - `fn write(data_dir: &Path, mode: Mode, user_file: Option<&Path>) -> Result<Vec<String>, String>`: reads the user's file, writes `<cli_dir>/settings.json`, returns the notices.
+  - `fn vendor_home() -> Option<PathBuf>`: `home_dir()` joined with `.gemini`. The user's settings file is `<vendor home>/antigravity-cli/settings.json`.
+  - `fn write(data_dir: &Path, mode: Mode, vendor_home: Option<&Path>) -> Result<Vec<String>, String>`: reads the user's file, writes `<cli_dir>/settings.json`, returns the notices. The vendor home is a parameter so tests and the gate (Task 12) name their own.
   - `const USER_SETTINGS_NOTICE: &str = "Octet could not read your Antigravity settings file, so this session runs without your own Antigravity settings"`.
   - `const USER_SETTINGS_LIMIT: u64 = 1024 * 1024`.
 - Rules for `merged`:
@@ -114,6 +115,7 @@
   - A missing user file is no settings and no notice. One that cannot be read, is over `USER_SETTINGS_LIMIT`, or is not UTF-8 gives the notice.
   - The folder is created owner-only (`0o700`); the file is written to a temporary name in that folder (`0o600`) and renamed over `settings.json`, replacing whatever `agy` saved there.
   - Failing to create or write gives `Err("Octet could not write its Antigravity settings (<path>): <error>")`. The user's file is never opened for writing.
+  - Octet's folder must not be inside the vendor home, by a link or by `--journal-dir`: `data_dir` is resolved (`canonicalize`) and checked before anything is created, and `cli_dir` is resolved and checked again once it exists, before the write. Inside means equal to, or under, the resolved vendor home. Then: `Err("Octet will not keep its Antigravity settings inside Antigravity's own folder (<resolved path>); choose another --journal-dir")`. A vendor home that does not exist forbids nothing.
 
 - [ ] **Step 1: Write the failing tests** in `settings.rs`:
   - `the_asking_modes_pin_request_review_and_full_access_proceeds`: for `Ask`, `AcceptEdits`, `Auto` the parsed `toolPermission` is `"request-review"`; for `FullAccess` it is `"always-proceed"`.
@@ -121,9 +123,11 @@
   - `settings_that_are_not_an_object_are_replaced_with_a_notice`: `user = "[1]"` and `user = "{broken"` each give only `toolPermission` and `Some(USER_SETTINGS_NOTICE)`.
   - `permissions_that_are_not_an_object_are_dropped`: `{"permissions":"all"}` gives no `permissions` key.
   - `the_two_pins_live_in_different_folders`: `cli_dir(d, Ask) == cli_dir(d, Auto)` and `!= cli_dir(d, FullAccess)`, both under `d/antigravity`.
-  - `the_file_is_written_fresh_and_the_users_is_untouched`: in a `TempDir`, a user file with `always-proceed`; put a stale `settings.json` holding `{"stale":true}` in `cli_dir`; `write` then leaves Octet's file with `request-review` and no `stale`, and the user's file byte-for-byte as it was.
+  - `the_file_is_written_fresh_and_the_users_is_untouched`: in a `TempDir`, a user file with `always-proceed`; put a stale `settings.json` holding `{"stale":true}` in `cli_dir`; `write` (given the temp vendor home) then leaves Octet's file with `request-review` and no `stale`, and the user's file byte-for-byte as it was.
   - `an_oversized_or_unreadable_users_file_gives_the_notice_and_the_pin` (a file of `USER_SETTINGS_LIMIT + 1` bytes; a directory where the file should be).
   - `a_folder_that_cannot_be_written_stops_the_launch`: `data_dir` is a regular file → `Err` starting `Octet could not write its Antigravity settings`.
+  - `a_settings_folder_that_is_a_link_into_the_vendors_home_is_refused`: `<data>/antigravity/review` is a link to `<home>/.gemini/antigravity-cli`, which holds the user's file → `Err` starting `Octet will not keep its Antigravity settings inside`, and the user's file is byte-for-byte as it was.
+  - `a_data_directory_inside_the_vendors_home_is_refused_and_nothing_is_created`: `data_dir = <home>/.gemini/octet` → the same `Err`, and `<home>/.gemini/octet/antigravity` does not exist.
 - [ ] **Step 2: Run** `scripts/rust-env.sh cargo test -p octet-engine antigravity::settings` → FAIL: not defined.
 - [ ] **Step 3: Implement** the functions above.
 - [ ] **Step 4: Run** `make rust-check` → PASS.
@@ -143,10 +147,13 @@
   - `pub fn antigravity_trusted(data_dir: &Path, cwd: &Path, found: &WorkspaceConfig) -> bool`.
   - `pub fn antigravity_trust(data_dir: &Path, cwd: &Path, found: &WorkspaceConfig) -> Result<(), String>`.
   - `pub(super) fn check(config: &Config, data_dir: &Path) -> Result<(), String>`: `Ok` when nothing is found, the workspace is trusted, or `config.trust_workspace`; else the refusal.
+  - `pub(super) fn unchanged(cwd: &Path, started_with: Option<&str>) -> Result<(), String>`: for the check before every prompt (Task 6). `started_with` is the fingerprint found when the session started (`None`: nothing was found). `Ok` when nothing is found now or the fingerprint is the same; else, or when the workspace cannot be checked, `Err` with the changed text below.
 - Rules:
   - Links are followed. The walk under `plugins/` stops with `Err("Octet cannot check this workspace's .agents/plugins: more than 2000 files, or folders nested deeper than 16")` past `MAX_FILES = 2000` or `MAX_DEPTH = 16`, and with a like error past `MAX_BYTES = 64 MiB` read in all. A file that exists but cannot be read is an `Err` naming it.
   - The record is `<data_dir>/antigravity/trusted-workspaces.json`: an array of `{"workspace": <canonical path>, "fingerprint": <hex>}`, newest last, one entry per workspace, at most `MAX_TRUSTED = 1024` (the oldest dropped). Written like Task 3's file (temporary name, rename, `0o600`). A record that cannot be parsed counts as empty.
   - `--trust-workspace-config` trusts for that run only; it records nothing.
+  - The changed text, verbatim: `"This workspace's .agents configuration changed since this session started: {files}. Review it, then type /trust in Octet's terminal interface, or start again with --trust-workspace-config"`, with `{files}` as in the refusal.
+  - What this does not close (design decision 27): a file changed in the moment between Octet's check and Antigravity reading it. Do not add a second hash to narrow it.
   - The refusal, verbatim: `"Antigravity would load this workspace's .agents configuration, which can run commands without asking: {files}. Review it, then type /trust in Octet's terminal interface, or pass --trust-workspace-config"`. `{files}` is the first eight paths joined with `", "`, then `" and N more"`.
 
 - [ ] **Step 1: Write the failing tests** in `trust.rs`, each in a `TempDir`:
@@ -160,6 +167,8 @@
   - `trusting_again_keeps_one_entry_and_the_list_stays_bounded` (trust 1,025 workspaces through the record's own helper with fake paths; the file holds 1,024 and not the first).
   - `an_untrusted_workspace_is_refused_naming_its_files`: `check` errs with the refusal holding `.agents/hooks.json`; `Ok` with `trust_workspace: true`; `Ok` once trusted.
   - `more_than_eight_files_are_summarised` (ten plugin files → `"… and 2 more"`).
+  - `a_link_pointed_elsewhere_is_seen`: `.agents/hooks.json` is a link to `a.json`; pointing it at `b.json` (other bytes) changes the fingerprint.
+  - `configuration_that_changes_or_appears_after_the_start_is_reported`: `unchanged(cwd, None)` is `Ok` with no `.agents`, and `Err` starting `This workspace's .agents configuration changed` once `hooks.json` exists; with `started_with` the fingerprint of the first contents it is `Ok`, `Err` after an edit, and `Ok` again once the files are removed.
 - [ ] **Step 2: Run** `scripts/rust-env.sh cargo test -p octet-engine antigravity::trust` → FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `make rust-check` → PASS.
@@ -173,32 +182,35 @@
 - Modify: `crates/octet-testkit/src/scenario.rs` (new constants, documented as "Antigravity: …")
 
 **Interfaces:**
-- Produces a fake the tests in Tasks 6–8 drive. It reads two files at start: `<the --cli_dir_name folder>/settings.json` (its `toolPermission`) and, if present, `fake-agy.json` in its working directory, with the optional keys `version` (default `"1.5.5"`), `signedOut`, `rejectSwitches`, `hangSwitches` (booleans).
+- Produces a fake the tests in Tasks 6–8 drive. It reads two files at start: `<the --cli_dir_name folder>/settings.json` (its `toolPermission`) and, if present, `fake-agy.json` in its working directory, with the optional keys `version` (default `"1.5.5"`), `signedOut`, `rejectSwitches`, `hangSwitches`, `bareSwitchReply`, `noCompact` (booleans). Started with `--gemini-dir`, it writes `<that folder>/left-behind` as it exits.
   - `initialize` → `{"protocolVersion":1,"agentInfo":{"name":"antigravity","version":<version>},"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"audio":false,"embeddedContext":true},"sessionCapabilities":{"resume":{},"close":{},"load":{},"list":{}}}}`.
-  - `session/new` and `session/resume` → `{"sessionId": "fixture-agy" | <the resumed ID>, "configOptions": [model, thought_level, mode]}`, then a `session/update` `available_commands_update` listing `fixture-agy-skill` ("An Antigravity fixture skill"), `compact`, `goal` and `plan`.
+  - `session/new` and `session/resume` → `{"sessionId": "fixture-agy" | <the resumed ID>, "configOptions": [model, thought_level, mode]}`, then a `session/update` `available_commands_update` listing `fixture-agy-skill` ("An Antigravity fixture skill"), `compact` (not with `noCompact`), `goal` and `plan`.
     - `model` options: `gemini-fixture-flash` ("Gemini Fixture Flash", current), `claude-fixture` ("Claude Fixture"), `plain-fixture` ("Plain Fixture").
     - `thought_level` options `low`, `medium`, `high`, current `high`; absent while the model is `plain-fixture`.
     - `mode` options `default` (current), `accept-edits`, `auto`, `plan`.
     - A resume starts at `default` and `high` again, as the real CLI does. Resuming `scenario::AGY_MISSING_SESSION` answers `{"code":-32603,"message":"Failed to read session missing-session"}`.
     - With `signedOut`, both answer `{"code":-32000,"message":"Authentication required"}`.
   - `session/fork` → `{"code":-32601,"message":"Method not found"}`.
-  - `session/set_config_option` → the updated `configOptions`, then a `config_option_update` (and, for `mode`, a `current_mode_update`). An unknown mode answers `{"code":-32602,"message":"Unknown mode: <value>"}`. With `rejectSwitches`, every `mode` request after the first gets that error; with `hangSwitches`, every one after the first gets no reply.
+  - `session/set_config_option` → the updated `configOptions`, then a `config_option_update` (and, for `mode`, a `current_mode_update`). An unknown mode answers `{"code":-32602,"message":"Unknown mode: <value>"}`. With `rejectSwitches`, every `mode` request after the first gets that error; with `hangSwitches`, every one after the first gets no reply; with `bareSwitchReply`, every one after the first gets the result `{}` and no update.
   - `session/prompt`, scripted by the first text block. A turn "asks" when `toolPermission` is not `always-proceed` and the mode is `default`, or `accept-edits` for a command.
     - no script: a `user_message_chunk`, an `agent_thought_chunk`, `agent_message_chunk` `scenario::AGY_REPLY`, then `{"stopReason":"end_turn","usage":{"inputTokens":40,"outputTokens":2,"totalTokens":42}}`. Several text blocks are echoed joined by a newline instead.
     - `HOLD`: holds until `session/cancel`, then `{"stopReason":"cancelled"}`.
-    - `APPROVAL`: `tool_call` (`toolCallId` `call-1`, `name` `run_command`, `kind` `execute`, `title` `echo fixture`, `rawInput` `{"command":"echo fixture"}`, `status` `in_progress`), an update `pending`, and when it asks a `session/request_permission` with `id` `"1"` and the two options. It then sends `in_progress`, `completed` (allowed, or not asked) or `failed` (denied), the text `allow`, `deny`, `cancelled` or `ran`, and `end_turn`.
+    - `APPROVAL`: `tool_call` (`toolCallId` `call-1`, `name` `run_command`, `kind` `execute`, `title` `echo fixture`, `rawInput` `{"command":"echo fixture"}`, `status` `in_progress`), an update `pending`, and when it asks a `session/request_permission` with `id` `"1"` and the two options. It then sends `in_progress`, `completed` (allowed, or not asked) or `failed` (denied), the text `allow`, `deny`, `cancelled` or `ran`, and `end_turn`. In every script, `tool_call_update` frames carry `toolCallId` and `status` only: no `kind`, no `name`.
     - `AGY_EDIT`: the same for `write_file`, `kind` `edit`, `title` `File fixture.txt`, one location `<cwd>/fixture.txt`; it asks only in `default`. Text `wrote` when not asked.
     - `APPROVALS_9`, `TOOL_FAIL`, `FAIL` (`{"code":-32603,"message":"Internal error: fixture failure"}`): as opencode's fake.
     - `AGY_UNASKED`: the `APPROVAL` tool call, never asking whatever the mode, text `ran unasked`; a `session/cancel` meanwhile ends it `cancelled`.
     - `AGY_SLOW_EDIT`: the `AGY_EDIT` tool call's first frame, then it waits for the next `session/set_config_option` to arrive, then `completed` with no request, `end_turn`.
     - `AGY_TO_PLAN`: `current_mode_update` and `config_option_update` naming `plan`, a text, `end_turn`.
-    - `AGY_TO_AUTO`: the same naming `auto`, then it holds until `session/cancel` → `cancelled`.
+    - `AGY_TO_AUTO`: the same naming `auto`, then it holds until `session/cancel`. It then waits for the next `session/set_config_option`, answers it, sends the text `late`, and only then answers the prompt `cancelled`.
+    - `AGY_IDLE_PLAN`: a normal reply and `end_turn`; after the prompt's reply, the two `AGY_TO_PLAN` updates.
+    - `AGY_LATE_COMMAND`: it waits for the next `session/set_config_option` and answers it, then runs `AGY_UNASKED`.
+    - `AGY_FLOOD`: 1,025 tool calls of kind `read` (`call-1` … `call-1025`), each `in_progress` then `completed`, a text, `end_turn`; a `session/cancel` meanwhile ends it `cancelled`.
     - `AGY_NEW_MODEL`: a `config_option_update` whose `model` is `claude-fixture`, a text, `end_turn`.
     - `AGY_SUBAGENT`: `tool_call` `invoke_subagent` (`kind` `other`) `in_progress` then `completed`, a text, `end_turn`.
     - `AGY_OTHER_SESSION`: a `session/request_permission` for session `other-ses`, then a normal reply.
-    - `PARAMS`: the text is a JSON object `{"argv":[…],"settings":<the parsed settings file>,"opened":<the session method>,"sets":[[configId, value], …]}`.
+    - `PARAMS`: the text is a JSON object `{"argv":[…],"settings":<the parsed settings file>,"opened":<the session method>,"sets":[[configId, value], …],"prompts":<how many session/prompt requests came before this one>}`.
     - an `image` block is echoed as `image <mimeType> <data length>`.
-- New `scenario` constants: `AGY_REPLY = "Hello Antigravity"`, `AGY_SKILL = "fixture-agy-skill"`, `AGY_MISSING_SESSION = "missing-session"`, `AGY_EDIT = "agy-edit"`, `AGY_UNASKED = "agy-unasked"`, `AGY_SLOW_EDIT = "agy-slow-edit"`, `AGY_TO_PLAN = "agy-to-plan"`, `AGY_TO_AUTO = "agy-to-auto"`, `AGY_NEW_MODEL = "agy-new-model"`, `AGY_SUBAGENT = "agy-subagent"`, `AGY_OTHER_SESSION = "agy-other-session"`.
+- New `scenario` constants: `AGY_REPLY = "Hello Antigravity"`, `AGY_SKILL = "fixture-agy-skill"`, `AGY_MISSING_SESSION = "missing-session"`, `AGY_EDIT = "agy-edit"`, `AGY_UNASKED = "agy-unasked"`, `AGY_SLOW_EDIT = "agy-slow-edit"`, `AGY_TO_PLAN = "agy-to-plan"`, `AGY_TO_AUTO = "agy-to-auto"`, `AGY_NEW_MODEL = "agy-new-model"`, `AGY_SUBAGENT = "agy-subagent"`, `AGY_OTHER_SESSION = "agy-other-session"`, `AGY_IDLE_PLAN = "agy-idle-plan"`, `AGY_LATE_COMMAND = "agy-late-command"`, `AGY_FLOOD = "agy-flood"`.
 
 - [ ] **Step 1: Write the fake**, mirroring `protocol-child/opencode.rs`'s fixture struct and `run()` loop.
 - [ ] **Step 2: Build it.** `scripts/rust-env.sh cargo build -p octet-testkit --bins` → OK. `make rust-check` → PASS.
@@ -209,6 +221,7 @@
 **Files:**
 - Modify: `crates/octet-engine/src/live/antigravity.rs` (the row, `AntigravityProtocol`, `start`, `prepare`, `launch_args`)
 - Modify: `crates/octet-engine/src/live/mod.rs` (`Engine::ANTIGRAVITY`, `ALL = [CODEX, CLAUDE, OPENCODE, ANTIGRAVITY, DEMO]`, the doc of `Engine::parse`, the doc of `Event::Effort`, exports)
+- Modify: `crates/octet-core/src/remote/protocol.rs` (`CHOICES` at `:179`: `Engine` values `["antigravity", "claude", "codex", "demo", "opencode"]`; the expected line at `:2349`), then regenerate `apps/mobile/src/protocol.ts`: `OCTET_WRITE_PROTOCOL=1 scripts/rust-env.sh cargo test -p octet-core the_checked_in`. That file is generated; never edit it by hand.
 - Test: `crates/octet-engine/tests/live.rs`
 
 **Interfaces:**
@@ -217,8 +230,9 @@
   - `pub const ANTIGRAVITY: Engine`; `pub const ANTIGRAVITY_VERIFIED_VERSIONS: &[&str] = &["1.5.5"]`, exported from `live`.
   - The row: the Global Constraints `modes`; `steer: false`, `mode_applies_next_turn: false`, `inline_images: true`, `effort_live: true`, `takes_effort: true`, `ids_carry_name: false`, `efforts: &[]`, `shutdown_grace: Duration::from_secs(1)` (375 ms measured with a session open), `lists_models: true`, `commands_expand_shell: false`, `forks: false`, `carries_others_models: true`, `launch_env: super::no_env`.
   - `fn mode_id(mode: Mode) -> &'static str` (Global Constraints) and `fn mode_of(id: &str, pinned: Mode) -> Option<Mode>`: `default` is `pinned` when `pinned` is `FullAccess`, else `Ask`; `accept-edits` and `auto` map back; anything else is `None`.
-  - `fn launch_args(config: &Config) -> Vec<OsString>`: `["acp", "--cli_dir_name", <settings::cli_dir(data_dir, mode)>]`, plus `["--gemini-dir", <data_dir>/antigravity/probe-home]` when `config.catalog_only`. Without a `data_dir` it is `["acp"]`, which never launches because `prepare` fails first.
-  - `fn prepare(config: &Config) -> Result<Vec<String>, String>`, in this order: no `data_dir` → `Err("Antigravity needs Octet's data directory to keep its settings in")`; plugins switched off and not a probe → `Err(NO_PLUGIN_SWITCH)`; `trust::check`; for a probe, create `probe-home`; `settings::write(data_dir, config.mode, settings::user_file().as_deref())`.
+  - `fn launch_args(config: &Config) -> Vec<OsString>`: `["acp", "--cli_dir_name", <settings::cli_dir(data_dir, mode)>]`, plus `["--gemini-dir", <settings::probe_home(data_dir)>]` when `config.catalog_only`. Without a `data_dir` it is `["acp"]`, which never launches because `prepare` fails first.
+  - `fn probe_home(data_dir: &Path) -> PathBuf` in `settings.rs`: `<data_dir>/antigravity/probe-<this process's ID>`. One Octet process runs one Antigravity probe at a time (`Models::probe` refuses a second for the same provider), so a folder per process is a folder per probe; two Octet processes never share one.
+  - `pub fn antigravity_prepare(config: &Config, vendor_home: Option<&Path>) -> Result<Prepared, String>`, exported from `live` for the gate, in this order: no `data_dir` → `Err("Antigravity needs Octet's data directory to keep its settings in")`; plugins switched off and not a probe → `Err(NO_PLUGIN_SWITCH)`; `trust::check`; `settings::write(data_dir, config.mode, vendor_home)`, whose notices it returns; for a probe, remove every `<data_dir>/antigravity/probe-*` folder last modified over an hour ago (a process that died left it), create `probe_home` owner-only, and return it as `Prepared.scratch`. The row's `prepare` is `antigravity_prepare(config, settings::vendor_home().as_deref())`.
   - `const NO_PLUGIN_SWITCH: &str = "Antigravity has no switch to turn plugins or their hooks off; start without --no-plugins and --no-plugin-hooks"`.
   - `const SIGN_IN: &str = "Sign in to Antigravity first: run `agy`"`.
 
@@ -227,20 +241,21 @@ Handshake (only moves forward; a reply out of order is `"Unexpected protocol ini
 2. `session/new {cwd, mcpServers: []}`, or `session/resume {sessionId, cwd, mcpServers: []}` when `config.resume` is set and this is not a probe.
    - An error whose `code` is `-32000`, or whose message holds `auth`, `sign in`, `log in` or `login` (any case), stops the session with `SIGN_IN`. Any other error: `"Antigravity could not open the session: {message}"`.
    - Success: `core.session` (the reply's, else the resumed ID), `Event::Models(acp::catalog(configOptions))`.
-   - A probe then waits up to 2 s for `available_commands_update` (`Event::Skills`), then `Event::Ready { session: String::new() }`, as opencode's probe does. `stopping` removes `probe-home` for a probe (only a path ending `antigravity/probe-home`).
+   - A probe then waits up to 2 s for `available_commands_update` (`Event::Skills`), then `Event::Ready { session: String::new() }`, as opencode's probe does. The driver removes the probe's folder once `agy` has stopped (Task 2's `Prepared.scratch`); the protocol's `stopping` does not.
 3. If `config.model` is set and differs from the `model` option's `currentValue`: set `model`. An error stops the session: `"Antigravity refused the model {model}: {message}"`.
 4. If `config.effort` is `Some(level)`: when the options have a `thought_level` listing it, set it; when they list others, `Event::Notice("Antigravity takes effort {a, b or c} for this model; it keeps {current}")`; when there is no `thought_level`, `Event::Notice("This Antigravity model takes no thinking level")`. In the last two cases `core.config.effort = None`.
-5. Set `mode` to `mode_id(core.mode)`, always. An error, or a reply whose `mode` `currentValue` is another ID, stops the session: `"Antigravity would not switch to mode {id} ({reason}); Octet stopped the session so Antigravity never acts outside the mode you chose"`.
+5. Set `mode` to `mode_id(core.mode)`, always. An error, a reply that names no mode (reason `its reply named no mode`), or a reply whose `mode` `currentValue` is another ID, stops the session: `"Antigravity would not switch to mode {id} ({reason}); Octet stopped the session so Antigravity never acts outside the mode you chose"`.
 6. `Phase::Idle`, `Event::Ready`, `Event::ModelSelected(model)`, `Event::Effort(level)` when step 4 set one, `core.adopt_mode(Some((Some(core.mode), id)))`.
 
 A resumed session goes through steps 3–5 like a new one: that is what puts its mode, model and effort back.
 
 Turn: `session/prompt {sessionId, prompt: [{type:"text", text}, …acp::image_blocks]}`.
 - `agent_message_chunk` → `Event::Text`. `agent_thought_chunk`, `user_message_chunk` and `session_info_update` are not shown.
-- `tool_call` / `tool_call_update` → `Event::Tool`: `id` is `toolCallId`; `name` is the first frame's `name`, else its `title`, else `"tool"`; `target` is `acp::frame_target`, else the title for kind `execute`; `phase` is `Done` for `completed`, `Failed` for `failed`, else `Running`; `detail` is `acp::content_text`. At most 256 calls are remembered per turn, each with its `kind`.
+- `tool_call` / `tool_call_update` → `Event::Tool`: `id` is `toolCallId`; `name` is the first frame's `name`, else its `title`, else `"tool"`; `target` is `acp::frame_target`, else the title for kind `execute`; `phase` is `Done` for `completed`, `Failed` for `failed`, else `Running`; `detail` is `acp::content_text`. At most `MAX_TOOLS = 1024` calls are remembered per turn, each with its name, target and the `kind` of its first frame (later frames need not repeat it). Task 8 says what happens past that.
 - `available_commands_update` → `Event::Skills(acp::commands(list))`, and the list is kept for `compact`.
 - The prompt's reply → `Event::Usage("{totalTokens} tokens")` when present, then `finish_turn`: `end_turn` → `Completed` (`Interrupted` if a cancel was sent this turn), `cancelled` → `Interrupted`, another reason → `Outcome::Other`, an error reply → `Failed` with its message.
-- `session/update` frames for another session, or while no turn runs, change nothing shown; `is_progress` is false for another session's frames.
+- `session/update` frames for another session change nothing; `is_progress` is false for them. For this session, `available_commands_update`, `config_option_update` and `current_mode_update` are read in every phase (the command list arrives before `Ready`; Task 8 handles a mode change while idle). Turn output (text, thoughts, tool calls) while no turn runs is dropped.
+- **Before every prompt, skill and compaction**, the workspace is checked again: `trust::unchanged(cwd, started_with)`, run with `tokio::task::spawn_blocking`, where `started_with` is the fingerprint `antigravity_workspace_config(cwd)` gave when the protocol's `initialize` ran. On `Err(text)` nothing is sent and the turn ends `Failed` with `"{NOT_SENT}{text}"`. This holds with `--trust-workspace-config` too: the flag trusts what was there at the start. (Design decision 27: Antigravity may itself write `.agents/hooks.json` in `accept-edits`, and a hook runs with the next prompt.)
 
 `set_effort` (live): before the session is ready, record the level in `core.config.effort` for step 4. Ready: a level the model lists is set with `thought_level`, and its reply records it, emits `Event::Effort(Some(level))` and `driver::effort_notice`; a level it does not list, or a model without levels, gets step 4's notice and `Event::Effort(core.config.effort.clone())`; `None` sets the level the model had when the session opened, when that differs from the current one, else records `None` and emits `Event::Effort(None)` with the notice. It always returns `Ok(true)`.
 
@@ -260,13 +275,17 @@ Turn: `session/prompt {sessionId, prompt: [{type:"text", text}, …acp::image_bl
   - `antigravity_needs_a_data_directory`, `antigravity_refuses_the_plugin_switches` (`plugins.hooks = false` → `NO_PLUGIN_SWITCH`).
   - `antigravity_an_untrusted_workspace_does_not_start`: `ws/.agents/hooks.json` exists → the error holds `.agents/hooks.json`, and `PARAMS` is never reached; with `trust_workspace = true` it connects.
   - `antigravity_image_goes_inline`: a 1×1 PNG → turn text `image image/png <n>`.
-  - `antigravity_probe_lists_models_and_skills`: `probe(config, PROBE_LIMIT)` gives three models and `AGY_SKILL`, and `data/antigravity/probe-home` is gone within 3 s of the probe returning.
-  - Unit tests in `antigravity.rs`: `every_mode_has_a_mode_id_and_back` (`mode_of(mode_id(m), m) == Some(m)` for each `Mode::ALL`; `mode_of("default", Ask) == Some(Ask)`; `mode_of("plan", Ask) == None`); `the_launch_names_octets_settings_folder` (`["acp","--cli_dir_name","/d/antigravity/review"]` for `data_dir = "/d"` in `Ask`); `a_probe_runs_in_a_scratch_home` (with `catalog_only`, the arguments end `["--gemini-dir","/d/antigravity/probe-home"]`).
+  - `antigravity_probe_lists_models_and_skills`: `probe(config, PROBE_LIMIT)` gives three models and `AGY_SKILL`; once it has returned, `data/antigravity` holds no entry starting `probe-`, although the fake wrote `left-behind` there as it exited.
+  - `antigravity_a_probe_that_cannot_start_leaves_no_folder`: `binary` names a file that does not exist → an error, and no `probe-` entry.
+  - `antigravity_configuration_that_appears_mid_session_stops_the_next_prompt`: one turn completes; the test writes `ws/.agents/hooks.json`; the next prompt → `Error` starting `Not sent: This workspace's .agents configuration changed since this session started: .agents/hooks.json`, `Finished{Failed}`; after the test removes the file, `PARAMS` runs and reports `prompts == 1`.
+  - `antigravity_trusted_configuration_edited_mid_session_stops_the_next_prompt`: the same with `trust_workspace = true` and a `hooks.json` present from the start, then edited.
+  - Unit tests in `antigravity.rs`: `every_mode_has_a_mode_id_and_back` (`mode_of(mode_id(m), m) == Some(m)` for each `Mode::ALL`; `mode_of("default", Ask) == Some(Ask)`; `mode_of("plan", Ask) == None`); `the_launch_names_octets_settings_folder` (`["acp","--cli_dir_name","/d/antigravity/review"]` for `data_dir = "/d"` in `Ask`); `a_probe_runs_in_a_scratch_home` (with `catalog_only`, the arguments end `["--gemini-dir", "/d/antigravity/probe-<std::process::id()>"]`); `preparing_a_probe_removes_only_old_probe_folders` (in a `TempDir`: `probe-1` with its modified time set two hours back is gone after `antigravity_prepare` for a probe, `probe-2` made now is kept, and `Prepared.scratch` exists).
   - `antigravity_handshake_out_of_order_is_an_error`.
   - In `live/mod.rs`, extend `claude_has_time_to_exit_on_its_own` with Antigravity's grace, and fix tests that list every vendor: their expectations, not the code.
+  - `octet-core`'s `the_closed_sets_match_the_engines_modes_and_refusal_codes` and `the_checked_in_typescript_is_current` fail until the schema and `protocol.ts` above are updated.
 - [ ] **Step 2: Run** `scripts/rust-env.sh cargo test -p octet-engine --test live antigravity_` → FAIL.
 - [ ] **Step 3: Implement** `AntigravityProtocol` (state: `next_id`, `requests: HashMap<u64, Outstanding>`, `cancel_sent`, the last reported `configOptions` values (`model`, `mode`, the `thought_level` list, its current and opening values), `commands: Vec<String>` bounded by `MAX_SKILLS`, `tools: HashMap<String, Tool>`, `probe_wait`) with an `Outstanding` enum (`Initialize`, `Open(Option<String>)`, `SetModel`, `SetEffort{..}`, `SetMode`, `Prompt`), sending through a `request` helper as opencode's does.
-- [ ] **Step 4: Run** `make rust-check` → PASS.
+- [ ] **Step 4: Run** `make rust-check` and `make mobile-check` → PASS. If `mobile-check` fails because a phone-app list no longer matches the `Engine` type, make Task 11's four phone-app edits now and say so in the commit.
 - [ ] **Step 5: Commit** `git commit -m "Antigravity provider: handshake, models, effort, turns, resume and probe over ACP"`
 
 ### Task 7: Approvals, cancel, live mode switches, skills and compact
@@ -280,10 +299,11 @@ Turn: `session/prompt {sessionId, prompt: [{type:"text", text}, …acp::image_bl
 - Produces:
   - `answer(wire, allow)`: `acp::permission_reply(wire, allow, ("allow", "deny"))`.
   - `pub fn antigravity_stray_reply(value: &Value) -> Option<Value>`: `acp::stray_reply(value, ("allow", "deny"))`, exported from `live`.
-  - A `session/request_permission` for this session while `Phase::InTurn`: its `toolCall.toolCallId` is remembered as asked (Task 8 reads it), then `core.queue_approval(wire, detail, summary)` with `acp::approval(toolCall, known, "Antigravity")`. Any other request gets the stray reply: quietly for `fs/*` and `terminal/*`; with `"Antigravity asked for a permission {while its turn is being cancelled | outside this session's running turn}; Octet rejected it"` for a permission; else `"Request declined: {method}"`.
+  - A `session/request_permission` for this session while `Phase::InTurn`: its `toolCall.toolCallId` is marked as asked in the tool table (Task 8 reads it; a call not yet in the table is added, under the same `MAX_TOOLS`), then `core.queue_approval(wire, detail, summary)` with `acp::approval(toolCall, known, "Antigravity")`. Any other request gets the stray reply: quietly for `fs/*` and `terminal/*`; with `"Antigravity asked for a permission {while its turn is being cancelled | outside this session's running turn}; Octet rejected it"` for a permission; else `"Request declined: {method}"`.
   - `interrupt`: `acp::cancel(session)`, `cancel_sent = true`.
   - `set_mode(target)`: `session/set_config_option {configId:"mode", value: mode_id(target)}` with a deadline of `limits.mode_confirm`; `mode_change_pending()` is true until the reply or the deadline; `holds_turn_for_switch()` is `true`.
-    - A reply naming `mode_id(target)` (or carrying no options): `core.mode = target`, `Event::ModeChanged(target)`.
+    - A reply naming `mode_id(target)`: `core.mode = target`, `Event::ModeChanged(target)`. Only this confirms a switch.
+    - A reply that names no mode stops the session with step 5's error and the reason `its reply named no mode`: Octet no longer knows the mode (design decision 28).
     - An error: `Event::Notice("Antigravity did not switch to {label}: {message}")`, `Event::ModeChanged(core.mode)`.
     - A reply naming the mode already in force: the same notice with `Antigravity reported mode {id}`. A reply naming any other mode stops the session with step 5's error.
     - The deadline: `Event::Notice("Antigravity has not confirmed the switch to {label}")`, `Event::ModeChanged(core.mode)`, `take_switch_timed_out()` true once, and `mode_unsettled()` is the target until its reply comes; a late reply is applied as above with `"Antigravity confirmed the switch to {label} late"`. At most 8 unanswered switches are kept; a ninth is refused with `"Antigravity has not confirmed 8 earlier mode switches; wait or reconnect"`.
@@ -299,7 +319,8 @@ Turn: `session/prompt {sessionId, prompt: [{type:"text", text}, …acp::image_bl
   - `antigravity_refused_switch_keeps_the_mode`: fixture `{"rejectSwitches":true}` → a notice starting `Antigravity did not switch to accept-edits`, no `ModeChanged(AcceptEdits)` within 1 s.
   - `antigravity_a_prompt_waits_for_an_unanswered_switch_and_is_not_sent`: fixture `{"hangSwitches":true}`, `quick()` limits; `SetMode(AcceptEdits)` then a prompt → the notice `Waiting for Antigravity to confirm the switch to accept-edits before sending your prompt`, then an error starting `Not sent: `, and a later prompt is refused with `its mode is unknown`.
   - `antigravity_another_sessions_permission_is_rejected_not_shown`: `AGY_OTHER_SESSION` → no `Approval`, a notice starting `Antigravity asked for a permission outside`.
-  - `antigravity_skill_runs_as_a_slash_prompt` (text `/fixture-agy-skill go`; with context, the context comes first); `antigravity_compact_uses_its_command` (text `/compact`, then the notice `Context compacted`).
+  - `antigravity_skill_runs_as_a_slash_prompt` (text `/fixture-agy-skill go`; with context, the context comes first); `antigravity_compact_uses_its_command` (text `/compact`, then the notice `Context compacted`); `antigravity_compact_is_refused_where_the_session_has_no_such_command` (fixture `{"noCompact":true}` → `Error` `Antigravity does not offer compaction in this session`, `Finished{Failed}`, and a later `PARAMS` reports `prompts == 0`).
+  - `antigravity_a_switch_reply_naming_no_mode_stops_the_session`: fixture `{"bareSwitchReply":true}`, `SetMode(AcceptEdits)` → the session ends with an error starting `Antigravity would not switch to mode accept-edits (its reply named no mode)`, and no `ModeChanged(AcceptEdits)`.
   - `antigravity_failed_turn_shows_the_message`; `antigravity_tool_error_is_a_failed_call`.
   - Unit test in `antigravity.rs`: `antigravity_stray_requests_are_refused` (`fs/read_text_file` → `-32601`; a permission request → `deny`; an `id` that is a string comes back a string).
 - [ ] **Step 2: Run** `scripts/rust-env.sh cargo test -p octet-engine antigravity_` → FAIL.
@@ -314,17 +335,19 @@ Turn: `session/prompt {sessionId, prompt: [{type:"text", text}, …acp::image_bl
 - Test: `crates/octet-engine/tests/live.rs`
 
 **Interfaces:**
-- Consumes: Task 7's asked set, tool table and switch state.
+- Consumes: the tool table (Task 6) with its asked marks (Task 7), and Task 7's switch state.
 - Produces:
-  - **The tripwire.** `fn tripped(kind: &str, loosest: Mode) -> Option<&'static str>`: `Some("a command")` for kind `execute` when `loosest` is `Ask` or `AcceptEdits`; `Some("an edit")` for kinds `edit`, `delete` and `move` when `loosest` is `Ask`; else `None`. `loosest` is the loosest mode in force since the turn began (`core.mode` at its start, raised by each switch confirmed during it, order `Ask < AcceptEdits < Auto < FullAccess`).
+  - **The tripwire.** `fn tripped(kind: &str, loosest: Mode) -> Option<&'static str>`: `Some("a command")` for kind `execute` when `loosest` is `Ask` or `AcceptEdits`; `Some("an edit")` for kinds `edit`, `delete` and `move` when `loosest` is `Ask`; else `None`. `loosest` is the loosest mode in force while that tool call ran: `core.mode` when its first frame arrived, raised by each switch confirmed before it ended (order `Ask < AcceptEdits < Auto < FullAccess`). It is kept per call in the tool table, not per turn: a call begun after a switch to a tighter mode is judged by the tighter mode (design decision 24, amended).
     - It is checked when a tool call's frame says `completed` or `failed` and no permission request named its `toolCallId` this turn.
-    - When it fires: `session/cancel` is sent once, and the turn ends `Failed` with `"Antigravity ran {what} without asking while Octet shows {label}: {target}. Octet's settings did not take effect with this agy, so ask and accept-edits cannot be relied on. Octet cancelled the turn and sends no more prompts in this session. What ran cannot be undone"`.
+    - When it fires: the turn is cancelled (see **Cancelling a turn** below) and ends `Failed` with `"Antigravity ran {what} without asking while Octet shows {label}: {target}. Octet's settings did not take effect with this agy, so ask and accept-edits cannot be relied on. Octet cancelled the turn and sends no more prompts in this session. What ran cannot be undone"`.
     - From then on every prompt, skill and compaction ends `Failed`, unsent, with `"{NOT_SENT}Antigravity acted without asking earlier in this session, so Octet sends it nothing more. Start a new session"`.
+    - **Past `MAX_TOOLS`.** While the mode is `Ask` or `AcceptEdits`, a tool call that cannot be remembered (the table is full), or a frame for a call that was not remembered, cancels the turn, which ends `Failed` with `"Antigravity made more than 1024 tool calls in one turn, more than Octet checks for unasked actions. Octet cancelled the turn"`. The session goes on. In `Auto` and `FullAccess` such calls are shown and not remembered.
+  - **Cancelling a turn** (the tripwire, the tool limit, a looser mode): as opencode's `stop_subtask` does. The reason is kept, `core.phase = Phase::Interrupting`, `interrupt`, `core.deadline = deadline_after(core.limits.interrupt)`, `core.deny_all_pending()`. The turn ends only when the prompt's own reply arrives, as `Failed` with the kept reason whatever the stop reason. It never ends earlier: a prompt sent before that reply would be ended by it.
   - **Antigravity changes the mode** (a `current_mode_update` or `config_option_update` naming a mode other than `mode_id(core.mode)` while none of Octet's switches is unanswered):
-    - Looser than Octet's during a turn (`accept-edits` or `auto` under `Ask`; `auto` under `AcceptEdits`): `session/cancel`, the mode is set back at once, and the turn ends `Failed` with `"Antigravity moved to its {id} mode while Octet shows {label}. Octet cancelled the turn and set {label} back"`.
+    - Looser than Octet's during a turn (`accept-edits` or `auto` under `Ask`; `auto` under `AcceptEdits`): the turn is cancelled, the mode is set back at once, and the turn ends `Failed` with `"Antigravity moved to its {id} mode while Octet shows {label}. Octet cancelled the turn and set {label} back"`.
     - Anything else (`plan`, a tighter mode, or any change while idle): `Event::Notice("Antigravity moved to its {id} mode. Octet sets {label} back before the next prompt")`, and the mode is set back when the turn ends, or at once when idle.
     - Setting it back is a `session/set_config_option` that counts as a pending switch (so the driver holds the next prompt). Its confirmation shows nothing; an error or another mode stops the session with `"Antigravity would not go back to mode {id} ({reason}); Octet stopped the session so Antigravity never acts outside the mode you chose"`. `Event::ModeChanged` is not emitted for Antigravity's own change: the header keeps Octet's mode.
-  - **Antigravity changes the model** (a `config_option_update` naming another `model`): `Event::ModelSelected(model)`, and the thinking levels are read again from that update.
+  - **Antigravity changes the model** (a `config_option_update` naming another `model`): `Event::ModelSelected(model)`, and the thinking levels are read again from that update. A reconnect asks for the model the user chose, as for every provider, not the one Antigravity moved to.
   - **Subagents.** The first `tool_call` named `invoke_subagent` in a turn whose mode is `Ask` or `AcceptEdits`: `Event::Notice("Antigravity started a subagent. Its approval requests never reach Octet, so what it must ask for waits and does not run. In auto, Antigravity's own checker decides")`. Once a turn; the turn goes on.
 
 - [ ] **Step 1: Write the failing tests:**
@@ -333,6 +356,10 @@ Turn: `session/prompt {sessionId, prompt: [{type:"text", text}, …acp::image_bl
   - `antigravity_an_unasked_command_trips_in_accept_edits_too`; `antigravity_an_unasked_edit_is_fine_in_accept_edits` (`AGY_EDIT` → `wrote`, `Completed`).
   - `antigravity_an_edit_begun_under_accept_edits_does_not_trip_after_a_switch_to_ask` (Review Focus): `mode = AcceptEdits`, `AGY_SLOW_EDIT`, then `SetMode(Ask)` → `ModeChanged(Ask)`, `Finished{Completed}`, no error.
   - `antigravity_a_denied_command_does_not_trip` (`APPROVAL` denied ends `failed` with a request → `Completed`).
+  - `antigravity_a_command_begun_after_tightening_to_ask_trips` (Review Focus): `mode = Auto`, `AGY_LATE_COMMAND`, then `SetMode(Ask)` → `ModeChanged(Ask)`, then `Error` starting `Antigravity ran a command without asking while Octet shows ask`, `Finished{Failed}`.
+  - `antigravity_more_tool_calls_than_octet_checks_cancels_the_turn`: `AGY_FLOOD` in `Ask` → `Error` starting `Antigravity made more than 1024 tool calls`, `Finished{Failed}`, and the next prompt completes; in `Auto` the flood ends `Completed`.
+  - `antigravity_a_turn_octet_cancels_ends_only_with_its_own_reply`: `AGY_TO_AUTO` in `Ask` → the turn's text holds `late`, exactly one `Finished` follows it, and the next prompt completes with `scenario::AGY_REPLY`.
+  - `antigravity_moving_itself_to_plan_while_idle_is_put_back_at_once`: `AGY_IDLE_PLAN` → `Finished{Completed}`, then the notice; `PARAMS` then shows `sets` ending `["mode","default"]`.
   - `antigravity_moving_itself_to_plan_is_put_back_before_the_next_prompt`: `AGY_TO_PLAN` → the notice, `Finished{Completed}`, no `ModeChanged`; then `PARAMS` shows `sets` ending `["mode","default"]`.
   - `antigravity_moving_itself_to_a_looser_mode_cancels_the_turn`: `AGY_TO_AUTO` in `Ask` → `Error` starting `Antigravity moved to its auto mode while Octet shows ask`, `Finished{Failed}`, and `sets` ends `["mode","default"]`.
   - `antigravity_a_model_it_changes_itself_reaches_the_header` (Review Focus): `AGY_NEW_MODEL` → `ModelSelected("claude-fixture")`.
@@ -397,12 +424,12 @@ Antigravity lists `claude-sonnet-4-6`, `claude-opus-4-6-thinking` and `gpt-oss-1
 
 **Files:**
 - Modify: `crates/octet/src/service.rs` (`TOOLS: [&str; 5]` gains `"agy"` last; the doc at `:285`; the test at `:716`)
-- Modify: `apps/mobile/app/new.tsx:28`, `apps/mobile/src/protocol.ts:11`, `apps/mobile/src/model/enums.ts:5`, `apps/mobile/src/recent.ts:7`, `apps/mobile/src/sessions.ts:28` (`antigravity`, shown as `"Antigravity"`)
+- Modify: `apps/mobile/app/new.tsx:28`, `apps/mobile/src/model/enums.ts:5`, `apps/mobile/src/recent.ts:7`, `apps/mobile/src/sessions.ts:28` (`antigravity`, shown as `"Antigravity"`). `apps/mobile/src/protocol.ts` was regenerated in Task 6.
 - Modify: `docs/rust/adding-a-provider.md` (`forks`, `prepare`, `holds_turn_for_switch`, `acp.rs`), `docs/tui.md` and `docs/rust/tui-features.md` (Antigravity in the provider lists; `/trust`; what its modes mean; no `/fork`, no `/steer`; tokens-only usage), `docs/remote-control.md` (`agy` among the tools `octet hub install` records)
 
 - [ ] **Step 1: Extend the failing test** at `service.rs:716`: a fake `agy` in a directory of its own is found after `tmux`, `claude`, `codex` and `opencode`.
 - [ ] **Step 2: Run it** → FAIL.
-- [ ] **Step 3: Implement** the `TOOLS` entry, the five phone-app lines and the docs.
+- [ ] **Step 3: Implement** the `TOOLS` entry, the four phone-app lines and the docs.
 - [ ] **Step 4: Run** `make rust-check` and `make mobile-check` → PASS.
 - [ ] **Step 5: Commit** `git commit -m "Hub and phone app offer Antigravity; docs"`
 
@@ -410,27 +437,28 @@ Antigravity lists `claude-sonnet-4-6`, `claude-opus-4-6-thinking` and `gpt-oss-1
 
 **Files:**
 - Create: `crates/octet-gate/src/antigravity.rs` (the ACP client: `initialize`, `open`, `set`, `prompt`, permission answers, evidence; modelled on `Opencode<'a>` in the gate binary)
-- Modify: `crates/octet-gate/src/lib.rs` (`pub mod antigravity;`), `crates/octet-gate/src/bin/protocol-gate.rs` (`ANTIGRAVITY_SCENARIOS`, `run_antigravity`, the `vendor_launch` branch)
+- Modify: `crates/octet-gate/src/lib.rs` (`pub mod antigravity;`), `crates/octet-gate/src/bin/protocol-gate.rs` (`ANTIGRAVITY_SCENARIOS`, `run_antigravity`, the `vendor_launch` branch; at `:125` the default binary becomes `engine.provider().default_binary`, so `make gate ENGINE=antigravity` starts `agy`, not `antigravity`)
 - Modify: `docs/rust/protocol-gate.md` (an Antigravity column and its notes)
 
 **Interfaces:**
-- Consumes: `launch_args`, `prepare`, `antigravity_stray_reply`, `ANTIGRAVITY_VERIFIED_VERSIONS`.
+- Consumes: `launch_args`, `antigravity_prepare`, `antigravity_stray_reply`, `ANTIGRAVITY_VERIFIED_VERSIONS`.
 - Produces: `const ANTIGRAVITY_SCENARIOS: [&str; 10] = ["initialize", "simple", "interrupt", "approval-allow", "approval-deny", "approval-interrupt", "resume", "compact", "lockdown", "subagent"]`, on model `gemini-3.8-flash` at `thought_level` `low`.
-  - Every run makes a second temporary folder beside the workspace (removed on every exit path) holding `octet-data/` (the `Config.data_dir`) and `gemini-home/`. It calls `prepare`, then launches with `launch_args` plus `--gemini-dir <gemini-home>`.
-  - **`lockdown`**: `gemini-home/antigravity-cli/settings.json` holds `{"toolPermission":"always-proceed","agentMode":"accept-edits","permissions":{"allow":["command(*)","write_file(*)"]}}`. In mode `default` it asks for `echo fixture` and for a file `gate.txt`. It passes only if each brought a `session/request_permission` (which it denies) and `gate.txt` does not exist.
-  - **`subagent`**: asks the model to delegate `touch gate-sub.txt` with `invoke_subagent`. It passes if, 30 s after the turn ends, `gate-sub.txt` does not exist and no `execute` tool call completed on the connection.
+  - Every run makes a second temporary folder beside the workspace (removed on every exit path) holding `octet-data/` (the `Config.data_dir`) and `gemini-home/`. It calls `antigravity_prepare(config, Some(<gemini-home>))`, so the settings Octet merges are the scenario's, never the user's, then launches with `launch_args` plus `--gemini-dir <gemini-home>`.
+  - A scenario ends `passed`, `failed` or `unproven: <why>`. `unproven` means the run did not exercise what it claims to prove; it is not a pass.
+  - **`lockdown`**: `gemini-home/antigravity-cli/settings.json` holds `{"toolPermission":"always-proceed","agentMode":"accept-edits","permissions":{"allow":["command(*)","write_file(*)"]},"octetGateMarker":true}`. Before launching, the gate reads `octet-data/antigravity/review/settings.json`: `unproven` unless it holds `octetGateMarker` (the fixture went through Octet's merge), `toolPermission` `request-review`, no `agentMode` and no `permissions.allow`. In mode `default` it then asks for `echo fixture` and for a file `gate.txt`. It passes only if each brought a `session/request_permission` (which it denies) and `gate.txt` does not exist.
+  - **`subagent`**: asks the model to delegate `touch gate-sub.txt` with `invoke_subagent`. It is `unproven: the model did not delegate` unless an `invoke_subagent` tool call was seen. Then it passes if, 30 s after the turn ends, `gate-sub.txt` does not exist and no `execute` tool call completed on the connection. The evidence records the subagent's state when a second turn asking for it (`manage_subagents`) reports one.
   - **`resume`**: a second process resumes; the evidence records the mode and thinking level the reply reports (`default`, `high` on 1.5.5), and the turn recalls a word from the first.
   - **`approval-interrupt`**: `session/cancel` while a request waits; the turn ends `cancelled`.
   - The evidence records `agentInfo.version`.
 
-- [ ] **Step 1: Write the scenarios.**
-- [ ] **Step 2: Run each.** `make gate ENGINE=antigravity SCENARIO=<name>` → `status` starts with `passed`. If `lockdown` or `subagent` fails, stop and tell the user what ran unasked: the spec's anti-goal is at stake, and Octet must not ship around it.
+- [ ] **Step 1: Write the failing test** in `protocol-gate.rs`'s option tests: `the_default_binary_is_the_providers` (`--engine antigravity` with no `--binary` gives `agy`; `--engine claude` gives `claude`). Run it → FAIL (`antigravity`). Then write the scenarios.
+- [ ] **Step 2: Run each.** `make gate ENGINE=antigravity SCENARIO=<name>` → `status` starts with `passed`. If `lockdown` or `subagent` fails or stays `unproven` after three tries, stop and tell the user what ran unasked: the spec's anti-goal is at stake, and Octet must not ship around it.
 - [ ] **Step 3: Check what the plan assumed** against the real CLI, and fix the code (not the check) where it differs:
   - a tool call's `rawInput` key for the command, so `ToolCall.target` and the approval's command read well;
   - the exit time when stdin closes in the middle of a turn; set `shutdown_grace` to that plus margin;
-  - whether `session/new` accepts a stdio MCP server in `mcpServers`; if it does, add an `mcp` scenario that passes only if the MCP tool asks in `default`; if it cannot be tested, say in `docs/tui.md` that Octet has not checked MCP tools against `ask`;
+  - whether `session/new` accepts a stdio MCP server in `mcpServers`; if it does, add an `mcp` scenario that passes only if the MCP tool asks in `default`; if it cannot be tested, the `/mode` copies for `ask` and `accept-edits` gain `"; Octet has not checked MCP tools"` before `(mode …)` (design decision 5: the description names an unchecked seam), the row's copy test is updated first, and `docs/tui.md` says the same;
   - the reply of a signed-out `agy` cannot be checked without signing out, which is not Octet's to do: Task 6's rule stays, and the doc says the wording is unconfirmed;
-  - which user settings keys beyond those in Task 3 change how Antigravity asks (`trustedWorkspaces` is the candidate): run `lockdown` with each present; one that lets an action through joins Task 3's removed keys, with a test.
+  - which user settings keys beyond those in Task 3 change how Antigravity asks (`trustedWorkspaces` is the candidate): run `lockdown` with each added to its fixture; one that lets an action through joins Task 3's removed keys, with a test.
 - [ ] **Step 4: A real run**, with `--binary` naming a wrapper (`exec agy "$@" --gemini-dir <scratch>`) so nothing reaches the user's history, in a throwaway workspace:
   - TUI (the tmux driver in memory `rust-tui-live-testing`): `--engine antigravity --model gemini-3.8-flash --effort low` completes a turn; in `ask`, "create hello.txt" asks, and denying leaves no file; Shift+Tab to `accept-edits` and the edit goes ahead while a command still asks; `/effort medium` is confirmed; `/reconnect` resumes and remembers; `/fork` is refused; `/model codex` (or `claude`) and back carries the conversation; `/model list` shows the clash labels `(claude)` and `(antigravity)` for a Claude model both list.
   - In a workspace with `.agents/hooks.json`: the session refuses, `/trust` connects, and editing the file refuses again.
