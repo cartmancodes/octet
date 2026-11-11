@@ -454,6 +454,41 @@ Declined from that review: carrying a model Antigravity moved to by itself
 into a reconnect. A reconnect asks for the model the user chose, as for
 every provider.
 
+### After Astra's second review, and during the build (2026-11-11)
+
+31. **What a session compares against is what was checked before the CLI
+    started.** The fingerprint the trust check accepts is handed to the
+    protocol. A baseline taken after the launch would accept configuration
+    that changed between the check and the launch.
+
+32. **Decision 29, tightened.** `~/.gemini` is forbidden by its path even
+    when it does not exist yet, and is resolved again once Octet's folder
+    exists. The folder must be the one Octet meant (no link from the
+    `proceed` folder to the `review` one). Octet removes the settings that
+    skip requests whatever the letter case of their keys.
+    - **Not closed:** another process that swaps Octet's folder for a link
+      in the moment between this check and the write. Closing it means
+      creating and renaming through held directory handles, which Rust's
+      standard library does not offer. Whoever can do that in the user's
+      own Octet data folder can already write `~/.gemini` directly. Astra
+      rated this Critical in both rounds; this is where the build does not
+      follow it.
+
+33. **The check before every prompt cannot hold Octet.** Only regular
+    files are read (a named pipe is refused before it is opened) and the
+    check has a deadline; past it the prompt is not sent.
+
+34. **A probe's folder has one owner.** It is created exclusively; a
+    second probe in the same process is refused and the first keeps its
+    folder.
+
+35. **A permission request rejected during a cancel still counts as
+    asked,** so its tool call ending `failed` does not trip the session.
+
+36. **The gate's subagent scenario proves a wait, not an absence.** It
+    passes only when the subagent was started and was seen waiting for
+    approval; anything less is `unproven`.
+
 ## Parity table
 
 What the user gets, feature by feature.
