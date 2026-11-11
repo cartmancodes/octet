@@ -3,27 +3,24 @@
 //! a probe's scratch home), the handshake, the model catalog and thinking
 //! levels, turns, resume and the probe.
 mod guarded;
+mod launch;
 mod settings;
 mod trust;
 
 use super::{
     BoxFuture, Channels, Config, DriverError, Event, ImageAttachment, Limits, Mode, NOT_SENT,
-    Outcome, Prepared, Provider, ToolCall, ToolPhase, acp,
+    Outcome, Provider, ToolCall, acp,
+    acp::Levels,
     activity::one_line,
     deadline_after,
     driver::{effort_notice, seconds},
     protocol::{Core, Phase, Protocol},
     short, valid_identifier,
 };
+pub use launch::antigravity_prepare;
+use launch::{mode_id, mode_of};
 use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    ffi::OsString,
-    io::ErrorKind,
-    os::unix::fs::DirBuilderExt as _,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
 use tokio::time::Instant;
 pub use trust::{
     WorkspaceConfig, antigravity_trust, antigravity_trusted, antigravity_workspace_config,
@@ -65,35 +62,21 @@ pub(super) const PROVIDER: Provider = Provider {
     commands_expand_shell: false,
     forks: false,
     carries_others_models: true,
-    launch_args,
+    launch_args: launch::launch_args,
     launch_env: super::no_env,
-    prepare,
+    prepare: launch::prepare,
     start,
 };
 
-/// Why a session cannot start with plugins or their hooks switched off.
-const NO_PLUGIN_SWITCH: &str = concat!(
-    "Antigravity has no switch to turn plugins or their hooks off; ",
-    "start without --no-plugins and --no-plugin-hooks"
-);
 /// What Octet says when Antigravity is not signed in.
 const SIGN_IN: &str = "Sign in to Antigravity first: run `agy`";
-/// Why a session cannot start without Octet's data directory.
-const NO_DATA_DIR: &str = "Antigravity needs Octet's data directory to keep its settings in";
-/// Why a probe cannot start while another of this process runs.
-const PROBE_BUSY: &str = "Octet is already asking Antigravity for its models";
 /// What Octet says when a model has no thinking level.
 const NO_LEVELS: &str = "This Antigravity model takes no thinking level";
 /// The most tool calls one turn remembers.
 const MAX_TOOLS: usize = 1024;
-/// The most thinking levels one model's option keeps.
-const MAX_EFFORTS: usize = 32;
 /// How long a probe waits, after the session opens, for Antigravity to list
 /// its commands before it settles for the models alone.
 const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
-/// How old a probe's home must be before a later probe removes it: one left
-/// by a process that died.
-const PROBE_STALE: Duration = Duration::from_hours(1);
 /// The permission options Octet answers with when a request lists none.
 const PERMISSION_IDS: (&str, &str) = ("allow", "deny");
 
@@ -102,135 +85,6 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
     Box::pin(
         async move { super::driver::run::<AntigravityProtocol>(config, limits, channels).await },
     )
-}
-
-/// Antigravity's ID for `mode`. Full access is `default` under the
-/// `always-proceed` settings.
-fn mode_id(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Ask | Mode::FullAccess => "default",
-        Mode::AcceptEdits => "accept-edits",
-        Mode::Auto => "auto",
-    }
-}
-
-/// The mode Antigravity's mode `id` carries in a session launched for
-/// `pinned`: `default` is full access under that pin, else ask. `None` for
-/// `plan` or a mode Octet does not know.
-fn mode_of(id: &str, pinned: Mode) -> Option<Mode> {
-    match id {
-        "default" if pinned == Mode::FullAccess => Some(Mode::FullAccess),
-        "default" => Some(Mode::Ask),
-        "accept-edits" => Some(Mode::AcceptEdits),
-        "auto" => Some(Mode::Auto),
-        _ => None,
-    }
-}
-
-/// The arguments that start `agy acp` with Octet's settings folder for the
-/// mode, and a probe in its scratch home. Without a data directory it is
-/// `acp` alone, which never launches: `prepare` fails first.
-fn launch_args(config: &Config) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec!["acp".into()];
-    let Some(data_dir) = &config.data_dir else {
-        return args;
-    };
-    args.push("--cli_dir_name".into());
-    args.push(settings::cli_dir(data_dir, config.mode).into_os_string());
-    if config.catalog_only {
-        args.push("--gemini-dir".into());
-        args.push(settings::probe_home(data_dir).into_os_string());
-    }
-    args
-}
-
-/// The row's `prepare`: [`antigravity_prepare`] with Antigravity's own folder.
-fn prepare(config: &Config) -> Result<Prepared, String> {
-    antigravity_prepare(config, settings::vendor_home().as_deref())
-}
-
-/// What runs before `agy` starts, in order: Octet's data directory must be
-/// known; plugins and their hooks cannot be switched off (except for a
-/// probe, which loads none); the workspace's `.agents` configuration must be
-/// trusted; Octet's settings file for the mode is written from the user's in
-/// `vendor_home`. A probe also removes the probe homes last changed over an
-/// hour ago (a process that died left them), and makes its own. `Prepared`
-/// carries the settings' notices, the probe's home and the fingerprint of the
-/// configuration accepted.
-///
-/// # Errors
-///
-/// Why the session cannot start, in words to show.
-pub fn antigravity_prepare(
-    config: &Config,
-    vendor_home: Option<&Path>,
-) -> Result<Prepared, String> {
-    let data_dir = config
-        .data_dir
-        .as_deref()
-        .ok_or_else(|| NO_DATA_DIR.to_owned())?;
-    let switched_off = !config.plugins.load || !config.plugins.hooks;
-    if switched_off && !config.catalog_only {
-        return Err(NO_PLUGIN_SWITCH.to_owned());
-    }
-    let workspace = trust::check(config, data_dir)?;
-    let notices = settings::write(data_dir, config.mode, vendor_home)?;
-    let scratch = if config.catalog_only {
-        Some(probe_folder(data_dir)?)
-    } else {
-        None
-    };
-    Ok(Prepared {
-        notices,
-        scratch,
-        workspace,
-    })
-}
-
-/// Makes this process's probe home, owner-only, after removing the stale
-/// ones. It is made exclusively: one already there belongs to a probe that
-/// is running, which keeps it.
-fn probe_folder(data_dir: &Path) -> Result<PathBuf, String> {
-    remove_stale_probes(&data_dir.join("antigravity"));
-    let home = settings::probe_home(data_dir);
-    match std::fs::DirBuilder::new().mode(0o700).create(&home) {
-        Ok(()) => Ok(home),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(PROBE_BUSY.to_owned()),
-        Err(error) => Err(format!(
-            "Octet could not make a home for Antigravity's model list ({}): {error}",
-            home.display()
-        )),
-    }
-}
-
-/// Removes the probe homes in `folder` last modified over [`PROBE_STALE`]
-/// ago: folders (never links) whose name starts with `probe-`. One whose
-/// age cannot be read is left alone, and a failure to remove one ignored.
-fn remove_stale_probes(folder: &Path) {
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name
-            .as_encoded_bytes()
-            .starts_with(settings::PROBE_PREFIX.as_bytes())
-        {
-            continue;
-        }
-        let path = entry.path();
-        let stale = std::fs::symlink_metadata(&path).is_ok_and(|meta| {
-            meta.is_dir()
-                && meta
-                    .modified()
-                    .ok()
-                    .and_then(|at| at.elapsed().ok())
-                    .is_some_and(|age| age > PROBE_STALE)
-        });
-        if stale {
-            let _ = std::fs::remove_dir_all(&path);
-        }
-    }
 }
 
 /// What a reply from Antigravity answers: one of Octet's own requests.
@@ -268,31 +122,6 @@ struct Wanted {
     level: Option<String>,
 }
 
-/// What Octet knows of the current model's thinking levels.
-#[derive(Default)]
-enum Levels {
-    /// Nothing yet: no options reported since the model changed.
-    #[default]
-    Unknown,
-    /// Antigravity reported options without a `thought_level` one: the
-    /// model has no levels.
-    Absent,
-    /// The model's `thought_level` option.
-    Listed(LevelOption),
-}
-
-/// The current model's `thought_level` option, as Antigravity last reported
-/// it.
-struct LevelOption {
-    /// The levels, in Antigravity's order, bounded.
-    values: Vec<String>,
-    /// The level in force.
-    current: Option<String>,
-    /// The level the model had when it was first reported in this session:
-    /// what `/effort default` goes back to.
-    opening: Option<String>,
-}
-
 /// A tool call of the running turn, as its first frame named it.
 struct Tool {
     /// The tool's name, else its title.
@@ -312,11 +141,9 @@ struct Tool {
 /// lists, and the turn's tool calls.
 #[derive(Default)]
 pub(super) struct AntigravityProtocol {
-    /// Octet's last wire request ID.
-    next_id: u64,
-    /// Octet's requests that have no reply yet, by wire ID, with what each
-    /// reply answers.
-    requests: HashMap<u64, Outstanding>,
+    /// Octet's requests that have no reply yet, with what each reply
+    /// answers.
+    requests: acp::Requests<Outstanding>,
     /// A `session/cancel` was sent this turn: an `end_turn` then means the
     /// turn was interrupted.
     cancel_sent: bool,
@@ -348,7 +175,7 @@ pub(super) struct AntigravityProtocol {
 
 impl Protocol for AntigravityProtocol {
     fn launch_args(config: &Config) -> Vec<OsString> {
-        launch_args(config)
+        launch::launch_args(config)
     }
 
     fn prepared(&mut self, workspace: Option<String>) {
@@ -374,10 +201,7 @@ impl Protocol for AntigravityProtocol {
     /// Only frames for this session count: another session's chatter is
     /// not progress.
     fn is_progress(&self, core: &Core, frame: &Value) -> bool {
-        frame
-            .pointer("/params/sessionId")
-            .and_then(Value::as_str)
-            .is_none_or(|id| id == core.session)
+        acp::for_session(frame, &core.session)
     }
 
     fn turn_started(&mut self) {
@@ -388,7 +212,8 @@ impl Protocol for AntigravityProtocol {
     /// Sends `initialize`, offering no client capabilities.
     async fn initialize(&mut self, core: &mut Core) -> Result<(), DriverError> {
         let params = json!({"protocolVersion": 1, "clientCapabilities": {}});
-        self.request(core, Outstanding::Initialize, "initialize", params)
+        self.requests
+            .send(core, Outstanding::Initialize, "initialize", params)
             .await
     }
 
@@ -409,7 +234,8 @@ impl Protocol for AntigravityProtocol {
         let mut prompt = vec![json!({"type": "text", "text": text})];
         prompt.extend(blocks);
         let params = json!({"sessionId": core.session, "prompt": prompt});
-        self.request(core, Outstanding::Prompt, "session/prompt", params)
+        self.requests
+            .send(core, Outstanding::Prompt, "session/prompt", params)
             .await
     }
 
@@ -514,10 +340,7 @@ impl Protocol for AntigravityProtocol {
         if v.get("id").is_some() {
             return refuse_request(core, &v).await;
         }
-        let this_session = !core.session.is_empty()
-            && v.pointer("/params/sessionId").and_then(Value::as_str)
-                == Some(core.session.as_str());
-        if method != "session/update" || !this_session {
+        if method != "session/update" || !acp::names_session(&v, &core.session) {
             return Ok(());
         }
         let update = &v["params"]["update"];
@@ -554,19 +377,6 @@ impl Protocol for AntigravityProtocol {
 }
 
 impl AntigravityProtocol {
-    /// Sends one of Octet's requests and records what its reply answers.
-    async fn request(
-        &mut self,
-        core: &Core,
-        kind: Outstanding,
-        method: &str,
-        params: Value,
-    ) -> Result<(), DriverError> {
-        self.next_id += 1;
-        self.requests.insert(self.next_id, kind);
-        core.send(acp::request(self.next_id, method, params)).await
-    }
-
     /// Sets the session's `option` to `value`.
     async fn set_option(
         &mut self,
@@ -576,7 +386,8 @@ impl AntigravityProtocol {
         value: &str,
     ) -> Result<(), DriverError> {
         let params = json!({"sessionId": core.session, "configId": option, "value": value});
-        self.request(core, kind, "session/set_config_option", params)
+        self.requests
+            .send(core, kind, "session/set_config_option", params)
             .await
     }
 
@@ -607,13 +418,7 @@ impl AntigravityProtocol {
 
     /// Replies to Octet's own requests, matched by the request they answer.
     async fn response(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
-        let id = v["id"].as_u64();
-        let Some(kind) = id.and_then(|id| self.requests.remove(&id)) else {
-            // A reply to a request not yet sent, while connecting, means the
-            // handshake is out of order; a repeated reply is ignored.
-            if !core.phase.is_ready() && id.is_some_and(|id| id > self.next_id) {
-                return Err("Unexpected protocol initialization order".into());
-            }
+        let Some(kind) = self.requests.answered(v, !core.phase.is_ready())? else {
             return Ok(());
         };
         match kind {
@@ -655,7 +460,8 @@ impl AntigravityProtocol {
             }
             _ => ("session/new", None),
         };
-        self.request(core, Outstanding::Open(resumed), method, params)
+        self.requests
+            .send(core, Outstanding::Open(resumed), method, params)
             .await
     }
 
@@ -770,7 +576,7 @@ impl AntigravityProtocol {
     /// The level the model opened at, when another is in force.
     fn opening_to_restore(&self) -> Option<String> {
         match &self.levels {
-            Levels::Listed(option) if option.current != option.opening => option.opening.clone(),
+            Levels::Listed(option) if option.current != option.default => option.default.clone(),
             _ => None,
         }
     }
@@ -908,29 +714,7 @@ impl AntigravityProtocol {
         if let Some(mode) = acp::current(config_options, "mode") {
             self.mode = Some(mode.to_owned());
         }
-        let Some(option) = list.iter().find(|option| option["id"] == "thought_level") else {
-            self.levels = Levels::Absent;
-            return;
-        };
-        let values: Vec<String> = option["options"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|choice| choice["value"].as_str())
-            .filter(|value| valid_identifier(value))
-            .take(MAX_EFFORTS)
-            .map(str::to_owned)
-            .collect();
-        let current = acp::current(config_options, "thought_level").map(str::to_owned);
-        let opening = match std::mem::take(&mut self.levels) {
-            Levels::Listed(known) if !changed => known.opening,
-            _ => current.clone(),
-        };
-        self.levels = Levels::Listed(LevelOption {
-            values,
-            current,
-            opening,
-        });
+        self.levels.note(list, "thought_level", changed);
     }
 
     /// Antigravity's commands: kept for compaction and shown as skills. A
@@ -954,11 +738,7 @@ impl AntigravityProtocol {
     /// A probe whose commands did not come in time is done with the models
     /// alone.
     fn probe_timed_out(&mut self, core: &Core) -> Result<(), DriverError> {
-        if self
-            .probe_wait
-            .take_if(|wait| *wait <= Instant::now())
-            .is_none()
-        {
+        if !acp::passed(&mut self.probe_wait) {
             return Ok(());
         }
         core.emit(Event::Ready {
@@ -972,20 +752,7 @@ impl AntigravityProtocol {
             return Ok(());
         }
         self.tools.clear();
-        if let Some(error) = v.get("error") {
-            return core.finish_turn(Outcome::Failed, Some(acp::error_text(error)));
-        }
-        let result = &v["result"];
-        if let Some(total) = result.pointer("/usage/totalTokens").and_then(Value::as_u64) {
-            core.emit(Event::Usage(format!("{total} tokens")))?;
-        }
-        let outcome = match result["stopReason"].as_str().unwrap_or("unknown") {
-            "end_turn" if self.cancel_sent => Outcome::Interrupted,
-            "end_turn" => Outcome::Completed,
-            "cancelled" => Outcome::Interrupted,
-            other => Outcome::Other(short(other)),
-        };
-        core.finish_turn(outcome, None)
+        acp::end_prompt(core, v, self.cancel_sent)
     }
 
     /// A `tool_call` or `tool_call_update`: the call as it now stands. Its
@@ -1008,16 +775,11 @@ impl AntigravityProtocol {
             }
             shown
         };
-        let phase = match update["status"].as_str() {
-            Some("completed") => ToolPhase::Done,
-            Some("failed") => ToolPhase::Failed,
-            _ => ToolPhase::Running,
-        };
         core.emit(Event::Tool(ToolCall {
             id,
             name,
             target,
-            phase,
+            phase: acp::tool_phase(&update["status"]),
             detail: acp::content_text(&update["content"]),
         }))
     }
@@ -1098,112 +860,6 @@ async fn refuse_request(core: &Core, v: &Value) -> Result<(), DriverError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use octet_testkit::TempDir;
-
-    #[test]
-    fn every_mode_has_a_mode_id_and_back() {
-        for mode in Mode::ALL {
-            assert_eq!(mode_of(mode_id(mode), mode), Some(mode), "{mode:?}");
-        }
-        assert_eq!(mode_of("default", Mode::Ask), Some(Mode::Ask));
-        assert_eq!(mode_of("default", Mode::Auto), Some(Mode::Ask));
-        assert_eq!(mode_of("plan", Mode::Ask), None);
-    }
-
-    fn data_config(mode: Mode) -> Config {
-        let mut config = Config::new(super::super::Engine::ANTIGRAVITY, "agy", "/w");
-        config.data_dir = Some("/d".into());
-        config.mode = mode;
-        config
-    }
-
-    #[test]
-    fn the_launch_names_octets_settings_folder() {
-        assert_eq!(
-            launch_args(&data_config(Mode::Ask)),
-            ["acp", "--cli_dir_name", "/d/antigravity/review"]
-        );
-        assert_eq!(
-            launch_args(&data_config(Mode::FullAccess)),
-            ["acp", "--cli_dir_name", "/d/antigravity/proceed"]
-        );
-        let mut bare = data_config(Mode::Ask);
-        bare.data_dir = None;
-        assert_eq!(launch_args(&bare), ["acp"]);
-    }
-
-    #[test]
-    fn a_probe_runs_in_a_scratch_home() {
-        let mut config = data_config(Mode::Ask);
-        config.catalog_only = true;
-        let args = launch_args(&config);
-        let home = format!("/d/antigravity/probe-{}", std::process::id());
-        assert_eq!(args[3..], [OsString::from("--gemini-dir"), home.into()]);
-    }
-
-    #[test]
-    fn preparing_a_probe_removes_only_old_probe_folders() {
-        let root = TempDir::new("octet-agy-probe-clean");
-        let cwd = root.path().join("ws");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let mut config = Config::new(super::super::Engine::ANTIGRAVITY, "agy", &cwd);
-        config.data_dir = Some(root.path().join("data"));
-        config.catalog_only = true;
-        let folder = root.path().join("data/antigravity");
-        let (old, new) = (folder.join("probe-1"), folder.join("probe-2"));
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::create_dir_all(&new).unwrap();
-        let two_hours_ago = std::time::SystemTime::now() - Duration::from_hours(2);
-        std::fs::File::open(&old)
-            .unwrap()
-            .set_modified(two_hours_ago)
-            .unwrap();
-        // An old link named like a probe is not followed or removed.
-        let target = root.path().join("elsewhere");
-        std::fs::create_dir_all(&target).unwrap();
-        std::os::unix::fs::symlink(&target, folder.join("probe-3")).unwrap();
-        let prepared = antigravity_prepare(&config, None).unwrap();
-        assert!(!old.exists(), "the old probe's folder is gone");
-        assert!(new.is_dir(), "a recent probe keeps its folder");
-        assert!(folder.join("probe-3").is_symlink());
-        assert!(target.is_dir());
-        let scratch = prepared.scratch.unwrap();
-        assert!(scratch.is_dir());
-        assert_eq!(scratch, settings::probe_home(&root.path().join("data")));
-    }
-
-    #[test]
-    fn a_probe_ignores_the_plugin_switches_and_a_session_does_not() {
-        let root = TempDir::new("octet-agy-prepare-plugins");
-        let cwd = root.path().join("ws");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let mut config = Config::new(super::super::Engine::ANTIGRAVITY, "agy", &cwd);
-        config.data_dir = Some(root.path().join("data"));
-        config.plugins.hooks = false;
-        assert_eq!(
-            antigravity_prepare(&config, None),
-            Err(NO_PLUGIN_SWITCH.into())
-        );
-        config.catalog_only = true;
-        let prepared = antigravity_prepare(&config, None).unwrap();
-        assert!(prepared.scratch.is_some());
-        assert_eq!(prepared.workspace, None);
-    }
-
-    #[test]
-    fn the_accepted_fingerprint_is_handed_on() {
-        let root = TempDir::new("octet-agy-prepare-fingerprint");
-        let cwd = root.path().join("ws");
-        std::fs::create_dir_all(cwd.join(".agents")).unwrap();
-        std::fs::write(cwd.join(".agents/hooks.json"), "{}").unwrap();
-        let mut config = Config::new(super::super::Engine::ANTIGRAVITY, "agy", &cwd);
-        config.data_dir = Some(root.path().join("data"));
-        config.trust_workspace = true;
-        let prepared = antigravity_prepare(&config, None).unwrap();
-        let found = antigravity_workspace_config(&cwd).unwrap().unwrap();
-        assert_eq!(prepared.workspace, Some(found.fingerprint));
-        assert_eq!(prepared.scratch, None);
-    }
 
     #[test]
     fn signing_in_is_recognised_by_code_or_by_words() {

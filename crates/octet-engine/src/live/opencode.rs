@@ -4,7 +4,7 @@
 //! model catalog, turns, skills and the probe.
 use super::{
     BoxFuture, Channels, Command, Config, DriverError, Event, ImageAttachment, Limits, Mode,
-    Outcome, Provider, ToolCall, ToolPhase, acp,
+    Outcome, Provider, ToolCall, acp,
     activity::one_line,
     deadline_after,
     protocol::{Core, Phase, Protocol},
@@ -70,8 +70,6 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
 
 /// The most tool calls one turn remembers the names of.
 const MAX_TOOLS: usize = 256;
-/// The most effort levels one model's option keeps.
-const MAX_EFFORTS: usize = 32;
 /// The most timed-out mode switches kept in case opencode confirms them late.
 const MAX_LATE_SWITCHES: usize = 8;
 /// How long a probe waits, after the session opens, for opencode to list its
@@ -118,39 +116,9 @@ struct Wanted {
     level: Option<String>,
 }
 
-/// What Octet knows of the current model's effort levels.
-#[derive(Default)]
-enum Efforts {
-    /// Nothing yet: no options reported since the model changed.
-    #[default]
-    Unknown,
-    /// opencode reported options without an `effort` one: the model has
-    /// no levels.
-    Absent,
-    /// The model's `effort` option.
-    Listed(EffortOption),
-}
-
-impl Efforts {
-    /// The model's `effort` option, when it has one.
-    fn listed(&self) -> Option<&EffortOption> {
-        match self {
-            Efforts::Listed(option) => Some(option),
-            Efforts::Unknown | Efforts::Absent => None,
-        }
-    }
-}
-
-/// The current model's `effort` option, as opencode last reported it.
-struct EffortOption {
-    /// The model's levels, in opencode's order, bounded.
-    values: Vec<String>,
-    /// The level in force.
-    current: Option<String>,
-    /// The level the model started at in this session: what
-    /// `/effort default` goes back to.
-    default: Option<String>,
-}
+/// What Octet knows of the current model's effort levels (its `effort`
+/// option).
+type Efforts = acp::Levels;
 
 /// A live mode switch, as it was sent.
 #[derive(Clone, Copy)]
@@ -179,11 +147,9 @@ struct ModeRequest {
 /// switches awaiting confirmation, and the turn's tool calls.
 #[derive(Default)]
 pub(super) struct OpencodeProtocol {
-    /// Octet's last wire request ID.
-    next_id: u64,
-    /// Octet's requests that have no reply yet, by wire ID, with what each
-    /// reply answers.
-    requests: HashMap<u64, Outstanding>,
+    /// Octet's requests that have no reply yet, with what each reply
+    /// answers.
+    requests: acp::Requests<Outstanding>,
     /// The live mode switch awaiting its reply, until its deadline.
     mode_request: Option<ModeRequest>,
     /// The wire IDs and targets of timed-out switches opencode may still
@@ -329,10 +295,7 @@ impl Protocol for OpencodeProtocol {
     /// Only frames for this session count: another session's chatter is
     /// not progress.
     fn is_progress(&self, core: &Core, frame: &Value) -> bool {
-        frame
-            .pointer("/params/sessionId")
-            .and_then(Value::as_str)
-            .is_none_or(|id| id == core.session)
+        acp::for_session(frame, &core.session)
     }
 
     fn turn_started(&mut self) {
@@ -435,7 +398,7 @@ impl Protocol for OpencodeProtocol {
         self.set_option(core, Outstanding::Switch(switch), "mode", agent(target))
             .await?;
         self.mode_request = Some(ModeRequest {
-            id: self.next_id,
+            id: self.requests.last_id(),
             target,
             deadline: deadline_after(core.limits.mode_confirm),
         });
@@ -536,10 +499,7 @@ impl Protocol for OpencodeProtocol {
                 .filter(|target| !target.is_empty());
             return server_request(core, v, known.as_deref()).await;
         }
-        let this_session = !core.session.is_empty()
-            && v.pointer("/params/sessionId").and_then(Value::as_str)
-                == Some(core.session.as_str());
-        if method != "session/update" || !this_session {
+        if method != "session/update" || !acp::names_session(&v, &core.session) {
             return Ok(());
         }
         let update = &v["params"]["update"];
@@ -814,9 +774,7 @@ impl OpencodeProtocol {
         method: &str,
         params: Value,
     ) -> Result<(), DriverError> {
-        self.next_id += 1;
-        self.requests.insert(self.next_id, kind);
-        core.send(acp::request(self.next_id, method, params)).await
+        self.requests.send(core, kind, method, params).await
     }
 
     /// Sets the session's `option` to `value`.
@@ -834,13 +792,7 @@ impl OpencodeProtocol {
 
     /// Replies to Octet's own requests, matched by the request they answer.
     async fn response(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
-        let id = v["id"].as_u64();
-        let Some(kind) = id.and_then(|id| self.requests.remove(&id)) else {
-            // A reply to a request not yet sent, while connecting, means the
-            // handshake is out of order; a repeated reply is ignored.
-            if !core.phase.is_ready() && id.is_some_and(|id| id > self.next_id) {
-                return Err("Unexpected protocol initialization order".into());
-            }
+        let Some(kind) = self.requests.answered(v, !core.phase.is_ready())? else {
             return Ok(());
         };
         match kind {
@@ -1110,11 +1062,7 @@ impl OpencodeProtocol {
     /// A probe whose commands did not come in time is done with the models
     /// alone.
     fn probe_timed_out(&mut self, core: &Core) -> Result<(), DriverError> {
-        if self
-            .probe_wait
-            .take_if(|wait| *wait <= Instant::now())
-            .is_none()
-        {
+        if !acp::passed(&mut self.probe_wait) {
             return Ok(());
         }
         self.finish_probe(core)
@@ -1153,32 +1101,7 @@ impl OpencodeProtocol {
         if let Some(agent) = acp::current(config_options, "mode") {
             self.agent = Some(agent.to_owned());
         }
-        let Some(effort) = list.iter().find(|option| option["id"] == "effort") else {
-            self.effort = Efforts::Absent;
-            return;
-        };
-        let values: Vec<String> = effort["options"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|choice| choice["value"].as_str())
-            .filter(|value| valid_identifier(value))
-            .take(MAX_EFFORTS)
-            .map(str::to_owned)
-            .collect();
-        let current = effort["currentValue"]
-            .as_str()
-            .filter(|value| valid_identifier(value))
-            .map(str::to_owned);
-        let default = match std::mem::take(&mut self.effort) {
-            Efforts::Listed(known) if !changed => known.default,
-            _ => current.clone(),
-        };
-        self.effort = Efforts::Listed(EffortOption {
-            values,
-            current,
-            default,
-        });
+        self.effort.note(list, "effort", changed);
     }
 
     /// The prompt's reply ends the turn, with its token count when it has one.
@@ -1191,20 +1114,7 @@ impl OpencodeProtocol {
         if let Some(refusal) = self.subtask_stopped.take() {
             return core.finish_turn(Outcome::Failed, Some(refusal));
         }
-        if let Some(error) = v.get("error") {
-            return core.finish_turn(Outcome::Failed, Some(acp::error_text(error)));
-        }
-        let result = &v["result"];
-        if let Some(total) = result.pointer("/usage/totalTokens").and_then(Value::as_u64) {
-            core.emit(Event::Usage(format!("{total} tokens")))?;
-        }
-        let outcome = match result["stopReason"].as_str().unwrap_or("unknown") {
-            "end_turn" if self.cancel_sent => Outcome::Interrupted,
-            "end_turn" => Outcome::Completed,
-            "cancelled" => Outcome::Interrupted,
-            other => Outcome::Other(short(other)),
-        };
-        core.finish_turn(outcome, None)
+        acp::end_prompt(core, v, self.cancel_sent)
     }
 
     /// A `tool_call` or `tool_call_update`: the call as it now stands. Its
@@ -1231,16 +1141,11 @@ impl OpencodeProtocol {
             }
             (name, target)
         };
-        let phase = match update["status"].as_str() {
-            Some("completed") => ToolPhase::Done,
-            Some("failed") => ToolPhase::Failed,
-            _ => ToolPhase::Running,
-        };
         core.emit(Event::Tool(ToolCall {
             id,
             name,
             target,
-            phase,
+            phase: acp::tool_phase(&update["status"]),
             detail: acp::content_text(&update["content"]),
         }))
     }
@@ -1360,8 +1265,7 @@ enum Refusal {
 /// quietly.
 async fn server_request(core: &mut Core, v: Value, known: Option<&str>) -> Result<(), DriverError> {
     let method = v["method"].as_str().unwrap_or_default();
-    let this_session = !core.session.is_empty()
-        && v.pointer("/params/sessionId").and_then(Value::as_str) == Some(core.session.as_str());
+    let this_session = acp::names_session(&v, &core.session);
     if method == "session/request_permission" && this_session && core.phase == Phase::InTurn {
         let (detail, summary) = acp::approval(&v["params"]["toolCall"], known, PROVIDER.title);
         return core.queue_approval(v, detail, summary).await;

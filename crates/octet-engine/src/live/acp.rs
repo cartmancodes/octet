@@ -3,20 +3,201 @@
 //! a session's options and a tool call, the permission dialog's contents,
 //! and the inline image blocks of a prompt.
 use super::{
-    ApprovalSummary, DriverError, ImageAttachment, ModelInfo, Outcome, SkillInfo,
+    ApprovalSummary, DriverError, Event, ImageAttachment, ModelInfo, Outcome, SkillInfo, ToolPhase,
     activity::one_line, check_inline, limited, protocol::Core, short, valid_identifier,
 };
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
+use tokio::time::Instant;
 
 /// The most models one catalog keeps.
 const MAX_MODELS: usize = 256;
+/// The most levels one model's level option keeps.
+const MAX_LEVELS: usize = 32;
 
 /// A JSON-RPC request: `method` with `params`, answered under `id`.
 pub(super) fn request(id: u64, method: &str, params: Value) -> Value {
     let mut frame = json!({"jsonrpc": "2.0", "id": id, "method": method});
     frame["params"] = params;
     frame
+}
+
+/// Octet's own requests that have no reply yet, numbered from 1 on the wire,
+/// each with what its reply answers (`K`).
+pub(super) struct Requests<K> {
+    /// The wire ID of the last request sent.
+    last: u64,
+    /// The requests awaiting a reply, by wire ID.
+    waiting: HashMap<u64, K>,
+}
+
+impl<K> Default for Requests<K> {
+    fn default() -> Self {
+        Self {
+            last: 0,
+            waiting: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Send> Requests<K> {
+    /// Sends `method` with `params` as the next request, remembering that its
+    /// reply answers `kind`.
+    pub(super) async fn send(
+        &mut self,
+        core: &Core,
+        kind: K,
+        method: &str,
+        params: Value,
+    ) -> Result<(), DriverError> {
+        self.last += 1;
+        self.waiting.insert(self.last, kind);
+        core.send(request(self.last, method, params)).await
+    }
+
+    /// The wire ID of the last request sent.
+    pub(super) fn last_id(&self) -> u64 {
+        self.last
+    }
+
+    /// What the reply `v` answers, no longer waiting; `None` for a reply
+    /// nothing waits for (a repeated one), which is ignored.
+    ///
+    /// # Errors
+    ///
+    /// While `connecting`, a reply to a request not yet sent: the handshake
+    /// is out of order.
+    pub(super) fn answered(
+        &mut self,
+        v: &Value,
+        connecting: bool,
+    ) -> Result<Option<K>, DriverError> {
+        let id = v["id"].as_u64();
+        let kind = id.and_then(|id| self.waiting.remove(&id));
+        if kind.is_none() && connecting && id.is_some_and(|id| id > self.last) {
+            return Err("Unexpected protocol initialization order".into());
+        }
+        Ok(kind)
+    }
+}
+
+/// Whether `frame` is for `session`, or names no session: only such frames
+/// show the turn is alive.
+pub(super) fn for_session(frame: &Value, session: &str) -> bool {
+    frame
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)
+        .is_none_or(|id| id == session)
+}
+
+/// Whether `frame` names `session`, the one Octet opened (none yet when it is
+/// empty).
+pub(super) fn names_session(frame: &Value, session: &str) -> bool {
+    !session.is_empty()
+        && frame.pointer("/params/sessionId").and_then(Value::as_str) == Some(session)
+}
+
+/// A tool call's `status` as its phase: `completed` is done, `failed`
+/// failed, anything else running.
+pub(super) fn tool_phase(status: &Value) -> ToolPhase {
+    match status.as_str() {
+        Some("completed") => ToolPhase::Done,
+        Some("failed") => ToolPhase::Failed,
+        _ => ToolPhase::Running,
+    }
+}
+
+/// Ends the running turn with the prompt's reply `v`: an error reply fails
+/// it with its message; otherwise its token count is reported, then its stop
+/// reason ends it (`end_turn` is interrupted when `cancel_sent`, since the
+/// vendor ends a cancelled prompt with it too).
+pub(super) fn end_prompt(core: &mut Core, v: &Value, cancel_sent: bool) -> Result<(), DriverError> {
+    if let Some(error) = v.get("error") {
+        return core.finish_turn(Outcome::Failed, Some(error_text(error)));
+    }
+    let result = &v["result"];
+    if let Some(total) = result.pointer("/usage/totalTokens").and_then(Value::as_u64) {
+        core.emit(Event::Usage(format!("{total} tokens")))?;
+    }
+    let outcome = match result["stopReason"].as_str().unwrap_or("unknown") {
+        "end_turn" if cancel_sent => Outcome::Interrupted,
+        "end_turn" => Outcome::Completed,
+        "cancelled" => Outcome::Interrupted,
+        other => Outcome::Other(short(other)),
+    };
+    core.finish_turn(outcome, None)
+}
+
+/// Whether the moment `wait` holds has come; it is cleared then.
+pub(super) fn passed(wait: &mut Option<Instant>) -> bool {
+    wait.take_if(|at| *at <= Instant::now()).is_some()
+}
+
+/// What Octet knows of the current model's levels (opencode's `effort`
+/// option, Antigravity's `thought_level`).
+#[derive(Default)]
+pub(super) enum Levels {
+    /// Nothing yet: no options reported since the model changed.
+    #[default]
+    Unknown,
+    /// The vendor reported options without the level one: the model has no
+    /// levels.
+    Absent,
+    /// The model's level option.
+    Listed(LevelOption),
+}
+
+/// The current model's level option, as the vendor last reported it.
+pub(super) struct LevelOption {
+    /// The model's levels, in the vendor's order, bounded.
+    pub(super) values: Vec<String>,
+    /// The level in force.
+    pub(super) current: Option<String>,
+    /// The level the model had when it was first reported in this session:
+    /// what `/effort default` goes back to.
+    pub(super) default: Option<String>,
+}
+
+impl Levels {
+    /// The model's level option, when it has one.
+    pub(super) fn listed(&self) -> Option<&LevelOption> {
+        match self {
+            Levels::Listed(option) => Some(option),
+            Levels::Unknown | Levels::Absent => None,
+        }
+    }
+
+    /// Reads the level option `id` from the session's `options`. None there
+    /// means the model has no levels; a model's first report of its level
+    /// (`model_changed`, or nothing listed before) is its default.
+    pub(super) fn note(&mut self, options: &[Value], id: &str, model_changed: bool) {
+        let Some(option) = options.iter().find(|option| option["id"] == id) else {
+            *self = Levels::Absent;
+            return;
+        };
+        let values: Vec<String> = option["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|choice| choice["value"].as_str())
+            .filter(|value| valid_identifier(value))
+            .take(MAX_LEVELS)
+            .map(str::to_owned)
+            .collect();
+        let current = option["currentValue"]
+            .as_str()
+            .filter(|value| valid_identifier(value))
+            .map(str::to_owned);
+        let default = match std::mem::take(self) {
+            Levels::Listed(known) if !model_changed => known.default,
+            _ => current.clone(),
+        };
+        *self = Levels::Listed(LevelOption {
+            values,
+            current,
+            default,
+        });
+    }
 }
 
 /// The `session/cancel` notification for `session`.
