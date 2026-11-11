@@ -5425,3 +5425,532 @@ async fn a_turn_claude_starts_after_a_background_task_is_reported() {
     ));
     stop(&handle, task).await;
 }
+
+/// The fake Antigravity in a temporary folder holding `ws/`, the workspace
+/// (with `fixture` as its `fake-agy.json`, unless that is `Null`), and
+/// `data/`, Octet's data directory.
+fn antigravity(fixture: serde_json::Value) -> (octet_testkit::TempDir, Config) {
+    let dir = octet_testkit::TempDir::new("octet-agy");
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    if let Some(knobs) = Some(fixture).filter(|fixture| !fixture.is_null()) {
+        std::fs::write(ws.join("fake-agy.json"), knobs.to_string()).unwrap();
+    }
+    let mut c = Config::new(Engine::ANTIGRAVITY, octet_testkit::protocol_child(), &ws);
+    c.data_dir = Some(dir.path().join("data"));
+    (dir, c)
+}
+/// The fake Antigravity's `PARAMS` echo, from a session that is ready.
+async fn agy_params(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+) -> serde_json::Value {
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    serde_json::from_str(&turn_text(events).await).unwrap()
+}
+/// A `[configId, value]` pair as the fake's `sets` holds it.
+fn set(config: &str, value: &str) -> serde_json::Value {
+    serde_json::json!([config, value])
+}
+/// The `probe-` folders in `data/antigravity`.
+fn probe_folders(dir: &octet_testkit::TempDir) -> Vec<String> {
+    std::fs::read_dir(dir.path().join("data/antigravity"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("probe-"))
+        .collect()
+}
+/// What Octet says when Antigravity is signed out.
+const AGY_SIGN_IN: &str = "Sign in to Antigravity first: run `agy`";
+#[tokio::test]
+async fn antigravity_connects_lists_models_and_skills() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    let (mut ready, mut models, mut skills, mut mode) = (None, None, None, None);
+    while ready.is_none() || models.is_none() || skills.is_none() || mode.is_none() {
+        match next(&mut events).await {
+            Event::Ready { session } => ready = Some(session),
+            Event::Models(list) => models = Some(list),
+            Event::Skills(list) => skills = Some(list),
+            Event::ModeChanged(changed) => mode = Some(changed),
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(ready.as_deref(), Some("fixture-agy"));
+    let models = models.unwrap();
+    let flash = models
+        .iter()
+        .find(|m| m.selection == "gemini-fixture-flash")
+        .unwrap_or_else(|| panic!("{models:?}"));
+    assert_eq!(flash.name, "Gemini Fixture Flash");
+    assert_eq!(flash.id.as_deref(), Some("gemini-fixture-flash"));
+    let skills = skills.unwrap();
+    assert!(
+        skills.iter().any(|s| s.name == scenario::AGY_SKILL),
+        "{skills:?}"
+    );
+    assert_eq!(mode, Some(Mode::Ask));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_turn_streams_text_and_usage() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    for _ in 0..2 {
+        handle.send(Command::Prompt("hello".into())).unwrap();
+        let (mut text, mut usage) = (String::new(), Vec::new());
+        loop {
+            match next(&mut events).await {
+                Event::Text(t) => text.push_str(&t),
+                Event::Usage(u) => usage.push(u),
+                Event::Finished { outcome } => {
+                    assert_eq!(outcome, Outcome::Completed);
+                    break;
+                }
+                Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        // The thought and the echoed prompt are not the reply.
+        assert_eq!(text, scenario::AGY_REPLY);
+        assert_eq!(usage, ["42 tokens"]);
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_launches_against_octets_settings() {
+    let (dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let echo = agy_params(&handle, &mut events).await;
+    let folder = dir.path().join("data/antigravity/review");
+    assert_eq!(
+        echo["argv"],
+        serde_json::json!(["acp", "--cli_dir_name", folder.to_str().unwrap()])
+    );
+    let settings = &echo["settings"];
+    assert_eq!(settings["toolPermission"], "request-review", "{echo}");
+    assert!(settings.get("agentMode").is_none(), "{echo}");
+    assert!(settings["permissions"].get("allow").is_none(), "{echo}");
+    let sets = echo["sets"].as_array().unwrap();
+    assert_eq!(sets.last(), Some(&set("mode", "default")), "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_full_access_launches_with_always_proceed() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.mode = Mode::FullAccess;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::FullAccess))
+    })
+    .await;
+    let echo = agy_params(&handle, &mut events).await;
+    let folder = echo["argv"][2].as_str().unwrap();
+    assert!(folder.ends_with("antigravity/proceed"), "{echo}");
+    assert_eq!(echo["settings"]["toolPermission"], "always-proceed");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_requested_model_and_effort_are_set_and_confirmed() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.model = Some("claude-fixture".into());
+    c.effort = Some("low".into());
+    let (handle, mut events, task) = spawn(c);
+    let selected = wait_for(&mut events, |e| matches!(e, Event::ModelSelected(_))).await;
+    assert!(
+        matches!(&selected, Event::ModelSelected(model) if model == "claude-fixture"),
+        "{selected:?}"
+    );
+    let effort = wait_for(&mut events, |e| matches!(e, Event::Effort(_))).await;
+    assert!(
+        matches!(&effort, Event::Effort(Some(level)) if level == "low"),
+        "{effort:?}"
+    );
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let echo = agy_params(&handle, &mut events).await;
+    assert_eq!(
+        echo["sets"],
+        serde_json::json!([
+            ["model", "claude-fixture"],
+            ["thought_level", "low"],
+            ["mode", "default"]
+        ])
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_effort_on_a_model_without_levels_is_a_notice() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.model = Some("plain-fixture".into());
+    c.effort = Some("high".into());
+    let (handle, mut events, task) = spawn(c);
+    let mut noticed = false;
+    loop {
+        match next(&mut events).await {
+            Event::Notice(notice) if notice == "This Antigravity model takes no thinking level" => {
+                noticed = true;
+            }
+            Event::Ready { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(noticed, "the notice came before Ready");
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let echo = agy_params(&handle, &mut events).await;
+    let sets = echo["sets"].as_array().unwrap();
+    assert!(!sets.iter().any(|s| s[0] == "thought_level"), "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_effort_changes_live() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::SetEffort(Some("medium".into())))
+        .unwrap();
+    let effort = wait_for(&mut events, |e| matches!(e, Event::Effort(_))).await;
+    assert!(
+        matches!(&effort, Event::Effort(Some(level)) if level == "medium"),
+        "{effort:?}"
+    );
+    handle.send(Command::SetEffort(Some("max".into()))).unwrap();
+    let notice = wait_for(
+        &mut events,
+        |e| matches!(e, Event::Notice(n) if n.starts_with("Antigravity takes effort")),
+    )
+    .await;
+    assert!(
+        matches!(&notice, Event::Notice(n) if n.starts_with("Antigravity takes effort low, medium or high")),
+        "{notice:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_resume_gets_its_mode_model_and_effort_back() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.resume = Some("ses-old".into());
+    c.mode = Mode::AcceptEdits;
+    c.model = Some("claude-fixture".into());
+    c.effort = Some("low".into());
+    let (handle, mut events, task) = spawn(c);
+    let ready = wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    assert!(
+        matches!(&ready, Event::Ready { session } if session == "ses-old"),
+        "{ready:?}"
+    );
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    let echo = agy_params(&handle, &mut events).await;
+    assert_eq!(echo["opened"], "session/resume");
+    let sets = echo["sets"].as_array().unwrap();
+    for wanted in [
+        set("model", "claude-fixture"),
+        set("thought_level", "low"),
+        set("mode", "accept-edits"),
+    ] {
+        assert!(sets.contains(&wanted), "{wanted} in {echo}");
+    }
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_missing_session_is_an_error_not_a_hang() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.resume = Some(scenario::AGY_MISSING_SESSION.into());
+    let (_handle, mut events, task) = spawn(c);
+    let error = expect_error(&mut events).await;
+    assert!(
+        error.starts_with("Antigravity could not open the session: Failed to read session"),
+        "{error}"
+    );
+    ended(task).await;
+}
+#[tokio::test]
+async fn antigravity_signed_out_says_how_to_sign_in() {
+    let (_dir, c) = antigravity(serde_json::json!({"signedOut": true}));
+    let (_handle, mut events, task) = spawn(c);
+    assert_eq!(expect_error(&mut events).await, AGY_SIGN_IN);
+    ended(task).await;
+}
+/// Every event of a session that connects, then runs two plain turns.
+async fn agy_two_turns(c: Config) -> Vec<Event> {
+    let (handle, mut events, task) = spawn(c);
+    let mut seen = Vec::new();
+    loop {
+        let event = next(&mut events).await;
+        let connected = matches!(event, Event::ModeChanged(_));
+        seen.push(event);
+        if connected {
+            break;
+        }
+    }
+    for _ in 0..2 {
+        handle.send(Command::Prompt("hello".into())).unwrap();
+        seen.extend(until_finished(&mut events).await);
+    }
+    stop(&handle, task).await;
+    seen
+}
+#[tokio::test]
+async fn antigravity_an_unverified_version_is_noticed_once() {
+    let unverified = |seen: &[Event]| -> Vec<String> {
+        seen.iter()
+            .filter_map(|event| match event {
+                Event::Notice(n)
+                    if n.starts_with("Octet has not been checked against Antigravity") =>
+                {
+                    Some(n.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let (_dir, c) = antigravity(serde_json::json!({"version": "9.9.9"}));
+    let notices = unverified(&agy_two_turns(c).await);
+    assert_eq!(
+        notices,
+        [concat!(
+            "Octet has not been checked against Antigravity 9.9.9 (checked: 1.5.5). ",
+            "If a command or an edit runs without asking in ask or accept-edits, ",
+            "Octet cancels the turn and stops sending prompts"
+        )]
+    );
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    assert!(unverified(&agy_two_turns(c).await).is_empty());
+}
+#[tokio::test]
+async fn antigravity_fork_is_refused_before_launch() {
+    let (dir, mut c) = antigravity(serde_json::Value::Null);
+    c.resume = Some("ses-old".into());
+    c.fork = true;
+    let (_handle, mut events, task) = spawn(c);
+    assert_eq!(
+        expect_error(&mut events).await,
+        "Antigravity cannot fork a session"
+    );
+    ended(task).await;
+    assert!(!dir.path().join("data/antigravity").exists());
+}
+#[tokio::test]
+async fn antigravity_needs_a_data_directory() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.data_dir = None;
+    let (_handle, mut events, task) = spawn(c);
+    assert_eq!(
+        expect_error(&mut events).await,
+        "Antigravity needs Octet's data directory to keep its settings in"
+    );
+    ended(task).await;
+}
+#[tokio::test]
+async fn antigravity_refuses_the_plugin_switches() {
+    for (load, hooks) in [(true, false), (false, true), (false, false)] {
+        let (dir, mut c) = antigravity(serde_json::Value::Null);
+        c.plugins = octet_engine::live::Plugins { load, hooks };
+        let (_handle, mut events, task) = spawn(c);
+        assert_eq!(
+            expect_error(&mut events).await,
+            concat!(
+                "Antigravity has no switch to turn plugins or their hooks off; ",
+                "start without --no-plugins and --no-plugin-hooks"
+            )
+        );
+        ended(task).await;
+        assert!(!dir.path().join("data/antigravity").exists());
+    }
+}
+#[tokio::test]
+async fn antigravity_an_untrusted_workspace_does_not_start() {
+    let (dir, c) = antigravity(serde_json::Value::Null);
+    let agents = dir.path().join("ws/.agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("hooks.json"), "{}").unwrap();
+    let (_handle, mut events, task) = spawn(c.clone());
+    let error = loop {
+        match next(&mut events).await {
+            Event::Error(error) => break error,
+            Event::Ready { session } => panic!("a session opened: {session}"),
+            _ => {}
+        }
+    };
+    assert!(error.contains(".agents/hooks.json"), "{error}");
+    ended(task).await;
+    // Nothing was launched: Octet's settings were not even written.
+    assert!(!dir.path().join("data/antigravity/review").exists());
+    let mut trusted = c;
+    trusted.trust_workspace = true;
+    let (handle, mut events, task) = spawn(trusted);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_image_goes_inline() {
+    let dir = octet_testkit::TempDir::new("octet-image-agy");
+    let (_agy, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let (command, _) = image_prompt(&dir, PIXEL_PNG);
+    handle.send(command).unwrap();
+    let length = octet_engine::live::encoded_len(PIXEL_PNG.len() as u64);
+    assert_eq!(
+        turn_text(&mut events).await,
+        format!("image image/png {length}")
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_probe_lists_models_and_skills() {
+    let (dir, c) = antigravity(serde_json::Value::Null);
+    let listing = probe(c, PROBE_LIMIT).await.unwrap();
+    assert_eq!(listing.models.len(), 3, "{:?}", listing.models);
+    assert!(
+        listing.skills.iter().any(|s| s.name == scenario::AGY_SKILL),
+        "{:?}",
+        listing.skills
+    );
+    // The fake wrote `left-behind` into its home as it exited; the folder
+    // went once it had stopped.
+    assert!(dir.path().join("data/antigravity").exists());
+    assert_eq!(probe_folders(&dir), Vec::<String>::new());
+}
+#[tokio::test]
+async fn antigravity_a_probe_that_cannot_start_leaves_no_folder() {
+    let (dir, mut c) = antigravity(serde_json::Value::Null);
+    c.binary = dir.path().join("no-such-agy");
+    assert!(probe(c, PROBE_LIMIT).await.is_err());
+    assert_eq!(probe_folders(&dir), Vec::<String>::new());
+}
+/// Sends a plain prompt and returns its error, if any, and its outcome.
+async fn agy_turn(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+) -> (Option<String>, Outcome) {
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let seen = until_finished(events).await;
+    let error = seen.iter().find_map(|event| match event {
+        Event::Error(error) => Some(error.clone()),
+        _ => None,
+    });
+    match seen.last() {
+        Some(Event::Finished { outcome }) => (error, outcome.clone()),
+        other => panic!("the turn did not finish: {other:?}"),
+    }
+}
+/// What a prompt is refused with once the workspace's configuration
+/// changed after the start.
+const AGY_CHANGED: &str = concat!(
+    "Not sent: This workspace's .agents configuration changed since this session started: ",
+    ".agents/hooks.json"
+);
+#[tokio::test]
+async fn antigravity_configuration_that_appears_mid_session_stops_the_next_prompt() {
+    let (dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    assert_eq!(
+        agy_turn(&handle, &mut events).await,
+        (None, Outcome::Completed)
+    );
+    let agents = dir.path().join("ws/.agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("hooks.json"), "{}").unwrap();
+    let (error, outcome) = agy_turn(&handle, &mut events).await;
+    let error = error.unwrap();
+    assert!(error.starts_with(AGY_CHANGED), "{error}");
+    assert_eq!(outcome, Outcome::Failed);
+    std::fs::remove_dir_all(&agents).unwrap();
+    let echo = agy_params(&handle, &mut events).await;
+    assert_eq!(echo["prompts"], 1, "the refused prompt was not sent");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_trusted_configuration_edited_mid_session_stops_the_next_prompt() {
+    let (dir, mut c) = antigravity(serde_json::Value::Null);
+    let hooks = dir.path().join("ws/.agents/hooks.json");
+    std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+    std::fs::write(&hooks, "{}").unwrap();
+    c.trust_workspace = true;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    assert_eq!(
+        agy_turn(&handle, &mut events).await,
+        (None, Outcome::Completed)
+    );
+    std::fs::write(&hooks, r#"{"hooks":[]}"#).unwrap();
+    let (error, outcome) = agy_turn(&handle, &mut events).await;
+    let error = error.unwrap();
+    assert!(error.starts_with(AGY_CHANGED), "{error}");
+    assert_eq!(outcome, Outcome::Failed);
+    // What was trusted at the start is fine again.
+    std::fs::write(&hooks, "{}").unwrap();
+    let echo = agy_params(&handle, &mut events).await;
+    assert_eq!(echo["prompts"], 1, "the refused prompt was not sent");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_configuration_written_as_the_cli_starts_stops_the_first_prompt() {
+    let (dir, c) = antigravity(serde_json::json!({"hooksAtStart": true}));
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let (error, outcome) = agy_turn(&handle, &mut events).await;
+    let error = error.unwrap();
+    assert!(
+        error.starts_with("Not sent: This workspace's .agents configuration changed"),
+        "{error}"
+    );
+    assert_eq!(outcome, Outcome::Failed);
+    std::fs::remove_dir_all(dir.path().join("ws/.agents")).unwrap();
+    let echo = agy_params(&handle, &mut events).await;
+    assert_eq!(echo["prompts"], 0, "the refused prompt was not sent");
+    stop(&handle, task).await;
+}
+#[test]
+fn antigravity_a_second_probe_at_once_is_refused_and_the_first_keeps_its_folder() {
+    let (dir, mut c) = antigravity(serde_json::Value::Null);
+    c.catalog_only = true;
+    let first = octet_engine::live::antigravity_prepare(&c, None).unwrap();
+    let scratch = first.scratch.clone().unwrap();
+    assert!(scratch.starts_with(dir.path().join("data/antigravity")));
+    let second = octet_engine::live::antigravity_prepare(&c, None).unwrap_err();
+    assert!(
+        second.starts_with("Octet is already asking Antigravity"),
+        "{second}"
+    );
+    assert!(scratch.is_dir(), "the first probe keeps its folder");
+}
+#[tokio::test]
+async fn antigravity_handshake_out_of_order_is_an_error() {
+    // Antigravity answers session/new (id 2) before initialize (id 1).
+    let (_vendor_dir, vendor) = script_vendor(
+        "octet-live-agy-out-of-order",
+        "read line\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"s1\",\"configOptions\":[]}}'\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n\
+         exec sleep 30\n",
+    );
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.binary = vendor;
+    let (_handle, mut events, task) = spawn(c);
+    loop {
+        match next(&mut events).await {
+            Event::Error(error) => {
+                assert_eq!(error, "Unexpected protocol initialization order");
+                break;
+            }
+            Event::Ready { session } => panic!("a session opened: {session}"),
+            _ => {}
+        }
+    }
+    ended(task).await;
+}

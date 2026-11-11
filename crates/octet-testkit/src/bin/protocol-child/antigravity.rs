@@ -334,9 +334,10 @@ pub(crate) fn run() {
         fixture.handle(&v);
     }
     if let Some(dir) = flag_value("--gemini-dir") {
-        // The CLI leaves something of its own in the folder; a failure to
-        // write the marker is of no interest.
-        drop(fs::write(format!("{dir}/left-behind"), ""));
+        // The CLI leaves something of its own in the folder, making it again
+        // if it is gone, as a real CLI makes its home; a failure to write the
+        // marker is of no interest.
+        drop(fs::create_dir_all(&dir).and_then(|()| fs::write(format!("{dir}/left-behind"), "")));
     }
 }
 

@@ -345,7 +345,10 @@ mod tests {
             usage_demo(&three),
             "Choose a real provider: /model codex, /model claude or /model gemini. Demo has no model."
         );
-        assert_eq!(vendor_names(), ["codex", "claude", "opencode"]);
+        assert_eq!(
+            vendor_names(),
+            ["codex", "claude", "opencode", "antigravity"]
+        );
     }
     fn config() -> Config {
         Config {

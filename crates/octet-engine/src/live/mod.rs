@@ -22,7 +22,8 @@ mod opencode;
 mod protocol;
 pub use activity::{APPROVAL_SCOPE, ApprovalSummary, ToolCall, ToolPhase};
 pub use antigravity::{
-    WorkspaceConfig, antigravity_trust, antigravity_trusted, antigravity_workspace_config,
+    ANTIGRAVITY_VERIFIED_VERSIONS, WorkspaceConfig, antigravity_prepare, antigravity_trust,
+    antigravity_trusted, antigravity_workspace_config,
 };
 pub use claude::claude_stray_reply;
 pub use codex::codex_stray_reply;
@@ -210,6 +211,9 @@ pub struct Prepared {
     /// A folder made for this launch alone; the driver removes it once the
     /// CLI has stopped.
     pub scratch: Option<PathBuf>,
+    /// What the provider checked in the workspace before the launch
+    /// (Antigravity: the fingerprint of its `.agents` configuration).
+    pub workspace: Option<String>,
 }
 
 /// What runs before `config`'s vendor CLI starts; the driver and the
@@ -268,6 +272,8 @@ impl Engine {
     pub const CLAUDE: Engine = Engine(&claude::PROVIDER);
     /// opencode, over the Agent Client Protocol (`opencode acp`).
     pub const OPENCODE: Engine = Engine(&opencode::PROVIDER);
+    /// Antigravity, over the Agent Client Protocol (`agy acp`).
+    pub const ANTIGRAVITY: Engine = Engine(&antigravity::PROVIDER);
     /// The offline preview; no vendor process.
     pub const DEMO: Engine = Engine(&demo::PROVIDER);
     /// Every provider, in the order help lists them: the provider table.
@@ -275,10 +281,11 @@ impl Engine {
         Engine::CODEX,
         Engine::CLAUDE,
         Engine::OPENCODE,
+        Engine::ANTIGRAVITY,
         Engine::DEMO,
     ];
-    /// The engine named `value` (`codex`, `claude`, `opencode` or `demo`),
-    /// exactly as spelled.
+    /// The engine named `value` (`codex`, `claude`, `opencode`,
+    /// `antigravity` or `demo`), exactly as spelled.
     ///
     /// ```
     /// use octet_engine::live::Engine;
@@ -708,7 +715,8 @@ pub enum Event {
     /// The permission mode the vendor confirmed.
     ModeChanged(Mode),
     /// The reasoning effort the vendor confirmed, or went back to after a
-    /// refusal; `None` is its default. Only opencode reports it.
+    /// refusal; `None` is its default. Only opencode and Antigravity report
+    /// it.
     Effort(Option<String>),
     /// The user's prompt, as the transcript shows it.
     User(String),
@@ -1158,6 +1166,7 @@ mod tests {
         for engine in [Engine::CODEX, Engine::CLAUDE, Engine::OPENCODE] {
             assert!(engine.provider().forks, "{engine}");
         }
+        assert!(!Engine::ANTIGRAVITY.provider().forks);
         assert!(!Engine::DEMO.provider().forks);
     }
     #[test]
@@ -1218,6 +1227,11 @@ mod tests {
         assert_eq!(
             process(Engine::OPENCODE).shutdown_grace,
             Duration::from_millis(250)
+        );
+        // Antigravity 1.5.5 took 375 ms with a session open.
+        assert_eq!(
+            process(Engine::ANTIGRAVITY).shutdown_grace,
+            Duration::from_secs(1)
         );
     }
     #[test]
@@ -1443,7 +1457,10 @@ mod tests {
     fn the_table_is_complete_and_unambiguous() {
         let names: Vec<&str> = Engine::ALL.iter().map(|e| e.as_str()).collect();
         // Vendors first, then the demo; this order is what help shows.
-        assert_eq!(names, ["codex", "claude", "opencode", "demo"]);
+        assert_eq!(
+            names,
+            ["codex", "claude", "opencode", "antigravity", "demo"]
+        );
         for engine in Engine::ALL {
             assert_eq!(Engine::parse(engine.as_str()), Some(*engine));
             assert!(engine.provider().modes.iter().all(|m| !m.is_empty()));

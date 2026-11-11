@@ -346,13 +346,6 @@ fn remember(
 ///
 /// When the configuration cannot be checked, or is not trusted and
 /// `config.trust_workspace` is off.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the Antigravity protocol, which a later commit adds"
-    )
-)]
 pub(super) fn check(config: &Config, data_dir: &Path) -> Result<Option<String>, String> {
     let Some(found) = antigravity_workspace_config(&config.cwd)? else {
         return Ok(None);
@@ -375,13 +368,6 @@ pub(super) fn check(config: &Config, data_dir: &Path) -> Result<Option<String>, 
 /// # Errors
 ///
 /// When the configuration differs, or cannot be checked (the error says why).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the Antigravity protocol, which a later commit adds"
-    )
-)]
 pub(super) fn unchanged(cwd: &Path, started_with: Option<&str>) -> Result<(), String> {
     match antigravity_workspace_config(cwd)? {
         Some(now) if started_with != Some(now.fingerprint.as_str()) => Err(format!(
@@ -423,7 +409,7 @@ mod tests {
     }
 
     fn config(cwd: &Path, trust_workspace: bool) -> Config {
-        let mut config = crate::live::Config::new(crate::live::Engine::OPENCODE, "agy", cwd);
+        let mut config = crate::live::Config::new(crate::live::Engine::ANTIGRAVITY, "agy", cwd);
         config.trust_workspace = trust_workspace;
         config
     }

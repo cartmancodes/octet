@@ -360,8 +360,9 @@ mod tests {
             description: String::new(),
         }
     }
-    /// Probes run the fake vendor for every provider.
-    fn fake_prober() -> Prober {
+    /// Probes run the fake vendor for every provider, keeping Octet's files
+    /// (Antigravity's settings) in `data_dir`.
+    fn fake_prober(data_dir: &Path) -> Prober {
         Prober {
             cwd: std::env::temp_dir(),
             binaries: Engine::ALL
@@ -370,7 +371,7 @@ mod tests {
                 .collect(),
             limit: octet_core::PROBE_LIMIT,
             plugins: octet_core::Plugins::default(),
-            data_dir: None,
+            data_dir: Some(data_dir.to_owned()),
             trust_workspace: false,
         }
     }
@@ -379,7 +380,7 @@ mod tests {
         let prober = Prober {
             data_dir: Some("/d".into()),
             trust_workspace: true,
-            ..fake_prober()
+            ..fake_prober(Path::new("/unused"))
         };
         let config = prober.config(Engine::CLAUDE);
         assert_eq!(config.data_dir, Some(PathBuf::from("/d")));
@@ -388,7 +389,7 @@ mod tests {
     }
     fn attached(dir: &Path) -> Models {
         let mut models = Models::default();
-        models.attach(dir, fake_prober());
+        models.attach(dir, fake_prober(dir));
         models
     }
     fn temp(name: &str) -> octet_testkit::TempDir {
@@ -498,7 +499,7 @@ mod tests {
             assert!(notes.iter().all(|n| n.starts_with("Fetched")), "{notes:?}");
         }
         engines.sort_unstable();
-        assert_eq!(engines, ["codex", "opencode"]);
+        assert_eq!(engines, ["antigravity", "codex", "opencode"]);
         let cached = Catalogs::load(&dir.path().join(octet_core::catalog::FILE));
         assert!(
             cached
@@ -515,16 +516,21 @@ mod tests {
         let dir = temp("octet-models-binary");
         let mut models = Models::default();
         // Only Codex has an override; Claude would run its default CLI.
-        // opencode gets one that cannot start, so the test never runs the
-        // real opencode, which would open a session in the user's history.
-        let mut prober = fake_prober();
+        // opencode and Antigravity get one that cannot start, so the test
+        // never runs the real CLI, which would open a session in the user's
+        // history.
+        let mut prober = fake_prober(dir.path());
         prober.binaries.retain(|engine, _| *engine == Engine::CODEX);
         prober
             .binaries
             .insert(Engine::OPENCODE, dir.path().join("no-such-opencode"));
+        prober
+            .binaries
+            .insert(Engine::ANTIGRAVITY, dir.path().join("no-such-agy"));
         models.attach(dir.path(), prober);
         models.probe_stale(Engine::CLAUDE, SystemTime::now());
-        // The probes finish in any order; opencode's fails at once.
+        // The probes finish in any order; opencode's and Antigravity's fail
+        // at once.
         let probed = loop {
             let probed = models.next().await;
             if probed.engine == Engine::CODEX {
@@ -541,20 +547,23 @@ mod tests {
         models.probe_stale(Engine::CLAUDE, SystemTime::now());
         let refreshed = models.refresh(Engine::CLAUDE);
         assert!(refreshed.started.is_empty());
-        assert_eq!(refreshed.running, [Engine::CODEX, Engine::OPENCODE]);
+        assert_eq!(
+            refreshed.running,
+            [Engine::CODEX, Engine::OPENCODE, Engine::ANTIGRAVITY]
+        );
         // Those were asked for again, so their end is reported too.
         let mut notes = Vec::new();
         while !models.probing.is_empty() {
             let probed = models.next().await;
             notes.extend(models.probed(probed, SystemTime::now()));
         }
-        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes.len(), 3, "{notes:?}");
     }
 
     #[tokio::test]
     async fn refresh_notes_each_list_as_it_comes_in_or_fails() {
         let dir = temp("octet-models-refresh-done");
-        let mut prober = fake_prober();
+        let mut prober = fake_prober(dir.path());
         // An opencode that cannot start: its probe fails at once.
         prober
             .binaries
@@ -562,19 +571,23 @@ mod tests {
         let mut models = Models::default();
         models.attach(dir.path(), prober);
         let refreshed = models.refresh(Engine::CLAUDE);
-        assert_eq!(refreshed.started, [Engine::CODEX, Engine::OPENCODE]);
+        assert_eq!(
+            refreshed.started,
+            [Engine::CODEX, Engine::OPENCODE, Engine::ANTIGRAVITY]
+        );
         let mut notes = Vec::new();
         while !models.probing.is_empty() {
             let probed = models.next().await;
             notes.extend(models.probed(probed, SystemTime::now()));
         }
         notes.sort();
-        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes.len(), 3, "{notes:?}");
         assert!(
             notes[0].starts_with("Could not fetch opencode's model list: "),
             "{notes:?}"
         );
-        assert_eq!(notes[1], "Fetched codex's model list (2 models)");
+        assert_eq!(notes[1], "Fetched antigravity's model list (3 models)");
+        assert_eq!(notes[2], "Fetched codex's model list (2 models)");
     }
 
     #[test]

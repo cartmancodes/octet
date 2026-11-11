@@ -240,6 +240,8 @@ impl Core {
 pub(crate) trait Protocol: Default + Send {
     /// The vendor CLI's arguments.
     fn launch_args(config: &Config) -> Vec<OsString>;
+    /// Handed what `prepare` checked, once, before `initialize`.
+    fn prepared(&mut self, _workspace: Option<String>) {}
     /// Starts the handshake.
     fn initialize(
         &mut self,

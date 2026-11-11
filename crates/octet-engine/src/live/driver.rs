@@ -3,7 +3,7 @@
 //! approvals and commands, and calls the protocol for the rest.
 use super::{
     BUSY, Channels, Command, Config, DriverError, Engine, Event, FULL_ACCESS_RECONNECTS, HEADROOM,
-    ImageAttachment, Limits, Mode, NO_TURN, NOT_SENT, Outcome, TurnGate, deadline_after,
+    ImageAttachment, Limits, Mode, NO_TURN, NOT_SENT, Outcome, Prepared, TurnGate, deadline_after,
     launch_env, prepare,
     protocol::{Core, Phase, Protocol},
     vendor_process,
@@ -62,10 +62,14 @@ pub(super) async fn run<P: Protocol>(
     if config.fork && !engine.provider().forks {
         return Err(format!("{} cannot fork a session", engine.title()));
     }
-    let prepared = prepare(&config)?;
+    let Prepared {
+        notices,
+        scratch,
+        workspace,
+    } = prepare(&config)?;
     // Declared before the process, so it is dropped after it: the folder goes
     // once the CLI has stopped, and when the spawn fails.
-    let _scratch = Scratch(prepared.scratch);
+    let _scratch = Scratch(scratch);
     let process = Process::spawn(&vendor_process(
         engine,
         config.binary.clone(),
@@ -81,8 +85,8 @@ pub(super) async fn run<P: Protocol>(
         held: None,
         switch_target: None,
     };
-    let result = match prepared
-        .notices
+    driver.protocol.prepared(workspace);
+    let result = match notices
         .into_iter()
         .try_for_each(|notice| driver.core.emit(Event::Notice(notice)))
     {

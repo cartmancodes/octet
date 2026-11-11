@@ -30,6 +30,19 @@ pub(super) fn cli_dir(data_dir: &Path, mode: Mode) -> PathBuf {
     data_dir.join("antigravity").join(pin_folder(mode))
 }
 
+/// The home a probe runs Antigravity in (`--gemini-dir`), so listing the
+/// models adds no session to the user's history:
+/// `<data_dir>/antigravity/probe-<this process's ID>`. One Octet process
+/// runs one Antigravity probe at a time.
+pub(super) fn probe_home(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("antigravity")
+        .join(format!("{PROBE_PREFIX}{}", std::process::id()))
+}
+
+/// How the name of every probe's home starts.
+pub(super) const PROBE_PREFIX: &str = "probe-";
+
 /// The name of `mode`'s folder inside `<data_dir>/antigravity`.
 fn pin_folder(mode: Mode) -> &'static str {
     if mode == Mode::FullAccess {

@@ -227,8 +227,8 @@ pub(super) fn approval(
             let address = input["url"].as_str().unwrap_or(title);
             ApprovalSummary::new(format!("Fetch {}", one_line(address)))
         }
-        // opencode's `external_directory` permission: a path outside the
-        // workspace, for a read or edit, or for a command.
+        // A path outside the workspace, for a read or edit, or for a
+        // command (opencode's `external_directory` permission is one).
         "other"
             if ["filepath", "parentDir", "directories"]
                 .iter()
