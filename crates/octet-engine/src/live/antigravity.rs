@@ -82,6 +82,10 @@ const NO_LEVELS: &str = "This Antigravity model takes no thinking level";
 const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
 /// The permission options Octet answers with when a request lists none.
 const PERMISSION_IDS: (&str, &str) = ("allow", "deny");
+/// How much later than Antigravity's own deadline for a cancelled turn with
+/// a kept reason the driver's interrupt watchdog is put, so that the
+/// reason is shown when the session stops.
+const STOP_MARGIN: Duration = Duration::from_secs(1);
 /// What Octet says when the session lists no `compact` command.
 const NO_COMPACT: &str = "Antigravity does not offer compaction in this session";
 /// Why a turn is not sent once Antigravity acted unasked in the session.
@@ -148,9 +152,16 @@ pub(super) struct AntigravityProtocol {
     /// A `session/cancel` was sent this turn: an `end_turn` then means the
     /// turn was interrupted.
     cancel_sent: bool,
-    /// Why Octet cancelled the running turn: it ends `Failed` with this,
-    /// whatever its stop reason. The first reason stays.
+    /// Why Octet cancelled the running turn, or why it fails although the
+    /// user cancelled it: it ends `Failed` with this, whatever its stop
+    /// reason (see `cancel_turn`).
     stop_reason: Option<String>,
+    /// The kept reason is the tripwire's.
+    stop_trip: bool,
+    /// When the kept reason is shown with the session's stop, if the
+    /// cancelled prompt is not answered: just before the driver's own
+    /// interrupt watchdog would stop the session without it.
+    stop_deadline: Option<Instant>,
     /// Antigravity acted unasked in this session: nothing more is sent.
     tripped: bool,
     /// Octet's mode, to be set back after Antigravity moved itself.
@@ -216,23 +227,30 @@ impl Protocol for AntigravityProtocol {
 
     /// The pending switch's deadline is also a set-back's.
     fn deadline(&self) -> Option<Instant> {
-        [self.switches.deadline(), self.probe_wait]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.switches.deadline(),
+            self.probe_wait,
+            self.stop_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
-    /// A set-back Antigravity has not confirmed in time stops the session.
-    /// A switch Antigravity has not confirmed in time is reported, and kept
-    /// in case Antigravity confirms it late. A probe whose commands never
-    /// came settles for the models. Nothing here waits, so the work is done
-    /// at once and handed back as a ready future.
+    /// A set-back Antigravity has not confirmed in time stops the session,
+    /// as does a cancelled turn with a kept reason that Antigravity has not
+    /// ended in time, saying the reason. A switch Antigravity has not
+    /// confirmed in time is reported, and kept in case Antigravity confirms
+    /// it late. A probe whose commands never came settles for the models.
+    /// Nothing here waits, so the work is done at once and handed back as a
+    /// ready future.
     fn on_deadline(
         &mut self,
         core: &mut Core,
     ) -> impl Future<Output = Result<(), DriverError>> + Send {
         std::future::ready(
             self.set_back_expired(core)
+                .and_then(|()| self.stop_expired(core))
                 .and_then(|()| self.switches.report_expired(core, PROVIDER.title))
                 .and_then(|()| self.probe_timed_out(core)),
         )
@@ -247,6 +265,8 @@ impl Protocol for AntigravityProtocol {
     fn turn_started(&mut self) {
         self.cancel_sent = false;
         self.stop_reason = None;
+        self.stop_trip = false;
+        self.stop_deadline = None;
         self.tools.clear();
     }
 
@@ -889,6 +909,8 @@ impl AntigravityProtocol {
             return Ok(());
         }
         self.tools.clear();
+        self.stop_deadline = None;
+        self.stop_trip = false;
         if let Some(reason) = self.stop_reason.take() {
             core.finish_turn(Outcome::Failed, Some(reason))?;
         } else {
@@ -920,9 +942,11 @@ impl AntigravityProtocol {
 
     /// Cancels the running turn as opencode's `stop_subtask` does, keeping
     /// `reason`: the turn ends only when the prompt's own reply comes, and
-    /// fails with it then. A turn already being cancelled (by Octet, or by
-    /// the user) keeps what it has. A `trip` marks the session whatever the
-    /// turn's state. Whether the reason was kept.
+    /// fails with it then. A `trip` marks the session whatever the turn's
+    /// state. A turn already being cancelled (by Octet, or by the user) gets
+    /// no second cancel; it keeps its reason, except that a trip's replaces
+    /// any reason that is not a trip's (the user must hear what ran), so a
+    /// turn the user cancelled then fails too. Whether the reason was kept.
     async fn cancel_turn(
         &mut self,
         core: &mut Core,
@@ -930,15 +954,42 @@ impl AntigravityProtocol {
         trip: bool,
     ) -> Result<bool, DriverError> {
         self.tripped |= trip;
-        if core.phase != Phase::InTurn {
-            return Ok(false);
+        match core.phase {
+            Phase::InTurn => {
+                core.phase = Phase::Interrupting;
+                <Self as Protocol>::interrupt(self, core).await?;
+                core.deadline = deadline_after(core.limits.interrupt);
+                core.deny_all_pending().await?;
+            }
+            Phase::Interrupting if trip && !self.stop_trip => {}
+            _ => return Ok(false),
         }
         self.stop_reason = Some(reason);
-        core.phase = Phase::Interrupting;
-        <Self as Protocol>::interrupt(self, core).await?;
-        core.deadline = deadline_after(core.limits.interrupt);
-        core.deny_all_pending().await?;
+        self.stop_trip = trip;
+        // Antigravity's own timer fires first, so the reason is not lost to
+        // the driver's watchdog.
+        if self.stop_deadline.is_none() {
+            self.stop_deadline = Some(core.deadline);
+            core.deadline += STOP_MARGIN;
+        }
         Ok(true)
+    }
+
+    /// A turn cancelled with a kept reason that Antigravity has not ended in
+    /// time stops the session, as the driver's interrupt watchdog would, but
+    /// saying the reason.
+    fn stop_expired(&self, core: &Core) -> Result<(), DriverError> {
+        let (Some(at), Some(reason)) = (self.stop_deadline, &self.stop_reason) else {
+            return Ok(());
+        };
+        if at > Instant::now() || !core.phase.is_running() {
+            return Ok(());
+        }
+        Err(format!(
+            "{reason}. Antigravity did not stop within {} of Octet's cancel; session stopped",
+            seconds(core.limits.interrupt)
+        )
+        .into())
     }
 
     /// A `config_option_update`: the options are recorded; a model of

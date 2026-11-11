@@ -255,7 +255,9 @@ enum Turn {
         /// The prompt's request ID.
         id: Value,
     },
-    /// `AGY_ASK_ON_CANCEL`, cancelled: the reply to the request `"1"`.
+    /// `AGY_ASK_ON_CANCEL`, cancelled: the reply to the request `"1"`; a
+    /// rejection fails the command, an allow completes it and says `allowed
+    /// on cancel`.
     AskedOnCancel {
         /// The prompt's request ID.
         id: Value,
@@ -930,7 +932,13 @@ impl AgyFixture {
                 }
             }
             Some(Turn::AskedOnCancel { id }) if v["id"] == REQUEST_ID => {
-                emit(&tool_status(&self.session, "call-1", "failed"));
+                // Only a rejection fails the command; an allow runs it.
+                if choice(v) == "deny" {
+                    emit(&tool_status(&self.session, "call-1", "failed"));
+                } else {
+                    emit(&tool_status(&self.session, "call-1", "completed"));
+                    emit(&acp_text(&self.session, "allowed on cancel"));
+                }
                 stop(&id, "cancelled");
             }
             other => self.turn = other,

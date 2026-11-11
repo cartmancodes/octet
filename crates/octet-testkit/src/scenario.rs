@@ -157,8 +157,9 @@ pub const AGY_LATE_COMMAND: &str = "agy-late-command";
 /// turn runs is ignored.
 pub const AGY_FLOOD: &str = "agy-flood";
 /// Antigravity: a command starts and the turn holds; a cancel makes the agent
-/// ask for permission, and once that is answered the tool call fails and the
-/// turn ends `cancelled`.
+/// ask for permission. A rejection (`deny`) fails the tool call; any other
+/// answer completes it and says `allowed on cancel`. Either way the turn then
+/// ends `cancelled`.
 pub const AGY_ASK_ON_CANCEL: &str = "agy-ask-on-cancel";
 
 /// opencode model value: once set, every later mode switch is refused with

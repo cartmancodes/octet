@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 /// The most tool calls one turn remembers.
-pub(super) const MAX_TOOLS: usize = 1024;
+const MAX_TOOLS: usize = 1024;
 
 /// The name of the tool that starts one of Antigravity's subagents.
 const SUBAGENT_TOOL: &str = "invoke_subagent";
@@ -113,9 +113,11 @@ impl Tools {
     }
 
     /// A `tool_call` or `tool_call_update`, arriving under `mode`: the call
-    /// as it now stands, and why it stops the turn, if it does. Its name and
-    /// kind are its first frame's; its target is the newest one a frame
-    /// names (see `acp::frame_target`), else a command's title. At most
+    /// as it now stands, and why it stops the turn, if it does. Its name is
+    /// its first frame's; its kind is the newest one a frame names, except
+    /// that a kind the tripwire covers sticks (see `Tool::update`); its
+    /// target is the newest one a frame names (see `acp::frame_target`),
+    /// else a command's title. At most
     /// [`MAX_TOOLS`] calls are remembered in a turn; while `mode` asks, a
     /// call that cannot be is a [`Stop::TooMany`]. A frame that ends a call
     /// no permission request named is judged by the tripwire; a call without
@@ -126,9 +128,7 @@ impl Tools {
         let phase = acp::tool_phase(&update["status"]);
         let ends = phase != ToolPhase::Running;
         let (name, target, stop) = if let Some(known) = self.calls.get_mut(&id) {
-            if let Some(target) = target {
-                known.target = target;
-            }
+            known.update(update, target);
             let stop = known.end(ends);
             (known.name.clone(), known.target.clone(), stop)
         } else {
@@ -190,6 +190,33 @@ impl Tool {
         }
     }
 
+    /// A later frame `update` of the call, naming `target`, if any. A kind
+    /// it names replaces the one known unless that one is covered by the
+    /// tripwire (a covered kind sticks, so a later frame cannot make a
+    /// command look like a read). A command that has no target yet takes the
+    /// frame's title.
+    fn update(&mut self, update: &Value, target: Option<String>) {
+        let named = |key: &str| {
+            update[key]
+                .as_str()
+                .map(one_line)
+                .filter(|text| !text.is_empty())
+        };
+        if let Some(kind) = named("kind")
+            && !COVERED.contains(&self.kind.as_str())
+        {
+            self.kind = kind;
+        }
+        if let Some(target) = target {
+            self.target = target;
+        } else if self.target.is_empty()
+            && self.kind == "execute"
+            && let Some(title) = named("title")
+        {
+            self.target = title;
+        }
+    }
+
     /// The call's frame says it `ends`: the first time, it is judged, and an
     /// unasked call the tripwire covers is a [`Stop::Unasked`].
     fn end(&mut self, ends: bool) -> Option<Stop> {
@@ -214,6 +241,9 @@ impl Tool {
         )))
     }
 }
+
+/// The kinds the tripwire covers in some mode.
+const COVERED: [&str; 4] = ["execute", "edit", "delete", "move"];
 
 /// The tripwire: what a call of `kind` that ran unasked did, when `loosest`,
 /// the loosest mode in force while it ran, should have asked for it — a
@@ -326,6 +356,45 @@ mod tests {
             "{stop:?}"
         );
         assert_eq!(tools.frame(&command("late", "failed"), Mode::Ask).1, None);
+    }
+
+    #[test]
+    fn a_kind_named_on_a_later_frame_is_judged_and_a_covered_kind_sticks() {
+        let unasked = |stop: Option<Stop>, target: &str| {
+            matches!(&stop, Some(Stop::Unasked(reason)) if reason.starts_with(&format!(
+                "Antigravity ran a command without asking while Octet shows ask: {target}."
+            )))
+        };
+        let completed = json!({"toolCallId": "c1", "kind": "execute",
+            "rawInput": {"command": "rm x"}, "status": "completed"});
+        // No kind at first: `other` until a later frame names one.
+        let mut tools = Tools::default();
+        tools.frame(
+            &json!({"toolCallId": "c1", "title": "Run", "status": "pending"}),
+            Mode::Ask,
+        );
+        let (call, stop) = tools.frame(&completed, Mode::Ask);
+        assert_eq!(call.target, "rm x");
+        assert!(unasked(stop, "rm x"));
+        // A kind the tripwire does not cover gives way to one it does.
+        let mut tools = Tools::default();
+        tools.frame(
+            &json!({"toolCallId": "c1", "kind": "read", "status": "in_progress"}),
+            Mode::Ask,
+        );
+        assert!(unasked(tools.frame(&completed, Mode::Ask).1, "rm x"));
+        // A covered kind is not downgraded by a later one; a later frame's
+        // title is the target of a command that named none.
+        let mut tools = Tools::default();
+        tools.frame(
+            &json!({"toolCallId": "c1", "kind": "execute", "status": "pending"}),
+            Mode::Ask,
+        );
+        let (_, stop) = tools.frame(
+            &json!({"toolCallId": "c1", "kind": "read", "title": "ls", "status": "completed"}),
+            Mode::Ask,
+        );
+        assert!(unasked(stop, "ls"));
     }
 
     #[test]

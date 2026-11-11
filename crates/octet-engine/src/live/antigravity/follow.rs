@@ -45,7 +45,8 @@ fn moved(id: &str, mode: Mode, running: bool) -> Option<Moved> {
     Some(if looser && running {
         let label = mode.label();
         Moved::Looser(format!(
-            "Antigravity moved to its {id} mode while Octet shows {label}. Octet cancelled the turn and set {label} back"
+            "Antigravity moved to its {id} mode while Octet shows {label}. \
+             Octet cancelled the turn and set {label} back"
         ))
     } else {
         Moved::Other
