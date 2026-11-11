@@ -28,9 +28,23 @@ pub(crate) struct Prober {
     pub(crate) limit: Duration,
     /// The run's plugin switches, so a probe loads what a session would.
     pub(crate) plugins: octet_core::Plugins,
+    /// The session's data directory, for a provider that keeps files there.
+    pub(crate) data_dir: Option<PathBuf>,
+    /// The session's trust flag, so a probe may run wherever the session may.
+    pub(crate) trust_workspace: bool,
 }
 
 impl Prober {
+    /// The configuration of a probe of `engine`.
+    fn config(&self, engine: Engine) -> octet_core::Config {
+        octet_core::Config {
+            plugins: self.plugins,
+            data_dir: self.data_dir.clone(),
+            trust_workspace: self.trust_workspace,
+            ..octet_core::Config::new(engine, self.binary(engine), self.cwd.clone())
+        }
+    }
+
     /// The CLI to start for `engine`.
     fn binary(&self, engine: Engine) -> PathBuf {
         self.binaries
@@ -158,11 +172,7 @@ impl Models {
         }
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let binary = prober.binary(engine);
-            let config = octet_core::Config {
-                plugins: prober.plugins,
-                ..octet_core::Config::new(engine, binary, prober.cwd)
-            };
+            let config = prober.config(engine);
             let result = octet_core::probe(config, prober.limit).await;
             let _ = tx.send(Probed { engine, result });
         });
@@ -360,7 +370,21 @@ mod tests {
                 .collect(),
             limit: octet_core::PROBE_LIMIT,
             plugins: octet_core::Plugins::default(),
+            data_dir: None,
+            trust_workspace: false,
         }
+    }
+    #[test]
+    fn a_probe_carries_the_data_directory_and_the_trust_flag() {
+        let prober = Prober {
+            data_dir: Some("/d".into()),
+            trust_workspace: true,
+            ..fake_prober()
+        };
+        let config = prober.config(Engine::CLAUDE);
+        assert_eq!(config.data_dir, Some(PathBuf::from("/d")));
+        assert!(config.trust_workspace);
+        assert_eq!(config.cwd, prober.cwd);
     }
     fn attached(dir: &Path) -> Models {
         let mut models = Models::default();

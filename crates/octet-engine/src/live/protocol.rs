@@ -308,6 +308,12 @@ pub(crate) trait Protocol: Default + Send {
     fn take_switch_timed_out(&mut self) -> bool {
         false
     }
+    /// A turn sent while a mode change is pending waits for it although the
+    /// provider's switch reaches a running turn: the vendor answers requests
+    /// in no fixed order.
+    fn holds_turn_for_switch(&self) -> bool {
+        false
+    }
     /// A switch that timed out is still unanswered, so the mode the vendor
     /// runs is unknown: the target of the latest such switch. For a
     /// provider whose mode applies from the next turn, the driver refuses

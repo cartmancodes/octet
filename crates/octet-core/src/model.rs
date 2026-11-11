@@ -78,6 +78,8 @@ impl Selection {
             fork: same && session.is_empty() && current.fork,
             catalog_only: false,
             plugins: current.plugins,
+            data_dir: current.data_dir.clone(),
+            trust_workspace: current.trust_workspace,
             engine: self.provider,
             model: self.model.clone(),
             cwd: current.cwd.clone(),
@@ -363,6 +365,21 @@ mod tests {
             .unwrap()
             .configure(&current, "thread", None);
         assert_eq!(next.approval_timeout, std::time::Duration::from_secs(300));
+    }
+    #[test]
+    fn configure_keeps_the_data_directory_and_the_trust_flag() {
+        let current = Config {
+            data_dir: Some("/d".into()),
+            trust_workspace: true,
+            ..config()
+        };
+        for selection in ["new-model", "claude example"] {
+            let next = Selection::parse(selection, Engine::CODEX)
+                .unwrap()
+                .configure(&current, "thread", None);
+            assert_eq!(next.data_dir, Some(PathBuf::from("/d")), "{selection}");
+            assert!(next.trust_workspace, "{selection}");
+        }
     }
     #[test]
     fn configure_carries_mode() {

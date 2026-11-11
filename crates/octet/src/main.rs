@@ -186,8 +186,9 @@ async fn run() -> Result<i32, CliError> {
         Some(cwd) => cwd.clone(),
         None => std::env::current_dir().map_err(|e| CliError::Run(e.to_string()))?,
     };
-    let config = args.config(args::workspace(&cwd)?);
+    let mut config = args.config(args::workspace(&cwd)?);
     let directory = data_dir(args.journal_dir.clone())?;
+    config.data_dir = Some(directory.clone());
     let result = match args.run {
         Run::Interface => octet_tui::run(
             config,

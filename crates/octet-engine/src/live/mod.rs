@@ -149,11 +149,20 @@ pub struct Provider {
     /// (opencode). The earlier conversation a provider switch carries must
     /// then never go with a command: it holds replies and tool output.
     pub commands_expand_shell: bool,
+    /// The vendor can open a session as a copy of another (`/fork`).
+    pub forks: bool,
+    /// Lists models that are other providers' own, under the same bare IDs
+    /// (Antigravity lists Claude and GPT models); a name another provider
+    /// also matches goes to that provider.
+    pub carries_others_models: bool,
     /// The vendor CLI's arguments for `config` (none for the demo).
     pub(crate) launch_args: fn(&Config) -> Vec<OsString>,
     /// The environment variables the vendor CLI is launched with, on top of
     /// the inherited ones (none for Codex, Claude and the demo).
     pub(crate) launch_env: fn(&Config) -> Vec<(OsString, OsString)>,
+    /// Runs before the CLI starts: `Ok` holds notices to show; `Err` is why
+    /// the session cannot start.
+    pub(crate) prepare: fn(&Config) -> Result<Prepared, String>,
     /// Runs one session until it stops.
     pub(crate) start: StartFn,
 }
@@ -187,6 +196,34 @@ pub fn launch_args(config: &Config) -> Vec<OsString> {
 /// [`launch_args`].
 pub fn launch_env(config: &Config) -> Vec<(OsString, OsString)> {
     (config.engine.provider().launch_env)(config)
+}
+
+/// What a provider's `prepare` step leaves for the driver.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Prepared {
+    /// Notices to show before the session starts, in order.
+    pub notices: Vec<String>,
+    /// A folder made for this launch alone; the driver removes it once the
+    /// CLI has stopped.
+    pub scratch: Option<PathBuf>,
+}
+
+/// What runs before `config`'s vendor CLI starts; the driver and the
+/// protocol gate share it with [`launch_args`] and [`launch_env`].
+///
+/// # Errors
+/// Why the session cannot start, in words to show.
+pub fn prepare(config: &Config) -> Result<Prepared, String> {
+    (config.engine.provider().prepare)(config)
+}
+
+/// A provider with nothing to do before its CLI starts.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the shape of `Provider::prepare`, which other providers can fail"
+)]
+pub(super) fn no_prepare(_: &Config) -> Result<Prepared, String> {
+    Ok(Prepared::default())
 }
 
 /// A provider that needs no environment variables of its own.
@@ -344,6 +381,13 @@ pub struct Config {
     pub catalog_only: bool,
     /// Load the vendor's plugins, and run their hooks.
     pub plugins: Plugins,
+    /// Octet's data directory, for a provider that keeps files of its own
+    /// there (Antigravity: its settings, and the workspaces the user
+    /// trusted).
+    pub data_dir: Option<PathBuf>,
+    /// Start although the workspace's own vendor configuration is not
+    /// trusted (`--trust-workspace-config`).
+    pub trust_workspace: bool,
 }
 /// Whether the vendor's plugins load, and whether their hooks run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +420,8 @@ impl Config {
             fork: false,
             catalog_only: false,
             plugins: Plugins::default(),
+            data_dir: None,
+            trust_workspace: false,
         }
     }
 }
@@ -1103,6 +1149,20 @@ pub fn spawn_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_vendor_but_the_demo_forks() {
+        for engine in [Engine::CODEX, Engine::CLAUDE, Engine::OPENCODE] {
+            assert!(engine.provider().forks, "{engine}");
+        }
+        assert!(!Engine::DEMO.provider().forks);
+    }
+    #[test]
+    fn a_provider_with_nothing_to_prepare_has_no_notices() {
+        assert_eq!(
+            prepare(&Config::new(Engine::CODEX, "codex", "/w")),
+            Ok(Prepared::default())
+        );
+    }
     #[test]
     fn a_skill_round_trips_through_json_and_bad_ones_are_skipped() {
         let skill = SkillInfo {

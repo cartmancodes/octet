@@ -4,13 +4,13 @@
 use super::{
     BUSY, Channels, Command, Config, DriverError, Engine, Event, FULL_ACCESS_RECONNECTS, HEADROOM,
     ImageAttachment, Limits, Mode, NO_TURN, NOT_SENT, Outcome, TurnGate, deadline_after,
-    launch_env,
+    launch_env, prepare,
     protocol::{Core, Phase, Protocol},
     vendor_process,
 };
 use octet_proc::Process;
 use serde_json::Value;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 use tokio::{
     sync::{mpsc, watch},
     time::Instant,
@@ -59,6 +59,13 @@ pub(super) async fn run<P: Protocol>(
         events,
     } = channels;
     let engine = config.engine;
+    if config.fork && !engine.provider().forks {
+        return Err(format!("{} cannot fork a session", engine.title()));
+    }
+    let prepared = prepare(&config)?;
+    // Declared before the process, so it is dropped after it: the folder goes
+    // once the CLI has stopped, and when the spawn fails.
+    let _scratch = Scratch(prepared.scratch);
     let process = Process::spawn(&vendor_process(
         engine,
         config.binary.clone(),
@@ -74,11 +81,30 @@ pub(super) async fn run<P: Protocol>(
         held: None,
         switch_target: None,
     };
-    let result = driver.run(&mut commands, &mut cancel, &mut stopping).await;
+    let result = match prepared
+        .notices
+        .into_iter()
+        .try_for_each(|notice| driver.core.emit(Event::Notice(notice)))
+    {
+        Ok(()) => driver.run(&mut commands, &mut cancel, &mut stopping).await,
+        Err(error) => Err(error),
+    };
     driver.protocol.stopping(&driver.core);
     let report = driver.core.process.shutdown().await;
     let verified = report.reaped && report.descendants_stopped;
     finish(result, verified, engine, &report.stderr_tail)
+}
+
+/// A folder made for one launch (`Prepared::scratch`), removed with what is
+/// in it when dropped. A failure to remove it is ignored.
+struct Scratch(Option<PathBuf>);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(folder) = &self.0 {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+    }
 }
 
 /// The session's result: the vendor's error with its stderr, and a note when
@@ -168,6 +194,13 @@ impl<P: Protocol> Driver<P> {
         Ok(())
     }
 
+    /// A mode switch takes effect only from the next turn: the provider
+    /// says so, or its protocol holds turns for a pending switch.
+    fn switch_reaches_next_turn_only(&self) -> bool {
+        self.core.config.engine.provider().mode_applies_next_turn
+            || self.protocol.holds_turn_for_switch()
+    }
+
     /// Whether `command` waits for the pending mode switch: a turn the
     /// session could start now, sent while the vendor has not answered a
     /// switch, on a provider whose switch reaches only the next turn
@@ -177,7 +210,7 @@ impl<P: Protocol> Driver<P> {
     fn must_hold(&self, command: &Command) -> bool {
         command.starts_turn()
             && self.core.phase == Phase::Idle
-            && self.core.config.engine.provider().mode_applies_next_turn
+            && self.switch_reaches_next_turn_only()
             && self.protocol.mode_change_pending()
     }
 
@@ -188,9 +221,9 @@ impl<P: Protocol> Driver<P> {
     fn mode_unknown_for(&self, command: &Command) -> Option<Mode> {
         (command.starts_turn()
             && self.core.phase == Phase::Idle
-            && self.core.config.engine.provider().mode_applies_next_turn)
-            .then(|| self.protocol.mode_unsettled())
-            .flatten()
+            && self.switch_reaches_next_turn_only())
+        .then(|| self.protocol.mode_unsettled())
+        .flatten()
     }
 
     /// A turn sent while the vendor's mode is unknown: recorded as failed,
@@ -641,6 +674,18 @@ pub(super) fn seconds(limit: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_scratch_folder_goes_with_what_is_in_it() {
+        let temp = octet_testkit::TempDir::new("octet-scratch-guard");
+        let folder = temp.path().join("scratch");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("file"), "x").unwrap();
+        drop(Scratch(Some(folder.clone())));
+        assert!(!folder.exists());
+        // Nothing to remove, or already gone: no panic.
+        drop(Scratch(None));
+        drop(Scratch(Some(folder)));
+    }
     #[test]
     fn an_unverified_shutdown_keeps_the_vendor_error() {
         let vendor: Result<(), DriverError> = Err("Vendor disconnected".into());

@@ -55,8 +55,11 @@ pub(super) const PROVIDER: Provider = Provider {
     // opencode 1.18.25's `command()` runs each `` !`cmd` `` of the expanded
     // template in the shell, before any agent or permission applies.
     commands_expand_shell: true,
+    forks: true,
+    carries_others_models: false,
     launch_args: <OpencodeProtocol as Protocol>::launch_args,
     launch_env,
+    prepare: super::no_prepare,
     start,
 };
 
