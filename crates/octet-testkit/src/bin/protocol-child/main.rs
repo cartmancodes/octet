@@ -1,10 +1,11 @@
-//! A fake Codex/Claude/opencode vendor for tests: it speaks just enough of each
+//! A fake Codex/Claude/opencode/Antigravity vendor for tests: it speaks just enough of each
 //! protocol to drive Octet through scripted scenarios (`scenario`), and has
 //! transport modes for octet-proc's tests.
 #![expect(
     clippy::unwrap_used,
     reason = "a test fixture: a panic here fails the test that started it"
 )]
+mod antigravity;
 mod claude;
 mod codex;
 mod opencode;
@@ -25,6 +26,7 @@ fn main() {
     match mode.as_str() {
         "app-server" => codex::run(),
         "--print" => claude::run(),
+        "acp" if env::args().any(|arg| arg == "--cli_dir_name") => antigravity::run(),
         "acp" => opencode::run(),
         "session" => opencode::session_command(),
         "debug" => opencode::debug_command(),

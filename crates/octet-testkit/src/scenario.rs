@@ -2,7 +2,7 @@
 //! that drive it. A prompt with one of these texts (or, where noted, a
 //! `--model` value or launch argument) runs that script.
 
-/// Codex, Claude and opencode: hold the turn open until interrupted.
+/// Codex, Claude, opencode and Antigravity: hold the turn open until interrupted.
 pub const HOLD: &str = "hold";
 /// Codex: hold the turn, after a text marker that the turn is named.
 pub const HOLD_MARKED: &str = "hold-marked";
@@ -12,9 +12,9 @@ pub const LATE_START: &str = "late-start";
 pub const REFUSE_START: &str = "refuse-start";
 /// Codex: hold the turn and exit when asked to interrupt it.
 pub const DIE_ON_INTERRUPT: &str = "die-on-interrupt";
-/// Codex, Claude and opencode: ask for one approval and echo the answer.
+/// Codex, Claude, opencode and Antigravity: ask for one approval and echo the answer.
 pub const APPROVAL: &str = "approval";
-/// Codex, Claude and opencode: ask for nine approvals at once.
+/// Codex, Claude, opencode and Antigravity: ask for nine approvals at once.
 pub const APPROVALS_9: &str = "approvals-9";
 /// Codex: a file change starts, then asks for approval.
 pub const FILE_APPROVAL: &str = "file-approval";
@@ -25,7 +25,8 @@ pub const BIGTOOL: &str = "bigtool";
 /// Codex: output for another thread that must not show, and no turn end.
 /// opencode: the same, for another session.
 pub const CHATTER: &str = "chatter";
-/// Codex: a failed turn (usage limit). opencode: an error reply to the prompt.
+/// Codex: a failed turn (usage limit). opencode and Antigravity: an error reply
+/// to the prompt.
 pub const FAIL: &str = "fail";
 /// Codex: a failed turn whose message is nested JSON.
 pub const FAIL_NESTED: &str = "fail-nested";
@@ -38,10 +39,12 @@ pub const SKILLS_CHANGED: &str = "skills-changed";
 pub const SLOW: &str = "slow";
 /// Codex: echo the thread and turn parameters received. opencode: echo the
 /// launch arguments, environment, model, modes and how the session was opened.
+/// Antigravity: echo the launch arguments, its settings file, how the session
+/// was opened, the options set so far and the prompts before this one.
 pub const PARAMS: &str = "params";
 /// Claude: one tool use.
 pub const TOOL: &str = "tool";
-/// Codex, Claude and opencode: one tool whose result is an error.
+/// Codex, Claude, opencode and Antigravity: one tool whose result is an error.
 pub const TOOL_FAIL: &str = "tool-fail";
 /// Claude: a turn that ends with a background task running; when the task
 /// finishes, Claude starts a turn of its own that replies
@@ -111,6 +114,47 @@ pub const CODEX_REPLY: &str = "Hello fixture";
 pub const CLAUDE_REPLY: &str = "Hello Claude";
 /// The reply the fake opencode gives a prompt with no script.
 pub const OPENCODE_REPLY: &str = "Hello opencode";
+
+/// The reply the fake Antigravity gives a prompt with no script.
+pub const AGY_REPLY: &str = "Hello Antigravity";
+/// Antigravity: the name of the skill the fake lists as a slash command.
+pub const AGY_SKILL: &str = "fixture-agy-skill";
+/// Antigravity: resuming this session ID fails ("Failed to read session
+/// missing-session").
+pub const AGY_MISSING_SESSION: &str = "missing-session";
+/// Antigravity: write `fixture.txt`; it asks only in mode `default`.
+pub const AGY_EDIT: &str = "agy-edit";
+/// Antigravity: a command that never asks, whatever the mode; a cancel while
+/// it streams ends the turn `cancelled`.
+pub const AGY_UNASKED: &str = "agy-unasked";
+/// Antigravity: an edit starts, then waits for the next
+/// `session/set_config_option` before it completes without asking.
+pub const AGY_SLOW_EDIT: &str = "agy-slow-edit";
+/// Antigravity: the agent switches itself to mode `plan`, then replies.
+pub const AGY_TO_PLAN: &str = "agy-to-plan";
+/// Antigravity: the agent switches itself to mode `auto`, then holds until a
+/// cancel; it then waits for a `session/set_config_option`, answers it, says
+/// `late` and only then ends the turn `cancelled`.
+pub const AGY_TO_AUTO: &str = "agy-to-auto";
+/// Antigravity: the agent switches itself to model `claude-fixture`, then replies.
+pub const AGY_NEW_MODEL: &str = "agy-new-model";
+/// Antigravity: an `invoke_subagent` tool call, then a reply.
+pub const AGY_SUBAGENT: &str = "agy-subagent";
+/// Antigravity: a permission request for another session, then a normal reply.
+pub const AGY_OTHER_SESSION: &str = "agy-other-session";
+/// Antigravity: a normal reply, then, once the turn has ended, the agent
+/// switches itself to mode `plan`.
+pub const AGY_IDLE_PLAN: &str = "agy-idle-plan";
+/// Antigravity: waits for a `session/set_config_option`, answers it, then runs
+/// [`AGY_UNASKED`].
+pub const AGY_LATE_COMMAND: &str = "agy-late-command";
+/// Antigravity: 1,025 `read` tool calls, then a reply; a cancel while they
+/// stream ends the turn `cancelled`.
+pub const AGY_FLOOD: &str = "agy-flood";
+/// Antigravity: a command starts and the turn holds; a cancel makes the agent
+/// ask for permission, and once that is answered the tool call fails and the
+/// turn ends `cancelled`.
+pub const AGY_ASK_ON_CANCEL: &str = "agy-ask-on-cancel";
 
 /// opencode model value: once set, every later mode switch is refused with
 /// "unknown agent" (the first one, right after the model, still succeeds).
