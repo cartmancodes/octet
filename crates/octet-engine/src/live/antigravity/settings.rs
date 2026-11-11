@@ -4,14 +4,13 @@
 //! request, so Octet launches `agy` with a file of its own, built from the
 //! user's with the request-skipping parts removed. The user's file, and
 //! everything else under Antigravity's home, is never written.
+use super::guarded;
 use crate::live::Mode;
 use serde_json::{Map, Value};
 use std::{
     fmt::Display,
-    io::{ErrorKind, Read as _, Write as _},
-    os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _},
+    io::{ErrorKind, Read as _},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// What Octet says when the user's Antigravity settings could not be used.
@@ -23,8 +22,6 @@ pub(super) const USER_SETTINGS_NOTICE: &str = concat!(
 pub(super) const USER_SETTINGS_LIMIT: u64 = 1024 * 1024;
 /// The settings file's name, in the user's folder and in Octet's.
 const FILE: &str = "settings.json";
-/// Numbers the temporary files of this process, so no two calls share a name.
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// The folder Octet launches Antigravity with: one for `FullAccess` (the
 /// `always-proceed` pin) and one for the other modes, so sessions in
@@ -113,52 +110,12 @@ fn read_user(vendor_home: &Path) -> UserFile {
     }
 }
 
-/// `path` with its links resolved. A path that does not exist yet is
-/// resolved through its deepest folder that does, the rest appended
-/// unchanged.
-fn resolve(path: &Path) -> std::io::Result<PathBuf> {
-    let mut rest = Vec::new();
-    let mut at = path;
-    loop {
-        match at.canonicalize() {
-            Ok(mut resolved) => {
-                resolved.extend(rest.iter().rev());
-                return Ok(resolved);
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let (Some(name), Some(parent)) = (at.file_name(), at.parent()) else {
-            return Err(ErrorKind::NotFound.into());
-        };
-        rest.push(name);
-        at = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-    }
-}
-
 /// The text Octet fails a launch with when `path` cannot be written.
 fn write_error(path: &Path, error: impl Display) -> String {
     format!(
         "Octet could not write its Antigravity settings ({}): {error}",
         path.display()
     )
-}
-
-/// `folder` resolved, unless that is the resolved vendor home `home` or is
-/// under it. Nothing is created.
-fn keep_out_of(folder: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
-    let resolved = resolve(folder).map_err(|error| write_error(folder, error))?;
-    match home {
-        Some(home) if resolved.starts_with(home) => Err(format!(
-            "Octet will not keep its Antigravity settings inside Antigravity's own folder ({}); choose another --journal-dir",
-            resolved.display()
-        )),
-        _ => Ok(resolved),
-    }
 }
 
 /// Reads the user's settings under `vendor_home`, writes Octet's file for
@@ -173,15 +130,8 @@ pub(super) fn write(
     mode: Mode,
     vendor_home: Option<&Path>,
 ) -> Result<Vec<String>, String> {
-    // The vendor home is resolved as far as it exists, so a folder inside one
-    // that is not there yet (or is a dangling link) is still refused.
-    let home = vendor_home
-        .map(|home| resolve(home).map_err(|error| write_error(home, error)))
-        .transpose()?;
-    let dir = cli_dir(data_dir, mode);
-    // Everything is checked before anything is created.
-    keep_out_of(data_dir, home.as_deref())?;
-    keep_out_of(&dir, home.as_deref())?;
+    let below = Path::new("antigravity").join(pin_folder(mode));
+    let dir = guarded::folder(data_dir, &below, vendor_home).map_err(into_text)?;
     let mut notices = Vec::new();
     let user = match vendor_home.map_or(UserFile::Missing, read_user) {
         UserFile::Text(text) => Some(text),
@@ -193,45 +143,14 @@ pub(super) fn write(
     };
     let (text, notice) = merged(user.as_deref(), mode);
     notices.extend(notice.map(str::to_owned));
-    // Only folders Octet creates are owner-only.
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|error| write_error(&dir, error))?;
-    // The folder must be the one meant, not a link made since the first
-    // check, nor a link from one pin's folder to the other's.
-    let real_data = keep_out_of(data_dir, home.as_deref())?;
-    let real_dir = keep_out_of(&dir, home.as_deref())?;
-    if real_dir != real_data.join("antigravity").join(pin_folder(mode)) {
-        return Err(write_error(&dir, "the folder is a link to another place"));
-    }
-    let file = dir.join(FILE);
-    // Named for this call alone, so another launch in this process (a probe
-    // beside a session) never meets, or removes, this file.
-    let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let temp = dir.join(format!("{FILE}.{}.{n}.tmp", std::process::id()));
-    write_new(&temp, text.as_bytes())
-        .and_then(|()| {
-            std::fs::rename(&temp, &file).inspect_err(|_| {
-                let _ = std::fs::remove_file(&temp);
-            })
-        })
-        .map_err(|error| write_error(&file, error))?;
+    guarded::write_private(&dir, FILE, text.as_bytes())
+        .map_err(|error| write_error(&dir.join(FILE), error))?;
     Ok(notices)
 }
 
-/// Writes `bytes` to a file `path` that does not exist yet, owner-only. A
-/// file this call made and could not fill is removed.
-fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes).inspect_err(|_| {
-        let _ = std::fs::remove_file(path);
-    })
+/// The text for a failure to make the settings folder.
+fn into_text(failure: guarded::Failure) -> String {
+    failure.into_text(|path, reason| write_error(path, reason))
 }
 
 #[cfg(test)]

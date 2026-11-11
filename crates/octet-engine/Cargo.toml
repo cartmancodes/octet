@@ -12,6 +12,7 @@ octet-proc.workspace = true
 tokio.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
+sha2 = "0.11.1"
 
 [dev-dependencies]
 libc.workspace = true

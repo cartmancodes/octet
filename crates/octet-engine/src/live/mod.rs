@@ -21,6 +21,9 @@ mod mode;
 mod opencode;
 mod protocol;
 pub use activity::{APPROVAL_SCOPE, ApprovalSummary, ToolCall, ToolPhase};
+pub use antigravity::{
+    WorkspaceConfig, antigravity_trust, antigravity_trusted, antigravity_workspace_config,
+};
 pub use claude::claude_stray_reply;
 pub use codex::codex_stray_reply;
 pub use image::{
