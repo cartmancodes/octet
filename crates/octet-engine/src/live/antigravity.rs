@@ -2,7 +2,10 @@
 //! the launch (Octet's own settings folder, the workspace's `.agents` check,
 //! a probe's scratch home), the handshake, the model catalog and thinking
 //! levels, turns and their approvals, live mode switches, skills and
-//! compaction, resume and the probe.
+//! compaction, resume and the probe; the tripwire that stops the session
+//! when Antigravity acts unasked, and Antigravity changing its own mode or
+//! model.
+mod follow;
 mod guarded;
 mod launch;
 mod settings;
@@ -81,6 +84,9 @@ const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
 const PERMISSION_IDS: (&str, &str) = ("allow", "deny");
 /// What Octet says when the session lists no `compact` command.
 const NO_COMPACT: &str = "Antigravity does not offer compaction in this session";
+/// Why a turn is not sent once Antigravity acted unasked in the session.
+const ACTED: &str = "Antigravity acted without asking earlier in this session, so Octet sends it nothing more. \
+                     Start a new session";
 
 /// Runs one Antigravity session through the shared driver.
 fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result<(), String>> {
@@ -104,6 +110,8 @@ enum Outstanding {
     SetMode,
     /// The mode the user switched to, in the open session.
     Switch(Mode),
+    /// Octet's mode, set back after Antigravity moved itself.
+    SetBack(Mode),
     /// `session/prompt`: its reply ends the turn.
     Prompt,
 }
@@ -140,6 +148,13 @@ pub(super) struct AntigravityProtocol {
     /// A `session/cancel` was sent this turn: an `end_turn` then means the
     /// turn was interrupted.
     cancel_sent: bool,
+    /// Why Octet cancelled the running turn: it ends `Failed` with this,
+    /// whatever its stop reason. The first reason stays.
+    stop_reason: Option<String>,
+    /// Antigravity acted unasked in this session: nothing more is sent.
+    tripped: bool,
+    /// Octet's mode, to be set back after Antigravity moved itself.
+    follow: follow::Follow,
     /// The session's model (`currentValue` of its `model` option).
     model: Option<String>,
     /// The session's mode ID (its `mode` option, or `current_mode_update`).
@@ -199,6 +214,7 @@ impl Protocol for AntigravityProtocol {
         true
     }
 
+    /// The pending switch's deadline is also a set-back's.
     fn deadline(&self) -> Option<Instant> {
         [self.switches.deadline(), self.probe_wait]
             .into_iter()
@@ -206,6 +222,7 @@ impl Protocol for AntigravityProtocol {
             .min()
     }
 
+    /// A set-back Antigravity has not confirmed in time stops the session.
     /// A switch Antigravity has not confirmed in time is reported, and kept
     /// in case Antigravity confirms it late. A probe whose commands never
     /// came settles for the models. Nothing here waits, so the work is done
@@ -215,8 +232,8 @@ impl Protocol for AntigravityProtocol {
         core: &mut Core,
     ) -> impl Future<Output = Result<(), DriverError>> + Send {
         std::future::ready(
-            self.switches
-                .report_expired(core, PROVIDER.title)
+            self.set_back_expired(core)
+                .and_then(|()| self.switches.report_expired(core, PROVIDER.title))
                 .and_then(|()| self.probe_timed_out(core)),
         )
     }
@@ -229,6 +246,7 @@ impl Protocol for AntigravityProtocol {
 
     fn turn_started(&mut self) {
         self.cancel_sent = false;
+        self.stop_reason = None;
         self.tools.clear();
     }
 
@@ -240,14 +258,17 @@ impl Protocol for AntigravityProtocol {
             .await
     }
 
-    /// The workspace is checked first; then the text, with the images
-    /// inline after it.
+    /// Nothing is sent once Antigravity acted unasked. The workspace is
+    /// checked next; then the text, with the images inline after it.
     async fn send_prompt(
         &mut self,
         core: &mut Core,
         text: &str,
         images: &[ImageAttachment],
     ) -> Result<(), DriverError> {
+        if self.tripped {
+            return core.finish_turn(Outcome::Failed, Some(format!("{NOT_SENT}{ACTED}")));
+        }
         if let Err(refusal) = self.workspace_unchanged(core).await {
             return core.finish_turn(Outcome::Failed, Some(format!("{NOT_SENT}{refusal}")));
         }
@@ -279,8 +300,12 @@ impl Protocol for AntigravityProtocol {
     /// Compaction is the prompt `/compact`, sent as a prompt (so the
     /// workspace is checked first) when Antigravity's last command list for
     /// this session holds `compact`. Without it, or before any list came,
-    /// the turn fails and nothing is sent.
+    /// the turn fails and nothing is sent; once Antigravity acted unasked,
+    /// it fails as every prompt does.
     async fn compact(&mut self, core: &mut Core) -> Result<(), DriverError> {
+        if self.tripped {
+            return self.send_prompt(core, "/compact", &[]).await;
+        }
         if !self.commands.iter().any(|name| name == "compact") {
             return core.finish_turn(Outcome::Failed, Some(NO_COMPACT.to_owned()));
         }
@@ -374,18 +399,16 @@ impl Protocol for AntigravityProtocol {
         let update = &v["params"]["update"];
         match update["sessionUpdate"].as_str().unwrap_or("") {
             "available_commands_update" => self.commands_listed(core, &update["availableCommands"]),
-            "config_option_update" => {
-                self.note_options(&update["configOptions"]);
-                Ok(())
-            }
+            "config_option_update" => self.options_updated(core, &update["configOptions"]).await,
             "current_mode_update" => {
-                if let Some(id) = update["currentModeId"]
+                let Some(id) = update["currentModeId"]
                     .as_str()
                     .filter(|id| valid_identifier(id))
-                {
-                    self.mode = Some(id.to_owned());
-                }
-                Ok(())
+                else {
+                    return Ok(());
+                };
+                self.mode = Some(id.to_owned());
+                self.followed(core, id).await
             }
             // A resume replays the session's history before any prompt: it
             // is not this turn's output.
@@ -396,7 +419,7 @@ impl Protocol for AntigravityProtocol {
                 }
                 _ => Ok(()),
             },
-            "tool_call" | "tool_call_update" => self.tool(core, update),
+            "tool_call" | "tool_call_update" => self.tool(core, update).await,
             // Thoughts, the prompt echoed back and the session's title are
             // not shown.
             _ => Ok(()),
@@ -455,8 +478,9 @@ impl AntigravityProtocol {
             Outstanding::SetModel => self.model_set(core, v).await,
             Outstanding::SetEffort(request) => self.effort_reply(core, v, request).await,
             Outstanding::SetMode => self.mode_set(core, v).await,
-            Outstanding::Switch(target) => self.switched(core, v, target),
-            Outstanding::Prompt => self.prompt_ended(core, v),
+            Outstanding::Switch(target) => self.switched(core, v, target).await,
+            Outstanding::SetBack(target) => self.set_back_reply(v, target),
+            Outstanding::Prompt => self.prompt_ended(core, v).await,
         }
     }
 
@@ -729,8 +753,26 @@ impl AntigravityProtocol {
     /// any other mode, stops the session: Octet no longer knows the mode
     /// Antigravity runs, which may ask for less than the header shows. A
     /// reply after the switch timed out is handled the same way; the header
-    /// was already put back then, and a confirmation says it came late.
-    fn switched(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
+    /// was already put back then, and a confirmation says it came late. A
+    /// confirmation raises the mode every running tool call is judged by;
+    /// a set-back that waited for the switch is sent once it is answered.
+    async fn switched(
+        &mut self,
+        core: &mut Core,
+        v: &Value,
+        target: Mode,
+    ) -> Result<(), DriverError> {
+        self.switch_answered(core, v, target)?;
+        self.send_due_set_back(core).await
+    }
+
+    /// A live switch's reply, as [`Self::switched`] takes it.
+    fn switch_answered(
+        &mut self,
+        core: &mut Core,
+        v: &Value,
+        target: Mode,
+    ) -> Result<(), DriverError> {
         let late = self.switches.answered(v);
         let wanted = mode_id(target);
         let reason = if let Some(error) = v.get("error") {
@@ -741,6 +783,7 @@ impl AntigravityProtocol {
             let reported = reported_mode(options);
             if reported.as_str() == Some(wanted) {
                 core.mode = target;
+                self.tools.raise(target);
                 if late {
                     core.emit(Event::Notice(format!(
                         "Antigravity confirmed the switch to {} late",
@@ -781,7 +824,7 @@ impl AntigravityProtocol {
         if asks {
             let tool_call = &v["params"]["toolCall"];
             let known = self.tools.known_target(tool_call);
-            self.tools.mark_asked(tool_call);
+            self.tools.mark_asked(tool_call, core.mode);
             if core.phase == Phase::InTurn {
                 let (detail, summary) = acp::approval(tool_call, known.as_deref(), PROVIDER.title);
                 return core.queue_approval(v, detail, summary).await;
@@ -838,19 +881,193 @@ impl AntigravityProtocol {
         })
     }
 
-    /// The prompt's reply ends the turn, with its token count when it has one.
-    fn prompt_ended(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
+    /// The prompt's reply ends the turn, with its token count when it has
+    /// one; a turn Octet cancelled fails with its reason, whatever the reply
+    /// says. A set-back due is sent then.
+    async fn prompt_ended(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
         if !core.phase.is_running() {
             return Ok(());
         }
         self.tools.clear();
-        acp::end_prompt(core, v, self.cancel_sent)
+        if let Some(reason) = self.stop_reason.take() {
+            core.finish_turn(Outcome::Failed, Some(reason))?;
+        } else {
+            acp::end_prompt(core, v, self.cancel_sent)?;
+        }
+        self.send_due_set_back(core).await
     }
 
     /// A `tool_call` or `tool_call_update`: the call as it now stands (see
-    /// `tools::Tools::frame`).
-    fn tool(&mut self, core: &Core, update: &Value) -> Result<(), DriverError> {
-        core.emit(Event::Tool(self.tools.frame(update)))
+    /// `tools::Tools::frame`), judged under the mode Octet shows. A call
+    /// that ran unasked where it should have asked trips the session; one
+    /// Octet cannot remember while the mode asks cancels the turn; the
+    /// turn's first subagent is reported while the mode asks.
+    async fn tool(&mut self, core: &mut Core, update: &Value) -> Result<(), DriverError> {
+        let (call, stop) = self.tools.frame(update, core.mode);
+        let subagent = self.tools.subagent_started(&call.name, core.mode);
+        core.emit(Event::Tool(call))?;
+        if subagent {
+            core.emit(Event::Notice(tools::SUBAGENT_NOTICE.to_owned()))?;
+        }
+        match stop {
+            Some(stop) => {
+                let trip = matches!(stop, tools::Stop::Unasked(_));
+                self.cancel_turn(core, stop.reason(), trip).await.map(drop)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Cancels the running turn as opencode's `stop_subtask` does, keeping
+    /// `reason`: the turn ends only when the prompt's own reply comes, and
+    /// fails with it then. A turn already being cancelled (by Octet, or by
+    /// the user) keeps what it has. A `trip` marks the session whatever the
+    /// turn's state. Whether the reason was kept.
+    async fn cancel_turn(
+        &mut self,
+        core: &mut Core,
+        reason: String,
+        trip: bool,
+    ) -> Result<bool, DriverError> {
+        self.tripped |= trip;
+        if core.phase != Phase::InTurn {
+            return Ok(false);
+        }
+        self.stop_reason = Some(reason);
+        core.phase = Phase::Interrupting;
+        <Self as Protocol>::interrupt(self, core).await?;
+        core.deadline = deadline_after(core.limits.interrupt);
+        core.deny_all_pending().await?;
+        Ok(true)
+    }
+
+    /// A `config_option_update`: the options are recorded; a model of
+    /// Antigravity's own choosing reaches the header (a reconnect still asks
+    /// for the user's), and a mode of its own is followed.
+    async fn options_updated(
+        &mut self,
+        core: &mut Core,
+        options: &Value,
+    ) -> Result<(), DriverError> {
+        let model = self.model.clone();
+        self.note_options(options);
+        if core.phase.is_ready()
+            && self.model != model
+            && let Some(model) = &self.model
+        {
+            core.emit(Event::ModelSelected(model.clone()))?;
+        }
+        match acp::current(options, "mode") {
+            Some(id) => self.followed(core, id).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Antigravity names its mode `id`. Once the session is ready, while none
+    /// of Octet's switches (a set-back included) awaits a reply, a mode other
+    /// than Octet's is Antigravity's own change (see `follow::moved`): a
+    /// looser one during a turn cancels the turn and is set back at once;
+    /// anything else is reported once and set back when no turn runs. The
+    /// header keeps Octet's mode.
+    async fn followed(&mut self, core: &mut Core, id: &str) -> Result<(), DriverError> {
+        if !core.phase.is_ready() || self.switches.pending() || self.switches.unsettled().is_some()
+        {
+            return Ok(());
+        }
+        match follow::moved(id, core.mode, core.phase.is_running()) {
+            None => Ok(()),
+            Some(follow::Moved::Looser(reason)) => {
+                if !self.cancel_turn(core, reason, false).await? {
+                    core.emit(Event::Notice(follow::notice(id, core.mode)))?;
+                }
+                self.follow.due = None;
+                self.send_set_back(core).await
+            }
+            Some(follow::Moved::Other) => {
+                if self.follow.due.as_deref() != Some(id) {
+                    core.emit(Event::Notice(follow::notice(id, core.mode)))?;
+                    self.follow.due = Some(id.to_owned());
+                }
+                self.send_due_set_back(core).await
+            }
+        }
+    }
+
+    /// Sends the set-back that is due, once no turn runs and none of Octet's
+    /// switches awaits a reply; none is needed when Antigravity last named
+    /// Octet's mode itself.
+    async fn send_due_set_back(&mut self, core: &Core) -> Result<(), DriverError> {
+        if self.follow.due.is_none()
+            || core.phase.is_running()
+            || self.switches.pending()
+            || self.switches.unsettled().is_some()
+        {
+            return Ok(());
+        }
+        self.follow.due = None;
+        if self.mode.as_deref() == Some(mode_id(core.mode)) {
+            return Ok(());
+        }
+        self.send_set_back(core).await
+    }
+
+    /// Sets Octet's mode back: a switch the driver holds the next prompt
+    /// for, whose reply shows nothing (see `set_back_reply`).
+    async fn send_set_back(&mut self, core: &Core) -> Result<(), DriverError> {
+        self.set_option(
+            core,
+            Outstanding::SetBack(core.mode),
+            "mode",
+            mode_id(core.mode),
+        )
+        .await?;
+        let id = self.requests.last_id();
+        self.switches
+            .sent(id, core.mode, deadline_after(core.limits.mode_confirm));
+        self.follow.sent = true;
+        Ok(())
+    }
+
+    /// The set-back's reply. Only one naming `target`'s mode confirms it,
+    /// and shows nothing; an error, or a reply naming no mode or another
+    /// one, stops the session: Antigravity may be acting outside the mode
+    /// the user chose.
+    fn set_back_reply(&mut self, v: &Value, target: Mode) -> Result<(), DriverError> {
+        self.switches.answered(v);
+        self.follow.sent = false;
+        let id = mode_id(target);
+        let reason = if let Some(error) = v.get("error") {
+            acp::error_text(error)
+        } else {
+            let options = &v["result"]["configOptions"];
+            self.note_options(options);
+            match reported_mode(options) {
+                Value::Null => NAMED_NO_MODE.to_owned(),
+                reported if reported.as_str() == Some(id) => return Ok(()),
+                reported => reported_reason(reported),
+            }
+        };
+        Err(follow::would_not_go_back(id, &reason))
+    }
+
+    /// A set-back Antigravity has not confirmed in time stops the session,
+    /// as a refusal does.
+    fn set_back_expired(&self, core: &Core) -> Result<(), DriverError> {
+        let expired = self.follow.sent
+            && self
+                .switches
+                .deadline()
+                .is_some_and(|at| at <= Instant::now());
+        if !expired {
+            return Ok(());
+        }
+        Err(follow::would_not_go_back(
+            mode_id(core.mode),
+            &format!(
+                "it did not answer within {}",
+                seconds(core.limits.mode_confirm)
+            ),
+        ))
     }
 }
 

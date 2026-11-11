@@ -6783,3 +6783,436 @@ async fn antigravity_tool_error_is_a_failed_call() {
     assert_eq!(outcome, Outcome::Completed);
     stop(&handle, task).await;
 }
+
+/// The errors among `seen`.
+fn errors_of(seen: &[Event]) -> Vec<String> {
+    seen.iter()
+        .filter_map(|event| match event {
+            Event::Error(error) => Some(error.clone()),
+            _ => None,
+        })
+        .collect()
+}
+/// The notices among `seen`.
+fn notices_of(seen: &[Event]) -> Vec<String> {
+    seen.iter()
+        .filter_map(|event| match event {
+            Event::Notice(notice) => Some(notice.clone()),
+            _ => None,
+        })
+        .collect()
+}
+/// How the turn `seen` ended.
+fn outcome_of(seen: &[Event]) -> Outcome {
+    match seen.last() {
+        Some(Event::Finished { outcome }) => outcome.clone(),
+        other => panic!("the turn did not finish: {other:?}"),
+    }
+}
+/// Every event of the turn the prompt `text` starts in a ready session.
+async fn agy_run(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+    text: &str,
+) -> Vec<Event> {
+    handle.send(Command::Prompt(text.into())).unwrap();
+    until_finished(events).await
+}
+/// The fake Antigravity, logging each prompt it receives to `prompts.log`
+/// in its workspace, in `mode`.
+fn agy_logging(mode: Mode) -> (octet_testkit::TempDir, Config) {
+    let (dir, mut c) = antigravity(serde_json::json!({"logPrompts": true}));
+    c.mode = mode;
+    (dir, c)
+}
+/// The prompts the logging fake of `c` received, in order.
+fn agy_prompts(c: &Config) -> Vec<String> {
+    std::fs::read_to_string(c.cwd.join("prompts.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+/// The tripwire's error for an unasked `echo fixture` under `label`.
+fn agy_ran_unasked(label: &str) -> String {
+    format!(
+        "Antigravity ran a command without asking while Octet shows {label}: echo fixture. \
+         Octet's settings did not take effect with this agy, so ask and accept-edits cannot be relied on. \
+         Octet cancelled the turn and sends no more prompts in this session. What ran cannot be undone"
+    )
+}
+/// What every turn is refused with once Antigravity acted unasked.
+const AGY_ACTED: &str = "Not sent: Antigravity acted without asking earlier in this session, \
+                         so Octet sends it nothing more. Start a new session";
+/// Checks that a tripped session refuses a prompt, `PARAMS`, a compaction
+/// and a skill, unsent: the logging fake of `c` received only `first`.
+async fn agy_sends_nothing_more(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+    c: &Config,
+    first: &str,
+) {
+    let skill = Command::Skill {
+        name: scenario::AGY_SKILL.into(),
+        path: None,
+        args: String::new(),
+        display: format!("/{}", scenario::AGY_SKILL),
+        context: None,
+    };
+    for command in [
+        Command::Prompt("hello".into()),
+        Command::Prompt(scenario::PARAMS.into()),
+        Command::Compact,
+        skill,
+    ] {
+        handle.send(command).unwrap();
+        let seen = until_finished(events).await;
+        assert_eq!(errors_of(&seen), [AGY_ACTED], "{seen:?}");
+        assert_eq!(outcome_of(&seen), Outcome::Failed);
+    }
+    assert_eq!(agy_prompts(c), [first], "nothing more reached Antigravity");
+}
+#[tokio::test]
+async fn antigravity_a_command_that_runs_unasked_stops_the_session() {
+    let (_dir, c) = agy_logging(Mode::Ask);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_UNASKED).await;
+    let errors = errors_of(&seen);
+    assert_eq!(errors, [agy_ran_unasked("ask")], "{seen:?}");
+    assert!(errors[0].starts_with(
+        "Antigravity ran a command without asking while Octet shows ask: echo fixture"
+    ));
+    assert_eq!(outcome_of(&seen), Outcome::Failed);
+    agy_sends_nothing_more(&handle, &mut events, &c, scenario::AGY_UNASKED).await;
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_an_unasked_command_trips_in_accept_edits_too() {
+    let (_dir, c) = agy_logging(Mode::AcceptEdits);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_UNASKED).await;
+    assert_eq!(
+        errors_of(&seen),
+        [agy_ran_unasked("accept-edits")],
+        "{seen:?}"
+    );
+    assert_eq!(outcome_of(&seen), Outcome::Failed);
+    agy_sends_nothing_more(&handle, &mut events, &c, scenario::AGY_UNASKED).await;
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_an_unasked_edit_is_fine_in_accept_edits() {
+    let (_dir, c) = agy_logging(Mode::AcceptEdits);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_EDIT).await;
+    assert_eq!(errors_of(&seen), Vec::<String>::new(), "{seen:?}");
+    assert_eq!(text_of(&seen), "wrote");
+    assert_eq!(outcome_of(&seen), Outcome::Completed);
+    // The session goes on.
+    assert_eq!(
+        agy_turn(&handle, &mut events).await,
+        (None, Outcome::Completed)
+    );
+    assert_eq!(agy_prompts(&c), [scenario::AGY_EDIT, "hello"]);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_an_edit_begun_under_accept_edits_does_not_trip_after_a_switch_to_ask() {
+    // The edit starts under accept-edits; the switch to ask is confirmed
+    // while it runs, and only then does it complete, unasked.
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.mode = Mode::AcceptEdits;
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| {
+        matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+    })
+    .await;
+    handle
+        .send(Command::Prompt(scenario::AGY_SLOW_EDIT.into()))
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Tool(_))).await;
+    handle.send(Command::SetMode(Mode::Ask)).unwrap();
+    let seen = until_finished(&mut events).await;
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::ModeChanged(Mode::Ask))),
+        "{seen:?}"
+    );
+    assert_eq!(errors_of(&seen), Vec::<String>::new(), "{seen:?}");
+    assert_eq!(outcome_of(&seen), Outcome::Completed);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_denied_command_does_not_trip() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::APPROVAL.into()))
+        .unwrap();
+    let Event::Approval { id, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    handle.send(Command::Answer { id, allow: false }).unwrap();
+    let seen = until_finished(&mut events).await;
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::Tool(call) if call.phase == ToolPhase::Failed)),
+        "the command ended failed: {seen:?}"
+    );
+    assert_eq!(errors_of(&seen), Vec::<String>::new(), "{seen:?}");
+    assert_eq!(outcome_of(&seen), Outcome::Completed);
+    // Not tripped: the next prompt is sent.
+    assert_eq!(
+        agy_turn(&handle, &mut events).await,
+        (None, Outcome::Completed)
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_command_begun_after_tightening_to_ask_trips() {
+    // The command starts only once the switch to ask is confirmed, so it is
+    // judged by ask although the turn began under auto.
+    let (_dir, c) = agy_logging(Mode::Auto);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Auto))).await;
+    handle
+        .send(Command::Prompt(scenario::AGY_LATE_COMMAND.into()))
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Started)).await;
+    handle.send(Command::SetMode(Mode::Ask)).unwrap();
+    let seen = until_finished(&mut events).await;
+    let switched = seen
+        .iter()
+        .position(|e| matches!(e, Event::ModeChanged(Mode::Ask)));
+    let tripped = seen.iter().position(|e| matches!(e, Event::Error(_)));
+    assert!(switched.is_some() && switched < tripped, "{seen:?}");
+    let errors = errors_of(&seen);
+    assert!(
+        errors[0].starts_with("Antigravity ran a command without asking while Octet shows ask"),
+        "{errors:?}"
+    );
+    assert_eq!(outcome_of(&seen), Outcome::Failed);
+    agy_sends_nothing_more(&handle, &mut events, &c, scenario::AGY_LATE_COMMAND).await;
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_more_tool_calls_than_octet_checks_cancels_the_turn() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_FLOOD).await;
+    let errors = errors_of(&seen);
+    assert_eq!(
+        errors,
+        [
+            "Antigravity made more than 1024 tool calls in one turn, more than Octet checks for unasked actions. \
+             Octet cancelled the turn"
+        ],
+        "{errors:?}"
+    );
+    assert_eq!(outcome_of(&seen), Outcome::Failed);
+    // The session goes on.
+    assert_eq!(
+        agy_turn(&handle, &mut events).await,
+        (None, Outcome::Completed)
+    );
+    // In auto the calls are shown, not remembered, and the turn completes.
+    agy_switch(&handle, &mut events, Mode::Auto).await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_FLOOD).await;
+    assert_eq!(errors_of(&seen), Vec::<String>::new());
+    assert_eq!(text_of(&seen), scenario::AGY_REPLY);
+    assert_eq!(outcome_of(&seen), Outcome::Completed);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_turn_octet_cancels_ends_only_with_its_own_reply() {
+    // After Octet's cancel, the fake answers the set-back, says `late`, and
+    // only then answers the prompt.
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_TO_AUTO).await;
+    assert!(text_of(&seen).contains("late"), "{seen:?}");
+    assert_eq!(outcome_of(&seen), Outcome::Failed);
+    // The next turn's events hold one end, its own, after its reply.
+    let next_turn = agy_run(&handle, &mut events, "hello").await;
+    assert!(
+        matches!(next_turn.first(), Some(Event::User(_))),
+        "no end of the earlier turn came first: {next_turn:?}"
+    );
+    assert_eq!(text_of(&next_turn), scenario::AGY_REPLY);
+    assert_eq!(outcome_of(&next_turn), Outcome::Completed);
+    stop(&handle, task).await;
+}
+/// The notice Octet gives when Antigravity moves itself to `plan` under ask.
+const AGY_TO_PLAN_NOTICE: &str =
+    "Antigravity moved to its plan mode. Octet sets ask back before the next prompt";
+/// The `mode` values the fake was set to, in order, from its `PARAMS` echo.
+fn agy_mode_sets(echo: &serde_json::Value) -> Vec<String> {
+    echo["sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| pair[0] == "mode")
+        .map(|pair| pair[1].as_str().unwrap().to_owned())
+        .collect()
+}
+#[tokio::test]
+async fn antigravity_moving_itself_to_plan_while_idle_is_put_back_at_once() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_IDLE_PLAN).await;
+    assert_eq!(outcome_of(&seen), Outcome::Completed);
+    let notice = wait_for(&mut events, |e| {
+        matches!(e, Event::Notice(_) | Event::ModeChanged(_))
+    })
+    .await;
+    assert!(
+        matches!(&notice, Event::Notice(text) if text == AGY_TO_PLAN_NOTICE),
+        "{notice:?}"
+    );
+    let echo = agy_params(&handle, &mut events).await;
+    // The handshake's mode, then the set-back.
+    assert_eq!(agy_mode_sets(&echo), ["default", "default"], "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_moving_itself_to_plan_is_put_back_before_the_next_prompt() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_TO_PLAN).await;
+    assert_eq!(notices_of(&seen), [AGY_TO_PLAN_NOTICE], "{seen:?}");
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::ModeChanged(_))),
+        "the header keeps Octet's mode: {seen:?}"
+    );
+    assert_eq!(text_of(&seen), scenario::AGY_REPLY);
+    assert_eq!(outcome_of(&seen), Outcome::Completed);
+    handle
+        .send(Command::Prompt(scenario::PARAMS.into()))
+        .unwrap();
+    let params = until_finished(&mut events).await;
+    assert!(
+        !params.iter().any(|e| matches!(e, Event::ModeChanged(_))),
+        "the set-back's confirmation shows nothing: {params:?}"
+    );
+    let echo: serde_json::Value = serde_json::from_str(&text_of(&params)).unwrap();
+    assert_eq!(agy_mode_sets(&echo), ["default", "default"], "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_moving_itself_to_a_looser_mode_cancels_the_turn() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_TO_AUTO).await;
+    let errors = errors_of(&seen);
+    assert_eq!(
+        errors,
+        [
+            "Antigravity moved to its auto mode while Octet shows ask. Octet cancelled the turn and set ask back"
+        ],
+        "{seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::ModeChanged(_))),
+        "the header keeps Octet's mode: {seen:?}"
+    );
+    assert_eq!(outcome_of(&seen), Outcome::Failed);
+    let echo = agy_params(&handle, &mut events).await;
+    assert_eq!(agy_mode_sets(&echo), ["default", "default"], "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_model_it_changes_itself_reaches_the_header() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_NEW_MODEL).await;
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::ModelSelected(model) if model == "claude-fixture")),
+        "{seen:?}"
+    );
+    assert_eq!(outcome_of(&seen), Outcome::Completed);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_permission_asked_while_cancelling_does_not_trip() {
+    // The fake asks once it reads the cancel, and fails the command only
+    // after it reads Octet's reply to that request: the failed frame, and
+    // the turn's end, prove the rejection reached the wire. The request was
+    // made in `Phase::Interrupting`; had it not marked the call asked, the
+    // failed command would trip the session and the next prompt would not
+    // be sent.
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle
+        .send(Command::Prompt(scenario::AGY_ASK_ON_CANCEL.into()))
+        .unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Tool(_))).await;
+    handle.interrupt();
+    let seen = until_finished(&mut events).await;
+    let asked: Vec<String> = notices_of(&seen)
+        .into_iter()
+        .filter(|n| {
+            n.starts_with("Antigravity asked for a permission while its turn is being cancelled")
+        })
+        .collect();
+    assert_eq!(asked.len(), 1, "{seen:?}");
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::Tool(call) if call.phase == ToolPhase::Failed)),
+        "the command failed after the rejection: {seen:?}"
+    );
+    assert_eq!(errors_of(&seen), Vec::<String>::new(), "{seen:?}");
+    assert_eq!(outcome_of(&seen), Outcome::Interrupted);
+    let next_turn = agy_run(&handle, &mut events, "hello").await;
+    assert_eq!(text_of(&next_turn), scenario::AGY_REPLY);
+    assert_eq!(outcome_of(&next_turn), Outcome::Completed);
+    stop(&handle, task).await;
+}
+/// What Octet says when Antigravity starts a subagent in an asking mode.
+const AGY_SUBAGENT_NOTICE: &str = "Antigravity started a subagent. Its approval requests never reach Octet, \
+                                   so what it must ask for waits and does not run. In auto, Antigravity's own checker decides";
+#[tokio::test]
+async fn antigravity_a_subagent_is_reported_once_in_the_asking_modes() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    // Once a turn: the call's two frames give one notice, each turn its own.
+    for _ in 0..2 {
+        let seen = agy_run(&handle, &mut events, scenario::AGY_SUBAGENT).await;
+        let started: Vec<String> = notices_of(&seen)
+            .into_iter()
+            .filter(|n| n.starts_with("Antigravity started a subagent"))
+            .collect();
+        assert_eq!(started, [AGY_SUBAGENT_NOTICE], "{seen:?}");
+        assert_eq!(outcome_of(&seen), Outcome::Completed);
+    }
+    agy_switch(&handle, &mut events, Mode::Auto).await;
+    let seen = agy_run(&handle, &mut events, scenario::AGY_SUBAGENT).await;
+    assert!(
+        !notices_of(&seen)
+            .iter()
+            .any(|n| n.starts_with("Antigravity started a subagent")),
+        "{seen:?}"
+    );
+    assert_eq!(outcome_of(&seen), Outcome::Completed);
+    stop(&handle, task).await;
+}

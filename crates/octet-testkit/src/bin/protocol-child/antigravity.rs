@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::VecDeque,
     env, fs,
-    io::{self, BufRead},
+    io::{self, BufRead, Write as _},
     sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
@@ -67,6 +67,10 @@ struct Knobs {
     no_compact: bool,
     /// `.agents/hooks.json` (`{}`) is written as the fake starts.
     hooks_at_start: bool,
+    /// Each `session/prompt`'s first text is appended, as a line, to
+    /// `prompts.log` in the working directory as it arrives: what a session
+    /// that refuses even `PARAMS` sent.
+    log_prompts: bool,
 }
 
 impl Knobs {
@@ -85,6 +89,7 @@ impl Knobs {
             bare_switch_reply: flag("bareSwitchReply"),
             no_compact: flag("noCompact"),
             hooks_at_start: flag("hooksAtStart"),
+            log_prompts: flag("logPrompts"),
         }
     }
 }
@@ -668,6 +673,14 @@ impl AgyFixture {
             .find(|block| block["type"] == "text")
             .and_then(|block| block["text"].as_str())
             .unwrap_or("");
+        if self.knobs.log_prompts {
+            let mut log = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("prompts.log")
+                .unwrap();
+            writeln!(log, "{text}").unwrap();
+        }
         let images: Vec<String> = blocks
             .iter()
             .filter(|block| block["type"] == "image")
