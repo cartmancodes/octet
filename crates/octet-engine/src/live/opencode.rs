@@ -12,12 +12,7 @@ use super::{
 };
 use serde_json::{Value, json, value::RawValue};
 use std::{
-    collections::{HashMap, VecDeque},
-    ffi::OsString,
-    future::Future,
-    path::Path,
-    process::Stdio,
-    time::Duration,
+    collections::HashMap, ffi::OsString, future::Future, path::Path, process::Stdio, time::Duration,
 };
 use tokio::time::Instant;
 
@@ -70,8 +65,6 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
 
 /// The most tool calls one turn remembers the names of.
 const MAX_TOOLS: usize = 256;
-/// The most timed-out mode switches kept in case opencode confirms them late.
-const MAX_LATE_SWITCHES: usize = 8;
 /// How long a probe waits, after the session opens, for opencode to list its
 /// commands before it settles for the models alone.
 const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
@@ -132,16 +125,6 @@ struct Switch {
     mid_turn: bool,
 }
 
-/// A live mode switch awaiting opencode's reply.
-struct ModeRequest {
-    /// The wire ID of the `session/set_config_option` request.
-    id: u64,
-    /// The mode the user asked for.
-    target: Mode,
-    /// When Octet stops waiting and says the switch is unconfirmed.
-    deadline: Instant,
-}
-
 /// opencode's per-connection state: Octet's requests awaiting replies, the
 /// session's model and agent as opencode last reported them, live mode
 /// switches awaiting confirmation, and the turn's tool calls.
@@ -150,15 +133,11 @@ pub(super) struct OpencodeProtocol {
     /// Octet's requests that have no reply yet, with what each reply
     /// answers.
     requests: acp::Requests<Outstanding>,
-    /// The live mode switch awaiting its reply, until its deadline.
-    mode_request: Option<ModeRequest>,
-    /// The wire IDs and targets of timed-out switches opencode may still
-    /// confirm, oldest first: the header must follow the agent opencode is
-    /// really in, and while any is unanswered that agent is unknown.
-    late_modes: VecDeque<(u64, Mode)>,
-    /// The last switch was reported unconfirmed and the driver has not
-    /// asked yet (see `Protocol::take_switch_timed_out`).
-    switch_timed_out: bool,
+    /// The live mode switch awaiting its reply, until its deadline, and the
+    /// timed-out ones opencode may still confirm: the header must follow the
+    /// agent opencode is really in, and while any is unanswered that agent
+    /// is unknown.
+    switches: acp::Switches,
     /// A `session/cancel` was sent this turn. opencode ends a cancelled
     /// prompt with `end_turn`, so this is what makes it an interruption.
     cancel_sent: bool,
@@ -222,19 +201,19 @@ impl Protocol for OpencodeProtocol {
     }
 
     fn answer(wire: &Value, allow: bool) -> Value {
-        acp::permission_reply(wire, allow, ("once", "reject"))
+        acp::permission_reply(wire, allow, PERMISSION_IDS)
     }
 
     fn mode_change_pending(&self) -> bool {
-        self.mode_request.is_some()
+        self.switches.pending()
     }
 
     fn mode_unsettled(&self) -> Option<Mode> {
-        self.late_modes.back().map(|(_, target)| *target)
+        self.switches.unsettled()
     }
 
     fn take_switch_timed_out(&mut self) -> bool {
-        std::mem::take(&mut self.switch_timed_out)
+        self.switches.take_timed_out()
     }
 
     /// A slash command waits while Octet reads the definitions its check
@@ -270,11 +249,14 @@ impl Protocol for OpencodeProtocol {
     }
 
     fn deadline(&self) -> Option<Instant> {
-        let mode = self.mode_request.as_ref().map(|request| request.deadline);
-        [mode, self.probe_wait, self.subagent_quiet]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.switches.deadline(),
+            self.probe_wait,
+            self.subagent_quiet,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// A switch opencode has not confirmed in time is reported, and kept in
@@ -286,7 +268,8 @@ impl Protocol for OpencodeProtocol {
         core: &mut Core,
     ) -> impl Future<Output = Result<(), DriverError>> + Send {
         std::future::ready(
-            self.report_late_mode(core)
+            self.switches
+                .report_expired(core, PROVIDER.title)
                 .and_then(|()| self.probe_timed_out(core))
                 .and_then(|()| self.report_quiet_subagent(core)),
         )
@@ -380,28 +363,23 @@ impl Protocol for OpencodeProtocol {
     }
 
     /// Sets the agent that carries `target`. The mode changes only when
-    /// opencode confirms it. While [`MAX_LATE_SWITCHES`] earlier switches
-    /// wait unconfirmed, another is refused: a late reply to it could not
-    /// be matched, and the header must follow the agent opencode is in.
+    /// opencode confirms it. While eight earlier switches wait unconfirmed,
+    /// another is refused (see `acp::Switches::refuse_when_full`).
     async fn set_mode(&mut self, core: &mut Core, target: Mode) -> Result<(), DriverError> {
-        if self.late_modes.len() >= MAX_LATE_SWITCHES {
-            core.emit(Event::Notice(format!(
-                "opencode has not confirmed {MAX_LATE_SWITCHES} earlier mode switches; wait or reconnect"
-            )))?;
-            return core.emit(Event::ModeChanged(core.mode));
+        if self.switches.refuse_when_full(core, PROVIDER.title)? {
+            return Ok(());
         }
-        self.switch_timed_out = false;
         let switch = Switch {
             target,
             mid_turn: core.phase.is_running(),
         };
         self.set_option(core, Outstanding::Switch(switch), "mode", agent(target))
             .await?;
-        self.mode_request = Some(ModeRequest {
-            id: self.requests.last_id(),
+        self.switches.sent(
+            self.requests.last_id(),
             target,
-            deadline: deadline_after(core.limits.mode_confirm),
-        });
+            deadline_after(core.limits.mode_confirm),
+        );
         Ok(())
     }
 
@@ -979,14 +957,7 @@ impl OpencodeProtocol {
     /// keeps its mode.
     fn switched(&mut self, core: &mut Core, v: &Value, switch: Switch) -> Result<(), DriverError> {
         let Switch { target, mid_turn } = switch;
-        let id = v["id"].as_u64();
-        let late = self
-            .mode_request
-            .take_if(|request| Some(request.id) == id)
-            .is_none();
-        if late {
-            self.late_modes.retain(|(late, _)| Some(*late) != id);
-        }
+        let late = self.switches.answered(v);
         if let Some(refusal) = self.agent_refusal(v, target) {
             let reason = match refusal {
                 Refusal::Error(message) => message,
@@ -1027,26 +998,6 @@ impl OpencodeProtocol {
             ))?;
         }
         Ok(())
-    }
-
-    /// Reports a live switch opencode did not confirm in time; the header
-    /// keeps the current mode until it does.
-    fn report_late_mode(&mut self, core: &Core) -> Result<(), DriverError> {
-        let Some(request) = self
-            .mode_request
-            .take_if(|request| request.deadline <= Instant::now())
-        else {
-            return Ok(());
-        };
-        // Kept bounded: `set_mode` refuses a switch while the list is full,
-        // so a vendor that never answers cannot grow it or `requests`.
-        self.late_modes.push_back((request.id, request.target));
-        self.switch_timed_out = true;
-        core.emit(Event::Notice(format!(
-            "opencode has not confirmed the switch to {}",
-            request.target.label()
-        )))?;
-        core.emit(Event::ModeChanged(core.mode))
     }
 
     /// A probe's commands arrived: they go out as its skills, then the probe
@@ -1270,27 +1221,10 @@ async fn server_request(core: &mut Core, v: Value, known: Option<&str>) -> Resul
         let (detail, summary) = acp::approval(&v["params"]["toolCall"], known, PROVIDER.title);
         return core.queue_approval(v, detail, summary).await;
     }
-    if let Some(reply) = opencode_stray_reply(&v) {
-        if acp::client_capability(method) {
-            // opencode 1.18.25 asks the client to write every edit it was
-            // allowed, although Octet offers no file system; it has already
-            // written the file itself, so the refusal is nothing to report.
-            return core.send(reply).await;
-        }
-        let notice = if method == "session/request_permission" {
-            let when = if this_session && core.phase == Phase::Interrupting {
-                "while its turn is being cancelled"
-            } else {
-                "outside this session's running turn"
-            };
-            format!("opencode asked for a permission {when}; Octet rejected it")
-        } else {
-            format!("Request declined: {}", short(method))
-        };
-        core.send(reply).await?;
-        core.emit(Event::Notice(notice))?;
-    }
-    Ok(())
+    // opencode 1.18.25 asks the client to write every edit it was allowed,
+    // although Octet offers no file system; it has already written the file
+    // itself, so the refusal, a client capability's, is nothing to report.
+    acp::refuse_request(core, &v, PERMISSION_IDS, PROVIDER.title).await
 }
 
 /// opencode counterpart of `codex_stray_reply`: the reply to a request Octet
@@ -1299,8 +1233,11 @@ async fn server_request(core: &mut Core, v: Value, known: Option<&str>) -> Resul
 /// included, which Octet does not offer) is an unsupported method. A frame
 /// that is not a request gets none.
 pub fn opencode_stray_reply(value: &Value) -> Option<Value> {
-    acp::stray_reply(value, ("once", "reject"))
+    acp::stray_reply(value, PERMISSION_IDS)
 }
+
+/// The permission options Octet answers with when a request lists none.
+const PERMISSION_IDS: (&str, &str) = ("once", "reject");
 
 /// Ends a turn that could not be sent, keeping the session.
 fn fail_turn(core: &mut Core, message: String) -> Result<(), DriverError> {

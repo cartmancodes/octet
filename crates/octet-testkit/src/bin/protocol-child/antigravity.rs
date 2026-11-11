@@ -147,6 +147,18 @@ impl Tool {
         }
     }
 
+    /// The read of `missing.txt`, which fails, as `call-1`.
+    fn missing() -> Self {
+        Self {
+            call: "call-1".to_owned(),
+            name: "read_file",
+            kind: "read",
+            title: "File missing.txt",
+            input: json!({"path":"missing.txt"}),
+            locations: None,
+        }
+    }
+
     /// The subagent invocation, as `call-1`.
     fn subagent() -> Self {
         Self {
@@ -676,7 +688,8 @@ impl AgyFixture {
             scenario::AGY_EDIT => self.tool_turn(&id, Tool::edit()),
             scenario::APPROVALS_9 => self.nine_approvals(id),
             scenario::TOOL_FAIL => {
-                emit(&Tool::command("call-1").started(&sid, "in_progress"));
+                // A read asks in no mode, so failing unasked is no tripwire.
+                emit(&Tool::missing().started(&sid, "in_progress"));
                 emit(&tool_status(&sid, "call-1", "failed"));
                 end_turn(&id);
             }

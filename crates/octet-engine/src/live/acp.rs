@@ -1,19 +1,30 @@
 //! What the Agent Client Protocol providers share: the JSON-RPC frames
-//! Octet sends, the replies to permission and stray requests, the reading of
-//! a session's options and a tool call, the permission dialog's contents,
-//! and the inline image blocks of a prompt.
+//! Octet sends, the replies to permission and stray requests, the live mode
+//! switches awaiting a reply, the reading of a session's options and a tool
+//! call, the permission dialog's contents, and the inline image blocks of a
+//! prompt.
 use super::{
-    ApprovalSummary, DriverError, Event, ImageAttachment, ModelInfo, Outcome, SkillInfo, ToolPhase,
-    activity::one_line, check_inline, limited, protocol::Core, short, valid_identifier,
+    ApprovalSummary, DriverError, Event, ImageAttachment, Mode, ModelInfo, Outcome, SkillInfo,
+    ToolPhase,
+    activity::one_line,
+    check_inline, limited,
+    protocol::{Core, Phase},
+    short, valid_identifier,
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+};
 use tokio::time::Instant;
 
 /// The most models one catalog keeps.
 const MAX_MODELS: usize = 256;
 /// The most levels one model's level option keeps.
 const MAX_LEVELS: usize = 32;
+/// The most timed-out mode switches kept in case the vendor confirms them
+/// late; while that many wait, another switch is refused.
+const MAX_LATE_SWITCHES: usize = 8;
 
 /// A JSON-RPC request: `method` with `params`, answered under `id`.
 pub(super) fn request(id: u64, method: &str, params: Value) -> Value {
@@ -200,6 +211,120 @@ impl Levels {
     }
 }
 
+/// A live mode switch awaiting the vendor's reply.
+struct SwitchRequest {
+    /// The wire ID of the `session/set_config_option` request.
+    id: u64,
+    /// The mode the user asked for.
+    target: Mode,
+    /// When Octet stops waiting and says the switch is unconfirmed.
+    deadline: Instant,
+}
+
+/// A provider's live mode switches: the one awaiting its reply, until its
+/// deadline, and the timed-out ones the vendor may still confirm, oldest
+/// first. The header must follow the mode the vendor is really in, and
+/// while any timed-out switch is unanswered that mode is unknown.
+#[derive(Default)]
+pub(super) struct Switches {
+    /// The switch awaiting its reply, until its deadline.
+    pending: Option<SwitchRequest>,
+    /// The wire IDs and targets of timed-out switches, oldest first, at most
+    /// [`MAX_LATE_SWITCHES`].
+    late: VecDeque<(u64, Mode)>,
+    /// The last switch was reported unconfirmed and the driver has not
+    /// asked yet (see `Protocol::take_switch_timed_out`).
+    timed_out: bool,
+}
+
+impl Switches {
+    /// Refuses another switch while [`MAX_LATE_SWITCHES`] earlier ones wait
+    /// unconfirmed: a late reply to it could not be matched, and the header
+    /// must follow the mode `vendor` is in. It says so and puts the header
+    /// back; whether it refused.
+    pub(super) fn refuse_when_full(&self, core: &Core, vendor: &str) -> Result<bool, DriverError> {
+        if self.late.len() < MAX_LATE_SWITCHES {
+            return Ok(false);
+        }
+        core.emit(Event::Notice(format!(
+            "{vendor} has not confirmed {MAX_LATE_SWITCHES} earlier mode switches; wait or reconnect"
+        )))?;
+        core.emit(Event::ModeChanged(core.mode))?;
+        Ok(true)
+    }
+
+    /// Records the switch to `target` just sent as request `id`, awaited
+    /// until `deadline`.
+    pub(super) fn sent(&mut self, id: u64, target: Mode, deadline: Instant) {
+        self.timed_out = false;
+        self.pending = Some(SwitchRequest {
+            id,
+            target,
+            deadline,
+        });
+    }
+
+    /// A switch awaits its reply, and its deadline has not passed.
+    pub(super) fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The target of the latest timed-out switch still unanswered.
+    pub(super) fn unsettled(&self) -> Option<Mode> {
+        self.late.back().map(|(_, target)| *target)
+    }
+
+    /// Whether the last switch was reported unconfirmed since it was sent;
+    /// reading it clears it.
+    pub(super) fn take_timed_out(&mut self) -> bool {
+        std::mem::take(&mut self.timed_out)
+    }
+
+    /// When the pending switch stops being awaited.
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|request| request.deadline)
+    }
+
+    /// The reply `v` to a switch has come, and its switch no longer waits:
+    /// whether it came late, after the switch timed out.
+    pub(super) fn answered(&mut self, v: &Value) -> bool {
+        let id = v["id"].as_u64();
+        let late = self
+            .pending
+            .take_if(|request| Some(request.id) == id)
+            .is_none();
+        if late {
+            self.late.retain(|(late, _)| Some(*late) != id);
+        }
+        late
+    }
+
+    /// The pending switch, once its deadline has passed at `now`: it is kept
+    /// as late, in case the vendor confirms it after all; its target.
+    fn expire(&mut self, now: Instant) -> Option<Mode> {
+        let request = self.pending.take_if(|request| request.deadline <= now)?;
+        // Kept bounded: `refuse_when_full` refuses a switch while the list
+        // is full, so a vendor that never answers cannot grow it, or the
+        // provider's requests awaiting a reply.
+        self.late.push_back((request.id, request.target));
+        self.timed_out = true;
+        Some(request.target)
+    }
+
+    /// Reports a switch `vendor` did not confirm in time; the header keeps
+    /// the current mode until it does.
+    pub(super) fn report_expired(&mut self, core: &Core, vendor: &str) -> Result<(), DriverError> {
+        let Some(target) = self.expire(Instant::now()) else {
+            return Ok(());
+        };
+        core.emit(Event::Notice(format!(
+            "{vendor} has not confirmed the switch to {}",
+            target.label()
+        )))?;
+        core.emit(Event::ModeChanged(core.mode))
+    }
+}
+
 /// The `session/cancel` notification for `session`.
 pub(super) fn cancel(session: &str) -> Value {
     json!({
@@ -258,6 +383,39 @@ pub(super) fn stray_reply(value: &Value, fallback: (&str, &str)) -> Option<Value
 /// a notice.
 pub(super) fn client_capability(method: &str) -> bool {
     method.starts_with("fs/") || method.starts_with("terminal/")
+}
+
+/// Answers `v`, a request from `vendor` that Octet will not put in front of
+/// the user, with the stray reply (`fallback` as in [`permission_reply`]):
+/// never an allow, and never left unanswered. A client capability's is
+/// refused quietly; a permission request says when it came (while this
+/// session's turn is being cancelled, or outside its running turn); any
+/// other request is declined by name.
+pub(super) async fn refuse_request(
+    core: &Core,
+    v: &Value,
+    fallback: (&str, &str),
+    vendor: &str,
+) -> Result<(), DriverError> {
+    let Some(reply) = stray_reply(v, fallback) else {
+        return Ok(());
+    };
+    let method = v["method"].as_str().unwrap_or_default();
+    core.send(reply).await?;
+    if client_capability(method) {
+        return Ok(());
+    }
+    let notice = if method == "session/request_permission" {
+        let when = if names_session(v, &core.session) && core.phase == Phase::Interrupting {
+            "while its turn is being cancelled"
+        } else {
+            "outside this session's running turn"
+        };
+        format!("{vendor} asked for a permission {when}; Octet rejected it")
+    } else {
+        format!("Request declined: {}", short(method))
+    };
+    core.emit(Event::Notice(notice))
 }
 
 /// An ACP error as a person should read it: its message, else the error
@@ -532,6 +690,57 @@ mod tests {
         assert_eq!(catalog(&model_options(&Value::Array(many))).len(), 256);
         assert!(catalog(&json!([{"id": "mode", "options": []}])).is_empty());
         assert!(catalog(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn a_switch_is_awaited_until_answered_or_late_until_its_late_reply() {
+        let now = Instant::now();
+        let reply = |id: u64| json!({"jsonrpc": "2.0", "id": id, "result": {}});
+        let mut switches = Switches::default();
+        switches.sent(1, Mode::AcceptEdits, now);
+        assert!(switches.pending());
+        assert_eq!(switches.deadline(), Some(now));
+        // Answered in time: not late, and nothing is left.
+        assert!(!switches.answered(&reply(1)));
+        assert!(!switches.pending());
+        assert_eq!(switches.expire(now), None);
+        // Unanswered: kept as late, reported once, unsettled until answered.
+        switches.sent(2, Mode::Auto, now);
+        assert_eq!(switches.expire(now), Some(Mode::Auto));
+        assert!(!switches.pending());
+        assert_eq!(switches.unsettled(), Some(Mode::Auto));
+        assert!(switches.take_timed_out());
+        assert!(!switches.take_timed_out());
+        assert!(switches.answered(&reply(2)));
+        assert_eq!(switches.unsettled(), None);
+        // Not yet due.
+        switches.sent(3, Mode::Ask, now + std::time::Duration::from_secs(60));
+        assert_eq!(switches.expire(now), None);
+        assert!(switches.pending());
+    }
+
+    #[test]
+    fn the_late_switches_are_kept_in_order_and_bounded_by_the_refusal() {
+        let now = Instant::now();
+        let mut switches = Switches::default();
+        for id in 1..=MAX_LATE_SWITCHES as u64 {
+            let target = if id % 2 == 0 {
+                Mode::Auto
+            } else {
+                Mode::AcceptEdits
+            };
+            switches.sent(id, target, now);
+            switches.expire(now);
+        }
+        assert_eq!(switches.late.len(), MAX_LATE_SWITCHES);
+        // The newest one is the unsettled mode; an older late reply leaves it.
+        assert_eq!(switches.unsettled(), Some(Mode::Auto));
+        assert!(switches.answered(&json!({"id": 1})));
+        assert_eq!(switches.late.len(), MAX_LATE_SWITCHES - 1);
+        assert_eq!(switches.unsettled(), Some(Mode::Auto));
+        // A reply nothing waits for changes nothing.
+        assert!(switches.answered(&json!({"id": 99})));
+        assert_eq!(switches.late.len(), MAX_LATE_SWITCHES - 1);
     }
 
     #[test]

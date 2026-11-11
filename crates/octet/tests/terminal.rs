@@ -498,9 +498,14 @@ fn provider_fixture() -> PathBuf {
 #[test]
 fn probes_of_the_other_providers_reach_only_the_stand_ins() {
     // Once ready, the interface probes every other provider by its default
-    // name on the PATH; the stand-ins first there are what it starts.
+    // name on the PATH; the stand-ins first there are what it starts. The
+    // rest of the PATH holds no vendor CLI, so were the stand-ins missing or
+    // last, nothing installed would start: the probes would just fail.
     let binary = provider_fixture();
-    let mut p = Pty::spawn_with(&["--engine", "codex", "--binary", binary.to_str().unwrap()]);
+    let mut p = Pty::spawn_with_env(
+        &["--engine", "codex", "--binary", binary.to_str().unwrap()],
+        &[("PATH", "/usr/bin:/bin")],
+    );
     p.wait(|p| p.shows("● ready"));
     let log = p
         .stand_ins

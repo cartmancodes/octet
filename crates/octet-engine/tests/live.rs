@@ -5980,7 +5980,7 @@ fn agy_script(c: &mut Config, steps: &[String]) -> (octet_testkit::TempDir, std:
     for step in steps {
         let _ = write!(
             body,
-            "read line\nprintf '%s\\n' \"$line\" >> sent.log\n{step}\n"
+            "read -r line\nprintf '%s\\n' \"$line\" >> sent.log\n{step}\n"
         );
     }
     body.push_str("exec sleep 30\n");
@@ -6142,5 +6142,608 @@ async fn antigravity_a_session_reply_without_options_still_gets_the_level_asked_
     let level = &sent[2];
     assert_eq!(level["params"]["configId"], "thought_level", "{sent:?}");
     assert_eq!(level["params"]["value"], "low");
+    stop(&handle, task).await;
+}
+
+/// The text and tool calls of an `APPROVAL` turn, and the notices it gave,
+/// from a session of `c`; its approval is answered with `answer`, or left
+/// for its window to close when that is `None`.
+async fn agy_answered(c: Config, answer: Option<bool>) -> (String, Vec<ToolCall>, Vec<String>) {
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::APPROVAL.into()))
+        .unwrap();
+    let (mut text, mut tools, mut notices) = (String::new(), Vec::new(), Vec::new());
+    loop {
+        match next(&mut events).await {
+            Event::Approval { id, summary, .. } => {
+                assert_eq!(summary.action, "Run a shell command");
+                assert_eq!(summary.command.as_deref(), Some("echo fixture"));
+                if let Some(allow) = answer {
+                    handle.send(Command::Answer { id, allow }).unwrap();
+                }
+            }
+            Event::Text(t) => text.push_str(&t),
+            Event::Tool(call) => tools.push(call),
+            Event::Notice(notice) => notices.push(notice),
+            Event::Finished { outcome } => {
+                assert_eq!(outcome, Outcome::Completed);
+                break;
+            }
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    stop(&handle, task).await;
+    (text, tools, notices)
+}
+#[tokio::test]
+async fn antigravity_approval_allowed_sends_allow() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (text, tools, _) = agy_answered(c, Some(true)).await;
+    assert_eq!(text, "allow");
+    assert_eq!(
+        tools.last().map(|t| t.phase),
+        Some(ToolPhase::Done),
+        "{tools:?}"
+    );
+}
+#[tokio::test]
+async fn antigravity_approval_denied_sends_deny() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (text, tools, _) = agy_answered(c, Some(false)).await;
+    assert_eq!(text, "deny");
+    assert_eq!(
+        tools.last().map(|t| t.phase),
+        Some(ToolPhase::Failed),
+        "{tools:?}"
+    );
+}
+#[tokio::test]
+async fn antigravity_approval_times_out_as_denied() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.approval_timeout = Duration::from_millis(200);
+    let (text, tools, notices) = agy_answered(c, None).await;
+    assert_eq!(text, "deny");
+    assert_eq!(
+        tools.last().map(|t| t.phase),
+        Some(ToolPhase::Failed),
+        "{tools:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|n| n == "Approval timed out and was denied"),
+        "{notices:?}"
+    );
+}
+#[tokio::test]
+async fn antigravity_nine_approvals_deny_the_ninth() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::APPROVALS_9.into()))
+        .unwrap();
+    let (mut shown, mut notices) = (Vec::new(), 0);
+    loop {
+        match next(&mut events).await {
+            Event::Approval { id, .. } => shown.push(id),
+            Event::Notice(text) if text.contains("Too many approvals are waiting") => {
+                notices += 1;
+            }
+            // The ninth request was denied: the fake echoes the answer.
+            Event::Text(text) if text == r#"answered "9":deny"# => break,
+            Event::Text(text) => panic!("unexpected answer: {text}"),
+            Event::Finished { .. } | Event::Stopped => panic!("no ninth denial"),
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!((shown.len(), notices), (8, 1));
+    // The eight shown still wait for the user.
+    handle
+        .send(Command::Answer {
+            id: shown[0],
+            allow: true,
+        })
+        .unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, Event::Text(t) if t == r#"answered "1":allow"#),
+    )
+    .await;
+    handle.interrupt();
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_an_edit_asks_and_names_its_file() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::AGY_EDIT.into()))
+        .unwrap();
+    let Event::Approval { id, summary, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(summary.action, "Edit files");
+    assert!(
+        summary.files.iter().any(|f| f.ends_with("/fixture.txt")),
+        "{:?}",
+        summary.files
+    );
+    handle.send(Command::Answer { id, allow: false }).unwrap();
+    assert_eq!(turn_text(&mut events).await, "deny");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_cancel_is_interrupted() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Prompt(scenario::HOLD.into())).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Started)).await;
+    handle.interrupt();
+    let finished = wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Interrupted
+            }
+        ),
+        "{finished:?}"
+    );
+    // The next turn is not taken for a cancelled one.
+    assert_eq!(
+        agy_turn(&handle, &mut events).await,
+        (None, Outcome::Completed)
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_cancel_denies_a_waiting_approval() {
+    // Octet sends `session/cancel` first, then denies the waiting approval:
+    // the fake ends the prompt `cancelled`, with no text, on the cancel, and
+    // ignores the denial that follows, which no prompt waits for any more.
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::APPROVAL.into()))
+        .unwrap();
+    let Event::Approval { id, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    handle.interrupt();
+    let (mut closed, mut text) = (false, String::new());
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::ApprovalClosed(done) if done == id => closed = true,
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { outcome } => break outcome,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert!(closed, "the approval was closed");
+    assert_eq!(outcome, Outcome::Interrupted);
+    assert_eq!(text, "", "the denial reached no waiting prompt");
+    assert_eq!(
+        agy_turn(&handle, &mut events).await,
+        (None, Outcome::Completed)
+    );
+    stop(&handle, task).await;
+}
+/// Switches a ready session to `target`; the first mode event or notice
+/// that follows must confirm it.
+async fn agy_switch(
+    handle: &octet_engine::live::Handle,
+    events: &mut mpsc::Receiver<Event>,
+    target: Mode,
+) {
+    handle.send(Command::SetMode(target)).unwrap();
+    let changed = wait_for(events, |e| {
+        matches!(e, Event::ModeChanged(_) | Event::Notice(_))
+    })
+    .await;
+    assert!(
+        matches!(&changed, Event::ModeChanged(mode) if *mode == target),
+        "{changed:?}"
+    );
+}
+#[tokio::test]
+async fn antigravity_live_switch_sets_the_mode() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    agy_switch(&handle, &mut events, Mode::AcceptEdits).await;
+    handle
+        .send(Command::Prompt(scenario::AGY_EDIT.into()))
+        .unwrap();
+    let mut text = String::new();
+    loop {
+        match next(&mut events).await {
+            Event::Approval { detail, .. } => panic!("the edit asked: {detail}"),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(text, "wrote");
+    let echo = agy_params(&handle, &mut events).await;
+    let sets = echo["sets"].as_array().unwrap();
+    assert_eq!(sets.last(), Some(&set("mode", "accept-edits")), "{echo}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_auto_runs_a_command_unasked_without_tripping() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    agy_switch(&handle, &mut events, Mode::Auto).await;
+    handle
+        .send(Command::Prompt(scenario::APPROVAL.into()))
+        .unwrap();
+    let mut text = String::new();
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Approval { detail, .. } => panic!("the command asked: {detail}"),
+            Event::Text(t) => text.push_str(&t),
+            Event::Finished { outcome } => break outcome,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert_eq!(text, "ran");
+    assert_eq!(outcome, Outcome::Completed);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_refused_switch_keeps_the_mode() {
+    let (_dir, c) = antigravity(serde_json::json!({"rejectSwitches": true}));
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let notice = wait_for(&mut events, |e| {
+        matches!(e, Event::Notice(_) | Event::ModeChanged(_))
+    })
+    .await;
+    assert!(
+        matches!(&notice, Event::Notice(text) if text.starts_with("Antigravity did not switch to accept-edits")),
+        "{notice:?}"
+    );
+    let switched = timeout(
+        Duration::from_secs(1),
+        wait_for(&mut events, |e| {
+            matches!(e, Event::ModeChanged(Mode::AcceptEdits))
+        }),
+    )
+    .await;
+    assert!(switched.is_err(), "{switched:?}");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_prompt_waits_for_an_unanswered_switch_and_is_not_sent() {
+    let (_dir, c) = antigravity(serde_json::json!({"hangSwitches": true}));
+    let (handle, mut events, task) = spawn_with_limits(c, quick());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let mut notices = Vec::new();
+    let error = loop {
+        match next(&mut events).await {
+            Event::Notice(notice) => notices.push(notice),
+            Event::Error(error) => break error,
+            Event::Started => notices.push("started".to_owned()),
+            _ => {}
+        }
+    };
+    let waiting = notices
+        .iter()
+        .position(|n| n.starts_with("Waiting for Antigravity"));
+    let started = notices.iter().position(|n| n == "started");
+    assert!(
+        waiting < started,
+        "the prompt waited before it started: {notices:?}"
+    );
+    assert!(
+        notices.contains(
+            &"Waiting for Antigravity to confirm the switch to accept-edits before sending your prompt"
+                .to_owned()
+        ),
+        "{notices:?}"
+    );
+    assert!(error.starts_with("Not sent: "), "{error}");
+    let finished = next(&mut events).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Failed
+            }
+        ),
+        "{finished:?}"
+    );
+    // The switch is still unanswered, so the mode Antigravity runs is unknown.
+    let (error, outcome) = agy_turn(&handle, &mut events).await;
+    let error = error.unwrap();
+    assert!(error.contains("its mode is unknown"), "{error}");
+    assert_eq!(outcome, Outcome::Failed);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_late_confirmation_is_applied() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let options =
+        |mode: &str| serde_json::json!({"configOptions": agy_options("high", Some(mode))});
+    let steps = [
+        agy_reply(1, &serde_json::json!({"agentInfo": {"version": "1.5.5"}})),
+        agy_reply(
+            2,
+            &serde_json::json!({"sessionId": "s1", "configOptions": agy_options("high", Some("default"))}),
+        ),
+        agy_reply(3, &options("default")),
+        format!("sleep 1.5\n{}", agy_reply(4, &options("accept-edits"))),
+    ];
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn_with_limits(c, quick());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let mut seen = Vec::new();
+    while seen.last().map(String::as_str) != Some("mode accept-edits") {
+        match wait_for_within(&mut events, 5, |_| true).await {
+            Event::Notice(text) => seen.push(text),
+            Event::ModeChanged(mode) => seen.push(format!("mode {}", mode.label())),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            "Antigravity has not confirmed the switch to accept-edits",
+            "mode ask",
+            "Antigravity confirmed the switch to accept-edits late",
+            "mode accept-edits",
+        ]
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_another_sessions_permission_is_rejected_not_shown() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::AGY_OTHER_SESSION.into()))
+        .unwrap();
+    let mut notices = Vec::new();
+    loop {
+        match next(&mut events).await {
+            Event::Approval { detail, .. } => panic!("another session's request shown: {detail}"),
+            Event::Notice(notice) => notices.push(notice),
+            Event::Finished { .. } => break,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let asked: Vec<&String> = notices
+        .iter()
+        .filter(|n| n.starts_with("Antigravity asked for a permission outside"))
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            "Antigravity asked for a permission outside this session's running turn; Octet rejected it"
+        ],
+        "{notices:?}"
+    );
+    stop(&handle, task).await;
+}
+/// A scripted Antigravity that opens session `s1` (listing `commands` after
+/// its reply, when there are any), confirms the first mode, then ends each
+/// of `turns` prompts `end_turn`.
+fn agy_scripted_turns(
+    c: &mut Config,
+    commands: &[&str],
+    turns: u64,
+) -> (octet_testkit::TempDir, std::path::PathBuf) {
+    let mut opened = agy_reply(
+        2,
+        &serde_json::json!({"sessionId": "s1", "configOptions": agy_options("high", Some("default"))}),
+    );
+    if !commands.is_empty() {
+        let listed: Vec<serde_json::Value> = commands
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "description": "A command"}))
+            .collect();
+        let update = serde_json::json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "s1",
+            "update": {"sessionUpdate": "available_commands_update", "availableCommands": listed}}});
+        let _ = write!(opened, "\necho '{update}'");
+    }
+    let mut steps = vec![
+        agy_reply(1, &serde_json::json!({"agentInfo": {"version": "1.5.5"}})),
+        opened,
+        agy_reply(
+            3,
+            &serde_json::json!({"configOptions": agy_options("high", Some("default"))}),
+        ),
+    ];
+    steps.extend(
+        (4..4 + turns).map(|id| agy_reply(id, &serde_json::json!({"stopReason": "end_turn"}))),
+    );
+    agy_script(c, &steps)
+}
+/// The text of the prompt request `frame`, when it is one text block.
+fn agy_prompt_text(frame: &serde_json::Value) -> &str {
+    assert_eq!(frame["method"], "session/prompt", "{frame}");
+    let prompt = frame["params"]["prompt"].as_array().unwrap();
+    assert_eq!(prompt.len(), 1, "{frame}");
+    assert_eq!(prompt[0]["type"], "text", "{frame}");
+    prompt[0]["text"].as_str().unwrap()
+}
+#[tokio::test]
+async fn antigravity_skill_runs_as_a_slash_prompt() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let (_script, _) = agy_scripted_turns(&mut c, &[scenario::AGY_SKILL], 3);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    let skill = |args: &str, context: Option<&str>| Command::Skill {
+        name: scenario::AGY_SKILL.into(),
+        path: None,
+        args: args.into(),
+        display: format!("/{} {args}", scenario::AGY_SKILL),
+        context: context.map(str::to_owned),
+    };
+    for command in [
+        skill("go", None),
+        skill("go", Some("earlier conversation")),
+        skill("", None),
+    ] {
+        handle.send(command).unwrap();
+        let finished = wait_for(&mut events, |e| matches!(e, Event::Finished { .. })).await;
+        assert!(
+            matches!(
+                finished,
+                Event::Finished {
+                    outcome: Outcome::Completed
+                }
+            ),
+            "{finished:?}"
+        );
+    }
+    let sent = agy_sent(&c);
+    let texts: Vec<&str> = sent[3..].iter().map(agy_prompt_text).collect();
+    assert_eq!(
+        texts,
+        [
+            format!("/{} go", scenario::AGY_SKILL),
+            format!("earlier conversation\n\n/{} go", scenario::AGY_SKILL),
+            format!("/{}", scenario::AGY_SKILL),
+        ]
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_compact_uses_its_command() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let (_script, _) = agy_scripted_turns(&mut c, &["compact"], 1);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| matches!(e, Event::Skills(_))).await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Compact).unwrap();
+    let mut compacted = false;
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Notice(n) if n == "Context compacted" => compacted = true,
+            Event::Finished { outcome } => break outcome,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert!(compacted, "the compaction was announced");
+    assert_eq!(outcome, Outcome::Completed);
+    let sent = agy_sent(&c);
+    assert_eq!(agy_prompt_text(&sent[3]), "/compact");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_compact_is_refused_where_the_session_has_no_such_command() {
+    let (_dir, c) = antigravity(serde_json::json!({"noCompact": true}));
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::Skills(_))).await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Compact).unwrap();
+    let error = expect_error(&mut events).await;
+    assert_eq!(
+        error,
+        "Antigravity does not offer compaction in this session"
+    );
+    let finished = next(&mut events).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Failed
+            }
+        ),
+        "{finished:?}"
+    );
+    let echo = agy_params(&handle, &mut events).await;
+    assert_eq!(echo["prompts"], 0, "the compaction was not sent");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_switch_reply_naming_no_mode_stops_the_session() {
+    let (_dir, c) = antigravity(serde_json::json!({"bareSwitchReply": true}));
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let error = loop {
+        match next(&mut events).await {
+            Event::Error(error) => break error,
+            Event::ModeChanged(Mode::AcceptEdits) => panic!("the header claimed accept-edits"),
+            Event::Stopped => panic!("stopped without an error"),
+            _ => {}
+        }
+    };
+    assert!(
+        error.starts_with(
+            "Antigravity would not switch to mode accept-edits (its reply named no mode)"
+        ),
+        "{error}"
+    );
+    // The session ends by itself.
+    ended(task).await;
+    drop(handle);
+}
+#[tokio::test]
+async fn antigravity_failed_turn_shows_the_message() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Prompt(scenario::FAIL.into())).unwrap();
+    let error = expect_error(&mut events).await;
+    assert_eq!(error, "Internal error: fixture failure");
+    let finished = next(&mut events).await;
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                outcome: Outcome::Failed
+            }
+        ),
+        "{finished:?}"
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_tool_error_is_a_failed_call() {
+    let (_dir, c) = antigravity(serde_json::Value::Null);
+    let (handle, mut events, task) = spawn(c);
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle
+        .send(Command::Prompt(scenario::TOOL_FAIL.into()))
+        .unwrap();
+    let mut calls = Vec::new();
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::Tool(call) => calls.push((call.id, call.name, call.phase)),
+            Event::Finished { outcome } => break outcome,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    let call = |phase| ("call-1".to_owned(), "read_file".to_owned(), phase);
+    assert_eq!(calls, [call(ToolPhase::Running), call(ToolPhase::Failed)]);
+    assert_eq!(outcome, Outcome::Completed);
     stop(&handle, task).await;
 }

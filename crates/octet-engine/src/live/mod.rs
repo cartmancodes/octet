@@ -22,8 +22,8 @@ mod opencode;
 mod protocol;
 pub use activity::{APPROVAL_SCOPE, ApprovalSummary, ToolCall, ToolPhase};
 pub use antigravity::{
-    ANTIGRAVITY_VERIFIED_VERSIONS, WorkspaceConfig, antigravity_prepare, antigravity_trust,
-    antigravity_trusted, antigravity_workspace_config,
+    ANTIGRAVITY_VERIFIED_VERSIONS, WorkspaceConfig, antigravity_prepare, antigravity_stray_reply,
+    antigravity_trust, antigravity_trusted, antigravity_workspace_config,
 };
 pub use claude::claude_stray_reply;
 pub use codex::codex_stray_reply;

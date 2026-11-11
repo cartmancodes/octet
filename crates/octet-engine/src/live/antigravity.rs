@@ -1,7 +1,8 @@
 //! The Antigravity CLI (`agy acp`) over the Agent Client Protocol: its row,
 //! the launch (Octet's own settings folder, the workspace's `.agents` check,
 //! a probe's scratch home), the handshake, the model catalog and thinking
-//! levels, turns, resume and the probe.
+//! levels, turns and their approvals, live mode switches, skills and
+//! compaction, resume and the probe.
 mod guarded;
 mod launch;
 mod settings;
@@ -79,6 +80,8 @@ const MAX_TOOLS: usize = 1024;
 const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
 /// The permission options Octet answers with when a request lists none.
 const PERMISSION_IDS: (&str, &str) = ("allow", "deny");
+/// What Octet says when the session lists no `compact` command.
+const NO_COMPACT: &str = "Antigravity does not offer compaction in this session";
 
 /// Runs one Antigravity session through the shared driver.
 fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result<(), String>> {
@@ -100,6 +103,8 @@ enum Outstanding {
     SetEffort(EffortRequest),
     /// The mode, set as the handshake's last step.
     SetMode,
+    /// The mode the user switched to, in the open session.
+    Switch(Mode),
     /// `session/prompt`: its reply ends the turn.
     Prompt,
 }
@@ -134,6 +139,10 @@ struct Tool {
         expect(dead_code, reason = "read by the tripwire, which a later commit adds")
     )]
     kind: String,
+    /// A permission request named the call this turn: a call that ends
+    /// without one ran unasked. The tripwire, which a later commit adds,
+    /// reads it.
+    asked: bool,
 }
 
 /// Antigravity's per-connection state: Octet's requests awaiting replies,
@@ -144,6 +153,9 @@ pub(super) struct AntigravityProtocol {
     /// Octet's requests that have no reply yet, with what each reply
     /// answers.
     requests: acp::Requests<Outstanding>,
+    /// The live mode switch awaiting its reply, and the timed-out ones
+    /// Antigravity may still confirm.
+    switches: acp::Switches,
     /// A `session/cancel` was sent this turn: an `end_turn` then means the
     /// turn was interrupted.
     cancel_sent: bool,
@@ -153,7 +165,8 @@ pub(super) struct AntigravityProtocol {
     mode: Option<String>,
     /// The current model's thinking levels.
     levels: Levels,
-    /// The names of the commands Antigravity lists, bounded.
+    /// The names of the commands Antigravity last listed for this session,
+    /// bounded; none before its first list.
     commands: Vec<String>,
     /// This turn's tool calls, by ID, at most [`MAX_TOOLS`].
     tools: HashMap<String, Tool>,
@@ -186,16 +199,45 @@ impl Protocol for AntigravityProtocol {
         acp::permission_reply(wire, allow, PERMISSION_IDS)
     }
 
-    fn deadline(&self) -> Option<Instant> {
-        self.probe_wait
+    fn mode_change_pending(&self) -> bool {
+        self.switches.pending()
     }
 
-    /// A probe whose commands never came settles for the models.
+    fn mode_unsettled(&self) -> Option<Mode> {
+        self.switches.unsettled()
+    }
+
+    fn take_switch_timed_out(&mut self) -> bool {
+        self.switches.take_timed_out()
+    }
+
+    /// Antigravity applies a switch to the running turn, but answers
+    /// requests in no fixed order: a prompt sent while a switch is
+    /// unanswered could run before the switch applies.
+    fn holds_turn_for_switch(&self) -> bool {
+        true
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        [self.switches.deadline(), self.probe_wait]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// A switch Antigravity has not confirmed in time is reported, and kept
+    /// in case Antigravity confirms it late. A probe whose commands never
+    /// came settles for the models. Nothing here waits, so the work is done
+    /// at once and handed back as a ready future.
     fn on_deadline(
         &mut self,
         core: &mut Core,
     ) -> impl Future<Output = Result<(), DriverError>> + Send {
-        std::future::ready(self.probe_timed_out(core))
+        std::future::ready(
+            self.switches
+                .report_expired(core, PROVIDER.title)
+                .and_then(|()| self.probe_timed_out(core)),
+        )
     }
 
     /// Only frames for this session count: another session's chatter is
@@ -239,28 +281,29 @@ impl Protocol for AntigravityProtocol {
             .await
     }
 
-    /// Not yet offered: the turn fails, and nothing is sent. Nothing here
-    /// waits, so the work is done at once and handed back as a ready future.
-    fn send_skill(
+    /// A skill is one of Antigravity's slash commands, sent as a prompt (see
+    /// `skill_text`), so the workspace is checked first.
+    async fn send_skill(
         &mut self,
         core: &mut Core,
-        _name: &str,
+        name: &str,
         _path: Option<&Path>,
-        _args: &str,
-        _context: Option<&str>,
-    ) -> impl Future<Output = Result<(), DriverError>> + Send {
-        std::future::ready(core.finish_turn(
-            Outcome::Failed,
-            Some("Antigravity skills arrive with a later commit".to_owned()),
-        ))
+        args: &str,
+        context: Option<&str>,
+    ) -> Result<(), DriverError> {
+        self.send_prompt(core, &skill_text(name, args, context), &[])
+            .await
     }
 
-    /// Not yet offered: the turn fails, and nothing is sent.
-    fn compact(&mut self, core: &mut Core) -> impl Future<Output = Result<(), DriverError>> + Send {
-        std::future::ready(core.finish_turn(
-            Outcome::Failed,
-            Some("Antigravity compaction arrives with a later commit".to_owned()),
-        ))
+    /// Compaction is the prompt `/compact`, sent as a prompt (so the
+    /// workspace is checked first) when Antigravity's last command list for
+    /// this session holds `compact`. Without it, or before any list came,
+    /// the turn fails and nothing is sent.
+    async fn compact(&mut self, core: &mut Core) -> Result<(), DriverError> {
+        if !self.commands.iter().any(|name| name == "compact") {
+            return core.finish_turn(Outcome::Failed, Some(NO_COMPACT.to_owned()));
+        }
+        self.send_prompt(core, "/compact", &[]).await
     }
 
     /// Sends the `session/cancel` notification. An `end_turn` then reads as
@@ -270,19 +313,23 @@ impl Protocol for AntigravityProtocol {
         core.send(acp::cancel(&core.session)).await
     }
 
-    /// Not yet offered: refused with a notice, and nothing is sent; the
-    /// header goes back to the mode in force.
-    fn set_mode(
-        &mut self,
-        core: &mut Core,
-        _target: Mode,
-    ) -> impl Future<Output = Result<(), DriverError>> + Send {
-        std::future::ready(
-            core.emit(Event::Notice(
-                "Antigravity mode switches arrive with a later commit".to_owned(),
-            ))
-            .and_then(|()| core.emit(Event::ModeChanged(core.mode))),
-        )
+    /// Sets the `mode` option to `target`'s mode ID, live. The mode changes
+    /// only when Antigravity's reply names it (see `switched`). While eight
+    /// earlier switches wait unconfirmed, another is refused (see
+    /// `acp::Switches::refuse_when_full`). The driver sends a switch only
+    /// once the session is ready.
+    async fn set_mode(&mut self, core: &mut Core, target: Mode) -> Result<(), DriverError> {
+        if self.switches.refuse_when_full(core, PROVIDER.title)? {
+            return Ok(());
+        }
+        self.set_option(core, Outstanding::Switch(target), "mode", mode_id(target))
+            .await?;
+        self.switches.sent(
+            self.requests.last_id(),
+            target,
+            deadline_after(core.limits.mode_confirm),
+        );
+        Ok(())
     }
 
     /// Sets the `thought_level` option, live. A level the model does not
@@ -338,7 +385,7 @@ impl Protocol for AntigravityProtocol {
             return self.response(core, &v).await;
         }
         if v.get("id").is_some() {
-            return refuse_request(core, &v).await;
+            return self.vendor_request(core, v).await;
         }
         if method != "session/update" || !acp::names_session(&v, &core.session) {
             return Ok(());
@@ -427,6 +474,7 @@ impl AntigravityProtocol {
             Outstanding::SetModel => self.model_set(core, v).await,
             Outstanding::SetEffort(request) => self.effort_reply(core, v, request).await,
             Outstanding::SetMode => self.mode_set(core, v).await,
+            Outstanding::Switch(target) => self.switched(core, v, target),
             Outstanding::Prompt => self.prompt_ended(core, v),
         }
     }
@@ -666,23 +714,14 @@ impl AntigravityProtocol {
         } else {
             let options = &v["result"]["configOptions"];
             self.note_options(options);
-            match &acp::option(options, "mode")["currentValue"] {
-                Value::Null => Some("its reply named no mode".to_owned()),
+            match reported_mode(options) {
+                Value::Null => Some(NAMED_NO_MODE.to_owned()),
                 reported if reported.as_str() == Some(id) => None,
-                reported => Some(format!(
-                    "Antigravity reported mode {}",
-                    reported
-                        .as_str()
-                        .map_or_else(|| short(&reported.to_string()), one_line)
-                )),
+                reported => Some(reported_reason(reported)),
             }
         };
         if let Some(reason) = reason {
-            return Err(format!(
-                "Antigravity would not switch to mode {id} ({reason}); \
-                 Octet stopped the session so Antigravity never acts outside the mode you chose"
-            )
-            .into());
+            return Err(mode_refused(id, &reason));
         }
         core.phase = Phase::Idle;
         core.emit(Event::Ready {
@@ -701,6 +740,99 @@ impl AntigravityProtocol {
             <Self as Protocol>::set_effort(self, core, level).await?;
         }
         Ok(())
+    }
+
+    /// A live switch's reply. Only a reply naming `target`'s mode confirms
+    /// it. An error, or a reply naming the mode already in force, is
+    /// reported and the session keeps its mode. A reply naming no mode, or
+    /// any other mode, stops the session: Octet no longer knows the mode
+    /// Antigravity runs, which may ask for less than the header shows. A
+    /// reply after the switch timed out is handled the same way; the header
+    /// was already put back then, and a confirmation says it came late.
+    fn switched(&mut self, core: &mut Core, v: &Value, target: Mode) -> Result<(), DriverError> {
+        let late = self.switches.answered(v);
+        let wanted = mode_id(target);
+        let reason = if let Some(error) = v.get("error") {
+            acp::error_text(error)
+        } else {
+            let options = &v["result"]["configOptions"];
+            self.note_options(options);
+            let reported = reported_mode(options);
+            if reported.as_str() == Some(wanted) {
+                core.mode = target;
+                if late {
+                    core.emit(Event::Notice(format!(
+                        "Antigravity confirmed the switch to {} late",
+                        target.label()
+                    )))?;
+                }
+                return core.emit(Event::ModeChanged(target));
+            }
+            if reported.is_null() {
+                return Err(mode_refused(wanted, NAMED_NO_MODE));
+            }
+            let reason = reported_reason(reported);
+            if reported.as_str() != Some(mode_id(core.mode)) {
+                return Err(mode_refused(wanted, &reason));
+            }
+            reason
+        };
+        core.emit(Event::Notice(format!(
+            "Antigravity did not switch to {}: {reason}",
+            target.label()
+        )))?;
+        if late {
+            Ok(())
+        } else {
+            core.emit(Event::ModeChanged(core.mode))
+        }
+    }
+
+    /// A request from Antigravity. A permission request for this session
+    /// marks its tool call as asked while a turn runs, being cancelled or
+    /// not: a request rejected during a cancel was still a request. While
+    /// the turn runs uncancelled, it is shown to the user, who decides.
+    /// Anything else gets the stray reply (see `acp::refuse_request`).
+    async fn vendor_request(&mut self, core: &mut Core, v: Value) -> Result<(), DriverError> {
+        let asks = v["method"] == "session/request_permission"
+            && acp::names_session(&v, &core.session)
+            && core.phase.is_running();
+        if asks {
+            let tool_call = &v["params"]["toolCall"];
+            let known = self.known_target(tool_call);
+            self.mark_asked(tool_call);
+            if core.phase == Phase::InTurn {
+                let (detail, summary) = acp::approval(tool_call, known.as_deref(), PROVIDER.title);
+                return core.queue_approval(v, detail, summary).await;
+            }
+        }
+        acp::refuse_request(core, &v, PERMISSION_IDS, PROVIDER.title).await
+    }
+
+    /// The target `tool_call`'s earlier frames named this turn, if any.
+    fn known_target(&self, tool_call: &Value) -> Option<String> {
+        tool_call["toolCallId"]
+            .as_str()
+            .and_then(|id| self.tools.get(&one_line(id)))
+            .map(|tool| tool.target.clone())
+            .filter(|target| !target.is_empty())
+    }
+
+    /// Marks the call `tool_call` names as asked, adding it to the table as
+    /// the request names it when it is not there yet. A call without an ID
+    /// cannot be named again, and a full table takes no more.
+    fn mark_asked(&mut self, tool_call: &Value) {
+        let id = one_line(tool_call["toolCallId"].as_str().unwrap_or_default());
+        if id.is_empty() {
+            return;
+        }
+        if let Some(tool) = self.tools.get_mut(&id) {
+            tool.asked = true;
+        } else if self.tools.len() < MAX_TOOLS {
+            let mut tool = Tool::first(tool_call, acp::frame_target(tool_call));
+            tool.asked = true;
+            self.tools.insert(id, tool);
+        }
     }
 
     /// Records the model, the mode and the thinking levels `config_options`
@@ -809,6 +941,7 @@ impl Tool {
             name: named("name").or(title).unwrap_or_else(|| "tool".to_owned()),
             target,
             kind,
+            asked: false,
         }
     }
 }
@@ -844,22 +977,54 @@ fn open_error(error: &Value) -> String {
     }
 }
 
-/// A request from Antigravity, which Octet does not answer for the user yet:
-/// it is rejected, never allowed and never left unanswered. A client
-/// capability's (`fs/*`, `terminal/*`) is refused quietly; any other says so.
-async fn refuse_request(core: &Core, v: &Value) -> Result<(), DriverError> {
-    let Some(reply) = acp::stray_reply(v, PERMISSION_IDS) else {
-        return Ok(());
-    };
-    core.send(reply).await?;
-    let method = v["method"].as_str().unwrap_or_default();
-    if acp::client_capability(method) {
-        return Ok(());
+/// Why a `mode` reply that names no mode is no confirmation.
+const NAMED_NO_MODE: &str = "its reply named no mode";
+
+/// The mode a `mode` reply's `options` report as current; `Null` when they
+/// name none.
+fn reported_mode(options: &Value) -> &Value {
+    &acp::option(options, "mode")["currentValue"]
+}
+
+/// Why a reply reporting the mode `reported` is not the one asked for.
+fn reported_reason(reported: &Value) -> String {
+    format!(
+        "Antigravity reported mode {}",
+        reported
+            .as_str()
+            .map_or_else(|| short(&reported.to_string()), one_line)
+    )
+}
+
+/// The error that stops the session when Antigravity would not switch to
+/// mode `id`, for `reason`: whatever mode it kept may ask for less than the
+/// mode the user chose.
+fn mode_refused(id: &str, reason: &str) -> DriverError {
+    format!(
+        "Antigravity would not switch to mode {id} ({reason}); \
+         Octet stopped the session so Antigravity never acts outside the mode you chose"
+    )
+    .into()
+}
+
+/// A skill's prompt text: its slash command, `/name args` trimmed, after
+/// `context` and a blank line when there is context.
+fn skill_text(name: &str, args: &str, context: Option<&str>) -> String {
+    let command = format!("/{name} {args}");
+    let command = command.trim();
+    match context.filter(|context| !context.is_empty()) {
+        Some(context) => format!("{context}\n\n{command}"),
+        None => command.to_owned(),
     }
-    core.emit(Event::Notice(format!(
-        "Request declined: {}",
-        short(method)
-    )))
+}
+
+/// Antigravity counterpart of `codex_stray_reply`: the reply to a request
+/// Octet will not put in front of the user. A permission request is
+/// rejected with its `reject_once` option (else `deny`); anything else
+/// (`fs/*` and `terminal/*` included, which Octet does not offer) is an
+/// unsupported method. A frame that is not a request gets none.
+pub fn antigravity_stray_reply(value: &Value) -> Option<Value> {
+    acp::stray_reply(value, PERMISSION_IDS)
 }
 
 #[cfg(test)]
@@ -900,6 +1065,75 @@ mod tests {
         let tool = Tool::first(&json!({}), Some("/w/a".into()));
         assert_eq!((tool.name.as_str(), tool.target.as_str()), ("tool", "/w/a"));
         assert_eq!(tool.kind, "other");
+    }
+
+    #[test]
+    fn antigravity_stray_requests_are_refused() {
+        let read =
+            json!({"jsonrpc": "2.0", "id": "7", "method": "fs/read_text_file", "params": {}});
+        let reply = antigravity_stray_reply(&read).unwrap();
+        assert_eq!(reply["error"]["code"], -32601);
+        assert_eq!(reply["id"], "7");
+        // A permission request is rejected with its own `reject_once` option,
+        // else with Antigravity's `deny`.
+        let asked = |options: Value| {
+            json!({"jsonrpc": "2.0", "id": "2", "method": "session/request_permission",
+                "params": {"sessionId": "s", "toolCall": {}, "options": options}})
+        };
+        for options in [
+            json!([{"optionId": "allow", "kind": "allow_once"}, {"optionId": "deny", "kind": "reject_once"}]),
+            json!([]),
+        ] {
+            let reply = antigravity_stray_reply(&asked(options)).unwrap();
+            assert_eq!(reply["result"]["outcome"]["optionId"], "deny");
+            assert_eq!(reply["id"], "2", "a string ID comes back a string");
+        }
+        // A notification is no request.
+        assert_eq!(
+            antigravity_stray_reply(&json!({"jsonrpc": "2.0", "method": "session/update"})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_skill_is_its_slash_command_after_any_context() {
+        assert_eq!(skill_text("review", "src", None), "/review src");
+        assert_eq!(skill_text("review", "", None), "/review");
+        assert_eq!(skill_text("review", "", Some("")), "/review");
+        assert_eq!(
+            skill_text("review", " a b ", Some("earlier")),
+            "earlier\n\n/review  a b"
+        );
+    }
+
+    #[test]
+    fn a_permission_request_marks_its_tool_call_asked() {
+        let mut protocol = AntigravityProtocol::default();
+        let call = |id: &str| json!({"toolCallId": id, "name": "run_command", "kind": "execute", "title": "ls"});
+        protocol
+            .tools
+            .insert("known".to_owned(), Tool::first(&call("known"), None));
+        protocol.mark_asked(&call("known"));
+        protocol.mark_asked(&call("new"));
+        // A call with no ID cannot be named again.
+        protocol.mark_asked(&json!({"kind": "execute"}));
+        assert!(protocol.tools["known"].asked);
+        let added = &protocol.tools["new"];
+        assert!(added.asked);
+        assert_eq!(
+            (added.name.as_str(), added.target.as_str()),
+            ("run_command", "ls")
+        );
+        assert_eq!(protocol.tools.len(), 2);
+        // A full table takes no more calls.
+        for n in protocol.tools.len()..MAX_TOOLS {
+            protocol
+                .tools
+                .insert(n.to_string(), Tool::first(&call("x"), None));
+        }
+        protocol.mark_asked(&call("late"));
+        assert!(!protocol.tools.contains_key("late"));
+        assert_eq!(protocol.tools.len(), MAX_TOOLS);
     }
 
     #[test]

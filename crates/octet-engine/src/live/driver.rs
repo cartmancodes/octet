@@ -208,9 +208,11 @@ impl<P: Protocol> Driver<P> {
     /// Whether `command` waits for the pending mode switch: a turn the
     /// session could start now, sent while the vendor has not answered a
     /// switch, on a provider whose switch reaches only the next turn
-    /// (opencode applies it at the next prompt). Claude reads its input in
-    /// order, so its switch is applied before a prompt sent after it. A busy
-    /// session refuses the turn at once, as it would anyway.
+    /// (opencode applies it at the next prompt) or whose protocol holds a
+    /// turn for a pending switch (`Protocol::holds_turn_for_switch`:
+    /// Antigravity answers requests in no fixed order). Claude reads its
+    /// input in order, so its switch is applied before a prompt sent after
+    /// it. A busy session refuses the turn at once, as it would anyway.
     fn must_hold(&self, command: &Command) -> bool {
         command.starts_turn()
             && self.core.phase == Phase::Idle
