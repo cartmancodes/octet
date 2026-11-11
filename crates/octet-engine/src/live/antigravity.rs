@@ -6,11 +6,12 @@
 mod guarded;
 mod launch;
 mod settings;
+mod tools;
 mod trust;
 
 use super::{
     BoxFuture, Channels, Config, DriverError, Event, ImageAttachment, Limits, Mode, NOT_SENT,
-    Outcome, Provider, ToolCall, acp,
+    Outcome, Provider, acp,
     acp::Levels,
     activity::one_line,
     deadline_after,
@@ -21,7 +22,7 @@ use super::{
 pub use launch::antigravity_prepare;
 use launch::{mode_id, mode_of};
 use serde_json::{Value, json};
-use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
+use std::{ffi::OsString, path::Path, time::Duration};
 use tokio::time::Instant;
 pub use trust::{
     WorkspaceConfig, antigravity_trust, antigravity_trusted, antigravity_workspace_config,
@@ -73,8 +74,6 @@ pub(super) const PROVIDER: Provider = Provider {
 const SIGN_IN: &str = "Sign in to Antigravity first: run `agy`";
 /// What Octet says when a model has no thinking level.
 const NO_LEVELS: &str = "This Antigravity model takes no thinking level";
-/// The most tool calls one turn remembers.
-const MAX_TOOLS: usize = 1024;
 /// How long a probe waits, after the session opens, for Antigravity to list
 /// its commands before it settles for the models alone.
 const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
@@ -127,24 +126,6 @@ struct Wanted {
     level: Option<String>,
 }
 
-/// A tool call of the running turn, as its first frame named it.
-struct Tool {
-    /// The tool's name, else its title.
-    name: String,
-    /// The newest target a frame named.
-    target: String,
-    /// The kind of its first frame; later frames need not repeat it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the tripwire, which a later commit adds")
-    )]
-    kind: String,
-    /// A permission request named the call this turn: a call that ends
-    /// without one ran unasked. The tripwire, which a later commit adds,
-    /// reads it.
-    asked: bool,
-}
-
 /// Antigravity's per-connection state: Octet's requests awaiting replies,
 /// the session's options as Antigravity last reported them, the commands it
 /// lists, and the turn's tool calls.
@@ -168,8 +149,8 @@ pub(super) struct AntigravityProtocol {
     /// The names of the commands Antigravity last listed for this session,
     /// bounded; none before its first list.
     commands: Vec<String>,
-    /// This turn's tool calls, by ID, at most [`MAX_TOOLS`].
-    tools: HashMap<String, Tool>,
+    /// This turn's tool calls.
+    tools: tools::Tools,
     /// A probe's session is open and its commands are awaited until this
     /// moment; `None` once the probe has been answered.
     probe_wait: Option<Instant>,
@@ -799,40 +780,14 @@ impl AntigravityProtocol {
             && core.phase.is_running();
         if asks {
             let tool_call = &v["params"]["toolCall"];
-            let known = self.known_target(tool_call);
-            self.mark_asked(tool_call);
+            let known = self.tools.known_target(tool_call);
+            self.tools.mark_asked(tool_call);
             if core.phase == Phase::InTurn {
                 let (detail, summary) = acp::approval(tool_call, known.as_deref(), PROVIDER.title);
                 return core.queue_approval(v, detail, summary).await;
             }
         }
         acp::refuse_request(core, &v, PERMISSION_IDS, PROVIDER.title).await
-    }
-
-    /// The target `tool_call`'s earlier frames named this turn, if any.
-    fn known_target(&self, tool_call: &Value) -> Option<String> {
-        tool_call["toolCallId"]
-            .as_str()
-            .and_then(|id| self.tools.get(&one_line(id)))
-            .map(|tool| tool.target.clone())
-            .filter(|target| !target.is_empty())
-    }
-
-    /// Marks the call `tool_call` names as asked, adding it to the table as
-    /// the request names it when it is not there yet. A call without an ID
-    /// cannot be named again, and a full table takes no more.
-    fn mark_asked(&mut self, tool_call: &Value) {
-        let id = one_line(tool_call["toolCallId"].as_str().unwrap_or_default());
-        if id.is_empty() {
-            return;
-        }
-        if let Some(tool) = self.tools.get_mut(&id) {
-            tool.asked = true;
-        } else if self.tools.len() < MAX_TOOLS {
-            let mut tool = Tool::first(tool_call, acp::frame_target(tool_call));
-            tool.asked = true;
-            self.tools.insert(id, tool);
-        }
     }
 
     /// Records the model, the mode and the thinking levels `config_options`
@@ -892,57 +847,10 @@ impl AntigravityProtocol {
         acp::end_prompt(core, v, self.cancel_sent)
     }
 
-    /// A `tool_call` or `tool_call_update`: the call as it now stands. Its
-    /// name and kind are its first frame's; its target is the newest one a
-    /// frame names (see `acp::frame_target`), else a command's title. At most
-    /// [`MAX_TOOLS`] calls are remembered in a turn.
+    /// A `tool_call` or `tool_call_update`: the call as it now stands (see
+    /// `tools::Tools::frame`).
     fn tool(&mut self, core: &Core, update: &Value) -> Result<(), DriverError> {
-        let id = one_line(update["toolCallId"].as_str().unwrap_or_default());
-        let target = acp::frame_target(update);
-        let (name, target) = if let Some(known) = self.tools.get_mut(&id) {
-            if let Some(target) = target {
-                known.target = target;
-            }
-            (known.name.clone(), known.target.clone())
-        } else {
-            let tool = Tool::first(update, target);
-            let shown = (tool.name.clone(), tool.target.clone());
-            if !id.is_empty() && self.tools.len() < MAX_TOOLS {
-                self.tools.insert(id.clone(), tool);
-            }
-            shown
-        };
-        core.emit(Event::Tool(ToolCall {
-            id,
-            name,
-            target,
-            phase: acp::tool_phase(&update["status"]),
-            detail: acp::content_text(&update["content"]),
-        }))
-    }
-}
-
-impl Tool {
-    /// A call as its first frame `update` names it, with the `target` that
-    /// frame names, if any.
-    fn first(update: &Value, target: Option<String>) -> Self {
-        let named = |key: &str| {
-            update[key]
-                .as_str()
-                .map(one_line)
-                .filter(|text| !text.is_empty())
-        };
-        let kind = named("kind").unwrap_or_else(|| "other".to_owned());
-        let title = named("title");
-        let target = target
-            .or_else(|| title.clone().filter(|_| kind == "execute"))
-            .unwrap_or_default();
-        Self {
-            name: named("name").or(title).unwrap_or_else(|| "tool".to_owned()),
-            target,
-            kind,
-            asked: false,
-        }
+        core.emit(Event::Tool(self.tools.frame(update)))
     }
 }
 
@@ -1047,27 +955,6 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_is_named_by_its_name_then_its_title() {
-        let tool = Tool::first(
-            &json!({"name": "run_command", "kind": "execute", "title": "ls -la"}),
-            None,
-        );
-        assert_eq!(
-            (tool.name.as_str(), tool.target.as_str()),
-            ("run_command", "ls -la")
-        );
-        assert_eq!(tool.kind, "execute");
-        let tool = Tool::first(&json!({"kind": "read", "title": "Read file"}), None);
-        assert_eq!(
-            (tool.name.as_str(), tool.target.as_str()),
-            ("Read file", "")
-        );
-        let tool = Tool::first(&json!({}), Some("/w/a".into()));
-        assert_eq!((tool.name.as_str(), tool.target.as_str()), ("tool", "/w/a"));
-        assert_eq!(tool.kind, "other");
-    }
-
-    #[test]
     fn antigravity_stray_requests_are_refused() {
         let read =
             json!({"jsonrpc": "2.0", "id": "7", "method": "fs/read_text_file", "params": {}});
@@ -1107,36 +994,6 @@ mod tests {
             skill_text("review", " a b ", Some("earlier")),
             "earlier\n\n/review  a b"
         );
-    }
-
-    #[test]
-    fn a_permission_request_marks_its_tool_call_asked() {
-        let mut protocol = AntigravityProtocol::default();
-        let call = |id: &str| json!({"toolCallId": id, "name": "run_command", "kind": "execute", "title": "ls"});
-        protocol
-            .tools
-            .insert("known".to_owned(), Tool::first(&call("known"), None));
-        protocol.mark_asked(&call("known"));
-        protocol.mark_asked(&call("new"));
-        // A call with no ID cannot be named again.
-        protocol.mark_asked(&json!({"kind": "execute"}));
-        assert!(protocol.tools["known"].asked);
-        let added = &protocol.tools["new"];
-        assert!(added.asked);
-        assert_eq!(
-            (added.name.as_str(), added.target.as_str()),
-            ("run_command", "ls")
-        );
-        assert_eq!(protocol.tools.len(), 2);
-        // A full table takes no more calls.
-        for n in protocol.tools.len()..MAX_TOOLS {
-            protocol
-                .tools
-                .insert(n.to_string(), Tool::first(&call("x"), None));
-        }
-        protocol.mark_asked(&call("late"));
-        assert!(!protocol.tools.contains_key("late"));
-        assert_eq!(protocol.tools.len(), MAX_TOOLS);
     }
 
     #[test]
