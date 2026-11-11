@@ -551,7 +551,10 @@ impl AntigravityProtocol {
 
     /// Why the current model cannot take `level`, from its last reported
     /// options; `None` when it lists the level or its levels are unknown
-    /// (then Antigravity decides).
+    /// (then Antigravity decides). The levels are unknown when the reply
+    /// that opened or resumed the session, or set the model, carried no
+    /// `configOptions`. A `thought_level` option that lists no level is no
+    /// option.
     fn effort_refusal(&self, level: &str) -> Option<String> {
         let (values, current) = match &self.levels {
             Levels::Unknown => return None,
@@ -561,7 +564,9 @@ impl AntigravityProtocol {
         if values.iter().any(|value| value == level) {
             return None;
         }
-        let (last, rest) = values.split_last()?;
+        let Some((last, rest)) = values.split_last() else {
+            return Some(NO_LEVELS.to_owned());
+        };
         let levels = if rest.is_empty() {
             last.clone()
         } else {
@@ -903,5 +908,26 @@ mod tests {
         assert!(version_notice(None).unwrap().starts_with(
             "Octet has not been checked against Antigravity unknown (checked: 1.5.5)"
         ));
+    }
+
+    #[test]
+    fn a_level_option_that_lists_no_level_is_no_level_at_all() {
+        let mut protocol = AntigravityProtocol::default();
+        protocol.note_options(&json!([
+            {"id": "model", "currentValue": "m", "options": [{"value": "m"}]},
+            {"id": "thought_level", "currentValue": "high", "options": []},
+        ]));
+        assert_eq!(protocol.effort_refusal("low").as_deref(), Some(NO_LEVELS));
+        // A listed level is taken; one not listed is refused, naming them.
+        protocol.note_options(&json!([
+            {"id": "model", "currentValue": "m", "options": [{"value": "m"}]},
+            {"id": "thought_level", "currentValue": "high",
+             "options": [{"value": "low"}, {"value": "high"}]},
+        ]));
+        assert_eq!(protocol.effort_refusal("low"), None);
+        assert_eq!(
+            protocol.effort_refusal("max").as_deref(),
+            Some("Antigravity takes effort low or high for this model; it keeps high")
+        );
     }
 }

@@ -360,18 +360,20 @@ mod tests {
             description: String::new(),
         }
     }
-    /// Probes run the fake vendor for every provider, keeping Octet's files
-    /// (Antigravity's settings) in `data_dir`.
-    fn fake_prober(data_dir: &Path) -> Prober {
+    /// Probes run the fake vendor for every provider in the test's own
+    /// folder `dir`, which is also where Octet keeps its files (Antigravity's
+    /// settings): nothing another test leaves in a shared folder can reach
+    /// them.
+    fn fake_prober(dir: &Path) -> Prober {
         Prober {
-            cwd: std::env::temp_dir(),
+            cwd: dir.to_owned(),
             binaries: Engine::ALL
                 .iter()
                 .map(|engine| (*engine, octet_testkit::protocol_child()))
                 .collect(),
             limit: octet_core::PROBE_LIMIT,
             plugins: octet_core::Plugins::default(),
-            data_dir: Some(data_dir.to_owned()),
+            data_dir: Some(dir.to_owned()),
             trust_workspace: false,
         }
     }
@@ -416,8 +418,8 @@ mod tests {
         models
             .catalogs
             .set(Engine::CODEX, vec![model("gpt-x")], now);
-        // `fake_prober` probes in the temporary directory, which has no
-        // Codex skills yet.
+        // `fake_prober` probes in the test's folder, which has no Codex
+        // skills yet.
         models.probe_stale(Engine::CLAUDE, now);
         assert!(models.probing.contains(&Engine::CODEX));
         // opencode, with no list at all, is probed too. Nobody asked for
@@ -473,8 +475,8 @@ mod tests {
             result: Ok(listing),
         };
         assert!(models.probed(probed, SystemTime::now()).is_empty());
-        // `fake_prober` probes in the temporary directory.
-        let ws = std::env::temp_dir();
+        // `fake_prober` probes in the test's folder.
+        let ws = dir.path().to_owned();
         assert_eq!(models.skills(Engine::CODEX, &ws)[0].name, "pdf");
         let cached =
             octet_core::skills::SkillCatalogs::load(&dir.path().join(octet_core::skills::FILE));

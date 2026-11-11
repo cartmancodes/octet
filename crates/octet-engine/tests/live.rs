@@ -5591,18 +5591,21 @@ async fn antigravity_effort_on_a_model_without_levels_is_a_notice() {
     c.model = Some("plain-fixture".into());
     c.effort = Some("high".into());
     let (handle, mut events, task) = spawn(c);
-    let mut noticed = false;
+    let (mut noticed, mut dropped) = (false, false);
     loop {
         match next(&mut events).await {
             Event::Notice(notice) if notice == "This Antigravity model takes no thinking level" => {
                 noticed = true;
             }
+            // The interface stops showing the level asked for.
+            Event::Effort(None) if noticed => dropped = true,
             Event::Ready { .. } => break,
             Event::Error(error) => panic!("{error}"),
             _ => {}
         }
     }
     assert!(noticed, "the notice came before Ready");
+    assert!(dropped, "Effort(None) followed the notice");
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
     let echo = agy_params(&handle, &mut events).await;
     let sets = echo["sets"].as_array().unwrap();
@@ -5786,7 +5789,7 @@ async fn antigravity_an_untrusted_workspace_does_not_start() {
     assert!(error.contains(".agents/hooks.json"), "{error}");
     ended(task).await;
     // Nothing was launched: Octet's settings were not even written.
-    assert!(!dir.path().join("data/antigravity/review").exists());
+    assert!(!dir.path().join("data/antigravity").exists());
     let mut trusted = c;
     trusted.trust_workspace = true;
     let (handle, mut events, task) = spawn(trusted);
@@ -5953,4 +5956,191 @@ async fn antigravity_handshake_out_of_order_is_an_error() {
         }
     }
     ended(task).await;
+}
+
+/// `configOptions` with a model, the levels low, medium and high at
+/// `level`, and mode `mode` (`None`: no mode option).
+fn agy_options(level: &str, mode: Option<&str>) -> serde_json::Value {
+    let mut options = vec![
+        serde_json::json!({"id": "model", "currentValue": "m", "options": [{"value": "m", "name": "M"}]}),
+        serde_json::json!({"id": "thought_level", "currentValue": level,
+            "options": [{"value": "low"}, {"value": "medium"}, {"value": "high"}]}),
+    ];
+    if let Some(mode) = mode {
+        options.push(serde_json::json!({"id": "mode", "currentValue": mode,
+            "options": [{"value": "default"}, {"value": "plan"}]}));
+    }
+    serde_json::Value::Array(options)
+}
+/// A scripted Antigravity, set as `c`'s binary, that runs in `c`'s workspace:
+/// for each of `steps` it reads one request, logs it to `sent.log` there,
+/// then runs the step (shell that answers it). The guard keeps the script.
+fn agy_script(c: &mut Config, steps: &[String]) -> (octet_testkit::TempDir, std::path::PathBuf) {
+    let mut body = String::new();
+    for step in steps {
+        let _ = write!(
+            body,
+            "read line\nprintf '%s\\n' \"$line\" >> sent.log\n{step}\n"
+        );
+    }
+    body.push_str("exec sleep 30\n");
+    let (dir, vendor) = script_vendor("octet-live-agy-script", &body);
+    c.binary.clone_from(&vendor);
+    (dir, vendor)
+}
+/// The shell line that answers request `id` with `result`.
+fn agy_reply(id: u64, result: &serde_json::Value) -> String {
+    let frame = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+    format!("echo '{frame}'")
+}
+/// The requests a scripted Antigravity logged in the workspace of `c`.
+fn agy_sent(c: &Config) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(c.cwd.join("sent.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+/// What a session stops with when the scripted Antigravity answers its
+/// first `mode` request with `reply` (the frame's `result` or `error`
+/// member); no `Ready` may come first.
+async fn agy_first_mode(reply: serde_json::Value) -> String {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let mut third = serde_json::json!({"jsonrpc": "2.0", "id": 3});
+    third
+        .as_object_mut()
+        .unwrap()
+        .extend(reply.as_object().unwrap().clone());
+    let steps = [
+        agy_reply(1, &serde_json::json!({"agentInfo": {"version": "1.5.5"}})),
+        agy_reply(
+            2,
+            &serde_json::json!({"sessionId": "s1", "configOptions": agy_options("high", Some("default"))}),
+        ),
+        format!("echo '{third}'"),
+    ];
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (_handle, mut events, task) = spawn(c);
+    let error = loop {
+        match next(&mut events).await {
+            Event::Error(error) => break error,
+            Event::Ready { session } => panic!("a session opened: {session}"),
+            Event::ModeChanged(mode) => panic!("the header claimed {mode:?}"),
+            Event::Stopped => panic!("stopped without an error"),
+            _ => {}
+        }
+    };
+    ended(task).await;
+    error
+}
+/// The error that stops a session whose first mode Antigravity would not
+/// confirm, for `reason`.
+fn agy_mode_refused(reason: &str) -> String {
+    format!(
+        "Antigravity would not switch to mode default ({reason}); \
+         Octet stopped the session so Antigravity never acts outside the mode you chose"
+    )
+}
+#[tokio::test]
+async fn antigravity_a_refused_first_mode_stops_the_session() {
+    let error = agy_first_mode(
+        serde_json::json!({"error": {"code": -32602, "message": "Unknown mode: default"}}),
+    )
+    .await;
+    assert_eq!(error, agy_mode_refused("Unknown mode: default"));
+}
+#[tokio::test]
+async fn antigravity_a_first_mode_reply_naming_no_mode_stops_the_session() {
+    let error = agy_first_mode(serde_json::json!({"result": {"configOptions": []}})).await;
+    assert_eq!(error, agy_mode_refused("its reply named no mode"));
+}
+#[tokio::test]
+async fn antigravity_a_first_mode_reply_naming_another_mode_stops_the_session() {
+    let error = agy_first_mode(
+        serde_json::json!({"result": {"configOptions": agy_options("high", Some("plan"))}}),
+    )
+    .await;
+    assert_eq!(error, agy_mode_refused("Antigravity reported mode plan"));
+}
+#[tokio::test]
+async fn antigravity_effort_asked_after_the_effort_step_is_set_once_ready() {
+    // The mode's reply is held back until the test has sent the level, so
+    // the level arrives after the handshake's effort step has run.
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let steps = [
+        agy_reply(1, &serde_json::json!({"agentInfo": {"version": "1.5.5"}})),
+        agy_reply(
+            2,
+            &serde_json::json!({"sessionId": "s1", "configOptions": agy_options("high", Some("default"))}),
+        ),
+        format!(
+            ": > asked-mode\nwhile [ ! -e release ]; do sleep 0.05; done\n{}",
+            agy_reply(
+                3,
+                &serde_json::json!({"configOptions": agy_options("high", Some("default"))})
+            )
+        ),
+        agy_reply(
+            4,
+            &serde_json::json!({"configOptions": agy_options("medium", Some("default"))}),
+        ),
+    ];
+    let (_script, _) = agy_script(&mut c, &steps);
+    let ws = c.cwd.clone();
+    let (handle, mut events, task) = spawn(c.clone());
+    timeout(Duration::from_secs(5), async {
+        while !ws.join("asked-mode").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the mode was never asked for");
+    handle
+        .send(Command::SetEffort(Some("medium".into())))
+        .unwrap();
+    // The driver takes a queued command before a frame, so the level is
+    // recorded before the mode's reply is read.
+    std::fs::write(ws.join("release"), "").unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    let effort = wait_for(&mut events, |e| matches!(e, Event::Effort(_))).await;
+    assert!(
+        matches!(&effort, Event::Effort(Some(level)) if level == "medium"),
+        "{effort:?}"
+    );
+    let sent = agy_sent(&c);
+    let last = sent.last().unwrap();
+    assert_eq!(last["method"], "session/set_config_option", "{sent:?}");
+    assert_eq!(last["params"]["configId"], "thought_level");
+    assert_eq!(last["params"]["value"], "medium");
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_session_reply_without_options_still_gets_the_level_asked_for() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.effort = Some("low".into());
+    let steps = [
+        agy_reply(1, &serde_json::json!({"agentInfo": {"version": "1.5.5"}})),
+        agy_reply(2, &serde_json::json!({"sessionId": "s1"})),
+        agy_reply(
+            3,
+            &serde_json::json!({"configOptions": agy_options("low", Some("default"))}),
+        ),
+        agy_reply(
+            4,
+            &serde_json::json!({"configOptions": agy_options("low", Some("default"))}),
+        ),
+    ];
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| matches!(e, Event::Ready { .. })).await;
+    let effort = wait_for(&mut events, |e| matches!(e, Event::Effort(_))).await;
+    assert!(
+        matches!(&effort, Event::Effort(Some(level)) if level == "low"),
+        "{effort:?}"
+    );
+    let sent = agy_sent(&c);
+    let level = &sent[2];
+    assert_eq!(level["params"]["configId"], "thought_level", "{sent:?}");
+    assert_eq!(level["params"]["value"], "low");
+    stop(&handle, task).await;
 }
