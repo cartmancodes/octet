@@ -124,8 +124,10 @@ pub const AGY_SKILL: &str = "fixture-agy-skill";
 pub const AGY_MISSING_SESSION: &str = "missing-session";
 /// Antigravity: write `fixture.txt`; it asks only in mode `default`.
 pub const AGY_EDIT: &str = "agy-edit";
-/// Antigravity: a command that never asks, whatever the mode; a cancel while
-/// it streams ends the turn `cancelled`.
+/// Antigravity: a command that never asks, whatever the mode. A
+/// `session/cancel` during the turn, or within 300 ms of the command's
+/// `completed` frame, ends it `cancelled` with no text; otherwise the text
+/// `ran unasked` and `end_turn`. A cancel while no turn runs is ignored.
 pub const AGY_UNASKED: &str = "agy-unasked";
 /// Antigravity: an edit starts, then waits for the next
 /// `session/set_config_option` before it completes without asking.
@@ -146,10 +148,13 @@ pub const AGY_OTHER_SESSION: &str = "agy-other-session";
 /// switches itself to mode `plan`.
 pub const AGY_IDLE_PLAN: &str = "agy-idle-plan";
 /// Antigravity: waits for a `session/set_config_option`, answers it, then runs
-/// [`AGY_UNASKED`].
+/// [`AGY_UNASKED`], cancel window included; a cancel before the
+/// `set_config_option` ends the turn `cancelled`.
 pub const AGY_LATE_COMMAND: &str = "agy-late-command";
-/// Antigravity: 1,025 `read` tool calls, then a reply; a cancel while they
-/// stream ends the turn `cancelled`.
+/// Antigravity: 1,025 `read` tool calls, then a reply. A `session/cancel`
+/// while they stream, or within 300 ms of the last one's `completed` frame
+/// (`call-1025`), ends the turn `cancelled` with no text. A cancel while no
+/// turn runs is ignored.
 pub const AGY_FLOOD: &str = "agy-flood";
 /// Antigravity: a command starts and the turn holds; a cancel makes the agent
 /// ask for permission, and once that is answered the tool call fails and the

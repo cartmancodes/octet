@@ -12,6 +12,7 @@ use std::{
     io::{self, BufRead},
     sync::mpsc::{self, Receiver},
     thread,
+    time::{Duration, Instant},
 };
 
 /// The model a session starts with.
@@ -26,7 +27,7 @@ const MODELS: [(&str, &str); 3] = [
     (MODEL_CLAUDE, "Claude Fixture"),
     (MODEL_PLAIN, "Plain Fixture"),
 ];
-/// The thinking levels offered, and the one a session starts at.
+/// The thinking levels offered.
 const LEVELS: [&str; 3] = ["low", "medium", "high"];
 /// The thinking level a session starts at.
 const LEVEL_DEFAULT: &str = "high";
@@ -41,6 +42,11 @@ const MODES: [(&str, &str); 4] = [
 const SESSION: &str = "fixture-agy";
 /// The `toolPermission` under which nothing asks.
 const ALWAYS_PROCEED: &str = "always-proceed";
+/// How long `AGY_UNASKED` and `AGY_FLOOD` wait after their last tool frame for a
+/// `session/cancel` before the turn goes on. Octet cancels when it sees the
+/// unasked action complete; the wait makes that cancel land inside the turn
+/// instead of racing the end of it.
+const CANCEL_WINDOW: Duration = Duration::from_millis(300);
 /// The ID of the permission request most scripts send.
 const REQUEST_ID: &str = "1";
 
@@ -434,6 +440,27 @@ impl AgyFixture {
         true
     }
 
+    /// Waits up to `CANCEL_WINDOW` for a `session/cancel`, or takes one that
+    /// has already arrived; whether there was one. Other frames that come
+    /// meanwhile stay in the backlog, in order.
+    fn cancel_within_window(&mut self) -> bool {
+        if self.cancel_arrived() {
+            return true;
+        }
+        let deadline = Instant::now() + CANCEL_WINDOW;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            let Ok(line) = self.frames.recv_timeout(left) else {
+                return false;
+            };
+            match parse(&line) {
+                Some(frame) if frame["method"] == "session/cancel" => return true,
+                Some(frame) => self.backlog.push_back(frame),
+                None => {}
+            }
+        }
+        false
+    }
+
     /// Answers one frame.
     fn handle(&mut self, v: &Value) {
         match v["method"].as_str() {
@@ -767,7 +794,9 @@ impl AgyFixture {
         self.turn = Some(Turn::Many { id, outstanding });
     }
 
-    /// `AGY_UNASKED`: the command runs without asking, whatever the mode.
+    /// `AGY_UNASKED`: the command runs without asking, whatever the mode. A
+    /// `session/cancel` during the turn, or within `CANCEL_WINDOW` of the
+    /// `completed` frame, ends it `cancelled` with no text.
     fn unasked(&mut self, id: &Value) {
         let sid = self.session.clone();
         let frames = [
@@ -775,14 +804,12 @@ impl AgyFixture {
             tool_status(&sid, "call-1", "pending"),
             tool_status(&sid, "call-1", "in_progress"),
             tool_status(&sid, "call-1", "completed"),
-            acp_text(&sid, "ran unasked"),
         ];
-        if self.stream(id, &frames) {
-            end_turn(id);
-        }
+        self.run_to_end(id, &frames, "ran unasked");
     }
 
-    /// `AGY_FLOOD`: 1,025 reads, each started then completed.
+    /// `AGY_FLOOD`: 1,025 reads, each started then completed; cancelled as
+    /// `unasked` is.
     fn flood(&mut self, id: &Value) {
         let sid = self.session.clone();
         let mut frames = Vec::new();
@@ -790,10 +817,22 @@ impl AgyFixture {
             frames.push(Tool::read(n).started(&sid, "in_progress"));
             frames.push(tool_status(&sid, &format!("call-{n}"), "completed"));
         }
-        frames.push(acp_text(&sid, scenario::AGY_REPLY));
-        if self.stream(id, &frames) {
-            end_turn(id);
+        self.run_to_end(id, &frames, scenario::AGY_REPLY);
+    }
+
+    /// Streams the tool `frames`, leaves `CANCEL_WINDOW` for a cancel, then
+    /// says `text` and ends the prompt `id`; a cancel ends it `cancelled`
+    /// with no further frame.
+    fn run_to_end(&mut self, id: &Value, frames: &[Value], text: &str) {
+        if !self.stream(id, frames) {
+            return;
         }
+        if self.cancel_within_window() {
+            stop(id, "cancelled");
+            return;
+        }
+        emit(&acp_text(&self.session, text));
+        end_turn(id);
     }
 
     /// `PARAMS`'s echo: the launch arguments, the settings file and what the
