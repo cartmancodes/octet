@@ -25,8 +25,12 @@ struct Tool {
     name: String,
     /// The newest target a frame named.
     target: String,
-    /// The kind of its first frame; later frames need not repeat it.
+    /// The strictest kind a frame named (see `Tool::update`); later frames
+    /// need not repeat it.
     kind: String,
+    /// The newest title a frame named: a command's target when no frame
+    /// names one.
+    title: Option<String>,
     /// A permission request named the call this turn: a call that ends
     /// without one ran unasked.
     asked: bool,
@@ -114,10 +118,9 @@ impl Tools {
 
     /// A `tool_call` or `tool_call_update`, arriving under `mode`: the call
     /// as it now stands, and why it stops the turn, if it does. Its name is
-    /// its first frame's; its kind is the newest one a frame names, except
-    /// that a kind the tripwire covers sticks (see `Tool::update`); its
-    /// target is the newest one a frame names (see `acp::frame_target`),
-    /// else a command's title. At most
+    /// its first frame's; its kind is the strictest one a frame names (see
+    /// `Tool::update`); its target is the newest one a frame names (see
+    /// `acp::frame_target`), else a command's best title. At most
     /// [`MAX_TOOLS`] calls are remembered in a turn; while `mode` asks, a
     /// call that cannot be is a [`Stop::TooMany`]. A frame that ends a call
     /// no permission request named is judged by the tripwire; a call without
@@ -181,20 +184,24 @@ impl Tool {
             .or_else(|| title.clone().filter(|_| kind == "execute"))
             .unwrap_or_default();
         Self {
-            name: named("name").or(title).unwrap_or_else(|| "tool".to_owned()),
+            name: named("name")
+                .or_else(|| title.clone())
+                .unwrap_or_else(|| "tool".to_owned()),
             target,
             kind,
+            title,
             asked: false,
             loosest: mode,
             ended: false,
         }
     }
 
-    /// A later frame `update` of the call, naming `target`, if any. A kind
-    /// it names replaces the one known unless that one is covered by the
-    /// tripwire (a covered kind sticks, so a later frame cannot make a
-    /// command look like a read). A command that has no target yet takes the
-    /// frame's title.
+    /// A later frame `update` of the call, naming `target`, if any. The
+    /// strictest kind named so far judges the call (see [`strictness`]): a
+    /// frame's kind replaces the one known only when it is stricter, or when
+    /// both are kinds the tripwire never covers, so a later frame cannot
+    /// make a command look like an edit or a read. A command that has no
+    /// target yet takes the best title seen (the newest a frame named).
     fn update(&mut self, update: &Value, target: Option<String>) {
         let named = |key: &str| {
             update[key]
@@ -202,18 +209,22 @@ impl Tool {
                 .map(one_line)
                 .filter(|text| !text.is_empty())
         };
-        if let Some(kind) = named("kind")
-            && !COVERED.contains(&self.kind.as_str())
-        {
-            self.kind = kind;
+        if let Some(kind) = named("kind") {
+            let known = strictness(&self.kind);
+            if strictness(&kind) > known || known == 0 {
+                self.kind = kind;
+            }
+        }
+        if let Some(title) = named("title") {
+            self.title = Some(title);
         }
         if let Some(target) = target {
             self.target = target;
         } else if self.target.is_empty()
             && self.kind == "execute"
-            && let Some(title) = named("title")
+            && let Some(title) = &self.title
         {
-            self.target = title;
+            self.target.clone_from(title);
         }
     }
 
@@ -242,8 +253,15 @@ impl Tool {
     }
 }
 
-/// The kinds the tripwire covers in some mode.
-const COVERED: [&str; 4] = ["execute", "edit", "delete", "move"];
+/// How strict the tripwire is about a call of `kind`: a command (2) asks in
+/// ask and accept-edits, an edit (1) in ask, anything else (0) never.
+fn strictness(kind: &str) -> u8 {
+    match kind {
+        "execute" => 2,
+        "edit" | "delete" | "move" => 1,
+        _ => 0,
+    }
+}
 
 /// The tripwire: what a call of `kind` that ran unasked did, when `loosest`,
 /// the loosest mode in force while it ran, should have asked for it — a
@@ -359,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_named_on_a_later_frame_is_judged_and_a_covered_kind_sticks() {
+    fn a_kind_named_on_a_later_frame_is_judged_and_never_lowered() {
         let unasked = |stop: Option<Stop>, target: &str| {
             matches!(&stop, Some(Stop::Unasked(reason)) if reason.starts_with(&format!(
                 "Antigravity ran a command without asking while Octet shows ask: {target}."
@@ -383,7 +401,7 @@ mod tests {
             Mode::Ask,
         );
         assert!(unasked(tools.frame(&completed, Mode::Ask).1, "rm x"));
-        // A covered kind is not downgraded by a later one; a later frame's
+        // A command is not lowered by a later kind; a later frame's
         // title is the target of a command that named none.
         let mut tools = Tools::default();
         tools.frame(
@@ -395,6 +413,66 @@ mod tests {
             Mode::Ask,
         );
         assert!(unasked(stop, "ls"));
+    }
+
+    #[test]
+    fn the_strictest_kind_a_frame_names_judges_the_call() {
+        // The kind the call is judged by, after frames naming `kinds` in order,
+        // and the tripwire's verdict under `mode`.
+        let judged = |kinds: &[&str], mode: Mode| {
+            let mut tools = Tools::default();
+            let (last, first) = kinds.split_last().unwrap();
+            for kind in first {
+                tools.frame(
+                    &json!({"toolCallId": "c1", "kind": kind, "title": "t", "status": "in_progress"}),
+                    mode,
+                );
+            }
+            let (_, stop) = tools.frame(
+                &json!({"toolCallId": "c1", "kind": last, "status": "completed"}),
+                mode,
+            );
+            (tools.calls["c1"].kind.clone(), stop)
+        };
+        let ran = |stop: &Option<Stop>, what: &str, label: &str| {
+            matches!(stop, Some(Stop::Unasked(reason))
+                if reason.starts_with(&format!("Antigravity ran {what} without asking while Octet shows {label}")))
+        };
+        // An edit that turns out to be a command is a command: in
+        // accept-edits it trips.
+        let (kind, stop) = judged(&["edit", "execute"], Mode::AcceptEdits);
+        assert_eq!(kind, "execute");
+        assert!(ran(&stop, "a command", "accept-edits"), "{stop:?}");
+        // A command stays a command; an edit stays an edit.
+        let (kind, stop) = judged(&["execute", "edit"], Mode::Ask);
+        assert_eq!(kind, "execute");
+        assert!(ran(&stop, "a command", "ask"), "{stop:?}");
+        let (kind, stop) = judged(&["execute", "read"], Mode::AcceptEdits);
+        assert_eq!(kind, "execute");
+        assert!(ran(&stop, "a command", "accept-edits"), "{stop:?}");
+        let (kind, stop) = judged(&["edit", "read"], Mode::Ask);
+        assert_eq!(kind, "edit");
+        assert!(ran(&stop, "an edit", "ask"), "{stop:?}");
+        // Among kinds the tripwire never covers, the newest is kept.
+        assert_eq!(judged(&["read", "think"], Mode::Ask).0, "think");
+    }
+
+    #[test]
+    fn a_command_without_a_target_falls_back_to_the_best_title_seen() {
+        let mut tools = Tools::default();
+        tools.frame(
+            &json!({"toolCallId": "c1", "name": "run_command", "title": "ls -la", "status": "pending"}),
+            Mode::Ask,
+        );
+        let (call, stop) = tools.frame(
+            &json!({"toolCallId": "c1", "kind": "execute", "status": "completed"}),
+            Mode::Ask,
+        );
+        assert_eq!(call.target, "ls -la");
+        assert!(
+            matches!(&stop, Some(Stop::Unasked(reason)) if reason.contains("shows ask: ls -la.")),
+            "{stop:?}"
+        );
     }
 
     #[test]

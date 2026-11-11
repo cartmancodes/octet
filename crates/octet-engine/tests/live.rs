@@ -7409,7 +7409,7 @@ async fn antigravity_the_reason_octet_cancelled_for_is_shown_when_the_cancel_goe
     assert_eq!(
         error,
         format!(
-            "{}. Antigravity did not stop within 1 second of Octet's cancel; session stopped",
+            "{}. Antigravity did not stop within 1 second of the cancel; session stopped",
             agy_ran_unasked("ask")
         )
     );

@@ -82,10 +82,6 @@ const NO_LEVELS: &str = "This Antigravity model takes no thinking level";
 const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
 /// The permission options Octet answers with when a request lists none.
 const PERMISSION_IDS: (&str, &str) = ("allow", "deny");
-/// How much later than Antigravity's own deadline for a cancelled turn with
-/// a kept reason the driver's interrupt watchdog is put, so that the
-/// reason is shown when the session stops.
-const STOP_MARGIN: Duration = Duration::from_secs(1);
 /// What Octet says when the session lists no `compact` command.
 const NO_COMPACT: &str = "Antigravity does not offer compaction in this session";
 /// Why a turn is not sent once Antigravity acted unasked in the session.
@@ -159,8 +155,9 @@ pub(super) struct AntigravityProtocol {
     /// The kept reason is the tripwire's.
     stop_trip: bool,
     /// When the kept reason is shown with the session's stop, if the
-    /// cancelled prompt is not answered: just before the driver's own
-    /// interrupt watchdog would stop the session without it.
+    /// cancelled prompt is not answered: the interrupt deadline. The driver's
+    /// own interrupt watchdog, which would stop the session without it, is
+    /// put a whole interrupt limit later (see `cancel_turn`).
     stop_deadline: Option<Instant>,
     /// Antigravity acted unasked in this session: nothing more is sent.
     tripped: bool,
@@ -966,11 +963,12 @@ impl AntigravityProtocol {
         }
         self.stop_reason = Some(reason);
         self.stop_trip = trip;
-        // Antigravity's own timer fires first, so the reason is not lost to
-        // the driver's watchdog.
+        // Antigravity's own timer, at the interrupt deadline, fires first:
+        // the driver's watchdog is put a whole interrupt limit later, so the
+        // reason is not lost to it even when the timer wakes late.
         if self.stop_deadline.is_none() {
             self.stop_deadline = Some(core.deadline);
-            core.deadline += STOP_MARGIN;
+            core.deadline += core.limits.interrupt;
         }
         Ok(true)
     }
@@ -986,7 +984,7 @@ impl AntigravityProtocol {
             return Ok(());
         }
         Err(format!(
-            "{reason}. Antigravity did not stop within {} of Octet's cancel; session stopped",
+            "{reason}. Antigravity did not stop within {} of the cancel; session stopped",
             seconds(core.limits.interrupt)
         )
         .into())
