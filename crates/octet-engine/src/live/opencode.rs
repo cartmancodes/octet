@@ -3,10 +3,10 @@
 //! permission modes, and the environment that starts it), the handshake, the
 //! model catalog, turns, skills and the probe.
 use super::{
-    ApprovalSummary, BoxFuture, Channels, Command, Config, DriverError, Event, ImageAttachment,
-    Limits, Mode, ModelInfo, Outcome, Provider, SkillInfo, ToolCall, ToolPhase,
+    BoxFuture, Channels, Command, Config, DriverError, Event, ImageAttachment, Limits, Mode,
+    Outcome, Provider, ToolCall, ToolPhase, acp,
     activity::one_line,
-    check_inline, deadline_after, limited,
+    deadline_after,
     protocol::{Core, Phase, Protocol},
     short, valid_identifier,
 };
@@ -67,8 +67,6 @@ fn start(config: Config, limits: Limits, channels: Channels) -> BoxFuture<Result
 
 /// The most tool calls one turn remembers the names of.
 const MAX_TOOLS: usize = 256;
-/// The most models one catalog keeps.
-const MAX_MODELS: usize = 256;
 /// The most effort levels one model's option keeps.
 const MAX_EFFORTS: usize = 32;
 /// The most timed-out mode switches kept in case opencode confirms them late.
@@ -255,7 +253,7 @@ impl Protocol for OpencodeProtocol {
     }
 
     fn answer(wire: &Value, allow: bool) -> Value {
-        answer_wire(wire, allow)
+        acp::permission_reply(wire, allow, ("once", "reject"))
     }
 
     fn mode_change_pending(&self) -> bool {
@@ -412,12 +410,7 @@ impl Protocol for OpencodeProtocol {
     /// prompt with `end_turn`, which this turn reads as interrupted.
     async fn interrupt(&mut self, core: &mut Core) -> Result<(), DriverError> {
         self.cancel_sent = true;
-        core.send(json!({
-            "jsonrpc": "2.0",
-            "method": "session/cancel",
-            "params": {"sessionId": core.session},
-        }))
-        .await
+        core.send(acp::cancel(&core.session)).await
     }
 
     /// Sets the agent that carries `target`. The mode changes only when
@@ -563,7 +556,7 @@ impl Protocol for OpencodeProtocol {
                 let running = self.turn_mode.filter(|_| core.phase.is_running());
                 self.commands
                     .listed(list, launch, core.limits.command_check, running);
-                core.emit(Event::Skills(commands(list)))
+                core.emit(Event::Skills(acp::commands(list)))
             }
             // A resume replays the session's history before any prompt: it
             // is not this turn's output.
@@ -694,35 +687,10 @@ impl OpencodeProtocol {
             }
         }
         self.turn_mode = Some(core.mode);
-        let mut encoded = Vec::with_capacity(images.len());
-        for image in images {
-            // A file swapped for a FIFO, or on a stalled mount, must not hold
-            // the session: cancel and stop wait while this runs.
-            match tokio::time::timeout(core.limits.image_read, image.read_base64()).await {
-                Ok(Ok(data)) => encoded.push((image, data)),
-                Ok(Err(error)) => return fail_turn(core, error.to_string()),
-                Err(_) => {
-                    return fail_turn(
-                        core,
-                        format!(
-                            "Reading {} took longer than {}; the prompt was not sent",
-                            image.name,
-                            super::driver::seconds(core.limits.image_read)
-                        ),
-                    );
-                }
-            }
-        }
-        // Files can change after they were attached; check what is sent.
-        let sizes = encoded
-            .iter()
-            .map(|(image, data)| (image.name.as_str(), data.len() as u64));
-        if let Err(error) = check_inline(PROVIDER.title, sizes) {
-            return fail_turn(core, error.to_string());
-        }
-        for (image, data) in encoded {
-            prompt.push(json!({"type": "image", "mimeType": image.media_type, "data": data}));
-        }
+        let Some(blocks) = acp::image_blocks(core, PROVIDER.title, images).await? else {
+            return Ok(());
+        };
+        prompt.extend(blocks);
         self.commands.turn_sent(core.mode);
         let params = json!({"sessionId": core.session, "prompt": prompt});
         self.request(core, Outstanding::Prompt, "session/prompt", params)
@@ -800,7 +768,7 @@ impl OpencodeProtocol {
             core.emit(Event::Notice(format!(
                 "opencode did not set effort {}: {}",
                 short(&request.value),
-                error_text(error)
+                acp::error_text(error)
             )))?;
             if request.handshake {
                 core.config.effort = None;
@@ -845,8 +813,7 @@ impl OpencodeProtocol {
     ) -> Result<(), DriverError> {
         self.next_id += 1;
         self.requests.insert(self.next_id, kind);
-        core.send(json!({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params}))
-            .await
+        core.send(acp::request(self.next_id, method, params)).await
     }
 
     /// Sets the session's `option` to `value`.
@@ -888,7 +855,9 @@ impl OpencodeProtocol {
     /// opens a new one, since it only reads the catalog.
     async fn handshaken(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
         if let Some(error) = v.get("error") {
-            return Err(format!("opencode initialization failed: {}", error_text(error)).into());
+            return Err(
+                format!("opencode initialization failed: {}", acp::error_text(error)).into(),
+            );
         }
         core.phase = Phase::Handshaken;
         let version = v
@@ -925,9 +894,11 @@ impl OpencodeProtocol {
         resumed: Option<String>,
     ) -> Result<(), DriverError> {
         if let Some(error) = v.get("error") {
-            return Err(
-                format!("opencode could not open the session: {}", error_text(error)).into(),
-            );
+            return Err(format!(
+                "opencode could not open the session: {}",
+                acp::error_text(error)
+            )
+            .into());
         }
         let result = &v["result"];
         core.session = result["sessionId"]
@@ -937,7 +908,7 @@ impl OpencodeProtocol {
             .or(resumed)
             .ok_or("opencode could not open the session")?;
         self.note_options(&result["configOptions"]);
-        core.emit(Event::Models(catalog(&result["configOptions"])))?;
+        core.emit(Event::Models(acp::catalog(&result["configOptions"])))?;
         if core.config.catalog_only {
             // A probe takes the models with the commands, which follow the
             // session's reply; it waits a little for them.
@@ -971,7 +942,7 @@ impl OpencodeProtocol {
             return Err(format!(
                 "opencode refused the model {}: {}",
                 short(&requested),
-                error_text(error)
+                acp::error_text(error)
             )
             .into());
         }
@@ -1028,11 +999,11 @@ impl OpencodeProtocol {
     /// confirms the request; one naming another agent does not.
     fn agent_refusal(&mut self, v: &Value, target: Mode) -> Option<Refusal> {
         if let Some(error) = v.get("error") {
-            return Some(Refusal::Error(error_text(error)));
+            return Some(Refusal::Error(acp::error_text(error)));
         }
         let options = &v["result"]["configOptions"];
         self.note_options(options);
-        let reported = &option(options, "mode")["currentValue"];
+        let reported = &acp::option(options, "mode")["currentValue"];
         (!reported.is_null() && reported.as_str() != Some(agent(target))).then(|| {
             Refusal::Reported {
                 agent: reported.as_str().map(str::to_owned),
@@ -1129,7 +1100,7 @@ impl OpencodeProtocol {
         if self.probe_wait.take().is_none() {
             return Ok(());
         }
-        core.emit(Event::Skills(commands(list)))?;
+        core.emit(Event::Skills(acp::commands(list)))?;
         self.finish_probe(core)
     }
 
@@ -1171,12 +1142,12 @@ impl OpencodeProtocol {
         let Some(list) = config_options.as_array() else {
             return;
         };
-        let model = current(config_options, "model").map(str::to_owned);
+        let model = acp::current(config_options, "model").map(str::to_owned);
         let changed = model.is_some() && model != self.model;
         if let Some(model) = model {
             self.model = Some(model);
         }
-        if let Some(agent) = current(config_options, "mode") {
+        if let Some(agent) = acp::current(config_options, "mode") {
             self.agent = Some(agent.to_owned());
         }
         let Some(effort) = list.iter().find(|option| option["id"] == "effort") else {
@@ -1218,7 +1189,7 @@ impl OpencodeProtocol {
             return core.finish_turn(Outcome::Failed, Some(refusal));
         }
         if let Some(error) = v.get("error") {
-            return core.finish_turn(Outcome::Failed, Some(error_text(error)));
+            return core.finish_turn(Outcome::Failed, Some(acp::error_text(error)));
         }
         let result = &v["result"];
         if let Some(total) = result.pointer("/usage/totalTokens").and_then(Value::as_u64) {
@@ -1238,7 +1209,7 @@ impl OpencodeProtocol {
     /// frame names (see `frame_target`).
     fn tool(&mut self, core: &Core, update: &Value) -> Result<(), DriverError> {
         let id = one_line(update["toolCallId"].as_str().unwrap_or_default());
-        let target = frame_target(update);
+        let target = acp::frame_target(update);
         let (name, target) = if let Some((name, known)) = self.tools.get_mut(&id) {
             if let Some(target) = target {
                 *known = target;
@@ -1267,25 +1238,9 @@ impl OpencodeProtocol {
             name,
             target,
             phase,
-            detail: content_text(&update["content"]),
+            detail: acp::content_text(&update["content"]),
         }))
     }
-}
-
-/// What a tool call's frame says the call acts on, in one line: a command's
-/// command (its location is only the folder it runs in), else the first path
-/// it touches, else its command; `None` when the frame names none of them.
-fn frame_target(update: &Value) -> Option<String> {
-    let command = update.pointer("/rawInput/command").and_then(Value::as_str);
-    let target = if update["kind"] == "execute" {
-        command
-    } else {
-        update
-            .pointer("/locations/0/path")
-            .and_then(Value::as_str)
-            .or(command)
-    };
-    target.map(one_line).filter(|target| !target.is_empty())
 }
 
 /// Deletes `session` with `opencode session delete`, on a task of its own:
@@ -1405,11 +1360,11 @@ async fn server_request(core: &mut Core, v: Value, known: Option<&str>) -> Resul
     let this_session = !core.session.is_empty()
         && v.pointer("/params/sessionId").and_then(Value::as_str) == Some(core.session.as_str());
     if method == "session/request_permission" && this_session && core.phase == Phase::InTurn {
-        let (detail, summary) = approval(&v["params"]["toolCall"], known);
+        let (detail, summary) = acp::approval(&v["params"]["toolCall"], known, PROVIDER.title);
         return core.queue_approval(v, detail, summary).await;
     }
     if let Some(reply) = opencode_stray_reply(&v) {
-        if client_capability(method) {
+        if acp::client_capability(method) {
             // opencode 1.18.25 asks the client to write every edit it was
             // allowed, although Octet offers no file system; it has already
             // written the file itself, so the refusal is nothing to report.
@@ -1431,219 +1386,18 @@ async fn server_request(core: &mut Core, v: Value, known: Option<&str>) -> Resul
     Ok(())
 }
 
-/// Whether `method` is one of the client capabilities (`fs/*`, `terminal/*`)
-/// Octet does not offer in `initialize`: such a request is refused without
-/// a notice.
-fn client_capability(method: &str) -> bool {
-    method.starts_with("fs/") || method.starts_with("terminal/")
-}
-
-/// What a permission request's `toolCall` would do: the dialog's detail
-/// (`kind · title`, then its `rawInput` in full) and its summary. `known` is
-/// the target its tool call named earlier: opencode 1.18.25 asks to read a
-/// file without naming it.
-fn approval(tool_call: &Value, known: Option<&str>) -> (String, ApprovalSummary) {
-    let kind = tool_call["kind"].as_str().unwrap_or("other");
-    let title = tool_call["title"].as_str().unwrap_or("tool");
-    let mut detail = format!("{kind} · {title}");
-    let input = &tool_call["rawInput"];
-    if !input.is_null() {
-        detail.push('\n');
-        detail.push_str(&serde_json::to_string_pretty(input).unwrap_or_default());
-    }
-    let locations: Vec<String> = tool_call["locations"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|location| location["path"].as_str())
-        .map(str::to_owned)
-        .collect();
-    let command = input["command"].as_str().map(str::to_owned);
-    let summary = match kind {
-        "execute" => ApprovalSummary {
-            command: Some(title.to_owned()),
-            ..ApprovalSummary::new("Run a shell command")
-        },
-        "edit" => ApprovalSummary {
-            files: locations,
-            ..ApprovalSummary::new("Edit files")
-        },
-        "read" => {
-            let files = if locations.is_empty() {
-                known.map(str::to_owned).into_iter().collect()
-            } else {
-                locations
-            };
-            let action = match files.as_slice() {
-                [] => "Read a file opencode did not name".to_owned(),
-                [file] => format!("Read {}", file_name(file)),
-                many => format!("Read {} files", many.len()),
-            };
-            ApprovalSummary {
-                files,
-                ..ApprovalSummary::new(action)
-            }
-        }
-        "fetch" => {
-            let address = input["url"].as_str().unwrap_or(title);
-            ApprovalSummary::new(format!("Fetch {}", one_line(address)))
-        }
-        // opencode's `external_directory` permission: a path outside the
-        // workspace, for a read or edit, or for a command.
-        "other"
-            if ["filepath", "parentDir", "directories"]
-                .iter()
-                .any(|key| !input[key].is_null()) =>
-        {
-            let path = input["filepath"]
-                .as_str()
-                .or_else(|| input.pointer("/directories/0").and_then(Value::as_str))
-                .or_else(|| input["parentDir"].as_str())
-                .or(known)
-                .unwrap_or(title);
-            ApprovalSummary {
-                command,
-                files: locations,
-                ..ApprovalSummary::new(format!("Reach {}, outside the workspace", one_line(path)))
-            }
-        }
-        _ => ApprovalSummary::new("Use a tool"),
-    };
-    (detail, summary)
-}
-
-/// The last part of `path` in one short line, or the path itself when it
-/// has none.
-fn file_name(path: &str) -> String {
-    let name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path);
-    one_line(name)
-}
-
-/// The reply to a `session/request_permission`: the request's own
-/// `allow_once` or `reject_once` option, never one that allows for longer.
-fn answer_wire(wire: &Value, allow: bool) -> Value {
-    let (kind, fallback) = if allow {
-        ("allow_once", "once")
-    } else {
-        ("reject_once", "reject")
-    };
-    let option = wire
-        .pointer("/params/options")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|option| option["kind"] == kind)
-        .and_then(|option| option["optionId"].as_str())
-        .unwrap_or(fallback);
-    json!({
-        "jsonrpc": "2.0",
-        "id": wire["id"],
-        "result": {"outcome": {"outcome": "selected", "optionId": option}},
-    })
-}
-
 /// opencode counterpart of `codex_stray_reply`: the reply to a request Octet
 /// will not put in front of the user. A permission request is rejected with
 /// its `reject_once` option; anything else (`fs/*` and `terminal/*`
 /// included, which Octet does not offer) is an unsupported method. A frame
 /// that is not a request gets none.
 pub fn opencode_stray_reply(value: &Value) -> Option<Value> {
-    let id = value.get("id")?;
-    let method = value.get("method")?.as_str()?;
-    Some(if method == "session/request_permission" {
-        answer_wire(value, false)
-    } else {
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": -32601, "message": format!("Octet does not support {}", short(method))},
-        })
-    })
+    acp::stray_reply(value, ("once", "reject"))
 }
 
 /// Ends a turn that could not be sent, keeping the session.
 fn fail_turn(core: &mut Core, message: String) -> Result<(), DriverError> {
     core.finish_turn(Outcome::Failed, Some(message))
-}
-
-/// An ACP error as a person should read it: its message, else the error
-/// itself, bounded.
-fn error_text(error: &Value) -> String {
-    match error["message"].as_str() {
-        Some(message) => limited(message),
-        None => limited(&error.to_string()),
-    }
-}
-
-/// The session option `id` in `config_options`, or `Null`.
-fn option<'a>(config_options: &'a Value, id: &str) -> &'a Value {
-    config_options
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|option| option["id"] == id)
-        .unwrap_or(&Value::Null)
-}
-
-/// The current value of the option `id`, when it is one Octet can use.
-fn current<'a>(config_options: &'a Value, id: &str) -> Option<&'a str> {
-    option(config_options, id)["currentValue"]
-        .as_str()
-        .filter(|value| valid_identifier(value))
-}
-
-/// The `model` option's choices as the catalog: each `value` is both what
-/// selects the model and its ID, and `name` is opencode's display name.
-/// Values Octet cannot use are dropped, and the list is bounded.
-fn catalog(config_options: &Value) -> Vec<ModelInfo> {
-    option(config_options, "model")["options"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|choice| {
-            let value = choice["value"].as_str().filter(|v| valid_identifier(v))?;
-            let name = choice["name"]
-                .as_str()
-                .filter(|name| !name.is_empty() && name.len() <= 512)
-                .unwrap_or(value);
-            Some(ModelInfo {
-                selection: value.to_owned(),
-                id: Some(value.to_owned()),
-                name: name.to_owned(),
-                description: String::new(),
-            })
-        })
-        .take(MAX_MODELS)
-        .collect()
-}
-
-/// `availableCommands` as skills: each with a usable name and its
-/// description, bounded.
-fn commands(list: &Value) -> Vec<SkillInfo> {
-    list.as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|command| {
-            SkillInfo::from_json(
-                &json!({"name": command["name"], "description": command["description"]}),
-            )
-        })
-        .take(super::MAX_SKILLS)
-        .collect()
-}
-
-/// A tool call's `content` as text: the text of each of its blocks.
-fn content_text(content: &Value) -> String {
-    content
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|block| block.pointer("/content/text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// What Octet says when `OPENCODE_CONFIG_CONTENT` is not a JSON object and
@@ -1894,14 +1648,6 @@ mod tests {
             .map(|(_, value)| value.to_string_lossy().into_owned())
     }
 
-    /// `configOptions` whose `model` option offers `choices`.
-    fn model_options(choices: &Value) -> Value {
-        json!([
-            {"id": "mode", "currentValue": "build", "options": [{"value": "build", "name": "build"}]},
-            {"id": "model", "currentValue": "a/b", "options": choices},
-        ])
-    }
-
     #[test]
     fn a_skill_prompt_is_its_slash_command_alone() {
         let text = |text: &str| json!({"type": "text", "text": text});
@@ -2022,48 +1768,6 @@ mod tests {
     }
 
     #[test]
-    fn the_catalog_is_the_model_options_values_and_names() {
-        let models = catalog(&model_options(&json!([
-            {"value": "opencode/free", "name": "OpenCode/Free"},
-            {"value": "bad\u{1b}id", "name": "Bad"},
-            {"value": "x".repeat(257), "name": "Long"},
-            {"value": "openai/gpt", "name": ""},
-            {"name": "No value"},
-        ])));
-        assert_eq!(
-            models,
-            [
-                ModelInfo {
-                    selection: "opencode/free".into(),
-                    id: Some("opencode/free".into()),
-                    name: "OpenCode/Free".into(),
-                    description: String::new(),
-                },
-                ModelInfo {
-                    selection: "openai/gpt".into(),
-                    id: Some("openai/gpt".into()),
-                    name: "openai/gpt".into(),
-                    description: String::new(),
-                },
-            ]
-        );
-        let many: Vec<Value> = (0..300)
-            .map(|n| json!({"value": format!("p/m{n}"), "name": "M"}))
-            .collect();
-        assert_eq!(catalog(&model_options(&Value::Array(many))).len(), 256);
-        assert!(catalog(&json!([{"id": "mode", "options": []}])).is_empty());
-        assert!(catalog(&Value::Null).is_empty());
-    }
-
-    #[test]
-    fn current_values_are_read_from_their_option() {
-        let options = model_options(&json!([]));
-        assert_eq!(current(&options, "model"), Some("a/b"));
-        assert_eq!(current(&options, "mode"), Some("build"));
-        assert_eq!(current(&options, "effort"), None);
-    }
-
-    #[test]
     fn opencode_stray_requests_are_refused() {
         for method in ["fs/read_text_file", "terminal/create", "x/unknown"] {
             let reply =
@@ -2106,117 +1810,6 @@ mod tests {
             None
         );
         assert_eq!(opencode_stray_reply(&json!({"id":1,"result":{}})), None);
-    }
-
-    #[test]
-    fn an_answer_picks_the_requests_once_option_never_always() {
-        let options = json!([
-            {"optionId": "ever", "kind": "allow_always"},
-            {"optionId": "yes", "kind": "allow_once"},
-            {"optionId": "no", "kind": "reject_once"},
-        ]);
-        let wire = json!({"id": 9, "params": {"options": options}});
-        let chosen = |allow| answer_wire(&wire, allow)["result"]["outcome"]["optionId"].clone();
-        assert_eq!(chosen(true), "yes");
-        assert_eq!(chosen(false), "no");
-        // A request without options gets opencode's usual IDs.
-        let bare = json!({"id": 9, "params": {}});
-        assert_eq!(
-            answer_wire(&bare, true)["result"]["outcome"]["optionId"],
-            "once"
-        );
-        assert_eq!(
-            answer_wire(&bare, false)["result"]["outcome"]["optionId"],
-            "reject"
-        );
-    }
-
-    #[test]
-    fn an_approval_shows_the_tool_call_and_what_it_would_do() {
-        let (detail, summary) = approval(
-            &json!({
-                "kind": "execute", "title": "rm -rf build",
-                "rawInput": {"command": "rm -rf build"}, "locations": [],
-            }),
-            None,
-        );
-        assert_eq!(
-            detail,
-            "execute · rm -rf build\n{\n  \"command\": \"rm -rf build\"\n}"
-        );
-        assert_eq!(summary.action, "Run a shell command");
-        assert_eq!(summary.command.as_deref(), Some("rm -rf build"));
-        assert!(summary.files.is_empty());
-
-        let (detail, summary) = approval(
-            &json!({
-                "kind": "edit", "title": "src/a.rs",
-                "locations": [{"path": "/w/src/a.rs"}, {"path": "/w/src/b.rs"}, {"line": 3}],
-            }),
-            None,
-        );
-        assert_eq!(detail, "edit · src/a.rs");
-        assert_eq!(summary.action, "Edit files");
-        assert_eq!(summary.files, ["/w/src/a.rs", "/w/src/b.rs"]);
-        assert_eq!(summary.command, None);
-
-        let (_, summary) = approval(&json!({}), None);
-        assert_eq!(summary.action, "Use a tool");
-        assert_eq!(summary.command, None);
-        assert_eq!(approval(&json!({}), None).0, "other · tool");
-    }
-
-    #[test]
-    fn a_read_approval_names_its_file_even_when_the_request_does_not() {
-        // opencode 1.18.25 sends a read's request with no path at all; the
-        // path is the one its tool call named.
-        let request = json!({"kind": "read", "title": "read", "locations": [], "rawInput": {}});
-        let (detail, summary) = approval(&request, Some("/w/.env"));
-        assert_eq!(detail, "read · read\n{}");
-        assert_eq!(summary.action, "Read .env");
-        assert_eq!(summary.files, ["/w/.env"]);
-        let (_, summary) = approval(&request, None);
-        assert_eq!(summary.action, "Read a file opencode did not name");
-        assert!(summary.files.is_empty());
-        // A path the request names wins.
-        let named = json!({"kind": "read", "title": "a.rs", "locations": [{"path": "/w/a.rs"}]});
-        let (_, summary) = approval(&named, Some("/w/.env"));
-        assert_eq!(summary.action, "Read a.rs");
-        assert_eq!(summary.files, ["/w/a.rs"]);
-    }
-
-    #[test]
-    fn a_fetch_approval_names_its_address() {
-        let request = json!({"kind": "fetch", "title": "https://example.com", "locations": [],
-            "rawInput": {"url": "https://example.com/a", "format": "text"}});
-        let (_, summary) = approval(&request, None);
-        assert_eq!(summary.action, "Fetch https://example.com/a");
-        assert!(summary.files.is_empty());
-        let (_, summary) = approval(
-            &json!({"kind": "fetch", "title": "https://b.example"}),
-            None,
-        );
-        assert_eq!(summary.action, "Fetch https://b.example");
-    }
-
-    #[test]
-    fn an_outside_the_workspace_approval_names_the_path_and_any_command() {
-        // A read outside the workspace, as opencode 1.18.25 asks for it.
-        let read = json!({"kind": "other", "title": "/etc",
-            "locations": [{"path": "/etc/hosts"}, {"path": "/etc"}],
-            "rawInput": {"filepath": "/etc/hosts", "parentDir": "/etc"}});
-        let (_, summary) = approval(&read, Some("/etc/hosts"));
-        assert_eq!(summary.action, "Reach /etc/hosts, outside the workspace");
-        assert_eq!(summary.files, ["/etc/hosts", "/etc"]);
-        assert_eq!(summary.command, None);
-        // A command that touches another folder.
-        let command = json!({"kind": "other", "title": "touch /h/x.txt",
-            "locations": [{"path": "/h"}],
-            "rawInput": {"command": "touch /h/x.txt", "directories": ["/h"], "patterns": ["/h/*"]}});
-        let (_, summary) = approval(&command, None);
-        assert_eq!(summary.action, "Reach /h, outside the workspace");
-        assert_eq!(summary.command.as_deref(), Some("touch /h/x.txt"));
-        assert_eq!(summary.files, ["/h"]);
     }
 
     #[test]

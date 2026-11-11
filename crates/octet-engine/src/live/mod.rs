@@ -8,6 +8,7 @@ use tokio::{
     time::timeout,
 };
 
+mod acp;
 mod activity;
 mod claude;
 mod claude_settings;
