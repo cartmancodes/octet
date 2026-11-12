@@ -65,6 +65,7 @@ pub(crate) async fn try_command(app: &mut App, vendor: &dyn Vendor, input: &str)
         Cmd::Image => {}
         Cmd::Sessions => return start_job(app, sessions_job(app)),
         Cmd::Resume => return Some(resume_command(app, argument)),
+        Cmd::Trust => return Some(trust_command(app)),
         Cmd::Steer if argument.is_empty() => app.note("Use /steer <text>"),
         Cmd::Steer => {
             steer(app, vendor, argument.to_owned());
@@ -247,12 +248,47 @@ pub(crate) fn can_reconnect(app: &App) -> Result<(), &'static str> {
 fn fork_command(app: &mut App) -> Action {
     if app.conn.engine.offline() {
         app.note("The offline demo has no context to fork");
+    } else if !app.conn.engine.provider().forks {
+        app.note(format!("{} cannot fork a session", app.conn.engine.title()));
     } else if app.conn.session.is_empty() {
         app.note("No vendor session to fork yet; send a prompt first");
     } else {
         return Action::Exit(Exit::Fork);
     }
     Action::Continue
+}
+
+/// `/trust`: records this workspace's `.agents` configuration as trusted, as it is now, and
+/// reconnects so a session refused for it can start. Only Antigravity loads that configuration.
+fn trust_command(app: &mut App) -> Action {
+    if app.conn.engine != octet_core::Engine::ANTIGRAVITY {
+        app.note("Only Antigravity loads a workspace's .agents configuration; nothing to trust");
+        return Action::Continue;
+    }
+    let found = match octet_core::antigravity_workspace_config(&app.conn.cwd) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            app.note("This workspace has no .agents configuration to trust");
+            return Action::Continue;
+        }
+        Err(error) => {
+            app.note(error);
+            return Action::Continue;
+        }
+    };
+    let Some(data_dir) = app.conn.data_dir.clone() else {
+        app.note("Octet has no data directory to record the trust in");
+        return Action::Continue;
+    };
+    if let Err(error) = octet_core::antigravity_trust(&data_dir, &app.conn.cwd, &found) {
+        app.note(error);
+        return Action::Continue;
+    }
+    app.note(format!(
+        "Trusted: {}. Octet asks again if these change",
+        found.files.join(", ")
+    ));
+    Action::Exit(Exit::Reconnect)
 }
 
 /// `/compact`: the vendor compacts its context in a turn of its own.

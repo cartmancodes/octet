@@ -133,6 +133,10 @@ pub(crate) struct Connection {
     /// behind an idle switch until the switch resolves.
     pub(crate) mode_sent_mid_turn: Option<bool>,
     pub(crate) workspace: String,
+    /// The workspace as the session's configuration names it (`workspace` is the text shown).
+    pub(crate) cwd: PathBuf,
+    /// Where the session's configuration keeps Octet's files: what `/trust` records into.
+    pub(crate) data_dir: Option<PathBuf>,
     pub(crate) model: String,
     pub(crate) requested_model: Option<String>,
     /// The connection resumes (or forks) a vendor session. Asked for no
@@ -179,6 +183,8 @@ impl Connection {
             mode_for_turn: None,
             mode_sent_mid_turn: None,
             workspace: clean(&config.cwd.display().to_string()),
+            cwd: config.cwd.clone(),
+            data_dir: config.data_dir.clone(),
             model: "awaiting model metadata".into(),
             requested_model: config.model.clone(),
             resumes: config.resume.is_some(),

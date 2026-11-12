@@ -22,6 +22,7 @@ pub(crate) enum Cmd {
     Image,
     Sessions,
     Resume,
+    Trust,
     Quit,
 }
 
@@ -201,6 +202,13 @@ pub(crate) const COMMANDS: &[Spec] = &[
     )
     .requires(Requires::NoTurn),
     spec(
+        Cmd::Trust,
+        "/trust",
+        "/trust: trust this workspace's .agents configuration for Antigravity, then connect",
+        "Trust workspace configuration",
+    )
+    .requires(Requires::NoTurn),
+    spec(
         Cmd::Quit,
         "/quit",
         "/quit or Ctrl+C twice: save and exit",
@@ -212,7 +220,7 @@ pub(crate) const COMMANDS: &[Spec] = &[
 impl Cmd {
     /// Every command, for the registry coverage test.
     #[cfg(test)]
-    pub(crate) const ALL: [Cmd; 20] = [
+    pub(crate) const ALL: [Cmd; 21] = [
         Cmd::Help,
         Cmd::Model,
         Cmd::Skills,
@@ -232,6 +240,7 @@ impl Cmd {
         Cmd::Image,
         Cmd::Sessions,
         Cmd::Resume,
+        Cmd::Trust,
         Cmd::Quit,
     ];
 }

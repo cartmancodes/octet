@@ -188,6 +188,27 @@ fn print_exits_one_when_opencode_refuses_the_model() {
 }
 
 #[test]
+fn print_refuses_an_untrusted_antigravity_workspace_naming_its_files() {
+    let workspace = octet_testkit::TempDir::new("octet-headless-agents");
+    std::fs::create_dir_all(workspace.path().join(".agents")).unwrap();
+    std::fs::write(workspace.path().join(".agents/hooks.json"), "{}").unwrap();
+    let cwd = workspace.path().to_str().unwrap();
+    let base = ["--engine", "antigravity", "--cwd", cwd];
+    let (code, stdout, stderr) = run(&[&base[..], &["--print", "hello"]].concat(), "");
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stdout, "", "the prompt ran");
+    assert!(stderr.contains(".agents/hooks.json"), "{stderr}");
+    assert!(stderr.contains("--trust-workspace-config"), "{stderr}");
+    // The flag is the way in, for this one run; nothing is remembered.
+    let flagged = [&base[..], &["--trust-workspace-config", "--print", "hello"]].concat();
+    let (code, stdout, stderr) = run(&flagged, "");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, format!("{}\n", octet_testkit::scenario::AGY_REPLY));
+    let (code, _, stderr) = run(&[&base[..], &["--print", "hello"]].concat(), "");
+    assert_eq!(code, 1, "{stderr}");
+}
+
+#[test]
 fn print_and_rpc_cannot_be_combined() {
     let (code, _, stderr) = run(&["--print", "hello", "--rpc"], "");
     assert_eq!(code, 2, "a usage error");

@@ -99,6 +99,9 @@ pub(crate) struct Args {
     pub(crate) approval_timeout: Duration,
     pub(crate) effort: Option<String>,
     pub(crate) plugins: Plugins,
+    /// Whether to start Antigravity in a workspace whose `.agents` configuration is not trusted
+    /// (`--trust-workspace-config`); nothing is recorded.
+    pub(crate) trust_workspace: bool,
     /// Whether the terminal interface shares its session with a hub.
     pub(crate) remote: bool,
     /// The tmux session a hub's `start` launched this interface in (the hidden `--remote-started`).
@@ -122,6 +125,7 @@ impl Args {
             approval_timeout: self.approval_timeout,
             effort: self.effort.clone(),
             plugins: self.plugins,
+            trust_workspace: self.trust_workspace,
             ..Config::new(self.engine, binary, cwd)
         }
     }
@@ -180,6 +184,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
     let mut approval_timeout = octet_core::DEFAULT_APPROVAL_TIMEOUT;
     let mut effort = None;
     let mut plugins = Plugins::default();
+    let mut trust_workspace = false;
     let mut remote = true;
     let mut remote_started = None;
     let mut remote_by = None;
@@ -204,6 +209,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
             "--rpc" => rpc = true,
             "--no-plugins" => plugins.load = false,
             "--no-plugin-hooks" => plugins.hooks = false,
+            "--trust-workspace-config" => trust_workspace = true,
             "--no-remote" => remote = false,
             "--remote-started" => remote_started = Some(text(&mut args, name)?),
             "--remote-by" => remote_by = Some(text(&mut args, name)?),
@@ -284,6 +290,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
         approval_timeout,
         effort,
         plugins,
+        trust_workspace,
         remote,
         remote_started,
         remote_by,
@@ -449,6 +456,19 @@ mod tests {
         let no_hooks = args(&["--no-plugin-hooks"]).plugins;
         assert!(no_hooks.load && !no_hooks.hooks);
         assert!(!args(&["--no-plugins"]).config("/tmp".into()).plugins.load);
+    }
+    #[test]
+    fn the_trust_flag_reaches_the_configuration() {
+        assert!(!args(&[]).trust_workspace);
+        assert!(!args(&[]).config("/tmp".into()).trust_workspace);
+        assert!(args(&["--trust-workspace-config"]).trust_workspace);
+        let print = args(&["--trust-workspace-config", "--print", "hi"]);
+        assert!(print.config("/tmp".into()).trust_workspace);
+        // A plain flag: the next option is not its value.
+        assert_eq!(
+            args(&["--trust-workspace-config", "--mode", "auto"]).mode,
+            Mode::Auto
+        );
     }
     fn hub(list: &[&str]) -> HubArgs {
         let mut full = vec!["hub"];

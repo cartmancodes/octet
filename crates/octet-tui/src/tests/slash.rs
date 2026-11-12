@@ -1123,3 +1123,165 @@ async fn a_skill_typed_during_a_turn_queues_and_goes_when_it_ends() {
         vendor.sent.borrow()
     );
 }
+
+/// A connected Antigravity interface in workspace `ws`, keeping its files in `data`.
+fn antigravity_app(ws: &std::path::Path, data: &std::path::Path) -> App {
+    let config = Config {
+        data_dir: Some(data.to_owned()),
+        ..Config::new(Engine::ANTIGRAVITY, "agy", ws)
+    };
+    let mut app = App::new(&config, "journal".into());
+    app.event(octet_core::Event::Ready {
+        session: "agy-1".into(),
+    });
+    app
+}
+/// A workspace folder with `.agents/hooks.json`, and a data folder beside it.
+fn untrusted_workspace(
+    name: &str,
+) -> (
+    octet_testkit::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let dir = octet_testkit::TempDir::new(name);
+    let (ws, data) = (dir.path().join("ws"), dir.path().join("data"));
+    std::fs::create_dir_all(ws.join(".agents")).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(ws.join(".agents/hooks.json"), "{}").unwrap();
+    (dir, ws, data)
+}
+#[tokio::test]
+async fn fork_is_refused_where_the_provider_cannot_fork() {
+    let dir = octet_testkit::TempDir::new("octet-tui-fork-agy");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut app = antigravity_app(dir.path(), dir.path());
+    assert!(matches!(command(&mut app, "/fork").await, Action::Continue));
+    assert!(
+        app.entries_text()
+            .contains("Antigravity cannot fork a session"),
+        "{}",
+        app.entries_text()
+    );
+}
+#[tokio::test]
+async fn trust_records_the_workspace_and_reconnects() {
+    let (_dir, ws, data) = untrusted_workspace("octet-tui-trust");
+    let found = octet_core::antigravity_workspace_config(&ws)
+        .unwrap()
+        .unwrap();
+    assert!(!octet_core::antigravity_trusted(&data, &ws, &found));
+    let mut app = antigravity_app(&ws, &data);
+    assert!(matches!(
+        command(&mut app, "/trust").await,
+        Action::Exit(Exit::Reconnect)
+    ));
+    assert!(octet_core::antigravity_trusted(&data, &ws, &found));
+    assert!(
+        app.entries_text()
+            .contains("Trusted: .agents/hooks.json. Octet asks again if these change"),
+        "{}",
+        app.entries_text()
+    );
+}
+#[tokio::test]
+async fn trust_works_before_the_session_connects_but_not_during_a_turn() {
+    let (_dir, ws, data) = untrusted_workspace("octet-tui-trust-early");
+    let config = Config {
+        data_dir: Some(data.clone()),
+        ..Config::new(Engine::ANTIGRAVITY, "agy", &ws)
+    };
+    // A refused start is how a session ends up here: not connected.
+    let mut app = App::new(&config, "journal".into());
+    assert!(matches!(
+        command(&mut app, "/trust").await,
+        Action::Exit(Exit::Reconnect)
+    ));
+    let mut running = antigravity_app(&ws, &data);
+    running.conn.start_turn();
+    assert!(matches!(
+        command(&mut running, "/trust").await,
+        Action::Continue
+    ));
+    assert_eq!(running.status_line, TURN_OPEN);
+}
+#[tokio::test]
+async fn trust_says_when_there_is_nothing_to_trust() {
+    let dir = octet_testkit::TempDir::new("octet-tui-trust-none");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut app = antigravity_app(dir.path(), dir.path());
+    assert!(matches!(
+        command(&mut app, "/trust").await,
+        Action::Continue
+    ));
+    assert!(
+        app.entries_text()
+            .contains("This workspace has no .agents configuration to trust"),
+        "{}",
+        app.entries_text()
+    );
+}
+#[tokio::test]
+async fn trust_shows_the_error_when_the_configuration_cannot_be_read() {
+    let dir = octet_testkit::TempDir::new("octet-tui-trust-unreadable");
+    // A folder where the hooks file belongs cannot be read as one.
+    std::fs::create_dir_all(dir.path().join(".agents/hooks.json")).unwrap();
+    let mut app = antigravity_app(dir.path(), dir.path());
+    assert!(matches!(
+        command(&mut app, "/trust").await,
+        Action::Continue
+    ));
+    let expected = octet_core::antigravity_workspace_config(dir.path()).unwrap_err();
+    assert!(
+        app.entries_text().contains(&expected),
+        "{}",
+        app.entries_text()
+    );
+}
+#[tokio::test]
+async fn trust_is_antigravitys_alone() {
+    let (_dir, ws, data) = untrusted_workspace("octet-tui-trust-codex");
+    let config = Config {
+        data_dir: Some(data.clone()),
+        ..Config::new(Engine::CODEX, "codex", &ws)
+    };
+    let mut app = App::new(&config, "journal".into());
+    crate::test_support::idle(&mut app);
+    assert!(matches!(
+        command(&mut app, "/trust").await,
+        Action::Continue
+    ));
+    assert!(
+        app.entries_text().contains(
+            "Only Antigravity loads a workspace's .agents configuration; nothing to trust"
+        ),
+        "{}",
+        app.entries_text()
+    );
+    // Nothing was recorded.
+    let found = octet_core::antigravity_workspace_config(&ws)
+        .unwrap()
+        .unwrap();
+    assert!(!octet_core::antigravity_trusted(&data, &ws, &found));
+}
+#[tokio::test]
+async fn a_listed_goal_command_does_not_replace_octets_goal() {
+    let (_dir, ws, data) = untrusted_workspace("octet-tui-listed-goal");
+    let mut app = antigravity_app(&ws, &data);
+    app.conn.skills = vec![skill("goal", &[], None), skill("compact", &[], None)];
+    let store = octet_core::goal::GoalStore::new(&data, &ws);
+    app.goals.attach(store).await.unwrap();
+    let vendor = RecordingVendor::default();
+    commands::try_command(&mut app, &vendor, "/compact").await;
+    // The compaction is a turn; once it is over the goal can start.
+    crate::test_support::idle(&mut app);
+    commands::try_command(&mut app, &vendor, "/goal x").await;
+    assert!(app.goals.goal().is_some(), "Octet's goal did not start");
+    let sent = vendor.sent.borrow();
+    assert!(
+        sent.iter()
+            .all(|command| !matches!(command, Command::Skill { .. })),
+        "{sent:?}"
+    );
+    assert!(sent.contains(&Command::Compact), "{sent:?}");
+}
