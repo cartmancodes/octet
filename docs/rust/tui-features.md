@@ -1,8 +1,8 @@
 # Octet TUI features
 
 This document describes the **Rust terminal UI preview**. It is a native terminal
-application for Linux and macOS that runs the installed `codex`, `claude` or
-`opencode` CLI as a child process. It does not need a browser, localhost server, or Python runtime.
+application for Linux and macOS that runs the installed `codex`, `claude`,
+`opencode` or `agy` (Antigravity) CLI as a child process. It does not need a browser, localhost server, or Python runtime.
 The vendor CLIs handle their own login. The [usage guide](../tui.md) has the full
 key reference and installation details; the [parity matrix](parity-matrix.md)
 tracks the work remaining for parity with the earlier Python harness, which was
@@ -12,7 +12,7 @@ removed from the repository on 2026-10-04.
 
 | Feature | Current behavior |
 | --- | --- |
-| Provider sessions | Start a multi-turn conversation with Codex, Claude or opencode. Responses stream into the transcript alongside tool activity, usage, and errors. An offline `demo` engine exercises the interface without a vendor login, and shows the full text a model would receive when `!` attachments or a goal change it. |
+| Provider sessions | Start a multi-turn conversation with Codex, Claude, opencode or Antigravity. Responses stream into the transcript alongside tool activity, usage, and errors. An offline `demo` engine exercises the interface without a vendor login, and shows the full text a model would receive when `!` attachments or a goal change it. |
 | Model discovery | `/model` lists **every provider's** models in one list, the current provider's first, with names, full model IDs, descriptions, freshness and selection commands. The current list is live (Codex pages through `model/list`; Claude uses its initialization catalog); others come from `models.json`, fetched in the background when missing or a day old by starting that CLI catalog-only (no session, no tokens). `/model refresh` fetches them now; `/model list N` opens another page. |
 | Plugins and skills | Claude loads the plugins its settings enable (`enabledPlugins` from user, project and local settings, nothing else); Codex loads its own. `--no-plugins` and `--no-plugin-hooks` turn plugins, or only their hooks, off on both. Hooks are journaled; failed, blocking or approval-deciding ones show. `/skills` lists every provider's skills (live for the current one, `skills.json` per workspace for others); Enter puts one in the prompt and nothing runs until you send it (another provider's skill switches provider on send, with an amber hint); `/NAME args` runs the current provider's. |
 | Model selection | Start with `--model ID`, or use `/model ID`, `/model codex ID`, or `/model claude ID`. A bare `/model ID` goes to the provider whose list holds it, else by the leading word its listed IDs share, else the current provider; Tab completes model names across providers; `/model` alone opens a picker (Up/Down, Enter switches). `/model default` selects the current provider's default. `/session` shows the requested selection, catalog ID, and confirmed session model ID separately. Custom IDs may be entered even when absent from the catalog. |
@@ -22,9 +22,9 @@ removed from the repository on 2026-10-04.
 | Tool activity | A run of tool calls is one entry: `▸ Read 3 files · Ran 1 command   Ctrl+O details` collapsed, `… Bash cargo test` while running. A failed call opens in amber with the last 8 lines of its output. Ctrl+O shows or hides every call's detail. Tool and approval events are typed and journaled (`tool.{id,name,target,phase,detail}`, `approval.summary`). |
 | Permission modes | `ask`, `accept-edits`, `auto` (the vendor's own reviewer decides) and `full-access`, mapped onto each vendor's settings. Set with `--mode`, `/mode` or Shift+Tab; `full-access` has to be typed and reconnects with every check off. Codex's header distinguishes the running mode from a mode selected for the next turn; steering keeps the running turn's permissions. |
 | Approval and cancellation | Command and file-change requests can be allowed once or denied in a modal that leads with the action, the `$ command`, the files, the directory and `Allows: This request only, once`, then shows the complete request (PgUp/PgDn). Esc or Ctrl+C cancels an active turn. Oversized, expired, cancelled and unknown requests are denied, and so is any request beyond eight waiting at once; Claude is told the reason for each denial. An approval waits 120 seconds by default; `--approval-timeout SECONDS` sets 10–3600. When one opens, Octet rings the bell and sends a desktop notification (OSC 9). |
-| Follow-up queue and steering | Enter during a turn queues the prompt (up to 8, with its attachments); `/queue` lists or clears them, and Esc drops them with the turn. `/steer TEXT` adds to the running Codex turn; Claude has no steering request, so the text is queued. |
-| Reasoning effort | `--effort LEVEL` or `/effort LEVEL`; `/effort default` returns to the vendor default. Claude takes `low` to `max` and reconnects to apply it; Codex applies it from the next turn. |
-| Fork and compaction | `/fork` continues the conversation in a new vendor session and leaves the original untouched; `/compact` asks the vendor to compact its context, as a cancellable turn. |
+| Follow-up queue and steering | Enter during a turn queues the prompt (up to 8, with its attachments); `/queue` lists or clears them, and Esc drops them with the turn. `/steer TEXT` adds to the running Codex turn; Claude and Antigravity have no steering request, so the text is queued. |
+| Reasoning effort | `--effort LEVEL` or `/effort LEVEL`; `/effort default` returns to the vendor default. Claude takes `low` to `max` and reconnects to apply it; Codex applies it from the next turn; Antigravity takes the levels its model lists (some list none) and applies one at once. |
+| Fork and compaction | `/fork` continues the conversation in a new vendor session and leaves the original untouched; `/compact` asks the vendor to compact its context, as a cancellable turn. Antigravity cannot fork (`/fork` says so), and compacts only when its session lists a `compact` command. |
 | Images | `/image PATH` attaches PNG, JPEG, GIF or WebP images to the next prompt: up to 5 MiB each and 4 per prompt (3.75 MiB each and 5.25 MiB together for Claude, which receives the bytes). Up recalls a prompt with its images. |
 | Session browser | `/sessions` lists up to 20 recent vendor sessions in this workspace, from Octet's journals; `/resume N` reopens one, switching provider if needed. |
 | Without the interface | `--print` (`-p`) runs one turn and writes the reply, `--output json` writes every event as a JSON line, and `--rpc` takes JSON-line commands on stdin. Print mode denies approvals; exit codes are 0, 1, 2 (usage), 130 (SIGINT) and 143 (SIGTERM). |
@@ -33,6 +33,7 @@ removed from the repository on 2026-10-04.
 | Copy | `/copy` or Ctrl+X copies the last reply through OSC 52, including over tmux and mosh. |
 | Terminal lifecycle | Ctrl+C twice on an idle, empty prompt exits (the first press asks for confirmation), Ctrl+Z suspends for shell use, and terminal modes are restored on ordinary exit, supported signals, and panic. |
 | Mascot | Octet, the crimson octopus in the header, changes pose with activity: idle, thinking, coding, searching, delegating, approval, success, error and sleeping. Poses change on events only; `NO_COLOR` replaces it with a text mark. |
+| Antigravity | `agy acp`, signed in with the Google account you use in `agy` (Octet never reads its credentials), started with a settings folder of Octet's own so your Antigravity settings and history are not changed. A workspace's `.agents/` configuration (hooks, MCP servers, plugins) loads only once you trust it: `/trust`, or `--trust-workspace-config` for one run. If Antigravity runs a command or an edit that its mode should have asked about, Octet cancels the turn and sends no more prompts in that session. Usage shows tokens, not cost. The [usage guide](../tui.md#antigravity) has the details. |
 | Persistent goals | `/goal <objective>` continues across successful turns, with status, pause, resume, audit, and clear commands. Goals survive restart in a private workspace-scoped file and load paused. Completion currently relies on a model-reported audit marker. |
 
 Model availability depends on the installed CLI, its version, account, and
@@ -53,8 +54,8 @@ make rust-build
 ./target/release/octet --engine claude --cwd /path/to/project
 ```
 
-Codex, Claude and opencode modes require the corresponding vendor CLI installed
-and signed in. The engine defaults to Codex and the workspace defaults to the current
+Codex, Claude, opencode and Antigravity modes require the corresponding vendor
+CLI installed and signed in. The engine defaults to Codex and the workspace defaults to the current
 directory. `--binary PATH` selects a custom vendor executable, and
 `--journal-dir PATH` changes where preview journals are written.
 

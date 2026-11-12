@@ -1,7 +1,7 @@
 # Octet terminal UI
 
-A native terminal application now runs against the official Codex, Claude and
-opencode CLIs. The harness uses Rust only: no browser, HTTP server or Python runtime.
+A native terminal application now runs against the official Codex, Claude,
+opencode and Antigravity CLIs. The harness uses Rust only: no browser, HTTP server or Python runtime.
 This is an interactive vertical slice, not the completed feature-parity release.
 
 ## Run
@@ -14,12 +14,14 @@ make rust-build
 ./target/release/octet --engine codex --cwd /path/to/project
 ./target/release/octet --engine claude --cwd /path/to/project
 ./target/release/octet --engine opencode --cwd /path/to/project
+./target/release/octet --engine antigravity --cwd /path/to/project
 ```
 
 `make tui-demo` builds and opens the offline demo. `make tui` opens Codex.
 Vendor modes require the corresponding CLI on PATH and its normal login. Use
 `--binary /absolute/path/to/cli` when needed. Octet does not read credentials.
-`--model MODEL` selects a model when opening the session.
+`--model MODEL` selects a model when opening the session. Antigravity's CLI is
+`agy`.
 
 Build on Linux to produce a Linux executable. For a user-level installation:
 
@@ -39,7 +41,9 @@ published as a pre-release, and re-running replaces the archives.
 
 `--effort LEVEL` sets the reasoning effort (see below). `--no-plugins` and
 `--no-plugin-hooks` turn the vendors' plugins, or only their hooks, off (see
-[Plugins and skills](#plugins-and-skills)). `--no-remote` keeps this session
+[Plugins and skills](#plugins-and-skills)). `--trust-workspace-config` lets
+Antigravity load a workspace's `.agents` configuration for one run (see
+[Antigravity](#antigravity)). `--no-remote` keeps this session
 off the phone hub (see [Phone app (hub)](remote-control.md#phone-app-hub)).
 
 ### Without the interface: print, JSON and RPC
@@ -199,7 +203,7 @@ phone apps vary in whether they accept it.
 
 Commands: `/help`, `/model`, `/skills`, `/mode`, `/goal`, `/session`, `/new`, `/reconnect`, `/export [new-path]`, `/copy`,
 `/remote-control`, `/queue`, `/steer`, `/effort`, `/fork`, `/compact`, `/image`, `/sessions`, `/resume`,
-`/quit` (or `/exit`).
+`/trust`, `/quit` (or `/exit`).
 Help (F1) and the command palette (Ctrl+P) scroll when the screen is short;
 in the palette, typing filters the list (by name or summary) and Backspace
 edits the filter.
@@ -243,9 +247,9 @@ before Esc that the vendor had not started. `/queue` lists it and
 `/queue clear` empties it. An active goal's continuation goes first.
 
 **Steering.** `/steer TEXT` adds TEXT to the running turn. Codex takes it
-into the same turn (`turn/steer`). Claude and opencode have no steering
-request, so the text is queued as the next prompt, and Octet says so; for
-opencode, that prompt runs under a mode selected meanwhile. While a
+into the same turn (`turn/steer`). Claude, opencode and Antigravity have no
+steering request, so the text is queued as the next prompt, and Octet says so;
+for opencode, that prompt runs under a mode selected meanwhile. While a
 cancelled turn is still stopping, `/steer` text is queued as the next
 prompt too. With no turn running, `/steer` sends the text as a prompt.
 
@@ -270,12 +274,20 @@ list is dropped with a notice and the session goes on), and `/effort` at
 once; `/effort default` goes back to the level the model started at. A
 model's level can reset when the model changes, so Octet sets it again at
 connect when the new model lists it.
+Antigravity's levels depend on the model too, and some models list none. It
+sets the level in the open session like opencode: `--effort` once the session
+opens, after the model and before the first prompt (a level the model does not
+list is dropped with a notice and the session goes on), and `/effort` at once,
+refusing a level the model does not list and naming the ones it does ("This
+Antigravity model takes no thinking level" for a model with none);
+`/effort default` goes back to the level the model opened at.
 Claude takes it at launch, so a change reconnects to the same session. The
 level carries across `/model`, `/new` and `/reconnect`.
 
 **Fork.** `/fork` continues this conversation in a new vendor session and
 leaves the original as it was (Codex `thread/fork`, Claude
-`--resume ID --fork-session`, opencode `session/fork`). The transcript
+`--resume ID --fork-session`, opencode `session/fork`; Antigravity cannot fork,
+and `/fork` says "Antigravity cannot fork a session"). The transcript
 stays on screen and the new session's ID replaces the old one. "Forking
 from X…" shows at once; "Forked from X into Y" once the vendor names the
 new session. It needs an idle session that the vendor has already named.
@@ -286,7 +298,10 @@ original is never written to.
 **Compaction.** `/compact` asks the vendor to compact its context (Codex
 `thread/compact/start`, Claude's own `/compact`, and opencode's `/compact`,
 which summarizes the session although opencode does not list it among its
-commands). It runs as a turn: its output streams as usual and Esc cancels it.
+commands). Antigravity's `/compact` is sent only when its list of commands
+for the session holds `compact`; otherwise the turn fails with
+"Antigravity does not offer compaction in this session" and nothing is sent.
+It runs as a turn: its output streams as usual and Esc cancels it.
 Once it completes Octet notes "Context compacted", as Codex compacts without
 a word.
 
@@ -295,8 +310,8 @@ box's chips row shows `+ image name.png` (or `+N images`). PNG, JPEG, GIF and We
 are accepted, by extension, up to 5 MiB each and 4 per prompt. A relative
 path is in the workspace, `~/` is your home folder, and a path dragged in
 from Finder (quoted, or with `\ ` escapes) works as typed. Codex receives
-the file's path and reads it itself. Claude receives the bytes inside the
-prompt, which limits each image to 3.75 MiB and a prompt's images to
+the file's path and reads it itself. Claude and Antigravity receive the bytes
+inside the prompt, which limits each image to 3.75 MiB and a prompt's images to
 5.25 MiB together; `/image` refuses more. The bytes are read when the prompt
 is sent; if a file has gone or grown past the limits by then, the turn fails
 with a message and the session carries on. Up recalls a prompt together with
@@ -340,12 +355,12 @@ Claude: no permission checks. /mode ask to turn them on". `/mode` alone shows
 the table for the current provider. The header shows the selected mode; during a Codex or opencode turn
 it also shows the running mode when a change is waiting for the next turn.
 
-| Mode | Claude | Codex (sandbox · approval · reviewer) | opencode (agent) |
-| --- | --- | --- | --- |
-| `ask` | `default` | workspace-write · untrusted · user | `octet-ask` (subagents off) |
-| `accept-edits` | `acceptEdits` | workspace-write · on-request · user | `octet-accept-edits` (subagents off) |
-| `auto` | `auto` (Claude's classifier) | workspace-write · on-request · `auto_review` | `build` (opencode's own permission settings) |
-| `full-access` | `bypassPermissions` | danger-full-access · never · user | `octet-full-access` |
+| Mode | Claude | Codex (sandbox · approval · reviewer) | opencode (agent) | Antigravity (mode) |
+| --- | --- | --- | --- | --- |
+| `ask` | `default` | workspace-write · untrusted · user | `octet-ask` (subagents off) | `default` |
+| `accept-edits` | `acceptEdits` | workspace-write · on-request · user | `octet-accept-edits` (subagents off) | `accept-edits` |
+| `auto` | `auto` (Claude's classifier) | workspace-write · on-request · `auto_review` | `build` (opencode's own permission settings) | `auto` (Antigravity's own checker) |
+| `full-access` | `bypassPermissions` | danger-full-access · never · user | `octet-full-access` | `default` with `toolPermission` set to `always-proceed` |
 
 `auto` hands approval decisions to the vendor's own reviewer; Octet never
 answers a vendor approval by itself. opencode's `ask` and `accept-edits`
@@ -433,7 +448,8 @@ defaults. Codex has no edits-only mode, so
 workspace-write, and the model asks only to escalate.
 
 `ask`, `accept-edits` and `auto` switch live. Claude applies the change
-immediately, even mid-turn; Codex and opencode apply it from the next turn
+immediately, even mid-turn, and so does Antigravity, once it confirms the
+switch; Codex and opencode apply it from the next turn
 (opencode sets the session's agent at once but runs each prompt under the
 agent it started with). For example, `ask → auto next` means the running
 Codex or opencode turn still uses `ask`. Codex steering
@@ -445,7 +461,8 @@ the mode the header shows. If opencode does not confirm within 10 seconds,
 the mode opencode runs is unknown: that prompt, and any sent before
 opencode answers, is not sent, with an error saying so. A late answer
 settles it and prompts run again; `/reconnect` resumes the session, with
-its model, in the mode the header shows.
+its model, in the mode the header shows. Antigravity holds and refuses prompts
+the same way, because it answers requests in no fixed order.
 An already-open approval still needs your answer. A change Claude
 refuses (for example, auto mode unavailable for the account) leaves the previous
 mode in place with a notice; one Claude does not confirm within 10 seconds is
@@ -454,6 +471,68 @@ the header shows the mode the vendor reports, with a notice if it differs from
 the one requested. `full-access` is never reached by Shift+Tab: type
 `/mode full-access` on an idle session, which reconnects to the same vendor
 session with all checks off. Leaving it reconnects again.
+
+### Antigravity
+
+Antigravity runs as `agy acp`. It uses the Google account you signed in to with
+`agy`; Octet never reads its credentials, and when Antigravity is signed out
+the session stops with "Sign in to Antigravity first: run `agy`".
+
+Octet starts `agy acp` with a settings folder of its own, `antigravity/review`
+(`antigravity/proceed` for `full-access`) in the journal directory. Its
+`settings.json` is built from your `~/.gemini/antigravity-cli/settings.json`,
+read-only and up to 1 MiB, without the keys that would skip permission
+requests (`agentMode`, `permissions.allow`) and with `toolPermission` set to
+`request-review` (`always-proceed` for `full-access`); every other key stays. A
+file Octet cannot use is left out with a notice, and the session runs without
+your own settings. Your settings and Antigravity's history are not changed, and
+a journal directory inside `~/.gemini` is refused. The model list is fetched in
+a scratch home Octet makes under the journal directory and removes afterwards,
+so listing models adds no session to Antigravity's history.
+
+The modes mean this. `ask`: Antigravity asks before commands and edits.
+`accept-edits`: edits run and commands ask. `auto`: Antigravity's own checker
+decides, and Octet's check below does not cover it. `full-access`: no
+permission checks. `/mode` shows each description. In `ask` and
+`accept-edits`, a subagent's approval requests never reach Octet, so Octet says
+once per turn when Antigravity starts one: what it must ask for waits and does
+not run.
+
+Octet checks that Antigravity asks. If Antigravity runs a command in `ask` or
+`accept-edits`, or an edit (a delete and a move count) in `ask`, without
+having asked, Octet cancels the turn, says what ran ("Antigravity ran a
+command without asking while Octet shows ask: …"), and sends nothing more in
+that session: later prompts fail unsent and say to start a new session. What
+ran cannot be undone. A call is judged by the loosest mode in force while it
+ran, and a turn with more tool calls than Octet can track (1024) is stopped in
+those modes. The check was made against `agy` 1.5.5; for another version Octet
+shows one notice at connect, saying so and that it will still cancel the turn
+if a command or an edit runs unasked.
+
+Antigravity has a `plan` mode of its own that Octet never selects. If
+Antigravity moves itself to a mode other than Octet's, Octet says so ("Antigravity
+moved to its plan mode. Octet sets ask back before the next prompt") and sets
+its mode back once no turn runs; the header keeps Octet's mode throughout. A
+move to a looser mode during a turn cancels the turn, and Octet sets its mode
+back at once. If Antigravity does not go back, the session stops.
+
+Antigravity loads a workspace's `.agents/` configuration: `hooks.json`,
+`mcp_config.json` and the files under `plugins/`. A hook runs a command with
+no approval request, so Octet starts Antigravity in a workspace with such files
+only once you trust them. Without that, the session does not start and names
+the files. `/trust` records the workspace (its path and a fingerprint of the
+files) as trusted, in `antigravity/trusted-workspaces.json` beside the
+journals, and reconnects; it is refused during a turn and for another
+provider. `--trust-workspace-config` starts one run (`--print` too) and records
+nothing. Octet checks the files again before every prompt:
+if they changed since the session started, the prompt is not sent, and
+`/trust` (or a fresh start with the flag) accepts them. A workspace without
+these files needs no trust. The phone cannot trust a workspace.
+
+Octet does not offer `/fork` for Antigravity or `/steer` (the text is queued as
+the next prompt). Usage shows a token count, not a cost. Skills are
+Antigravity's slash commands, and thinking levels come from the model
+(`/effort`, above).
 
 ## Switch models and providers
 
@@ -512,7 +591,10 @@ does); a name in no list goes to the provider whose listed IDs share its
 leading word (`gpt-5.5` to the provider listing `gpt-…` models), else to
 the one listing it after a `sub/` part (`glm-5.3-flash-free` to opencode's
 `opencode/glm-5.3-flash-free`), else stays with the current provider as a
-custom ID. `default` is always the current
+custom ID. Antigravity also lists some Claude and GPT models: a bare name
+another provider lists too goes to that provider, unless Antigravity is the
+current one, and `/model antigravity NAME` or `/model antigravity/NAME`
+picks Antigravity's copy. `default` is always the current
 provider's, and the explicit forms (`/model codex X`, `claude/X`) work as
 before. A model the provider refuses when the session connects (a typo, or
 one opencode does not list) stops the session with an error naming the model
@@ -616,6 +698,11 @@ bring, and runs them.
   something, or answered an approval ("Hook PreToolUse:Bash allowed the tool
   (Octet was not asked)"). Codex hooks are not shown. `--no-plugin-hooks` is
   the control; it also stops start-up bootstraps such as superpowers'.
+- **Antigravity** has no switch to turn plugins or their hooks off, so a launch
+  with `--no-plugins` or `--no-plugin-hooks` stops with a message saying so
+  (the background model-list fetch ignores them). A workspace's `.agents`
+  configuration (hooks, MCP servers, plugins) loads only once trusted (see
+  [Antigravity](#antigravity)).
 - The switches apply to every launch: the interface, `--print`, `--rpc` and
   the background model-list fetches. A background fetch loads the plugins
   for their skills but never runs their hooks, since nothing would show it.
@@ -633,7 +720,9 @@ bring, and runs them.
   `usage`). Your personal and project Claude skills (`~/.claude/skills`,
   `.claude/skills`) stay off with the rest of those settings. Codex lists the
   enabled skills of its plugins, `~/.agents/skills`, `.agents/skills` and its
-  bundled ones.
+  bundled ones. Antigravity's skills are the slash commands it lists for the
+  session; `/NAME args` goes to it as a prompt, after the workspace's `.agents`
+  configuration is checked.
 - `/skills` lists the current provider's skills first (as its session
   reported them), then each other provider's, cached per workspace in
   `skills.json` beside `models.json` and fetched with the model lists (also
@@ -833,8 +922,8 @@ Under 30 rows the banner gives way to a one-row header with the same facts:
 Status and usage stay at the right edge, sized to their text so a narrow
 terminal never cuts them. The usage is what the provider reports: Claude's
 session cost; for Codex, the context the last request used, of the model's
-window (`14.3k/272k context`), which drops after `/compact`; for opencode,
-its token count. Below the banner, the conversation
+window (`14.3k/272k context`), which drops after `/compact`; for opencode and
+Antigravity, its token count (no cost). Below the banner, the conversation
 area stays empty until the first message; the composer's placeholder says
 what to type.
 

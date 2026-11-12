@@ -415,7 +415,7 @@ and enables it. Either way the service runs the `octet` you ran this from, as
 `octet hub --journal-dir DIR`, where DIR is the data directory this command resolved
 (from `--journal-dir`, `$XDG_DATA_HOME`, or `~/.local/share`), so the service and its log
 agree even though it doesn't see your shell's environment. Its `PATH` starts
-with the directories where `tmux`, `claude`, `codex` and `opencode` were
+with the directories where `tmux`, `claude`, `codex`, `opencode` and `agy` were
 found on your shell's `PATH` when you ran the command, then the usual system directories, so
 the hub can start sessions (and the agents in them) from a service's bare
 environment, even after a login with no tmux running. The service doesn't use
@@ -433,14 +433,18 @@ environment, even after a login with no tmux running. The service doesn't use
   `octet hub install` again after moving or reinstalling it; on Linux that also
   restarts the running service. A file already at the service file's path that
   isn't Octet's is never replaced.
-- **Move or install tmux, Claude, Codex or opencode.** Install records where
-  `tmux`, `claude`, `codex` and `opencode` were found; re-run
+- **Move or install tmux, Claude, Codex, opencode or Antigravity.** Install records where
+  `tmux`, `claude`, `codex`, `opencode` and `agy` were found; re-run
   `octet hub install` after moving or installing them, or the hub won't find
   them.
 - **Installed before opencode support.** A hub installed by an `octet` that
   predates opencode support has a `PATH` without opencode's directory
   (`~/.opencode/bin` by default), so its sessions can't start opencode. Re-run
   `octet hub install` from a shell where `opencode` is on the `PATH`.
+- **Installed before Antigravity support.** A hub installed by an `octet` that
+  predates Antigravity support has a `PATH` without the directory `agy` is in,
+  so its sessions can't start Antigravity. Re-run `octet hub install` from a
+  shell where `agy` is on the `PATH`.
 - **Remove it.** `octet hub uninstall` stops the service and deletes the file.
   It says "Not installed" if there is nothing to remove.
 - **Restarts.** launchd restarts the hub whenever it stops; systemd restarts it
@@ -929,6 +933,12 @@ It then creates no socket and no file, and the hub and the phone never see it.
 - The phone can start sessions only in workspaces that appear in your recent
   sessions or in the `workspaces` list of `hub.json` in the data directory,
   and at most eight phone-started sessions run at once.
+- The phone cannot trust a workspace. Antigravity loads a workspace's
+  `.agents` configuration (hooks, MCP servers, plugins) only once you trust it
+  with `/trust` in the terminal interface, and a session the phone starts
+  passes no `--trust-workspace-config`; in a workspace whose configuration is
+  not trusted yet, it cannot start and says why. Trust the workspace at the
+  desk first.
 - The phone runs exactly these desk commands and no others: `/model`,
   `/mode`, `/new`, `/session`, `/help` and `/export`. The last four go as one
   `command` request naming one of `new`, `session`, `help` or `export`, with
