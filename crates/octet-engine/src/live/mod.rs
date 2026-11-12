@@ -342,6 +342,11 @@ impl Engine {
     pub fn is_vendor(self) -> bool {
         !self.0.offline
     }
+    /// Lists models that are other providers' own, under the same bare IDs
+    /// (Antigravity lists Claude and GPT models).
+    pub fn carries_others_models(self) -> bool {
+        self.0.carries_others_models
+    }
 }
 impl PartialEq for Engine {
     fn eq(&self, other: &Self) -> bool {

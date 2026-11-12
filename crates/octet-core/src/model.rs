@@ -128,7 +128,9 @@ impl Selection {
     /// Resolves a `/model` argument. A bare name goes to the provider whose
     /// list holds it (`current` first), else to the one whose listed IDs
     /// share its leading word, else to the one listing it as `sub/NAME`
-    /// (with that full ID), else to `current`; `default` and the explicit
+    /// (with that full ID), else to `current`; a provider that lists other
+    /// providers' own models (Antigravity) yields to the one they belong to
+    /// unless it is `current`; `default` and the explicit
     /// forms (`PROVIDER [NAME]`, `PROVIDER/NAME`) resolve as `parse` does.
     ///
     /// # Errors
@@ -158,7 +160,7 @@ impl Selection {
                 });
             }
         };
-        let owners = catalogs.owners(bare);
+        let owners = set_aside_carriers(catalogs.owners(bare), current);
         let suffixed = catalogs.suffix_owners(bare);
         let (provider, found) = if bare == "default" {
             (current, Found::Current)
@@ -168,7 +170,8 @@ impl Selection {
             (*owner, Found::Listed)
         } else if !owners.is_empty() {
             return Err(ambiguous(bare, &owners));
-        } else if let [owner] = catalogs.prefix_owners(bare).as_slice() {
+        } else if let [owner] = set_aside_carriers(catalogs.prefix_owners(bare), current).as_slice()
+        {
             let word = bare.split_once('-').map_or("", |(word, _)| word);
             (*owner, Found::Prefix(word.to_owned()))
         } else if let [(owner, id)] = suffixed.as_slice() {
@@ -197,6 +200,21 @@ impl Selection {
         let selection = Self::parse(&format!("{provider} {bare}"), current)?;
         Ok(Resolved { selection, found })
     }
+}
+
+/// `owners` of a name, less the providers that list other providers' own
+/// models (Antigravity) when `current` is not among them and one that does
+/// not remains: such a name goes to the provider it belongs to.
+fn set_aside_carriers(owners: Vec<Engine>, current: Engine) -> Vec<Engine> {
+    if owners.len() < 2 || owners.contains(&current) {
+        return owners;
+    }
+    let own: Vec<Engine> = owners
+        .iter()
+        .copied()
+        .filter(|engine| !engine.carries_others_models())
+        .collect();
+    if own.is_empty() { owners } else { own }
 }
 
 /// The refusal for a name several other providers list.
@@ -738,5 +756,121 @@ mod tests {
             opencode.configure(&current, "t-1", None).effort.as_deref(),
             Some("high")
         );
+    }
+
+    /// Claude lists `claude-sonnet-4-6`, Codex `gpt-5.5`, and Antigravity its
+    /// Gemini models plus a Claude and a GPT model under their own IDs.
+    fn with_antigravity() -> crate::catalog::Catalogs {
+        let mut c = crate::catalog::Catalogs::default();
+        let listing = |ids: &[&str]| -> Vec<crate::ModelInfo> {
+            ids.iter()
+                .map(|s| crate::ModelInfo {
+                    selection: (*s).into(),
+                    id: Some((*s).into()),
+                    name: (*s).into(),
+                    description: String::new(),
+                })
+                .collect()
+        };
+        let now = std::time::SystemTime::now();
+        c.set(Engine::CLAUDE, listing(&["claude-sonnet-4-6"]), now);
+        c.set(Engine::CODEX, listing(&["gpt-5.5"]), now);
+        c.set(
+            Engine::ANTIGRAVITY,
+            listing(&[
+                "gemini-3.8-flash",
+                "claude-sonnet-4-6",
+                "gpt-oss-120b-medium",
+            ]),
+            now,
+        );
+        c
+    }
+
+    /// `input` resolved from `current` against [`with_antigravity`].
+    fn resolved_with_antigravity(input: &str, current: Engine) -> (Engine, Option<String>, Found) {
+        let r = Selection::resolve(input, current, &with_antigravity()).unwrap();
+        (r.selection.provider, r.selection.model, r.found)
+    }
+
+    #[test]
+    fn a_name_claude_and_antigravity_both_list_goes_to_claude() {
+        assert_eq!(
+            resolved_with_antigravity("claude-sonnet-4-6", Engine::CODEX),
+            (
+                Engine::CLAUDE,
+                Some("claude-sonnet-4-6".into()),
+                Found::Listed
+            )
+        );
+    }
+
+    #[test]
+    fn on_antigravity_that_name_stays_on_antigravity() {
+        assert_eq!(
+            resolved_with_antigravity("claude-sonnet-4-6", Engine::ANTIGRAVITY),
+            (
+                Engine::ANTIGRAVITY,
+                Some("claude-sonnet-4-6".into()),
+                Found::Listed
+            )
+        );
+    }
+
+    #[test]
+    fn a_gpt_name_still_reaches_codex_by_its_leading_word() {
+        assert_eq!(
+            resolved_with_antigravity("gpt-6-astra", Engine::CLAUDE),
+            (
+                Engine::CODEX,
+                Some("gpt-6-astra".into()),
+                Found::Prefix("gpt".into())
+            )
+        );
+    }
+
+    #[test]
+    fn a_claude_name_still_reaches_claude_by_its_leading_word() {
+        assert_eq!(
+            resolved_with_antigravity("claude-opus-5-5", Engine::CODEX),
+            (
+                Engine::CLAUDE,
+                Some("claude-opus-5-5".into()),
+                Found::Prefix("claude".into())
+            )
+        );
+    }
+
+    #[test]
+    fn antigravitys_own_models_resolve_to_it() {
+        for (name, found) in [
+            ("gemini-3.8-flash", Found::Listed),
+            ("gemini-9", Found::Prefix("gemini".into())),
+            ("gpt-oss-120b-medium", Found::Listed),
+        ] {
+            assert_eq!(
+                resolved_with_antigravity(name, Engine::CODEX),
+                (Engine::ANTIGRAVITY, Some(name.into()), found),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn naming_antigravity_picks_its_copy() {
+        for input in [
+            "antigravity/claude-sonnet-4-6",
+            "antigravity claude-sonnet-4-6",
+        ] {
+            assert_eq!(
+                resolved_with_antigravity(input, Engine::CODEX),
+                (
+                    Engine::ANTIGRAVITY,
+                    Some("claude-sonnet-4-6".into()),
+                    Found::Named
+                ),
+                "{input}"
+            );
+        }
     }
 }
