@@ -310,8 +310,8 @@ box's chips row shows `+ image name.png` (or `+N images`). PNG, JPEG, GIF and We
 are accepted, by extension, up to 5 MiB each and 4 per prompt. A relative
 path is in the workspace, `~/` is your home folder, and a path dragged in
 from Finder (quoted, or with `\ ` escapes) works as typed. Codex receives
-the file's path and reads it itself. Claude and Antigravity receive the bytes
-inside the prompt, which limits each image to 3.75 MiB and a prompt's images to
+the file's path and reads it itself. Claude, opencode and Antigravity
+receive the bytes inside the prompt, which limits each image to 3.75 MiB and a prompt's images to
 5.25 MiB together; `/image` refuses more. The bytes are read when the prompt
 is sent; if a file has gone or grown past the limits by then, the turn fails
 with a message and the session carries on. Up recalls a prompt together with
@@ -483,10 +483,11 @@ Octet starts `agy acp` with a settings folder of its own, `antigravity/review`
 `settings.json` is built from your `~/.gemini/antigravity-cli/settings.json`,
 read-only and up to 1 MiB, without the keys that would skip permission
 requests (`agentMode`, `permissions.allow`) and with `toolPermission` set to
-`request-review` (`always-proceed` for `full-access`); every other key stays. A
-file Octet cannot use is left out with a notice, and the session runs without
-your own settings. Your settings and Antigravity's history are not changed, and
-a journal directory inside `~/.gemini` is refused. The model list is fetched in
+`request-review` (`always-proceed` for `full-access`); every other key stays (a
+`permissions` that is not an object is dropped too). A file Octet cannot use is
+left out with a notice, and the session runs without your own settings. Octet
+never writes to your Antigravity settings, and a journal directory inside
+`~/.gemini` is refused. The model list is fetched in
 a scratch home Octet makes under the journal directory and removes afterwards,
 so listing models adds no session to Antigravity's history.
 
@@ -498,9 +499,10 @@ permission checks. `/mode` shows each description. In `ask` and
 once per turn when Antigravity starts one: what it must ask for waits and does
 not run.
 
-Octet checks that Antigravity asks. If Antigravity runs a command in `ask` or
-`accept-edits`, or an edit (a delete and a move count) in `ask`, without
-having asked, Octet cancels the turn, says what ran ("Antigravity ran a
+Octet checks that Antigravity asks, and the check comes after the fact: once
+a call has run without asking, Octet cancels the turn. This applies to a
+command in `ask` or `accept-edits`, and to an edit (a delete and a move count)
+in `ask`. Octet then says what ran ("Antigravity ran a
 command without asking while Octet shows ask: …"), and sends nothing more in
 that session: later prompts fail unsent and say to start a new session. What
 ran cannot be undone. A call is judged by the loosest mode in force while it

@@ -216,8 +216,8 @@ pub struct Prepared {
     pub workspace: Option<String>,
 }
 
-/// What runs before `config`'s vendor CLI starts; the driver and the
-/// protocol gate share it with [`launch_args`] and [`launch_env`].
+/// What runs before `config`'s vendor CLI starts: the driver calls it (a
+/// catalog probe goes through the driver too).
 ///
 /// # Errors
 /// Why the session cannot start, in words to show.

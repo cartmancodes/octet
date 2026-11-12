@@ -442,8 +442,9 @@ environment, even after a login with no tmux running. The service doesn't use
   (`~/.opencode/bin` by default), so its sessions can't start opencode. Re-run
   `octet hub install` from a shell where `opencode` is on the `PATH`.
 - **Installed before Antigravity support.** A hub installed by an `octet` that
-  predates Antigravity support has a `PATH` without the directory `agy` is in,
-  so its sessions can't start Antigravity. Re-run `octet hub install` from a
+  predates Antigravity support has a `PATH` without the directory `agy` is in, if
+  that is not one of the usual system directories, so its sessions can't start
+  Antigravity. Re-run `octet hub install` from a
   shell where `agy` is on the `PATH`.
 - **Remove it.** `octet hub uninstall` stops the service and deletes the file.
   It says "Not installed" if there is nothing to remove.

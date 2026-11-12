@@ -80,11 +80,11 @@ goes to that provider unless the vendor is the current one, and
 `prepare` is work that has to happen before the CLI starts, such as writing a
 settings folder the launch arguments name (Antigravity). It returns `Prepared`:
 notices to show before the session starts, a `scratch` folder that the driver
-removes once the CLI has stopped, and a `workspace` string that the driver
-hands to the protocol through `Protocol::prepared` before `initialize`. An
-`Err` is the reason the session cannot start. The driver and the protocol gate
-both call it, as they call `launch_args` and `launch_env`; `super::no_prepare`
-is for a vendor with nothing to do.
+removes once the CLI has stopped, and `workspace`, an `Option<String>` that the
+driver hands to the protocol through `Protocol::prepared` before `initialize`.
+An `Err` is the reason the session cannot start. The driver calls it (a catalog
+probe goes through the driver too); `super::no_prepare` is for a vendor with
+nothing to do.
 
 **The protocol and its state.** Keep only this vendor's state here; the
 shared state is in `Core`.
@@ -161,7 +161,7 @@ scenarios are per vendor.
 | `initialize` | Send the handshake. When its reply arrives (in `on_frame`): set `core.phase = Phase::Idle`, emit `Event::Ready` with the session ID, and pass the mode the vendor reports to `core.adopt_mode`, which notes a mismatch and emits `Event::ModeChanged`. A two-step handshake passes through `Phase::Handshaken`. **Only move the phase forward**: ignore a repeated reply, and treat a step that arrives early as a protocol error, as Codex and Claude do. |
 | `launch_args` (more) | Also: `config.effort` when the vendor takes effort at launch, and `config.fork` (open `resume` as a new session). |
 | `launch_env` (the row's function, not a method) | The environment variables the CLI starts with, on top of the inherited ones. `super::no_env` for a vendor that needs none; opencode passes its agents and permission rules this way (`OPENCODE_CONFIG_CONTENT`). The driver and the protocol gate both call it, so the gate checks what ships. |
-| `prepare` (the row's function, not a method) | Work before the CLI starts, once per launch (a catalog probe too, with `config.catalog_only` set). Returns `Prepared { notices, scratch, workspace }`: the notices are shown first, the `scratch` folder is removed when the CLI has stopped (or failed to start), and `workspace` is handed to `Protocol::prepared`. `Err` is why the session cannot start. `super::no_prepare` for a vendor with nothing to do. Antigravity writes its settings folder and checks its workspace configuration here. |
+| `prepare` (the row's function, not a method) | Work before the CLI starts, once per launch (a catalog probe too, with `config.catalog_only` set). Returns `Prepared { notices, scratch, workspace }`: the notices are shown first, the `scratch` folder is removed when the CLI has stopped (or failed to start), and `workspace` (an `Option<String>`) is handed to `Protocol::prepared`. `Err` is why the session cannot start. `super::no_prepare` for a vendor with nothing to do. Antigravity writes its settings folder and checks its workspace configuration here. |
 | `prepared` | Receives `Prepared::workspace` once, before `initialize`. The default ignores it. |
 | `send_prompt` | Send the user's text, then its images (`ImageAttachment`: path, media type, name; `read_base64` reads the bytes). The driver has already set `Phase::InTurn` and emitted `User` and `Started`. If an image cannot be read, fail the turn with `core.finish_turn(Outcome::Failed, Some(message))`. |
 | `compact` | Ask the vendor to compact its context, as a turn: the driver has set `Phase::InTurn` and emitted `User("/compact")` and `Started`. |
