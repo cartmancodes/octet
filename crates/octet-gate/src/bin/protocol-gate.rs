@@ -8,10 +8,10 @@ use octet_engine::live::{
     launch_env, opencode_built_in_commands, opencode_command_expansion, opencode_stray_reply,
 };
 use octet_gate::{
-    Evidence, GateError, GateProcess, claude_fixture_allow, claude_fixture_hook_response,
-    claude_fixture_mcp_response, claude_fixture_mcp_tool_allow, codex_fixture_allow,
-    codex_fixture_user_input, opencode_fixture_allow, opencode_is_fixture_request,
-    opencode_is_lockdown_request, opencode_task_allow,
+    Evidence, GateError, GateProcess, antigravity, claude_fixture_allow,
+    claude_fixture_hook_response, claude_fixture_mcp_response, claude_fixture_mcp_tool_allow,
+    codex_fixture_allow, codex_fixture_user_input, opencode_fixture_allow,
+    opencode_is_fixture_request, opencode_is_lockdown_request, opencode_task_allow,
 };
 use serde_json::{Value, json};
 use std::{
@@ -44,8 +44,22 @@ const SCENARIOS: [&str; 17] = [
     "subagent",
     "command-expansion",
 ];
-/// The scenarios opencode runs; `lockdown`, `subagent` and
-/// `command-expansion` are its alone.
+/// The scenarios Antigravity runs, on `gemini-3.8-flash` at thinking level
+/// `low` (see `octet_gate::antigravity`).
+const ANTIGRAVITY_SCENARIOS: [&str; 10] = [
+    "initialize",
+    "simple",
+    "interrupt",
+    "approval-allow",
+    "approval-deny",
+    "approval-interrupt",
+    "resume",
+    "compact",
+    "lockdown",
+    "subagent",
+];
+/// The scenarios opencode runs; `command-expansion` is its alone, and
+/// `lockdown` and `subagent` it shares only with Antigravity.
 const OPENCODE_SCENARIOS: [&str; 10] = [
     "initialize",
     "simple",
@@ -73,27 +87,31 @@ struct Opt {
     output: Option<PathBuf>,
     timeout: Duration,
 }
+/// The gate's options, from the process's arguments.
 fn options() -> Result<Opt, &'static str> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    parse(env::args().skip(1).collect())
+}
+
+/// The gate's options, from `args` (the arguments after the program name).
+fn parse(args: Vec<String>) -> Result<Opt, &'static str> {
     let mut engine = None;
     let mut scenario = None;
     let mut binary = None;
     let mut workdir = None;
     let mut output = None;
-    let mut seconds = 90;
-    let mut i = 0;
-    while i < args.len() {
-        let val = args.get(i + 1).ok_or("flag requires value")?.clone();
-        match args[i].as_str() {
+    let mut seconds = None;
+    let mut words = args.into_iter();
+    while let Some(flag) = words.next() {
+        let val = words.next().ok_or("flag requires value")?;
+        match flag.as_str() {
             "--engine" => engine = Some(val),
             "--scenario" => scenario = Some(val),
             "--binary" => binary = Some(PathBuf::from(val)),
             "--workdir" => workdir = Some(PathBuf::from(val)),
             "--output" => output = Some(PathBuf::from(val)),
-            "--timeout" => seconds = val.parse().map_err(|_| "invalid timeout")?,
+            "--timeout" => seconds = Some(val.parse().map_err(|_| "invalid timeout")?),
             _ => return Err("unknown flag"),
         }
-        i += 2;
     }
     let name = engine.ok_or("missing --engine")?;
     let engine = Engine::parse(&name)
@@ -103,6 +121,15 @@ fn options() -> Result<Opt, &'static str> {
     if !SCENARIOS.contains(&scenario.as_str()) {
         return Err("unsupported scenario");
     }
+    // An Antigravity scenario that waits, or runs several turns, has a
+    // longer default of its own; `--timeout` still wins.
+    let seconds = seconds.unwrap_or_else(|| {
+        if engine == Engine::ANTIGRAVITY {
+            antigravity::default_seconds(&scenario)
+        } else {
+            90
+        }
+    });
     if !(1..=300).contains(&seconds) {
         return Err("timeout outside 1..300 seconds");
     }
@@ -110,6 +137,8 @@ fn options() -> Result<Opt, &'static str> {
     let claude_only = ["mcp", "hook"];
     let supported = if engine == Engine::OPENCODE {
         OPENCODE_SCENARIOS.contains(&scenario.as_str())
+    } else if engine == Engine::ANTIGRAVITY {
+        ANTIGRAVITY_SCENARIOS.contains(&scenario.as_str())
     } else if engine == Engine::CODEX {
         !claude_only.contains(&scenario.as_str())
             && !locked_down(&scenario)
@@ -122,7 +151,7 @@ fn options() -> Result<Opt, &'static str> {
     if !supported {
         return Err("scenario is unsupported by selected engine");
     }
-    let binary = binary.unwrap_or_else(|| PathBuf::from(&name));
+    let binary = binary.unwrap_or_else(|| PathBuf::from(engine.provider().default_binary));
     Ok(Opt {
         engine,
         scenario,
@@ -1625,6 +1654,18 @@ fn valid_session_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Runs an Antigravity scenario (`octet_gate::antigravity`): Octet's launch
+/// in a scratch home, checked before it starts. The status, the evidence,
+/// whether every child stopped, and what only Antigravity reports.
+async fn run_antigravity(
+    opt: &Opt,
+    cwd: &Path,
+    deadline: Instant,
+) -> (String, Evidence, bool, Value) {
+    let run = antigravity::run(&opt.binary, &opt.scenario, cwd, deadline).await;
+    (run.status, run.evidence, run.cleaned, run.extra)
+}
+
 /// Runs the scenario once, and for Claude's `resume` and `fork` again in a
 /// second process. The status, the evidence and whether every child stopped.
 async fn run_scenario(opt: &Opt, cwd: &Path, deadline: Instant) -> (String, Evidence, bool) {
@@ -1742,8 +1783,12 @@ async fn run() -> i32 {
     }
     let started = Instant::now();
     let deadline = started + opt.timeout;
+    let antigravity = opt.engine == Engine::ANTIGRAVITY;
     let (mut status, evidence, replayed, cleaned, extra) = if opencode {
         run_opencode(&opt, &cwd, deadline).await
+    } else if antigravity {
+        let (status, evidence, cleaned, extra) = run_antigravity(&opt, &cwd, deadline).await;
+        (status, evidence, 0, cleaned, extra)
     } else {
         let (status, evidence, cleaned) = run_scenario(&opt, &cwd, deadline).await;
         (status, evidence, 0, cleaned, Value::Null)
@@ -1770,7 +1815,16 @@ async fn run() -> i32 {
     {
         status = "failed: denied or interrupted fixture write occurred".into();
     }
-    let mut record = json!({"engine":opt.engine.as_str(),"scenario":opt.scenario,"version":version(&opt.binary).await,"host":env::consts::OS,"arch":env::consts::ARCH,"status":status,"events":evidence.events,"approval_requests":evidence.approval_requests,"mcp_calls":evidence.mcp_calls,"hook_calls":evidence.hook_calls,"compact_boundaries":evidence.compact_boundaries,"agent_messages":evidence.agent_messages,"late_usage_turns":evidence.late_usage_turns,"tool_only_turns":evidence.tool_only_turns,"user_questions":evidence.user_questions,"failure_kind":evidence.failure_kind,"fixture_write":fixture_write,"child_cleanup":cleaned,"elapsed_ms":started.elapsed().as_millis()});
+    // Antigravity's version is the one its `initialize` reported: the gate
+    // runs `agy` only as Octet launches it, in the scratch home.
+    let version = if antigravity {
+        extra["version"]
+            .as_str()
+            .map_or_else(|| "unknown".to_owned(), str::to_owned)
+    } else {
+        version(&opt.binary).await
+    };
+    let mut record = json!({"engine":opt.engine.as_str(),"scenario":opt.scenario,"version":version,"host":env::consts::OS,"arch":env::consts::ARCH,"status":status,"events":evidence.events,"approval_requests":evidence.approval_requests,"mcp_calls":evidence.mcp_calls,"hook_calls":evidence.hook_calls,"compact_boundaries":evidence.compact_boundaries,"agent_messages":evidence.agent_messages,"late_usage_turns":evidence.late_usage_turns,"tool_only_turns":evidence.tool_only_turns,"user_questions":evidence.user_questions,"failure_kind":evidence.failure_kind,"fixture_write":fixture_write,"child_cleanup":cleaned,"elapsed_ms":started.elapsed().as_millis()});
     if opencode {
         record["sessions"] = json!(evidence.sessions);
         record["sessions_left"] = json!(sessions_left);
@@ -1779,6 +1833,10 @@ async fn run() -> i32 {
         if opt.scenario == "command-expansion" {
             record["expansion"] = extra;
         }
+    } else if antigravity {
+        record["sessions"] = json!(evidence.sessions);
+        record["stop_reasons"] = json!(evidence.stop_reasons);
+        record["antigravity"] = extra;
     }
     let serialized = record.to_string();
     let serialized = serde_json::to_string_pretty(&record).unwrap_or(serialized);
@@ -1796,4 +1854,46 @@ async fn run() -> i32 {
 async fn main() {
     let code = run().await;
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse` of the words in `line`.
+    fn parsed(line: &str) -> Result<Opt, &'static str> {
+        parse(line.split_whitespace().map(str::to_owned).collect())
+    }
+
+    #[test]
+    fn the_default_binary_is_the_providers() {
+        let antigravity = parsed("--engine antigravity --scenario initialize").unwrap();
+        assert_eq!(antigravity.binary, PathBuf::from("agy"));
+        let claude = parsed("--engine claude --scenario initialize").unwrap();
+        assert_eq!(claude.binary, PathBuf::from("claude"));
+    }
+
+    #[test]
+    fn antigravity_runs_exactly_its_ten_scenarios() {
+        for scenario in SCENARIOS {
+            let supported = parsed(&format!("--engine antigravity --scenario {scenario}")).is_ok();
+            assert_eq!(
+                supported,
+                ANTIGRAVITY_SCENARIOS.contains(&scenario),
+                "{scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_antigravity_scenario_that_waits_has_a_longer_default_and_timeout_wins() {
+        let timeout = |line: &str| parsed(line).unwrap().timeout.as_secs();
+        assert_eq!(timeout("--engine antigravity --scenario subagent"), 240);
+        assert_eq!(timeout("--engine antigravity --scenario simple"), 90);
+        assert_eq!(
+            timeout("--engine antigravity --scenario subagent --timeout 30"),
+            30
+        );
+        assert_eq!(timeout("--engine opencode --scenario subagent"), 90);
+    }
 }

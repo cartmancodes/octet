@@ -827,3 +827,179 @@ fn command_expansion_fails_when_opencode_runs_other_shell_or_its_built_ins_drift
         );
     }
 }
+
+/// A scripted `agy`: keeps its arguments in `argv`, writes `frames`, then
+/// keeps what the gate sent in `stdin`.
+fn agy_script(frames: &[Value]) -> String {
+    let wire = frames
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "dir=\"$(dirname \"$0\")\"\n\
+         for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > \"$dir/argv\"\n\
+         cat <<'WIRE'\n{wire}\nWIRE\ncat > \"$dir/stdin\""
+    )
+}
+
+/// The options Antigravity reports: the gate's model, level and `default`.
+fn agy_options() -> Value {
+    json!([{"id":"model","currentValue":"gemini-3.8-flash"},
+        {"id":"thought_level","currentValue":"low"},{"id":"mode","currentValue":"default"}])
+}
+
+/// Antigravity's handshake for session `s` with the options confirmed, then
+/// `events`, each prompt's `end_turn` reply numbered from 5 for `prompts`.
+fn agy_frames(events: Vec<Value>, prompts: u64) -> Vec<Value> {
+    let mut frames = vec![
+        json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,
+            "agentInfo":{"name":"Antigravity ACP Server","version":"1.5.5"},"authMethods":[{"id":"oauth-personal"}]}}),
+        json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s","configOptions":agy_options(),
+            "_meta":{"antigravity":{"tier":{"name":"a tier","id":"t"}}}}}),
+        json!({"jsonrpc":"2.0","id":3,"result":{"configOptions":agy_options()}}),
+        json!({"jsonrpc":"2.0","id":4,"result":{"configOptions":agy_options()}}),
+    ];
+    frames.extend(events);
+    for id in 5..5 + prompts {
+        frames.push(json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}));
+    }
+    frames
+}
+
+/// A `session/update` for session `s` carrying `update`.
+fn agy_update(update: &Value) -> Value {
+    json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":update}})
+}
+
+/// A permission request, numbered `id` (a string, as Antigravity's are), for
+/// `call` in session `s`.
+fn agy_ask(id: &str, call: &Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":"s",
+        "toolCall":call,"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]}})
+}
+
+/// The gate's temporary folders left under `root`.
+fn gate_folders_left(root: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("octet-protocol-"))
+        .collect()
+}
+
+#[test]
+fn the_gate_launches_antigravity_as_octet_does_in_a_scratch_home_it_removes() {
+    let root = octet_testkit::TempDir::new("octet-gate-agy-simple");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let reply = agy_update(
+        &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"READY"}}),
+    );
+    let (code, evidence) = probe_in(
+        root.path(),
+        "antigravity",
+        "simple",
+        &agy_script(&agy_frames(vec![reply], 1)),
+    );
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(0), "{evidence}");
+    assert_eq!(evidence["status"], "passed");
+    assert_eq!(evidence["version"], "1.5.5");
+    assert_eq!(evidence["antigravity"]["options"]["mode"], "default");
+    let argv = std::fs::read_to_string(root.path().join("argv")).unwrap();
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(argv[..2], ["acp", "--cli_dir_name"], "{argv:?}");
+    assert!(
+        argv[2].ends_with("/octet-data/antigravity/review"),
+        "{argv:?}"
+    );
+    assert_eq!(argv[3], "--gemini-dir");
+    assert!(argv[4].ends_with("/gemini-home"), "{argv:?}");
+    assert!(
+        argv[2].starts_with(argv[4].trim_end_matches("gemini-home")),
+        "{argv:?}"
+    );
+    let text = evidence.to_string();
+    assert!(
+        !text.contains("tier") && !text.contains("oauth"),
+        "no account details: {text}"
+    );
+    assert_eq!(gate_folders_left(root.path()), Vec::<String>::new());
+}
+
+#[test]
+fn antigravity_lockdown_passes_only_when_both_actions_ask() {
+    let echo = json!({"toolCallId":"c1","name":"run_command","kind":"execute","title":"echo fixture",
+        "rawInput":{"CommandLine":"echo fixture"}});
+    let write = json!({"toolCallId":"c2","name":"write_file","kind":"edit","title":"File gate.txt",
+        "rawInput":{"Path":"/w/gate.txt","Content":"gate"}});
+    let root = octet_testkit::TempDir::new("octet-gate-agy-lockdown");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let frames = agy_frames(vec![agy_ask("1", &echo), agy_ask("2", &write)], 2);
+    let (code, evidence) = probe_in(root.path(), "antigravity", "lockdown", &agy_script(&frames));
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(0), "{evidence}");
+    assert_eq!(evidence["approval_requests"], 2);
+    let keys = &evidence["antigravity"]["settings"]["keys"];
+    assert_eq!(
+        keys,
+        &json!(["octetGateMarker", "permissions", "toolPermission"]),
+        "{evidence}"
+    );
+    let sent = std::fs::read_to_string(root.path().join("stdin")).unwrap();
+    for id in ["1", "2"] {
+        let answer = sent
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|frame| frame["id"] == id)
+            .unwrap();
+        assert_eq!(answer["result"]["outcome"]["optionId"], "deny");
+    }
+    assert_eq!(gate_folders_left(root.path()), Vec::<String>::new());
+
+    // Only the command asks: the write was never exercised.
+    let root = octet_testkit::TempDir::new("octet-gate-agy-lockdown-half");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let frames = agy_frames(vec![agy_ask("1", &echo)], 2);
+    let (code, evidence) = probe_in(root.path(), "antigravity", "lockdown", &agy_script(&frames));
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(1), "{evidence}");
+    assert_eq!(
+        evidence["status"],
+        "unproven: the model did not ask to write gate.txt"
+    );
+
+    // A command that completes without a request fails the run.
+    let root = octet_testkit::TempDir::new("octet-gate-agy-lockdown-unasked");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let mut ran = echo.clone();
+    ran["sessionUpdate"] = json!("tool_call_update");
+    ran["status"] = json!("completed");
+    let frames = agy_frames(vec![agy_update(&ran)], 2);
+    let (code, evidence) = probe_in(root.path(), "antigravity", "lockdown", &agy_script(&frames));
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(1), "{evidence}");
+    assert_eq!(
+        evidence["status"],
+        "failed: run_command ran without a permission request"
+    );
+    assert_eq!(gate_folders_left(root.path()), Vec::<String>::new());
+}
+
+#[test]
+fn antigravity_subagent_is_unproven_when_the_model_does_not_delegate() {
+    let root = octet_testkit::TempDir::new("octet-gate-agy-subagent");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let reply = agy_update(
+        &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}),
+    );
+    let (code, evidence) = probe_in(
+        root.path(),
+        "antigravity",
+        "subagent",
+        &agy_script(&agy_frames(vec![reply], 1)),
+    );
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(1), "{evidence}");
+    assert_eq!(evidence["status"], "unproven: the model did not delegate");
+}

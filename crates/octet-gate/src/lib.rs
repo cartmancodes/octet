@@ -1,8 +1,10 @@
 //! The protocol gate: drives a real vendor CLI through fixed scenarios and
 //! records contract evidence. Default replies are Octet's own
 //! (`octet_engine::live::{codex_stray_reply, claude_stray_reply,
-//! opencode_stray_reply}`).
+//! opencode_stray_reply, antigravity_stray_reply}`).
 #![forbid(unsafe_code)]
+
+pub mod antigravity;
 
 use octet_proc::{Process, ProcessError, ProcessSender, ShutdownReport};
 use serde_json::{Value, json};
