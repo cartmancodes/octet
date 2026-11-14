@@ -79,7 +79,7 @@ impl Selection {
             catalog_only: false,
             plugins: current.plugins,
             data_dir: current.data_dir.clone(),
-            trust_workspace: current.trust_workspace,
+            trust_workspace: current.trust_workspace.clone(),
             engine: self.provider,
             model: self.model.clone(),
             cwd: current.cwd.clone(),
@@ -391,7 +391,9 @@ mod tests {
     fn configure_keeps_the_data_directory_and_the_trust_flag() {
         let current = Config {
             data_dir: Some("/d".into()),
-            trust_workspace: true,
+            trust_workspace: Some(crate::TrustedAtStart::capture(std::path::Path::new(
+                "/nonexistent",
+            ))),
             ..config()
         };
         for selection in ["new-model", "claude example"] {
@@ -399,7 +401,7 @@ mod tests {
                 .unwrap()
                 .configure(&current, "thread", None);
             assert_eq!(next.data_dir, Some(PathBuf::from("/d")), "{selection}");
-            assert!(next.trust_workspace, "{selection}");
+            assert_eq!(next.trust_workspace, current.trust_workspace, "{selection}");
         }
     }
     #[test]

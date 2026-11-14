@@ -987,7 +987,7 @@ fn a_live_list_is_cached() {
             limit: octet_core::PROBE_LIMIT,
             plugins: octet_core::Plugins::default(),
             data_dir: None,
-            trust_workspace: false,
+            trust_workspace: None,
         },
     );
     app.event(octet_core::Event::Models(vec![listed("opus")]));

@@ -317,7 +317,7 @@ fn attach_models(
                 limit: octet_core::PROBE_LIMIT,
                 plugins: config.plugins,
                 data_dir: config.data_dir.clone(),
-                trust_workspace: config.trust_workspace,
+                trust_workspace: config.trust_workspace.clone(),
             },
         );
     }

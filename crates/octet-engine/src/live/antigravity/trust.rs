@@ -46,6 +46,35 @@ pub struct WorkspaceConfig {
     pub fingerprint: String,
 }
 
+/// What `--trust-workspace-config` trusts: the workspace's own vendor
+/// configuration as Octet found it when it started, never a later change.
+/// Every later connection (a reconnect, `/new`, `/model`, `/mode`, the
+/// phone's) accepts only this; `/trust` is the way to accept a change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedAtStart {
+    /// The fingerprint found at the start; `None` when there was no
+    /// configuration, or it could not be read, so only an empty one passes.
+    fingerprint: Option<String>,
+}
+
+impl TrustedAtStart {
+    /// What the workspace `cwd` holds now, for a run started with the flag.
+    #[must_use]
+    pub fn capture(cwd: &Path) -> Self {
+        Self {
+            fingerprint: antigravity_workspace_config(cwd)
+                .ok()
+                .flatten()
+                .map(|found| found.fingerprint),
+        }
+    }
+
+    /// Whether `fingerprint` is the configuration found at the start.
+    fn accepts(&self, fingerprint: &str) -> bool {
+        self.fingerprint.as_deref() == Some(fingerprint)
+    }
+}
+
 /// What a path is, links followed.
 #[derive(Debug, PartialEq, Eq)]
 enum Kind {
@@ -344,14 +373,26 @@ fn remember(
 ///
 /// # Errors
 ///
-/// When the configuration cannot be checked, or is not trusted and
-/// `config.trust_workspace` is off.
+/// When the configuration cannot be checked, or is neither trusted nor what
+/// `config.trust_workspace` trusted when Octet started.
 pub(super) fn check(config: &Config, data_dir: &Path) -> Result<Option<String>, String> {
     let Some(found) = antigravity_workspace_config(&config.cwd)? else {
         return Ok(None);
     };
-    if config.trust_workspace || antigravity_trusted(data_dir, &config.cwd, &found) {
+    let flagged = config
+        .trust_workspace
+        .as_ref()
+        .is_some_and(|start| start.accepts(&found.fingerprint));
+    if flagged || antigravity_trusted(data_dir, &config.cwd, &found) {
         return Ok(Some(found.fingerprint));
+    }
+    if config.trust_workspace.is_some() {
+        return Err(format!(
+            "This workspace's .agents configuration changed since Octet started; \
+             --trust-workspace-config trusts only what was there then: {}. \
+             Review it, then type /trust in Octet's terminal interface",
+            listed(&found.files)
+        ));
     }
     Err(format!(
         "Antigravity would load this workspace's .agents configuration, which can run \
@@ -410,8 +451,54 @@ mod tests {
 
     fn config(cwd: &Path, trust_workspace: bool) -> Config {
         let mut config = crate::live::Config::new(crate::live::Engine::ANTIGRAVITY, "agy", cwd);
-        config.trust_workspace = trust_workspace;
+        config.trust_workspace = trust_workspace.then(|| TrustedAtStart::capture(cwd));
         config
+    }
+
+    #[test]
+    fn the_flag_trusts_only_what_was_there_when_octet_started() {
+        let root = TempDir::new("octet-agy-trust-start");
+        let data = root.path().join("data");
+        let cwd = workspace(root.path(), "w");
+        let start = config(&cwd, true);
+        let fingerprint = found(&cwd).fingerprint;
+        assert_eq!(check(&start, &data), Ok(Some(fingerprint.clone())));
+        put(&cwd, ".agents/hooks.json", r#"{"hooks":[]}"#);
+        let error = check(&start, &data).unwrap_err();
+        assert_eq!(
+            error,
+            "This workspace's .agents configuration changed since Octet started; \
+             --trust-workspace-config trusts only what was there then: .agents/hooks.json. \
+             Review it, then type /trust in Octet's terminal interface"
+        );
+        // `/trust` accepts the change.
+        trust_in(&data, &cwd, &found(&cwd), None).unwrap();
+        assert!(check(&start, &data).is_ok());
+        put(&cwd, ".agents/hooks.json", "{}");
+        assert_eq!(check(&start, &data), Ok(Some(fingerprint)));
+    }
+
+    #[test]
+    fn the_flag_with_nothing_at_the_start_accepts_only_nothing_later() {
+        let root = TempDir::new("octet-agy-trust-start-none");
+        let data = root.path().join("data");
+        let cwd = root.path().join("w");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let start = config(&cwd, true);
+        assert_eq!(
+            start.trust_workspace,
+            Some(TrustedAtStart { fingerprint: None })
+        );
+        assert_eq!(check(&start, &data), Ok(None));
+        put(&cwd, ".agents/hooks.json", "{}");
+        assert!(check(&start, &data).is_err());
+        // Unreadable at the start counts as nothing.
+        let odd = root.path().join("odd");
+        std::fs::create_dir_all(odd.join(".agents/hooks.json")).unwrap();
+        assert_eq!(
+            TrustedAtStart::capture(&odd),
+            TrustedAtStart { fingerprint: None }
+        );
     }
 
     #[test]

@@ -22,8 +22,8 @@ mod opencode;
 mod protocol;
 pub use activity::{APPROVAL_SCOPE, ApprovalSummary, ToolCall, ToolPhase};
 pub use antigravity::{
-    ANTIGRAVITY_VERIFIED_VERSIONS, WorkspaceConfig, antigravity_prepare, antigravity_stray_reply,
-    antigravity_trust, antigravity_trusted, antigravity_workspace_config,
+    ANTIGRAVITY_VERIFIED_VERSIONS, TrustedAtStart, WorkspaceConfig, antigravity_prepare,
+    antigravity_stray_reply, antigravity_trust, antigravity_trusted, antigravity_workspace_config,
 };
 pub use claude::claude_stray_reply;
 pub use codex::codex_stray_reply;
@@ -402,8 +402,9 @@ pub struct Config {
     /// trusted).
     pub data_dir: Option<PathBuf>,
     /// Start although the workspace's own vendor configuration is not
-    /// trusted (`--trust-workspace-config`).
-    pub trust_workspace: bool,
+    /// trusted, as long as it is what Octet found when it started
+    /// (`--trust-workspace-config`); `None` without the flag.
+    pub trust_workspace: Option<TrustedAtStart>,
 }
 /// Whether the vendor's plugins load, and whether their hooks run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,7 +438,7 @@ impl Config {
             catalog_only: false,
             plugins: Plugins::default(),
             data_dir: None,
-            trust_workspace: false,
+            trust_workspace: None,
         }
     }
 }

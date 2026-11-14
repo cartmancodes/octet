@@ -30,8 +30,9 @@ pub(crate) struct Prober {
     pub(crate) plugins: octet_core::Plugins,
     /// The session's data directory, for a provider that keeps files there.
     pub(crate) data_dir: Option<PathBuf>,
-    /// The session's trust flag, so a probe may run wherever the session may.
-    pub(crate) trust_workspace: bool,
+    /// The session's trust flag (what it trusted at the start), so a probe
+    /// may run wherever the session may.
+    pub(crate) trust_workspace: Option<octet_core::TrustedAtStart>,
 }
 
 impl Prober {
@@ -40,7 +41,7 @@ impl Prober {
         octet_core::Config {
             plugins: self.plugins,
             data_dir: self.data_dir.clone(),
-            trust_workspace: self.trust_workspace,
+            trust_workspace: self.trust_workspace.clone(),
             ..octet_core::Config::new(engine, self.binary(engine), self.cwd.clone())
         }
     }
@@ -374,19 +375,19 @@ mod tests {
             limit: octet_core::PROBE_LIMIT,
             plugins: octet_core::Plugins::default(),
             data_dir: Some(dir.to_owned()),
-            trust_workspace: false,
+            trust_workspace: None,
         }
     }
     #[test]
     fn a_probe_carries_the_data_directory_and_the_trust_flag() {
         let prober = Prober {
             data_dir: Some("/d".into()),
-            trust_workspace: true,
+            trust_workspace: Some(octet_core::TrustedAtStart::capture(Path::new("/unused"))),
             ..fake_prober(Path::new("/unused"))
         };
         let config = prober.config(Engine::CLAUDE);
         assert_eq!(config.data_dir, Some(PathBuf::from("/d")));
-        assert!(config.trust_workspace);
+        assert_eq!(config.trust_workspace, prober.trust_workspace);
         assert_eq!(config.cwd, prober.cwd);
     }
     fn attached(dir: &Path) -> Models {

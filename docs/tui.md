@@ -42,7 +42,8 @@ published as a pre-release, and re-running replaces the archives.
 `--effort LEVEL` sets the reasoning effort (see below). `--no-plugins` and
 `--no-plugin-hooks` turn the vendors' plugins, or only their hooks, off (see
 [Plugins and skills](#plugins-and-skills)). `--trust-workspace-config` lets
-Antigravity load a workspace's `.agents` configuration for one run (see
+Antigravity load a workspace's `.agents` configuration, as it was when Octet
+started, for one run (see
 [Antigravity](#antigravity)). `--no-remote` keeps this session
 off the phone hub (see [Phone app (hub)](remote-control.md#phone-app-hub)).
 
@@ -530,11 +531,16 @@ only once you trust them. Without that, the session does not start and names
 the files. `/trust` records the workspace (its path and a fingerprint of the
 files) as trusted, in `antigravity/trusted-workspaces.json` beside the
 journals, and reconnects; it is refused during a turn and for another
-provider. `--trust-workspace-config` starts one run (`--print` too) and records
-nothing. Octet checks the files again before every prompt:
-if they changed since the session started, the prompt is not sent, and
-`/trust` (or a fresh start with the flag) accepts them. A workspace without
-these files needs no trust. The phone cannot trust a workspace.
+provider. `--trust-workspace-config` trusts, for one run (`--print` too), the
+files as they were when Octet started, and records nothing; a workspace with
+none at the start is trusted only while it has none. Octet checks the files
+again before every prompt: if they changed since the session started, the
+prompt is not sent. Every later connection of that run (`/reconnect`, `/new`,
+`/model`, `/mode`, or the phone's model, mode and `new`) is refused too while
+the files differ from the start, flag or not: `/trust` is the only way to
+accept a later change (or quit and start Octet again with the flag). A
+workspace without these files needs no trust. The phone cannot trust a
+workspace.
 
 Octet does not offer `/fork` for Antigravity or `/steer` (the text is queued as
 the next prompt). Usage shows a token count, not a cost. Skills are

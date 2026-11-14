@@ -100,7 +100,8 @@ pub(crate) struct Args {
     pub(crate) effort: Option<String>,
     pub(crate) plugins: Plugins,
     /// Whether to start Antigravity in a workspace whose `.agents` configuration is not trusted
-    /// (`--trust-workspace-config`); nothing is recorded.
+    /// (`--trust-workspace-config`), as long as it is what was there when Octet started; nothing is
+    /// recorded.
     pub(crate) trust_workspace: bool,
     /// Whether the terminal interface shares its session with a hub.
     pub(crate) remote: bool,
@@ -125,7 +126,10 @@ impl Args {
             approval_timeout: self.approval_timeout,
             effort: self.effort.clone(),
             plugins: self.plugins,
-            trust_workspace: self.trust_workspace,
+            // What the workspace holds now is all the flag ever trusts.
+            trust_workspace: self
+                .trust_workspace
+                .then(|| octet_core::TrustedAtStart::capture(&cwd)),
             ..Config::new(self.engine, binary, cwd)
         }
     }
@@ -460,10 +464,10 @@ mod tests {
     #[test]
     fn the_trust_flag_reaches_the_configuration() {
         assert!(!args(&[]).trust_workspace);
-        assert!(!args(&[]).config("/tmp".into()).trust_workspace);
+        assert!(args(&[]).config("/tmp".into()).trust_workspace.is_none());
         assert!(args(&["--trust-workspace-config"]).trust_workspace);
         let print = args(&["--trust-workspace-config", "--print", "hi"]);
-        assert!(print.config("/tmp".into()).trust_workspace);
+        assert!(print.config("/tmp".into()).trust_workspace.is_some());
         // A plain flag: the next option is not its value.
         assert_eq!(
             args(&["--trust-workspace-config", "--mode", "auto"]).mode,

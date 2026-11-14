@@ -938,8 +938,11 @@ It then creates no socket and no file, and the hub and the phone never see it.
   `.agents` configuration (hooks, MCP servers, plugins) only once you trust it
   with `/trust` in the terminal interface, and a session the phone starts
   passes no `--trust-workspace-config`; in a workspace whose configuration is
-  not trusted yet, it cannot start and says why. Trust the workspace at the
-  desk first.
+  not trusted yet, it cannot start and says why. A desk session started with
+  `--trust-workspace-config` trusts only the configuration it found when it
+  started, so the phone's model, mode or `new` on that session is refused
+  while the configuration differs from that. Trust the workspace at the desk
+  first.
 - The phone runs exactly these desk commands and no others: `/model`,
   `/mode`, `/new`, `/session`, `/help` and `/export`. The last four go as one
   `command` request naming one of `new`, `session`, `help` or `export`, with

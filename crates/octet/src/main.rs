@@ -62,7 +62,7 @@ fn help() -> String {
         "enabledPlugins); --no-plugins turns them off, --no-plugin-hooks only their hooks.",
         "Antigravity: a workspace's .agents configuration (hooks, MCP servers, plugins)",
         "loads only once you trust it: /trust in the interface, or",
-        "--trust-workspace-config for one run.",
+        "--trust-workspace-config for one run (as it is when Octet starts).",
         "",
         "Keys: Enter send · Alt+Enter / Ctrl+J newline · Esc cancel · Ctrl+C twice quit",
         "      PageUp/PageDown scroll · Ctrl+P commands · F1 help · Shift+Tab mode",

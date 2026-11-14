@@ -6,7 +6,7 @@
 )]
 use octet_engine::live::{
     Command, Config, Engine, Event, ImageAttachment, Limits, Mode, Outcome, PROBE_LIMIT, ToolCall,
-    ToolPhase, probe, spawn, spawn_with_limits,
+    ToolPhase, TrustedAtStart, probe, spawn, spawn_with_limits,
 };
 use octet_testkit::scenario;
 use std::{fmt::Write as _, time::Duration};
@@ -5798,10 +5798,56 @@ async fn antigravity_an_untrusted_workspace_does_not_start() {
     // Nothing was launched: Octet's settings were not even written.
     assert!(!dir.path().join("data/antigravity").exists());
     let mut trusted = c;
-    trusted.trust_workspace = true;
+    trusted.trust_workspace = Some(TrustedAtStart::capture(&trusted.cwd));
     let (handle, mut events, task) = spawn(trusted);
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
     stop(&handle, task).await;
+}
+/// Starts `c` and returns whether a session opened (stopping it), or the
+/// error it was refused with.
+async fn agy_start(c: Config) -> Result<(), String> {
+    let (handle, mut events, task) = spawn(c);
+    loop {
+        match next(&mut events).await {
+            Event::Error(error) => {
+                ended(task).await;
+                return Err(error);
+            }
+            Event::ModeChanged(_) => {
+                stop(&handle, task).await;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+#[tokio::test]
+async fn antigravity_the_trust_flag_trusts_only_the_configuration_found_at_the_start() {
+    let (dir, mut c) = antigravity(serde_json::Value::Null);
+    let hooks = dir.path().join("ws/.agents/hooks.json");
+    std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+    std::fs::write(&hooks, "{}").unwrap();
+    c.trust_workspace = Some(TrustedAtStart::capture(&c.cwd));
+    assert_eq!(agy_start(c.clone()).await, Ok(()));
+    // A reconnect with the same configuration still starts.
+    assert_eq!(agy_start(c.clone()).await, Ok(()));
+    // Changed after the start: a reconnect is refused although the flag is set.
+    std::fs::write(&hooks, r#"{"hooks":[]}"#).unwrap();
+    let error = agy_start(c.clone()).await.unwrap_err();
+    assert!(error.contains(".agents/hooks.json"), "{error}");
+    std::fs::write(&hooks, "{}").unwrap();
+    assert_eq!(agy_start(c).await, Ok(()));
+}
+#[tokio::test]
+async fn antigravity_the_trust_flag_with_no_configuration_at_the_start_trusts_none_later() {
+    let (dir, mut c) = antigravity(serde_json::Value::Null);
+    c.trust_workspace = Some(TrustedAtStart::capture(&c.cwd));
+    assert_eq!(agy_start(c.clone()).await, Ok(()));
+    let hooks = dir.path().join("ws/.agents/hooks.json");
+    std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+    std::fs::write(&hooks, "{}").unwrap();
+    let error = agy_start(c).await.unwrap_err();
+    assert!(error.contains(".agents/hooks.json"), "{error}");
 }
 #[tokio::test]
 async fn antigravity_image_goes_inline() {
@@ -5889,7 +5935,7 @@ async fn antigravity_trusted_configuration_edited_mid_session_stops_the_next_pro
     let hooks = dir.path().join("ws/.agents/hooks.json");
     std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
     std::fs::write(&hooks, "{}").unwrap();
-    c.trust_workspace = true;
+    c.trust_workspace = Some(TrustedAtStart::capture(&c.cwd));
     let (handle, mut events, task) = spawn(c);
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
     assert_eq!(

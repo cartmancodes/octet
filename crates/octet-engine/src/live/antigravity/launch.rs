@@ -340,7 +340,7 @@ mod tests {
         std::fs::write(cwd.join(".agents/hooks.json"), "{}").unwrap();
         let mut config = Config::new(Engine::ANTIGRAVITY, "agy", &cwd);
         config.data_dir = Some(root.path().join("data"));
-        config.trust_workspace = true;
+        config.trust_workspace = Some(super::trust::TrustedAtStart::capture(&cwd));
         let prepared = antigravity_prepare(&config, None).unwrap();
         let found = antigravity_workspace_config(&cwd).unwrap().unwrap();
         assert_eq!(prepared.workspace, Some(found.fingerprint));

@@ -28,7 +28,8 @@ use serde_json::{Value, json};
 use std::{ffi::OsString, path::Path, time::Duration};
 use tokio::time::Instant;
 pub use trust::{
-    WorkspaceConfig, antigravity_trust, antigravity_trusted, antigravity_workspace_config,
+    TrustedAtStart, WorkspaceConfig, antigravity_trust, antigravity_trusted,
+    antigravity_workspace_config,
 };
 
 /// The Antigravity versions Octet has been checked against.
