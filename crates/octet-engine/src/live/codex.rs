@@ -41,6 +41,7 @@ pub(super) const PROVIDER: Provider = Provider {
     commands_expand_shell: false,
     forks: true,
     carries_others_models: false,
+    own_model_words: &[],
     launch_args: <CodexProtocol as Protocol>::launch_args,
     launch_env: super::no_env,
     prepare: super::no_prepare,

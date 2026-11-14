@@ -129,9 +129,12 @@ impl Selection {
     /// list holds it (`current` first), else to the one whose listed IDs
     /// share its leading word, else to the one listing it as `sub/NAME`
     /// (with that full ID), else to `current`; a provider that lists other
-    /// providers' own models (Antigravity) yields to the one they belong to
-    /// unless it is `current`; `default` and the explicit
+    /// providers' own models (Antigravity, a carrier) yields to the one they
+    /// belong to unless it is `current`; `default` and the explicit
     /// forms (`PROVIDER [NAME]`, `PROVIDER/NAME`) resolve as `parse` does.
+    /// A carrier that is not `current` wins a name by its leading word only
+    /// for a word of its own models (`gemini`, not `claude`), and never over
+    /// a `sub/NAME` in `current`'s list.
     ///
     /// # Errors
     ///
@@ -162,17 +165,33 @@ impl Selection {
         };
         let owners = set_aside_carriers(catalogs.owners(bare), current);
         let suffixed = catalogs.suffix_owners(bare);
+        let word = bare.split_once('-').map_or("", |(word, _)| word);
+        // A carrier other than `current` does not win over `current`'s own
+        // `sub/NAME` (`anthropic/claude-sonnet-4-6` on opencode).
+        let current_suffix = suffixed
+            .iter()
+            .find(|(engine, _)| *engine == current)
+            .map(|(_, id)| id.clone());
+        let carried = |owner: Engine| owner != current && owner.carries_others_models();
         let (provider, found) = if bare == "default" {
             (current, Found::Current)
         } else if owners.contains(&current) {
             (current, Found::Listed)
+        } else if let ([owner], Some(id)) = (owners.as_slice(), &current_suffix)
+            && carried(*owner)
+        {
+            return Self::parse(&format!("{current} {id}"), current).map(|selection| Resolved {
+                selection,
+                found: Found::Listed,
+            });
         } else if let [owner] = owners.as_slice() {
             (*owner, Found::Listed)
         } else if !owners.is_empty() {
             return Err(ambiguous(bare, &owners));
         } else if let [owner] = set_aside_carriers(catalogs.prefix_owners(bare), current).as_slice()
+            && !(carried(*owner)
+                && (current_suffix.is_some() || !owner.own_model_words().contains(&word)))
         {
-            let word = bare.split_once('-').map_or("", |(word, _)| word);
             (*owner, Found::Prefix(word.to_owned()))
         } else if let [(owner, id)] = suffixed.as_slice() {
             let selection = Self::parse(&format!("{owner} {id}"), current)?;
@@ -874,5 +893,73 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    /// [`with_antigravity`] without `without`'s list, plus an opencode list
+    /// of `opencode` IDs.
+    fn antigravity_lacking(without: Engine, opencode: &[&str]) -> crate::catalog::Catalogs {
+        let full = with_antigravity();
+        let mut c = crate::catalog::Catalogs::default();
+        let now = std::time::SystemTime::now();
+        for engine in [Engine::CLAUDE, Engine::CODEX, Engine::ANTIGRAVITY] {
+            if engine != without
+                && let Some(listed) = full.get(engine)
+            {
+                c.set(engine, listed.models.clone(), now);
+            }
+        }
+        if !opencode.is_empty() {
+            let models = with_opencode(opencode)
+                .get(Engine::OPENCODE)
+                .unwrap()
+                .models
+                .clone();
+            c.set(Engine::OPENCODE, models, now);
+        }
+        c
+    }
+
+    #[test]
+    fn without_the_owners_list_a_name_does_not_go_to_antigravity_by_its_leading_word() {
+        for (without, name, current) in [
+            (Engine::CLAUDE, "claude-opus-5-5", Engine::CODEX),
+            (Engine::CODEX, "gpt-6-astra", Engine::CLAUDE),
+        ] {
+            let r = Selection::resolve(name, current, &antigravity_lacking(without, &[])).unwrap();
+            assert_eq!(
+                (r.selection.provider, r.selection.model.as_deref(), r.found),
+                (current, Some(name), Found::Current),
+                "{name}"
+            );
+        }
+        // Antigravity's own family still reaches it by its leading word.
+        let r = Selection::resolve(
+            "gemini-9",
+            Engine::CODEX,
+            &antigravity_lacking(Engine::CLAUDE, &[]),
+        )
+        .unwrap();
+        assert_eq!(r.selection.provider, Engine::ANTIGRAVITY);
+        assert_eq!(r.found, Found::Prefix("gemini".into()));
+    }
+
+    #[test]
+    fn antigravity_does_not_win_over_the_current_providers_sub_id() {
+        let catalogs = antigravity_lacking(Engine::CLAUDE, &["anthropic/claude-sonnet-4-6"]);
+        let r = Selection::resolve("claude-sonnet-4-6", Engine::OPENCODE, &catalogs).unwrap();
+        assert_eq!(
+            (r.selection.provider, r.selection.model.as_deref(), r.found),
+            (
+                Engine::OPENCODE,
+                Some("anthropic/claude-sonnet-4-6"),
+                Found::Listed
+            )
+        );
+        // From another provider, Antigravity's exact listing still counts.
+        let r = Selection::resolve("claude-sonnet-4-6", Engine::CODEX, &catalogs).unwrap();
+        assert_eq!(r.selection.provider, Engine::ANTIGRAVITY);
+        // And on Antigravity, a name it lists stays there.
+        let r = Selection::resolve("claude-sonnet-4-6", Engine::ANTIGRAVITY, &catalogs).unwrap();
+        assert_eq!(r.selection.provider, Engine::ANTIGRAVITY);
     }
 }

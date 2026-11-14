@@ -71,6 +71,8 @@ pub(super) const PROVIDER: Provider = Provider {
     commands_expand_shell: false,
     forks: false,
     carries_others_models: true,
+    // Its Gemini models; the Claude and GPT ones it lists are carried.
+    own_model_words: &["gemini"],
     launch_args: launch::launch_args,
     launch_env: super::no_env,
     prepare: launch::prepare,

@@ -630,7 +630,12 @@ the one listing it after a `sub/` part (`glm-5.3-flash-free` to opencode's
 custom ID. Antigravity also lists some Claude and GPT models: a bare name
 another provider lists too goes to that provider, unless Antigravity is the
 current one, and `/model antigravity NAME` or `/model antigravity/NAME`
-picks Antigravity's copy. `default` is always the current
+picks Antigravity's copy. From another provider, Antigravity takes a name it
+does not list by its leading word only for its own Gemini models
+(`gemini-…`): with Claude's or Codex's list missing, `claude-…` or `gpt-…`
+stays with the current provider rather than going to Antigravity. Nor does it
+take a name the current provider lists after a `sub/` part
+(`anthropic/claude-sonnet-4-6` on opencode). `default` is always the current
 provider's, and the explicit forms (`/model codex X`, `claude/X`) work as
 before. A model the provider refuses when the session connects (a typo, or
 one opencode does not list) stops the session with an error naming the model

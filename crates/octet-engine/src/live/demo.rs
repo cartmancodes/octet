@@ -31,6 +31,7 @@ pub(super) const PROVIDER: Provider = Provider {
     commands_expand_shell: false,
     forks: false,
     carries_others_models: false,
+    own_model_words: &[],
     launch_args: |_| Vec::new(),
     launch_env: super::no_env,
     prepare: super::no_prepare,

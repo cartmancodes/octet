@@ -160,6 +160,11 @@ pub struct Provider {
     /// (Antigravity lists Claude and GPT models); a name another provider
     /// also matches goes to that provider.
     pub carries_others_models: bool,
+    /// For a provider that `carries_others_models`: the leading words of its
+    /// own model IDs (`gemini`). Only by one of these does it win a bare
+    /// `/model` name by its leading word, so a name of a carried family
+    /// (`claude-…`) never goes to it by that word alone. Empty otherwise.
+    pub own_model_words: &'static [&'static str],
     /// The vendor CLI's arguments for `config` (none for the demo).
     pub(crate) launch_args: fn(&Config) -> Vec<OsString>,
     /// The environment variables the vendor CLI is launched with, on top of
@@ -346,6 +351,11 @@ impl Engine {
     /// (Antigravity lists Claude and GPT models).
     pub fn carries_others_models(self) -> bool {
         self.0.carries_others_models
+    }
+    /// The leading words of the provider's own model IDs, for a provider
+    /// that carries others' models (see [`Provider::own_model_words`]).
+    pub fn own_model_words(self) -> &'static [&'static str] {
+        self.0.own_model_words
     }
 }
 impl PartialEq for Engine {

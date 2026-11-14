@@ -52,6 +52,7 @@ pub(super) const PROVIDER: Provider = Provider {
     commands_expand_shell: true,
     forks: true,
     carries_others_models: false,
+    own_model_words: &[],
     launch_args: <OpencodeProtocol as Protocol>::launch_args,
     launch_env,
     prepare: super::no_prepare,
