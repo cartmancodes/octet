@@ -500,8 +500,12 @@ so listing models adds no session to Antigravity's history.
 The modes mean this. `ask`: Antigravity asks before commands and edits.
 `accept-edits`: edits run and commands ask. `auto`: Antigravity's own checker
 decides, and Octet's check below does not cover it. `full-access`: no
-permission checks. `/mode` shows each description. In `ask` and
-`accept-edits`, a subagent's approval requests never reach Octet, so Octet says
+permission checks. `/mode` shows each description. Octet has not checked
+MCP tools: whether a tool from a trusted `.agents/mcp_config.json`, or from
+an MCP server you set up for all workspaces, asks first in `ask` or
+`accept-edits` is unknown, and the check below does not cover such a tool.
+In `ask` and `accept-edits`, a subagent's approval requests never reach
+Octet, so Octet says
 once per turn when Antigravity starts one: what it must ask for waits and does
 not run.
 
@@ -541,6 +545,15 @@ the files differ from the start, flag or not: `/trust` is the only way to
 accept a later change (or quit and start Octet again with the flag). A
 workspace without these files needs no trust. The phone cannot trust a
 workspace.
+
+Trust covers those configuration files, not the scripts or programs a hook or
+an MCP entry runs: such a script outside `.agents/plugins/` can change
+without Octet noticing, and in `accept-edits`, where edits proceed, an edited script
+runs on the next prompt. Octet reads at most 2,000 entries under `plugins/`,
+folders nested at most 16 deep, and 64 MiB of configuration in all. Past
+those limits Octet cannot check the workspace, and Antigravity cannot start
+in it, with `--trust-workspace-config` too: the check fails before the flag
+is looked at.
 
 Octet does not offer `/fork` for Antigravity or `/steer` (the text is queued as
 the next prompt). Usage shows a token count, not a cost. Skills are

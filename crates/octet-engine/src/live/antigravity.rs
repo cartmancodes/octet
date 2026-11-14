@@ -43,10 +43,13 @@ pub(super) const PROVIDER: Provider = Provider {
     offline: false,
     modes: [
         concat!(
-            "Antigravity asks before commands, edits and other actions; reads inside the workspace ",
-            "never ask; a subagent's requests never reach Octet (mode default)"
+            "Antigravity asks before commands and edits; reads inside the workspace never ask; ",
+            "a subagent's requests never reach Octet; Octet has not checked MCP tools (mode default)"
         ),
-        "Edits proceed; commands and other actions ask; a subagent's requests never reach Octet (mode accept-edits)",
+        concat!(
+            "Edits proceed; commands and other actions ask; a subagent's requests never reach Octet; ",
+            "Octet has not checked MCP tools (mode accept-edits)"
+        ),
         concat!(
             "Antigravity's own checker and sandbox decide; it asks rarely ",
             "(network and delete commands ran unasked when tested) (mode auto)"
@@ -1142,6 +1145,22 @@ mod tests {
         assert_eq!(
             antigravity_stray_reply(&json!({"jsonrpc": "2.0", "method": "session/update"})),
             None
+        );
+    }
+
+    #[test]
+    fn the_mode_descriptions_name_what_octet_has_not_checked() {
+        assert_eq!(
+            PROVIDER.modes,
+            [
+                "Antigravity asks before commands and edits; reads inside the workspace never ask; \
+                 a subagent's requests never reach Octet; Octet has not checked MCP tools (mode default)",
+                "Edits proceed; commands and other actions ask; a subagent's requests never reach Octet; \
+                 Octet has not checked MCP tools (mode accept-edits)",
+                "Antigravity's own checker and sandbox decide; it asks rarely \
+                 (network and delete commands ran unasked when tested) (mode auto)",
+                "No permission checks at all (toolPermission always-proceed)",
+            ]
         );
     }
 

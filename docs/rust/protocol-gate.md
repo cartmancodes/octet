@@ -79,7 +79,7 @@ characters).
 | `resume` | Reopening a session | yes | yes | yes | yes |
 | `fork` | Forking a session | yes | yes | yes | no |
 | `compact` | Compacting a session's context | yes | yes | no | yes |
-| `mcp` | An MCP tool call | yes | no | no | no |
+| `mcp` | An MCP tool call | yes | no | no | no (see below) |
 | `hook` | A hook callback | yes | no | no | no |
 | `user-input` | A request for user input | no | yes | no | no |
 | `tool-only` | A turn that only runs a tool | no | yes | no | no |
@@ -190,6 +190,11 @@ value, fails the run with what Antigravity said.
   30 s and passes only if `gate-sub.txt` does not exist and no `execute`
   tool call completed on the connection. The evidence records the reply,
   and `manage_subagents`' own output if its updates carry any.
+
+Antigravity has no `mcp` scenario: it would need an MCP server fixture
+loaded through `.agents/mcp_config.json` and the real CLI. Whether an MCP
+tool asks first is therefore unchecked, and the `/mode` descriptions for
+`ask` and `accept-edits` say "Octet has not checked MCP tools".
 
 The evidence's `antigravity` object holds the version and whether Octet
 lists it as verified (`ANTIGRAVITY_VERIFIED_VERSIONS`), the launch (the
