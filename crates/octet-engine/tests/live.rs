@@ -5689,7 +5689,10 @@ async fn antigravity_a_missing_session_is_an_error_not_a_hang() {
 async fn antigravity_signed_out_says_how_to_sign_in() {
     let (_dir, c) = antigravity(serde_json::json!({"signedOut": true}));
     let (_handle, mut events, task) = spawn(c);
-    assert_eq!(expect_error(&mut events).await, AGY_SIGN_IN);
+    assert_eq!(
+        expect_error(&mut events).await,
+        format!("{AGY_SIGN_IN}. Antigravity said: Authentication required")
+    );
     ended(task).await;
 }
 /// Every event of a session that connects, then runs two plain turns.
@@ -6379,7 +6382,7 @@ fn agy_permission(session: &str, id: &str) -> String {
     let request = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission",
         "params": {"sessionId": session,
             "toolCall": {"toolCallId": "call-1", "name": "run_command", "kind": "execute",
-                "title": "echo fixture", "rawInput": {"command": "echo fixture"}, "status": "pending"},
+                "title": "echo fixture", "rawInput": {"CommandLine": "echo fixture"}, "status": "pending"},
             "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
                 {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]}});
     format!("echo '{request}'")
@@ -6437,6 +6440,72 @@ async fn antigravity_cancel_denies_a_waiting_approval() {
     assert_eq!(
         agy_turn(&handle, &mut events).await,
         (None, Outcome::Completed)
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_turn_that_ends_with_an_approval_waiting_denies_it() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let mut steps = agy_handshake();
+    steps.push(format!(
+        "{}\n{}",
+        agy_permission("s1", "1"),
+        agy_reply(4, &serde_json::json!({"stopReason": "end_turn"}))
+    ));
+    steps.push(":".to_owned());
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let Event::Approval { id, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    let mut closed = false;
+    let outcome = loop {
+        match next(&mut events).await {
+            Event::ApprovalClosed(done) if done == id => closed = true,
+            Event::Finished { outcome } => break outcome,
+            Event::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert_eq!(outcome, Outcome::Completed);
+    agy_seen_until_sent(&mut events, &c, 5).await;
+    assert!(closed, "the approval was closed");
+    assert_eq!(agy_sent(&c)[4], agy_denial("1"));
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_an_allow_a_request_cannot_take_is_refused_with_a_notice() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let request = serde_json::json!({"jsonrpc": "2.0", "id": "1", "method": "session/request_permission",
+        "params": {"sessionId": "s1",
+            "toolCall": {"toolCallId": "call-1", "kind": "execute", "title": "echo fixture"},
+            "options": [{"optionId": "allow", "name": "Always", "kind": "allow_always"}]}});
+    let mut steps = agy_handshake();
+    steps.push(format!("echo '{request}'"));
+    steps.push(agy_reply(4, &serde_json::json!({"stopReason": "end_turn"})));
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    let Event::Approval { id, .. } =
+        wait_for(&mut events, |e| matches!(e, Event::Approval { .. })).await
+    else {
+        unreachable!()
+    };
+    handle.send(Command::Answer { id, allow: true }).unwrap();
+    let seen = until_finished(&mut events).await;
+    assert!(
+        seen.iter().any(|e| matches!(e, Event::Notice(text) if text
+            == "Antigravity offered no way to allow this request once; Octet refused it instead")),
+        "{seen:?}"
+    );
+    assert_eq!(
+        agy_sent(&c)[4],
+        serde_json::json!({"jsonrpc": "2.0", "id": "1", "result": {"outcome": {"outcome": "cancelled"}}})
     );
     stop(&handle, task).await;
 }
@@ -7443,7 +7512,7 @@ fn agy_command_started() -> String {
     agy_update(
         &serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "call-1",
         "name": "run_command", "kind": "execute", "title": "echo fixture",
-        "rawInput": {"command": "echo fixture"}, "status": "in_progress"}),
+        "rawInput": {"CommandLine": "echo fixture"}, "status": "in_progress"}),
     )
 }
 /// The scripted `tool_call_update` that says `call-1` completed.
@@ -7485,7 +7554,7 @@ async fn antigravity_a_command_kind_named_only_on_a_later_frame_trips() {
             ),
             agy_update(
                 &serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1",
-                "kind": "execute", "rawInput": {"command": "rm x"}, "status": "completed"})
+                "kind": "execute", "rawInput": {"CommandLine": "rm x"}, "status": "completed"})
             )
         ),
         agy_reply(4, &serde_json::json!({"stopReason": "cancelled"})),

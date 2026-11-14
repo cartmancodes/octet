@@ -601,4 +601,15 @@ mod tests {
             assert_eq!(stop, None, "{id}");
         }
     }
+
+    #[test]
+    fn a_command_without_a_title_is_named_by_its_command_line() {
+        let mut tools = Tools::default();
+        let (call, _) = tools.frame(
+            &json!({"toolCallId": "c", "name": "run_command", "kind": "execute", "status": "in_progress",
+                "rawInput": {"CommandLine": "ls -la", "WaitMsBeforeAsync": 0, "toolSummary": "List"}}),
+            Mode::Auto,
+        );
+        assert_eq!(call.target, "ls -la");
+    }
 }

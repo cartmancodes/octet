@@ -210,6 +210,10 @@ impl Protocol for AntigravityProtocol {
         acp::permission_reply(wire, allow, PERMISSION_IDS)
     }
 
+    fn allow_withheld(wire: &Value) -> bool {
+        acp::allow_withheld(wire)
+    }
+
     fn mode_change_pending(&self) -> bool {
         self.switches.pending()
     }
@@ -946,8 +950,10 @@ impl AntigravityProtocol {
 
     /// The prompt's reply ends the turn, with its token count when it has
     /// one; a turn Octet cancelled fails with its reason, whatever the reply
-    /// says. A set-back due is sent then.
+    /// says. An approval still waiting is denied first, so Antigravity is not
+    /// left with a request open. A set-back due is sent then.
     async fn prompt_ended(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
+        core.deny_all_pending().await?;
         if !core.phase.is_running() {
             return Ok(());
         }
@@ -1070,9 +1076,10 @@ fn version_notice(version: Option<&str>) -> Option<String> {
     })
 }
 
-/// Why the session could not be opened: [`SIGN_IN`] when Antigravity is not
-/// signed in (code `-32000`, or a message about signing in), else its
-/// message.
+/// Why the session could not be opened: [`SIGN_IN`] when Antigravity looks
+/// signed out (code `-32000`, or a message about signing in), then its own
+/// message, which may say otherwise (the signed-out reply of the real CLI
+/// is unconfirmed); else its message.
 fn open_error(error: &Value) -> String {
     let message = acp::error_text(error);
     let lower = message.to_lowercase();
@@ -1081,7 +1088,7 @@ fn open_error(error: &Value) -> String {
             .iter()
             .any(|word| lower.contains(word));
     if signed_out {
-        SIGN_IN.to_owned()
+        format!("{SIGN_IN}. Antigravity said: {message}")
     } else {
         format!("Antigravity could not open the session: {message}")
     }
@@ -1143,13 +1150,28 @@ mod tests {
 
     #[test]
     fn signing_in_is_recognised_by_code_or_by_words() {
-        for error in [
-            json!({"code": -32000, "message": "Something"}),
-            json!({"code": -32603, "message": "Please LOG IN again"}),
-            json!({"code": -32603, "message": "Unauthenticated"}),
+        for (error, said) in [
+            (json!({"code": -32000, "message": "Something"}), "Something"),
+            (
+                json!({"code": -32603, "message": "Please LOG IN again"}),
+                "Please LOG IN again",
+            ),
+            (
+                json!({"code": -32603, "message": "Unauthenticated"}),
+                "Unauthenticated",
+            ),
         ] {
-            assert_eq!(open_error(&error), SIGN_IN, "{error}");
+            assert_eq!(
+                open_error(&error),
+                format!("{SIGN_IN}. Antigravity said: {said}"),
+                "{error}"
+            );
         }
+        // Antigravity's message is bounded as every vendor message is.
+        let long = json!({"code": -32000, "message": "x".repeat(100_000)});
+        let shown = open_error(&long);
+        assert!(shown.ends_with("[detail exceeds preview limit]"), "{shown}");
+        assert!(shown.len() < 40_000);
         assert_eq!(
             open_error(&json!({"code": -32603, "message": "Failed to read session x"})),
             "Antigravity could not open the session: Failed to read session x"

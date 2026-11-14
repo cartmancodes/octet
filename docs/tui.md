@@ -146,6 +146,10 @@ sets 10–3600), cancellation and unknown request types fail closed; requests to
 At most eight approvals wait at once; a ninth is denied with a notice. Claude
 receives the reason with each denial (your refusal, the timeout, the cap), so it
 can tell a refusal from a limit; Codex's decline carries no reason.
+Allow always answers with the request's allow-once option: when an opencode or
+Antigravity request offers none, Octet refuses it instead (with its reject
+option, else by cancelling it) and says so. An Antigravity turn that ends while
+an approval still waits denies it.
 Vendor sandbox policy still applies. The vendor policy depends on the permission
 mode below; this is not a promise that every vendor action raises a dialog.
 When an approval starts waiting, Octet rings the terminal bell once and sends a desktop
@@ -477,7 +481,11 @@ session with all checks off. Leaving it reconnects again.
 
 Antigravity runs as `agy acp`. It uses the Google account you signed in to with
 `agy`; Octet never reads its credentials, and when Antigravity is signed out
-the session stops with "Sign in to Antigravity first: run `agy`".
+the session stops with "Sign in to Antigravity first: run `agy`", followed by
+Antigravity's own message. What the real CLI answers when signed out has not
+been confirmed: Octet gives that hint when opening the session fails with
+error code -32000, or with a message that mentions signing in, logging in or
+authentication.
 
 Octet starts `agy acp` with a settings folder of its own, `antigravity/review`
 (`antigravity/proceed` for `full-access`) in the journal directory. Its
@@ -485,7 +493,9 @@ Octet starts `agy acp` with a settings folder of its own, `antigravity/review`
 read-only and up to 1 MiB, without the keys that would skip permission
 requests (`agentMode`, `permissions.allow`) and with `toolPermission` set to
 `request-review` (`always-proceed` for `full-access`); every other key stays (a
-`permissions` that is not an object is dropped too). A file Octet cannot use is
+`permissions` that is not an object is dropped too, and so is any key, at the
+top or inside `permissions`, whose name is not plain ASCII, since Antigravity
+could read it as one of the keys Octet removes; a notice says how many). A file Octet cannot use is
 left out with a notice, and the session runs without your own settings. Octet
 never writes to your Antigravity settings, and a journal directory inside
 `~/.gemini` is refused. Antigravity takes the folder's name relative to its

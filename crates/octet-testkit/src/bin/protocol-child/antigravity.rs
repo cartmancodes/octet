@@ -106,7 +106,7 @@ struct Tool {
     kind: &'static str,
     /// The title shown for the call.
     title: &'static str,
-    /// The tool's input.
+    /// The tool's input, with the keys `agy` 1.5.5 uses.
     input: Value,
     /// The files it touches; only the edit names any.
     locations: Option<Value>,
@@ -120,7 +120,7 @@ impl Tool {
             name: "run_command",
             kind: "execute",
             title: "echo fixture",
-            input: json!({"command":"echo fixture"}),
+            input: json!({"CommandLine":"echo fixture","WaitMsBeforeAsync":0,"toolSummary":"Run echo fixture"}),
             locations: None,
         }
     }
@@ -137,7 +137,7 @@ impl Tool {
             name: "write_file",
             kind: "edit",
             title: "File fixture.txt",
-            input: json!({"path":path,"content":"fixture\n"}),
+            input: json!({"Path":path,"Content":"fixture\n"}),
             locations: Some(json!([{"path":path}])),
         }
     }

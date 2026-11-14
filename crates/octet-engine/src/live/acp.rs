@@ -334,29 +334,53 @@ pub(super) fn cancel(session: &str) -> Value {
     })
 }
 
+/// The options a `session/request_permission` lists; `None` when it lists
+/// none (no `options`, or an empty list).
+fn listed_options(wire: &Value) -> Option<&Vec<Value>> {
+    wire.pointer("/params/options")
+        .and_then(Value::as_array)
+        .filter(|options| !options.is_empty())
+}
+
+/// Whether allowing `wire` cannot be sent as an allow: it lists options,
+/// none of them `allow_once`, so [`permission_reply`] refuses it instead.
+pub(super) fn allow_withheld(wire: &Value) -> bool {
+    listed_options(wire)
+        .is_some_and(|options| !options.iter().any(|option| option["kind"] == "allow_once"))
+}
+
 /// The reply to a `session/request_permission`: the request's own
 /// `allow_once` or `reject_once` option, never one that allows for longer.
-/// `fallback` is the option ID (allow, reject) used when the request lists
-/// no such option.
+/// `fallback` is the option ID (allow, reject) used only when the request
+/// lists no options. When it lists some but not the wanted kind, an allow
+/// is answered with its `reject_once` option, and otherwise the request is
+/// cancelled: an ID the request does not list as that kind could allow for
+/// longer.
 pub(super) fn permission_reply(wire: &Value, allow: bool, fallback: (&str, &str)) -> Value {
-    let (kind, fallback) = if allow {
-        ("allow_once", fallback.0)
-    } else {
-        ("reject_once", fallback.1)
+    let outcome = match listed_options(wire) {
+        None => {
+            let id = if allow { fallback.0 } else { fallback.1 };
+            json!({"outcome": "selected", "optionId": id})
+        }
+        Some(options) => {
+            let of_kind = |kind: &str| {
+                options
+                    .iter()
+                    .find(|option| option["kind"] == kind)
+                    .and_then(|option| option["optionId"].as_str())
+            };
+            let chosen = if allow {
+                of_kind("allow_once").or_else(|| of_kind("reject_once"))
+            } else {
+                of_kind("reject_once")
+            };
+            match chosen {
+                Some(id) => json!({"outcome": "selected", "optionId": id}),
+                None => json!({"outcome": "cancelled"}),
+            }
+        }
     };
-    let option = wire
-        .pointer("/params/options")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|option| option["kind"] == kind)
-        .and_then(|option| option["optionId"].as_str())
-        .unwrap_or(fallback);
-    json!({
-        "jsonrpc": "2.0",
-        "id": wire["id"],
-        "result": {"outcome": {"outcome": "selected", "optionId": option}},
-    })
+    json!({"jsonrpc": "2.0", "id": wire["id"], "result": {"outcome": outcome}})
 }
 
 /// The reply to a request Octet will not put in front of the user. A
@@ -498,14 +522,21 @@ pub(super) fn content_text(content: &Value) -> String {
 /// What a tool call's frame says the call acts on, in one line: a command's
 /// command (its location is only the folder it runs in), else the first path
 /// it touches, else its command; `None` when the frame names none of them.
+/// The command is `rawInput.command` (opencode) or `rawInput.CommandLine`
+/// (Antigravity's `run_command`); a path is the first location, else
+/// `rawInput.Path` (Antigravity's `write_file`).
 pub(super) fn frame_target(update: &Value) -> Option<String> {
-    let command = update.pointer("/rawInput/command").and_then(Value::as_str);
+    let input = &update["rawInput"];
+    let command = input["command"]
+        .as_str()
+        .or_else(|| input["CommandLine"].as_str());
     let target = if update["kind"] == "execute" {
         command
     } else {
         update
             .pointer("/locations/0/path")
             .and_then(Value::as_str)
+            .or_else(|| input["Path"].as_str())
             .or(command)
     };
     target.map(one_line).filter(|target| !target.is_empty())
@@ -775,6 +806,63 @@ mod tests {
             permission_reply(&bare, false, ("once", "reject"))["result"]["outcome"]["optionId"],
             "reject"
         );
+    }
+
+    #[test]
+    fn listed_options_without_the_wanted_kind_never_get_the_fallback_id() {
+        let outcome = |options: Value, allow: bool| {
+            let wire = json!({"id": 9, "params": {"options": options}});
+            permission_reply(&wire, allow, ("once", "reject"))["result"]["outcome"].clone()
+        };
+        // No `allow_once`: the reject option answers an allow.
+        let always = json!([
+            {"optionId": "once", "kind": "allow_always"},
+            {"optionId": "no", "kind": "reject_once"},
+        ]);
+        assert_eq!(
+            outcome(always, true),
+            json!({"outcome": "selected", "optionId": "no"})
+        );
+        // Neither wanted kind: the request is cancelled, whatever its IDs.
+        let only_always = json!([{"optionId": "once", "kind": "allow_always"}]);
+        for allow in [true, false] {
+            assert_eq!(
+                outcome(only_always.clone(), allow),
+                json!({"outcome": "cancelled"})
+            );
+        }
+        // An empty list is no list: the fallback IDs.
+        assert_eq!(
+            outcome(json!([]), true),
+            json!({"outcome": "selected", "optionId": "once"})
+        );
+        assert!(allow_withheld(&json!({"params": {"options": [
+            {"optionId": "once", "kind": "allow_always"}]}})));
+        for wire in [
+            json!({"params": {}}),
+            json!({"params": {"options": []}}),
+            json!({"params": {"options": [{"optionId": "y", "kind": "allow_once"}]}}),
+        ] {
+            assert!(!allow_withheld(&wire), "{wire}");
+        }
+    }
+
+    #[test]
+    fn a_frames_target_comes_from_either_vendors_input_keys() {
+        // opencode's keys.
+        let opencode = json!({"kind": "execute", "rawInput": {"command": "ls"}});
+        assert_eq!(frame_target(&opencode).as_deref(), Some("ls"));
+        // Antigravity 1.5.5's: `CommandLine` for `run_command`, `Path` for
+        // `write_file`; no title needed.
+        let command = json!({"kind": "execute",
+            "rawInput": {"CommandLine": "rm -rf build", "WaitMsBeforeAsync": 500, "toolSummary": "Clean"}});
+        assert_eq!(frame_target(&command).as_deref(), Some("rm -rf build"));
+        let write = json!({"kind": "edit", "rawInput": {"Path": "/w/a.txt", "Content": "x"}});
+        assert_eq!(frame_target(&write).as_deref(), Some("/w/a.txt"));
+        // A location still comes first for anything but a command.
+        let located = json!({"kind": "edit", "locations": [{"path": "/w/b.txt"}],
+            "rawInput": {"Path": "/w/a.txt"}});
+        assert_eq!(frame_target(&located).as_deref(), Some("/w/b.txt"));
     }
 
     #[test]

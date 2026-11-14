@@ -597,6 +597,12 @@ impl<P: Protocol> Driver<P> {
             return core.emit(Event::Notice("That approval is no longer active".into()));
         };
         core.send(core.answer(&pending.wire, allow)).await?;
+        if allow && P::allow_withheld(&pending.wire) {
+            core.emit(Event::Notice(format!(
+                "{} offered no way to allow this request once; Octet refused it instead",
+                core.config.engine.title()
+            )))?;
+        }
         core.emit(Event::ApprovalClosed(id))?;
         // The silence watchdog was paused while the user decided.
         core.resume_watchdog();

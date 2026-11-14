@@ -286,6 +286,11 @@ pub(crate) trait Protocol: Default + Send {
     ) -> impl Future<Output = Result<(), DriverError>> + Send;
     /// The reply allowing or denying the approval request `wire`.
     fn answer(wire: &Value, allow: bool) -> Value;
+    /// Whether `answer` cannot allow `wire` and refuses it instead (it
+    /// offers no way to allow once); the driver then says so.
+    fn allow_withheld(_wire: &Value) -> bool {
+        false
+    }
     /// The reply denying `wire` because of `reason`. A vendor that passes a
     /// reason on to the model overrides this; the default is a plain deny.
     fn deny(wire: &Value, _reason: &str) -> Value {

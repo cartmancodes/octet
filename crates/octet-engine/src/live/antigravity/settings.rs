@@ -53,19 +53,30 @@ fn pin_folder(mode: Mode) -> &'static str {
 }
 
 /// The JSON text of Octet's settings file for `mode`, built from the user's
-/// settings `user`, and a notice when `user` could not be used. The user's
-/// request-skipping settings are dropped (`agentMode`, `permissions.allow`,
-/// whatever the letter case of the keys, since Octet cannot see how
-/// Antigravity matches them) and `toolPermission` is pinned; every other key
-/// is kept as it was.
-pub(super) fn merged(user: Option<&str>, mode: Mode) -> (String, Option<&'static str>) {
-    let (mut settings, notice) = match user.map(serde_json::from_str::<Value>) {
+/// settings `user`, and a notice when `user` could not be used or keys were
+/// left out for their names. The user's request-skipping settings are
+/// dropped (`agentMode`, `permissions.allow`, whatever the letter case of
+/// the keys, since Octet cannot see how Antigravity matches them) and
+/// `toolPermission` is pinned. A key whose name is not plain ASCII, at the
+/// top or inside `permissions`, is dropped too: Go folds key names by
+/// Unicode (`ſ` matches `s`, the Kelvin sign `k`), so it could be read as
+/// one of those. Every other key is kept as it was.
+pub(super) fn merged(user: Option<&str>, mode: Mode) -> (String, Option<String>) {
+    let (mut settings, mut notice) = match user.map(serde_json::from_str::<Value>) {
         None => (Map::new(), None),
         Some(Ok(Value::Object(map))) => (map, None),
-        Some(_) => (Map::new(), Some(USER_SETTINGS_NOTICE)),
+        Some(_) => (Map::new(), Some(USER_SETTINGS_NOTICE.to_owned())),
+    };
+    let mut unplain = 0;
+    let mut plain = |key: &String| {
+        let ascii = key.is_ascii();
+        unplain += usize::from(!ascii);
+        ascii
     };
     settings.retain(|key, _| {
-        !key.eq_ignore_ascii_case("toolPermission") && !key.eq_ignore_ascii_case("agentMode")
+        plain(key)
+            && !key.eq_ignore_ascii_case("toolPermission")
+            && !key.eq_ignore_ascii_case("agentMode")
     });
     settings.retain(|key, value| {
         if !key.eq_ignore_ascii_case("permissions") {
@@ -73,12 +84,18 @@ pub(super) fn merged(user: Option<&str>, mode: Mode) -> (String, Option<&'static
         }
         match value {
             Value::Object(permissions) => {
-                permissions.retain(|name, _| !name.eq_ignore_ascii_case("allow"));
+                permissions.retain(|name, _| plain(name) && !name.eq_ignore_ascii_case("allow"));
                 true
             }
             _ => false,
         }
     });
+    if unplain > 0 {
+        notice = Some(format!(
+            "Octet left out {unplain} of your Antigravity settings whose names are not plain ASCII: \
+             Antigravity could read such a name as one of the settings Octet removes"
+        ));
+    }
     let pin = if mode == Mode::FullAccess {
         "always-proceed"
     } else {
@@ -155,7 +172,7 @@ pub(super) fn write(
         }
     };
     let (text, notice) = merged(user.as_deref(), mode);
-    notices.extend(notice.map(str::to_owned));
+    notices.extend(notice);
     guarded::write_private(&dir, FILE, text.as_bytes())
         .map_err(|error| write_error(&dir.join(FILE), error))?;
     Ok(notices)
@@ -210,7 +227,7 @@ mod tests {
         for user in ["[1]", "{broken"] {
             let (text, notice) = merged(Some(user), Mode::Ask);
             assert_eq!(parsed(&text), json!({"toolPermission": "request-review"}));
-            assert_eq!(notice, Some(USER_SETTINGS_NOTICE));
+            assert_eq!(notice.as_deref(), Some(USER_SETTINGS_NOTICE));
         }
     }
 
@@ -234,6 +251,31 @@ mod tests {
         assert_eq!(settings["Permissions"], json!({"deny": ["command(rm)"]}));
         assert!(settings.get("PERMISSIONS").is_none());
         assert_eq!(settings["modelProvider"], "x");
+        assert_eq!(notice, None);
+    }
+
+    #[test]
+    fn keys_with_non_ascii_names_are_dropped_with_a_count() {
+        // U+017F (long s) folds to `s` and U+212A (Kelvin) to `k` in Go's
+        // key matching: either could be read as a key Octet removes.
+        let user = "{\"toolPermi\u{17f}\u{17f}ion\":\"always-proceed\",\"\u{212a}eep\":1,\
+            \"permissions\":{\"allow\":[\"x\"],\"\u{212a}\":[\"command(*)\"],\"deny\":[\"y\"]},\
+            \"modelProvider\":\"x\"}";
+        let (text, notice) = merged(Some(user), Mode::Ask);
+        let settings = parsed(&text);
+        assert_eq!(
+            settings,
+            json!({"permissions": {"deny": ["y"]}, "modelProvider": "x",
+                "toolPermission": "request-review"})
+        );
+        assert_eq!(
+            notice.as_deref(),
+            Some(
+                "Octet left out 3 of your Antigravity settings whose names are not plain ASCII: \
+                 Antigravity could read such a name as one of the settings Octet removes"
+            )
+        );
+        let (_, notice) = merged(Some(r#"{"modelProvider":"x"}"#), Mode::Ask);
         assert_eq!(notice, None);
     }
 

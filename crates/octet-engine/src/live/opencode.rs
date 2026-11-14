@@ -204,6 +204,10 @@ impl Protocol for OpencodeProtocol {
         acp::permission_reply(wire, allow, PERMISSION_IDS)
     }
 
+    fn allow_withheld(wire: &Value) -> bool {
+        acp::allow_withheld(wire)
+    }
+
     fn mode_change_pending(&self) -> bool {
         self.switches.pending()
     }
