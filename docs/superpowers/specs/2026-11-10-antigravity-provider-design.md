@@ -145,13 +145,24 @@ workspace. The account's tier is reported as "Google AI Plus".
   request, while the session reported mode `default`. Adding `ask` rules
   (`command(*)`, `write_file(*)`, `mcp(*)`, `read_url(*)`, `execute_url(*)`)
   did **not** bring the requests back.
-- **`--cli_dir_name DIR` moves the settings file.** With the user's
-  settings file saying `always-proceed`, and `agy acp --cli_dir_name DIR`
-  where `DIR/settings.json` says `{"toolPermission": "request-review"}`,
-  both actions asked again. `DIR` may be an absolute path outside
-  `~/.gemini`; `agy` then writes nothing of its own there in a short run.
-  With a relative name it also creates `cache` and `log` inside it.
-  Conversations stay in the shared place either way.
+- **`--cli_dir_name NAME` moves the settings file.** `agy acp --help` calls
+  it the "Subdirectory under app_data_dir for CLI settings and logs"; the
+  app data folder is `<gemini dir>/antigravity-cli`. With the user's
+  settings file saying `always-proceed`, and `agy acp --cli_dir_name NAME`,
+  both actions asked again. Conversations stay in the shared place.
+
+  *Corrected 2026-11-12.* This said an absolute `DIR` names that folder.
+  It does not: `agy` joins an absolute name under its app data folder,
+  dropping the leading `/` (its log: `Failed to load CLI settings, using
+  defaults: open <gemini dir>/antigravity-cli/<DIR>/settings.json: no such
+  file or directory`), makes `cache` and `log` there, and runs on its
+  defaults. The requests above came back only because the defaults ask.
+  Verified now (scratch `--gemini-dir`): a name of 32 `../` (24 works too)
+  followed by the folder's absolute path without its leading `/` resolves
+  to the folder itself; `agy` reads `settings.json` there (a malformed file
+  is reported, a valid one is not) and makes its `cache` and `log` inside
+  it, and nothing for it under its home. Switching model, thinking level
+  and mode over ACP did not rewrite the file.
 - A session opened under a settings file with `agentMode: "accept-edits"`
   still started in mode `default`.
 
@@ -253,8 +264,13 @@ settings saying `request-review`) together, which work in one launch.
    including that reads inside the workspace never ask.
 
 4. **Octet's own settings file closes the `always-proceed` gap.** Octet
-   launches `agy acp --cli_dir_name <DIR>`, where `<DIR>` is a folder in
-   Octet's own data directory, never under `~/.gemini`. Octet writes
+   launches `agy acp --cli_dir_name <NAME>`, where `<NAME>` names a folder
+   `<DIR>` in Octet's own data directory, never under `~/.gemini`: 32 `../`
+   (to climb out of `agy`'s app data folder to the root), then `<DIR>`'s
+   absolute path without its leading `/`. *Corrected 2026-11-12:* this
+   said `<DIR>` itself; `agy` joins an absolute name under
+   `~/.gemini/antigravity-cli` and then runs on its defaults, never reading
+   Octet's file (see "What was verified"). Octet writes
    `<DIR>/settings.json` fresh before every launch, so nothing `agy` saved
    there carries over. The user's own settings file is read, never written.
    What Octet's file holds:

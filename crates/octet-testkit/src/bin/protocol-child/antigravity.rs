@@ -1,8 +1,9 @@
 //! The fake Antigravity agent (`agy acp --cli_dir_name <folder>`): the Agent
 //! Client Protocol's `initialize` and `session/*` requests, with the scripts in
-//! `scenario` chosen by the prompt's first text block. At start it reads
-//! `<folder>/settings.json` (its `toolPermission` decides whether a turn asks)
-//! and, when the working directory has one, `fake-agy.json` (see [`Knobs`]).
+//! `scenario` chosen by the prompt's first text block. At start it reads the
+//! `settings.json` of its settings folder, found as `agy` finds it (see
+//! [`settings_folder`]; its `toolPermission` decides whether a turn asks) and,
+//! when the working directory has one, `fake-agy.json` (see [`Knobs`]).
 use crate::wire::{acp_error, acp_result, acp_text, acp_update, emit};
 use octet_testkit::scenario;
 use serde_json::{Map, Value, json};
@@ -10,6 +11,7 @@ use std::{
     collections::VecDeque,
     env, fs,
     io::{self, BufRead, Write as _},
+    path::{Component, Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
@@ -307,6 +309,45 @@ fn flag_value(name: &str) -> Option<String> {
     None
 }
 
+/// `path` with `.` and `..` folded away by name alone, as `agy` resolves its
+/// settings folder; a `..` at the root is dropped.
+fn fold(path: &Path) -> PathBuf {
+    let mut folded = PathBuf::from("/");
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => folded.push(name),
+            Component::ParentDir => {
+                folded.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    folded
+}
+
+/// The settings folder, found as `agy` 1.5.5 finds it: under its app data
+/// folder (`<gemini dir>/antigravity-cli`, the gemini dir being `--gemini-dir`,
+/// else `$HOME/.gemini`), the `--cli_dir_name` value with any leading `/`
+/// removed, `.` and `..` folded by name. An absolute value therefore lands
+/// inside the gemini dir. `None` without `--cli_dir_name`, and for a folder
+/// inside the user's real `~/.gemini` (when `--gemini-dir` is absent): the
+/// fake never reads the user's Antigravity home, and Octet keeps no settings
+/// there, so `agy` would find none.
+fn settings_folder() -> Option<PathBuf> {
+    let value = flag_value("--cli_dir_name")?;
+    let scratch = flag_value("--gemini-dir").map(PathBuf::from);
+    let gemini = match &scratch {
+        Some(dir) => dir.clone(),
+        None => PathBuf::from(env::var_os("HOME")?).join(".gemini"),
+    };
+    let folder = fold(
+        &gemini
+            .join("antigravity-cli")
+            .join(value.trim_start_matches('/')),
+    );
+    (scratch.is_some() || !folder.starts_with(fold(&gemini))).then_some(folder)
+}
+
 /// The frame a line holds; `None` for a blank one.
 fn parse(line: &str) -> Option<Value> {
     (!line.trim().is_empty()).then(|| serde_json::from_str(line).unwrap())
@@ -319,8 +360,8 @@ pub(crate) fn run() {
         fs::create_dir_all(".agents").unwrap();
         fs::write(".agents/hooks.json", "{}").unwrap();
     }
-    let settings = flag_value("--cli_dir_name")
-        .and_then(|dir| fs::read_to_string(format!("{dir}/settings.json")).ok())
+    let settings = settings_folder()
+        .and_then(|dir| fs::read_to_string(dir.join("settings.json")).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(Value::is_object)
         .unwrap_or(Value::Null);

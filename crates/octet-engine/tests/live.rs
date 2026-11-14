@@ -5529,10 +5529,17 @@ async fn antigravity_launches_against_octets_settings() {
     let (handle, mut events, task) = spawn(c);
     wait_for(&mut events, |e| matches!(e, Event::ModeChanged(_))).await;
     let echo = agy_params(&handle, &mut events).await;
+    // The folder is named by climbing to the root first: `agy` joins the name
+    // under its own app data folder.
     let folder = dir.path().join("data/antigravity/review");
+    let name = format!(
+        "{}{}",
+        "../".repeat(32),
+        folder.to_str().unwrap().trim_start_matches('/')
+    );
     assert_eq!(
         echo["argv"],
-        serde_json::json!(["acp", "--cli_dir_name", folder.to_str().unwrap()])
+        serde_json::json!(["acp", "--cli_dir_name", name])
     );
     let settings = &echo["settings"];
     assert_eq!(settings["toolPermission"], "request-review", "{echo}");

@@ -50,16 +50,39 @@ pub(super) fn mode_of(id: &str, pinned: Mode) -> Option<Mode> {
     }
 }
 
+/// How many `../` start the name of Octet's settings folder (see
+/// [`cli_dir_arg`]). `agy` joins `--cli_dir_name` under its app data folder
+/// (`<gemini dir>/antigravity-cli`), so the name must climb out of it to the
+/// root first. 32 is more than any such folder is deep, on purpose: a `..`
+/// at the root stays at the root, so the name does not depend on where the
+/// vendor home is, on `--gemini-dir`, or on whether `agy` resolves `..` by
+/// name or through the file system.
+const CLIMB: usize = 32;
+
+/// The `--cli_dir_name` value that names `dir` to `agy`: [`CLIMB`] `../`,
+/// then `dir`'s absolute path without its leading `/`. An absolute name
+/// would not do: `agy` 1.5.5 joins it under its app data folder (dropping
+/// the `/`) and, finding no settings there, runs on its defaults. A
+/// relative `dir` is made absolute first (from the working directory), or
+/// used as given if that fails.
+fn cli_dir_arg(dir: &Path) -> OsString {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
+    let mut name = OsString::from("../".repeat(CLIMB));
+    name.push(dir.strip_prefix("/").unwrap_or(&dir));
+    name
+}
+
 /// The arguments that start `agy acp` with Octet's settings folder for the
-/// mode, and a probe in its scratch home. Without a data directory it is
-/// `acp` alone, which never launches: `prepare` fails first.
+/// mode (named by [`cli_dir_arg`]), and a probe in its scratch home. Without
+/// a data directory it is `acp` alone, which never launches: `prepare`
+/// fails first.
 pub(super) fn launch_args(config: &Config) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["acp".into()];
     let Some(data_dir) = &config.data_dir else {
         return args;
     };
     args.push("--cli_dir_name".into());
-    args.push(settings::cli_dir(data_dir, config.mode).into_os_string());
+    args.push(cli_dir_arg(&settings::cli_dir(data_dir, config.mode)));
     if config.catalog_only {
         args.push("--gemini-dir".into());
         args.push(settings::probe_home(data_dir).into_os_string());
@@ -179,19 +202,76 @@ mod tests {
         config
     }
 
+    /// `name` resolved as `agy` 1.5.5 resolves its `--cli_dir_name`: joined
+    /// under `app_data` with any leading `/` removed, `.` and `..` folded by
+    /// name, a `..` at the root dropped.
+    fn resolved_by_agy(app_data: &Path, name: &OsString) -> PathBuf {
+        let name = Path::new(name);
+        let joined = app_data.join(name.strip_prefix("/").unwrap_or(name));
+        let mut folded = PathBuf::from("/");
+        for part in joined.components() {
+            match part {
+                std::path::Component::Normal(part) => folded.push(part),
+                std::path::Component::ParentDir => {
+                    folded.pop();
+                }
+                _ => {}
+            }
+        }
+        folded
+    }
+
     #[test]
     fn the_launch_names_octets_settings_folder() {
+        let climb = "../".repeat(CLIMB);
         assert_eq!(
             launch_args(&data_config(Mode::Ask)),
-            ["acp", "--cli_dir_name", "/d/antigravity/review"]
+            [
+                OsString::from("acp"),
+                "--cli_dir_name".into(),
+                format!("{climb}d/antigravity/review").into()
+            ]
         );
         assert_eq!(
-            launch_args(&data_config(Mode::FullAccess)),
-            ["acp", "--cli_dir_name", "/d/antigravity/proceed"]
+            launch_args(&data_config(Mode::FullAccess))[2],
+            OsString::from(format!("{climb}d/antigravity/proceed"))
         );
         let mut bare = data_config(Mode::Ask);
         bare.data_dir = None;
         assert_eq!(launch_args(&bare), ["acp"]);
+    }
+
+    #[test]
+    fn agy_resolves_the_settings_folder_to_octets_wherever_its_home_is() {
+        let folder = Path::new("/Users/me/.local/share/octet/antigravity/review");
+        let name = cli_dir_arg(folder);
+        let shallow = Path::new("/h/.gemini/antigravity-cli");
+        let deep: PathBuf = ["/"]
+            .into_iter()
+            .chain(std::iter::repeat_n("level", 24))
+            .chain([".gemini", "antigravity-cli"])
+            .collect();
+        for app_data in [shallow, deep.as_path()] {
+            assert_eq!(
+                resolved_by_agy(app_data, &name),
+                folder,
+                "{}",
+                app_data.display()
+            );
+        }
+        // The old, absolute name lands inside the vendor home.
+        let absolute = OsString::from(folder);
+        assert!(resolved_by_agy(shallow, &absolute).starts_with(shallow));
+    }
+
+    #[test]
+    fn a_relative_folder_is_named_from_the_working_directory() {
+        let name = cli_dir_arg(Path::new("data/antigravity/review"));
+        let expected = std::path::absolute("data/antigravity/review").unwrap();
+        assert_eq!(
+            resolved_by_agy(Path::new("/h/.gemini/antigravity-cli"), &name),
+            expected
+        );
     }
 
     #[test]
