@@ -138,9 +138,9 @@ exits 1 for it. In every Antigravity scenario a tool call that edits or runs
 something (kind `execute`, `edit`, `delete` or `move`) and completes without
 a permission request fails the run, and any request the scenario does not
 handle gets Octet's own reply (`antigravity_stray_reply`: a permission
-request is rejected). Every scenario sets the model and the thinking level
-right after opening the session, and the mode to `default` unless the
-session already reports it; a refusal, or a reply that does not confirm the
+request is rejected). Every scenario but `initialize` (which opens no
+session) sets the model and the thinking level right after opening the
+session, and the mode to `default` unless the session already reports it; a refusal, or a reply that does not confirm the
 value, fails the run with what Antigravity said.
 
 - **`simple`** asks for `READY` and passes if the reply is that word and the
@@ -175,17 +175,21 @@ value, fails the run with what Antigravity said.
   `permissions.allow`. Once the session is open it is `unproven` too unless
   `agy` made its `log` folder in Octet's settings folder: otherwise that
   was not the folder `agy` used. In mode `default` it then asks for
-  `echo fixture` and, in a second turn, for a file `gate.txt`. It passes only if each brought a
-  permission request (which the gate rejects) and `gate.txt` does not exist;
+  `echo fixture` and, in a second turn, for a file `gate.txt`. It passes
+  only if each brought a permission request (which the gate rejects) and
+  `gate.txt` does not exist;
   a missing request leaves it `unproven`.
 - **`subagent`** asks the model to delegate `touch gate-sub.txt` with
   `invoke_subagent`. It is `unproven` unless an `invoke_subagent` tool call
   completed. After 15 s, a second turn asks for the subagent's state with
-  `manage_subagents`: unless that call completed and its output or the reply
-  reports the subagent waiting for input, the run is `unproven`. Then it
-  watches for 30 s and passes only if `gate-sub.txt` does not exist and no
-  `execute` tool call completed on the connection. The evidence records what
-  `manage_subagents` reported.
+  `manage_subagents`, and asks for the reply in a fixed form, exactly one
+  line `STATE: <state>` with the state word as `manage_subagents` reports
+  it. Unless that call completed and the reply is exactly
+  `STATE: waiting_for_input`, the run is `unproven`: free text, another
+  state or a differently written state never counts. Then it watches for
+  30 s and passes only if `gate-sub.txt` does not exist and no `execute`
+  tool call completed on the connection. The evidence records the reply,
+  and `manage_subagents`' own output if its updates carry any.
 
 The evidence's `antigravity` object holds the version and whether Octet
 lists it as verified (`ANTIGRAVITY_VERIFIED_VERSIONS`), the launch (the
@@ -195,7 +199,8 @@ Octet's settings folder by the end of the run
 (`agy_log_in_settings_folder`), the options confirmed and those a resume
 reported, each permission request (its tool, kind, title and the answer)
 and tool call (its kind, statuses, whether it asked, and its `rawInput`'s
-key names), each reply text, the session's commands, and the scratch
+key names), each reply text, how many commands the session lists and
+whether `compact` is one of them, and the scratch
 folder's layout when the run ended (16 levels, 80 entries). Nothing of the
 account is recorded: not `authMethods`, not the tier, and any word with an
 `@` in vendor text is replaced.

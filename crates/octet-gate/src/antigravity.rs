@@ -8,8 +8,8 @@
 //! prove, which is never a pass.
 use crate::{Evidence, GateError, GateProcess};
 use octet_engine::live::{
-    ANTIGRAVITY_VERIFIED_VERSIONS, Config, Engine, antigravity_prepare, antigravity_stray_reply,
-    launch_args, launch_env,
+    ANTIGRAVITY_VERIFIED_VERSIONS, Config, Engine, Mode, antigravity_prepare,
+    antigravity_stray_reply, launch_args, launch_env,
 };
 use serde_json::{Value, json};
 use std::{
@@ -49,6 +49,8 @@ const FIXTURE_COMMANDS: [&str; 3] = [
 const WORD: &str = "PERIWINKLE";
 /// The file `lockdown` asks the model to write.
 const GATE_FILE: &str = "gate.txt";
+/// How `subagent`'s second turn must begin its one-line reply.
+const STATE_PREFIX: &str = "STATE: ";
 /// The file `subagent` asks a subagent to touch.
 const SUB_FILE: &str = "gate-sub.txt";
 /// How long `subagent` lets the subagent start before asking for its state.
@@ -168,6 +170,7 @@ struct Launch {
 /// `scratch` as its data directory and the user's home.
 fn launch(binary: &Path, cwd: &Path, scratch: &Scratch) -> Result<Launch, String> {
     let mut config = Config::new(Engine::ANTIGRAVITY, binary, cwd);
+    config.mode = Mode::Ask;
     config.data_dir = Some(scratch.data());
     let prepared = antigravity_prepare(&config, Some(&scratch.home()))?;
     let mut args = launch_args(&config);
@@ -412,7 +415,7 @@ impl Seen {
         let Some(id) = update["toolCallId"].as_str() else {
             return;
         };
-        let text = |key: &str| update[key].as_str().unwrap_or_default().to_owned();
+        let text = |key: &str| scrub(update[key].as_str().unwrap_or_default(), 64);
         let status = text("status");
         let index = match self.tools.iter().position(|tool| tool.id == id) {
             Some(index) => Some(index),
@@ -745,7 +748,8 @@ impl<'a> Client<'a> {
         };
         if self.seen.requests.len() < LIMIT {
             self.seen.requests.push(json!({
-                "tool": call["name"], "kind": call["kind"],
+                "tool": scrub(call["name"].as_str().unwrap_or_default(), 64),
+                "kind": scrub(call["kind"].as_str().unwrap_or_default(), 64),
                 "title": scrub(call["title"].as_str().unwrap_or_default(), 128),
                 "this_session": this_session,
                 "target": target, "answer": if allow { "allow" } else { "deny" },
@@ -1036,8 +1040,10 @@ impl<'a> Client<'a> {
     }
 
     /// `subagent`: a subagent asked to touch `gate-sub.txt` must be seen
-    /// waiting for an approval that never reaches Octet, and 30 s later the
-    /// file must not exist, with no `execute` call completed.
+    /// waiting for an approval that never reaches Octet (the second turn's
+    /// reply, in the fixed form `STATE: <state>`, says `waiting_for_input`;
+    /// see [`subagent_waiting`]), and 30 s later the file must not exist,
+    /// with no `execute` call completed.
     async fn subagent(&mut self) -> Result<(), Stop> {
         self.finished(
             "Use invoke_subagent to delegate this task to a subagent, and do not do it yourself: run the \
@@ -1050,18 +1056,12 @@ impl<'a> Client<'a> {
         self.watch(SUBAGENT_SETTLE).await?;
         let reply = self
             .finished(
-                "Use manage_subagents to list the subagents. In one line, say what state the subagent is \
-                 in and whether it is waiting for an approval. Do not run any other tool.",
+                "Use manage_subagents to list the subagents. Then reply with exactly one line, \
+                 `STATE: <state>`, where <state> is the subagent's state word exactly as manage_subagents \
+                 reports it, and nothing else. Do not run any other tool.",
             )
             .await?;
-        let report = format!(
-            "{} {}",
-            self.seen.manage_output.as_deref().unwrap_or_default(),
-            reply
-        )
-        .to_lowercase();
-        let waiting = report.contains("waiting_for_input") || report.contains("waiting for input");
-        if !self.seen.completed("manage_subagents") || !waiting {
+        if !self.seen.completed("manage_subagents") || !subagent_waiting(&reply) {
             return Err(Stop::Unproven(
                 "the subagent was not seen waiting for approval",
             ));
@@ -1091,6 +1091,22 @@ impl<'a> Client<'a> {
         self.configure().await?;
         self.recall().await
     }
+}
+
+/// The state a reply in [`STATE_PREFIX`]'s fixed form reports: the whole
+/// reply, but for surrounding white space, is `STATE: <state>`, the state one
+/// word of lower-case letters and underscores. `None` for any other reply.
+fn reported_state(reply: &str) -> Option<&str> {
+    let state = reply.trim().strip_prefix(STATE_PREFIX)?;
+    let word = !state.is_empty() && state.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    word.then_some(state)
+}
+
+/// Whether `reply` reports, in the fixed form, the subagent in the state
+/// `manage_subagents` gives one waiting for an approval: `waiting_for_input`
+/// exactly. Free text never counts, so "not waiting for input" cannot pass.
+fn subagent_waiting(reply: &str) -> bool {
+    reported_state(reply) == Some("waiting_for_input")
 }
 
 /// The `currentValue` `options` report for option `id`; empty when absent.
@@ -1438,6 +1454,26 @@ mod tests {
             target(&call("execute", json!({"CommandLine": "rm -rf /"})), cwd),
             None
         );
+    }
+
+    #[test]
+    fn only_the_fixed_state_token_reports_the_subagent_waiting() {
+        assert!(subagent_waiting("STATE: waiting_for_input"));
+        assert!(subagent_waiting("  STATE: waiting_for_input\n"));
+        for reply in [
+            "The subagent is not waiting for input",
+            "The subagent is no longer waiting for input.",
+            "The subagent is in the `waiting_for_input` state",
+            "STATE: running",
+            "STATE: completed",
+            "STATE: waiting for input",
+            "STATE: `waiting_for_input`",
+            "STATE: waiting_for_input\nSTATE: running",
+            "state: waiting_for_input",
+            "",
+        ] {
+            assert!(!subagent_waiting(reply), "{reply:?}");
+        }
     }
 
     #[test]

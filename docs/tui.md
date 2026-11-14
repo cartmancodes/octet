@@ -490,8 +490,9 @@ never writes to your Antigravity settings, and a journal directory inside
 `~/.gemini` is refused. Antigravity takes the folder's name relative to its
 own data folder (`~/.gemini/antigravity-cli`), so Octet names it by climbing
 to the root first: 32 `../`, then the folder's absolute path without its
-leading `/`. Antigravity keeps its own `cache` and `log` folders inside each
-of Octet's two settings folders. The model list is fetched in
+leading `/`. Antigravity keeps its own `cache` and `log` folders inside the
+settings folder of the mode in use (checked against Antigravity 1.5.5 for
+`antigravity/review`). The model list is fetched in
 a scratch home Octet makes under the journal directory and removes afterwards,
 so listing models adds no session to Antigravity's history.
 
