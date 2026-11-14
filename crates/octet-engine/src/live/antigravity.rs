@@ -167,6 +167,9 @@ pub(super) struct AntigravityProtocol {
     tripped: bool,
     /// Octet's mode, to be set back after Antigravity moved itself.
     follow: follow::Follow,
+    /// The wire ID of the newest live switch or set-back Antigravity
+    /// confirmed: a late reply to an older switch is stale.
+    newest_confirmed: u64,
     /// The session's model (`currentValue` of its `model` option).
     model: Option<String>,
     /// The session's mode ID (its `mode` option, or `current_mode_update`).
@@ -578,7 +581,9 @@ impl AntigravityProtocol {
 
     /// The model's reply; the thinking level and the mode are set next. A
     /// refusal stops the session: going on would run the user's prompts on
-    /// a model (and perhaps a bill) they never chose.
+    /// a model (and perhaps a bill) they never chose. A mode the reply
+    /// names is followed as any other (see `followed`; during the handshake
+    /// the mode step that comes next sets and checks it).
     async fn model_set(&mut self, core: &mut Core, v: &Value) -> Result<(), DriverError> {
         let requested = core.config.model.clone().unwrap_or_default();
         if let Some(error) = v.get("error") {
@@ -592,6 +597,7 @@ impl AntigravityProtocol {
         let options = &v["result"]["configOptions"];
         if options.is_array() {
             self.note_options(options);
+            self.follow_options(core, options).await?;
         } else {
             // A reply without the options still confirms the request; the
             // new model's levels are not known yet.
@@ -678,8 +684,9 @@ impl AntigravityProtocol {
 
     /// A thinking level's reply. A confirmation records the level and, live,
     /// tells the interface; the handshake reports it once ready. A refusal
-    /// is reported and the interface goes back to the level in force. The
-    /// handshake then sets the mode.
+    /// is reported and the interface goes back to the level in force. A mode
+    /// a confirmation names is followed (see `followed`). The handshake then
+    /// sets the mode.
     async fn effort_reply(
         &mut self,
         core: &mut Core,
@@ -714,6 +721,7 @@ impl AntigravityProtocol {
                     core.phase.is_running(),
                 )))?;
             }
+            self.follow_options(core, options).await?;
         }
         if request.handshake {
             self.mode_step(core).await
@@ -777,23 +785,29 @@ impl AntigravityProtocol {
     /// was already put back then, and a confirmation says it came late. A
     /// confirmation raises the mode every running tool call is judged by;
     /// a set-back that waited for the switch is sent once it is answered.
+    /// A late confirmation that comes after a newer switch was confirmed is
+    /// not adopted: the mode it names is followed as Antigravity's own move
+    /// (see `followed`), so the header's mode is set back.
     async fn switched(
         &mut self,
         core: &mut Core,
         v: &Value,
         target: Mode,
     ) -> Result<(), DriverError> {
-        self.switch_answered(core, v, target)?;
+        if let Some(stale) = self.switch_answered(core, v, target)? {
+            self.followed(core, stale).await?;
+        }
         self.send_due_set_back(core).await
     }
 
-    /// A live switch's reply, as [`Self::switched`] takes it.
+    /// A live switch's reply, as [`Self::switched`] takes it; the mode ID a
+    /// stale confirmation named, for `followed`.
     fn switch_answered(
         &mut self,
         core: &mut Core,
         v: &Value,
         target: Mode,
-    ) -> Result<(), DriverError> {
+    ) -> Result<Option<&'static str>, DriverError> {
         let late = self.switches.answered(v);
         let wanted = mode_id(target);
         let reason = if let Some(error) = v.get("error") {
@@ -803,6 +817,11 @@ impl AntigravityProtocol {
             self.note_options(options);
             let reported = reported_mode(options);
             if reported.as_str() == Some(wanted) {
+                let id = v["id"].as_u64().unwrap_or_default();
+                if late && id < self.newest_confirmed {
+                    return self.stale_confirmation(core, target);
+                }
+                self.newest_confirmed = self.newest_confirmed.max(id);
                 core.mode = target;
                 self.tools.raise(target);
                 if late {
@@ -811,7 +830,8 @@ impl AntigravityProtocol {
                         target.label()
                     )))?;
                 }
-                return core.emit(Event::ModeChanged(target));
+                core.emit(Event::ModeChanged(target))?;
+                return Ok(None);
             }
             if reported.is_null() {
                 return Err(mode_refused(wanted, NAMED_NO_MODE));
@@ -826,11 +846,33 @@ impl AntigravityProtocol {
             "Antigravity did not switch to {}: {reason}",
             target.label()
         )))?;
-        if late {
-            Ok(())
-        } else {
-            core.emit(Event::ModeChanged(core.mode))
+        if !late {
+            core.emit(Event::ModeChanged(core.mode))?;
         }
+        Ok(None)
+    }
+
+    /// Antigravity confirmed the switch to `target` late, after a newer
+    /// switch was confirmed: it may now be in `target`'s mode, so the
+    /// header's mode is set back (said here, so `followed` does not say it
+    /// again); nothing is needed when that is the header's mode already.
+    fn stale_confirmation(
+        &mut self,
+        core: &Core,
+        target: Mode,
+    ) -> Result<Option<&'static str>, DriverError> {
+        let named = mode_id(target);
+        if named == mode_id(core.mode) {
+            return Ok(None);
+        }
+        core.emit(Event::Notice(format!(
+            "Antigravity confirmed the switch to {} late, after the switch to {label}. \
+             Octet sets {label} back before the next prompt",
+            target.label(),
+            label = core.mode.label()
+        )))?;
+        self.follow.due = Some(named.to_owned());
+        Ok(Some(named))
     }
 
     /// A request from Antigravity. A permission request for this session
@@ -1010,10 +1052,7 @@ impl AntigravityProtocol {
         {
             core.emit(Event::ModelSelected(model.clone()))?;
         }
-        match acp::current(options, "mode") {
-            Some(id) => self.followed(core, id).await,
-            None => Ok(()),
-        }
+        self.follow_options(core, options).await
     }
 }
 

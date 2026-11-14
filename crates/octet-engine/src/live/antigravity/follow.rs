@@ -78,10 +78,19 @@ impl AntigravityProtocol {
     /// than Octet's is Antigravity's own change (see `moved`): a
     /// looser one during a turn cancels the turn and is set back at once;
     /// anything else is reported once and set back when no turn runs. The
-    /// header keeps Octet's mode.
+    /// header keeps Octet's mode. While a switch awaits its reply, or one
+    /// that timed out is unanswered, it is only recorded: once they settle,
+    /// the mode is set back unless Antigravity names the header's by then
+    /// (see `send_due_set_back`), so a switch it refuses after moving
+    /// still gets its set-back.
     pub(super) async fn followed(&mut self, core: &mut Core, id: &str) -> Result<(), DriverError> {
-        if !core.phase.is_ready() || self.switches.pending() || self.switches.unsettled().is_some()
-        {
+        if !core.phase.is_ready() {
+            return Ok(());
+        }
+        if self.switches.pending() || self.switches.unsettled().is_some() {
+            if id != mode_id(core.mode) {
+                self.follow.due = Some(id.to_owned());
+            }
             return Ok(());
         }
         match moved(id, core.mode, core.phase.is_running()) {
@@ -100,6 +109,20 @@ impl AntigravityProtocol {
                 }
                 self.send_due_set_back(core).await
             }
+        }
+    }
+
+    /// The mode `options` name as current, if they name one, followed (see
+    /// `followed`): a reply to a model or a thinking level that names a mode
+    /// counts as Antigravity naming it.
+    pub(super) async fn follow_options(
+        &mut self,
+        core: &mut Core,
+        options: &Value,
+    ) -> Result<(), DriverError> {
+        match acp::current(options, "mode") {
+            Some(id) => self.followed(core, id).await,
+            None => Ok(()),
         }
     }
 
@@ -153,7 +176,11 @@ impl AntigravityProtocol {
             self.note_options(options);
             match reported_mode(options) {
                 Value::Null => NAMED_NO_MODE.to_owned(),
-                reported if reported.as_str() == Some(id) => return Ok(()),
+                reported if reported.as_str() == Some(id) => {
+                    let confirmed = v["id"].as_u64().unwrap_or_default();
+                    self.newest_confirmed = self.newest_confirmed.max(confirmed);
+                    return Ok(());
+                }
                 reported => reported_reason(reported),
             }
         };

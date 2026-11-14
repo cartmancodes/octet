@@ -6608,6 +6608,144 @@ async fn antigravity_a_late_confirmation_is_applied() {
     );
     stop(&handle, task).await;
 }
+/// The `configOptions` reply of a scripted Antigravity in mode `mode`.
+fn agy_in_mode(mode: &str) -> serde_json::Value {
+    serde_json::json!({"configOptions": agy_options("high", Some(mode))})
+}
+/// The session's notices, errors and modes (`mode <label>`) until the
+/// scripted Antigravity of `c` has read `requests` requests, and a moment
+/// after; it fails after three seconds.
+async fn agy_seen_until_sent(
+    events: &mut mpsc::Receiver<Event>,
+    c: &Config,
+    requests: usize,
+) -> Vec<String> {
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut settle = None;
+    loop {
+        let now = tokio::time::Instant::now();
+        if settle.is_none() && agy_sent(c).len() >= requests {
+            settle = Some(now + Duration::from_millis(300));
+        }
+        if settle.is_some_and(|at| now >= at) {
+            return seen;
+        }
+        assert!(
+            now < deadline,
+            "Antigravity read {} requests: {seen:?}",
+            agy_sent(c).len()
+        );
+        match timeout(Duration::from_millis(50), events.recv()).await {
+            Ok(Some(Event::Notice(text))) => seen.push(text),
+            Ok(Some(Event::Error(text))) => seen.push(format!("error {text}")),
+            Ok(Some(Event::ModeChanged(mode))) => seen.push(format!("mode {}", mode.label())),
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => panic!("the session stopped: {seen:?}"),
+        }
+    }
+}
+/// The `mode` values Octet set, in order, from a scripted Antigravity's log.
+fn agy_sent_modes(c: &Config) -> Vec<String> {
+    agy_sent(c)
+        .iter()
+        .filter(|frame| frame["params"]["configId"] == "mode")
+        .map(|frame| frame["params"]["value"].as_str().unwrap().to_owned())
+        .collect()
+}
+#[tokio::test]
+async fn antigravity_a_late_confirmation_after_a_newer_switch_is_not_adopted() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    c.mode = Mode::Auto;
+    let steps = [
+        agy_reply(1, &serde_json::json!({"agentInfo": {"version": "1.5.5"}})),
+        agy_reply(
+            2,
+            &serde_json::json!({"sessionId": "s1", "configOptions": agy_options("high", Some("auto"))}),
+        ),
+        agy_reply(3, &agy_in_mode("auto")),
+        // The switch to ask (4) is not answered in time.
+        ":".to_owned(),
+        // The switch to accept-edits (5) is confirmed; then 4's reply comes.
+        format!(
+            "{}\n{}",
+            agy_reply(5, &agy_in_mode("accept-edits")),
+            agy_reply(4, &agy_in_mode("default"))
+        ),
+        // Octet sets accept-edits back.
+        agy_reply(6, &agy_in_mode("accept-edits")),
+    ];
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn_with_limits(c.clone(), quick());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Auto))).await;
+    handle.send(Command::SetMode(Mode::Ask)).unwrap();
+    wait_for(&mut events, |e| {
+        matches!(e, Event::Notice(text) if text == "Antigravity has not confirmed the switch to ask")
+    })
+    .await;
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Auto))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let seen = agy_seen_until_sent(&mut events, &c, 6).await;
+    assert_eq!(
+        seen,
+        [
+            "mode accept-edits",
+            "Antigravity confirmed the switch to ask late, after the switch to accept-edits. \
+             Octet sets accept-edits back before the next prompt",
+        ]
+    );
+    assert_eq!(
+        agy_sent_modes(&c),
+        ["auto", "default", "accept-edits", "accept-edits"]
+    );
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_move_during_a_switch_that_is_then_refused_is_set_back() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let mut steps = agy_handshake();
+    // Antigravity names accept-edits, then refuses the switch to it.
+    steps.push(format!(
+        "{}\n{}",
+        agy_update(&serde_json::json!({"sessionUpdate": "current_mode_update",
+            "currentModeId": "accept-edits"})),
+        r#"echo '{"jsonrpc":"2.0","id":4,"error":{"code":-32603,"message":"busy"}}'"#
+    ));
+    steps.push(agy_reply(5, &agy_in_mode("default")));
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn_with_limits(c.clone(), quick());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let seen = agy_seen_until_sent(&mut events, &c, 5).await;
+    assert_eq!(
+        seen,
+        [
+            "Antigravity did not switch to accept-edits: busy",
+            "mode ask"
+        ]
+    );
+    assert_eq!(agy_sent_modes(&c), ["default", "accept-edits", "default"]);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_mode_named_in_an_effort_reply_is_followed() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let mut steps = agy_handshake();
+    steps.push(agy_reply(
+        4,
+        &serde_json::json!({"configOptions": agy_options("low", Some("plan"))}),
+    ));
+    steps.push(agy_reply(5, &agy_in_mode("default")));
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn_with_limits(c.clone(), quick());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::SetEffort(Some("low".into()))).unwrap();
+    let seen = agy_seen_until_sent(&mut events, &c, 5).await;
+    assert!(seen.contains(&AGY_TO_PLAN_NOTICE.to_owned()), "{seen:?}");
+    assert!(!seen.iter().any(|s| s.starts_with("mode ")), "{seen:?}");
+    assert_eq!(agy_sent_modes(&c), ["default", "default"]);
+    stop(&handle, task).await;
+}
 #[tokio::test]
 async fn antigravity_another_sessions_permission_is_rejected_not_shown() {
     // The scripted Antigravity asks for another session, then reads Octet's

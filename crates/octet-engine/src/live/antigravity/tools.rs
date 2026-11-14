@@ -9,6 +9,8 @@ use std::collections::HashMap;
 
 /// The most tool calls one turn remembers.
 const MAX_TOOLS: usize = 1024;
+/// The longest tool call ID, in bytes, a call is remembered by.
+const MAX_ID: usize = 256;
 
 /// The name of the tool that starts one of Antigravity's subagents.
 const SUBAGENT_TOOL: &str = "invoke_subagent";
@@ -63,6 +65,27 @@ impl Stop {
     }
 }
 
+/// What a tool call is remembered by.
+enum Key<'a> {
+    /// Its frames name no ID: it cannot be named again.
+    Absent,
+    /// Its whole ID.
+    Kept(&'a str),
+    /// An ID longer than [`MAX_ID`], or with a line break: a call Octet
+    /// cannot remember, as one past [`MAX_TOOLS`].
+    Unkept,
+}
+
+/// The key of the call `value` (a `tool_call` frame or a request's
+/// `toolCall`) names.
+fn key(value: &Value) -> Key<'_> {
+    match value["toolCallId"].as_str().unwrap_or_default() {
+        "" => Key::Absent,
+        id if id.len() > MAX_ID || id.contains(['\n', '\r']) => Key::Unkept,
+        id => Key::Kept(id),
+    }
+}
+
 /// This turn's tool calls, by ID, at most [`MAX_TOOLS`], and whether its
 /// subagent was reported.
 #[derive(Default)]
@@ -82,27 +105,29 @@ impl Tools {
 
     /// The target `tool_call`'s earlier frames named this turn, if any.
     pub(super) fn known_target(&self, tool_call: &Value) -> Option<String> {
-        tool_call["toolCallId"]
-            .as_str()
-            .and_then(|id| self.calls.get(&one_line(id)))
+        let Key::Kept(id) = key(tool_call) else {
+            return None;
+        };
+        self.calls
+            .get(id)
             .map(|tool| tool.target.clone())
             .filter(|target| !target.is_empty())
     }
 
     /// Marks the call `tool_call` names as asked, adding it to the table as
     /// the request names it, under `mode`, when it is not there yet. A call
-    /// without an ID cannot be named again, and a full table takes no more.
+    /// without an ID, or one Octet cannot remember (see [`Key`]), cannot be
+    /// named again, and a full table takes no more.
     pub(super) fn mark_asked(&mut self, tool_call: &Value, mode: Mode) {
-        let id = one_line(tool_call["toolCallId"].as_str().unwrap_or_default());
-        if id.is_empty() {
+        let Key::Kept(id) = key(tool_call) else {
             return;
-        }
-        if let Some(tool) = self.calls.get_mut(&id) {
+        };
+        if let Some(tool) = self.calls.get_mut(id) {
             tool.asked = true;
         } else if self.calls.len() < MAX_TOOLS {
             let mut tool = Tool::first(tool_call, acp::frame_target(tool_call), mode);
             tool.asked = true;
-            self.calls.insert(id, tool);
+            self.calls.insert(id.to_owned(), tool);
         }
     }
 
@@ -121,16 +146,22 @@ impl Tools {
     /// its first frame's; its kind is the strictest one a frame names (see
     /// `Tool::update`); its target is the newest one a frame names (see
     /// `acp::frame_target`), else a command's best title. At most
-    /// [`MAX_TOOLS`] calls are remembered in a turn; while `mode` asks, a
-    /// call that cannot be is a [`Stop::TooMany`]. A frame that ends a call
-    /// no permission request named is judged by the tripwire; a call without
-    /// an ID is judged on its own frame.
+    /// [`MAX_TOOLS`] calls are remembered in a turn, each by its whole ID;
+    /// while `mode` asks, a call that cannot be (past the limit, or with an
+    /// ID too long to keep, see [`Key`]) is a [`Stop::TooMany`]. A frame
+    /// that ends a call no permission request named is judged by the
+    /// tripwire; a call without an ID, or one not remembered, is judged on
+    /// its own frame.
     pub(super) fn frame(&mut self, update: &Value, mode: Mode) -> (ToolCall, Option<Stop>) {
-        let id = one_line(update["toolCallId"].as_str().unwrap_or_default());
+        let key = key(update);
         let target = acp::frame_target(update);
         let phase = acp::tool_phase(&update["status"]);
         let ends = phase != ToolPhase::Running;
-        let (name, target, stop) = if let Some(known) = self.calls.get_mut(&id) {
+        let known = match key {
+            Key::Kept(id) => self.calls.get_mut(id),
+            Key::Absent | Key::Unkept => None,
+        };
+        let (name, target, stop) = if let Some(known) = known {
             known.update(update, target);
             let stop = known.end(ends);
             (known.name.clone(), known.target.clone(), stop)
@@ -138,17 +169,21 @@ impl Tools {
             let mut tool = Tool::first(update, target, mode);
             let mut stop = tool.end(ends);
             let shown = (tool.name.clone(), tool.target.clone());
-            if !id.is_empty() {
-                if self.calls.len() < MAX_TOOLS {
-                    self.calls.insert(id.clone(), tool);
-                } else if asks(mode) {
-                    stop = stop.or(Some(Stop::TooMany));
+            match key {
+                Key::Absent => {}
+                Key::Kept(id) if self.calls.len() < MAX_TOOLS => {
+                    self.calls.insert(id.to_owned(), tool);
+                }
+                Key::Kept(_) | Key::Unkept => {
+                    if asks(mode) {
+                        stop = stop.or(Some(Stop::TooMany));
+                    }
                 }
             }
             (shown.0, shown.1, stop)
         };
         let call = ToolCall {
-            id,
+            id: one_line(update["toolCallId"].as_str().unwrap_or_default()),
             name,
             target,
             phase,
@@ -528,5 +563,42 @@ mod tests {
         tools.mark_asked(&call("late"), Mode::Ask);
         assert!(!tools.calls.contains_key("late"));
         assert_eq!(tools.calls.len(), MAX_TOOLS);
+    }
+
+    #[test]
+    fn calls_are_told_apart_by_their_whole_id() {
+        let command = |id: &str, status: &str| {
+            json!({"toolCallId": id, "name": "run_command", "kind": "execute",
+                "rawInput": {"command": "ls"}, "status": status})
+        };
+        // Two IDs whose first lines match: one's request does not mark the
+        // other asked.
+        let mut tools = Tools::default();
+        tools.mark_asked(&command("call\nA", "pending"), Mode::Ask);
+        tools.frame(&command("call\nB", "in_progress"), Mode::Ask);
+        let (_, stop) = tools.frame(&command("call\nB", "completed"), Mode::Ask);
+        assert!(stop.is_some(), "the unasked call was not judged");
+        // Two long IDs that share their first 256 bytes.
+        let long = "a".repeat(256);
+        let mut tools = Tools::default();
+        tools.mark_asked(&command(&format!("{long}1"), "pending"), Mode::Ask);
+        let (_, stop) = tools.frame(&command(&format!("{long}2"), "completed"), Mode::Ask);
+        assert!(stop.is_some(), "the unasked call was not judged");
+        // An ID of 256 bytes is kept; a longer one, or one with a newline,
+        // is a call Octet cannot remember: it stops the turn while the mode
+        // asks, and is judged on its own frame otherwise.
+        let mut tools = Tools::default();
+        tools.mark_asked(&command(&long, "pending"), Mode::Ask);
+        let (_, stop) = tools.frame(&command(&long, "completed"), Mode::Ask);
+        assert_eq!(stop, None);
+        for id in [format!("{long}1"), "call\nB".to_owned()] {
+            let mut tools = Tools::default();
+            let (call, stop) = tools.frame(&command(&id, "in_progress"), Mode::Ask);
+            assert_eq!(stop, Some(Stop::TooMany), "{id}");
+            assert_eq!(call.id, one_line(&id));
+            assert!(tools.calls.is_empty());
+            let (_, stop) = tools.frame(&command(&id, "in_progress"), Mode::Auto);
+            assert_eq!(stop, None, "{id}");
+        }
     }
 }
