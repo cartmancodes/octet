@@ -17,7 +17,7 @@ use std::{
     ffi::OsString,
     fs,
     os::unix::fs::DirBuilderExt as _,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::Instant;
@@ -191,9 +191,30 @@ fn flag_value<'a>(args: &'a [OsString], flag: &str) -> Option<&'a OsString> {
     at.next().is_none().then(|| args.get(index + 1))?
 }
 
-/// Whether `args` start `agy acp` with a settings folder under `data` (never
-/// the full-access one) and `--gemini-dir` exactly `home`, and nothing that
-/// skips permission requests. The gate launches nothing else.
+/// The folder `agy` 1.5.5 uses for `--cli_dir_name` `name` when its home is
+/// `home`: `name` joined under `<home>/antigravity-cli` with any leading `/`
+/// removed, `.` and `..` folded by name, a `..` at the root dropped.
+fn resolved_by_agy(home: &Path, name: &Path) -> PathBuf {
+    let joined = home
+        .join("antigravity-cli")
+        .join(name.strip_prefix("/").unwrap_or(name));
+    let mut folded = PathBuf::from("/");
+    for part in joined.components() {
+        match part {
+            Component::Normal(part) => folded.push(part),
+            Component::ParentDir => {
+                folded.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    folded
+}
+
+/// Whether `args` start `agy acp` with `--gemini-dir` exactly `home`, a
+/// `--cli_dir_name` that `agy` resolves (see [`resolved_by_agy`]) to a
+/// settings folder under `data` (never the full-access one), and nothing
+/// that skips permission requests. The gate launches nothing else.
 fn check_launch(args: &[OsString], data: &Path, home: &Path) -> Result<(), String> {
     if args.first().is_none_or(|first| first != "acp") {
         return Err("the launch is not `agy acp`; the gate refuses to launch it".into());
@@ -204,25 +225,38 @@ fn check_launch(args: &[OsString], data: &Path, home: &Path) -> Result<(), Strin
     {
         return Err("the launch skips permission requests; the gate refuses to launch it".into());
     }
-    let settings = flag_value(args, "--cli_dir_name").map(Path::new);
-    if settings.is_none_or(|dir| !dir.starts_with(data) || dir.ends_with("proceed")) {
-        return Err(format!(
-            "the launch does not name Octet's settings folder under {}; the gate refuses to launch it",
-            data.display()
-        ));
-    }
     if flag_value(args, "--gemini-dir").map(Path::new) != Some(home) {
         return Err(format!(
             "the launch does not run in the scratch home {}; the gate refuses to launch it",
             home.display()
         ));
     }
+    let settings =
+        flag_value(args, "--cli_dir_name").map(|name| resolved_by_agy(home, Path::new(name)));
+    if settings.is_none_or(|dir| !dir.starts_with(data) || dir.ends_with("proceed")) {
+        return Err(format!(
+            "the launch's settings folder, as agy resolves it, is not Octet's under {}; \
+             the gate refuses to launch it",
+            data.display()
+        ));
+    }
     Ok(())
+}
+
+/// Octet's settings folder for the modes that ask.
+fn review(scratch: &Scratch) -> PathBuf {
+    scratch.data().join("antigravity/review")
+}
+
+/// Whether `agy` made its `log` folder in Octet's settings folder `review`:
+/// the sign that it used that folder, so read Octet's settings there.
+fn agy_used(review: &Path) -> bool {
+    review.join("log").is_dir()
 }
 
 /// Octet's settings file as Octet's preparation wrote it.
 fn written_settings(scratch: &Scratch) -> Option<Value> {
-    let path = scratch.data().join("antigravity/review/settings.json");
+    let path = review(scratch).join("settings.json");
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
@@ -531,6 +565,8 @@ struct Client<'a> {
     gate: &'a mut GateProcess,
     scenario: &'a str,
     cwd: &'a Path,
+    /// Octet's settings folder for the modes that ask.
+    review: &'a Path,
     seen: &'a mut Seen,
     next_id: u64,
     session: String,
@@ -544,12 +580,14 @@ impl<'a> Client<'a> {
         gate: &'a mut GateProcess,
         scenario: &'a str,
         cwd: &'a Path,
+        review: &'a Path,
         seen: &'a mut Seen,
     ) -> Self {
         Self {
             gate,
             scenario,
             cwd,
+            review,
             seen,
             next_id: 0,
             session: String::new(),
@@ -966,8 +1004,15 @@ impl<'a> Client<'a> {
 
     /// `lockdown`: under Octet's merge of settings that would skip every
     /// request, `echo fixture` and a write of `gate.txt` must each ask
-    /// (and be denied), and `gate.txt` must not exist.
+    /// (and be denied), and `gate.txt` must not exist. Unproven unless `agy`
+    /// made its `log` folder in Octet's settings folder once the session
+    /// opened: otherwise it did not use Octet's settings.
     async fn lockdown(&mut self) -> Result<(), Stop> {
+        if !agy_used(self.review) {
+            return Err(Stop::Unproven(
+                "Octet's settings folder was not the one agy used: agy made no log folder in it",
+            ));
+        }
         self.finished(
             "Use your shell command tool to run exactly `echo fixture`, once, with no other commands. \
              If permission is denied, stop and say denied.",
@@ -1088,6 +1133,7 @@ pub async fn run(binary: &Path, scenario: &str, cwd: &Path, deadline: Instant) -
         GATE_FILE: cwd.join(GATE_FILE).exists(),
         SUB_FILE: cwd.join(SUB_FILE).exists(),
     });
+    seen_json["agy_log_in_settings_folder"] = json!(agy_used(&review(&scratch)));
     seen_json["scratch_layout"] = json!(layout(&scratch.root));
     drop(scratch);
     Run {
@@ -1126,13 +1172,22 @@ async fn run_in(
         Err(why) => return failed(why),
     };
     extra["notices"] = json!(first_launch.notices);
+    // The scratch folder is shown as `<scratch>`: in an absolute path, and in
+    // the settings folder's name, which climbs to the root first.
+    let root = scratch.root.to_string_lossy();
+    let bare = root.trim_start_matches('/');
     extra["launch"] = json!(
         first_launch
             .args
             .iter()
-            .map(|arg| arg
-                .to_string_lossy()
-                .replace(&*scratch.root.to_string_lossy(), "<scratch>"))
+            .map(|arg| {
+                let arg = arg.to_string_lossy();
+                if arg.starts_with('/') {
+                    arg.replace(&*root, "<scratch>")
+                } else {
+                    arg.replace(bare, "<scratch>")
+                }
+            })
             .collect::<Vec<_>>()
     );
     if scenario == "lockdown"
@@ -1154,7 +1209,10 @@ async fn run_in(
         Ok(gate) => gate,
         Err(error) => return failed(error.to_string()),
     };
-    let mut result = Client::new(&mut gate, scenario, cwd, seen).first().await;
+    let settings_folder = review(scratch);
+    let mut result = Client::new(&mut gate, scenario, cwd, &settings_folder, seen)
+        .first()
+        .await;
     let mut evidence = gate.evidence().clone();
     let report = gate.shutdown().await;
     let mut cleaned = report.reaped && report.descendants_stopped;
@@ -1179,7 +1237,7 @@ async fn run_in(
         Ok(second) => second,
         Err(error) => return (Err(Stop::Failed(error.to_string())), evidence, cleaned),
     };
-    let mut result = Client::new(&mut second, scenario, cwd, seen)
+    let mut result = Client::new(&mut second, scenario, cwd, &settings_folder, seen)
         .reopen(&first)
         .await;
     evidence.add_resumed(second.evidence());
@@ -1202,7 +1260,8 @@ mod tests {
     #[test]
     fn the_gate_launches_only_octets_settings_in_the_scratch_home() {
         let (data, home) = (Path::new("/s/octet-data"), Path::new("/s/gemini-home"));
-        let good = ["acp", "--cli_dir_name", "/s/octet-data/antigravity/review"];
+        let climbed = format!("{}s/octet-data/antigravity/review", "../".repeat(32));
+        let good = ["acp", "--cli_dir_name", climbed.as_str()];
         let with_home = |extra: &[&str]| {
             let mut all = args(&good);
             all.extend(args(extra));
@@ -1233,9 +1292,15 @@ mod tests {
         ] {
             assert!(with_home(refused).is_err(), "{refused:?}");
         }
+        // An absolute name resolves inside the scratch home, a climb short of
+        // the root somewhere else, and the full-access folder is never used.
+        let short = format!("{}s/octet-data/antigravity/review", "../".repeat(2));
+        let proceed = format!("{}s/octet-data/antigravity/proceed", "../".repeat(32));
         for settings in [
+            "/s/octet-data/antigravity/review",
             "/home/.gemini/antigravity-cli",
-            "/s/octet-data/antigravity/proceed",
+            short.as_str(),
+            proceed.as_str(),
         ] {
             let all = args(&[
                 "acp",

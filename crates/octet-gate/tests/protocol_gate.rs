@@ -828,18 +828,30 @@ fn command_expansion_fails_when_opencode_runs_other_shell_or_its_built_ins_drift
     }
 }
 
-/// A scripted `agy`: keeps its arguments in `argv`, writes `frames`, then
-/// keeps what the gate sent in `stdin`.
+/// A scripted `agy`: keeps its arguments in `argv`, makes its `log` folder
+/// in the settings folder its `--cli_dir_name` climbs to (as `agy` does),
+/// writes `frames`, then keeps what the gate sent in `stdin`.
 fn agy_script(frames: &[Value]) -> String {
+    agy_script_logging(frames, true)
+}
+
+/// As `agy_script`, making the `log` folder only if `log`.
+fn agy_script_logging(frames: &[Value], log: bool) -> String {
     let wire = frames
         .iter()
         .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n");
+    let log = if log {
+        "v=\"$3\"; while case \"$v\" in ../*) true;; *) false;; esac; do v=\"${v#../}\"; done\n\
+         mkdir -p \"/$v/log\"\n"
+    } else {
+        ""
+    };
     format!(
         "dir=\"$(dirname \"$0\")\"\n\
          for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > \"$dir/argv\"\n\
-         cat <<'WIRE'\n{wire}\nWIRE\ncat > \"$dir/stdin\""
+         {log}cat <<'WIRE'\n{wire}\nWIRE\ncat > \"$dir/stdin\""
     )
 }
 
@@ -906,6 +918,7 @@ fn the_gate_launches_antigravity_as_octet_does_in_a_scratch_home_it_removes() {
     assert_eq!(evidence["status"], "passed");
     assert_eq!(evidence["version"], "1.5.5");
     assert_eq!(evidence["antigravity"]["options"]["mode"], "default");
+    assert_eq!(evidence["antigravity"]["agy_log_in_settings_folder"], true);
     let argv = std::fs::read_to_string(root.path().join("argv")).unwrap();
     let argv: Vec<&str> = argv.lines().collect();
     assert_eq!(argv[..2], ["acp", "--cli_dir_name"], "{argv:?}");
@@ -915,8 +928,12 @@ fn the_gate_launches_antigravity_as_octet_does_in_a_scratch_home_it_removes() {
     );
     assert_eq!(argv[3], "--gemini-dir");
     assert!(argv[4].ends_with("/gemini-home"), "{argv:?}");
+    // The settings folder is named by climbing to the root: `agy` joins the
+    // name under `<gemini-home>/antigravity-cli`.
+    let climbed = argv[2].trim_start_matches("../");
+    assert_eq!(argv[2].len() - climbed.len(), 3 * 32, "{argv:?}");
     assert!(
-        argv[2].starts_with(argv[4].trim_end_matches("gemini-home")),
+        format!("/{climbed}").starts_with(argv[4].trim_end_matches("gemini-home")),
         "{argv:?}"
     );
     let text = evidence.to_string();
@@ -956,6 +973,20 @@ fn antigravity_lockdown_passes_only_when_both_actions_ask() {
         assert_eq!(answer["result"]["outcome"]["optionId"], "deny");
     }
     assert_eq!(gate_folders_left(root.path()), Vec::<String>::new());
+
+    // agy did not use Octet's settings folder: nothing is proven.
+    let root = octet_testkit::TempDir::new("octet-gate-agy-lockdown-elsewhere");
+    std::fs::create_dir_all(root.path()).unwrap();
+    let frames = agy_frames(vec![agy_ask("1", &echo), agy_ask("2", &write)], 2);
+    let script = agy_script_logging(&frames, false);
+    let (code, evidence) = probe_in(root.path(), "antigravity", "lockdown", &script);
+    let evidence = evidence.unwrap();
+    assert_eq!(code, Some(1), "{evidence}");
+    assert_eq!(
+        evidence["status"],
+        "unproven: Octet's settings folder was not the one agy used: agy made no log folder in it"
+    );
+    assert_eq!(evidence["antigravity"]["agy_log_in_settings_folder"], false);
 
     // Only the command asks: the write was never exercised.
     let root = octet_testkit::TempDir::new("octet-gate-agy-lockdown-half");

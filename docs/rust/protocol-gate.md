@@ -23,11 +23,16 @@ temporary folder, owner-only, beside the workspace: `octet-data/` (Octet's
 data directory) and `gemini-home/`. The gate prepares the launch as Octet
 does (`antigravity_prepare`, reading "the user's" settings from
 `gemini-home`, never from `~/.gemini`), then starts `agy` with Octet's
-arguments (`launch_args`: `acp --cli_dir_name <octet-data>/antigravity/review`)
-plus `--gemini-dir <gemini-home>`, so no run adds a session to your
-Antigravity history. Before launching it checks that the arguments name a
-settings folder under `octet-data` (never the full-access one) and exactly
-that `--gemini-dir`, and refuses to launch otherwise. The folder is removed
+arguments (`launch_args`: `acp --cli_dir_name ../…/<octet-data>/antigravity/review`,
+32 `../` then the folder's absolute path without its leading `/`) plus
+`--gemini-dir <gemini-home>`, so no run adds a session to your Antigravity
+history. `agy` takes `--cli_dir_name` relative to its app data folder
+(`<gemini-home>/antigravity-cli`): an absolute name would land inside
+`gemini-home`. Before launching, the gate resolves the name as `agy` does
+(joined under `<gemini-home>/antigravity-cli` with any leading `/` removed,
+`.` and `..` folded by name) and refuses to launch unless it lands in a
+settings folder under `octet-data` (never the full-access one), with
+exactly that `--gemini-dir`. The folder is removed
 when the run ends, whatever its outcome. The gate does not run
 `agy --version`: the evidence's `version` is the `agentInfo.version` that
 `initialize` reports.
@@ -167,8 +172,10 @@ value, fails the run with what Antigravity said.
   (`octet-data/antigravity/review/settings.json`): the run is `unproven`
   unless they hold the marker (the fixture went through Octet's merge),
   `toolPermission` `request-review`, no `agentMode` and no
-  `permissions.allow`. In mode `default` it then asks for `echo fixture` and,
-  in a second turn, for a file `gate.txt`. It passes only if each brought a
+  `permissions.allow`. Once the session is open it is `unproven` too unless
+  `agy` made its `log` folder in Octet's settings folder: otherwise that
+  was not the folder `agy` used. In mode `default` it then asks for
+  `echo fixture` and, in a second turn, for a file `gate.txt`. It passes only if each brought a
   permission request (which the gate rejects) and `gate.txt` does not exist;
   a missing request leaves it `unproven`.
 - **`subagent`** asks the model to delegate `touch gate-sub.txt` with
@@ -183,7 +190,9 @@ value, fails the run with what Antigravity said.
 The evidence's `antigravity` object holds the version and whether Octet
 lists it as verified (`ANTIGRAVITY_VERIFIED_VERSIONS`), the launch (the
 scratch folder shown as `<scratch>`), the key names of the settings Octet
-wrote and their `toolPermission`, the options confirmed and those a resume
+wrote and their `toolPermission`, whether `agy` made its `log` folder in
+Octet's settings folder by the end of the run
+(`agy_log_in_settings_folder`), the options confirmed and those a resume
 reported, each permission request (its tool, kind, title and the answer)
 and tool call (its kind, statuses, whether it asked, and its `rawInput`'s
 key names), each reply text, the session's commands, and the scratch
