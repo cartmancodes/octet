@@ -193,7 +193,18 @@ fn print_refuses_an_untrusted_antigravity_workspace_naming_its_files() {
     std::fs::create_dir_all(workspace.path().join(".agents")).unwrap();
     std::fs::write(workspace.path().join(".agents/hooks.json"), "{}").unwrap();
     let cwd = workspace.path().to_str().unwrap();
-    let base = ["--engine", "antigravity", "--cwd", cwd];
+    // Every run shares one journal folder, where a trust would be recorded.
+    let journal = octet_testkit::TempDir::new("octet-headless-agents-journal");
+    std::fs::create_dir_all(journal.path()).unwrap();
+    let journal_dir = journal.path().to_str().unwrap();
+    let base = [
+        "--engine",
+        "antigravity",
+        "--cwd",
+        cwd,
+        "--journal-dir",
+        journal_dir,
+    ];
     let (code, stdout, stderr) = run(&[&base[..], &["--print", "hello"]].concat(), "");
     assert_eq!(code, 1, "{stderr}");
     assert_eq!(stdout, "", "the prompt ran");
@@ -204,8 +215,17 @@ fn print_refuses_an_untrusted_antigravity_workspace_naming_its_files() {
     let (code, stdout, stderr) = run(&flagged, "");
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, format!("{}\n", octet_testkit::scenario::AGY_REPLY));
-    let (code, _, stderr) = run(&[&base[..], &["--print", "hello"]].concat(), "");
+    assert!(
+        !journal
+            .path()
+            .join("antigravity/trusted-workspaces.json")
+            .exists(),
+        "the flagged run recorded a trust"
+    );
+    let (code, stdout, stderr) = run(&[&base[..], &["--print", "hello"]].concat(), "");
     assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stdout, "", "the prompt ran");
+    assert!(stderr.contains(".agents/hooks.json"), "{stderr}");
 }
 
 #[test]

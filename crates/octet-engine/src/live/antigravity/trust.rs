@@ -26,6 +26,8 @@ const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TRUSTED: usize = 1024;
 /// Most bytes of the record read; a larger one counts as empty.
 const MAX_RECORD: u64 = 8 * 1024 * 1024;
+/// What the record's folder holds, as a refusal to make it names it.
+const RECORD_KEPT: &str = "its record of trusted Antigravity workspaces";
 /// The record's name inside `<data_dir>/antigravity`.
 const RECORD: &str = "trusted-workspaces.json";
 /// How many paths a refusal lists before it says how many more there are.
@@ -348,7 +350,7 @@ fn remember(
     fingerprint: &str,
     vendor_home: Option<&Path>,
 ) -> Result<(), String> {
-    let dir = guarded::folder(data_dir, Path::new("antigravity"), vendor_home)
+    let dir = guarded::folder(data_dir, Path::new("antigravity"), vendor_home, RECORD_KEPT)
         .map_err(|failure| failure.into_text(|path, reason| not_recorded(path, reason)))?;
     let mut entries = read_record(data_dir);
     entries.retain(|(known, _)| known != workspace);
@@ -762,7 +764,9 @@ mod tests {
         let cwd = workspace(root.path(), "w");
         let error = trust_in(&data, &cwd, &found(&cwd), Some(&home)).unwrap_err();
         assert!(
-            error.starts_with("Octet will not keep its Antigravity settings inside"),
+            error.starts_with(
+                "Octet will not keep its record of trusted Antigravity workspaces inside"
+            ),
             "{error}"
         );
         assert!(!record_path(&data).exists());

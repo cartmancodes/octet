@@ -84,12 +84,13 @@ fn resolve_home(home: Option<&Path>) -> Result<Option<PathBuf>, Failure> {
 }
 
 /// `folder` resolved, unless that is one of the resolved vendor homes `homes`
-/// or is under one. Nothing is created.
-fn keep_out_of(folder: &Path, homes: &[PathBuf]) -> Result<PathBuf, Failure> {
+/// or is under one; the refusal names `kept`, what the folder would hold.
+/// Nothing is created.
+fn keep_out_of(folder: &Path, homes: &[PathBuf], kept: &str) -> Result<PathBuf, Failure> {
     let resolved = resolve(folder).map_err(|error| Failure::failed(folder, error))?;
     if homes.iter().any(|home| resolved.starts_with(home)) {
         return Err(Failure::Refused(format!(
-            "Octet will not keep its Antigravity settings inside Antigravity's own folder ({}); \
+            "Octet will not keep {kept} inside Antigravity's own folder ({}); \
              choose another --journal-dir",
             resolved.display()
         )));
@@ -100,16 +101,19 @@ fn keep_out_of(folder: &Path, homes: &[PathBuf]) -> Result<PathBuf, Failure> {
 /// Makes `<data_dir>/<below>` (owner-only where it is new) and returns it,
 /// unless it, or `data_dir`, is inside `vendor_home` (by a link or by
 /// `--journal-dir`) or is not where `below` says once links are followed.
-/// Everything is checked before anything is created, and again after.
+/// Everything is checked before anything is created, and again after. A
+/// refusal names `kept`, what the folder is for ("its Antigravity
+/// settings").
 pub(super) fn folder(
     data_dir: &Path,
     below: &Path,
     vendor_home: Option<&Path>,
+    kept: &str,
 ) -> Result<PathBuf, Failure> {
     let dir = data_dir.join(below);
     let before: Vec<PathBuf> = resolve_home(vendor_home)?.into_iter().collect();
-    keep_out_of(data_dir, &before)?;
-    keep_out_of(&dir, &before)?;
+    keep_out_of(data_dir, &before, kept)?;
+    keep_out_of(&dir, &before, kept)?;
     // Only folders Octet creates are owner-only.
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -121,8 +125,8 @@ pub(super) fn folder(
     // resolved again and the folder must be outside both.
     let mut homes = before;
     homes.extend(resolve_home(vendor_home)?);
-    let real_data = keep_out_of(data_dir, &homes)?;
-    let real_dir = keep_out_of(&dir, &homes)?;
+    let real_data = keep_out_of(data_dir, &homes, kept)?;
+    let real_dir = keep_out_of(&dir, &homes, kept)?;
     // The folder must be the one meant, not a link made since the first
     // check, nor a link from one folder to another.
     if real_dir != real_data.join(below) {
@@ -190,7 +194,8 @@ mod tests {
         let home = root.path().join("home/.gemini");
         symlink(root.path().join("elsewhere"), &home).unwrap();
         let data = root.path().join("elsewhere/octet");
-        let failure = folder(&data, Path::new("antigravity"), Some(&home)).unwrap_err();
+        let kept = "its Antigravity settings";
+        let failure = folder(&data, Path::new("antigravity"), Some(&home), kept).unwrap_err();
         let Failure::Refused(text) = failure else {
             panic!("expected the refusal, got {failure:?}");
         };

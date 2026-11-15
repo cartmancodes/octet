@@ -20,6 +20,8 @@ pub(super) const USER_SETTINGS_NOTICE: &str = concat!(
 );
 /// The most bytes of the user's settings file Octet reads.
 pub(super) const USER_SETTINGS_LIMIT: u64 = 1024 * 1024;
+/// What Octet's settings folder holds, as a refusal to make it names it.
+pub(super) const SETTINGS_KEPT: &str = "its Antigravity settings";
 /// The settings file's name, in the user's folder and in Octet's.
 const FILE: &str = "settings.json";
 
@@ -161,7 +163,7 @@ pub(super) fn write(
     vendor_home: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     let below = Path::new("antigravity").join(pin_folder(mode));
-    let dir = guarded::folder(data_dir, &below, vendor_home).map_err(into_text)?;
+    let dir = guarded::folder(data_dir, &below, vendor_home, SETTINGS_KEPT).map_err(into_text)?;
     let mut notices = Vec::new();
     let user = match vendor_home.map_or(UserFile::Missing, read_user) {
         UserFile::Text(text) => Some(text),

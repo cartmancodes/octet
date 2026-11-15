@@ -1239,6 +1239,64 @@ async fn trust_shows_the_error_when_the_configuration_cannot_be_read() {
     );
 }
 #[tokio::test]
+async fn trust_names_every_file_it_trusts() {
+    let (_dir, ws, data) = untrusted_workspace("octet-tui-trust-two");
+    std::fs::write(ws.join(".agents/mcp_config.json"), "{}").unwrap();
+    let mut app = antigravity_app(&ws, &data);
+    assert!(matches!(
+        command(&mut app, "/trust").await,
+        Action::Exit(Exit::Reconnect)
+    ));
+    assert!(
+        app.entries_text().contains(
+            "Trusted: .agents/hooks.json, .agents/mcp_config.json. Octet asks again if these change"
+        ),
+        "{}",
+        app.entries_text()
+    );
+}
+#[tokio::test]
+async fn trust_that_cannot_be_recorded_says_so_and_does_not_reconnect() {
+    let (dir, ws, _data) = untrusted_workspace("octet-tui-trust-unrecorded");
+    // A file where the data folder belongs: the record cannot be written.
+    let data = dir.path().join("data-file");
+    std::fs::write(&data, "not a folder").unwrap();
+    let mut app = antigravity_app(&ws, &data);
+    assert!(matches!(
+        command(&mut app, "/trust").await,
+        Action::Continue
+    ));
+    assert!(
+        app.entries_text()
+            .contains("Octet could not record this workspace as trusted ("),
+        "{}",
+        app.entries_text()
+    );
+}
+#[tokio::test]
+async fn trust_without_a_data_directory_says_so_before_reading_the_workspace() {
+    let dir = octet_testkit::TempDir::new("octet-tui-trust-no-data");
+    // A configuration that cannot be read: the data folder is looked at first.
+    std::fs::create_dir_all(dir.path().join(".agents/hooks.json")).unwrap();
+    let mut app = App::new(
+        &Config::new(Engine::ANTIGRAVITY, "agy", dir.path()),
+        "journal".into(),
+    );
+    app.event(octet_core::Event::Ready {
+        session: "agy-1".into(),
+    });
+    assert!(matches!(
+        command(&mut app, "/trust").await,
+        Action::Continue
+    ));
+    assert!(
+        app.entries_text()
+            .contains("Octet has no data directory to record the trust in"),
+        "{}",
+        app.entries_text()
+    );
+}
+#[tokio::test]
 async fn trust_is_antigravitys_alone() {
     let (_dir, ws, data) = untrusted_workspace("octet-tui-trust-codex");
     let config = Config {

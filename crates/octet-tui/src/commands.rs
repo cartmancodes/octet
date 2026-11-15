@@ -265,6 +265,11 @@ fn trust_command(app: &mut App) -> Action {
         app.note("Only Antigravity loads a workspace's .agents configuration; nothing to trust");
         return Action::Continue;
     }
+    // Looked at first: without it the workspace's files need not be read.
+    let Some(data_dir) = app.conn.data_dir.clone() else {
+        app.note("Octet has no data directory to record the trust in");
+        return Action::Continue;
+    };
     let found = match octet_core::antigravity_workspace_config(&app.conn.cwd) {
         Ok(Some(found)) => found,
         Ok(None) => {
@@ -275,10 +280,6 @@ fn trust_command(app: &mut App) -> Action {
             app.note(error);
             return Action::Continue;
         }
-    };
-    let Some(data_dir) = app.conn.data_dir.clone() else {
-        app.note("Octet has no data directory to record the trust in");
-        return Action::Continue;
     };
     if let Err(error) = octet_core::antigravity_trust(&data_dir, &app.conn.cwd, &found) {
         app.note(error);

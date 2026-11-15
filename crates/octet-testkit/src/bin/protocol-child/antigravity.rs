@@ -788,12 +788,6 @@ impl AgyFixture {
                 emit(&acp_text(&sid, scenario::AGY_REPLY));
                 end_turn(&id);
             }
-            scenario::AGY_OTHER_SESSION => {
-                // The request is for a session this process does not serve,
-                // and its reply is not waited for.
-                emit(&Tool::command("call-other").request("other-ses", "other-1"));
-                self.reply(&id, blocks);
-            }
             scenario::PARAMS => {
                 emit(&acp_text(&sid, &self.params(before)));
                 end_turn(&id);

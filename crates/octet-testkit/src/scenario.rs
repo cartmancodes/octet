@@ -142,8 +142,6 @@ pub const AGY_TO_AUTO: &str = "agy-to-auto";
 pub const AGY_NEW_MODEL: &str = "agy-new-model";
 /// Antigravity: an `invoke_subagent` tool call, then a reply.
 pub const AGY_SUBAGENT: &str = "agy-subagent";
-/// Antigravity: a permission request for another session, then a normal reply.
-pub const AGY_OTHER_SESSION: &str = "agy-other-session";
 /// Antigravity: a normal reply, then, once the turn has ended, the agent
 /// switches itself to mode `plan`.
 pub const AGY_IDLE_PLAN: &str = "agy-idle-plan";
