@@ -550,10 +550,13 @@ provider. `--trust-workspace-config` trusts, for one run (`--print` too), the
 files as they were when Octet started, and records nothing; a workspace with
 none at the start is trusted only while it has none. Octet checks the files
 again before every prompt: if they changed since the session started, the
-prompt is not sent. Every later connection of that run (`/reconnect`, `/new`,
-`/model`, `/mode`, or the phone's model, mode and `new`) is refused too while
-the files differ from the start, flag or not: `/trust` is the only way to
-accept a later change (or quit and start Octet again with the flag). A
+prompt is not sent, whatever was done before it. Every later connection of
+that run is refused too while the files differ from the start, flag or not:
+`/reconnect`, `/new`, `/model`, a mode change to or from `full-access`, and
+the phone's model change and `new`. A live switch between `ask`,
+`accept-edits` and `auto` does not reconnect, so it is not refused; the next
+prompt still is. `/trust` is the only way to accept a later change (or quit
+and start Octet again with the flag). A
 workspace without these files needs no trust. The phone cannot trust a
 workspace.
 
