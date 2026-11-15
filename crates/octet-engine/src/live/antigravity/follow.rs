@@ -80,9 +80,9 @@ impl AntigravityProtocol {
     /// anything else is reported once and set back when no turn runs. The
     /// header keeps Octet's mode. While a switch awaits its reply, or one
     /// that timed out is unanswered, it is only recorded: once they settle,
-    /// the mode is set back unless Antigravity names the header's by then
-    /// (see `send_due_set_back`), so a switch it refuses after moving
-    /// still gets its set-back.
+    /// the mode Antigravity last named is followed here (see `switched`), so
+    /// a switch it refuses after moving still gets its set-back, and a
+    /// looser move during a turn still cancels it.
     pub(super) async fn followed(&mut self, core: &mut Core, id: &str) -> Result<(), DriverError> {
         if !core.phase.is_ready() {
             return Ok(());

@@ -6796,6 +6796,77 @@ async fn antigravity_a_move_during_a_switch_that_is_then_refused_is_set_back() {
     assert_eq!(agy_sent_modes(&c), ["default", "accept-edits", "default"]);
     stop(&handle, task).await;
 }
+/// The steps of a scripted Antigravity that takes the prompt (4) and keeps
+/// it running, then answers the switch (5) by naming `moved` and refusing
+/// it, followed by `after` (shell) in the same step.
+fn agy_refused_switch_mid_turn(moved: &str, after: &str) -> Vec<String> {
+    let mut steps = agy_handshake();
+    steps.push(":".to_owned());
+    steps.push(format!(
+        "{}\n{}\n{after}",
+        agy_update(&serde_json::json!({"sessionUpdate": "current_mode_update",
+            "currentModeId": moved})),
+        r#"echo '{"jsonrpc":"2.0","id":5,"error":{"code":-32603,"message":"busy"}}'"#
+    ));
+    steps
+}
+#[tokio::test]
+async fn antigravity_a_looser_move_during_a_refused_switch_mid_turn_cancels_the_turn() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    let mut steps = agy_refused_switch_mid_turn("auto", ":");
+    // Octet's cancel ends the prompt; then its set-back is confirmed.
+    steps.push(agy_reply(
+        4,
+        &serde_json::json!({"stopReason": "cancelled"}),
+    ));
+    steps.push(agy_reply(6, &agy_in_mode("default")));
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Started)).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let seen = until_finished(&mut events).await;
+    assert_eq!(
+        errors_of(&seen),
+        [
+            "Antigravity moved to its auto mode while Octet shows ask. Octet cancelled the turn and set ask back"
+        ],
+        "{seen:?}"
+    );
+    assert_eq!(outcome_of(&seen), Outcome::Failed);
+    agy_seen_until_sent(&mut events, &c, 7).await;
+    let sent = agy_sent(&c);
+    assert_eq!(sent[5]["method"], "session/cancel", "{sent:?}");
+    assert_eq!(agy_sent_modes(&c), ["default", "accept-edits", "default"]);
+    stop(&handle, task).await;
+}
+#[tokio::test]
+async fn antigravity_a_tighter_move_during_a_refused_switch_mid_turn_waits_for_the_turn_end() {
+    let (_dir, mut c) = antigravity(serde_json::Value::Null);
+    // The turn ends by itself a moment after the refusal.
+    let after = format!(
+        "sleep 0.3\n{}",
+        agy_reply(4, &serde_json::json!({"stopReason": "end_turn"}))
+    );
+    let mut steps = agy_refused_switch_mid_turn("plan", &after);
+    steps.push(agy_reply(6, &agy_in_mode("default")));
+    let (_script, _) = agy_script(&mut c, &steps);
+    let (handle, mut events, task) = spawn(c.clone());
+    wait_for(&mut events, |e| matches!(e, Event::ModeChanged(Mode::Ask))).await;
+    handle.send(Command::Prompt("hello".into())).unwrap();
+    wait_for(&mut events, |e| matches!(e, Event::Started)).await;
+    handle.send(Command::SetMode(Mode::AcceptEdits)).unwrap();
+    let seen = until_finished(&mut events).await;
+    assert_eq!(errors_of(&seen), Vec::<String>::new(), "{seen:?}");
+    assert_eq!(outcome_of(&seen), Outcome::Completed);
+    agy_seen_until_sent(&mut events, &c, 6).await;
+    // The set-back came after the turn, not a cancel.
+    let sent = agy_sent(&c);
+    assert_eq!(sent[5]["params"]["configId"], "mode", "{sent:?}");
+    assert_eq!(agy_sent_modes(&c), ["default", "accept-edits", "default"]);
+    stop(&handle, task).await;
+}
 #[tokio::test]
 async fn antigravity_a_mode_named_in_an_effort_reply_is_followed() {
     let (_dir, mut c) = antigravity(serde_json::Value::Null);

@@ -793,7 +793,9 @@ impl AntigravityProtocol {
     /// a set-back that waited for the switch is sent once it is answered.
     /// A late confirmation that comes after a newer switch was confirmed is
     /// not adopted: the mode it names is followed as Antigravity's own move
-    /// (see `followed`), so the header's mode is set back.
+    /// (see `followed`), so the header's mode is set back. Once no switch
+    /// waits, a move recorded meanwhile is followed as the mode Antigravity
+    /// last named, so a looser one during a turn cancels it at once.
     async fn switched(
         &mut self,
         core: &mut Core,
@@ -802,6 +804,13 @@ impl AntigravityProtocol {
     ) -> Result<(), DriverError> {
         if let Some(stale) = self.switch_answered(core, v, target)? {
             self.followed(core, stale).await?;
+        }
+        let settled = !self.switches.pending() && self.switches.unsettled().is_none();
+        if settled
+            && self.follow.due.is_some()
+            && let Some(named) = self.mode.clone()
+        {
+            self.followed(core, &named).await?;
         }
         self.send_due_set_back(core).await
     }

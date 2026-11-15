@@ -146,9 +146,10 @@ sets 10–3600), cancellation and unknown request types fail closed; requests to
 At most eight approvals wait at once; a ninth is denied with a notice. Claude
 receives the reason with each denial (your refusal, the timeout, the cap), so it
 can tell a refusal from a limit; Codex's decline carries no reason.
-Allow always answers with the request's allow-once option: when an opencode or
-Antigravity request offers none, Octet refuses it instead (with its reject
-option, else by cancelling it) and says so. An Antigravity turn that ends while
+Allowing answers with the request's allow-once option only, never one that
+allows for longer, even when the vendor offers one: when an opencode or
+Antigravity request offers no allow-once option, Octet refuses it instead
+(with its reject option, else by cancelling it) and says so. An Antigravity turn that ends while
 an approval still waits denies it.
 Vendor sandbox policy still applies. The vendor policy depends on the permission
 mode below; this is not a promise that every vendor action raises a dialog.

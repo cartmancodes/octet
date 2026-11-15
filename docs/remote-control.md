@@ -940,9 +940,11 @@ It then creates no socket and no file, and the hub and the phone never see it.
   passes no `--trust-workspace-config`; in a workspace whose configuration is
   not trusted yet, it cannot start and says why. A desk session started with
   `--trust-workspace-config` trusts only the configuration it found when it
-  started, so the phone's model, mode or `new` on that session is refused
-  while the configuration differs from that. Trust the workspace at the desk
-  first.
+  started. While the configuration differs from that, every prompt is
+  refused, whoever sends it, and so is every action that reconnects: the
+  phone's model change, `new`, and a mode change to or from `full-access`
+  (a switch between `ask`, `accept-edits` and `auto` is live and does not
+  reconnect). Trust the workspace at the desk first.
 - The phone runs exactly these desk commands and no others: `/model`,
   `/mode`, `/new`, `/session`, `/help` and `/export`. The last four go as one
   `command` request naming one of `new`, `session`, `help` or `export`, with
