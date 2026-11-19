@@ -14,14 +14,16 @@ tokio.workspace = true
 serde_json.workspace = true
 getrandom = "0.4.3"
 sha2 = "0.11.1"
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "fs"] }
 p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "pem"] }
+snow = { version = "0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
 octet-testkit.workspace = true
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
 
 [lints]
 workspace = true
