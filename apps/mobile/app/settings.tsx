@@ -9,6 +9,7 @@ import { confirmBiometric } from "../src/auth";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { confirmUnpair } from "../src/components/unpair";
+import { runCryptoBench } from "../src/dev/cryptoBench";
 import { openDrawer } from "../src/drawer";
 import { useHubController, useMacs, useNotices, type MacInfo } from "../src/hub";
 import { MAC_NAME_CHARS, MAX_MACS, cleanMacName, machineWords } from "../src/macs";
@@ -227,6 +228,8 @@ export default function Settings() {
           ) : null}
         </Card>
 
+        <CryptoSpeed />
+
         <Text style={[type.caption, { color: theme.muted }]}>{version ? `Octet v${version} · ${FOOTER}` : `Octet · ${FOOTER}`}</Text>
       </ScrollView>
     </View>
@@ -316,6 +319,49 @@ const MachineRow = memo(function MachineRow({ mac, first, onRename, onUnpair }: 
         </View>
       ) : null}
     </View>
+  );
+});
+
+/** How fast this phone encrypts: Measure runs the speed measurement here and shows the mean
+ * handshake time and the rate. In every build, because the number that counts is the optimised
+ * build's, and the preview build is the one in daily use. */
+const CryptoSpeed = memo(function CryptoSpeed() {
+  const theme = useTheme();
+  const alive = useAlive();
+  const [words, setWords] = useState<string | null>(null);
+  const [measuring, setMeasuring] = useState(false);
+  const measure = useCallback(() => {
+    setMeasuring(true);
+    setWords("Measuring…");
+    // After a frame, so "Measuring…" is on screen before the measurement holds the JS thread.
+    setTimeout(() => {
+      let result: string;
+      try {
+        const { handshakeMs, megabytesPerSecond } = runCryptoBench();
+        result = `Handshake ${handshakeMs.toFixed(1)} ms · ${megabytesPerSecond.toFixed(1)} MiB/s`;
+      } catch {
+        result = "Could not measure";
+      }
+      if (!alive()) return;
+      setWords(result);
+      setMeasuring(false);
+    }, 50);
+  }, [alive]);
+  return (
+    <Card title="Encryption speed">
+      <View style={styles.row}>
+        <Text style={[type.body, styles.grow, { color: words === null ? theme.muted : theme.fg }]}>
+          {words ?? "Not measured"}
+        </Text>
+        <Button
+          label="Measure"
+          accessibilityLabel="Measure encryption speed"
+          disabled={measuring}
+          busy={measuring}
+          onPress={measure}
+        />
+      </View>
+    </Card>
   );
 });
 

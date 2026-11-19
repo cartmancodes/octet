@@ -24,6 +24,11 @@ jest.mock("expo-constants", () => ({
   },
 }));
 
+// The real measurement takes seconds; its own test runs it (src/dev/cryptoBench.test.ts).
+const measured = () => ({ handshakeMs: 12.34, megabytesPerSecond: 45.67 });
+let mockBench: () => { handshakeMs: number; megabytesPerSecond: number } = measured;
+jest.mock("./dev/cryptoBench", () => ({ runCryptoBench: () => mockBench() }));
+
 const auth = LocalAuthentication as jest.Mocked<typeof LocalAuthentication>;
 const notifications = Notifications as jest.Mocked<typeof Notifications>;
 
@@ -569,5 +574,32 @@ describe("Settings › Live Activity", () => {
     expect(island()?.props.value).toBe(true);
     expect((await loadSettings()).liveActivity).toBe(true);
     expect(socket.commandsOf("register_activity")).toHaveLength(2);
+  });
+});
+
+describe("Settings › Encryption speed", () => {
+  const measure = () => screen.getByRole("button", { name: "Measure encryption speed" });
+
+  it("is not measured until asked, then shows the handshake time and the rate", async () => {
+    await open();
+    expect(screen.getByText("Encryption speed")).toBeTruthy();
+    expect(screen.getByText("Not measured")).toBeTruthy();
+    await act(async () => fireEvent.press(measure()));
+    expect(screen.getByText("Measuring…")).toBeTruthy();
+    expect(measure().props.accessibilityState).toMatchObject({ disabled: true });
+    await flush();
+    expect(screen.getByText("Handshake 12.3 ms · 45.7 MiB/s")).toBeTruthy();
+    expect(measure().props.accessibilityState).toMatchObject({ disabled: false });
+  });
+
+  it("says so when the measurement fails", async () => {
+    mockBench = () => {
+      throw new Error("the measured handshake failed");
+    };
+    await open();
+    await act(async () => fireEvent.press(measure()));
+    await flush();
+    expect(screen.getByText("Could not measure")).toBeTruthy();
+    mockBench = measured;
   });
 });
