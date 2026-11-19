@@ -208,8 +208,8 @@ carry binary only.
 5. Says if `tmux` is missing: the phone can watch and answer, but cannot start sessions.
 
 **The code.** Both sides compute it from the handshake hash of the connection the `pair`
-arrived on (the first 20 bits of SHA-256 over `"octet-pair-code-v1"` and the hash, as six
-decimal digits). It depends on both static keys and both ephemeral keys, so it identifies the
+arrived on (the first four bytes of SHA-256 over `"octet-pair-code-v1"` and the hash, read as
+a big-endian number, modulo 1,000,000, padded to six digits). It depends on both static keys and both ephemeral keys, so it identifies the
 exact phone at the other end: a different phone using a copied QR code produces a different
 code, which the owner's phone is not showing. The name and platform are the phone's own claim
 and are shown for convenience only. One pairing waits for an answer at a time; a second `pair`
