@@ -7,6 +7,14 @@ mod git;
 mod launch;
 mod owner;
 mod push;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the relay link (plan Task 6) is the first caller outside the tests"
+    )
+)]
+mod secure;
 mod server;
 mod sessions;
 mod store;
