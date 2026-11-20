@@ -92,8 +92,12 @@ fn hub_help_lists_the_actions() {
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
     let help = String::from_utf8_lossy(&output.stdout);
-    for word in ["serve", "devices", "revoke", "watch", "--port", "--owner"] {
+    for word in ["serve", "devices", "revoke", "watch", "install"] {
         assert!(help.contains(word), "{word} missing from: {help}");
+    }
+    // The hub listens on no port and knows nothing of a tailnet.
+    for gone in ["--port", "--owner", "tailscale", "tailnet"] {
+        assert!(!help.contains(gone), "{gone} in: {help}");
     }
     let main = Command::new(env!("CARGO_BIN_EXE_octet"))
         .arg("--help")
@@ -122,11 +126,16 @@ fn hub_revoke_of_an_unknown_device_fails() {
 }
 
 #[test]
-fn hub_port_zero_is_a_usage_error() {
+fn hub_port_and_owner_are_usage_errors() {
     let dir = octet_testkit::TempDir::new("octet-hub-cli");
-    let output = hub(&["--port", "0"], dir.path());
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Port must be"));
+    for (flag, value) in [("--port", "47823"), ("--owner", "me@example.com")] {
+        let output = hub(&[flag, value], dir.path());
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&format!("Unknown argument {flag}")),
+            "{flag}"
+        );
+    }
 }
 
 #[test]
@@ -250,27 +259,17 @@ fn hub_serve_announces_itself_and_watch_follows_until_interrupted() {
         "/tmp/ohcli{}",
         std::process::id()
     )));
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let mut serve = Command::new(env!("CARGO_BIN_EXE_octet"))
-        .args(["hub", "serve", "--owner", "me@example.com", "--port"])
-        .arg(port.to_string())
-        .arg("--journal-dir")
+        .args(["hub", "serve", "--journal-dir"])
         .arg(&dir.0)
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
     let lines = octet_testkit::line_reader(serve.stdout.take().unwrap());
     let first = lines.recv_timeout(octet_testkit::QUICK).unwrap();
-    assert_eq!(first, format!("Octet hub on 127.0.0.1:{port}"));
-    let second = lines.recv_timeout(octet_testkit::QUICK).unwrap();
-    assert!(
-        second == format!("Publish it on your tailnet: tailscale serve --bg {port}")
-            || second.starts_with("Published at https://"),
-        "{second}"
+    assert_eq!(
+        first,
+        "Octet hub running; phones reach it through the relay once one is paired"
     );
 
     let mut watch = Command::new(env!("CARGO_BIN_EXE_octet"))

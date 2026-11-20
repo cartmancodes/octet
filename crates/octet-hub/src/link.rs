@@ -8,6 +8,9 @@ const PREFIX: &str = "octet://pair/";
 const SECURE: u8 = 1;
 /// The link's version byte for a relay reached over `ws`, which only debug builds make.
 const PLAIN: u8 = 0;
+/// Whether this build makes `ws` links: debug builds only, for tests and a relay on the same
+/// network.
+const PLAIN_ALLOWED: bool = cfg!(debug_assertions);
 /// The longest `host` or `host:port` a link carries, in bytes.
 const AUTHORITY_LIMIT: usize = 253;
 /// The longest label of a host name, in bytes.
@@ -56,7 +59,8 @@ fn is_label(label: &str) -> bool {
 /// version byte (`1` for a `wss` relay, `0` for `ws`), the hub's 32-byte `identity` public key,
 /// the 32-byte `channel` id, the 32-byte `secret`, and the relay's `host` or `host:port` in
 /// ASCII. `channel` and `secret` are the hex the hub keeps them as. None when `relay` is not an
-/// address [`split_relay`] takes, or either is not 64 lowercase hex digits.
+/// address [`split_relay`] takes, is a `ws` one in a release build (only debug builds make such
+/// a link), or either is not 64 lowercase hex digits.
 pub(crate) fn pair_link(
     relay: &str,
     identity: &[u8; 32],
@@ -64,6 +68,9 @@ pub(crate) fn pair_link(
     secret: &str,
 ) -> Option<String> {
     let (secure, authority) = split_relay(relay)?;
+    if !secure && !PLAIN_ALLOWED {
+        return None;
+    }
     let channel = unhex::<32>(channel)?;
     let secret = unhex::<32>(secret)?;
     let mut payload = Vec::with_capacity(97 + authority.len());
@@ -120,6 +127,14 @@ mod tests {
     }
 
     #[test]
+    fn only_a_debug_build_makes_a_ws_link() {
+        assert_eq!(PLAIN_ALLOWED, cfg!(debug_assertions));
+        let plain = pair_link("ws://127.0.0.1:9000", &IDENTITY, CHANNEL, SECRET);
+        assert_eq!(plain.is_some(), cfg!(debug_assertions));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
     fn a_ws_relay_makes_a_version_0_link() {
         let link = pair_link("ws://127.0.0.1:9000", &IDENTITY, CHANNEL, SECRET).expect("a link");
         let payload = decode(link.strip_prefix("octet://pair/").expect("the scheme"));

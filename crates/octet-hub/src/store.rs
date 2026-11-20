@@ -20,9 +20,6 @@ use tokio::{
 
 /// The relay a hub dials when `hub.json` names none: a placeholder until the owner names the host.
 pub const DEFAULT_RELAY: &str = "wss://relay.octet.invalid";
-/// The loopback port of the TCP listener, which `hub.json` no longer sets. Task 6 deletes this
-/// with the listener.
-pub const DEFAULT_PORT: u16 = 47823;
 /// The environment variable that names a relay in a debug build, `ws://` only.
 #[cfg(debug_assertions)]
 const RELAY_ENVIRONMENT: &str = "OCTET_HUB_RELAY_URL";
@@ -48,11 +45,9 @@ pub struct Device {
     pub created: u64,
     /// When it last connected, in seconds since the epoch.
     pub last_seen: u64,
-    /// The phone's public key, 64 lowercase hex digits; a device is its key. (Until the hub's TCP
-    /// listener goes in Task 6, the hex SHA-256 of the device token takes its place.)
+    /// The phone's Noise static public key, 64 lowercase hex digits; a device is its key.
     pub key: String,
-    /// The relay address it paired through, as the hub's config gave it; empty for a pairing over
-    /// the TCP listener.
+    /// The relay address it paired through, as the hub's config gave it then.
     pub relay: String,
     /// The Expo push token notifications go to, if the phone turned them on.
     pub push_token: Option<String>,
@@ -395,6 +390,11 @@ impl Store {
         };
         let secret = self.secrets.swap_remove(position);
         Ok(Pairing { device, secret })
+    }
+
+    /// Whether a pairing secret is out and unexpired at `now`: the hub then dials the relay.
+    pub(crate) fn pairing_open(&self, now: SystemTime) -> bool {
+        self.secrets.iter().any(|kept| !expired(kept.issued, now))
     }
 
     /// A pairing whose device was not saved gives its secret back, for a retry.
@@ -961,8 +961,29 @@ impl Default for HubConfig {
     }
 }
 
-/// The settings in `hub.json`; defaults if it is missing.
+/// The settings in `hub.json` (defaults if it is missing), with, in a debug build, the relay
+/// `OCTET_HUB_RELAY_URL` names in place of `hub.json`'s.
 async fn read_config(directory: &Path) -> io::Result<HubConfig> {
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(unused_mut, reason = "only a debug build changes it")
+    )]
+    let mut config = read_file_config(directory).await?;
+    #[cfg(debug_assertions)]
+    if let Ok(relay) = std::env::var(RELAY_ENVIRONMENT) {
+        if environment_relay(&relay) {
+            config.relay = relay;
+        } else {
+            eprintln!(
+                "{RELAY_ENVIRONMENT} must be ws://<host> or ws://<host>:<port> alone; ignored"
+            );
+        }
+    }
+    Ok(config)
+}
+
+/// The settings in `hub.json`; defaults if it is missing.
+async fn read_file_config(directory: &Path) -> io::Result<HubConfig> {
     let mut config = HubConfig::default();
     let bytes = match fs::read(directory.join("hub.json")).await {
         Ok(bytes) => bytes,
@@ -980,16 +1001,6 @@ async fn read_config(directory: &Path) -> io::Result<HubConfig> {
                 "hub.json relay must be wss://<host> or wss://<host>:<port>, with no path, query or \
                  user name; using {DEFAULT_RELAY}"
             ),
-        }
-    }
-    #[cfg(debug_assertions)]
-    if let Ok(relay) = std::env::var(RELAY_ENVIRONMENT) {
-        if environment_relay(&relay) {
-            config.relay = relay;
-        } else {
-            eprintln!(
-                "{RELAY_ENVIRONMENT} must be ws://<host> or ws://<host>:<port> alone; ignored"
-            );
         }
     }
     if !value["workspaces"].is_null() {
@@ -1193,6 +1204,23 @@ mod tests {
             refusal
         );
         assert_eq!(store.devices().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_pairing_is_open_while_a_secret_is_out_and_unexpired() {
+        let dir = TempDir::new("hub-open");
+        let mut store = Store::open(dir.path()).await.expect("the store");
+        let now = epoch(1_000_000);
+        assert!(!store.pairing_open(now));
+        let secret = store.pairing_secret(now);
+        assert!(store.pairing_open(now + Duration::from_mins(10)));
+        assert!(!store.pairing_open(now + Duration::from_mins(11)));
+        // Spent, it is closed.
+        store
+            .pair(&secret, "Phone", "ios", &key_of("Phone"), RELAY, now)
+            .await
+            .expect("paired");
+        assert!(!store.pairing_open(now));
     }
 
     #[tokio::test]

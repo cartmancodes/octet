@@ -34,40 +34,28 @@ fn interrupted() -> impl std::future::Future<Output = Result<(), CliError>> {
     }
 }
 
-/// Runs the hub until SIGINT or SIGTERM, saying where it listens and whether it is published.
-pub(crate) async fn serve(
-    directory: PathBuf,
-    port: Option<u16>,
-    owner: Option<String>,
-) -> Result<i32, CliError> {
-    // Task 6 deletes the port with the TCP listener; `hub.json` no longer sets it.
-    let port = port.unwrap_or(octet_hub::DEFAULT_PORT);
-    let owner = octet_hub::owner_login(owner).await.map_err(failed)?;
+/// Runs the hub until SIGINT or SIGTERM, saying once it is up.
+pub(crate) async fn serve(directory: PathBuf) -> Result<i32, CliError> {
     // Signals are caught before the hub starts, so none is lost in between.
     let stop = interrupted();
-    let (ready, bound) = oneshot::channel();
+    let (ready, started) = oneshot::channel();
     let shutdown = async {
         let _ = stop.await;
     };
-    let serving = Hub::serve_notify(directory, port, owner, shutdown, ready);
+    let serving = Hub::serve_notify(directory, shutdown, ready);
     tokio::pin!(serving);
     tokio::select! {
         result = &mut serving => result.map(|()| 0).map_err(failed),
-        Ok(port) = bound => {
-            let announce = announce(port);
-            let (result, ()) = tokio::join!(serving, announce);
-            result.map(|()| 0).map_err(failed)
+        Ok(()) = started => {
+            announce();
+            serving.await.map(|()| 0).map_err(failed)
         }
     }
 }
 
-/// Prints where the hub listens, then where it is published or how to publish it.
-async fn announce(port: u16) {
-    println!("Octet hub on 127.0.0.1:{port}");
-    match octet_hub::published_url(port).await {
-        Some(url) => println!("Published at {url}"),
-        None => println!("Publish it on your tailnet: tailscale serve --bg {port}"),
-    }
+/// Says the hub is up, and how phones reach it.
+fn announce() {
+    println!("Octet hub running; phones reach it through the relay once one is paired");
     let _ = std::io::stdout().flush();
 }
 

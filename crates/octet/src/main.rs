@@ -14,12 +14,12 @@ const JOURNAL_DIR: &str = "octet/rust-preview";
 
 /// `octet hub --help`.
 fn hub_help() -> &'static str {
-    "Octet hub — your terminal sessions on your phone, over your tailnet\n\
+    "Octet hub — your terminal sessions on your phone, through a relay, end-to-end encrypted\n\
 \n\
-Usage: octet hub [ACTION] [--journal-dir PATH] [--port N] [--owner LOGIN] [--print]\n\
+Usage: octet hub [ACTION] [--journal-dir PATH] [--print]\n\
 \n\
 Actions:\n\
-  serve          Run the hub on 127.0.0.1 until interrupted (the default)\n\
+  serve          Run the hub until interrupted (the default)\n\
   devices        List the paired phones\n\
   revoke NAME    Unpair the phone called NAME (a running hub drops it within 2 s)\n\
   watch          Print what every session is doing until Ctrl+C\n\
@@ -27,12 +27,8 @@ Actions:\n\
   uninstall      Stop that service and remove it\n\
 \n\
 Options:\n\
-  --port N       serve: the loopback port (default: hub.json's, else 47823)\n\
-  --owner LOGIN  serve: the tailnet login that may connect (default: this Mac's, from Tailscale)\n\
   --print        install: show the service file without installing it\n\
-  --journal-dir PATH  Where journals and the hub's files live (install keeps it)\n\
-\n\
-Publish the hub to your tailnet with: tailscale serve --bg <port>\n"
+  --journal-dir PATH  Where journals and the hub's files live (install keeps it)\n"
 }
 
 /// `--help`: fixed usage and keys, then every command from the registry.
@@ -158,7 +154,7 @@ async fn run() -> Result<i32, CliError> {
         Parsed::Hub(args) => {
             let directory = data_dir(args.journal_dir)?;
             return match args.action {
-                HubAction::Serve => hub::serve(directory, args.port, args.owner).await,
+                HubAction::Serve => hub::serve(directory).await,
                 HubAction::Devices => hub::devices(&directory).await,
                 HubAction::Revoke(name) => hub::revoke(&directory, &name).await,
                 HubAction::Watch => hub::watch(&directory).await,

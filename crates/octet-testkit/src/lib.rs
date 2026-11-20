@@ -1,5 +1,7 @@
 //! Test support shared by the workspace: the fake vendor binary and
 //! self-cleaning temporary directories.
+#[cfg(feature = "relay")]
+pub mod relay;
 pub mod scenario;
 use std::{
     path::{Path, PathBuf},

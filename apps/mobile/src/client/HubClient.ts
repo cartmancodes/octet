@@ -283,8 +283,12 @@ export class HubClient {
         if (!frame) {
           this.garbage += 1;
         } else if (frame.type === "paired") {
-          this.tokenValue = frame.token;
-          finish(() => resolve({ token: frame.token, device: frame.device }));
+          // A hub over the relay sends no token (the phone is its key); until the app pairs by
+          // key (plan Task 10), one from an older hub is still taken.
+          const legacy: unknown = (frame as { token?: unknown }).token;
+          const token = typeof legacy === "string" ? legacy : "";
+          this.tokenValue = token;
+          finish(() => resolve({ token, device: frame.device }));
         } else if (frame.type === "refused") {
           finish(() => reject(refusalOf(frame)));
         }

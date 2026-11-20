@@ -4,12 +4,12 @@
 //! anything else runs cannot race another test. A release build ignores `OCTET_HUB_PUSH_URL`, so
 //! the test runs in debug builds only.
 #![cfg(debug_assertions)]
-use futures_util::{SinkExt, StreamExt};
 use octet_core::remote::{
     protocol::{ack, bridge_state_frame},
     run::Registration,
 };
 use octet_hub::Hub;
+use octet_testkit::relay::{Link as PairLink, Phone, PhoneKey, Relay, control, pair};
 use serde_json::{Value, json};
 use std::{
     os::unix::fs::PermissionsExt,
@@ -18,28 +18,19 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{
-        TcpListener, TcpStream, UnixListener, UnixStream,
+        TcpListener, TcpStream, UnixListener,
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::oneshot,
-    time::timeout,
-};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
+    time::{Instant, timeout},
 };
 
-const OWNER: &str = "owner@example";
 const WAIT: Duration = Duration::from_secs(5);
 /// How long a push may take: the 2 s window, the hub's 1 s sweep, and `curl`.
 const PUSH_WITHIN: Duration = Duration::from_secs(10);
 const JOURNAL: &str = "session-1-1.jsonl";
-/// The host every hub here is published at, as its pushes name it.
-const MAC: &str = "mac.tail1234.ts.net";
-
-type Phone = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// The local stand-in for Expo: it keeps every body posted, and answers `DeviceNotRegistered`
 /// for any message to a token containing `gone`, `ok` for the rest.
@@ -143,11 +134,13 @@ impl Fake {
     }
 }
 
-/// A data directory, the hub serving it and its fake bridge.
+/// A data directory, a relay, the hub serving it and its fake bridge.
 struct Env {
     root: PathBuf,
     run: PathBuf,
-    port: u16,
+    _relay: Relay,
+    /// The hub's link, once a phone paired: its channel is the `mac` every push names.
+    link: Mutex<Option<PairLink>>,
     bridge: UnixListener,
     id: String,
     stop: Option<oneshot::Sender<()>>,
@@ -182,55 +175,41 @@ impl Env {
         registration.write(&run).await.expect("registration");
         let (stop, stopped) = oneshot::channel::<()>();
         let directory = root.clone();
+        let relay = Relay::start().await;
+        let url = relay.url();
         tokio::spawn(async move {
             let shutdown = async {
                 let _ = stopped.await;
             };
-            Hub::serve_with(
-                directory,
-                0,
-                OWNER.to_owned(),
-                shutdown,
-                oneshot::channel().0,
-                (
-                    |_| Box::pin(async { Some("https://mac.tail1234.ts.net".to_owned()) }),
-                    Duration::from_secs(10),
-                ),
-            )
-            .await
+            let log = Arc::new(|_: &str| {});
+            Hub::serve_with(directory, url, log, shutdown, oneshot::channel().0).await
         });
-        let mut env = Self {
+        let env = Self {
             root,
             run,
-            port: 0,
+            _relay: relay,
+            link: Mutex::new(None),
             bridge,
             id: registration.id,
             stop: Some(stop),
         };
-        let status = timeout(WAIT, async {
-            loop {
-                if let Some(status) = env.control(&json!({"type": "status"})).await {
-                    return status;
-                }
+        timeout(WAIT, async {
+            while control(&env.run, &json!({"type": "status"}))
+                .await
+                .is_none()
+            {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
         .expect("the hub starts");
-        env.port = u16::try_from(status["port"].as_u64().expect("a port")).expect("a port");
         env
     }
 
-    async fn control(&self, request: &Value) -> Option<Value> {
-        let stream = UnixStream::connect(self.run.join("hub.sock")).await.ok()?;
-        let (read, mut write) = stream.into_split();
-        write
-            .write_all(format!("{request}\n").as_bytes())
-            .await
-            .ok()?;
-        let mut line = String::new();
-        BufReader::new(read).read_line(&mut line).await.ok()?;
-        serde_json::from_str(&line).ok()
+    /// The hub's channel id: the `mac` its pushes name.
+    fn channel(&self) -> String {
+        let link = self.link.lock().expect("lock");
+        link.as_ref().expect("a phone paired").channel.clone()
     }
 
     /// The hub's link to the bridge, once it is made.
@@ -252,27 +231,17 @@ impl Env {
         self.paired_phone(name, token, kinds).await.0
     }
 
-    /// [`phone`](Self::phone), with the device token it said hello with.
-    async fn paired_phone(&self, name: &str, token: &str, kinds: Option<Value>) -> (Phone, String) {
-        let mut phone = self.connect().await;
-        let secret = self
-            .control(&json!({"type": "pair_secret"}))
-            .await
-            .expect("a secret");
-        send(
-            &mut phone,
-            json!({"v": 1, "req": 1, "type": "pair", "secret": secret["secret"],
-                "name": name, "platform": "ios"}),
-        )
-        .await;
-        let paired = recv_kind(&mut phone, "paired").await;
-        let device_token = paired["token"].as_str().expect("a token").to_owned();
-        let mut phone = self.connect().await;
-        send(
-            &mut phone,
-            json!({"v": 1, "req": 2, "type": "hello", "token": device_token}),
-        )
-        .await;
+    /// [`phone`](Self::phone), with the key it said hello with.
+    async fn paired_phone(
+        &self,
+        name: &str,
+        token: &str,
+        kinds: Option<Value>,
+    ) -> (Phone, PhoneKey) {
+        let (link, key, _) = pair(&self.run, name).await;
+        *self.link.lock().expect("lock") = Some(link);
+        let mut phone = self.connect(&key).await;
+        send(&mut phone, json!({"v": 1, "req": 2, "type": "hello"})).await;
         recv_kind(&mut phone, "welcome").await;
         let mut register = json!({"v": 1, "req": 3, "type": "register_push", "token": token});
         if let Some(kinds) = kinds {
@@ -283,34 +252,31 @@ impl Env {
             recv_kind(&mut phone, "ack").await,
             ack(3, "Notifications on")
         );
-        (phone, device_token)
+        (phone, key)
     }
 
-    /// A background connection of the device `device`: the app handing a token over, not the
-    /// app in front.
-    async fn background_hello(&self, device: &str) -> Phone {
-        let mut phone = self.connect().await;
+    /// A background connection of the device whose key is `device`: the app handing a token
+    /// over, not the app in front.
+    async fn background_hello(&self, device: &PhoneKey) -> Phone {
+        let mut phone = self.connect(device).await;
         send(
             &mut phone,
-            json!({"v": 1, "req": 2, "type": "hello", "token": device, "background": true}),
+            json!({"v": 1, "req": 2, "type": "hello", "background": true}),
         )
         .await;
         recv_kind(&mut phone, "welcome").await;
         phone
     }
 
-    async fn connect(&self) -> Phone {
-        let mut request = format!("ws://127.0.0.1:{}/", self.port)
-            .into_client_request()
-            .expect("a request");
-        request
-            .headers_mut()
-            .insert("Tailscale-User-Login", OWNER.parse().expect("a header"));
-        let (phone, _) = timeout(WAIT, connect_async(request))
-            .await
-            .expect("the handshake ends")
-            .expect("connects");
-        phone
+    /// A connection of the device whose key is `key`, past its handshake.
+    async fn connect(&self, key: &PhoneKey) -> Phone {
+        let link = self
+            .link
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("a phone paired");
+        Phone::connect(&link, key).await.expect("connects")
     }
 
     /// Appends a record to the session's journal, as the terminal UI does.
@@ -364,32 +330,16 @@ impl Link {
 }
 
 async fn send(phone: &mut Phone, message: Value) {
-    let sent = timeout(WAIT, phone.send(Message::text(message.to_string()))).await;
-    sent.expect("send in time").expect("send");
+    phone.send(&message).await;
 }
 
 async fn recv_kind(phone: &mut Phone, kind: &str) -> Value {
-    timeout(WAIT, async {
-        loop {
-            match phone.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(text.as_str()).expect("a frame");
-                    if frame["type"] == kind {
-                        return frame;
-                    }
-                }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                other => panic!("expected a frame, got {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("a frame arrives")
+    phone.recv_kind(kind).await
 }
 
 /// Closes the phone's socket, as the app does in the background, and gives the hub a moment.
 async fn background(mut phone: Phone) {
-    let _ = timeout(WAIT, phone.close(None)).await;
+    phone.close().await;
     drop(phone);
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
@@ -401,10 +351,10 @@ async fn pushes_after(fake: &Fake, token: &str, wait: Duration) -> usize {
 }
 
 /// What a push looks like on the phone: exactly these keys, nothing from the session, and the
-/// hub's own published host as `mac`.
-fn approval_message(token: &str, session: &str) -> Value {
+/// hub's channel id as `mac`.
+fn approval_message(token: &str, session: &str, mac: &str) -> Value {
     json!({"to": token, "title": "Octet", "body": "Approval waiting",
-        "data": {"session": session, "mac": MAC}, "sound": "default", "priority": "high",
+        "data": {"session": session, "mac": mac}, "sound": "default", "priority": "high",
         "channelId": "approvals"})
 }
 
@@ -494,6 +444,10 @@ fn push_goes_out_content_free_to_a_phone_in_the_background() {
             connected_phones_are_left_alone(&fake, root.join("b")),
             a_dead_token_is_dropped(&fake, root.join("c")),
             a_background_connection_is_not_the_app(&fake, root.join("d")),
+            a_phone_that_stops_answering_encrypted_pings_is_dropped_and_its_pushes_resume(
+                &fake,
+                root.join("e")
+            ),
         );
         assert_content_free(&fake);
         // No call to curl, whoever made it, had a push token in its argv.
@@ -522,7 +476,7 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     link.state("idle", &[1]).await;
     assert_eq!(
         fake.wait_for(TOKEN, 0).await,
-        approval_message(TOKEN, &env.id)
+        approval_message(TOKEN, &env.id, &env.channel())
     );
     // The same approval again, and answered, are not news.
     link.state("idle", &[1]).await;
@@ -532,7 +486,8 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     assert_eq!(
         turn,
         json!({"to": TOKEN, "title": "Octet", "body": "Turn finished",
-            "data": {"session": env.id, "mac": MAC}, "priority": "normal", "channelId": "turns"})
+            "data": {"session": env.id, "mac": env.channel()}, "priority": "normal",
+            "channelId": "turns"})
     );
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 2);
     // An error in the session's journal: one push, which says nothing of the error.
@@ -542,7 +497,8 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     assert_eq!(
         error,
         json!({"to": TOKEN, "title": "Octet", "body": "Session error",
-            "data": {"session": env.id, "mac": MAC}, "priority": "high", "channelId": "errors"})
+            "data": {"session": env.id, "mac": env.channel()}, "priority": "high",
+            "channelId": "errors"})
     );
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 3);
 
@@ -560,7 +516,7 @@ async fn approval_then_turn(fake: &Fake, root: PathBuf, url: &str, log: &Path) {
     assert_eq!(
         batches,
         [
-            json!([approval_message(TOKEN, &env.id)]),
+            json!([approval_message(TOKEN, &env.id, &env.channel())]),
             json!([error]),
             json!([turn])
         ]
@@ -600,7 +556,7 @@ async fn connected_phones_are_left_alone(fake: &Fake, root: PathBuf) {
     background(phone).await;
     assert_eq!(
         fake.wait_for(TOKEN, 0).await,
-        approval_message(TOKEN, &env.id)
+        approval_message(TOKEN, &env.id, &env.channel())
     );
     assert_eq!(pushes_after(fake, TOKEN, Duration::from_secs(3)).await, 1);
     link.state("idle", &[1, 2]).await;
@@ -648,7 +604,45 @@ async fn a_background_connection_is_not_the_app(fake: &Fake, root: PathBuf) {
     link.state("idle", &[1]).await;
     assert_eq!(
         fake.wait_for(TOKEN, 0).await,
-        approval_message(TOKEN, &env.id)
+        approval_message(TOKEN, &env.id, &env.channel())
     );
     drop(wake);
+}
+
+/// A phone with the app in front that stops answering the hub's encrypted pings (its socket is
+/// still read, so the relay still sees it) is let go when its next ping falls due, 40 seconds
+/// on: the approval it was spared is pushed then, as to any phone that left.
+async fn a_phone_that_stops_answering_encrypted_pings_is_dropped_and_its_pushes_resume(
+    fake: &Fake,
+    root: PathBuf,
+) {
+    const TOKEN: &str = "ExpoPushToken[story-e-token]";
+    let env = Env::start(root, 6105).await;
+    let mut link = env.link().await;
+    let mut phone = env.phone("Story E phone", TOKEN, None).await;
+    let began = Instant::now();
+    phone.ignore_pings();
+    let reader = tokio::spawn(async move {
+        while phone.next().await.is_some() {}
+        phone.pings()
+    });
+    link.state("idle", &[]).await;
+    link.state("idle", &[1]).await;
+    // While it looks present, nothing is pushed: past the first ping, still nothing.
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    assert_eq!(fake.to(TOKEN).len(), 0, "pushed to a phone in front");
+    let pings = timeout(Duration::from_secs(30), reader)
+        .await
+        .expect("the hub lets the phone go")
+        .expect("the reader");
+    let dropped = began.elapsed();
+    assert_eq!(pings, 1, "let go as its second ping fell due");
+    assert!(
+        dropped >= Duration::from_secs(39) && dropped < Duration::from_secs(45),
+        "{dropped:?}"
+    );
+    assert_eq!(
+        fake.wait_for(TOKEN, 0).await,
+        approval_message(TOKEN, &env.id, &env.channel())
+    );
 }

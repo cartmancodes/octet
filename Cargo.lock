@@ -935,6 +935,7 @@ dependencies = [
  "getrandom 0.4.3",
  "octet-core",
  "octet-proc",
+ "octet-relay",
  "octet-store",
  "octet-testkit",
  "p256",
@@ -987,8 +988,14 @@ dependencies = [
 name = "octet-testkit"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
+ "getrandom 0.4.3",
  "libc",
+ "octet-relay",
  "serde_json",
+ "snow",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]
