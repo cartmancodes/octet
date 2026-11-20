@@ -343,6 +343,11 @@ fn status_line(frame: &mut Frame, area: Rect, app: &App, compact: bool) {
 }
 /// Help, the palette or an approval over everything; else the cursor.
 fn overlays(frame: &mut Frame, area: Rect, app: &mut App, cursor: (u16, u16)) {
+    let covered = app.overlay.help || app.overlay.palette || !app.overlay.approvals.is_empty();
+    if let Some(wait) = app.pairing.as_mut().filter(|_| covered) {
+        // Covered, the pairing question must be seen again before a key answers it.
+        wait.hidden();
+    }
     if app.overlay.help {
         // Drawn over any approval, which must be seen again before a key
         // answers it.
@@ -360,9 +365,36 @@ fn overlays(frame: &mut Frame, area: Rect, app: &mut App, cursor: (u16, u16)) {
         let count = app.overlay.approvals.len();
         approval(frame, area, asked, &mut app.overlay.approval_scroll, count);
         app.overlay.approval_drawn();
+    } else if let Some(wait) = app.pairing.as_mut()
+        && let Some(question) = &wait.question
+    {
+        pair_question(frame, area, &question.prompt());
+        wait.drawn();
     } else {
         frame.set_cursor_position(cursor);
     }
+}
+/// The pairing question over everything: the prompt `octet pair` asks, and its keys.
+fn pair_question(frame: &mut Frame, area: Rect, prompt: &str) {
+    const KEYS: &str = "Y  Yes     N / Enter / Esc  No";
+    let width = cells(prompt.width().max(KEYS.width())).saturating_add(4);
+    let width = width.min(area.width.saturating_sub(4));
+    let rows = wrapped(&[prompt], usize::from(width.saturating_sub(4)));
+    let area = modal(area, width, cells(rows.len()).saturating_add(5));
+    frame.render_widget(Clear, area);
+    let mut lines = vec![Line::default()];
+    lines.extend(rows.into_iter().map(|row| Line::from(format!(" {row}"))));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        format!(" {KEYS}"),
+        Style::default().fg(AMBER),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(card(" Pair a phone ").border_style(Style::default().fg(AMBER)))
+            .style(Style::default().bg(PANEL).fg(FG)),
+        area,
+    );
 }
 /// The `@`, path or command suggestions, just above the prompt box.
 fn completion_popup(frame: &mut Frame, composer: Rect, app: &App) {

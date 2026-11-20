@@ -3,7 +3,7 @@
 //! outlives a reconnect (it moves to the next interface); on quit only an
 //! export is waited for, so it is never cut short. A job a phone asked for
 //! (an `/export`) carries its [`Asker`], who is answered when it ends.
-use crate::{app::App, remote};
+use crate::{app::App, pairing::Control, remote};
 use octet_core::{ExportError, RecentSession};
 use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
 use tokio::task::JoinHandle;
@@ -13,9 +13,10 @@ pub(crate) const GRACE: Duration = Duration::from_secs(5);
 
 /// What a finished job reports.
 pub(crate) enum Done {
-    Remote(remote::Checks),
-    /// A pairing code asked of the hub; the secret is shown once and kept out of logs.
-    Pair(remote::Pairing),
+    /// Where the hub stands, for plain `/remote-control`.
+    Remote(remote::HubState),
+    /// A pairing opened on the hub; its link is shown once, in the transcript only.
+    Pair(remote::Opened),
     Sessions(Vec<RecentSession>),
     Exported {
         path: PathBuf,
@@ -52,25 +53,22 @@ pub(crate) struct Job {
 }
 
 impl Job {
-    /// The `/remote-control` checks.
-    pub(crate) fn remote(directory: PathBuf) -> Self {
+    /// Where the hub at `control` stands, for plain `/remote-control`.
+    pub(crate) fn remote(control: impl Control + Send + Sync + 'static) -> Self {
         Self {
-            label: "Checking phone access…",
+            label: "Asking the hub…",
             must_finish: false,
             asker: None,
-            work: Box::pin(async move { Done::Remote(remote::probe(&directory).await) }),
+            work: Box::pin(async move { Done::Remote(remote::status(&control).await) }),
         }
     }
-    /// A pairing secret from the hub, for `/remote-control pair`.
-    pub(crate) fn pair(directory: PathBuf) -> Self {
+    /// A pairing opened on the hub at `control`, for `/remote-control pair`.
+    pub(crate) fn pair(control: impl Control + Send + Sync + 'static) -> Self {
         Self {
-            label: "Asking the hub for a pairing code…",
+            label: "Opening a pairing…",
             must_finish: false,
             asker: None,
-            work: Box::pin(async move {
-                let run = octet_core::remote::run::run_dir(&directory);
-                Done::Pair(remote::pairing(&run, remote::CHECK_TIMEOUT).await)
-            }),
+            work: Box::pin(async move { Done::Pair(remote::open(control).await) }),
         }
     }
     /// The journals beside this one, for `/sessions`.
@@ -172,14 +170,13 @@ pub(crate) fn apply(app: &mut App, ended: Ended) {
         }
     };
     match done {
-        Done::Remote(mut checks) => {
-            checks.bridge_off.clone_from(&app.remote_off);
-            let report = remote::report(&checks);
-            app.note(report.text.as_str());
-            // The status line, one row high, gets the count of problems.
-            app.hint(remote::summary(&report));
+        Done::Remote(state) => {
+            let report = remote::report(&state, app.remote_off.as_deref());
+            app.note(report.as_str());
+            // The status line, one row high, gets the report on one line.
+            app.hint(report.replace('\n', " · "));
         }
-        Done::Pair(pairing) => crate::commands::show_pairing(app, pairing),
+        Done::Pair(opened) => remote::show(app, opened),
         Done::Sessions(listed) => crate::commands::show_sessions(app, listed),
         Done::Exported { path, result } => match result {
             Ok(()) => app.note(format!("Exported journal to {}", path.display())),

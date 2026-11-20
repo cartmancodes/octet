@@ -100,130 +100,11 @@ async fn copy_reports_the_size_of_the_last_reply() {
         );
     });
 }
-#[tokio::test]
-async fn remote_control_reports_without_changing_the_session() {
-    let mut app = app();
-    let action = command(&mut app, "/remote-control").await;
-    assert!(matches!(&action, Action::Job(job) if job.label == "Checking phone access…"));
-    // Under test the checks run stand-in program names that never exist,
-    // so the result doesn't depend on what this machine has installed.
-    run_job(&mut app, action).await;
-    let text = app.entries_text();
-    assert!(text.contains("Remote control setup"), "{text}");
-    assert!(text.contains("[!!] Tailscale isn't connected"), "{text}");
-    assert!(
-        app.status_line.starts_with("Remote control: "),
-        "{}",
-        app.status_line
-    );
-    assert!(
-        app.status_line.ends_with("problems (report above)"),
-        "{}",
-        app.status_line
-    );
-    assert_eq!(app.conn.session, "thread-1");
-}
 /// An interface whose data directory is `dir`, as the journal's parent decides it.
 fn app_in(dir: &std::path::Path) -> App {
     let mut app = app();
     app.conn.journal = dir.join("journal.jsonl");
     app
-}
-#[tokio::test]
-async fn remote_control_pair_without_a_hub_says_how_to_start_one() {
-    let dir = octet_testkit::TempDir::new("octet-rc-nohub");
-    let mut app = app_in(dir.path());
-    let action = command(&mut app, "/remote-control pair").await;
-    assert!(
-        matches!(&action, Action::Job(job) if job.label == "Asking the hub for a pairing code…")
-    );
-    run_job(&mut app, action).await;
-    let text = app.entries_text();
-    assert!(text.contains("Start the hub first: octet hub"), "{text}");
-}
-#[tokio::test]
-async fn remote_control_pair_shows_the_qr_and_keeps_the_secret_off_the_status_line() {
-    let dir = octet_testkit::TempDir::new("octet-rc-qr");
-    let served = crate::test_support::serve_hub(
-        &octet_core::remote::run::run_dir(dir.path()),
-        r#"{"secret":"s3cretvalue","url":"https://mac.ts.net"}"#,
-    );
-    let mut app = app_in(dir.path());
-    let action = command(&mut app, "/remote-control pair").await;
-    run_job(&mut app, action).await;
-    served.await.unwrap();
-    let text = app.entries_text();
-    assert!(
-        text.contains("https://mac.ts.net/#pair=s3cretvalue"),
-        "{text}"
-    );
-    assert!(text.contains("█"), "{text}");
-    assert!(
-        text.contains("Expires in 10 minutes · works once"),
-        "{text}"
-    );
-    assert!(
-        !app.status_line.contains("s3cretvalue"),
-        "{}",
-        app.status_line
-    );
-    assert!(
-        app.status_line.contains("Pairing code"),
-        "{}",
-        app.status_line
-    );
-}
-#[tokio::test]
-async fn remote_control_pair_on_a_narrow_terminal_asks_to_widen_it() {
-    let dir = octet_testkit::TempDir::new("octet-rc-narrow");
-    let served = crate::test_support::serve_hub(
-        &octet_core::remote::run::run_dir(dir.path()),
-        r#"{"secret":"s3cretvalue","url":"https://mac.ts.net"}"#,
-    );
-    let mut app = app_in(dir.path());
-    app.last_width = 40;
-    let action = command(&mut app, "/remote-control pair").await;
-    run_job(&mut app, action).await;
-    served.await.unwrap();
-    let text = app.entries_text();
-    assert!(
-        text.contains("Widen the terminal to show the QR code"),
-        "{text}"
-    );
-    assert!(text.contains("#pair=s3cretvalue"), "{text}");
-    assert!(!text.contains("█"), "{text}");
-}
-#[tokio::test]
-async fn remote_control_pair_without_an_address_shows_no_secret() {
-    let dir = octet_testkit::TempDir::new("octet-rc-nots");
-    let served = crate::test_support::serve_hub(
-        &octet_core::remote::run::run_dir(dir.path()),
-        r#"{"secret":"s3cretvalue","url":null}"#,
-    );
-    let mut app = app_in(dir.path());
-    let action = command(&mut app, "/remote-control pair").await;
-    run_job(&mut app, action).await;
-    served.await.unwrap();
-    let text = app.entries_text();
-    assert!(text.contains("The hub gave no address"), "{text}");
-    assert!(!text.contains("s3cretvalue") && !app.status_line.contains("s3cretvalue"));
-}
-#[tokio::test]
-async fn remote_control_names_the_hub_in_its_report() {
-    let dir = octet_testkit::TempDir::new("octet-rc-rep");
-    let served = crate::test_support::serve_hub(
-        &octet_core::remote::run::run_dir(dir.path()),
-        r#"{"port":47823,"published":true,"url":"https://mac.ts.net","devices":1}"#,
-    );
-    let mut app = app_in(dir.path());
-    let action = command(&mut app, "/remote-control").await;
-    run_job(&mut app, action).await;
-    served.await.unwrap();
-    let text = app.entries_text();
-    assert!(
-        text.contains("Hub: https://mac.ts.net · 1 paired device"),
-        "{text}"
-    );
 }
 #[tokio::test]
 async fn remote_control_with_an_unknown_argument_lists_what_it_takes() {
@@ -234,6 +115,464 @@ async fn remote_control_with_an_unknown_argument_lists_what_it_takes() {
     ));
     let text = app.entries_text();
     assert!(text.contains("/remote-control pair"), "{text}");
+}
+/// `/remote-control`: the hub's state, and pairing a phone with a question at the desk, against a
+/// stand-in hub (on a control socket in a temporary directory, or in process with the clock paused).
+mod remote_control {
+    use super::*;
+    use crate::{
+        pairing::{ANSWER_WITHIN, Control, NOT_PAIRED, PHONE_LEFT, POLL_EVERY, TIMED_OUT},
+        remote,
+    };
+    use serde_json::{Value, json};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    /// The link the stand-in hub opens.
+    const LINK: &str =
+        "octet://pair/AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8w";
+    /// The question `octet pair` asks about the stand-in phone.
+    const ASKS: &str = "Phone shows 482 913? Pair \"Pixel\" (ios)? [y/N]";
+
+    /// A hub that answers from a script, keeping every request.
+    #[derive(Clone)]
+    struct Hub {
+        /// Its `status` answer.
+        status: Value,
+        /// Its `pair_wait` answers in turn; the last one repeats.
+        waits: Arc<Mutex<VecDeque<Value>>>,
+        /// Its `pair_answer` answer to a yes, then to a no.
+        answers: (Value, Value),
+        /// Every request so far.
+        asked: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl Hub {
+        /// A hub holding the phone `waits` tells of, pairing it on a yes.
+        fn new(waits: Vec<Value>) -> Self {
+            Self {
+                status: json!({"relay": "registered", "devices": 1}),
+                waits: Arc::new(Mutex::new(waits.into())),
+                answers: (
+                    json!({"paired": true, "device": "Pixel"}),
+                    json!({"paired": false}),
+                ),
+                asked: Arc::default(),
+            }
+        }
+
+        /// A hub answering a no with `refusal`.
+        fn refusing(waits: Vec<Value>, refusal: Value) -> Self {
+            Self {
+                answers: (json!({"paired": true, "device": "Pixel"}), refusal),
+                ..Self::new(waits)
+            }
+        }
+
+        /// The `type` of every request so far.
+        fn kinds(&self) -> Vec<String> {
+            let asked = self.asked.lock().unwrap();
+            asked
+                .iter()
+                .map(|request| request["type"].as_str().unwrap().to_owned())
+                .collect()
+        }
+
+        /// Every `pair_answer` so far.
+        fn answered(&self) -> Vec<Value> {
+            let asked = self.asked.lock().unwrap();
+            asked
+                .iter()
+                .filter(|request| request["type"] == "pair_answer")
+                .cloned()
+                .collect()
+        }
+
+        /// Serves this script on the control socket of the hub whose files are in `directory`.
+        fn serve(&self, directory: &std::path::Path) -> tokio::task::JoinHandle<()> {
+            let run = octet_core::remote::run::run_dir(directory);
+            std::fs::create_dir_all(&run).unwrap();
+            let listener = tokio::net::UnixListener::bind(run.join("hub.sock")).unwrap();
+            let hub = self.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let hub = hub.clone();
+                    tokio::spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        let mut line = String::new();
+                        BufReader::new(read).read_line(&mut line).await.unwrap();
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let reply = hub.call(&request).await.unwrap();
+                        let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                    });
+                }
+            })
+        }
+    }
+
+    impl Control for Hub {
+        async fn call(&self, request: &Value) -> Option<Value> {
+            // Answered after a turn of the runtime, as a socket would be.
+            tokio::task::yield_now().await;
+            self.asked.lock().unwrap().push(request.clone());
+            Some(match request["type"].as_str()? {
+                "status" => self.status.clone(),
+                "pair_secret" => json!({"link": LINK}),
+                "pair_wait" => {
+                    let mut waits = self.waits.lock().unwrap();
+                    if waits.len() > 1 {
+                        waits.pop_front().unwrap()
+                    } else {
+                        waits[0].clone()
+                    }
+                }
+                "pair_answer" if request["accept"] == true => self.answers.0.clone(),
+                "pair_answer" => self.answers.1.clone(),
+                _ => json!({"error": "Unknown request"}),
+            })
+        }
+    }
+
+    /// The hub's question about the phone called Pixel, held as pairing `pending`.
+    fn question(pending: u64, replaces: bool) -> Value {
+        json!({"pending": pending, "code": "482913", "name": "Pixel", "platform": "ios", "replaces": replaces})
+    }
+
+    /// Opens a pairing on `hub` the way `/remote-control pair` does.
+    async fn open(app: &mut App, hub: &Hub) {
+        run_job(app, Action::Job(crate::jobs::Job::pair(hub.clone()))).await;
+        assert!(app.pairing.is_some(), "{}", app.entries_text());
+    }
+
+    /// Waits for what the pairing tells next, and acts on it as the event loop does.
+    async fn told(app: &mut App) {
+        let told = app
+            .pairing
+            .as_mut()
+            .expect("a pairing is open")
+            .next()
+            .await;
+        remote::apply(app, told);
+    }
+
+    /// The open question's prompt.
+    fn asking(app: &App) -> Option<String> {
+        let wait = app.pairing.as_ref()?;
+        wait.question.as_ref().map(crate::pairing::Question::prompt)
+    }
+
+    /// The screen, drawn 100 by 40.
+    fn screen(app: &mut App) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::view::draw(frame, app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..40)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The last thing the transcript says.
+    fn last_said(app: &App) -> String {
+        app.chat
+            .entries
+            .back()
+            .map(|entry| entry.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// Presses `code`.
+    async fn press(app: &mut App, code: KeyCode) {
+        key_action(app, &RecordingVendor::default(), KeyEvent::from(code)).await;
+    }
+
+    #[tokio::test]
+    async fn pair_shows_the_qr_then_asks_with_the_code() {
+        let dir = octet_testkit::TempDir::new("octet-rc-ask");
+        let hub = Hub::new(vec![question(7, false)]);
+        let _served = hub.serve(dir.path());
+        let mut app = app_in(dir.path());
+        let action = command(&mut app, "/remote-control pair").await;
+        assert!(matches!(&action, Action::Job(job) if job.label == "Opening a pairing…"));
+        run_job(&mut app, action).await;
+        let text = app.entries_text();
+        assert!(text.contains('█') || text.contains('▀'), "{text}");
+        assert!(text.lines().any(|line| line == LINK), "{text}");
+        assert!(
+            text.contains("Expires in 10 minutes · works once"),
+            "{text}"
+        );
+        assert!(
+            text.contains("On the phone: open the Octet app → Pair → scan, or open the link"),
+            "{text}"
+        );
+        // The link carries the secret: it stays off the status line.
+        assert!(!app.status_line.contains(LINK), "{}", app.status_line);
+        // The QR first; the question once the hub holds a phone.
+        assert_eq!(asking(&app), None);
+        told(&mut app).await;
+        assert_eq!(asking(&app).as_deref(), Some(ASKS));
+        let drawn = screen(&mut app);
+        assert!(drawn.contains(ASKS), "{drawn}");
+        assert_eq!(hub.kinds()[..3], ["status", "pair_secret", "pair_wait"]);
+    }
+
+    #[tokio::test]
+    async fn remote_control_pair_on_a_narrow_terminal_asks_to_widen_it() {
+        let dir = octet_testkit::TempDir::new("octet-rc-narrow");
+        let _served = Hub::new(vec![json!({"expired": true})]).serve(dir.path());
+        let mut app = app_in(dir.path());
+        app.last_width = 40;
+        let action = command(&mut app, "/remote-control pair").await;
+        run_job(&mut app, action).await;
+        let text = app.entries_text();
+        assert!(
+            text.contains("Widen the terminal to show the QR code"),
+            "{text}"
+        );
+        assert!(text.lines().any(|line| line == LINK), "{text}");
+        assert!(!text.contains('█') && !text.contains('▀'), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answering_yes_pairs_and_no_does_not() {
+        for (code, pairs) in [
+            (KeyCode::Char('y'), true),
+            (KeyCode::Char('Y'), true),
+            (KeyCode::Char('n'), false),
+            (KeyCode::Enter, false),
+            (KeyCode::Esc, false),
+        ] {
+            let hub = Hub::new(vec![question(7, false)]);
+            let mut app = app();
+            open(&mut app, &hub).await;
+            told(&mut app).await;
+            assert_eq!(asking(&app).as_deref(), Some(ASKS));
+            // A key typed as the question appears does not answer it.
+            press(&mut app, code).await;
+            assert_eq!(asking(&app).as_deref(), Some(ASKS), "{code:?}");
+            app.pairing.as_mut().unwrap().arm();
+            // Nor does any other key, nor does it reach the prompt box.
+            press(&mut app, KeyCode::Char('x')).await;
+            assert_eq!(asking(&app).as_deref(), Some(ASKS), "{code:?}");
+            assert_eq!(app.composer.editor.text(), "");
+            press(&mut app, code).await;
+            assert_eq!(asking(&app), None, "{code:?}");
+            told(&mut app).await;
+            assert!(app.pairing.is_none(), "{code:?}");
+            let said = if pairs {
+                "Paired \"Pixel\""
+            } else {
+                NOT_PAIRED
+            };
+            assert_eq!(last_said(&app), said, "{code:?}");
+            assert_eq!(
+                hub.answered(),
+                [json!({"type": "pair_answer", "pending": 7, "accept": pairs})],
+                "{code:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pairing_that_replaces_asks_replace() {
+        let hub = Hub::new(vec![question(7, true)]);
+        let mut app = app();
+        open(&mut app, &hub).await;
+        told(&mut app).await;
+        assert_eq!(
+            asking(&app).as_deref(),
+            Some("Phone shows 482 913? Replace \"Pixel\" (ios)? [y/N]")
+        );
+        app.pairing.as_mut().unwrap().arm();
+        press(&mut app, KeyCode::Char('n')).await;
+        told(&mut app).await;
+        assert_eq!(last_said(&app), NOT_PAIRED);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_prompt_ends_when_the_pairing_times_out() {
+        let hub = Hub::new(vec![question(7, false)]);
+        let mut app = app();
+        open(&mut app, &hub).await;
+        told(&mut app).await;
+        let began = tokio::time::Instant::now();
+        // Nobody answers: the prompt ends on its own.
+        told(&mut app).await;
+        let waited = began.elapsed();
+        assert!(app.pairing.is_none());
+        assert_eq!(last_said(&app), TIMED_OUT);
+        assert!(
+            (ANSWER_WITHIN..ANSWER_WITHIN + POLL_EVERY * 2).contains(&waited),
+            "{waited:?}"
+        );
+        // The phone was asked after about once a second, and refused once at the end.
+        let polls = hub
+            .kinds()
+            .iter()
+            .filter(|kind| *kind == "pair_wait")
+            .count();
+        assert!((100..=122).contains(&polls), "{polls} asks");
+        assert_eq!(
+            hub.answered(),
+            [json!({"type": "pair_answer", "pending": 7, "accept": false})]
+        );
+        assert_eq!(hub.kinds().last().map(String::as_str), Some("pair_answer"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_prompt_ends_when_the_phone_leaves() {
+        let held = || vec![question(7, false), question(7, false), question(7, false)];
+        let expired = [held(), vec![json!({"expired": true})]].concat();
+        let another = [held(), vec![question(8, false)]].concat();
+        let left = json!({"error": "The phone left"});
+        let late = json!({"error": "Pairing timed out"});
+        for (waits, refusal, said) in [
+            (expired.clone(), left.clone(), PHONE_LEFT),
+            (
+                another,
+                json!({"error": "No phone is waiting for that answer"}),
+                PHONE_LEFT,
+            ),
+            // The hub's own two minutes ran out first: it says so.
+            (expired, late, TIMED_OUT),
+        ] {
+            let hub = Hub::refusing(waits, refusal);
+            let mut app = app();
+            open(&mut app, &hub).await;
+            told(&mut app).await;
+            let began = tokio::time::Instant::now();
+            // Nobody answers: the prompt ends because the phone went.
+            told(&mut app).await;
+            assert!(began.elapsed() < POLL_EVERY * 5, "{:?}", began.elapsed());
+            assert!(app.pairing.is_none());
+            assert_eq!(last_said(&app), said);
+            // One refusal, for that pairing, after the poll that found it gone.
+            assert_eq!(
+                hub.answered(),
+                [json!({"type": "pair_answer", "pending": 7, "accept": false})]
+            );
+            assert_eq!(hub.kinds().last().map(String::as_str), Some("pair_answer"));
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_remote_control_reports_hub_relay_and_phones() {
+        let dir = octet_testkit::TempDir::new("octet-rc-report");
+        let hub = Hub {
+            status: json!({"relay": "registered", "devices": 2}),
+            ..Hub::new(vec![])
+        };
+        let _served = hub.serve(dir.path());
+        let mut app = app_in(dir.path());
+        let action = command(&mut app, "/remote-control").await;
+        assert!(matches!(&action, Action::Job(job) if job.label == "Asking the hub…"));
+        run_job(&mut app, action).await;
+        assert_eq!(
+            last_said(&app),
+            "Hub: running\nRelay: has the hub\nPhones paired: 2"
+        );
+        assert_eq!(hub.kinds(), ["status"]);
+        assert_eq!(app.conn.session, "thread-1");
+        // With no hub there is nothing to ask.
+        let none = octet_testkit::TempDir::new("octet-rc-nohub-report");
+        let mut app = app_in(none.path());
+        let action = command(&mut app, "/remote-control").await;
+        run_job(&mut app, action).await;
+        assert_eq!(
+            last_said(&app),
+            "Hub: not running · run \"octet pair\" in a terminal to start it\nRelay: unknown\nPhones paired: unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_with_no_hub_says_to_run_octet_pair_and_runs_no_command() {
+        let dir = octet_testkit::TempDir::new("octet-rc-nohub");
+        let mut app = app_in(dir.path());
+        let action = command(&mut app, "/remote-control pair").await;
+        run_job(&mut app, action).await;
+        assert_eq!(
+            last_said(&app),
+            "The hub isn't running. Run \"octet pair\" in a terminal first."
+        );
+        assert!(app.pairing.is_none());
+        // Nothing was installed, started or written: the data directory is still not there.
+        assert!(!dir.path().exists());
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_cannot_reach_the_relay_says_so_and_opens_nothing() {
+        let mut app = app();
+        let action = Action::Job(crate::jobs::Job::pair(Unlinked));
+        run_job(&mut app, action).await;
+        assert_eq!(last_said(&app), "Can't reach the relay at relay.example");
+        assert!(app.pairing.is_none());
+    }
+
+    /// A hub that answers `status` but gives no link: the relay does not have it.
+    struct Unlinked;
+
+    impl Control for Unlinked {
+        async fn call(&self, request: &Value) -> Option<Value> {
+            // Answered after a turn of the runtime, as a socket would be.
+            tokio::task::yield_now().await;
+            Some(match request["type"].as_str()? {
+                "status" => json!({"relay": "connecting", "devices": 0}),
+                _ => json!({"link": null, "reason": "Can't reach the relay at relay.example"}),
+            })
+        }
+    }
+
+    /// The end-to-end check, with stand-in programs recording any run, is
+    /// `no_tailscale_ssh_or_mosh_command_is_run` in crates/octet/tests/terminal.rs.
+    #[tokio::test]
+    async fn remote_control_only_speaks_to_the_hub() {
+        // Nothing behind /remote-control can start a program: it only speaks to the hub.
+        for (name, source) in [
+            ("remote.rs", include_str!("../remote.rs")),
+            ("pairing.rs", include_str!("../pairing.rs")),
+        ] {
+            let source = source.to_lowercase();
+            for banned in [
+                "command::new",
+                "process::command",
+                "tailscale",
+                "tailnet",
+                "mosh",
+                "ssh",
+            ] {
+                assert!(!source.contains(banned), "{name} mentions {banned}");
+            }
+        }
+        // Both forms ask the stand-in hub only control requests, and say nothing of them either.
+        let dir = octet_testkit::TempDir::new("octet-rc-nocmd");
+        let hub = Hub::new(vec![json!({"expired": true})]);
+        let _served = hub.serve(dir.path());
+        let mut app = app_in(dir.path());
+        for input in ["/remote-control", "/remote-control pair"] {
+            let action = command(&mut app, input).await;
+            run_job(&mut app, action).await;
+        }
+        told(&mut app).await;
+        assert_eq!(
+            hub.kinds(),
+            ["status", "status", "pair_secret", "pair_wait"]
+        );
+        let text = app.entries_text().to_lowercase();
+        for banned in ["tailscale", "tailnet", "mosh", "ssh"] {
+            assert!(!text.contains(banned), "{text}");
+        }
+    }
 }
 #[tokio::test]
 async fn goal_commands_start_pause_resume_and_clear_without_a_vendor_turn() {

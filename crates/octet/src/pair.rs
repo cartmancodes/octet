@@ -7,93 +7,34 @@
 //! `pair_wait` again about once a second (one request at a time: the hub keeps one waiter): the
 //! same pairing means the phone is still there.
 use crate::args::CliError;
-use octet_hub::{Store, plain};
-use serde_json::{Value, json};
+use octet_hub::Store;
+use octet_tui::pairing::{
+    Control, HUB_SILENT, Heard, Outcome, REQUEST_WITHIN, Socket, Waited, answer, answers, hear,
+    let_go, no_link, pair_lines, within,
+};
+use serde_json::json;
 use std::{
     io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt as _, BufReader},
     net::UnixStream,
-    time::{Instant, sleep, sleep_until, timeout},
+    time::{sleep, timeout},
 };
 
 /// How long a hub that was just started has to answer on its control socket.
 const START_WITHIN: Duration = Duration::from_secs(15);
 /// How often the control socket is tried while the hub starts.
 const START_POLL: Duration = Duration::from_millis(100);
-/// How long `status` may take before the hub counts as not running.
-const STATUS_WITHIN: Duration = Duration::from_secs(2);
-/// How long `pair_secret` (which waits up to 10 seconds for the relay) or `pair_answer` (which
-/// waits for the device to be saved) may take.
-const REQUEST_WITHIN: Duration = Duration::from_secs(15);
-/// How long the owner has to answer for one phone: the hub's own two minutes.
-const ANSWER_WITHIN: Duration = Duration::from_secs(120);
-/// How often, while the question is open, the hub is asked whether the phone is still held.
-const POLL_EVERY: Duration = Duration::from_secs(1);
-/// How long one of those asks may take: a hub holding a phone answers at once.
-const POLL_WITHIN: Duration = Duration::from_secs(5);
-/// The longest control answer read, in bytes.
-const ANSWER_LIMIT: u64 = 64 * 1024;
-/// Longest device name, platform or hub message printed, in characters.
-const NAME_CHARS: usize = 64;
-/// Longest reason from the hub printed, in characters.
-const REASON_CHARS: usize = 200;
 
-/// Said when the owner refused the phone, or gave no answer before the input ended.
-pub(crate) const NOT_PAIRED: &str = "Not paired";
-/// Said when two minutes passed without an answer.
-pub(crate) const TIMED_OUT: &str = "Pairing timed out";
-/// Said when the held phone's connection ended before the answer.
-pub(crate) const PHONE_LEFT: &str = "The phone left";
-/// Said when the hub could not save the device the owner said yes to.
-pub(crate) const NOT_SAVED: &str = "Could not save the device";
 /// Said when `tmux` is not on the `PATH`.
 pub(crate) const NO_TMUX: &str =
     "tmux isn't installed: the phone can watch and answer, but can't start sessions";
 /// Said when the pairing link ran out, or was replaced, before a phone came.
 pub(crate) const LINK_EXPIRED: &str =
     "The link expired before a phone used it; run octet pair again";
-/// Said when the terminal is too narrow for the QR code.
-pub(crate) const WIDEN: &str = "Widen the terminal to show the QR code";
-
-/// Where `octet pair` sends its requests: the hub's control socket, or a test's stand-in.
-pub(crate) trait Control {
-    /// The hub's one-line answer to `request`; `None` when no hub answers.
-    async fn call(&self, request: &Value) -> Option<Value>;
-}
-
-/// The hub's control socket.
-#[derive(Debug)]
-pub(crate) struct Socket(PathBuf);
-
-impl Socket {
-    /// The control socket of the hub whose files are in `directory`.
-    pub(crate) fn of(directory: &Path) -> Self {
-        Self(octet_core::remote::run::run_dir(directory).join("hub.sock"))
-    }
-}
-
-impl Control for Socket {
-    /// One request line, one answer line, on a connection of its own. The write side stays open
-    /// until the answer: the hub takes a closed one as the client leaving.
-    async fn call(&self, request: &Value) -> Option<Value> {
-        let stream = UnixStream::connect(&self.0).await.ok()?;
-        let (read, mut write) = stream.into_split();
-        write
-            .write_all(format!("{request}\n").as_bytes())
-            .await
-            .ok()?;
-        let mut line = String::new();
-        BufReader::new(read.take(ANSWER_LIMIT))
-            .read_line(&mut line)
-            .await
-            .ok()?;
-        serde_json::from_str(&line).ok()
-    }
-}
 
 /// What `octet pair` takes from the world around it, which tests replace.
 #[derive(Debug)]
@@ -170,11 +111,7 @@ where
     .await
     .ok_or_else(no_answer)?;
     let Some(link) = opened["link"].as_str() else {
-        let reason = opened["reason"]
-            .as_str()
-            .or_else(|| opened["error"].as_str())
-            .unwrap_or("The hub opened no pairing");
-        say(out, &plain(reason, REASON_CHARS))?;
+        say(out, &no_link(&opened))?;
         return Ok(1);
     };
     show(out, link, width)?;
@@ -193,75 +130,18 @@ where
         .call(&json!({"type": "pair_wait"}))
         .await
         .ok_or_else(no_answer)?;
-    let Some(question) = Question::read(&waited) else {
-        let said = if waited["expired"] == true {
-            LINK_EXPIRED
-        } else {
-            waited["error"]
-                .as_str()
-                .unwrap_or("The hub sent no phone to pair")
-        };
-        say(out, &plain(said, REASON_CHARS))?;
-        return Ok(1);
+    let question = match Waited::read(&waited) {
+        Waited::Asked(question) => question,
+        Waited::Expired => {
+            say(out, LINK_EXPIRED)?;
+            return Ok(1);
+        }
+        Waited::Not(said) => {
+            say(out, &said)?;
+            return Ok(1);
+        }
     };
     ask(&control, &mut input, out, &question).await
-}
-
-/// A phone the hub holds for the owner's answer, as `pair_wait` tells of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Question {
-    /// The pairing's id, which the answer names.
-    pending: u64,
-    /// The six digits the phone shows.
-    code: String,
-    /// The phone's name, as it claims.
-    name: String,
-    /// Its platform, as it claims.
-    platform: String,
-    /// Whether a device of its name is paired already, and pairing replaces it.
-    replaces: bool,
-}
-
-impl Question {
-    /// The question in a `pair_wait` answer; `None` for any other answer, or a code that is not
-    /// six digits.
-    fn read(answer: &Value) -> Option<Self> {
-        let code = answer["code"].as_str()?;
-        if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        Some(Self {
-            pending: answer["pending"].as_u64()?,
-            code: code.to_owned(),
-            name: answer["name"].as_str()?.to_owned(),
-            platform: answer["platform"].as_str()?.to_owned(),
-            replaces: answer["replaces"].as_bool().unwrap_or(false),
-        })
-    }
-
-    /// `Phone shows 482 913? Pair "<name>" (<platform>)? [y/N]`, or `Replace` in place of `Pair`
-    /// when it replaces a device. The name and platform are the phone's claims, shown plain.
-    fn prompt(&self) -> String {
-        let (first, last) = self.code.split_at(3);
-        let verb = if self.replaces { "Replace" } else { "Pair" };
-        format!(
-            "Phone shows {first} {last}? {verb} \"{}\" ({})? [y/N]",
-            plain(&self.name, NAME_CHARS),
-            plain(&self.platform, NAME_CHARS),
-        )
-    }
-}
-
-/// How the question ended.
-enum Heard {
-    /// The owner answered this line.
-    Line,
-    /// The input ended, or failed, before a whole line.
-    Ended,
-    /// Two minutes passed.
-    TimedOut,
-    /// The hub no longer holds the phone.
-    Gone,
 }
 
 /// Asks the owner about `question` on `input` until a line, the end of the input, two minutes,
@@ -270,96 +150,41 @@ async fn ask(
     control: &impl Control,
     input: &mut (impl AsyncBufRead + Unpin),
     out: &mut impl Write,
-    question: &Question,
+    question: &octet_tui::pairing::Question,
 ) -> Result<i32, CliError> {
     write!(out, "{} ", question.prompt())
         .and_then(|()| out.flush())
         .map_err(|e| terminal(&e))?;
-    let deadline = Instant::now() + ANSWER_WITHIN;
     let mut line = String::new();
-    let heard = {
-        let read = input.read_line(&mut line);
-        let poll = still_held(control, question.pending);
-        tokio::pin!(read, poll);
-        loop {
-            tokio::select! {
-                biased;
-                read = &mut read => {
-                    break if read.is_ok_and(|n| n > 0) { Heard::Line } else { Heard::Ended };
-                }
-                () = sleep_until(deadline) => break Heard::TimedOut,
-                held = &mut poll => {
-                    if !held {
-                        break Heard::Gone;
-                    }
-                    poll.set(still_held(control, question.pending));
-                }
-            }
-        }
+    // A whole line answers; the input ending, failing, or ending in the middle of a line is no
+    // answer.
+    let read = async {
+        input
+            .read_line(&mut line)
+            .await
+            .is_ok_and(|n| n > 0 && line.ends_with('\n'))
     };
-    // A line the input ended in the middle of is no answer.
-    let heard = match heard {
-        Heard::Line if !line.ends_with('\n') => Heard::Ended,
-        heard => heard,
-    };
+    let heard = hear(control, question.pending, read).await;
     // The prompt's line ends here, unless the owner's Enter ended it.
-    if !matches!(heard, Heard::Line) {
+    if heard != Heard::Answer(true) {
         say(out, "")?;
     }
     match heard {
-        Heard::Line | Heard::Ended => {
-            let yes = matches!(heard, Heard::Line) && is_yes(&line);
-            let answer = answer(control, question.pending, yes).await;
-            answered(out, answer.as_ref())
+        Heard::Answer(whole) => {
+            let yes = whole && is_yes(&line);
+            let reply = answer(control, question.pending, yes)
+                .await
+                .ok_or_else(no_answer)?;
+            let outcome = Outcome::read(&reply);
+            say(out, &outcome.said)?;
+            Ok(i32::from(!outcome.paired))
         }
-        Heard::TimedOut => {
-            // The hub refuses it on its own clock too; this only tells the phone sooner.
-            let _ = answer(control, question.pending, false).await;
-            say(out, TIMED_OUT)?;
-            Ok(1)
-        }
-        Heard::Gone => {
-            // The hub remembers how the pairing it last let go ended.
-            let answer = answer(control, question.pending, false).await;
-            let timed_out = answer
-                .as_ref()
-                .is_some_and(|answer| answer["error"] == TIMED_OUT);
-            say(out, if timed_out { TIMED_OUT } else { PHONE_LEFT })?;
+        Heard::TimedOut | Heard::Gone => {
+            let said = let_go(control, question.pending, heard == Heard::TimedOut).await;
+            say(out, said)?;
             Ok(1)
         }
     }
-}
-
-/// Whether the hub, asked after [`POLL_EVERY`], still holds the pairing `pending`. A hub that
-/// holds a phone tells of it at once; anything else (no answer, an expired secret, another
-/// pairing, another waiter) means it has let this one go.
-async fn still_held(control: &impl Control, pending: u64) -> bool {
-    sleep(POLL_EVERY).await;
-    let answer = within(POLL_WITHIN, control.call(&json!({"type": "pair_wait"}))).await;
-    answer.is_some_and(|answer| answer["pending"].as_u64() == Some(pending))
-}
-
-/// The hub's answer to `pair_answer` for `pending`.
-async fn answer(control: &impl Control, pending: u64, accept: bool) -> Option<Value> {
-    let request = json!({"type": "pair_answer", "pending": pending, "accept": accept});
-    within(REQUEST_WITHIN, control.call(&request)).await
-}
-
-/// Says how `pair_answer` went; 0 when the phone was paired.
-fn answered(out: &mut impl Write, answer: Option<&Value>) -> Result<i32, CliError> {
-    let answer = answer.ok_or_else(no_answer)?;
-    if answer["paired"] == true {
-        let device = answer["device"].as_str().unwrap_or_default();
-        say(out, &format!("Paired \"{}\"", plain(device, NAME_CHARS)))?;
-        return Ok(0);
-    }
-    let said = match answer["error"].as_str() {
-        None => NOT_PAIRED.to_owned(),
-        Some(error @ (TIMED_OUT | PHONE_LEFT | NOT_SAVED)) => error.to_owned(),
-        Some(other) => plain(other, REASON_CHARS),
-    };
-    say(out, &said)?;
-    Ok(1)
 }
 
 /// Whether `line` says yes: `y` or `yes`, in any case.
@@ -371,27 +196,9 @@ fn is_yes(line: &str) -> bool {
 /// Shows the pairing: its QR code where `width` fits it (any width when unknown), the link, and
 /// what to do with them.
 fn show(out: &mut impl Write, link: &str, width: Option<usize>) -> Result<(), CliError> {
-    say(out, "Pair a phone")?;
-    say(out, "")?;
-    match octet_tui::qr_rows(link) {
-        Some(rows)
-            if width
-                .is_none_or(|width| rows.first().map_or(0, |row| row.chars().count()) <= width) =>
-        {
-            for row in rows {
-                say(out, &row)?;
-            }
-            say(out, "")?;
-        }
-        Some(_) => say(out, WIDEN)?,
-        None => say(out, "The link is too long for a QR code")?,
-    }
-    say(out, link)?;
-    say(out, "Expires in 10 minutes · works once")?;
-    say(
-        out,
-        "On the phone: open the Octet app → Pair → scan, or open the link",
-    )
+    pair_lines(link, width)
+        .iter()
+        .try_for_each(|line| say(out, line))
 }
 
 /// How many paired phones went through another relay than the one in `link`, from the device
@@ -442,13 +249,6 @@ fn unbase64url(text: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Whether a hub answers `status` on `control`.
-async fn answers(control: &impl Control) -> bool {
-    within(STATUS_WITHIN, control.call(&json!({"type": "status"})))
-        .await
-        .is_some()
-}
-
 /// Whether a hub answers on `control` within [`START_WITHIN`].
 async fn started(control: &impl Control) -> bool {
     timeout(START_WITHIN, async {
@@ -458,11 +258,6 @@ async fn started(control: &impl Control) -> bool {
     })
     .await
     .is_ok()
-}
-
-/// `call`'s answer, if it comes within `limit`.
-async fn within(limit: Duration, call: impl Future<Output = Option<Value>>) -> Option<Value> {
-    timeout(limit, call).await.ok().flatten()
 }
 
 /// Writes `line` and a newline to `out`, at once.
@@ -479,7 +274,7 @@ fn terminal(error: &std::io::Error) -> CliError {
 
 /// The hub stopped answering.
 fn no_answer() -> CliError {
-    failed("The hub stopped answering")
+    failed(HUB_SILENT)
 }
 
 /// A failure while running.

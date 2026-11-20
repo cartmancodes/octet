@@ -411,7 +411,10 @@ pub(crate) fn size_label(bytes: usize) -> String {
 /// Pasted text goes into the draft, tabs and all, unless a dialog has
 /// focus; then it is dropped with a hint.
 pub(crate) fn paste(app: &mut App, value: &str) {
-    let dialog = !app.overlay.approvals.is_empty() || app.overlay.help || app.overlay.palette;
+    let dialog = !app.overlay.approvals.is_empty()
+        || app.overlay.help
+        || app.overlay.palette
+        || app.pairing_asked();
     if dialog {
         app.hint("Close the dialog to paste into the prompt");
     } else if !app.composer.editor.insert(&text::strip(value)) {
@@ -431,8 +434,8 @@ pub(crate) fn paste(app: &mut App, value: &str) {
     }
     refresh_completion(app);
 }
-/// One key. Dialogs take keys first (help, an approval, the palette, a
-/// popup); otherwise the key edits or sends the draft.
+/// One key. Dialogs take keys first (help, an approval, the pairing question,
+/// the palette, a popup); otherwise the key edits or sends the draft.
 pub(crate) async fn key_action(app: &mut App, vendor: &dyn Vendor, key: KeyEvent) -> Action {
     // Any key ends a pending quit; only a second Ctrl+C in time completes it.
     let quit_armed = app.quit_armed.take();
@@ -450,6 +453,11 @@ pub(crate) async fn key_action(app: &mut App, vendor: &dyn Vendor, key: KeyEvent
     if let Some(asked) = app.overlay.approvals.front() {
         let id = asked.id;
         approval_key(app, vendor, key, id).await;
+        return Action::Continue;
+    }
+    // So do the pairing question's.
+    if app.pairing_asked() {
+        crate::remote::key(app, key);
         return Action::Continue;
     }
     if app.overlay.palette {

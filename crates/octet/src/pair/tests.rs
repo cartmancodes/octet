@@ -8,6 +8,8 @@ use octet_testkit::{
     TempDir,
     relay::{Held, Link, Relay, hold_with, roomy},
 };
+use octet_tui::pairing::{ANSWER_WITHIN, NOT_PAIRED, PHONE_LEFT, POLL_EVERY, WIDEN};
+use serde_json::Value;
 use std::{
     ffi::OsString,
     sync::{
@@ -16,9 +18,10 @@ use std::{
     },
 };
 use tokio::{
-    io::{DuplexStream, duplex},
+    io::{AsyncWriteExt as _, DuplexStream, duplex},
     sync::oneshot,
     task::JoinHandle,
+    time::Instant,
 };
 
 /// How long any one step may take before the test fails.
@@ -523,7 +526,9 @@ async fn a_narrow_terminal_gets_the_link_and_no_qr() {
     std::fs::create_dir_all(dir.path()).unwrap();
     let expired = Scripted::new(json!({"expired": true}), json!({}));
     let link = expired.link.clone();
-    let width = octet_tui::qr_rows(&link).unwrap()[0].chars().count();
+    let width = octet_tui::pairing::qr_rows(&link).unwrap()[0]
+        .chars()
+        .count();
     let directory = dir.path().to_owned();
     let run = |width| {
         let directory = directory.clone();
