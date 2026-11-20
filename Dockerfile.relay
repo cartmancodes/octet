@@ -1,0 +1,20 @@
+# The relay's image (docs/relay.md). Build from the repository root:
+#   docker build -f Dockerfile.relay -t octet-relay:<commit> .
+# The first stage builds the one binary; the second runs it alone, as a non-root user.
+FROM rust:1.98.1 AS build
+WORKDIR /src
+# The workspace manifests and every member's sources (cargo reads all members), not the
+# toolchain file: the image already has 1.98.1, and the build needs no rustfmt or clippy.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --locked -p octet-relay
+
+# The same Debian release as rust:1.98.1, so the binary finds the glibc it was built against.
+# The root certificates the probe checks a wss:// relay with are compiled in.
+FROM debian:trixie-slim
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin relay
+COPY --from=build /src/target/release/octet-relay /usr/local/bin/octet-relay
+USER 10001
+ENV PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/octet-relay"]
