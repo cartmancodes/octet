@@ -237,8 +237,9 @@ impl Writer {
     }
 }
 
-/// A pairing under way: the device to save, and the secret it spent, which goes back
-/// ([`Store::unspend`]) if the save fails.
+/// A pairing under way: the device to save, and the secret it spent, which [`Store::pair`]
+/// gives back ([`Store::unspend`]) if its save fails. The hub's held pairing never does: its
+/// secret is spent whatever happens next.
 pub(crate) struct Pairing {
     pub(crate) device: Device,
     secret: Secret,
@@ -308,15 +309,27 @@ impl Store {
         secret
     }
 
+    /// A new pairing secret, as [`pairing_secret`](Self::pairing_secret) makes one, in place of
+    /// every secret not yet used: one pairing is open at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system has no random bytes to give.
+    pub(crate) fn replace_pairing_secret(&mut self, now: SystemTime) -> String {
+        self.secrets.clear();
+        self.pairing_secret(now)
+    }
+
     /// Pairs a phone: spends `secret` and returns the new device, known by `key` (the phone's
-    /// public key, 64 lowercase hex digits) and the `relay` it paired through. A refusal that is
-    /// the phone's to fix leaves the secret unspent.
+    /// public key, 64 lowercase hex digits) and the `relay` it paired through. A device already
+    /// paired under its name is replaced, in the same write. A refusal that is the phone's to
+    /// fix leaves the secret unspent.
     ///
     /// # Errors
     ///
     /// Fails with the reason to show the phone when the secret is unknown, used or older than 10
-    /// minutes, a field is empty or too long, the key is not a key, the name or key is taken, or
-    /// the device cannot be saved.
+    /// minutes, a field is empty or too long, the key is not a key or is paired already, or the
+    /// device cannot be saved.
     pub async fn pair(
         &mut self,
         secret: &str,
@@ -328,7 +341,7 @@ impl Store {
     ) -> Result<Device, &'static str> {
         let pairing = self.begin_pair(secret, name, platform, key, relay, now)?;
         match self.update(pair_change(pairing.device.clone())).await {
-            Ok(Ok(())) => Ok(pairing.device),
+            Ok(Ok(_)) => Ok(pairing.device),
             Ok(Err(reason)) => {
                 self.unspend(pairing);
                 Err(reason)
@@ -340,14 +353,14 @@ impl Store {
         }
     }
 
-    /// [`pair`](Self::pair) up to the write: checks `secret` and the fields, and spends the
-    /// secret. The device is saved by [`pair_change`]; if that fails, [`unspend`](Self::unspend)
-    /// gives the secret back.
+    /// [`pair`](Self::pair) up to the write: checks `secret`, the fields and the key, and spends
+    /// the secret. The device is saved by [`pair_change`].
     ///
     /// # Errors
     ///
-    /// Fails with the reason to show the phone when the secret is unknown, used or older than 10
-    /// minutes, a field is empty or too long, or `key` is not 64 lowercase hex digits.
+    /// Fails with the reason to show the phone, the secret unspent, when the secret is unknown,
+    /// used or older than 10 minutes, a field is empty or too long, or `key` is not 64 lowercase
+    /// hex digits or is a paired device's.
     pub(crate) fn begin_pair(
         &mut self,
         secret: &str,
@@ -375,6 +388,9 @@ impl Store {
         )?;
         if !is_key(key) {
             return Err("Device key must be 64 lowercase hex digits");
+        }
+        if self.devices.iter().any(|device| device.key == key) {
+            return Err(KEY_PAIRED);
         }
         let seconds = seconds(now);
         let device = Device {
@@ -689,18 +705,23 @@ async fn locked_update<R>(directory: &Path, change: Change<R>) -> io::Result<(R,
 
 /// Why a pairing was not saved, when the file could not be written.
 pub(crate) const PAIR_NOT_SAVED: &str = "Could not save the device";
+/// The refusal of a pairing whose key is a paired device's.
+const KEY_PAIRED: &str = "That device's key is already paired";
 
-/// Saves the new `device` of a pairing, unless a device of its name or key is already paired.
-pub(crate) fn pair_change(device: Device) -> Change<Result<(), &'static str>> {
+/// Saves the new `device` of a pairing, in place of the device already paired under its name if
+/// there is one (which goes with its push and Live Activity tokens), and says that device's key.
+/// A key already paired is refused.
+pub(crate) fn pair_change(device: Device) -> Change<Result<Option<String>, &'static str>> {
     Box::new(move |devices| {
-        if devices.iter().any(|kept| kept.name == device.name) {
-            return (Err("A device with that name is already paired"), false);
-        }
         if devices.iter().any(|kept| kept.key == device.key) {
-            return (Err("That device's key is already paired"), false);
+            return (Err(KEY_PAIRED), false);
         }
+        let replaced = devices
+            .iter()
+            .position(|kept| kept.name == device.name)
+            .map(|at| devices.remove(at).key);
         devices.push(device);
-        (Ok(()), true)
+        (Ok(replaced), true)
     })
 }
 
@@ -1349,6 +1370,78 @@ mod tests {
             )
             .await;
         assert!(again.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_key_already_paired_is_refused_before_the_secret_is_spent() {
+        let dir = TempDir::new("hub-begin-samekey");
+        let mut store = store(&dir).await;
+        let key = paired(&mut store, "Gemini 10", epoch(1)).await;
+        let secret = store.pairing_secret(epoch(2));
+        let refused = store.begin_pair(&secret, "Another", "ios", &key, RELAY, epoch(2));
+        assert_eq!(
+            refused.map(|_| ()),
+            Err("That device's key is already paired")
+        );
+        assert!(store.pairing_open(epoch(2)), "the secret was spent");
+    }
+
+    #[tokio::test]
+    async fn a_pairing_under_a_name_already_paired_replaces_it_in_one_write() {
+        let dir = TempDir::new("hub-replace");
+        let mut store = store(&dir).await;
+        let old = paired(&mut store, "Gemini 10", epoch(1)).await;
+        paired(&mut store, "Other", epoch(1)).await;
+        assert!(
+            store
+                .set_push_token(&old, Some(PUSH.into()))
+                .await
+                .expect("saved")
+        );
+        let tokens = ActivityTokens {
+            token: Some(ACTIVITY.into()),
+            start_token: Some(START.into()),
+            registered: Some(1),
+        };
+        assert!(store.set_activity(&old, tokens).await.expect("saved"));
+        // A new key under the name: the old record goes, with its tokens, as the new one comes.
+        let secret = store.pairing_secret(epoch(2));
+        let new = key_of("Gemini 10 again");
+        let device = store
+            .pair(&secret, "Gemini 10", "android", &new, RELAY, epoch(2))
+            .await
+            .expect("paired");
+        assert_eq!(
+            (device.key.as_str(), device.platform.as_str()),
+            (new.as_str(), "android")
+        );
+        let reopened = Store::open(dir.path()).await.expect("the store");
+        let held: Vec<_> = reopened
+            .devices()
+            .iter()
+            .map(|d| (d.name.as_str(), d.key.as_str()))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("Other", key_of("Other").as_str()),
+                ("Gemini 10", new.as_str())
+            ]
+        );
+        let text = std::fs::read_to_string(dir.path().join("devices.json")).expect("the file");
+        for gone in [old.as_str(), PUSH, ACTIVITY, START] {
+            assert!(!text.contains(gone), "{gone} in {text}");
+        }
+        // The write says which key it let go.
+        let secret = store.pairing_secret(epoch(3));
+        let pairing = store
+            .begin_pair(&secret, "Other", "ios", &key_of("Third"), RELAY, epoch(3))
+            .expect("begun");
+        let replaced = store
+            .update(pair_change(pairing.device))
+            .await
+            .expect("saved");
+        assert_eq!(replaced, Ok(Some(key_of("Other"))));
     }
 
     #[tokio::test]

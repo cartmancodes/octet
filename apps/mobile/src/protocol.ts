@@ -219,6 +219,14 @@ export interface PairedFrame {
   name: string;
 }
 
+/** The hub holds this phone's `pair` (`req`) for the owner's answer at the Mac, which shows the same `code`: six digits the hub drew at random. The phone shows it while it waits, and never works one out for itself; `paired` or a refusal follows. */
+export interface PairCodeFrame {
+  v: 1;
+  type: "pair_code";
+  req: number;
+  code: string;
+}
+
 /** The live sessions, oldest first: at most `MAX_SESSION_ROWS`, the most recently active, in a frame of at most `MAX_MESSAGE` bytes. Past that, rows lose their `approval`, `usage`, `now` and `goal`, in that order and least recently active first, and then the least recently active rows go. Sent when a row changes, at most four times a second. */
 export interface SessionsFrame {
   v: 1;
@@ -319,7 +327,7 @@ export interface HelloCommand {
   background?: boolean | null;
 }
 
-/** Pair a new device with a pairing secret. */
+/** Pair a new device with a pairing secret. The hub holds it for the owner's answer at the Mac (sending `pair_code`), then answers `paired` or refuses it; the secret is spent either way. */
 export interface PairCommand {
   v: 1;
   type: "pair";
@@ -603,6 +611,7 @@ export interface BridgeRefusedFrame {
 export type ToPhone =
   | WelcomeFrame
   | PairedFrame
+  | PairCodeFrame
   | SessionsFrame
   | SubscribedFrame
   | EventFrame

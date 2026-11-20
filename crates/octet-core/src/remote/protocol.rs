@@ -492,6 +492,14 @@ pub static MESSAGES: &[Message] = &[
          characters, for display only). The phone keeps the key it paired with.",
     ),
     message(
+        "pair_code",
+        ToPhone,
+        &[req("req", U64), req("code", Str)],
+        "The hub holds this phone's `pair` (`req`) for the owner's answer at the Mac, which shows \
+         the same `code`: six digits the hub drew at random. The phone shows it while it waits, \
+         and never works one out for itself; `paired` or a refusal follows.",
+    ),
+    message(
         "sessions",
         ToPhone,
         &[req("sessions", ObjectList("SessionInfo"))],
@@ -599,7 +607,9 @@ pub static MESSAGES: &[Message] = &[
         "pair",
         FromPhone,
         &[req("secret", Str), req("name", Str), req("platform", Str)],
-        "Pair a new device with a pairing secret.",
+        "Pair a new device with a pairing secret. The hub holds it for the owner's answer at the \
+         Mac (sending `pair_code`), then answers `paired` or refuses it; the secret is spent \
+         either way.",
     ),
     message(
         "register_push",
@@ -1721,6 +1731,10 @@ pub fn welcome(device: &str, name: &str) -> Value {
 pub fn paired(device: &str, name: &str) -> Value {
     frame("paired", json!({ "device": device, "name": name }))
 }
+/// The `pair_code` frame for the held `pair` `req`: the six digits the Mac shows.
+pub fn pair_code(req: u64, code: &str) -> Value {
+    frame("pair_code", json!({ "req": req, "code": code }))
+}
 /// The `sessions` frame: each row is a `SessionInfo`.
 pub fn sessions_frame(sessions: &[Value]) -> Value {
     frame("sessions", json!({ "sessions": sessions }))
@@ -2205,6 +2219,7 @@ mod tests {
             (diff_frame(6, &diff), Direction::ToPhone),
             (welcome("Gemini 10", "Studio"), Direction::ToPhone),
             (paired("Gemini 10", "Studio"), Direction::ToPhone),
+            (pair_code(2, "482913"), Direction::ToPhone),
             (sessions_frame(&[session]), Direction::ToPhone),
             (
                 subscribed_frame("1-2", false, &["session-1.jsonl".into()]),

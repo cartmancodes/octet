@@ -9,16 +9,29 @@
 //! unauthenticated and accepts only `hello` (from a known key) and `pair` (a pairing secret); an
 //! unknown key that says hello is refused `unpaired` and closed, and anything else, or a failed
 //! `pair`, is refused and closed, as is one with no accepted frame 10 seconds after its
-//! `connect`. After `hello` it is authenticated as that device: every frame first checks that the
-//! device is still paired (a revoked one is told `revoked`, then closed) and takes a token from
-//! the device's bucket (60 a minute; an empty bucket refuses, it does not close). Every
-//! connection is sent an encrypted ping every 20 seconds, and one whose last ping is still
-//! unanswered when the next falls due is let go. Bridge commands go to the session under a
-//! hub-wide req and the reply comes back under the phone's own; one unanswered for 30 seconds is
-//! refused for it.
+//! `connect`. A good `pair` is held for the owner's answer at the Mac ([`pairing`]): the phone,
+//! sent its code, waits up to two minutes past those 10 seconds, still counted as not past its
+//! first frame, and is then told `paired` and closed (it says hello on a connection of its own),
+//! or refused and closed. After `hello` it is authenticated as that device: every frame first
+//! checks that the device is still paired (a revoked one is told `revoked`, then closed) and
+//! takes a token from the device's bucket (60 a minute; an empty bucket refuses, it does not
+//! close). Every connection is sent an encrypted ping every 20 seconds, and one whose last ping
+//! is still unanswered when the next falls due is let go. Bridge commands go to the session
+//! under a hub-wide req and the reply comes back under the phone's own; one unanswered for 30
+//! seconds is refused for it.
 //!
-//! The hub dials the relay only while it is wanted: a device is paired, or a pairing secret is
-//! out and unexpired.
+//! The hub dials the relay only while it is wanted: a device is paired, a pairing secret is out
+//! and unexpired, or a phone is held for its answer; and for 3 seconds after a phone was revoked
+//! or refused its pairing, so it hears that before its socket goes with the link.
+//!
+//! # The control socket
+//!
+//! `<run>/hub.sock` answers one request line with one answer line, the request read within 5
+//! seconds: `status`; `watch` (a line for each change, until the client leaves); and pairing's
+//! three. `pair_secret` opens a pairing (in place of one no phone has used) and gives its link
+//! once the relay has the hub, waiting up to 10 seconds; `pair_wait` answers when a phone is held,
+//! or the secret runs out, and ends if the client leaves (closes its side); `pair_answer` says yes
+//! or no for the phone held under its `pending` id.
 //!
 //! # Subscriptions
 //!
@@ -62,15 +75,13 @@ use crate::{
     git::{self, Git},
     keys::HubKeys,
     launch::{self, Launches, StartRequest, clip as clip_to},
-    link::pair_link,
     push::{self, Limiter, Pusher, Sender, Snapshot},
     relay::{self, Arrival, FIRST_FRAME_WITHIN, Log, RelayState, Room, Seat, Stream},
     secure::{Incoming, Secure},
     sessions::{SessionUpdate, Sessions},
     store::{
-        ActivityTokens, Change, Device, Disk, PAIR_NOT_SAVED, Pairing, SECRET_REFUSED, Store,
-        activity_change, activity_clear, activity_token_drop, hex, pair_change, push_change,
-        push_token_drop, seen_change,
+        ActivityTokens, Change, Device, Disk, Store, activity_change, activity_clear,
+        activity_token_drop, hex, push_change, push_token_drop, seen_change,
     },
     tail::{self, file_name},
 };
@@ -78,7 +89,7 @@ use octet_core::PROMPT_LIMIT;
 use octet_core::remote::{
     protocol::{
         BridgeCommand, Code, Cursor, PhoneCommand, PushKinds, Secret, ack, catalog_frame,
-        event_frame, full_access_confirmed, paired, parse_phone, recent_frame, refused, req_of,
+        event_frame, full_access_confirmed, parse_phone, recent_frame, refused, req_of,
         state_frame, subscribed_frame, welcome,
     },
     run::run_dir,
@@ -105,8 +116,10 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 
 mod git_commands;
+mod pairing;
 
 use git_commands::Listings;
+use pairing::{Opened, PHONE_WAITS, Pairings};
 
 /// Frames waiting for one `octet hub watch`; a watcher that lets it fill is dropped.
 const WATCH_QUEUE: usize = 256;
@@ -159,6 +172,8 @@ const NAME_LIMIT: usize = 64;
 const CONTROL_LIMIT: u64 = 4096;
 /// How long a control client may take to ask or to read the answer.
 const CONTROL_WITHIN: Duration = Duration::from_secs(5);
+/// How long `pair_secret` waits for the relay to have the hub before giving up on it.
+const REGISTERED_WITHIN: Duration = Duration::from_secs(10);
 /// The refusal for a device past its bucket.
 const RATE_REFUSED: &str = "Too many commands; wait a minute";
 /// The refusal sent to a phone whose device was unpaired, just before it is closed.
@@ -279,12 +294,10 @@ struct Saved {
 enum AfterSave {
     /// The time a hello was seen.
     Seen,
-    /// A pairing on `conn`, answering `req`.
+    /// The device of the held pairing `pending`, and the key of the device it replaced.
     Paired {
-        conn: u64,
-        req: u64,
-        pairing: Pairing,
-        result: std::io::Result<Result<(), &'static str>>,
+        pending: u64,
+        result: std::io::Result<Result<Option<String>, &'static str>>,
     },
     /// `register_push` from `device` on `conn`, answering `req`.
     Push {
@@ -524,8 +537,9 @@ struct Conn {
     key: String,
     /// The device, once `hello` succeeded.
     device: Option<Device>,
-    /// Whether the phone waits for the answer to its `pair`: from a `pair` the hub took until
-    /// `paired` or the refusal goes to it. The relay link stays up meanwhile.
+    /// Whether the phone waits for the answer to its `pair`: from the `pair` the hub held until
+    /// `paired` or the refusal goes to it. The relay link stays up meanwhile, and its 10 seconds
+    /// do not run.
     awaiting: bool,
     /// The sessions it streams, by id.
     subscriptions: HashMap<String, Subscription>,
@@ -587,8 +601,16 @@ impl Bucket {
 /// A control-socket request the hub loop answers.
 #[derive(Debug)]
 enum Control {
-    /// A new pairing secret, as a pairing link; `None` if the relay address cannot go in one.
-    PairSecret(oneshot::Sender<Option<String>>),
+    /// `pair_secret`: a new pairing secret, as a pairing link, unless a phone is held.
+    PairSecret(oneshot::Sender<Opened>),
+    /// `pair_wait`: the question for the Mac once a phone is held, or `expired`.
+    PairWait(oneshot::Sender<Value>),
+    /// `pair_answer`: yes or no for the held pairing `pending`.
+    PairAnswer {
+        pending: u64,
+        accept: bool,
+        reply: oneshot::Sender<Value>,
+    },
     /// The number of paired devices.
     Status(oneshot::Sender<usize>),
     /// A watcher: the lines it is to be sent, first the rows as they stand.
@@ -656,9 +678,11 @@ pub struct Hub {
     activity: Option<Activity>,
     /// The snapshots the pushes and the Live Activity last looked at.
     observed: Vec<Snapshot>,
-    /// Until when the relay link stays up for revoked phones still to be told so, though nothing
-    /// is paired any more.
+    /// Until when the relay link stays up for revoked or refused phones still to be told so,
+    /// though nothing else wants it.
     lingering: Option<Instant>,
+    /// The pairing held for the owner's answer, and the Mac waiting to hear of one.
+    pairings: Pairings,
     /// The last id given to a connection, hub req or replay.
     ids: u64,
 }
@@ -773,6 +797,7 @@ impl Hub {
             activity,
             observed: Vec::new(),
             lingering: None,
+            pairings: Pairings::default(),
             ids: 0,
         };
         hub.want_relay();
@@ -816,8 +841,8 @@ impl Hub {
 
     /// Tells the relay link whether it should be up: while a device is paired, a pairing secret
     /// is out and unexpired, or a phone waits for the answer to its `pair` (its secret already
-    /// spent, its device not yet saved), and for a moment after a revoke, so the revoked phone
-    /// hears it before its socket goes with the link.
+    /// spent, its device not yet saved), and for a moment after a revoke or a refused pairing
+    /// ([`linger`](Self::linger)), so that phone hears it before its socket goes with the link.
     fn want_relay(&mut self) {
         let now = Instant::now();
         self.lingering = self.lingering.filter(|until| *until > now);
@@ -830,6 +855,12 @@ impl Hub {
             *was = wanted;
             changed
         });
+    }
+
+    /// Keeps the relay link up for a moment, whatever else wants it: a phone just told it is
+    /// revoked or refused hears it before its socket goes with the link.
+    fn linger(&mut self) {
+        self.lingering = Some(Instant::now() + REVOKED_GRACE + CLOSE_WITHIN);
     }
 
     /// Marks whether `conn`'s phone waits for the answer to its `pair` (see [`Conn::awaiting`]),
@@ -997,37 +1028,10 @@ impl Hub {
                 name,
                 platform,
             } => {
-                // The device is the key the handshake proved, paired through this relay. (Until
-                // the confirmation at the Mac, plan Task 7, a valid secret pairs at once.)
-                match self.store.begin_pair(
-                    secret.expose(),
-                    &name,
-                    &platform,
-                    &key,
-                    &self.relay,
-                    now,
-                ) {
-                    // Answered once the device is saved (see `on_saved`).
-                    Ok(pairing) => {
-                        self.await_answer(conn, true);
-                        let change = pair_change(pairing.device.clone());
-                        self.save(change, move |result| AfterSave::Paired {
-                            conn,
-                            req,
-                            pairing,
-                            result,
-                        });
-                    }
-                    Err(reason) => {
-                        let code = if reason == SECRET_REFUSED {
-                            Code::Unpaired
-                        } else {
-                            Code::Invalid
-                        };
-                        self.refuse(conn, req, code, reason);
-                        self.close(conn);
-                    }
-                }
+                // The device is the key the handshake proved, paired through this relay once the
+                // owner says yes.
+                self.pair((conn, req, &key), secret.expose(), &name, &platform)
+                    .await;
             }
             _ => {
                 self.refuse(conn, req, Code::Unpaired, "Say hello first");
@@ -1304,29 +1308,7 @@ impl Hub {
         }
         match then {
             AfterSave::Seen => {}
-            AfterSave::Paired {
-                conn,
-                req,
-                pairing,
-                result,
-            } => {
-                // Answered below either way; the link may go once it is sent.
-                self.await_answer(conn, false);
-                let reason = match result {
-                    Ok(Ok(())) => {
-                        // Who paired, and when; never the key or the secret.
-                        self.store.audit(&pairing.device.name, "", "paired").await;
-                        self.send(conn, &paired(&pairing.device.name, &self.name));
-                        return;
-                    }
-                    Ok(Err(reason)) => reason,
-                    Err(_) => PAIR_NOT_SAVED,
-                };
-                // The phone may try again with the same code.
-                self.store.unspend(pairing);
-                self.refuse(conn, req, Code::Invalid, reason);
-                self.close(conn);
-            }
+            AfterSave::Paired { pending, result } => self.paired_saved(pending, result).await,
             AfterSave::Push {
                 conn,
                 req,
@@ -1793,12 +1775,14 @@ impl Hub {
     async fn on_control(&mut self, request: Control) {
         match request {
             Control::PairSecret(reply) => {
-                let secret = self.store.pairing_secret(SystemTime::now());
-                let identity = self.keys.identity_public();
-                let link = pair_link(&self.relay, &identity, self.keys.channel(), &secret);
-                self.want_relay();
-                let _ = reply.send(link);
+                let _ = reply.send(self.open_pairing());
             }
+            Control::PairWait(reply) => self.wait_for_phone(reply),
+            Control::PairAnswer {
+                pending,
+                accept,
+                reply,
+            } => self.answer(pending, accept, reply),
             Control::Status(reply) => {
                 self.store.reload_if_changed().await;
                 let _ = reply.send(self.store.devices().len());
@@ -1823,14 +1807,19 @@ impl Hub {
     }
 
     /// Refuses, for their phones, the commands no session answered in time, and closes
-    /// connections that never said hello 10 seconds after their `connect`.
+    /// connections that never said hello 10 seconds after their `connect`, but for a phone held
+    /// for the owner's answer.
     fn sweep(&mut self) {
         let now = Instant::now();
         self.launches.running(self.sessions.phone_started(), now);
         let silent: Vec<u64> = self
             .conns
             .iter()
-            .filter(|(_, state)| state.device.is_none() && now >= state.opened + FIRST_FRAME_WITHIN)
+            .filter(|(_, state)| {
+                state.device.is_none()
+                    && !state.awaiting
+                    && now >= state.opened + FIRST_FRAME_WITHIN
+            })
             .map(|(&conn, _)| conn)
             .collect();
         for conn in silent {
@@ -1849,10 +1838,12 @@ impl Hub {
         }
     }
 
-    /// Every second: refuses what timed out, sends the pushes and Live Activity sends due, and
-    /// lets the relay link go once the last pairing secret expired with nothing paired.
+    /// Every second: refuses what timed out (a held pairing too), sends the pushes and Live
+    /// Activity sends due, and lets the relay link go once the last pairing secret expired with
+    /// nothing paired.
     fn tick(&mut self) {
         self.sweep();
+        self.pairing_tick(Instant::now());
         self.flush_push();
         self.flush_activity();
         self.want_relay();
@@ -1908,7 +1899,7 @@ impl Hub {
         let Some(state) = self.forget(conn) else {
             return;
         };
-        self.lingering = Some(Instant::now() + REVOKED_GRACE + CLOSE_WITHIN);
+        self.linger();
         let told = state
             .out
             .try_send(Out::Text(
@@ -2033,12 +2024,13 @@ impl Hub {
         }
     }
 
-    /// Removes `conn` and its unanswered commands; its replays stop as it drops. When it was its
-    /// device's last connection, the approvals that device was spared while looking are offered
-    /// to it again.
+    /// Removes `conn`, its unanswered commands and a pairing held on it; its replays stop as it
+    /// drops. When it was its device's last connection, the approvals that device was spared
+    /// while looking are offered to it again.
     fn forget(&mut self, conn: u64) -> Option<Conn> {
         let state = self.conns.remove(&conn)?;
         self.pending.retain(|_, pending| pending.conn != conn);
+        self.pairing_conn_gone(conn);
         if let Some(device) = &state.device {
             let key = &device.key;
             // A background connection going was never the app in front.
@@ -2396,9 +2388,10 @@ async fn control_client(
     {
         return;
     }
-    if request_kind(&line) == "watch" {
-        watch_stream(&mut reader, &mut write, &hub).await;
-        return;
+    match request_kind(&line).as_str() {
+        "watch" => return watch_stream(&mut reader, &mut write, &hub).await,
+        "pair_wait" => return pair_wait(&mut reader, &mut write, &hub).await,
+        _ => {}
     }
     let answer = control_answer(&line, &hub, &relay).await;
     let _ = timeout(
@@ -2448,35 +2441,110 @@ async fn watch_stream(
     }
 }
 
-/// The answer to one control request: `pair_secret` gives a pairing link (and opens the
-/// pairing, which brings the relay link up), `status` where the hub stands with the relay and
-/// how many phones are paired.
+/// Answers a `pair_wait` once the hub has an answer for it; a client that leaves first (its side
+/// closed) ends the wait.
+async fn pair_wait(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    write: &mut OwnedWriteHalf,
+    hub: &mpsc::Sender<Control>,
+) {
+    let (reply, mut answer) = oneshot::channel();
+    let answer = if hub.send(Control::PairWait(reply)).await.is_err() {
+        stopping()
+    } else {
+        let mut ignored = [0u8; 64];
+        loop {
+            tokio::select! {
+                answer = &mut answer => break answer.unwrap_or_else(|_| stopping()),
+                // The client sends nothing more; a read that ends means it left.
+                read = reader.read(&mut ignored) => {
+                    if read.is_ok_and(|n| n > 0) {
+                        continue;
+                    }
+                    return;
+                }
+            }
+        }
+    };
+    let _ = timeout(
+        CONTROL_WITHIN,
+        write.write_all(format!("{answer}\n").as_bytes()),
+    )
+    .await;
+}
+
+/// The answer to a control request the hub cannot take: it is stopping.
+fn stopping() -> Value {
+    json!({"error": "The hub is stopping"})
+}
+
+/// The `pending` id and the yes or no of a `pair_answer` request line.
+fn pair_answer_request(line: &str) -> Option<(u64, bool)> {
+    let request: Value = serde_json::from_str(line).ok()?;
+    Some((
+        request.get("pending")?.as_u64()?,
+        request.get("accept")?.as_bool()?,
+    ))
+}
+
+/// The answer to one control request: `pair_secret` opens a pairing (which brings the relay link
+/// up) and gives its link once the relay has the hub; `pair_answer` says yes or no for the held
+/// phone and hears how that went; `status` gives where the hub stands with the relay and how many
+/// phones are paired.
 async fn control_answer(
     line: &str,
     hub: &mpsc::Sender<Control>,
     relay: &watch::Receiver<RelayState>,
 ) -> Value {
     let kind = request_kind(line);
-    let gone = || json!({"error": "The hub is stopping"});
     match kind.as_str() {
         "pair_secret" => {
-            let (reply, link) = oneshot::channel();
+            let (reply, opened) = oneshot::channel();
             if hub.send(Control::PairSecret(reply)).await.is_err() {
-                return gone();
+                return stopping();
             }
-            match link.await {
-                Ok(Some(link)) => json!({"link": link}),
-                Ok(None) => json!({"error": "The relay's address can't go in a pairing link"}),
-                Err(_) => gone(),
+            match opened.await {
+                Ok(Opened::Link { link, host }) => {
+                    let mut relay = relay.clone();
+                    let registered = relay.wait_for(|state| *state == RelayState::Registered);
+                    if timeout(REGISTERED_WITHIN, registered)
+                        .await
+                        .is_ok_and(|registered| registered.is_ok())
+                    {
+                        json!({"link": link})
+                    } else {
+                        json!({"link": null, "reason": format!("Can't reach the relay at {host}")})
+                    }
+                }
+                Ok(Opened::Waiting) => json!({"link": null, "reason": PHONE_WAITS}),
+                Ok(Opened::Unlinkable) => {
+                    json!({"error": "The relay's address can't go in a pairing link"})
+                }
+                Err(_) => stopping(),
             }
+        }
+        "pair_answer" => {
+            let Some((pending, accept)) = pair_answer_request(line) else {
+                return json!({"error": "pair_answer needs pending and accept"});
+            };
+            let (reply, answer) = oneshot::channel();
+            let request = Control::PairAnswer {
+                pending,
+                accept,
+                reply,
+            };
+            if hub.send(request).await.is_err() {
+                return stopping();
+            }
+            answer.await.unwrap_or_else(|_| stopping())
         }
         "status" => {
             let (reply, devices) = oneshot::channel();
             if hub.send(Control::Status(reply)).await.is_err() {
-                return gone();
+                return stopping();
             }
             let Ok(devices) = devices.await else {
-                return gone();
+                return stopping();
             };
             json!({"relay": relay.borrow().as_str(), "devices": devices})
         }

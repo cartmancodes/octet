@@ -1,7 +1,8 @@
 //! A hub's world in a test: an in-process relay, a phone that reaches the hub through it the way
 //! the app does (the Noise `IK` initiator, then frames in chunks, answering the hub's encrypted
-//! pings), the pairing link it scans, and the hub's control socket. Nothing here is hardened: a
-//! step that fails panics, as a test's failure report.
+//! pings), the pairing link it scans, and the hub's control socket, where the owner's answer to
+//! a held pairing is given. Nothing here is hardened: a step that fails panics, as a test's
+//! failure report.
 use futures_util::{SinkExt, StreamExt};
 use octet_relay::{Config, Limits, serve};
 use serde_json::{Value, json};
@@ -43,8 +44,9 @@ const PONG: u8 = 3;
 /// What encryption adds to a plaintext.
 const TAG: usize = 16;
 
-/// A WebSocket a phone opened.
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// A WebSocket a phone talks over: one it opened, or one a relay played by a test accepted (on a
+/// plain stream).
+pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// The relay's default limits, less those a test that is not about them would trip: the
 /// per-address ones (every test connects from `127.0.0.1`) and the byte rate (a test may replay
@@ -310,25 +312,107 @@ pub async fn pair_link(run: &Path) -> Link {
     Link::parse(link).unwrap_or_else(|| panic!("not a pairing link: {link}"))
 }
 
+/// Asks the hub whose run directory is `run` for a pairing secret without waiting for its answer
+/// (which comes once the relay has the hub): the pairing is open, and the hub dials, as soon as
+/// the hub has read the request. The task ends with the answer.
+pub fn open_pairing(run: &Path) -> JoinHandle<Option<Value>> {
+    let run = run.to_owned();
+    tokio::spawn(async move { control(&run, &json!({"type": "pair_secret"})).await })
+}
+
+/// The `pair` frame a phone called `name` sends with `secret`, as `req` 1.
+pub fn pair_frame(secret: &str, name: &str) -> Value {
+    json!({"v": 1, "req": 1, "type": "pair", "secret": secret, "name": name, "platform": "ios"})
+}
+
+/// The answer to `pair_wait` on the hub whose run directory is `run`.
+///
+/// # Panics
+///
+/// If the hub gives none within [`WAIT`].
+pub async fn pair_wait(run: &Path) -> Value {
+    control(run, &json!({"type": "pair_wait"}))
+        .await
+        .expect("the hub answers pair_wait")
+}
+
+/// The answer to `pair_answer` for the pairing `pending` on the hub whose run directory is `run`.
+///
+/// # Panics
+///
+/// If the hub gives none within [`WAIT`].
+pub async fn pair_answer(run: &Path, pending: u64, accept: bool) -> Value {
+    let request = json!({"type": "pair_answer", "pending": pending, "accept": accept});
+    control(run, &request)
+        .await
+        .expect("the hub answers pair_answer")
+}
+
+/// A phone the hub holds for the owner's answer.
+#[derive(Debug)]
+pub struct Held {
+    /// The link it scanned.
+    pub link: Link,
+    /// Its key.
+    pub key: PhoneKey,
+    /// Its connection, past the `pair_code` frame.
+    pub phone: Phone,
+    /// The `pair_code` frame it was sent.
+    pub code: Value,
+}
+
+/// A phone called `name` that sent `pair` to the hub whose run directory is `run` with a new
+/// pairing secret, once its relay has it, and was sent its code: the hub holds it for the
+/// owner's answer.
+///
+/// # Panics
+///
+/// If any step fails.
+pub async fn hold(run: &Path, name: &str) -> Held {
+    let link = pair_link(run).await;
+    hold_with(&link, name).await
+}
+
+/// A phone called `name` that sent `pair` with `link`'s secret and was sent its code.
+///
+/// # Panics
+///
+/// If any step fails.
+pub async fn hold_with(link: &Link, name: &str) -> Held {
+    let key = PhoneKey::new();
+    let mut phone = Phone::connect(link, &key)
+        .await
+        .expect("the phone connects");
+    phone.send(&pair_frame(&link.secret, name)).await;
+    let code = phone.recv().await;
+    assert_eq!(code["type"], "pair_code", "{code}");
+    Held {
+        link: link.clone(),
+        key,
+        phone,
+        code,
+    }
+}
+
 /// A phone called `name` paired with the hub whose run directory is `run`, once its relay has
-/// it: the link it scanned, its key, and the `paired` frame.
+/// it, the owner saying yes at the Mac: the link it scanned, its key, and the `paired` frame.
 ///
 /// # Panics
 ///
 /// If any step fails.
 pub async fn pair(run: &Path, name: &str) -> (Link, PhoneKey, Value) {
-    let link = pair_link(run).await;
-    relay_state(run, "registered").await;
-    let key = PhoneKey::new();
-    let mut phone = Phone::connect(&link, &key)
-        .await
-        .expect("the phone connects");
-    phone
-        .send(
-            &json!({"v": 1, "req": 1, "type": "pair", "secret": link.secret, "name": name,
-            "platform": "ios"}),
-        )
-        .await;
+    let Held {
+        link,
+        key,
+        mut phone,
+        ..
+    } = hold(run, name).await;
+    let question = pair_wait(run).await;
+    let pending = question["pending"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{question}"));
+    let answer = pair_answer(run, pending, true).await;
+    assert_eq!(answer, json!({"paired": true, "device": name}));
     let paired = phone.recv().await;
     assert_eq!(paired["type"], "paired", "{paired}");
     (link, key, paired)
@@ -338,6 +422,8 @@ pub async fn pair(run: &Path, name: &str) -> (Link, PhoneKey, Value) {
 pub struct Phone {
     ws: Box<Socket>,
     noise: Box<TransportState>,
+    /// The handshake's first message, as it sent it.
+    first: Vec<u8>,
     /// The chunks of the frame being joined.
     joining: Vec<u8>,
     /// The bytes of a hub's ping whose pong is not sent yet.
@@ -383,10 +469,6 @@ impl Phone {
     /// # Errors
     ///
     /// How it ended before the hub answered.
-    ///
-    /// # Panics
-    ///
-    /// If the Noise pattern cannot be built.
     pub async fn connect_to(
         relay: &str,
         channel: &str,
@@ -398,6 +480,21 @@ impl Phone {
             .await
             .map_err(|_| Refused::Failed("the upgrade took too long".into()))?
             .map_err(|error| Refused::Failed(error.to_string()))?;
+        Self::over(ws, identity, key).await
+    }
+
+    /// Runs the handshake with the hub with `identity` over `ws`, as the phone whose key is
+    /// `key`: a socket the phone opened, or the hub's data connection to a relay played by the
+    /// test.
+    ///
+    /// # Errors
+    ///
+    /// How it ended before the hub answered.
+    ///
+    /// # Panics
+    ///
+    /// If the Noise pattern cannot be built.
+    pub async fn over(ws: Socket, identity: &[u8; 32], key: &PhoneKey) -> Result<Self, Refused> {
         // Boxed, as is the handshake: a TLS stream and Noise's state are large to carry around.
         let mut ws = Box::new(ws);
         let mut noise = Builder::new(PATTERN.parse().expect("the pattern"))
@@ -411,7 +508,7 @@ impl Phone {
         let len = noise.write_message(&[], &mut first).expect("message 1");
         first.truncate(len);
         // A relay with no hub may have closed already; its close says why.
-        let _ = ws.send(Message::binary(first)).await;
+        let _ = ws.send(Message::binary(first.clone())).await;
         let answer = timeout(WAIT, async {
             loop {
                 match ws.next().await {
@@ -440,6 +537,7 @@ impl Phone {
         Ok(Self {
             ws,
             noise,
+            first,
             joining: Vec::new(),
             owed: None,
             answers: true,
@@ -470,18 +568,39 @@ impl Phone {
     ///
     /// If a chunk cannot be encrypted or sent in time.
     pub async fn send_text(&mut self, text: &str) {
-        let count = text.len().div_ceil(CHUNK);
-        for (index, chunk) in text.as_bytes().chunks(CHUNK).enumerate() {
-            let kind = if index + 1 == count { LAST } else { MORE };
-            let mut plain = Vec::with_capacity(chunk.len() + 1);
-            plain.push(kind);
-            plain.extend_from_slice(chunk);
-            let message = self.seal(&plain);
+        for message in self.seal_text(text) {
             timeout(WAIT, self.ws.send(Message::binary(message)))
                 .await
                 .expect("sent in time")
                 .expect("sent");
         }
+    }
+
+    /// The handshake's first message, as the phone sent it: what a relay could copy and replay.
+    pub fn first_message(&self) -> &[u8] {
+        &self.first
+    }
+
+    /// The encrypted messages that would carry `frame`, one a chunk, made but not sent (the
+    /// phone's next messages are then the ones after them): what a relay could copy and replay.
+    pub fn seal_frame(&mut self, frame: &Value) -> Vec<Vec<u8>> {
+        self.seal_text(&frame.to_string())
+    }
+
+    /// The encrypted messages that carry `text` as one frame, in chunks.
+    fn seal_text(&mut self, text: &str) -> Vec<Vec<u8>> {
+        let count = text.len().div_ceil(CHUNK);
+        text.as_bytes()
+            .chunks(CHUNK)
+            .enumerate()
+            .map(|(index, chunk)| {
+                let kind = if index + 1 == count { LAST } else { MORE };
+                let mut plain = Vec::with_capacity(chunk.len() + 1);
+                plain.push(kind);
+                plain.extend_from_slice(chunk);
+                self.seal(&plain)
+            })
+            .collect()
     }
 
     /// Sends an encrypted message of `plain` exactly as given: a test of what the hub refuses.

@@ -958,18 +958,7 @@ async fn audit_records_remote_actions() {
 async fn a_pairing_is_audited_without_its_key_or_secret() {
     let mut env = Env::new();
     env.start().await;
-    let link = env.link().await;
-    relay_state(&env.run, "registered").await;
-    let key = PhoneKey::new();
-    let mut phone = Phone::connect(&link, &key).await.expect("connects");
-    send(
-        &mut phone,
-        json!({"v": 1, "req": 1, "type": "pair", "secret": link.secret, "name": "Test phone",
-            "platform": "ios"}),
-    )
-    .await;
-    let paired = recv(&mut phone).await;
-    assert_eq!(paired["type"], "paired", "{paired}");
+    let (link, key, _) = pair(&env.run, "Test phone").await;
     let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
     let lines: Vec<Value> = audit
         .lines()
