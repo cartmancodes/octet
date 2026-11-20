@@ -385,6 +385,49 @@ mod remote_control {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_question_that_arrives_over_the_palette_is_seen_and_answered() {
+        for (code, said) in [
+            (KeyCode::Char('y'), "Paired \"Pixel\""),
+            (KeyCode::Char('n'), NOT_PAIRED),
+        ] {
+            let hub = Hub::new(vec![question(7, false)]);
+            let mut app = app();
+            open(&mut app, &hub).await;
+            // The owner opens the palette while waiting for a phone; then the phone comes.
+            key_action(&mut app, &RecordingVendor::default(), ctrl('p')).await;
+            assert!(app.overlay.palette);
+            told(&mut app).await;
+            // The question is on top: drawn, and what the keys answer.
+            let drawn = screen(&mut app);
+            // The dialog's own keys line: the status line repeats the prompt, not these.
+            assert!(
+                drawn.contains("Y  Yes     N / Enter / Esc  No"),
+                "{code:?}: {drawn}"
+            );
+            assert!(
+                !drawn.contains("Commands · ↑ ↓ choose"),
+                "{code:?}: {drawn}"
+            );
+            // Nor can the palette open over it.
+            key_action(&mut app, &RecordingVendor::default(), ctrl('p')).await;
+            assert!(!app.overlay.palette, "{code:?}");
+            app.pairing.as_mut().unwrap().arm();
+            // Drawn again, it stays armed: nothing covers it.
+            screen(&mut app);
+            press(&mut app, code).await;
+            assert_eq!(asking(&app), None, "{code:?}");
+            told(&mut app).await;
+            assert_eq!(last_said(&app), said, "{code:?}");
+            assert_eq!(
+                hub.answered(),
+                [
+                    json!({"type": "pair_answer", "pending": 7, "accept": code == KeyCode::Char('y')})
+                ]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_pairing_that_replaces_asks_replace() {
         let hub = Hub::new(vec![question(7, true)]);
         let mut app = app();

@@ -260,6 +260,9 @@ pub(crate) fn apply(app: &mut App, told: Option<Told>) {
             if let Some(wait) = app.pairing.as_mut() {
                 wait.question = Some(question);
                 wait.hidden();
+                // Keys reach the question before the palette, so it must not open under one: the
+                // palette closes, and (taking no keys while the question is open) stays closed.
+                app.overlay.palette = false;
                 app.hint(prompt);
             }
         }
