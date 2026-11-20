@@ -2,15 +2,18 @@
 
 An Expo app (React Native, SDK 57) that lists the Octet sessions running on your Mac, shows each
 transcript, sends prompts, answers approvals, changes mode and model, shows and commits what a
-session changed, and starts or resumes a session. It talks to `octet hub` on your Mac over your tailnet; it holds no vendor credentials and
+session changed, and starts or resumes a session. It talks to `octet hub` on your Mac through a
+relay, end-to-end encrypted (Noise), with no VPN and no account; it holds no vendor credentials and
 no SSH keys. Why the hub is built the way it is, and how to set up the Mac side, is in
-[docs/remote-control.md](../../docs/remote-control.md#phone-app-hub).
+[docs/remote-control.md](../../docs/remote-control.md#phone-app-hub). The relay is in
+[docs/relay.md](../../docs/relay.md).
 
 ## What you need
 
-- Octet on the Mac with the hub running (`octet hub`) and published on your tailnet (`tailscale
-  serve --bg 47823`; you run that yourself).
-- The Tailscale app on the phone, signed in to the same tailnet.
+- Octet on the Mac. `octet pair` starts the hub, if it is not running, and pairs the phone (see
+  [Pairing](#pairing)).
+- A relay both can reach. **The default relay is not deployed yet**, so until it is, run your own
+  ([docs/relay.md](../../docs/relay.md)) and name it in `hub.json`, or a phone cannot reach the Mac.
 - Node 22 and npm, to work on the app.
 
 ## Local development
@@ -38,9 +41,11 @@ build. Never pair a development build with the Mac you use every day: see
 
 ### The contract test
 
-`npm run contract` (or `make mobile-contract`) starts `target/debug/octet hub` on a free port with
-a fake session (a Unix socket, a registration and a journal in a temp directory), pairs, and drives
-`HubClient` through hello, sessions, subscribe, replay, a live event, a prompt, an approval
+`npm run contract` (or `make mobile-contract`) starts `target/debug/octet-relay` on a free loopback
+port and `target/debug/octet hub` dialling it (over `ws://`, which only debug builds allow), with
+a fake session (a Unix socket, a registration and a journal in a temp directory). It pairs the way
+the app does, with the owner's yes given on the hub's control socket as `octet pair` gives it, and
+drives `HubClient` through the encrypted channel: hello, sessions, subscribe, replay, a live event, a prompt, an approval
 answer, a dropped connection with a cursor (no duplicates), a ping, a desk command, the
 workspace's changes, a diff of a listed file (and the refusal of one not listed), a commit and
 then "Nothing to commit", notifications on (a push to a local fake, never to Expo, with the exact
@@ -48,15 +53,13 @@ content-free body), notifications off, and a revoke. The fake session's workspac
 repository the test makes in its temp directory, with its own `user.name`, `user.email` and
 `commit.gpgsign=false` (the hub takes every `GIT_*` variable out of git's environment), so the
 test needs `git` on the `PATH`. It builds nothing:
-run `scripts/rust-env.sh cargo build -p octet` first. Without that binary it skips. It never
-touches Tailscale: the hub is given a stand-in `tailscale` on its `PATH`, and the test's socket
-adds the `Tailscale-User-Login` header that `tailscale serve` adds in real life. The app never
-sends that header. The hub posts push with `curl`, so `curl` must be on the `PATH`. Its pushes name
-the stand-in's host as `mac`. A second part runs two hubs at once, as two Macs (each with its own
-temp directory, port, stand-in `tailscale` and fake session, the same session id on both), feeds
-one store from both clients and checks that both are listed apart, that an answer reaches only its
-own Mac's session, and that the other Mac keeps streaming after one is unpaired. CI runs this
-test in its own `contract` job.
+run `scripts/rust-env.sh cargo build -p octet -p octet-relay` first. Without those binaries it
+skips. The hub posts push with `curl`, so `curl` must be on the `PATH`. Its pushes name the hub's
+channel id as `mac`. A second part runs two hubs at once on one relay, as two Macs (each with its
+own temp directory and fake session, the same session id on both), feeds one store from both
+clients and checks that both are listed apart, that an answer reaches only its own Mac's session,
+and that the other Mac keeps streaming after one is unpaired. CI runs this test in its own
+`contract` job.
 
 ## Building the app for a phone
 
@@ -72,20 +75,22 @@ only the JavaScript inside it, and it has no development launcher.
 **Use `development` only while you work on the app, and never pair it with the Mac you use every
 day.** If you did pair one, unpair it and revoke it on the Mac (`octet hub revoke NAME`).
 
-A development build runs whatever JavaScript it is pointed at, and that code holds the device
-token:
+A development build runs whatever JavaScript it is pointed at, and that code holds the pairing's
+private key:
 
 - With `expo-dev-client`, a tapped `exp+octet://` link can load a bundle from anywhere.
 - A Debug build fetches its bundle from Metro over plain HTTP, so anyone on the same Wi-Fi can
   replace it.
 
-Either way, that code can do everything the token allows, without Face ID: start a session in
+Either way, that code can do everything the key allows, without Face ID: start a session in
 full access, or allow an approval. Every check of the phone's own is in JavaScript, so none of them
 stops it.
 
 A development build says so: it shows an amber "Development build — don't pair with your everyday
-Mac" on Pair, Sessions and Settings. It also keeps its token under its own keychain item
-(`octet.token.dev`), so it never picks up the pairing of a release build on the same phone.
+Mac" on Pair, Sessions and Settings. It also keeps each pairing's key under its own keychain items
+(`octet.token.dev.<id>`), so it never picks up the pairing of a release build on the same phone.
+A development build also takes `ws://` pairing links, which only a debug hub makes; a release
+build takes `wss://` only.
 
 ### iPhone
 
@@ -122,22 +127,34 @@ run:android`. The same rule applies: never pair that build with your everyday Ma
 
 ## Pairing
 
-1. On the Mac, start the hub and publish it (see [the guide](../../docs/remote-control.md#phone-app-hub)).
-2. In an Octet session on the Mac, type `/remote-control pair`. It shows a QR code and a link.
-3. Open the app. Until it is paired it shows **Scan the code from /remote-control pair**: point the camera at
-   the code, inside the four corner brackets. Or tap **Enter code instead** and paste the link into
-   **Paste link** (with the camera off, those fields show at once). Once the link is valid the app
-   says `Pair with <the hub's address>?` and the **Pair** button turns on (it is dimmed until then).
-   Give the phone a name under **Device name** (the Mac lists it in `octet hub devices`) and tap
-   **Pair**. A toast says `Paired with <the Mac>`. The code works once and expires after 10 minutes.
+1. On the Mac, run `octet pair` in a terminal. It starts the hub if it is not running (installing
+   the per-user service, as `octet hub install` does), prints a QR code and a link, and waits. See
+   [the guide](../../docs/remote-control.md#pair-a-phone-in-three-steps). (`/remote-control pair`
+   in an Octet session shows the same code and asks the same question, once the hub is running.)
+2. Open the app. Until it is paired it shows **Scan the code from octet pair**: point the
+   camera at the code, inside the four corner brackets. Or tap **Enter code instead** and paste the
+   link (`octet://pair/…`) into **Paste link** (with the camera off, those fields show at once).
+   Once the link is valid the app says `Pair with this Mac?` and the **Pair** button turns on (it is
+   dimmed until then). Give the phone a name under **Device name** (the Mac lists it in `octet hub
+   devices`; pairing again under a name the Mac already has replaces that phone) and tap **Pair**.
+3. The app shows a six-digit code under **Check this code on your Mac**, and the Mac asks `Phone
+   shows 482 913? Pair "<name>" (<platform>)? [y/N]`. If the digits match, answer `y` at the Mac. A
+   toast then says `Paired with <the Mac>`. The link works once and expires after 10 minutes.
 
-The app keeps the device token in the iOS Keychain / Android Keystore (`expo-secure-store`), never
-in plain storage.
+**If no code shows on the phone while the Mac asks, answer no.** The code comes from the hub, over
+the encrypted channel, only to the phone it is holding for the Mac's owner. A Mac that asks while
+your phone shows no code is holding someone else's phone (a copied link): answer `n` and run `octet
+pair` again. The app waits 130 seconds for the answer; the Mac refuses after two minutes.
+
+The app keeps each pairing's private key (the phone's own, made at pairing) in the iOS Keychain /
+Android Keystore (`expo-secure-store`, readable while the phone is unlocked, this device only), never
+in plain storage, together with the hub's public key (pinned at pairing), the Mac's channel id and
+the relay address in its settings. A relay that changes means pairing again.
 
 ### More than one Mac
 
 The app pairs with up to 4 Macs. To add one, open **Settings › Machines › + Pair another machine**
-(off at 4: `4 Macs is the most`) and scan that Mac's code. Every Mac stays connected while the app is
+(off at 4: `4 Macs is the most`) and scan the code `octet pair` shows on that Mac. Every Mac stays connected while the app is
 open; the Inbox and the drawer show all their sessions, each named by its Mac, and a Mac that can't
 be reached shows "asleep" (back in the app, "connecting…" until its first try is over) and greys
 only its own sessions. New session keeps the Mac you chose: if it drops while you type, its chip
@@ -145,12 +162,12 @@ says so and Start waits for it. In **Machines**, **Rename** gives a Mac a
 name of 1 to 40 characters on this phone, and **Unpair** asks `Unpair <name>? Its sessions leave
 this phone.` and drops only that Mac (a screen showing one of its sessions goes back to the Inbox).
 
-A push names the Mac it came from (`data.mac`, the hub's published host), and a tap opens that
-Mac's session. A host none of your pairings has, no host with several Macs paired, or a session that
-has ended opens the Inbox. A Mac you unpair while it can't be reached doesn't hear "notifications
+A push names the Mac it came from (`data.mac`, the hub's channel id: 64 lowercase hex digits), and a
+tap opens that Mac's session. A channel id none of your pairings has, none at all, or a session that
+has ended opens the Inbox (so does a notification left from before the relay, which named a host). A Mac you unpair while it can't be reached doesn't hear "notifications
 off": it keeps pushing until you run `octet hub revoke <device>` on it, because the phone's push
-token is shared with your other Macs (a tap on one finds no pairing for its host and opens the
-Inbox). A pairing whose token the
+token is shared with your other Macs (a tap on one finds no pairing for its channel id and opens the
+Inbox). A pairing whose key the
 phone can't read shows `offline` in Machines, and on Pair (with Unpair) when it is the only kind
 left, so it can always be cleared.
 
@@ -187,7 +204,7 @@ side drawer (or swipe in from the left edge) on the Inbox, a Conversation and Se
   - **Open PR on the desk** shows `gh pr create` to run at the Mac, and sends nothing. The phone
     can't push, open a pull request or commit only some files.
 - **Settings.** Three cards. **Machines**: each Mac with ● or ○, its own state (`online`,
-  `connecting…`, `asleep` or `offline`), its host, **Rename** and **Unpair**; this phone's name; and
+  `connecting…`, `asleep` or `offline`), its relay address, **Rename** and **Unpair**; this phone's name; and
   **+ Pair another machine**. **Notify me when**: three switches, **An action needs approval**, **A turn
   finishes** and **A session hits an error**, one per kind of push. A switch moves only when the
   Mac acknowledges (a refusal or an unreachable Mac is said below them). Turning one on while
@@ -267,7 +284,7 @@ shows no switch for it.
   went idle. When a new activity appears, the native module ends the ones it saw before it, so they
   don't stack; one it already saw, or one already over, ends nothing, so one activity always stays.
 - **While it isn't**, one Mac's hub starts, updates and ends that same activity through APNs, with
-  content-free pushes (the state, the hub's own session id, its host, two times and a count; no
+  content-free pushes (the state, the hub's own session id, its channel id, two times and a count; no
   names or commands), each start and update stale 15 minutes on: the widget then dims it and shows a
   muted **Stale**. It updates it through the activity
   token the phone registered, so only once that token has reached the hub. That needs your APNs key
@@ -293,7 +310,7 @@ shows no switch for it.
   hub doesn't take it for the app in front), which registers and closes on the answer or after 10
   seconds; a closed app that iOS launches in the background for the token hands it over once it has
   read its settings and pairings. This needs iOS to give the app time in the background when the
-  token arrives, and the phone unlocked: each Mac's device token is in the keychain readable only
+  token arrives, and the phone unlocked: each Mac's private key is in the keychain readable only
   while unlocked (`WHEN_UNLOCKED_THIS_DEVICE_ONLY`).
 - **What a locked phone costs.** Without the hand-over (a locked phone, or no background time), the
   Mac never gets the token of the activity it started: it can neither update nor end it until you
@@ -306,7 +323,7 @@ shows no switch for it.
 - **The names and commands** the widget shows come from the phone only: the app writes each waiting
   approval's session name (at most 80 characters) and command (folded like the Permission card, at
   most 200) to the App Group `group.dev.octet.mobile`, at most 64 of them, newest first, whenever the
-  approvals change, keyed by the host (lowercased) and the session. Both are marked
+  approvals change, keyed by the Mac's channel id and the session. Both are marked
   privacy-sensitive, so iOS hides them on a locked phone when set to. Unpairing a Mac removes its
   entries.
 - **Deny** answers no to that approval, on the Mac that owns it, without Face ID (it allows
@@ -318,7 +335,7 @@ shows no switch for it.
   (`handOverSettled`). On a locked
   phone that connection can't be made, so the Deny waits for you to unlock and open the app. One that
   couldn't go is sent on the Mac's next connection, within 10 minutes. Each Deny is sent once.
-- **Allow** opens `octet://approve/<host>/<session>/<approval>`. The app opens that approval's
+- **Allow** opens `octet://approve/<channel id>/<session>/<approval>`. The app opens that approval's
   session, where Allow asks for Face ID (if **Face ID to allow** is on) and waits out the 400 ms arm,
   as anywhere else: the link alone never allows. It opens the session only while the approval is
   the session's front one, the one its Permission card shows. A malformed link, one for a Mac that
@@ -345,7 +362,9 @@ The tests cannot cover a real phone. Run this on the iPhone 15 and on the Gemini
 build from your own EAS project, against real Claude and Codex with tiny prompts in a throwaway
 workspace. Tick each one on each phone.
 
-- [ ] Pair the phone (QR code, and the pasted link).
+- [ ] Pair the phone (QR code, and the pasted link), on cellular, through the hosted relay once it is
+      deployed. The phone and the Mac show the same six digits. A second phone that uses the same link
+      gets no code and is refused.
 - [ ] Notifications on, then a push on a locked phone: start a turn that needs approval, lock the
       phone, and the push arrives reading `Octet` / `Approval waiting`.
 - [ ] Tap that push: the app opens on that session (from locked, from the background, and from a
@@ -361,6 +380,11 @@ workspace. Tick each one on each phone.
 - [ ] An approval that arrives with the app open, still waiting when you leave the app: one push.
 - [ ] With `octet hub install`, after a fresh login and no tmux running, start a Claude session
       from the phone.
+- [ ] **Deny** from the Island against its 10 seconds on cellular through the relay, cold and warm,
+      locked and unlocked: the whole trip (name lookup, TLS, the WebSocket, the relay's splice, the
+      handshake, `hello` and the ack) finishes in time, or the app opens for the answer.
+- [ ] Time the crypto on each phone (a long journal replay, and the handshake), the Android phone
+      being the likely worst case.
 - [ ] Switch from Wi-Fi to cellular mid-turn: the transcript resumes with nothing missing or doubled.
 - [ ] Answer an approval on one phone: it closes on the other phone and on the desk.
 - [ ] Change the model and the mode; full access asks for the typed confirmation.
@@ -453,20 +477,18 @@ workspace. Tick each one on each phone.
 
 ## Troubleshooting
 
-**The Inbox shows "Can't reach your Mac".** The phone must be on the tailnet:
-open the Tailscale app, check it is connected and signed in to the same tailnet as the Mac, and
-that the Mac itself is online there. The hub is reachable only through your tailnet; there is no
-other route. Check that `octet hub` is still running on the Mac.
+**The Inbox shows "Can't reach your Mac".** The phone reached the relay, but the relay has no hub
+for that Mac (a close of 4404), or it could not reach the relay at all. Check, on the Mac, that the
+hub is running (`/remote-control` reports `Hub: running` and `Relay: has the hub`) and that the
+phone has a network. A hub dials the relay only while a phone is paired or a pairing is open, so a
+Mac whose last phone was revoked stays "Can't reach your Mac" for ever: remove it in **Settings ›
+Machines › Unpair**. If you changed the relay in `hub.json`, or the default relay moved, the phone
+must pair again. While the default relay is not deployed, a phone cannot reach any Mac that has not
+named a relay of its own.
 
-**`/remote-control pair` says "Publish it first".** The hub is running but `tailscale serve` is
-not set up for it. Run `tailscale serve --bg 47823` on the Mac yourself (the hub never changes
-your Tailscale configuration), as described in
-[docs/remote-control.md](../../docs/remote-control.md#put-it-on-your-tailnet). The hub looks again
-every 10 seconds, so it can take that long to notice.
-
-**The app is back on the pairing screen ("Scan the code from /remote-control pair"), saying "This phone was unpaired on the Mac".** The Mac
-removed this phone (`octet hub revoke NAME`), so the hub no longer knows its token. Pair again with
-`/remote-control pair`. `octet hub devices` lists the phones the Mac knows.
+**The app is back on the pairing screen ("Scan the code from octet pair"), saying "This phone was unpaired on the Mac".** The Mac
+removed this phone (`octet hub revoke NAME`), so the hub no longer knows its key. Pair again with
+`octet pair`. `octet hub devices` lists the phones the Mac knows.
 
 **Allow says "Face ID isn't set up on this phone. Turn it off in Settings to allow from here."**
 Allowing an approval asks the phone's biometrics first. If Face ID or a fingerprint isn't set up on
@@ -480,8 +502,12 @@ be installed, the workspace must be one the hub allows (a folder from your recen
 `hub.json`'s `workspaces`), and at most eight phone-started sessions run at once. Pull down on the
 Inbox to refresh it; after a Start the app says "NAME hasn't appeared yet. Check tmux on the Mac." when the session is late.
 
-**Pairing says the code is invalid or expired.** Codes work once and last 10 minutes. Run
-`/remote-control pair` again for a new one.
+**Pairing says the link is invalid, expired or already used.** A link works once and lasts 10
+minutes. Run `octet pair` again for a new one. If the app says `Pairing was refused on the Mac`, the
+owner answered no, or two minutes passed with no answer.
+
+**The Mac asks to pair but the phone shows no code.** Answer no at the Mac and run `octet pair`
+again: the Mac is holding someone else's phone, not yours (see [Pairing](#pairing)).
 
 **The camera is off.** The pairing screen says "Camera access is off — paste the link instead": paste the
 link into **Paste link** (the fields show at once).

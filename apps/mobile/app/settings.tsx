@@ -25,7 +25,7 @@ const TURN_OFF_REASON = "Turn off Face ID for allowing";
 export const MACS_FULL = "4 Macs is the most";
 
 /** The footer's words, after the app's name and version. */
-const FOOTER = "talks to your Macs directly over your tailnet; nothing passes through a relay.";
+const FOOTER = "reaches your Macs through a relay, end-to-end encrypted.";
 
 /** This phone's settings: the Macs it is paired with (each to rename or unpair, and another to
  * pair), what to notify it about, and whether Allow asks for Face ID. */

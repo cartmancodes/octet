@@ -972,8 +972,8 @@ mod tests {
     /// The activity token and the push-to-start token of the device under test.
     const TOKEN: &str = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
     const START: &str = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
-    /// The host the tests' hub is published at.
-    const MAC: &str = "mac.tail1234.ts.net";
+    /// The tests' hub's channel id, which names it in a payload.
+    const MAC: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     /// Where the tests' sessions keep their journals: a name the payload must never carry.
     const JOURNAL: &str = "/work/secret-project/session-1-1.jsonl";
 

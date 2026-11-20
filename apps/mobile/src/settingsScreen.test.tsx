@@ -61,7 +61,7 @@ const turn = async (on: boolean) => {
 describe("Settings", () => {
   it("shows the hub's host only and the device name", async () => {
     await open();
-    expect(screen.getByText("mac.tail1234.ts.net")).toBeTruthy();
+    expect(screen.getByText("relay.example.test")).toBeTruthy();
     expect(screen.queryByText(/wss:/)).toBeNull();
     expect(screen.getByText("Shubh's iPhone")).toBeTruthy();
   });
@@ -69,7 +69,7 @@ describe("Settings", () => {
   it("ends with the footer, naming the app version from the app's config", async () => {
     await open();
     expect(
-      screen.getByText("Octet v4.5.6 · talks to your Macs directly over your tailnet; nothing passes through a relay."),
+      screen.getByText("Octet v4.5.6 · reaches your Macs through a relay, end-to-end encrypted."),
     ).toBeTruthy();
   });
 
@@ -77,7 +77,7 @@ describe("Settings", () => {
     mockConfig = null;
     await open();
     expect(screen.queryByText(/ v\d/)).toBeNull();
-    expect(screen.getByText("Octet · talks to your Macs directly over your tailnet; nothing passes through a relay.")).toBeTruthy();
+    expect(screen.getByText("Octet · reaches your Macs through a relay, end-to-end encrypted.")).toBeTruthy();
     mockConfig = { version: "4.5.6" };
   });
 
@@ -241,7 +241,7 @@ describe("Settings", () => {
       expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBeNull();
       expect((await loadSettings()).pairings).toEqual([]);
       expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, offer: false, macs: [], notices: [] });
-      expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
+      expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
       expect(rig.view.getPathname()).toBe("/pair");
       expect(screen.queryByText(/unpaired on/)).toBeNull();
     });

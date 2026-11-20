@@ -52,7 +52,7 @@ jest.mock("expo-constants", () => ({
 
 const METRICS = { frame: { x: 0, y: 0, width: 390, height: 844 }, insets: { top: 47, left: 0, right: 0, bottom: 34 } };
 const SECRET = "ab".repeat(32);
-const LINK = pairLinkTo("mac", SECRET, { relay: "mac.tail1234.ts.net" });
+const LINK = pairLinkTo("mac", SECRET, { relay: "relay.example.test" });
 /** The private key, as hex, of the key pair the phone makes when it pairs. */
 const TOKEN = "cd".repeat(32);
 const GRANTED = { granted: true, canAskAgain: true, status: "granted" };
@@ -130,10 +130,10 @@ beforeEach(async () => {
 });
 
 describe("the Pair screen", () => {
-  it("is a panel with 'Scan the code from /remote-control pair', with a hint,, the camera in four accent corner brackets, and a sheet", async () => {
+  it("is a panel with 'Scan the code from octet pair', with a hint,, the camera in four accent corner brackets, and a sheet", async () => {
     await open();
-    expect(screen.getByText("Scan the code from /remote-control pair")).toBeTruthy();
-    expect(screen.getByText("On your Mac, run /remote-control pair in Octet.")).toBeTruthy();
+    expect(screen.getByText("Scan the code from octet pair")).toBeTruthy();
+    expect(screen.getByText("On your Mac, run octet pair in a terminal.")).toBeTruthy();
     const style = (el: { props: { style?: unknown } }) => StyleSheet.flatten(el.props.style as never) as Record<string, unknown>;
     const frame = style(screen.getByTestId("scan-frame"));
     expect(frame.width).toBe(240);
@@ -189,7 +189,7 @@ describe("the Pair screen", () => {
     await SecureStore.setItemAsync(tokenKeyOf("m000000aa"), TOKEN);
     await saveSettings({
       pairings: [
-        { id: "m000000aa", relay: "wss://mac.tail1234.ts.net/", channel: channelOf("mac"), hubKey: hubKeyOf("mac"), deviceName: "iPhone", macName: "Desk" },
+        { id: "m000000aa", relay: "wss://relay.example.test/", channel: channelOf("mac"), hubKey: hubKeyOf("mac"), deviceName: "iPhone", macName: "Desk" },
       ],
     });
     const rig = await open();
@@ -558,7 +558,7 @@ describe("pairing another machine", () => {
   async function pairedWith(...hosts: string[]) {
     const pairings = hosts.map((host, i) => ({
       id: `m0000000${(10 + i).toString(16)}`,
-      relay: `wss://${host}.tail1234.ts.net/`,
+      relay: `wss://${host}.relay.example.test/`,
       channel: channelOf(host),
       hubKey: hubKeyOf(host),
       deviceName: "iPhone",
@@ -606,7 +606,7 @@ describe("pairing another machine", () => {
   it("is the first pairing's screen without the add mode, however many Macs", async () => {
     await pairedWith("studio-mac");
     await open();
-    expect(screen.getByText("Scan the code from /remote-control pair")).toBeTruthy();
+    expect(screen.getByText("Scan the code from octet pair")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Cancel adding a Mac" })).toBeNull();
   });
 });

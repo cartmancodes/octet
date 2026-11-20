@@ -53,7 +53,7 @@ describe("Settings › Machines", () => {
     expect(screen.getAllByTestId(/^machine-/).map((r) => r.props.testID)).toEqual(MACS.slice(0, 3).map((m) => `machine-${m.id}`));
     expect(row(STUDIO.id).getByText("● studio")).toBeTruthy();
     expect(row(STUDIO.id).getByText("online")).toBeTruthy();
-    expect(row(STUDIO.id).getByText("studio.tail1234.ts.net")).toBeTruthy();
+    expect(row(STUDIO.id).getByText("studio.relay.example.test")).toBeTruthy();
     expect(row(AIR.id).getByText("○ air")).toBeTruthy();
     expect(row(AIR.id).getByText("connecting…")).toBeTruthy();
     // mini drops its link: only its own row says so.

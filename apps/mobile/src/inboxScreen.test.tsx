@@ -53,7 +53,7 @@ const waiting = (id: string, approval: ApprovalInfo, extra: Partial<SessionInfo>
 beforeEach(async () => {
   await AsyncStorage.clear();
   await SecureStore.setItemAsync(tokenKeyOf(M), TOKEN);
-  await saveSettings({ pairings: [pairingOf(M, "studio-mac", "studio-mac.tail1234.ts.net")], faceId: false });
+  await saveSettings({ pairings: [pairingOf(M, "studio-mac", "studio-relay.example.test")], faceId: false });
   octetStore.getState().reset();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
   auth.hasHardwareAsync.mockResolvedValue(true);

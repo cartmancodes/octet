@@ -27,7 +27,7 @@ jest.mock("expo-camera", () => ({
 /** The private key, as hex, each saved pairing's keychain entry holds. */
 export const TOKEN = "cd".repeat(32);
 /** The relay host the one Mac is reached through. */
-export const RELAY = "mac.tail1234.ts.net";
+export const RELAY = "relay.example.test";
 
 export const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
   id,
@@ -134,8 +134,8 @@ export const MACS = [
 ] as const;
 
 /** The address of the phone sockets to the Mac whose host label is `host`, which is reached through
- * a relay of its own name (`<host>.tail1234.ts.net`). */
-export const macUrl = (host: string): string => phoneUrlOf(host, `${host}.tail1234.ts.net`);
+ * a relay of its own name (`<host>.relay.example.test`). */
+export const macUrl = (host: string): string => phoneUrlOf(host, `${host}.relay.example.test`);
 
 /** Call in `beforeEach`: the first `count` of `MACS` paired (each its key in its own keychain
  * entry), Face ID off, an empty store. */
@@ -147,7 +147,7 @@ export async function pairedMacs(count: number = 2): Promise<void> {
   await saveSettings({
     deviceName: "Shubh's iPhone",
     faceId: false,
-    pairings: macs.map((m) => pairingOf(m.id, m.host, `${m.host}.tail1234.ts.net`, { deviceName: "Shubh's iPhone" })),
+    pairings: macs.map((m) => pairingOf(m.id, m.host, `${m.host}.relay.example.test`, { deviceName: "Shubh's iPhone" })),
   });
   octetStore.getState().reset();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));

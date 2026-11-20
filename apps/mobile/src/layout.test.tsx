@@ -46,7 +46,7 @@ jest.mock("expo-constants", () => ({
 /** The private key, as hex, of the saved pairing and of the key pair a pairing makes. */
 const TOKEN = "cd".repeat(32);
 const n = Notifications as jest.Mocked<typeof Notifications>;
-const LINK = pairLinkTo("mac", "ab".repeat(32), { relay: "mac.tail1234.ts.net" });
+const LINK = pairLinkTo("mac", "ab".repeat(32), { relay: "relay.example.test" });
 
 let changeAppState: (state: string) => void = () => {};
 
@@ -66,7 +66,7 @@ afterEach(() => jest.restoreAllMocks());
 async function launch(opts: { paired?: boolean } = {}) {
   if (opts.paired) {
     await SecureStore.setItemAsync(tokenKeyOf(M), TOKEN);
-    await saveSettings({ pairings: [pairingOf(M, "mac", "mac.tail1234.ts.net")] });
+    await saveSettings({ pairings: [pairingOf(M, "mac", "relay.example.test")] });
   }
   const sockets = new Sockets();
   const clock = new FakeClock();
@@ -111,7 +111,7 @@ async function connected({ sockets }: { sockets: Sockets }): Promise<void> {
 describe("the app shell", () => {
   it("opens on Pair without a key", async () => {
     const { sockets } = await launch();
-    expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
+    expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
     expect(screen.queryByText("Sessions list")).toBeNull();
     expect(sockets.all).toHaveLength(0);
   });
@@ -129,7 +129,7 @@ describe("the app shell", () => {
       { initialUrl: "/usage?id=x" },
     );
     await view;
-    expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
+    expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
     expect(screen.queryByText("Usage x")).toBeNull();
   });
 
@@ -146,7 +146,7 @@ describe("the app shell", () => {
       { initialUrl: sessionPath("x") },
     );
     await view;
-    expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
+    expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
     expect(screen.queryByText("Session x")).toBeNull();
     expect(view.getPathname()).toBe("/pair");
     expect(sockets.all).toHaveLength(0);
@@ -155,7 +155,7 @@ describe("the app shell", () => {
   it("opens on Sessions with a key, and connects once", async () => {
     const { sockets } = await launch({ paired: true });
     expect(await screen.findByText("Sessions list")).toBeTruthy();
-    expect(screen.queryByText("Scan the code from /remote-control pair")).toBeNull();
+    expect(screen.queryByText("Scan the code from octet pair")).toBeNull();
     expect(sockets.all).toHaveLength(1);
   });
 
@@ -240,7 +240,7 @@ describe("the app shell", () => {
     await act(async () => {
       sockets.last.receive({ type: "refused", req: 0, reason: "This device was revoked", code: "revoked" });
     });
-    expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
+    expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
     expect(screen.getByText(unpairedNotice("mac"))).toBeTruthy();
     expect(screen.queryByText("Sessions list")).toBeNull();
     expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBeNull();
@@ -264,7 +264,7 @@ describe("the app shell", () => {
       jest.mocked(SystemUI.setBackgroundColorAsync).mockClear();
       jest.spyOn(ReactNative, "useColorScheme").mockReturnValue("dark");
       await launch();
-      await screen.findByText("Scan the code from /remote-control pair");
+      await screen.findByText("Scan the code from octet pair");
       expect(SystemUI.setBackgroundColorAsync).toHaveBeenLastCalledWith(dark.bg);
     });
 
@@ -272,7 +272,7 @@ describe("the app shell", () => {
       jest.mocked(SystemUI.setBackgroundColorAsync).mockClear();
       jest.spyOn(ReactNative, "useColorScheme").mockReturnValue("light");
       await launch();
-      await screen.findByText("Scan the code from /remote-control pair");
+      await screen.findByText("Scan the code from octet pair");
       expect(SystemUI.setBackgroundColorAsync).toHaveBeenLastCalledWith(light.bg);
     });
   });
@@ -295,7 +295,7 @@ describe("notifications", () => {
 
   it("keeps the splash up while the saved pairing is being read", async () => {
     // A saved pairing whose key the keychain is still reading.
-    await saveSettings({ pairings: [pairingOf(M, "mac", "mac.tail1234.ts.net")] });
+    await saveSettings({ pairings: [pairingOf(M, "mac", "relay.example.test")] });
     const sockets = new Sockets();
     const hub = new Fleet({
       factory: () => sockets.factory,
@@ -335,7 +335,7 @@ describe("notifications", () => {
 
   it("a tap while unpaired goes to Pair", async () => {
     const { view } = await launch();
-    await screen.findByText("Scan the code from /remote-control pair");
+    await screen.findByText("Scan the code from octet pair");
     await act(async () => listener()?.(tap({ session: SESSION, mac: MAC })));
     expect(view.getPathname()).toBe("/pair");
   });
@@ -358,7 +358,7 @@ describe("notifications", () => {
   it("a cold start from a tap while unpaired lands on Pair", async () => {
     n.getLastNotificationResponse.mockReturnValue(tap({ session: SESSION, mac: MAC }));
     const { view } = await launch();
-    await screen.findByText("Scan the code from /remote-control pair");
+    await screen.findByText("Scan the code from octet pair");
     expect(view.getPathname()).toBe("/pair");
   });
 

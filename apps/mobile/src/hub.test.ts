@@ -24,8 +24,8 @@ jest.mock("expo-constants", () => ({
 }));
 
 const SECRET = "ab".repeat(32);
-/** The one Mac, reached through the relay `mac.tail1234.ts.net`. */
-const RELAY = "mac.tail1234.ts.net";
+/** The one Mac, reached through the relay `relay.example.test`. */
+const RELAY = "relay.example.test";
 const LINK = pairLinkTo("mac", SECRET, { relay: RELAY });
 /** Where its phone sockets go. */
 const URL_ = phoneUrlOf("mac", RELAY);
@@ -100,7 +100,7 @@ describe("starting", () => {
   });
 
   it("does not trust a saved relay address that is not one a link gives: unpaired, key dropped", async () => {
-    for (const relay of ["wss://evil.example/path", "https://mac.ts.net/", "wss://mac.ts.net:99999/", "wss://mac.ts.net", "javascript:x"]) {
+    for (const relay of ["wss://evil.example/path", "https://relay.example.test/", "wss://relay.example.test:99999/", "wss://relay.example.test", "javascript:x"]) {
       await SecureStore.setItemAsync(KEY, TOKEN);
       await saveSettings({ pairings: [{ ...PAIRING, relay }] });
       const r = rig();

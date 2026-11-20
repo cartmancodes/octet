@@ -109,10 +109,12 @@ running across turns, and pick the session up from your phone.
 
 **From your phone**
 
-- Run Octet in tmux on your Mac and reach it from an iPhone over Tailscale and
-  mosh. `/remote-control` checks the Mac's side without changing anything and
-  prints the exact command for Blink or Termius.
-  [Step-by-step guide](docs/remote-control.md).
+- Watch your sessions, answer approvals and send prompts from the Octet phone
+  app. Install the app, run `octet pair` on the Mac, and scan the QR code: the
+  phone reaches your Mac through a relay, end-to-end encrypted, with no VPN and
+  no account. The default relay is not deployed yet, so for now you run your
+  own ([Running the relay](docs/relay.md)). The terminal UI also works over any
+  SSH connection inside tmux. [Guide](docs/remote-control.md).
 
 **In the terminal**
 
@@ -251,6 +253,7 @@ Start at the [documentation index](docs/README.md). The main guides:
   journals and limits
 - [Use Octet from your phone](docs/remote-control.md)
 - [The phone app](apps/mobile/README.md): build, pair, troubleshoot
+- [Running the relay](docs/relay.md)
 - [Persistent goals](docs/rust/goals.md)
 
 ## Project layout

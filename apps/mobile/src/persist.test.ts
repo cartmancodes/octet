@@ -119,7 +119,7 @@ describe("settings", () => {
   });
 
   it("an app upgraded from before push kinds keeps what the Mac was pushing it: all three while notifications are on", async () => {
-    const before = { deviceName: "Old", faceId: true, hubUrl: "wss://mac.tail1234.ts.net/", textSize: 13 };
+    const before = { deviceName: "Old", faceId: true, hubUrl: "wss://relay.example.test/", textSize: 13 };
     await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...before, notifications: true }));
     expect((await loadSettings()).pushKinds).toEqual({ approvals: true, errors: true, turns: true });
     // A save writes them down, so they stay what they were.

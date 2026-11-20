@@ -11,6 +11,14 @@ Claude Code and Codex CLIs.
 
 ### Added
 
+- The phone reaches your Mac through a relay, end to end encrypted (Noise), with
+  no Tailscale and no account. Pairing is one command: `octet pair` starts the
+  hub if needed, shows a QR code, and asks at the Mac to confirm the phone by a
+  six-digit code both screens show. A phone is a key pair, and `octet hub
+  revoke NAME` removes it; a Mac is known by its channel id. `octet-relay` is
+  the relay, with a `Dockerfile.relay` and a deploy guide (`docs/relay.md`).
+  The default relay is not deployed yet, so for now a hub names its own relay
+  in `hub.json`. A phone paired before this pairs again.
 - A Live Activity for the phone app, in the Dynamic Island and on the Lock
   Screen (iOS 17.2 or later; the app still runs on iOS 16.4). It shows whether
   a session runs, waits for approval or is done, and for how long, with the
@@ -119,22 +127,23 @@ Claude Code and Codex CLIs.
   contract test (`ping`, `register_push` and the push itself) now runs in CI,
   and `apps/mobile/README.md` has the push setup and a device-pass checklist.
 - A phone hub and a bridge in every terminal interface: `octet hub` serves
-  your running sessions to a phone app over your tailnet (loopback only,
-  published with `tailscale serve`), with transcripts, prompts, approvals,
-  mode and model changes, recent sessions and starting or ending a session.
-  Each interface shares its session through a private socket in `run/`; a
-  device token and your tailnet login are both required, every remote action
-  is audited, and full access needs a typed confirmation.
+  your running sessions to a phone app through the relay (it listens on no
+  port), with transcripts, prompts, approvals, mode and model changes, recent
+  sessions and starting or ending a session. Each interface shares its session
+  through a private socket in `run/`; only a phone whose key the hub stored can
+  connect, every remote action is audited, and full access needs a typed
+  confirmation.
 - A phone app (`apps/mobile`, Expo and React Native): it pairs by QR code or
   link, lists your sessions with what each is doing, streams transcripts,
   sends prompts, answers approvals (Face ID or fingerprint first), changes
   mode and model, resumes recent sessions and starts new ones in a workspace
-  you choose. The device token lives in the phone's secure storage, and a
+  you choose. The phone's private key lives in its secure storage, and a
   revoked phone is told to pair again. A contract test (`make mobile-contract`)
   runs the app's hub client against the real `octet hub`. Build and
   troubleshooting notes are in `apps/mobile/README.md`.
 - `/remote-control pair` shows a QR code and link that pair a phone with the
-  hub (single use, 10 minutes); `/remote-control` also reports the hub.
+  hub (single use, 10 minutes) and asks you to confirm the phone; `/remote-control`
+  reports the hub, the relay and the paired phones.
 - `octet hub devices`, `octet hub revoke NAME` and `octet hub watch` list
   paired phones, unpair one, and print what every session is doing.
 - `--no-remote` keeps a session off the hub.
@@ -172,9 +181,8 @@ Claude Code and Codex CLIs.
 - A provider switch carries the conversation: the first prompt to the new
   provider includes a transcript of what was shown (at most 64 KiB, newest
   turns and the first prompt kept), while you see only what you typed.
-- Phone access over tmux, Tailscale SSH and mosh, with a step-by-step guide
-  and `/remote-control`, a read-only check that names each fix and prints the
-  phone command.
+- The terminal UI works over any SSH connection inside tmux; the notes are in
+  `docs/rust/remote-control-ssh.md`. Octet does not set it up or check it.
 - A multiline prompt editor with Unicode-aware editing, bracketed paste and
   history; the prompt box grows with the draft.
 - A responsive layout down to 38 × 12 cells with a Task sidebar from 112

@@ -1,395 +1,221 @@
 # Use Octet from your phone
 
-Run Octet on your Mac and use it from your phone. Your phone uses a terminal
-app (Blink Shell or Termius) and reaches the Mac over Tailscale, your own
-private network. mosh keeps the connection through Wi-Fi and cellular
-changes, and tmux keeps Octet running while your phone is away.
-
-You need:
-
-- a Mac that stays on while you're away, with Octet built
-  (`make rust-build` puts it in `target/release/octet`);
-- an iPhone or Android phone with Blink Shell (iOS) or Termius (iOS and
-  Android);
-- a Tailscale account (the free plan is enough).
-
-Setup takes about 20 minutes. Inside Octet, `/remote-control` checks your
-progress at any point: it changes nothing, and lists what is ready (`[ok]`),
-what is missing (`[!!]`) and the command to fix it. Everything it checks,
-and what it can't, is in [The `/remote-control` check](#the-remote-control-check);
-if the phone won't connect, see [Troubleshooting](#troubleshooting). Why this
-design, and its limits: [the evaluation](rust/remote-control-ssh.md).
-
-Octet also has a hub that lets a phone app list, watch and answer your running
-sessions without a terminal: see [Phone app (hub)](#phone-app-hub). It is
-optional, and the terminal route in steps 1 to 7 works without it.
-
-## 1. Install tmux and mosh on the Mac
-
-```sh
-brew install tmux mosh
-mosh-server --version
-```
-
-The version must be 1.4.0 or newer; older mosh shows Octet in 256 colours.
-
-On an Apple silicon Mac, Homebrew installs into `/opt/homebrew/bin`, which a
-login over SSH doesn't search: SSH runs commands through a shell that reads
-only `~/.zshenv`, so the phone gets `mosh-server: command not found`. Add
-Homebrew to that file once:
-
-```sh
-echo 'export PATH="/opt/homebrew/bin:$PATH"' >> ~/.zshenv
-```
-
-## 2. Configure tmux
-
-Create `~/.tmux.conf`, or add these lines to it:
-
-```
-# Octet from a phone over mosh: 24-bit colour, and flag bells (approvals)
-# from windows you aren't looking at.
-set -g default-terminal "tmux-256color"
-set -as terminal-features ",xterm-256color:RGB"
-set -g monitor-bell on
-set -g bell-action any
-# Let /copy reach the phone's clipboard.
-set -g set-clipboard on
-```
-
-If tmux is already running, reload it with `tmux source-file ~/.tmux.conf`.
-
-## 3. Put the Mac on Tailscale
-
-Install the Tailscale app from the Mac App Store (or from
-[tailscale.com/download](https://tailscale.com/download)), open it and sign in.
-In the app, note the Mac's **machine name**, for example
-`my-mac.tail1234.ts.net`. The phone connects to that name.
-
-## 4. Let the phone log in over SSH
-
-Pick one option.
-
-### Option A: Remote Login (works with the App Store Tailscale app)
-
-1. Open **System Settings → General → Sharing** and turn on
-   **Remote Login**. Click its info button and set **Allow access for** to
-   **Only these users**, with just your account.
-2. Turn off password login, so only your phone's key can log in. Run these
-   commands, entering your Mac password when asked:
-
-   ```sh
-   printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
-     | sudo tee /etc/ssh/sshd_config.d/010-octet.conf
-   sudo sshd -t && echo "SSH settings OK"
-   ```
-
-   The file name starts with `010` so it is read before macOS's own
-   settings. Turn Remote Login off and on again to apply it.
-3. Do step 6 (create a key on the phone) and add the phone's public key
-   before you leave the Mac, or you'll be locked out:
-
-   ```sh
-   mkdir -p ~/.ssh && chmod 700 ~/.ssh
-   echo 'PASTE-THE-PHONE-PUBLIC-KEY-HERE' >> ~/.ssh/authorized_keys
-   chmod 600 ~/.ssh/authorized_keys
-   ```
-
-Remote Login answers on every network the Mac joins, not only Tailscale.
-Key-only login (step 2) is what keeps that safe.
-
-### Option B: Tailscale SSH (only Tailscale can reach the Mac)
-
-This needs Tailscale's open-source build instead of the App Store app; the
-App Store app can't accept Tailscale SSH connections.
-
-```sh
-brew install tailscale
-sudo tailscaled install-system-daemon
-sudo tailscale up
-sudo tailscale set --ssh
-```
-
-The daemon runs as root, so these commands need `sudo` unless you first make
-yourself its operator with `sudo tailscale set --operator=$USER`.
-
-Tailscale then handles login with your Tailscale account; no SSH keys are
-needed. In the
-[Tailscale admin console](https://login.tailscale.com/admin/acls), make sure
-the `ssh` rules allow only your own devices to reach this Mac as your user.
-`"action": "check"` asks you to sign in again every 12 hours.
-
-## 5. Check from Octet
-
-Start Octet inside a tmux session named `octet`:
-
-```sh
-tmux new -A -s octet "octet --engine codex --cwd ~/Projects/my-app --approval-timeout 600"
-```
-
-- `--approval-timeout 600` gives you ten minutes to answer an approval from
-  the phone before it is denied (the default is 120 seconds).
-- `-A` reattaches to the session if it already exists.
-
-Type `/remote-control` on the Mac. It checks the Mac's side only (the phone's
-Tailscale and app settings are yours to check), so run it before you leave
-the desk or when the phone can't connect. When the Mac is ready, every line
-shows `[ok]`, and the report ends with the exact commands for your phone.
-With Option A the SSH line reads `[ok] SSH answers on the tailnet address`
-instead:
-
-```
-Remote control setup (read-only check)
-[ok] Running in tmux session "octet"
-[ok] Tailscale connected: my-mac.tail1234.ts.net (100.101.102.103)
-[ok] Tailscale SSH is on
-[ok] mosh-server 1.4.0
-Phone (Blink):   mosh you@my-mac.tail1234.ts.net -- tmux new -A -s octet
-Phone (Termius): host my-mac.tail1234.ts.net, user you, Mosh on, startup: tmux new -A -s octet
-Setup guide: docs/remote-control.md
-```
-
-Each `[!!]` line names its fix; the full list is in
-[Report lines and fixes](#report-lines-and-fixes). The status line under the
-prompt sums it up, for example `Remote control: ready (report above)` or
-`Remote control: 2 problems (report above)`.
-
-## 6. Set up the phone
-
-1. Install the **Tailscale** app and sign in with the same account. Leave it
-   connected.
-2. Set up your terminal app.
-
-**Blink Shell (iOS)**
-
-1. Type `config`, then **Keys & Certificates → +**, and create a key.
-   For Option A, copy its public key into `~/.ssh/authorized_keys` on the
-   Mac (step 4).
-2. Back in **config**, open **Hosts → +**. Set an alias such as `mac`,
-   the Mac's machine name as the host name, your Mac user name, and the
-   key.
-3. Connect with:
-
-   ```
-   mosh mac -- tmux new -A -s octet
-   ```
-
-**Termius (iOS and Android)**
-
-1. In **Keychain**, generate a key. For Option A, copy its public key into
-   `~/.ssh/authorized_keys` on the Mac (step 4).
-2. Create a **New Host** with the Mac's machine name as the address, your
-   Mac user name, and the key (Option B needs no key). Turn on **Mosh**. If
-   Termius can't resolve the name, use the Mac's `100.x.y.z` address from
-   the `/remote-control` report instead.
-3. Add a startup snippet that runs `tmux new -A -s octet`. If your version
-   doesn't run snippets over mosh, type that line after connecting.
-
-You now see the same Octet screen as on the Mac.
-
-## 7. Keep the Mac awake
-
-Octet stops when the Mac sleeps. While you're away, either set
-**System Settings → Battery → Options → Prevent automatic sleeping on power
-adapter when the display is off** (on a desktop Mac, **System Settings →
-Energy**), or run this once:
-
-```sh
-tmux new-window -d -t octet caffeinate -dims
-```
-
-## The `/remote-control` check
-
-`/remote-control` answers one question: is the Mac ready for the phone? It
-is a pre-flight and troubleshooting check, not part of using Octet from the
-phone. Termius or Blink does the connecting, and nothing in Octet needs to
-run for that.
-
-### Where and when to run it
-
-Run it **on the Mac**, in the Octet session you'll use from the phone
-(started inside tmux, step 5):
-
-- before you leave the desk, to be sure the phone will get in;
-- after changing the setup, such as a Tailscale update, a new
-  `~/.tmux.conf` or a reinstall;
-- when the phone can't connect, to rule the Mac in or out.
-
-Typed from the phone it prints the same report, because Octet runs on the
-Mac and every check looks at the Mac. By then the phone is already
-connected, so the check adds little there.
-
-### Usage
-
-```
-/remote-control
-/remote-control status
-```
-
-Both run the same checks. Any other argument prints
-`Use /remote-control or /remote-control status`. The report appears as a
-note in the conversation; nothing is sent to the agent and the session is
-unchanged.
-
-### What it checks, and how
-
-| Check | How it finds out | Passes when |
-| --- | --- | --- |
-| tmux session | `$TMUX` is set in Octet's environment, then `tmux display-message -p '#S'` gives the session name. | The session name comes back. |
-| tmux colour | `tmux show-options -s terminal-features` and `terminal-overrides`. Shown only when it fails. | An `RGB` feature, or a `Tc`/`RGB` override on older tmux, for a pattern that matches `xterm-256color` (the name the phone arrives under over mosh), such as `xterm-256color`, `xterm*` or `*256col*`. A setting for another terminal, such as `alacritty`, doesn't count. If tmux lists neither option, or Octet isn't in tmux, there is no line. |
-| Tailscale | `tailscale status --json`. If `tailscale` isn't on the PATH, the App Store app's own CLI at `/Applications/Tailscale.app/Contents/MacOS/Tailscale`. | `BackendState` is `Running`. The report shows the machine name and first tailnet address. |
-| SSH login | Only checked once Tailscale is connected. Two checks at once: `tailscale debug prefs` reports `RunSSH: true` (Option B, skipped for the App Store app), or a TCP connection to port 22 on the Mac's own tailnet address succeeds (Option A). | Either one passes. |
-| mosh | `mosh-server --version`. | Version 1.4.0 or newer. |
-| Phone commands | Built from `$USER`, the machine name and the tmux session name (`octet` if unknown). | Printed when Tailscale is connected and SSH passes. |
-
-Why two SSH checks: Tailscale SSH serves only connections that arrive
-through the tunnel from another device. The Mac connecting to its own
-tailnet address is refused even when Tailscale SSH is on, so Octet asks
-Tailscale for its setting instead.
-
-### Timing
-
-All the commands run at once and share one 2-second deadline. A command
-that hasn't answered by then is stopped and counts as missing (or, for
-tmux, as "didn't answer"). The SSH checks then get half a second. So the
-report arrives within about 2.5 seconds, even if tmux or Tailscale hangs.
-The checks run in the background: while they do, the status line reads
-`Checking phone access…`, and the screen keeps drawing, taking keys and
-showing the agent's output.
-
-### Report lines and fixes
-
-| Line | Meaning and fix |
-| --- | --- |
-| `[ok] Running in tmux session "NAME"` | The phone commands use `NAME`. |
-| `[!!] Not inside tmux. Quit and restart with: …` | Octet will stop when this terminal closes. Quit it (Ctrl+C twice) and start it with the `tmux new -A -s octet …` line in step 5. |
-| `[!!] Inside tmux, but tmux didn't answer; …` | `$TMUX` is set but tmux didn't reply within 2 seconds. Run `tmux ls` in another terminal and restart tmux if it hangs. The phone commands assume the session is named `octet`. |
-| `[!!] tmux reduces colours. Add to ~/.tmux.conf: …` | Add step 2's colour lines, then `tmux source-file ~/.tmux.conf`. |
-| `[ok] Tailscale connected: NAME (100.x.y.z)` | The phone connects to `NAME`, or to the address if it can't resolve the name. |
-| `[!!] Tailscale isn't connected. …` | Tailscale is missing, signed out or stopped. Open the app and sign in, or run `tailscale up` (step 3). There's no SSH line until this passes. |
-| `[ok] Tailscale SSH is on` | Option B is ready. |
-| `[ok] SSH answers on the tailnet address` | Option A (Remote Login) is ready. |
-| `[!!] SSH doesn't answer on the tailnet. Turn on Remote Login …` | Do step 4. The App Store app gets the Remote Login advice only; other installs also get `tailscale set --ssh`. |
-| `[ok] mosh-server 1.4.0` | mosh is ready. |
-| `[!!] mosh-server X.Y.Z is too old for 24-bit colour; …` | `brew upgrade mosh`. |
-| `[!!] mosh-server isn't installed: brew install mosh` | Do step 1. The same line appears if `mosh-server` isn't on Octet's PATH. |
-| `Phone (Blink): …` and `Phone (Termius): …` | Copy these into the phone app (step 6). When Octet isn't in tmux they follow `After restarting Octet in tmux:`, because until then they would open a new, empty session. |
-| `Setup guide: docs/remote-control.md` | Always the last line. |
-
-### What it can't check
-
-It sees only the Mac. If every line is `[ok]` and the phone still fails, the
-cause is one of these (see [Troubleshooting](#troubleshooting)):
-
-- Tailscale on the phone: connected, and signed in to the same account;
-- whether the phone can resolve the Mac's machine name (MagicDNS);
-- the phone app's host, user name, key and Mosh setting;
-- whether `mosh-server` and `tmux` are on the PATH of an SSH login. The
-  check uses Octet's own PATH, which comes from your interactive shell;
-- the `ssh` rules in the Tailscale admin console;
-- whether the Mac will stay awake (step 7);
-- whether the phone app shows the bell while it's in the background.
-
-### What it never does
-
-It only runs the commands in the table above. It changes no system, tmux or
-Tailscale settings, starts no listener, and holds no keys or passwords. Its
-one connection goes to the Mac's own address and closes at once.
-
-## Troubleshooting
-
-Start with `/remote-control` on the Mac. Then find the symptom here.
-
-| Symptom on the phone | Cause and fix |
-| --- | --- |
-| Termius: address resolution failed | The phone isn't using Tailscale's DNS. Use the Mac's `100.x.y.z` address from the report (or `tailscale ip -4` on the Mac) as the host. Or, in the phone's Tailscale app, turn on **Use Tailscale DNS** and check that MagicDNS is on in the admin console's DNS page. |
-| Connection refused | Nothing serves SSH on the Mac. Option B: run `sudo tailscale set --ssh`. Option A: turn on Remote Login. `/remote-control` should then show an `[ok]` SSH line. |
-| Connection times out | Tailscale is off on the phone, or signed in to a different account. Both devices should appear in `tailscale status` on the Mac. |
-| Permission denied (publickey) | Option A: the phone's public key isn't in `~/.ssh/authorized_keys` on the Mac, or the host uses a different key or user name. |
-| Tailscale asks you to sign in, or denies access | Option B: the admin console's `ssh` rules don't allow this device and user. With `"action": "check"`, sign in again every 12 hours. |
-| `mosh-server: command not found`, or Mosh fails while plain SSH works | Homebrew isn't on the PATH for SSH logins. Add the `~/.zshenv` line from step 1. |
-| `tmux: command not found` from the startup snippet | Same cause and fix as above. |
-| A plain shell instead of Octet | The startup snippet didn't run. Type `tmux new -A -s octet`. If that opens an empty session, Octet is in a session with another name: use the name from `/remote-control`, or list them with `tmux ls`. |
-| 256 colours instead of full colour | Check the report for `tmux reduces colours` or an old mosh-server. After changing `~/.tmux.conf`, reload it and reattach. |
-| Octet is gone | The Mac slept (step 7), or Octet was quit. Start it again with step 5's line. |
-| `/remote-control` shows `[!!] SSH doesn't answer` but the phone connects with Tailscale SSH | An older Octet build only tested port 22, which Tailscale SSH refuses from the Mac itself. Rebuild (below). |
-
-After pulling Octet changes, run `make rust-build`, then quit Octet (Ctrl+C
-twice) and start it again with step 5's line; the running copy keeps the old
-code until then.
-
-## Everyday use
-
-| To | Do |
-| --- | --- |
-| Send a newline | **Ctrl+J** (phone keyboards rarely send Alt+Enter) |
-| Cancel a turn | **Esc** from the app's key bar |
-| Answer an approval | **A** to allow once, **D** to deny |
-| Change the permission mode | `/mode auto` (Shift+Tab if your app sends it) |
-| Help | `/help` (F1 isn't on phone keyboards) |
-| Scroll | PgUp/PgDn from the key bar |
-| Show tool details | **Ctrl+O** (a failed tool call opens by itself) |
-| Leave Octet running | Close the app, or press **Ctrl+B** then **D** to detach |
-| Quit Octet | **Ctrl+C** twice; this ends the agent's session |
-
-When an approval starts waiting, Octet rings the terminal bell; tmux flags
-it, and the bell reaches your phone app over mosh. Whether the phone shows it
-while the app is in the background depends on the app. The desk and the
-phone can be attached to the same session at once. By default (tmux 3.1 and
-later) the screen takes the size of whichever of them was used last; add
-`set -g window-size smallest` to `~/.tmux.conf` to fit both instead.
+The Octet app on your phone lists the sessions running on your Mac, shows their
+transcripts, sends prompts, answers approvals, changes mode and model, shows and
+commits what a session changed, and starts or resumes a session. The phone reaches
+your Mac through a relay, and everything between the two is encrypted end to end:
+the relay only passes bytes along and cannot read them. There is no VPN to set up and
+no account to make.
+
+**The default relay is not deployed yet.** Octet's built-in relay address is a
+placeholder (`wss://relay.octet.invalid`) that does not resolve, so no phone can reach a Mac
+through it. Until the default relay is running, run a relay of your own
+([Running the relay](relay.md)) and name it in `hub.json` (see [Moving to another
+relay](#moving-to-another-relay)). The rest of this guide is how it works once a
+relay is there.
+
+The phone app is not in any app store: you build it from source and install it
+yourself, as [its README](../apps/mobile/README.md#building-the-app-for-a-phone)
+describes. That is the largest part of the setup.
 
 ## Phone app (hub)
 
-The hub is a small server on the Mac that shares your running Octet sessions
-with a phone app, over your tailnet. The phone sees each session's transcript,
-sends prompts, answers approvals, changes mode and model, runs a few safe desk
-commands (`/new`, `/session`, `/export`, `/help`), shows what a session's
-workspace changed and commits it, and can start a session or resume a recent
-one. You can still sit at the Mac and join any
-session: a session started from the phone runs in tmux (`tmux attach -t
-octet-NAME`), and one started at the desk shows up on the phone.
+The hub is a small program on the Mac that shares your running Octet sessions with
+the phone app. It makes no listening port on your Mac: it dials out to the relay,
+and only while a phone is paired or a pairing is open. You can still sit at the Mac
+and join any session: a session started from the phone runs in tmux (`tmux attach -t
+octet-NAME`), and one started at the desk shows up on the phone. The phone runs a few
+safe desk commands (`/new`, `/session`, `/export`, `/help`).
 
-You need the Mac side of Tailscale (step 3), and `tmux` if the phone should
-start sessions (step 1). The phone app is not in any app store: you build it
-from source and install it on your phone yourself, as
-[its README](../apps/mobile/README.md#building-the-app-for-a-phone) describes. It
-needs no SSH setup.
+You need Octet on the Mac, the app on the phone, and `tmux` if the phone should start
+sessions. Nothing else.
 
-The app is an Expo (React Native) project in
-[`apps/mobile`](../apps/mobile/README.md). Its README covers building it for
-an iPhone or an Android phone, working on it, pairing, and what to check when
-the app can't reach the Mac, says it is unpaired, or doesn't show a session
-you started.
+The app is an Expo (React Native) project in [`apps/mobile`](../apps/mobile/README.md).
+Its README covers building it for an iPhone or an Android phone, working on it, pairing,
+and what to check when the app can't reach the Mac, says it is unpaired, or doesn't show a
+session you started.
 
-Set it up in this order. The first four steps are all a phone needs:
+### Pair a phone in three steps
 
-1. [Start the hub](#start-the-hub), and if you like, [keep it
-   running](#keep-the-hub-running) as a service.
-2. [Put it on your tailnet](#put-it-on-your-tailnet).
-3. [Pair a phone](#pair-a-phone).
-4. Optionally, [push notifications](#push-notifications), the [Live
-   Activity](#live-activity-dynamic-island) (iPhone, with your own APNs key),
-   and [more Macs](#more-than-one-mac).
+1. **Install the app** on the phone.
+2. **Run `octet pair`** on the Mac, in a terminal.
+3. **Scan the QR code** with the app (its **Pair** screen), check the code, and answer
+   `y` at the Mac.
 
-After those come [what the phone is sent](#what-the-phone-is-sent), [changes
-and commits](#changes-and-commits-from-the-phone), [keeping a session
+```sh
+octet pair
+```
+
+`octet pair` does everything the Mac needs, in order:
+
+1. If no hub is running, it says `Starting the hub` and installs the hub as a per-user
+   service, exactly as `octet hub install` does (see [Keep the hub
+   running](#keep-the-hub-running)), then waits up to 15 seconds for it.
+2. It opens a pairing, which is what makes a hub with no paired phones dial the relay,
+   and waits for the relay to accept the hub.
+3. It prints a QR code and the same pairing link, `octet://pair/…`. The link works once
+   and expires after 10 minutes. The app opens it from its own scanner, from the phone's
+   camera, or pasted (**Enter code instead**).
+4. If the terminal is too narrow for the QR code it says `Widen the terminal to show the QR
+   code`; the link is still printed.
+5. It says `tmux isn't installed: the phone can watch and answer, but can't start
+   sessions` if `tmux` is not on your `PATH`.
+6. When a phone uses the link, it asks you to check a code (next section).
+
+It exits 0 when a phone was paired, and 1 when not. `--journal-dir PATH` names the hub's
+data directory, as for `octet hub`.
+
+Inside Octet, `/remote-control pair` works too, once the hub is running: it shows the
+same QR code and asks the same question in the terminal UI, but it never starts or
+installs the hub (the terminal UI changes no system settings). With no hub running it
+says `The hub isn't running. Run "octet pair" in a terminal first.` Plain
+`/remote-control` reports where things stand:
+
+```
+Hub: running
+Relay: has the hub
+Phones paired: 2
+```
+
+`Relay:` reads `has the hub`, `connecting`, or `off · nothing is paired and no pairing is
+open`. In the terminal UI, `Y` answers yes to the question, and `N`, Enter, Esc or Ctrl+C
+answer no; a key typed just as the question appears never answers it.
+
+### The confirmation code
+
+The pairing link alone would let anyone who got hold of it pair from anywhere on the
+internet. So the Mac asks you, and the check is a six-digit code both screens show:
+
+```
+Phone shows 482 913? Pair "Shubh's iPhone" (ios)? [y/N]
+```
+
+- The phone shows the same digits under **Check this code on your Mac**. Compare them,
+  and answer `y` only if they match.
+- The hub picks the digits at random when it accepts a pairing, and sends them to that
+  one phone inside the encrypted channel. The phone never works the code out for itself,
+  and a hostile relay cannot choose it. A code on the phone's screen therefore means the
+  hub is holding that phone's connection for your answer.
+- **If the phone shows no code, answer no.** The prompt at the Mac with no code on your
+  phone means someone else used the link first (a photographed or copied QR code): the Mac
+  holds their phone, not yours. Answer `n` (or let the two
+  minutes pass), then run `octet pair` again for a fresh link.
+- The name and platform in the prompt are the phone's own claim, shown for convenience.
+  `Replace` stands in for `Pair` when a phone of that name is already paired: see [Pairing
+  a phone again](#pairing-a-phone-again).
+- The link's secret is spent the moment the hub accepts a phone's `pair`, whatever you
+  answer. One pairing waits at a time; a second phone meanwhile is refused and gets no
+  code. If the held phone's connection closes, the question ends with it, and you start
+  again with a new `octet pair`.
+- No answer in two minutes refuses the phone. The app waits 130 seconds for the answer.
+  A phone is stored only on `y`.
+
+The command ends with `Paired "NAME"`, `Not paired`, `Pairing timed out`, `The phone
+left`, or why the hub could not save it.
+
+### What the relay sees
+
+A relay, honest or not, sees each connection's address, the channel ids hubs and phones
+name (a channel id is a hash of the hub's relay key, 64 hex digits), and the timing and
+size of every message. It can drop or delay messages or cut a connection. It cannot read
+or change a frame (authenticated encryption), pose as your Mac (it lacks the identity
+key the phone pinned at pairing), pose as your phone (it lacks the phone's key), keep a
+departed phone looking present (the hub pings inside the encrypted channel), or see a
+pairing link: that travels by QR code and never touches the relay. The encryption is
+`Noise_IK_25519_ChaChaPoly_SHA256`, with fresh keys for every connection. How to run a
+relay, and what an operator can watch, is in [Running the relay](relay.md).
+
+### Pairing a phone again
+
+A phone that pairs again makes a new key, so the hub cannot tell it is the same phone;
+its name decides. When you confirm a pairing under a name the hub already holds, the new
+key replaces the old one in one step: the old key's connections close, and its push and
+Live Activity tokens are dropped. The prompt says `Replace` so you can see it. This is how
+a phone comes back after a relay move, a lost `paired`, or a wiped app, without leaving its
+old key authorised. If you pair two different phones, give them different names.
+
+### Moving to another relay
+
+A phone keeps the relay address it paired through. The hub dials the default relay unless
+`hub.json` (in the data directory, beside `devices.json`) names another:
+
+```json
+{
+  "relay": "wss://relay.example.com"
+}
+```
+
+It must be `wss://HOST` or `wss://HOST:PORT`, with no path, query or user name; anything
+else is ignored with a line saying so, and the default is used. Restart the hub after
+changing it. If the hub's relay changes (the default moves, or you add `"relay"`), phones
+paired before can no longer reach it and must pair again; `octet pair` says so when it
+sees paired devices that went through a different relay (`N phones are paired through
+another relay and must pair again`). The default relay's hostname is meant to be
+permanent. Debug builds of Octet (not release builds) also read `ws://HOST:PORT` from the
+`OCTET_HUB_RELAY_URL` environment variable, for trying a phone against a relay on the
+same network before one is hosted.
+
+### Lost or finished with a phone
+
+```sh
+octet hub devices
+octet hub revoke "My iPhone"
+```
+
+`devices` lists each phone as `NAME · PLATFORM · paired DATE · last seen AGO`. `revoke`
+deletes the phone's stored key: a running hub drops its connections within two seconds,
+and the phone is told it was unpaired the next time it connects, forgets the pairing, and
+can only come back by pairing again. Revoking also removes its push and Live Activity
+tokens. Run both with the same `--journal-dir` as the hub if you gave it one. Neither
+reads `hub.json`, so a mistake there never blocks a revoke. A relative `--journal-dir` is
+resolved to an absolute path when Octet starts, so the hub, the sessions at your desk and
+the sessions a phone starts use the same directory, whatever directory each runs in.
+
+**After the last phone is revoked**, the hub has nothing paired and no pairing open, so it
+stops dialling the relay. That phone then sees only "Can't reach your Mac" and never
+learns it was revoked, because there is no hub on the relay to tell it. Remove the Mac in
+the app yourself (**Settings › Machines › Unpair**). With other phones still paired, the
+hub keeps dialling, and a revoked phone that connects is told it is unpaired.
+
+### Resetting the hub's identity
+
+The hub's identity is two keys in `hub.key` in the data directory (mode 0600, made on
+first use): an X25519 key that phones pin at pairing, and an Ed25519 key whose hash is the
+channel id. To reset it, delete `hub.key` and restart the hub. The hub makes
+new keys, and because every paired phone pinned the old identity and could never connect
+again, it empties `devices.json` first, with every push and Live Activity token in it, so
+no old phone keeps getting notifications. Pair each phone again afterwards. A `hub.key`
+that exists but cannot be read stops the hub with an error naming the file; it is never
+replaced silently.
+
+### Set it up in this order
+
+1. [Pair a phone](#pair-a-phone-in-three-steps). That is all a phone needs.
+2. Optionally, [keep the hub running](#keep-the-hub-running) at login (`octet pair` does
+   this for you), [push notifications](#push-notifications), the [Live
+   Activity](#live-activity-dynamic-island) (iPhone, with your own APNs key), and [more
+   Macs](#more-than-one-mac).
+
+After those come [what the phone is sent](#what-the-phone-is-sent), [changes and
+commits](#changes-and-commits-from-the-phone), [keeping a session
 private](#keep-a-session-off-the-phone) and the [hub security
 notes](#hub-security-notes).
 
 ### Start the hub
 
+`octet pair` starts the hub for you. To run it yourself, in its own terminal or tmux
+window:
+
 ```sh
 octet hub
 ```
 
-It listens on `127.0.0.1` port 47823 (`--port N` or `hub.json` changes it)
-and says where it is. Only the Mac itself can reach that port. The tailnet
-login that may connect is yours, read from Tailscale (`--owner LOGIN` sets
-another). Leave the hub running in its own terminal or tmux window; running
-Octet sessions carry on if it stops, and the phone just can't reach them. To have
-it start at login and come back if it stops, see [Keep the hub
-running](#keep-the-hub-running).
+It says `Octet hub running; phones reach it through the relay once one is paired`. Running
+Octet sessions carry on if the hub stops, and the phone just can't reach them. A hub with
+no paired phone and no open pairing makes no outbound connection at all. If the relay is
+down, the hub retries from half a second, doubling to 30 seconds, with jitter, and sessions
+at your desk are unaffected. To have it start at login and come back if it stops, see [Keep
+the hub running](#keep-the-hub-running).
 
 To see what every session is doing, in another terminal:
 
@@ -397,8 +223,8 @@ To see what every session is doing, in another terminal:
 octet hub watch
 ```
 
-It prints one line per session event (tool calls, approvals, finished turns)
-until you press Ctrl+C. It shows the same thing the phone would see.
+It prints one line per session event (tool calls, approvals, finished turns) until you
+press Ctrl+C. It shows the same thing the phone would see.
 
 ### Keep the hub running
 
@@ -418,8 +244,8 @@ agree even though it doesn't see your shell's environment. Its `PATH` starts
 with the directories where `tmux`, `claude`, `codex`, `opencode` and `agy` were
 found on your shell's `PATH` when you ran the command, then the usual system directories, so
 the hub can start sessions (and the agents in them) from a service's bare
-environment, even after a login with no tmux running. The service doesn't use
-`--port` or `--owner`; set the port in `hub.json`.
+environment, even after a login with no tmux running. `octet pair` installs this service
+for you when no hub is running.
 
 - **Logs.** On macOS the hub's output goes to `hub.log` in the data directory
   (`~/.local/share/octet/rust-preview/hub.log` unless you chose another); read it with
@@ -458,53 +284,6 @@ environment, even after a login with no tmux running. The service doesn't use
 - **Linux without a login session.** A systemd user service stops when you log
   out unless lingering is on: `loginctl enable-linger "$USER"`.
 
-### Put it on your tailnet
-
-The hub never listens on the network. Publish it with Tailscale, which adds
-HTTPS on the Mac's `*.ts.net` name and tells the hub which tailnet user is
-connecting:
-
-```sh
-tailscale serve --bg 47823
-```
-
-Only devices on your tailnet can open that address. Use `tailscale serve
-status` to see it, and `tailscale serve --https=443 off` to take it down.
-Never publish the hub with `tailscale funnel`: Funnel puts it on the public
-internet, and the hub is for your tailnet only.
-
-### Pair a phone
-
-In an Octet session on the Mac, type:
-
-```
-/remote-control pair
-```
-
-It shows a QR code and a link. In the phone app choose **Pair** and scan it.
-The code works once and expires after 10 minutes. If the hub isn't running,
-Octet says `Start the hub first: octet hub`; if it isn't published yet, Octet
-makes no code and says `Publish it first: tailscale serve --bg 47823`.
-Plain `/remote-control` also reports the hub: whether it is running, whether
-it is published, and how many phones are paired. The hub checks Tailscale when
-it starts and every 10 seconds after, so a `tailscale serve` you just ran can
-take that long to show.
-
-To list the paired phones, or remove one:
-
-```sh
-octet hub devices
-octet hub revoke "My iPhone"
-```
-
-A revoked phone is disconnected within two seconds and can't come back
-without pairing again. Run `octet hub devices` and `revoke` with the same
-`--journal-dir` as the hub if you gave it one. Neither reads `hub.json`, so a
-mistake there never blocks a revoke. A relative `--journal-dir` is resolved
-to an absolute path when Octet starts. The hub, the sessions at your desk and
-the sessions a phone starts then use the same directory, whatever directory
-each one runs in.
-
 ### Push notifications
 
 When an agent needs your approval, hits an error, or finishes a turn, the hub
@@ -515,11 +294,10 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
 
 - **What is sent.** Exactly this and nothing else: the title `Octet`, the body
   `Approval waiting`, `Session error` or `Turn finished`, and `data` holding
-  the hub's opaque session id so a tap opens that session and, while the hub
-  is published, `mac`: the host name of its published address (for example
-  `studio.tail1234.ts.net`, lowercased; left out when it isn't a plain DNS
-  name), which the phone already holds from pairing and uses to tell which
-  Mac a tap is for. The title and body never name it. Then the fixed delivery fields
+  the hub's opaque session id so a tap opens that session, and `mac`: the
+  hub's channel id (64 lowercase hex digits, which the phone already holds
+  from pairing), which it uses to tell which Mac a tap is for. The title and
+  body never name it. Then the fixed delivery fields
   Expo needs (`to`, which is the phone's push token, and `sound`, `priority`
   and `channelId`, which are constants: `approvals`, `errors` or `turns`). No
   prompt, command, file name, workspace, model, error or reply text ever goes in
@@ -534,7 +312,8 @@ your own EAS and Apple or Firebase accounts), and nothing is sent until it does.
 - **Where it goes.** The hub posts each push to Expo's push service, `https://exp.host/--/api/v2/push/send`,
   which hands it to Apple or Google. These requests, and the Live Activity's
   to Apple once you add an APNs key ([below](#live-activity-dynamic-island)),
-  are the only things the hub sends outside your Mac and your tailnet. A push
+  are the only things the hub sends outside your Mac, besides the encrypted
+  traffic through the relay. A push
   carries the phone's Expo push token, which the hub keeps in `devices.json`
   (readable by you alone) and never writes to logs, journals, the audit file
   or a command line. Expo, Apple and Google see that a push for that token
@@ -626,7 +405,8 @@ again each time you come back to the app. Until then both Macs can drive the act
 ```json
 {"aps": {"timestamp": 1790000101, "event": "start",
          "content-state": {"kind": "approval", "session": "4821-1790000000",
-                           "mac": "studio.tail1234.ts.net", "since": 1790000059, "approvals": 2},
+                           "mac": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                           "since": 1790000059, "approvals": 2},
          "stale-date": 1790001001,
          "attributes-type": "OctetActivity", "attributes": {},
          "alert": {"title": "Octet", "body": "Approval waiting"}}}
@@ -634,7 +414,7 @@ again each time you come back to the app. Until then both Macs can drive the act
 
 - `kind` is `running`, `approval` or `done`; `session` is the hub's own opaque id of the session
   that leads (the one with the oldest waiting approval, else the newest running turn, else the last
-  to finish), or empty; `mac` is the host of the hub's published address, or empty; `since` is
+  to finish), or empty; `mac` is the hub's channel id; `since` is
   when that session's state began; `approvals` counts the approvals waiting.
 - `stale-date` is 15 minutes after the send, on every start and update: an activity the hub can't
   keep up to date shows as stale after that, rather than looking current. Its content dims and a
@@ -692,7 +472,7 @@ or clear the Mac turns away for now (busy, rate-limited, not saved, or timed out
 hand-over needs two things:
 
 - **Time in the background.** iOS must give the app time when the activity's token arrives.
-- **An unlocked phone.** Each Mac's device token is kept in the keychain readable only while the
+- **An unlocked phone.** Each Mac's private key is kept in the keychain readable only while the
   phone is unlocked (`WHEN_UNLOCKED_THIS_DEVICE_ONLY`), so on a locked phone the app can't
   reach any Mac.
 
@@ -702,7 +482,7 @@ can neither update nor end that activity until you unlock and open the app. The 
 showing what it started with (`Approval waiting`, say, after you answered at the desk), it shows as
 stale (dimmed, marked **Stale**) 15 minutes after the start, and the Mac starts no second one for up
 to 8 hours while the first still waits for its token. Once you open the app, the app takes the
-activity over and brings it up to date. This follows from keeping the Macs' device tokens unreadable
+activity over and brings it up to date. This follows from keeping the Macs' keys unreadable
 while the phone is locked.
 
 The hub keeps the tokens per phone in `devices.json`, records `activity registered` (or `activity
@@ -721,7 +501,7 @@ revoke` and when you unpair that Mac in the app.
   again), so the Deny waits until you unlock and open the app. A Deny that couldn't go, or for a Mac
   out of reach, is sent on that Mac's next connection, within 10 minutes; after that it is dropped.
   Each Deny is sent once. A Deny that names no paired Mac sends nothing.
-- **Allow** only opens the app (`octet://approve/<host>/<session>/<approval>`), at that approval in
+- **Allow** only opens the app (`octet://approve/<channel id>/<session>/<approval>`), at that approval in
   its session, where Allow asks for Face ID and waits out its short arm as always. The link allows
   nothing by itself. It opens the session only while the approval it names is the one at the front
   of that session's waiting approvals (the one its Permission card shows). A link for a Mac that
@@ -753,8 +533,10 @@ account) is its first real check; see the app's [device pass](../apps/mobile/REA
 
 The app pairs with up to 4 Macs, each running its own hub. Pair the first as
 above; for each next one, open **Settings › Machines › + Pair another
-machine** and scan that Mac's `/remote-control pair` code. Pairing a Mac the
-phone already has (the same host) replaces its pairing and keeps its name. A
+machine** and scan the code `octet pair` shows on that Mac. A Mac is known by its channel
+id, not its address: every Mac behind the same relay shares the relay's hostname. Pairing
+a Mac the phone already has (the same channel id) replaces its pairing, once the hub has
+answered `paired`, and keeps its name, its sessions and their cursors. A
 5th is refused (`Unpair a Mac first (4 at most)`), and the button is off at 4
 (`4 Macs is the most`).
 
@@ -764,19 +546,19 @@ phone already has (the same host) replaces its pairing and keeps its name. A
   be reached shows "asleep" and only its sessions grey out. Every command goes
   to the Mac that owns its session, so two Macs whose sessions have the same id
   never mix.
-- **Settings › Machines** lists each Mac with its host and its own state
+- **Settings › Machines** lists each Mac with its relay address and its own state
   (`online`, `connecting…`, `asleep`, or `offline` for a pairing whose
-  credentials the phone can't read right now). **Rename** gives it a name of
+  key the phone can't read right now). **Rename** gives it a name of
   1 to 40 characters, for this phone only. **Unpair** asks "Unpair NAME? Its
   sessions leave this phone." and drops only that Mac: its sessions, drafts
   and approvals leave the phone, and a screen showing one of them goes back to
   the Inbox. The other Macs are untouched.
-- **Notifications** are one choice for every Mac. Each push names its Mac's
-  published host (`mac`, above), and a tap opens that Mac's session. A tap
-  goes to the Inbox when the push names a host none of your pairings has, when
-  it names none and several Macs are paired, or when that session has ended.
-  A hub that isn't published sends no `mac`; with one Mac paired the tap still
-  opens its session.
+- **Notifications** are one choice for every Mac. Each push names its Mac by
+  channel id (`mac`, above), and a tap opens that Mac's session. A tap
+  goes to the Inbox when the push names a channel id none of your pairings has,
+  when it names none, or when that session has ended, even with one Mac paired.
+  A notification or Live Activity left over from before the relay, which names
+  a hostname, names no Mac: tapping it opens the app and nothing more.
 - **Unpairing a Mac that can't be reached.** Unpairing tells that Mac
   "notifications off" when it can, and to forget the phone's Live Activity
   tokens (`clear_activity`), so it starts and updates no more activities on
@@ -786,10 +568,10 @@ phone already has (the same host) replaces its pairing and keeps its name. A
   stopping every Mac's pushes. That Mac keeps pushing until you run
   `octet hub revoke "NAME"` on it (`octet hub devices` lists the names), and
   keeps its Live Activity tokens until then too. The
-  app ignores those pushes' sessions (their host matches no pairing, so a tap
+  app ignores those pushes' sessions (their channel id matches no pairing, so a tap
   only opens the Inbox), but they still show. Unpairing the last Mac also
   turns the phone's push registration off when that Mac doesn't answer, or
-  when the phone had no connection to it at all (its pairing credentials
+  when the phone had no connection to it at all (its pairing key
   couldn't be read).
 
 ### What the phone is sent
@@ -885,34 +667,58 @@ It then creates no socket and no file, and the hub and the phone never see it.
 
 ### Hub security notes
 
-- The hub listens on `127.0.0.1` only. The only way in from outside is
-  `tailscale serve`, which is reachable from your tailnet and nowhere else.
-  Never expose the port any other way.
-- A connection needs your tailnet login **and** a device token. The token is
-  made when you pair; the hub keeps only its hash in `devices.json`, which is
-  readable by you alone, and the phone keeps the token in its secure storage.
-  Another tailnet device, or another program on the Mac, can't connect
-  without pairing.
-- A web page can't use your browser to connect. The hub refuses a
-  connection whose `Origin` names another site. The app sends none, or the
-  hub's own address: the one the request names, or the `*.ts.net` name
-  `tailscale serve` publishes it at.
-- Connections that stall mid-request can't keep a phone out. Each one must
-  finish connecting within 5 seconds, and once 32 are connecting at once, a new
-  one pushes out the oldest. A stalled one never counts among those waiting to
-  say hello.
-- Connections that connect and then never say hello can't keep a phone out
-  for long either. Each one is closed after 10 seconds. At most 32 wait to say
-  hello at once: a new one pushes out the oldest once that one has waited
-  2 seconds, so a phone gets in unless 32 connections younger than 2 seconds
-  are all waiting. Then the hub turns it away (`503 Too many connections`, as
-  it does past 64 open connections), and the app tries again with its usual
-  backoff: from about half a second, doubling to 30 seconds.
+- **What Tailscale did that nothing does now.** Before the relay, every connection to
+  the hub, not only pairing, had to come from a device signed in to your tailnet. That
+  check is gone. A phone's stored key is now the whole of its authority: someone who
+  extracts it can connect from anywhere until you revoke the device, and removing a
+  device from a tailnet no longer cuts it off. The key is kept in the phone's keychain
+  (this device only, readable while the phone is unlocked). The typed confirmation for
+  `full-access` and the biometric check are the app's own; a program written to hold a
+  stolen key could skip the second and supply the first. That is what dropping Tailscale
+  gives up. The pairing confirmation at the Mac (above) is what restores a second check
+  when a phone pairs.
+- **The hub listens on no port.** It dials out to the relay, and only while a phone is
+  paired or a pairing is open. Nothing on your network, or on the internet, can connect
+  to it.
+- **Every connection is Noise end to end.** The phone pins the hub's identity key from
+  the pairing link, and the hub knows each paired phone by its own key. A connection's
+  first message must be exactly 96 bytes (then 48), carries no payload, and uses fresh
+  keys; a failed decryption closes the connection, and there is no unencrypted fallback.
+  A known phone key sends `hello` and is authenticated as that device. An unknown key that
+  sends `hello` is told `unpaired` and closed, so a revoked phone learns it is revoked. An
+  unknown key that sends `pair` with a live link secret starts a pairing; anything else is
+  closed. Each connection has 10 seconds from the relay's `connect` for all of this.
+- **A compromised or malicious relay** sees only what [What the relay
+  sees](#what-the-relay-sees) lists. It can cut a connection, or drop or delay messages,
+  and that is all. If the relay is down, no phone can connect; the desk is unaffected.
+- **Anyone on the internet who learns your channel id** can send bytes to the hub's
+  handshake. The hub does not trust the relay's limits: it takes a place in its own room
+  before it dials (64 connections in all, 32 of them not yet authenticated), ignores a
+  relay `connect` when none is free, takes at most 120 a minute, and ignores a connection
+  id that is malformed or already seen. A phone waiting for your answer to a pairing counts
+  as one unauthenticated connection. Such a person can also fill a channel's 16 places at
+  the relay for 10 seconds at a time, keeping its phones out; the relay's per-address limit
+  is the only brake on that.
+- **A photographed or copied pairing link** works once, expires in 10 minutes, and still
+  needs your yes at the Mac. Whoever uses it first is the one the Mac holds: the Mac shows
+  a code, and your own phone shows no code, so you answer no ([The confirmation
+  code](#the-confirmation-code)). A guess at the six digits is one in a million, once.
+- **Forward secrecy** covers what was sent, not who sent it. Every connection uses fresh
+  keys, discarded when it ends, so recording traffic and later stealing a long-term key does
+  not decrypt the frames. Stealing the hub's key does reveal which phone key opened each
+  recorded connection, because this pattern sends the phone's key encrypted to the hub's.
+- **The code is new.** The Noise code in the app and the hub, and the pairing flow, have
+  had no review by anyone but their author yet. Treat the hosted relay as for the owner's
+  own use until they have.
+- Every device command is rate limited to 60 a minute per device, and the hub checks that
+  the device is still paired on every frame. The hub also sends an encrypted ping every 20
+  seconds and closes a connection that has not answered the last one, so a relay cannot
+  keep a departed phone looking present, or hold a command back for longer than that.
+- A lost or stolen phone: run `octet hub revoke NAME` on the Mac, as above. That cuts it
+  off at once; nothing else needs doing.
 - The hub won't start if `run/` in the data directory is a symlink, isn't a
   directory, or belongs to another user. It names the path. If `run/` is
   readable by others, the hub makes it `0700`.
-- A lost or stolen phone: run `octet hub revoke NAME` on the Mac. Then
-  remove the phone from the tailnet in the Tailscale admin console.
 - Every action from a phone (prompt, answer, mode, start and so on) is
   recorded with the phone's name in `hub-audit.jsonl`, without the prompt
   text. The desk also shows a note naming the phone. A commit is recorded as
@@ -920,7 +726,7 @@ It then creates no socket and no file, and the hub and the phone never see it.
   `commit failed` means git refused it after `git add` ran; the desk shows no
   note for a commit. Listing changes and reading diffs aren't recorded.
   Pairing (`paired`) and `octet hub revoke` (`revoked`) are recorded too, with
-  the phone's name and never a token or pairing code.
+  the phone's name and never a key or pairing code.
 - A command that was waiting when a session's link dropped is refused with
   `Lost the link to that session; check it before sending again`. The command
   may have run, so look before you send it again. `The session ended` means
@@ -972,7 +778,7 @@ It then creates no socket and no file, and the hub and the phone never see it.
 - The phone can't run any other slash command, `!` shell commands or `/goal`,
   edit files outside a session, push or open a pull request, or see sessions
   started with `--no-remote`.
-- What leaves the Mac and the tailnet: pushes to Expo
+- What leaves the Mac, besides the relay's encrypted traffic: pushes to Expo
   (`exp.host`), for phones that turned notifications on, and, with an `apns`
   block in `hub.json`, Live Activity pushes straight to Apple
   (`api.push.apple.com`, or `api.sandbox.push.apple.com` with `sandbox`), for
@@ -984,25 +790,28 @@ It then creates no socket and no file, and the hub and the phone never see it.
   receives them, besides unpairing and `octet hub revoke`. Each is recorded in
   `hub-audit.jsonl` (`push on`, `push off`, `activity registered`, `activity
   cleared`).
-- Pairing codes, device tokens, push tokens, ActivityKit tokens, the APNs key
+- Pairing codes and secrets, private keys, push tokens, ActivityKit tokens, the APNs key
   and its JWT are never written to logs or journals.
 
-The hub's files (`devices.json`, `hub.json`, `hub-audit.jsonl`) and the
+The hub's files (`devices.json`, `hub.json`, `hub.key`, `hub-audit.jsonl`) and the
 `run/` directory live beside the journals: `$XDG_DATA_HOME/octet/rust-preview`,
 or `~/.local/share/octet/rust-preview`. `--journal-dir PATH` chooses another.
 
+## Use the terminal UI over SSH
+
+The terminal UI itself works over any SSH connection you already have, from any phone
+terminal app, as long as Octet runs inside tmux so it keeps going while you are away. That
+can be a VPN, or Tailscale, or a plain SSH server you already trust: Octet doesn't set it
+up, check it, or name a network for it. Start Octet with `tmux new -A -s octet "octet …"`
+and reattach with the same line. Anyone who can log in over SSH can run anything as your
+user, including switching Octet to `full-access`, so keep login to your own key, and never
+forward port 22 on your router. The notes on tmux, mosh and phone keyboards that this
+route needs are in [the evaluation](rust/remote-control-ssh.md).
+
 ## Turn it off
 
-- Quit Octet with Ctrl+C twice, or `tmux kill-session -t octet`.
-- Turn off **Remote Login** in System Settings, or run `sudo tailscale set --ssh=false`.
-- Disconnect the Mac in the Tailscale app.
-- Stop the hub with Ctrl+C (or `octet hub uninstall`, if you installed it as a service), and take it off the tailnet with `tailscale serve --https=443 off`.
-
-## Security notes
-
-- Anyone who can log in over SSH can run anything as your user, including
-  switching Octet to `full-access`. Keep login to your own key (Option A) or
-  your own devices (Option B).
-- Never forward port 22 on your router; Tailscale makes that unnecessary.
-- The approval window still denies when it runs out. Prefer `ask` mode and
-  check in, or `auto` to let the vendor's reviewer decide.
+- Revoke each phone with `octet hub revoke "NAME"` (`octet hub devices` lists them). With
+  none left and no pairing open, the hub stops dialling the relay.
+- Stop the hub with Ctrl+C, or `octet hub uninstall` if you installed it as a service.
+- Remove the Mac in the app (**Settings › Machines › Unpair**) so the phone forgets it.
+- To stop one session reaching the phone, start it with `octet --no-remote`.

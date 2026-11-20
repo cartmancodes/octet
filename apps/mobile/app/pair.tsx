@@ -170,10 +170,10 @@ export default function Pair() {
         ) : (
           <Text accessibilityRole="header" style={[type.body, styles.heading, { color: theme.fg }]}>
             {"Scan the code from "}
-            <Text style={styles.bold}>/remote-control pair</Text>
+            <Text style={styles.bold}>octet pair</Text>
           </Text>
         )}
-        <Text style={[type.label, styles.hint, { color: theme.muted }]}>On your Mac, run /remote-control pair in Octet.</Text>
+        <Text style={[type.label, styles.hint, { color: theme.muted }]}>On your Mac, run octet pair in a terminal.</Text>
 
         <View style={styles.scan}>
           <View testID="scan-frame" style={styles.frame}>

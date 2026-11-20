@@ -51,7 +51,7 @@ const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
 beforeEach(async () => {
   await AsyncStorage.clear();
   await SecureStore.setItemAsync(tokenKeyOf(M), TOKEN);
-  await saveSettings({ pairings: [pairingOf(M, "mac", "mac.tail1234.ts.net")] });
+  await saveSettings({ pairings: [pairingOf(M, "mac", "relay.example.test")] });
   octetStore.getState().reset();
   resetTextSize();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
