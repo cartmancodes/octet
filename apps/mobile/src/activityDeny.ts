@@ -1,9 +1,9 @@
-// The Island's Deny: each tap answers its approval no, once, on the Mac its host names. Moved out of
+// The Island's Deny: each tap answers its approval no, once, on the Mac its channel id names. Moved out of
 // src/activity.ts, which hands it the taps, the app's place (in front or not) and each Mac's link
 // coming up. Plain TypeScript.
 import type { DenyEvent } from "../modules/octet-live";
 import { Refusal, type RequestBody } from "./client/HubClient";
-import { hostKey, macOfKey, splitKey, type Links } from "./macs";
+import { macOfKey, splitKey, type Links } from "./macs";
 import { parseApprovalId } from "./navigation";
 import { sendVia } from "./sendVia";
 import { hasEnded, type OctetStore } from "./store";
@@ -19,7 +19,7 @@ export interface DenyFleet {
   /** `status` is "loading" until the saved pairings are read. */
   snapshot(): { status: string };
   readonly links: Links;
-  keyFor(host: string | null, raw: string): string | null;
+  keyFor(channel: string | null, raw: string): string | null;
   /** Sends `body` to Macs `macs` over background connections of their own; resolves to the Macs
    * that acked. */
   sendInBackground(macs: readonly string[], body: RequestBody): Promise<string[]>;
@@ -44,8 +44,9 @@ interface HeldDeny {
 }
 
 /**
- * Answers each Deny tapped on the Island once (by host, without case or a trailing dot, session and
- * approval), to the Mac `keyFor` resolves its host to; one that resolves to none sends nothing.
+ * Answers each Deny tapped on the Island once (by channel id, session and approval), to the Mac
+ * `keyFor` resolves its channel id to; one that resolves to none (a hostname, from an activity of
+ * before the relay, or nothing) sends nothing.
  * In front it goes over the Mac's link, or waits for it. In the background, when every link is
  * closed, it goes at once over a background connection to that Mac (hello `background: true`, the
  * answer, closed on the ack or after 10 s); if that gets no ack it waits for the link. At most 16
@@ -73,11 +74,11 @@ export class IslandDenies {
     const done = this.once(event.id);
     const approval = parseApprovalId(event.approval);
     if (approval === null) return done();
-    const mark = `${hostKey(event.mac)}\n${event.session}\n${approval}`;
+    const mark = `${event.mac}\n${event.session}\n${approval}`;
     if (this.denied.includes(mark)) return done();
     this.denied.push(mark);
     if (this.denied.length > DENIES_SEEN) this.denied.shift();
-    const key = this.o.fleet.keyFor(event.mac === "" ? null : event.mac, event.session);
+    const key = this.o.fleet.keyFor(event.mac, event.session);
     if (key === null) return done();
     this.send({ key, approval, at: this.o.now() }, done);
   }

@@ -4,7 +4,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { isHex32 } from "./client/link";
-import { MAC_ID, MAX_MACS, cleanMacName, macNameOf, type Pairing } from "./macs";
+import { MAC_ID, MAX_MACS, UNNAMED_MAC, cleanMacName, type Pairing } from "./macs";
 import type { PushKinds } from "./protocol";
 
 export interface Settings {
@@ -97,7 +97,7 @@ function pairings(x: unknown): { kept: Pairing[]; dropped: string[] } {
     if (kept.length >= MAX_MACS || !relay || deviceName === null) continue;
     if (typeof channel !== "string" || !isHex32(channel) || typeof hubKey !== "string" || !isHex32(hubKey)) continue;
     if (kept.some((p) => p.id === id || p.channel === channel)) continue;
-    kept.push({ id, relay, channel, hubKey, deviceName, macName: cleanMacName(item.macName) ?? macNameOf(null) });
+    kept.push({ id, relay, channel, hubKey, deviceName, macName: cleanMacName(item.macName) ?? UNNAMED_MAC });
   }
   const ids = new Set(kept.map((p) => p.id));
   return { kept, dropped: [...new Set(seen.filter((id) => !ids.has(id)))] };

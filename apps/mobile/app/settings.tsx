@@ -246,7 +246,7 @@ interface MachineRowProps {
   onUnpair: (mac: MacInfo) => void;
 }
 
-/** One paired Mac: its name and its own link's state, its host (muted) under it, and Rename and
+/** One paired Mac: its name and its own link's state, its relay (muted) under it, and Rename and
  * Unpair. Rename opens a field in place: 1 to 40 characters, cleaned as the Fleet keeps them. */
 const MachineRow = memo(function MachineRow({ mac, first, onRename, onUnpair }: MachineRowProps) {
   const theme = useTheme();
@@ -289,7 +289,7 @@ const MachineRow = memo(function MachineRow({ mac, first, onRename, onUnpair }: 
         <Text style={[type.body, { color: theme.muted }]}>{machineWords(hub, tried)}</Text>
       </View>
       <Text numberOfLines={1} style={[type.label, { color: theme.muted }]}>
-        {mac.host}
+        {mac.relay}
       </Text>
       {draft === null ? (
         <View style={styles.actions}>

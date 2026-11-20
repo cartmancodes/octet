@@ -12,13 +12,13 @@ import { secureSocketFactory, type LinkKeys } from "../client/secureSocket";
 import { webSocketFactory } from "../client/socket";
 import { DEFAULT_PUSH_KINDS, NOT_SAVED, loadSettings, readSettings, updateSettings, type Settings } from "../persist";
 import { createCoalescer, type Coalescer } from "../coalesce";
-import { MAX_MACS, TOO_MANY_MACS, cleanMacName, hostOf, keyFor, macNameOf, macOfKey, newMacId, tapKey, type Links, type Pairing, type Tap } from "../macs";
+import { MAX_MACS, TOO_MANY_MACS, UNNAMED_MAC, cleanMacName, keyFor, macOfKey, newMacId, tapKey, type Links, type Pairing, type Tap } from "../macs";
 import type { ApproveLink } from "../navigation";
 import { askForToken, currentToken, dropPushRegistration, projectId } from "../notifications";
 import type { Cursor, PushKinds } from "../protocol";
 import { hasEnded, octetStore, type OctetStore } from "../store";
 import { TOKEN_KEY, keepKey, keyPairOf, keyStore, secureStore, tokenKeyOf, type Keychain, type KeyStore } from "./keychain";
-import { MacLink, UNREACHABLE, type LinkHost, type MacInfo, type PushResult } from "./macLink";
+import { MacLink, UNREACHABLE, macInfoOf, type LinkHost, type MacInfo, type PushResult } from "./macLink";
 
 export { NOT_A_LINK };
 /** How long an approve link waits for its Mac's list before it gives up (and the Inbox stays). */
@@ -315,7 +315,7 @@ export class Fleet {
     if (this.current.notice !== null) this.emit({ notice: null });
     try {
       const paired = await client.pair(parsed.secret, deviceName, this.platform, onCode);
-      const macName = before?.macName ?? cleanMacName(paired.name) ?? macNameOf(null);
+      const macName = before?.macName ?? cleanMacName(paired.name) ?? UNNAMED_MAC;
       const pairing: Pairing = { id, relay: parsed.relay, channel: parsed.channel, hubKey: parsed.hubKey, deviceName, macName };
       const keys = keyStore(this.keychain, pairing.id);
       let notifications = false;
@@ -558,12 +558,12 @@ export class Fleet {
     return saved ? { ok: true } : { ok: false, message: NOT_SAVED };
   }
 
-  /** The phone's key of session `raw` on the Mac whose hub publishes `host` (see `keyFor`): the
-   * one way from what a hub sends (a push, and in time the Island and an approve link) to a key.
-   * Null for a host no pairing has, for no host with several pairings, and for a raw id that is
-   * not one. A pairing with no link counts. */
-  keyFor(host: string | null, raw: string): string | null {
-    return keyFor(this.pairings, host, raw);
+  /** The phone's key of session `raw` on the Mac whose channel id is `channel` (see `keyFor`): the
+   * one way from what a hub sends (a push, the Island, an approve link) to a key. Null for no
+   * channel, a channel no pairing has, and a raw id that is not one. A pairing with no link
+   * counts. */
+  keyFor(channel: string | null, raw: string): string | null {
+    return keyFor(this.pairings, channel, raw);
   }
 
   /** The key a push tap opens (see `tapKey`, which resolves through `keyFor`): null for the Inbox,
@@ -584,7 +584,7 @@ export class Fleet {
    * and the arm.
    */
   approveNow(link: ApproveLink): string | null | undefined {
-    const key = this.keyFor(link.host, link.raw);
+    const key = this.keyFor(link.channel, link.raw);
     const mac = key === null ? null : macOfKey(key);
     if (key === null || mac === null) return null;
     const state = this.store.getState();
@@ -711,9 +711,9 @@ export class Fleet {
     const macs = this.pairings.map((p) => {
       const link = this.all.find((l) => l.id === p.id);
       if (link) return link.info();
-      const host = hostOf(p.relay) ?? "";
+      const fresh = macInfoOf(p);
       const had = this.unlinked.get(p.id);
-      const info: MacInfo = had && had.macName === p.macName && had.host === host ? had : { id: p.id, macName: p.macName, host };
+      const info: MacInfo = had && had.macName === fresh.macName && had.channel === fresh.channel && had.relay === fresh.relay ? had : fresh;
       unlinked.set(p.id, info);
       return info;
     });

@@ -60,7 +60,7 @@ export const nativeLive: LiveApi = {
 /** What the controller needs of the Fleet (src/hub.ts). */
 export interface ActivityFleet extends DenyFleet {
   /** `status` is "loading" until the saved pairings are read; `macs` are the pairings, in order. */
-  snapshot(): { status: string; macs: readonly { id: string; host: string }[] };
+  snapshot(): { status: string; macs: readonly { id: string; channel: string }[] };
   subscribe(fn: () => void): () => void;
 }
 
@@ -151,7 +151,7 @@ export class LiveActivity {
 
   /** The App Group's entries as last written; null when they are to be written again. */
   private entries: string | null = null;
-  private macs: readonly { id: string; host: string }[] = [];
+  private macs: readonly { id: string; channel: string }[] = [];
 
   private readonly denies: IslandDenies;
   /** Settings' switch, following `supported`. */
@@ -337,7 +337,9 @@ export class LiveActivity {
     return this.wanted() === true && this.attached && this.foreground && !this.stopped;
   }
 
-  private hostOf = (mac: string): string | null => this.macs.find((m) => m.id === mac)?.host ?? null;
+  /** The channel id of pairing `mac`, as the hub names its Mac outside the app; null when it is
+   * not paired. */
+  private channelOf = (mac: string): string | null => this.macs.find((m) => m.id === mac)?.channel ?? null;
 
   /** Picks the Mac that drives the Island: while the app is in front, the lead session's Mac;
    * otherwise (or with no lead) the owner it had, while that one is still paired; else the first
@@ -358,14 +360,14 @@ export class LiveActivity {
     this.syncAll();
   }
 
-  /** The content state now: the lead's raw id and its Mac's host, as the hub sends them. */
+  /** The content state now: the lead's raw id and its Mac's channel id, as the hub sends them. */
   private stateNow(): ActivityState {
     const lead = this.model.content(this.now());
     const split = lead.key === "" ? null : splitKey(lead.key);
     return {
       kind: lead.kind,
       session: split?.raw ?? "",
-      mac: split ? (this.hostOf(split.mac) ?? "") : "",
+      mac: split ? (this.channelOf(split.mac) ?? "") : "",
       since: Math.floor(lead.since / 1000),
       approvals: lead.approvals,
     };
@@ -496,7 +498,7 @@ export class LiveActivity {
   /** Writes the entries when they changed, then shows the activity again. */
   private writeEntries(): void {
     if (this.wanted() !== true || !this.attached || this.stopped) return;
-    const entries = widgetEntries(this.store.getState().sessions, this.hostOf);
+    const entries = widgetEntries(this.store.getState().sessions, this.channelOf);
     const text = JSON.stringify(entries);
     if (text === this.entries) return;
     this.entries = text;

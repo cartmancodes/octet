@@ -20,7 +20,7 @@ export interface OctetState {
    * hub's ids. */
   bySession: ReadonlyMap<string, SessionView>;
   /** The link to each Mac. `bestHub` gives the app's. The one place a link's state is kept:
-   * the Fleet's `MacInfo` holds only a Mac's name and host. */
+   * the Fleet's `MacInfo` holds only a Mac's name, channel id and relay. */
   hubs: ReadonlyMap<string, HubState>;
   /** The Macs whose link has ended an attempt (ready, refused, or failed) of its run, the run
    * since its client last started (the app came to the foreground, or it was paired): until then

@@ -2,6 +2,7 @@
 // `"<mac>/<session>"`: `<mac>` is the phone's own id for the pairing (never holding a `/`), and
 // `<session>` the hub's raw id, which appears only on the wire. Pure: no React, no storage.
 import type { HubClient, HubState } from "./client/HubClient";
+import { isHex32 } from "./client/link";
 import { field } from "./model/text";
 
 /** Pairings kept, at most: one link each, all open in the foreground. */
@@ -69,42 +70,17 @@ export interface Pairing {
   macName: string;
 }
 
-/** A scheme, `//`, the host (never holding `@`), an optional port of 1 to 5 digits, then the end,
- * a path, a query or a fragment: user info, or a `:` that is not such a port, matches nothing. */
-const HOST = /^[a-z][a-z0-9+.-]*:\/\/(\[[^\]/@]*\]|[^/:?#[\]@]+)(?::\d{1,5})?(?=$|[/?#])/i;
+/** Whether `text` is a channel id, as a hub names its Mac outside its link (a push's `mac`, the
+ * Island's, an approve link's): 64 lowercase hex digits, the SHA-256 of the hub's identity key. */
+export const isChannelId = (text: string): boolean => isHex32(text);
 
-/** The host of a hub address, as written ("[::1]" keeps its brackets); null when it has none, and
- * for an address with user info or a port that is not 1 to 5 digits (the hub's rule for `mac`). */
-export function hostOf(url: string | null | undefined): string | null {
-  return HOST.exec(url ?? "")?.[1] ?? null;
+/** The pairing whose channel id is `channel`; null when none is, and for anything that is not a
+ * channel id. A Mac is found from outside the app by its channel alone: every Mac on a relay
+ * shares the relay's host. */
+export function macOfChannel(pairings: readonly Pick<Pairing, "id" | "channel">[], channel: string): string | null {
+  if (!isChannelId(channel)) return null;
+  return pairings.find((p) => p.channel === channel)?.id ?? null;
 }
-
-/** A host as it compares: without case or a trailing dot. */
-export const hostKey = (host: string): string => host.replace(/\.$/, "").toLowerCase();
-
-/** Whether two hosts are the same, without case or a trailing dot. */
-export const sameHost = (a: string, b: string): boolean => hostKey(a) === hostKey(b);
-
-/** The pairing whose relay's host is `host`, compared without case; null when none is. (Until the
- * app names a Mac from outside by its channel id, it is by the host it is reached at.) */
-export function macOfHost(pairings: readonly Pick<Pairing, "id" | "relay">[], host: string): string | null {
-  if (host === "") return null;
-  for (const p of pairings) {
-    const own = hostOf(p.relay);
-    if (own !== null && sameHost(own, host)) return p.id;
-  }
-  return null;
-}
-
-/** The longest DNS name, and the longest label of one. */
-const HOST_CHARS = 253;
-const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
-
-/** Whether `host` is a DNS name, as a hub publishes itself (a push's `mac`, the Island's): 253
- * characters at most, each label 1 to 63 letters, digits and hyphens, never starting or ending
- * with a hyphen. */
-export const isHostName = (host: string): boolean =>
-  host.length <= HOST_CHARS && host.split(".").every((label) => HOST_LABEL.test(label));
 
 /** The hub's session ids are `{pid}-{started}`, both numbers. */
 const SESSION_ID = /^[0-9]+-[0-9]+$/;
@@ -115,23 +91,22 @@ const SESSION_ID_CHARS = 128;
 export const isSessionId = (raw: string): boolean => raw.length <= SESSION_ID_CHARS && SESSION_ID.test(raw);
 
 /**
- * The phone's key of session `raw` on the Mac whose hub publishes `host`: the one way from what a
- * hub sends outside its link (a push's `mac` and `session`; in time the Island's and an approve
- * link's) to a key, so that nothing splits a key that came from outside. The Mac is the pairing
- * whose hub host is `host`, without case or a trailing dot; with no host, the only pairing, if
- * there is just one. Null for a host no pairing has, no host with several pairings, and a raw id
- * that is not one.
+ * The phone's key of session `raw` on the Mac whose channel id is `channel`: the one way from what
+ * a hub sends outside its link (a push's `mac` and `session`, the Island's, an approve link's) to
+ * a key, so that nothing splits a key that came from outside. Null for no channel (even with one
+ * pairing: what names no Mac, such as a push or an activity from before the relay, opens nothing),
+ * a channel no pairing has, and a raw id that is not one.
  */
-export function keyFor(pairings: readonly Pick<Pairing, "id" | "relay">[], host: string | null, raw: string): string | null {
-  if (!isSessionId(raw)) return null;
-  const mac = host !== null ? macOfHost(pairings, host) : pairings.length === 1 ? (pairings[0]?.id ?? null) : null;
+export function keyFor(pairings: readonly Pick<Pairing, "id" | "channel">[], channel: string | null, raw: string): string | null {
+  if (!isSessionId(raw) || channel === null) return null;
+  const mac = macOfChannel(pairings, channel);
   return mac === null ? null : keyOf(mac, raw);
 }
 
-/** What a push tap names: the host of the Mac that sent it (its `mac`; null when it named none
- * that is a host name) and the hub's raw session id (null when it named none that is valid). */
+/** What a push tap names: the channel id of the Mac that sent it (its `mac`; null when it named
+ * none that is a channel id) and the hub's raw session id (null when it named none that is valid). */
 export interface Tap {
-  host: string | null;
+  channel: string | null;
   session: string | null;
 }
 
@@ -139,23 +114,13 @@ export interface Tap {
  * The key a push tap opens, or null for the Inbox: the tap's session on its Mac, by `keyFor`. No
  * session, any tap `keyFor` finds no key for, or a session `ended` says is over: the Inbox.
  */
-export function tapKey(tap: Tap, pairings: readonly Pick<Pairing, "id" | "relay">[], ended: (key: string) => boolean): string | null {
-  const key = tap.session === null ? null : keyFor(pairings, tap.host, tap.session);
+export function tapKey(tap: Tap, pairings: readonly Pick<Pairing, "id" | "channel">[], ended: (key: string) => boolean): string | null {
+  const key = tap.session === null ? null : keyFor(pairings, tap.channel, tap.session);
   return key === null || ended(key) ? null : key;
 }
 
-const SOME_MAC = "Mac";
-const LABEL_MAX = 63;
-
-/** The Mac's name: the first label of the hub's host ("studio" from "wss://studio.tail1.ts.net/").
- * An IP address is kept whole. "Mac" without an address. */
-export function macNameOf(hubUrl: string | null | undefined): string {
-  const host = hostOf(hubUrl);
-  if (!host) return SOME_MAC;
-  if (host.startsWith("[") || /^[0-9.]+$/.test(host)) return host;
-  const first = host.split(".")[0] ?? "";
-  return first === "" ? SOME_MAC : first.slice(0, LABEL_MAX);
-}
+/** A Mac's name when its hub gave none that is left once cleaned (`cleanMacName`). */
+export const UNNAMED_MAC = "Mac";
 
 /** Where the connection to each Mac is: what code that holds a key asks for its Mac's client. */
 export interface Links {

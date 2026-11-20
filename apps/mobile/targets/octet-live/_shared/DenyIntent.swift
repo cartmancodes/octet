@@ -14,7 +14,7 @@ struct DenyIntent: LiveActivityIntent {
   static let title: LocalizedStringResource = "Deny"
   static let isDiscoverable = false
 
-  /// The hub's published host, as the content state carried it ("" when it had none).
+  /// The Mac's channel id, as the content state carried it ("" when it had none).
   @Parameter(title: "Mac") var mac: String
   /// The hub's raw session id.
   @Parameter(title: "Session") var session: String

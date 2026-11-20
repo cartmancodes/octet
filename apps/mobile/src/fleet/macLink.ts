@@ -1,7 +1,7 @@
 // One pairing's link: its client, what it feeds the store, and its push registration.
 import { Refusal, type HubClient } from "../client/HubClient";
 import type { Coalescer } from "../coalesce";
-import { hostOf, type Links, type Pairing } from "../macs";
+import type { Links, Pairing } from "../macs";
 import { DENIED, currentToken, dropPushRegistration, onTokenChange } from "../notifications";
 import { loadSettings } from "../persist";
 import type { PushKinds } from "../protocol";
@@ -14,8 +14,17 @@ export interface MacInfo {
   /** The phone's id for the pairing: every key of the Mac's sessions starts `<id>/`. */
   id: string;
   macName: string;
-  /** The host of the relay the Mac is reached through, as the pairing link gave it. */
-  host: string;
+  /** The Mac's channel id: what names it outside the app (a push, the Island). */
+  channel: string;
+  /** The relay the Mac is reached through, as the pairing link gave it (`host` or `host:port`):
+   * shown, and never what tells one Mac from another. */
+  relay: string;
+}
+
+/** What screens show of `pairing`. */
+export function macInfoOf(pairing: Pairing): MacInfo {
+  const relay = /^wss?:\/\/([^/]*)\/$/.exec(pairing.relay)?.[1] ?? pairing.relay;
+  return { id: pairing.id, macName: pairing.macName, channel: pairing.channel, relay };
 }
 
 /** The outcome of turning notifications on or off: done, or the words for why not. */
@@ -83,7 +92,7 @@ export class MacLink {
   }
 
   private describe(): MacInfo {
-    return { id: this.id, macName: this.pairing.macName, host: hostOf(this.pairing.relay) ?? "" };
+    return macInfoOf(this.pairing);
   }
 
   /** Feeds the store from the client, keyed by this Mac (its link's state included), and follows

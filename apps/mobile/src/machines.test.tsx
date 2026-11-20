@@ -11,6 +11,7 @@ import Changes from "../app/changes";
 import Session from "../app/session/[id]";
 import Settings from "../app/settings";
 import Usage from "../app/usage";
+import { channelOf } from "./client/fakes";
 import { tokenKeyOf } from "./hub";
 import { keyOf } from "./macs";
 import { loadSettings } from "./persist";
@@ -219,35 +220,38 @@ describe("a pairing with no link", () => {
 describe("tap_routes_by_mac", () => {
   const tap = (data: unknown, id: string) => ({ notification: { request: { identifier: id, content: { data } } } }) as never;
   const listener = () => n.addNotificationResponseReceivedListener.mock.calls[0]?.[0];
-  const host = (label: string) => `${label}.tail1234.ts.net`;
+  const channel = (label: string) => channelOf(label);
   const sent = (rig: Rig) => rig.sockets.all.reduce((count, s) => count + s.sent.length, 0);
 
   beforeEach(() => pairedMacs(2));
 
-  // Both Macs list the same raw id: the host alone says whose it is.
+  // Both Macs list the same raw id: the channel id alone says whose it is.
   const both = { studio: [info("1-1")], mini: [info("1-1")] };
 
-  it("a known host opens that Mac's session, whatever its case", async () => {
+  it("a known channel opens that Mac's session", async () => {
     const rig = await launchMacs("/", {}, both);
-    await act(async () => listener()?.(tap({ session: "1-1", mac: host("mini") }, "t1")));
+    await act(async () => listener()?.(tap({ session: "1-1", mac: channel("mini") }, "t1")));
     expect(rig.view.getPathname()).toBe(`/session/${inMini("1-1")}`);
-    await act(async () => listener()?.(tap({ session: "1-1", mac: "STUDIO.Tail1234.TS.net" }, "t2")));
+    await act(async () => listener()?.(tap({ session: "1-1", mac: channel("studio") }, "t2")));
     expect(rig.view.getPathname()).toBe(`/session/${inStudio("1-1")}`);
   });
 
-  it("a known host whose session has ended opens the Inbox, and nothing is sent", async () => {
+  it("a known channel whose session has ended opens the Inbox, and nothing is sent", async () => {
     const rig = await launchMacs("/", {}, both);
     await act(async () => router.push("/settings"));
     const before = sent(rig);
-    await act(async () => listener()?.(tap({ session: "9-9", mac: host("mini") }, "t1")));
+    await act(async () => listener()?.(tap({ session: "9-9", mac: channel("mini") }, "t1")));
     expect(rig.view.getPathname()).toBe("/");
     expect(sent(rig)).toBe(before);
   });
 
-  it("an unknown host, or none with two Macs, opens the Inbox", async () => {
+  it("an unknown channel, a hostname, or none, opens the Inbox", async () => {
     const rig = await launchMacs("/", {}, both);
     await act(async () => router.push("/settings"));
-    await act(async () => listener()?.(tap({ session: "1-1", mac: host("air") }, "t1")));
+    await act(async () => listener()?.(tap({ session: "1-1", mac: channel("air") }, "t1")));
+    expect(rig.view.getPathname()).toBe("/");
+    await act(async () => router.push("/settings"));
+    await act(async () => listener()?.(tap({ session: "1-1", mac: "mini.tail1234.ts.net" }, "t3")));
     expect(rig.view.getPathname()).toBe("/");
     await act(async () => router.push("/settings"));
     await act(async () => listener()?.(tap({ session: "1-1" }, "t2")));
@@ -255,7 +259,7 @@ describe("tap_routes_by_mac", () => {
   });
 
   it("a cold start's tap waits for the pairings, then opens the Mac it names", async () => {
-    n.getLastNotificationResponse.mockReturnValue(tap({ session: "1-1", mac: host("mini") }, "t1"));
+    n.getLastNotificationResponse.mockReturnValue(tap({ session: "1-1", mac: channel("mini") }, "t1"));
     const rig = await mount("/", {});
     await flush();
     await hearOn(rig, "mini", [info("1-1")]);

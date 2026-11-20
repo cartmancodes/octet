@@ -34,7 +34,8 @@ import { sendVia } from "../src/sendVia";
 import { fromHex, parsePairLink, type PairLink } from "../src/client/link";
 import { newKeyPair, type KeyPair } from "../src/client/noise";
 import { secureSocketFactory } from "../src/client/secureSocket";
-import { keyOf, linksOf } from "../src/macs";
+import { keyOf, linksOf, tapKey } from "../src/macs";
+import { tapFromData } from "../src/notifications";
 import type { EventFrame, ToPhone } from "../src/protocol";
 import { connectStore, createOctetStore, entriesNow, watch } from "../src/store";
 import { nodeSocketFactory } from "./nodeSocket";
@@ -670,6 +671,15 @@ run("the app's hub client against the real octet hub", () => {
         channelId: "approvals",
       },
     ]);
+    // A tap routes by that channel id, through the resolvers the app uses (`tapFromData`, then
+    // `tapKey` on `keyFor`), to the pairing made from this hub's own pairing link, and not to
+    // another Mac's on the same relay: the channel is the whole of push routing.
+    const [pushed] = JSON.parse(body) as [{ data: unknown }];
+    const pairings = [
+      { id: "m0000000c", channel: randomBytes(32).toString("hex") },
+      { id: "m0000000d", channel: identity?.link.channel ?? "" },
+    ];
+    expect(tapKey(tapFromData(pushed.data), pairings, () => false)).toBe(keyOf("m0000000d", sessionId));
     // Nothing of the approval, the workspace, the model or the engine is in it, and it came once.
     for (const secret of ["/work", workspace, "rm -rf", "secret-dir", "private", "opus", "claude"]) {
       expect(body).not.toContain(secret);

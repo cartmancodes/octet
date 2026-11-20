@@ -11,7 +11,7 @@ import { AppState, Text } from "react-native";
 
 import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
-import { FakeClock, Sockets, pairLinkTo, pairingOf } from "./client/fakes";
+import { FakeClock, Sockets, channelOf, pairLinkTo, pairingOf } from "./client/fakes";
 import { fromHex } from "./client/link";
 import { newKeyPair } from "./client/noise";
 import { HubContext, Fleet, TOKEN_KEY, tokenKeyOf, unpairedNotice } from "./hub";
@@ -283,6 +283,8 @@ describe("notifications", () => {
     ({ notification: { request: { identifier: id, content: { data } } } }) as never;
   const listener = () => n.addNotificationResponseReceivedListener.mock.calls[0]?.[0];
   const SESSION = "4821-1790000000";
+  /** What the hub's pushes name their Mac by: its channel id. */
+  const MAC = channelOf("mac");
 
   it("is configured at start-up: nothing shows in the foreground, and the splash lifts once the state is known", async () => {
     await launch({ paired: true });
@@ -314,7 +316,7 @@ describe("notifications", () => {
     const { sockets, view } = await launch({ paired: true });
     await screen.findByText("Sessions list");
     await connected({ sockets });
-    await act(async () => listener()?.(tap({ session: SESSION })));
+    await act(async () => listener()?.(tap({ session: SESSION, mac: MAC })));
     expect(view.getPathname()).toBe(`/session/${k(SESSION)}`);
   });
 
@@ -324,7 +326,7 @@ describe("notifications", () => {
     await connected({ sockets });
     await act(async () => router.push(sessionPath(SESSION)));
     await act(async () => router.push("/settings"));
-    await act(async () => listener()?.(tap({ session: SESSION })));
+    await act(async () => listener()?.(tap({ session: SESSION, mac: MAC })));
     expect(view.getPathname()).toBe(`/session/${k(SESSION)}`);
     await act(async () => router.back());
     expect(view.getPathname()).toBe("/");
@@ -334,7 +336,7 @@ describe("notifications", () => {
   it("a tap while unpaired goes to Pair", async () => {
     const { view } = await launch();
     await screen.findByText("Scan the code from /remote-control pair");
-    await act(async () => listener()?.(tap({ session: SESSION })));
+    await act(async () => listener()?.(tap({ session: SESSION, mac: MAC })));
     expect(view.getPathname()).toBe("/pair");
   });
 
@@ -348,13 +350,13 @@ describe("notifications", () => {
   });
 
   it("a cold start from a tap opens the session once the app knows it is paired", async () => {
-    n.getLastNotificationResponse.mockReturnValue(tap({ session: SESSION }));
+    n.getLastNotificationResponse.mockReturnValue(tap({ session: SESSION, mac: MAC }));
     const { view } = await launch({ paired: true });
     await waitFor(() => expect(view.getPathname()).toBe(`/session/${k(SESSION)}`));
   });
 
   it("a cold start from a tap while unpaired lands on Pair", async () => {
-    n.getLastNotificationResponse.mockReturnValue(tap({ session: SESSION }));
+    n.getLastNotificationResponse.mockReturnValue(tap({ session: SESSION, mac: MAC }));
     const { view } = await launch();
     await screen.findByText("Scan the code from /remote-control pair");
     expect(view.getPathname()).toBe("/pair");
@@ -368,7 +370,7 @@ describe("notifications", () => {
   });
 
   it("a cold start's tap is opened once, however often the shell mounts", async () => {
-    let last: unknown = tap({ session: SESSION });
+    let last: unknown = tap({ session: SESSION, mac: MAC });
     n.getLastNotificationResponse.mockImplementation(() => last as never);
     n.clearLastNotificationResponse.mockImplementation(() => {
       last = null;
@@ -390,7 +392,7 @@ describe("notifications", () => {
     const [command] = sockets.last.commandsOf("pair");
     sockets.last.receive({ type: "paired", req: command?.req, device: "iPhone", name: "mac" });
     const skip = await screen.findByRole("button", { name: "Not now" });
-    await act(async () => listener()?.(tap({ session: SESSION })));
+    await act(async () => listener()?.(tap({ session: SESSION, mac: MAC })));
     expect(view.getPathname()).toBe("/pair");
     await fireEvent.press(skip);
     await waitFor(() => expect(view.getPathname()).toBe(`/session/${k(SESSION)}`));

@@ -3,7 +3,7 @@
 // TypeScript.
 import type { useRouter } from "expo-router";
 
-import { isHostName, isSessionId } from "./macs";
+import { isChannelId, isSessionId } from "./macs";
 
 type Router = Pick<ReturnType<typeof useRouter>, "push" | "replace" | "dismiss">;
 
@@ -58,11 +58,11 @@ export function openSession(router: Router, root: unknown, pathname: string, id:
   else router.push(target);
 }
 
-/** What the Island's Allow names: `octet://approve/<host>/<raw session>/<approval>`. `host` is the
- * hub's published host, null for none (an empty part: the only pairing's); `raw` the hub's own
- * session id; `approval` its id. */
+/** What the Island's Allow names: `octet://approve/<channel id>/<raw session>/<approval>`.
+ * `channel` is the Mac's channel id, null for none (an empty part, which names no Mac); `raw` the
+ * hub's own session id; `approval` its id. */
 export interface ApproveLink {
-  host: string | null;
+  channel: string | null;
   raw: string;
   approval: number;
 }
@@ -83,8 +83,8 @@ export function parseApprovalId(text: string): number | null {
  * Inbox, and maybe the approval's session over it. */
 export const isApproveUrl = (url: string): boolean => APPROVE.test(url);
 
-/** The parts of an approve link, each percent-decoded and checked: the host by the push rule
- * (`isHostName`, or empty), the session by `isSessionId`, the approval by `parseApprovalId`. Null
+/** The parts of an approve link, each percent-decoded and checked: the channel by the push rule
+ * (`isChannelId`, or empty), the session by `isSessionId`, the approval by `parseApprovalId`. Null
  * for anything else: another scheme or action, a part missing or extra, a query or fragment, or a
  * part that fails its rule. */
 export function parseApproveLink(url: string): ApproveLink | null {
@@ -97,11 +97,11 @@ export function parseApproveLink(url: string): ApproveLink | null {
   } catch {
     return null; // bad percent-encoding
   }
-  const [host = "", raw = "", approval = ""] = decoded;
-  if (host !== "" && !isHostName(host)) return null;
+  const [channel = "", raw = "", approval = ""] = decoded;
+  if (channel !== "" && !isChannelId(channel)) return null;
   if (!isSessionId(raw)) return null;
   const id = parseApprovalId(approval);
-  return id === null ? null : { host: host === "" ? null : host, raw, approval: id };
+  return id === null ? null : { channel: channel === "" ? null : channel, raw, approval: id };
 }
 
 /** An approve link that came before anything listened (a cold start from the Island), kept for the

@@ -23,9 +23,10 @@ const TOKEN = "cd".repeat(32);
 const PUSH = "ExponentPushToken[abc-123_XYZ]";
 const n = Notifications as jest.Mocked<typeof Notifications>;
 
-/** Each Mac of these tests is reached through a relay of its own name, `<host>.tail1234.ts.net`, so
- * that what still names a Mac by its relay's host tells them apart. */
-const relayOf = (host: string) => `${host}.tail1234.ts.net`;
+/** Every Mac of these tests is reached through the one relay, as on the hosted relay: only its
+ * channel id tells one from another. */
+const RELAY = "relay.example.test";
+const relayOf = (_host: string) => RELAY;
 const linkTo = (host: string) => pairLinkTo(host, SECRET, { relay: relayOf(host) });
 /** The address of the phone sockets to the Mac on `host`. */
 const urlOf = (host: string) => phoneUrlOf(host, relayOf(host));
@@ -477,23 +478,110 @@ describe("pairing more than one Mac", () => {
 });
 
 describe("keyFor", () => {
-  it("resolves a hub's published host and raw id to the phone's key, through the pairings", async () => {
+  it("resolves the channel id a hub sends and a raw id to the phone's key, through the pairings", async () => {
     const r = rig();
     r.fleet.setForeground(true);
     await r.fleet.init();
     await pairWith(r, "studio");
-    expect(r.fleet.keyFor("studio.tail1234.ts.net", "1-2")).toBe(keyOf("m00000001", "1-2"));
-    expect(r.fleet.keyFor(null, "1-2")).toBe(keyOf("m00000001", "1-2"));
-    await pairWith(r, "laptop");
-    expect(r.fleet.keyFor("Laptop.tail1234.ts.net", "1-2")).toBe(keyOf("m00000002", "1-2"));
+    expect(r.fleet.keyFor(channelOf("studio"), "1-2")).toBe(keyOf("m00000001", "1-2"));
+    // No channel names no Mac, even the only one.
     expect(r.fleet.keyFor(null, "1-2")).toBeNull();
-    expect(r.fleet.keyFor("air.tail1234.ts.net", "1-2")).toBeNull();
-    expect(r.fleet.keyFor("studio.tail1234.ts.net", "m00000002/1-2")).toBeNull();
+    await pairWith(r, "laptop");
+    expect(r.fleet.keyFor(channelOf("laptop"), "1-2")).toBe(keyOf("m00000002", "1-2"));
+    expect(r.fleet.keyFor(channelOf("air"), "1-2")).toBeNull();
+    expect(r.fleet.keyFor(RELAY, "1-2")).toBeNull();
+    expect(r.fleet.keyFor(channelOf("studio"), "m00000002/1-2")).toBeNull();
     // A tap resolves the same way, and opens the Inbox for a session its Mac has ended.
-    expect(r.fleet.tapKey({ host: "laptop.tail1234.ts.net", session: "1-2" })).toBe(keyOf("m00000002", "1-2"));
+    expect(r.fleet.tapKey({ channel: channelOf("laptop"), session: "1-2" })).toBe(keyOf("m00000002", "1-2"));
     socketOf(r, "laptop").receive({ type: "sessions", sessions: [] });
     r.clock.advance(50);
-    expect(r.fleet.tapKey({ host: "laptop.tail1234.ts.net", session: "1-2" })).toBeNull();
+    expect(r.fleet.tapKey({ channel: channelOf("laptop"), session: "1-2" })).toBeNull();
+  });
+
+  it("two_macs_on_one_relay_stay_two", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio", "aa".repeat(32));
+    await pairWith(r, "laptop", "bb".repeat(32));
+    // One relay, two channels: two pairings, each found by its own channel id.
+    expect((await loadSettings()).pairings.map((p) => [p.id, p.relay, p.channel])).toEqual([
+      ["m00000001", `wss://${RELAY}/`, channelOf("studio")],
+      ["m00000002", `wss://${RELAY}/`, channelOf("laptop")],
+    ]);
+    expect(r.fleet.snapshot().macs).toEqual([
+      { id: "m00000001", macName: "studio", channel: channelOf("studio"), relay: RELAY },
+      { id: "m00000002", macName: "laptop", channel: channelOf("laptop"), relay: RELAY },
+    ]);
+    expect(r.fleet.keyFor(channelOf("studio"), "1-2")).toBe(keyOf("m00000001", "1-2"));
+    expect(r.fleet.keyFor(channelOf("laptop"), "1-2")).toBe(keyOf("m00000002", "1-2"));
+  });
+
+  describe("two_macs_with_the_same_session_id_stay_apart", () => {
+    /** Two Macs through the one relay, each listing session 1-2 with approval `studio` and
+     * `laptop` waiting at its front. */
+    async function both({ studio, laptop }: { studio: number; laptop: number }) {
+      const r = rig();
+      r.fleet.setForeground(true);
+      await r.fleet.init();
+      const a = await pairWith(r, "studio", "aa".repeat(32));
+      const b = await pairWith(r, "laptop", "bb".repeat(32));
+      const waiting = (id: number) => info("1-2", { approvals: 1, approval: { id, summary: { action: "Run", command: "make", files: [], scope: "once" } } });
+      a.receive({ type: "sessions", sessions: [waiting(studio)] });
+      b.receive({ type: "sessions", sessions: [waiting(laptop)] });
+      r.clock.advance(50);
+      return r;
+    }
+
+    it("a push tap", async () => {
+      const r = await both({ studio: 3, laptop: 4 });
+      expect(r.fleet.tapKey({ channel: channelOf("studio"), session: "1-2" })).toBe(keyOf("m00000001", "1-2"));
+      expect(r.fleet.tapKey({ channel: channelOf("laptop"), session: "1-2" })).toBe(keyOf("m00000002", "1-2"));
+    });
+
+    it("Allow", async () => {
+      const r = await both({ studio: 3, laptop: 4 });
+      expect(r.fleet.approveNow({ channel: channelOf("laptop"), raw: "1-2", approval: 4 })).toBe(keyOf("m00000002", "1-2"));
+      expect(r.fleet.approveNow({ channel: channelOf("studio"), raw: "1-2", approval: 3 })).toBe(keyOf("m00000001", "1-2"));
+      // Each approval is its own Mac's: the other's channel with it opens the Inbox.
+      expect(r.fleet.approveNow({ channel: channelOf("studio"), raw: "1-2", approval: 4 })).toBeNull();
+      expect(r.fleet.approveNow({ channel: channelOf("laptop"), raw: "1-2", approval: 3 })).toBeNull();
+    });
+  });
+});
+
+describe("a Mac's name", () => {
+  /** Pairs with the Mac on `host`, whose hub answers `paired` with `extra` (its name, or none). */
+  async function pairNamed(extra: object) {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const pending = r.fleet.pair(linkTo("studio"), "iPhone");
+    const pairing = r.sockets.last;
+    pairing.open();
+    const [command] = pairing.commandsOf("pair");
+    pairing.receive({ type: "paired", req: command?.req, device: "iPhone", ...extra });
+    pairing.drop(1000);
+    return { r, result: await pending };
+  }
+
+  it("the_macs_name_is_the_hubs_cleaned", async () => {
+    const { r, result } = await pairNamed({ name: "  Studio\u0007 \n  Mac\u202e " });
+    expect(result).toEqual({ ok: true, macName: "Studio Mac" });
+    expect(r.fleet.snapshot().macs.map((m) => m.macName)).toEqual(["Studio Mac"]);
+    expect((await loadSettings()).pairings.map((p) => p.macName)).toEqual(["Studio Mac"]);
+  });
+
+  it.each([
+    ["no name", {}],
+    ["an empty name", { name: "" }],
+    ["a name of spaces and controls", { name: " \u0007\u202e " }],
+  ])("a_missing_name_falls_back_to_Mac: %s", async (_what, extra) => {
+    const { r, result } = await pairNamed(extra);
+    expect(result).toEqual({ ok: true, macName: "Mac" });
+    expect(r.fleet.snapshot().macs.map((m) => m.macName)).toEqual(["Mac"]);
+    // Never the relay's host, which every Mac on it shares.
+    expect((await loadSettings()).pairings.map((p) => p.macName)).toEqual(["Mac"]);
   });
 });
 
@@ -897,7 +985,7 @@ describe("fix round 1", () => {
     await again.fleet.init();
     expect(again.fleet.snapshot().macs).toEqual([
       expect.objectContaining({ id: "m00000001" }),
-      { id: "m00000002", macName: "laptop", host: "laptop.tail1234.ts.net" },
+      { id: "m00000002", macName: "laptop", channel: channelOf("laptop"), relay: RELAY },
     ]);
     expect(again.fleet.links.macs()).toEqual(["m00000001"]);
     // The store holds no link of it: offline, and not tried.
