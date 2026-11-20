@@ -4,12 +4,13 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { hubHost, pairLinkProblem, parsePairLink } from "../src/client/link";
+import { isDevBuild } from "../src/build";
+import { pairLinkProblem, parsePairLink } from "../src/client/link";
+import { showCode } from "../src/client/noise";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { confirmUnpair } from "../src/components/unpair";
 import { NOT_A_LINK, useFleetStatus, useHubController, useMacs, useNotice, useOffer, type MacInfo, type Fleet } from "../src/hub";
-import { hostOf, macNameOf } from "../src/macs";
 import { Mascot } from "../src/mascot/Mascot";
 import { useHub } from "../src/store";
 import { radius, spacing, type, useTheme } from "../src/theme";
@@ -24,11 +25,12 @@ const FRAME = 240;
 const CORNER = 36;
 const CORNER_LINE = 3;
 
-/** Pairing: scan the QR code the Mac shows, or enter its link. The hub's refusals and every
+/** Pairing: scan the QR code the Mac shows, or enter its link (`?link=` fills it in, as for a link
+ * the system opened). While the Mac asks its owner, the code the hub sent shows under "Check this
+ * code on your Mac", and no code shows before the hub sends one. The hub's refusals and every
  * failure are shown as plain text. Opened with `?add=1` on a paired phone, it pairs another
  * machine: the Macs paired already stay, and Cancel goes back. With no Mac linked, a pairing that
- * is still saved (its token could not be read) is listed with Unpair, so the phone can be
- * cleared. */
+ * is still saved (its key could not be read) is listed with Unpair, so the phone can be cleared. */
 export default function Pair() {
   const theme = useTheme();
   const router = useRouter();
@@ -38,17 +40,30 @@ export default function Pair() {
   const offer = useOffer();
   const macs = useMacs();
   const status = useFleetStatus();
-  const { add } = useLocalSearchParams<{ add?: string }>();
+  const { add, link: opened } = useLocalSearchParams<{ add?: string; link?: string }>();
   const adding = add === "1" && status === "paired";
+  const alive = useAlive();
   const [permission, requestPermission] = useCameraPermissions();
-  const [link, setLink] = useState("");
+  const [link, setLink] = useState(() => (typeof opened === "string" ? opened : ""));
   const [name, setName] = useState(() => hub.initialName());
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  // "Enter code instead" was pressed, or a scan or paste filled the link: the paste and name fields show.
-  const [entering, setEntering] = useState(false);
+  // "Enter code instead" was pressed, or a scan, a paste or an opened link filled the link: the
+  // paste and name fields show.
+  const [entering, setEntering] = useState(() => typeof opened === "string" && opened !== "");
+  // The six digits the hub sent while the Mac asks its owner; null until it sends them.
+  const [code, setCode] = useState<string | null>(null);
   const attempting = useRef(false);
   const lastScan = useRef<string | null>(null);
+
+  // Another link the system opens while Pair is up takes the place of what was there.
+  useEffect(() => {
+    if (typeof opened !== "string" || opened === "" || attempting.current) return;
+    lastScan.current = null;
+    setError(null);
+    setEntering(true);
+    setLink(opened);
+  }, [opened]);
 
   useEffect(() => {
     if (permission && !permission.granted && permission.canAskAgain) void requestPermission();
@@ -56,9 +71,9 @@ export default function Pair() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permission?.status]);
 
-  const parsed = useMemo(() => parsePairLink(link), [link]);
+  const parsed = useMemo(() => parsePairLink(link, isDevBuild()), [link]);
   const pasted = link.trim() !== "";
-  const shownError = error ?? (pasted && parsed === null ? (pairLinkProblem(link) ?? NOT_A_LINK) : null);
+  const shownError = error ?? (pasted && parsed === null ? (pairLinkProblem(link, isDevBuild()) ?? NOT_A_LINK) : null);
 
   const pair = useCallback(async () => {
     if (attempting.current || parsed === null) return;
@@ -66,11 +81,12 @@ export default function Pair() {
     setBusy(true);
     setError(null);
     try {
-      const result = await hub.pair(link, name);
+      const result = await hub.pair(link, name, (sent) => {
+        if (alive()) setCode(sent);
+      });
       if (result.ok) {
         // The name the pairing has: a Mac paired again keeps the one it was given.
-        const host = hostOf(parsed.url);
-        showToast(`Paired with ${hub.snapshot().macs.find((m) => m.host === host)?.macName ?? macNameOf(parsed.url)}`);
+        showToast(`Paired with ${result.macName}`);
         // With a notifications step to show, Pair stays up until the user answers it.
         if (!hub.snapshot().offer) router.replace("/");
         return;
@@ -83,9 +99,12 @@ export default function Pair() {
       }
     } finally {
       attempting.current = false;
-      setBusy(false);
+      if (alive()) {
+        setBusy(false);
+        setCode(null);
+      }
     }
-  }, [hub, link, name, parsed, router]);
+  }, [alive, hub, link, name, parsed, router]);
   // Not the promise itself: a press handler's returned promise would be awaited by the caller.
   const onPair = useCallback(() => void pair(), [pair]);
 
@@ -94,7 +113,7 @@ export default function Pair() {
     // fills the field; the user confirms the Mac it names, and pairing waits for the tap.
     if (attempting.current || data === lastScan.current) return;
     lastScan.current = data;
-    const problem = pairLinkProblem(data);
+    const problem = pairLinkProblem(data, isDevBuild());
     if (problem !== null) {
       setError(problem);
       return;
@@ -207,7 +226,7 @@ export default function Pair() {
                 style={field}
                 value={link}
                 onChangeText={onLink}
-                placeholder="https://…#pair=…"
+                placeholder="octet://pair/…"
                 placeholderTextColor={theme.muted}
                 autoCapitalize="none"
                 autoCorrect={false}
@@ -226,7 +245,13 @@ export default function Pair() {
                 accessibilityLabel="Device name"
               />
 
-              {parsed !== null && <Text style={[type.title, { color: theme.fg }]}>{`Pair with ${hubHost(parsed.url)}?`}</Text>}
+              {parsed !== null && <Text style={[type.title, { color: theme.fg }]}>Pair with this Mac?</Text>}
+              {busy && code !== null ? (
+                <View accessibilityLiveRegion="polite" style={styles.code}>
+                  <Text style={[type.body, { color: theme.muted }]}>Check this code on your Mac</Text>
+                  <Text style={[type.display, styles.digits, { color: theme.fg }]}>{showCode(code)}</Text>
+                </View>
+              ) : null}
             </>
           ) : null}
 
@@ -365,6 +390,8 @@ const styles = StyleSheet.create({
   mac: { minHeight: 44, justifyContent: "center" },
   macRow: { flexDirection: "row", alignItems: "center", gap: spacing.md },
   enter: { alignSelf: "flex-start", paddingHorizontal: 0 },
+  code: { gap: spacing.xs, paddingVertical: spacing.sm },
+  digits: { fontVariant: ["tabular-nums"], letterSpacing: 2 },
   field: { minHeight: 44, borderWidth: 1, borderRadius: radius.card, paddingHorizontal: spacing.md, fontSize: 16 },
   step: { padding: spacing.lg, gap: spacing.md, paddingTop: spacing.xxl },
 });

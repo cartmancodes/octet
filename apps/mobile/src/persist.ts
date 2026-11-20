@@ -1,8 +1,9 @@
-// The only things the phone keeps on disk: non-secret settings. Each pairing's device token is in
-// expo-secure-store (src/hub.ts); cursors are in memory and transcripts are never saved, so a cold
-// start subscribes fresh.
+// The only things the phone keeps on disk: non-secret settings. Each pairing's private key is in
+// expo-secure-store (src/fleet/keychain.ts); cursors are in memory and transcripts are never
+// saved, so a cold start subscribes fresh.
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
+import { isHex32 } from "./client/link";
 import { MAC_ID, MAX_MACS, cleanMacName, macNameOf, type Pairing } from "./macs";
 import type { PushKinds } from "./protocol";
 
@@ -11,13 +12,15 @@ export interface Settings {
   deviceName: string | null;
   /** Allow asks for Face ID or the fingerprint. On unless the user turned it off. */
   faceId: boolean;
-  /** The hub address of the one pairing settings held before there could be several: read only
-   * to move it into `pairings` (src/hub.ts), then saved as null. */
-  hubUrl: string | null;
-  /** The Macs this phone is paired with, in the order paired: at most `MAX_MACS`, each id once. */
+  /** Read, never saved: these settings were saved by a version from before keys, which paired
+   * by a hub's address and a token (they carry `hubUrl`). Its tokens are deleted at this launch,
+   * once, and the user pairs again. */
+  beforeKeys: boolean;
+  /** The Macs this phone is paired with, in the order paired: at most `MAX_MACS`, each id and each
+   * channel once. */
   pairings: Pairing[];
-  /** Ids of pairings that went whose keychain entries could not be deleted yet: the next launch
-   * deletes them. */
+  /** Ids of pairings that went whose keychain entries could not be deleted yet, and of pairings
+   * from before keys: the next launch deletes their entries. */
   forget: string[];
   /** Push notifications are on: every Mac has this phone's token. One choice for every Mac. Off
    * unless the user turned it on. */
@@ -47,7 +50,7 @@ const ALL_PUSH_KINDS: PushKinds = { approvals: true, errors: true, turns: true }
 export const DEFAULT_SETTINGS: Settings = {
   deviceName: null,
   faceId: true,
-  hubUrl: null,
+  beforeKeys: false,
   pairings: [],
   forget: [],
   notifications: false,
@@ -74,29 +77,36 @@ function pushKinds(x: unknown): PushKinds {
   };
   return { approvals: kind("approvals"), errors: kind("errors"), turns: kind("turns") };
 }
-/** The saved pairings that are whole: an id of the phone's making, an address and a device name;
- * a missing or blank Mac name is the host's. The first of an id is kept; at most `MAX_MACS`. */
-function pairings(x: unknown): Pairing[] {
-  if (!Array.isArray(x)) return [];
-  const out: Pairing[] = [];
-  const ids = new Set<string>();
+/** The saved pairings that are whole: an id of the phone's making, a relay address, a channel id
+ * and a hub key (64 lowercase hex digits each) and a device name; a missing or blank Mac name is
+ * "Mac". The first of an id or a channel is kept; at most `MAX_MACS`. `dropped` is the ids of the
+ * rest that are not kept ids (a pairing from before keys, which named its hub by `hubUrl`, among
+ * them): their keychain entries are to be deleted. The relay is checked where it is dialled. */
+function pairings(x: unknown): { kept: Pairing[]; dropped: string[] } {
+  if (!Array.isArray(x)) return { kept: [], dropped: [] };
+  const kept: Pairing[] = [];
+  const seen: string[] = [];
   for (const item of x as unknown[]) {
-    if (out.length >= MAX_MACS) break;
     if (!isObj(item)) continue;
     const id = typeof item.id === "string" && MAC_ID.test(item.id) ? item.id : null;
-    const hubUrl = text(item.hubUrl);
+    if (id === null) continue;
+    seen.push(id);
+    const relay = text(item.relay);
     const deviceName = text(item.deviceName);
-    if (id === null || ids.has(id) || !hubUrl || deviceName === null) continue;
-    ids.add(id);
-    out.push({ id, hubUrl, deviceName, macName: cleanMacName(item.macName) ?? macNameOf(hubUrl) });
+    const { channel, hubKey } = item;
+    if (kept.length >= MAX_MACS || !relay || deviceName === null) continue;
+    if (typeof channel !== "string" || !isHex32(channel) || typeof hubKey !== "string" || !isHex32(hubKey)) continue;
+    if (kept.some((p) => p.id === id || p.channel === channel)) continue;
+    kept.push({ id, relay, channel, hubKey, deviceName, macName: cleanMacName(item.macName) ?? macNameOf(null) });
   }
-  return out;
+  const ids = new Set(kept.map((p) => p.id));
+  return { kept, dropped: [...new Set(seen.filter((id) => !ids.has(id)))] };
 }
 /** The ids still to forget: Mac ids only, each once, at most a few. */
 const FORGET_MAX = 16;
-function forget(x: unknown): string[] {
-  if (!Array.isArray(x)) return [];
-  const ids = (x as unknown[]).filter((id): id is string => typeof id === "string" && MAC_ID.test(id));
+function forget(x: unknown, dropped: readonly string[] = []): string[] {
+  const saved = Array.isArray(x) ? (x as unknown[]) : [];
+  const ids = [...saved, ...dropped].filter((id): id is string => typeof id === "string" && MAC_ID.test(id));
   return [...new Set(ids)].slice(-FORGET_MAX);
 }
 const textSize = (x: unknown): TextSize => (TEXT_SIZES as readonly unknown[]).includes(x) ? (x as TextSize) : DEFAULT_SETTINGS.textSize;
@@ -120,14 +130,15 @@ export async function readSettings(): Promise<{ ok: true; settings: Settings } |
     // Saved before kinds existed, with notifications on: keep what the Mac was pushing, rather
     // than turn finished turns off behind the user's back on the next register.
     const upgraded = notifications && !("pushKinds" in value);
+    const saved = pairings(value.pairings);
     return {
       ok: true,
       settings: {
         deviceName: text(value.deviceName),
         faceId: typeof value.faceId === "boolean" ? value.faceId : DEFAULT_SETTINGS.faceId,
-        hubUrl: text(value.hubUrl),
-        pairings: pairings(value.pairings),
-        forget: forget(value.forget),
+        beforeKeys: "hubUrl" in value,
+        pairings: saved.kept,
+        forget: forget(value.forget, saved.dropped),
         notifications,
         pushKinds: upgraded ? ALL_PUSH_KINDS : pushKinds(value.pushKinds),
         textSize: textSize(value.textSize),
@@ -173,7 +184,6 @@ async function write(change: (saved: Settings) => Partial<Settings>): Promise<bo
       JSON.stringify({
         deviceName: next.deviceName,
         faceId: next.faceId,
-        hubUrl: next.hubUrl,
         pairings: next.pairings,
         forget: next.forget,
         notifications: next.notifications,

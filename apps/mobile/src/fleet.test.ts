@@ -4,7 +4,9 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Notifications from "expo-notifications";
 import * as SecureStore from "expo-secure-store";
 
-import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
+import { FakeClock, Sockets, channelOf, hubKeyOf, pairLinkTo, phoneUrlOf, type FakeSocket } from "./client/fakes";
+import { fromHex } from "./client/link";
+import { newKeyPair } from "./client/noise";
 import { Fleet, TOKEN_KEY, tokenKeyOf, unpairedNotice, type Keychain } from "./hub";
 import { MAC_ID, TOO_MANY_MACS, keyOf, macStatus } from "./macs";
 import { SETTINGS_KEY, loadSettings, saveSettings } from "./persist";
@@ -21,8 +23,23 @@ const TOKEN = "cd".repeat(32);
 const PUSH = "ExponentPushToken[abc-123_XYZ]";
 const n = Notifications as jest.Mocked<typeof Notifications>;
 
-const linkTo = (host: string) => `https://${host}.tail1234.ts.net/#pair=${SECRET}`;
-const urlOf = (host: string) => `wss://${host}.tail1234.ts.net/`;
+/** Each Mac of these tests is reached through a relay of its own name, `<host>.tail1234.ts.net`, so
+ * that what still names a Mac by its relay's host tells them apart. */
+const relayOf = (host: string) => `${host}.tail1234.ts.net`;
+const linkTo = (host: string) => pairLinkTo(host, SECRET, { relay: relayOf(host) });
+/** The address of the phone sockets to the Mac on `host`. */
+const urlOf = (host: string) => phoneUrlOf(host, relayOf(host));
+
+const madeKeys = new Map<string, ReturnType<typeof newKeyPair>>();
+/** The key pair whose private half is `hex`, made once (a test may take the random source away). */
+function keyOfHex(hex: string) {
+  let key = madeKeys.get(hex);
+  if (!key) {
+    key = newKeyPair(() => fromHex(hex) ?? new Uint8Array(32));
+    madeKeys.set(hex, key);
+  }
+  return key;
+}
 
 /** Ids in order: m00000001, m00000002, ... */
 function ids() {
@@ -75,15 +92,22 @@ function rig(keychain?: Keychain, newId: (() => string) | null = ids()) {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const store = createOctetStore();
+  /** The private key, as hex, the next pairing makes; and the keys each link's sockets were made with. */
+  const next = { key: TOKEN };
+  const keys: { hubKey: Uint8Array; device: { publicKey: Uint8Array; privateKey: Uint8Array } }[] = [];
   const fleet = new Fleet({
-    factory: sockets.factory,
+    factory: (k) => {
+      keys.push(k);
+      return sockets.factory;
+    },
+    newKey: () => keyOfHex(next.key),
     store,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
     ...(newId ? { newId } : {}),
     ...(keychain ? { keychain } : {}),
   });
-  return { sockets, clock, store, fleet };
+  return { sockets, clock, store, fleet, next, keys };
 }
 type Rig = ReturnType<typeof rig>;
 
@@ -105,14 +129,23 @@ const settle = async () => {
   for (let i = 0; i < 30; i++) await Promise.resolve();
 };
 
-/** Pairs with `host` (the Mac accepts with `token`) and walks its link to ready. */
-async function pairWith(r: Rig, host: string, token = TOKEN): Promise<FakeSocket> {
-  const pending = r.fleet.pair(linkTo(host), "iPhone");
+/** The Mac on `host` answers the pairing just sent: its code, then `paired` under its name. */
+function accept(r: Rig, host: string): void {
   const pairing = r.sockets.last;
   pairing.open();
   const [command] = pairing.commandsOf("pair");
-  pairing.receive({ type: "paired", req: command?.req, token, device: "iPhone" });
-  expect(await pending).toEqual({ ok: true });
+  pairing.receive({ type: "pair_code", req: command?.req, code: "482913" });
+  pairing.receive({ type: "paired", req: command?.req, device: "iPhone", name: host });
+  pairing.drop(1000); // the hub closes the paired connection: the phone says hello on its own
+}
+
+/** Pairs with `host` (the phone making the key whose private half is `key`, as hex) and walks its
+ * link to ready. */
+async function pairWith(r: Rig, host: string, key = TOKEN): Promise<FakeSocket> {
+  r.next.key = key;
+  const pending = r.fleet.pair(linkTo(host), "iPhone");
+  accept(r, host);
+  expect(await pending).toEqual({ ok: true, macName: expect.any(String) });
   r.fleet.finishOffer();
   const socket = socketOf(r, host);
   socket.open();
@@ -139,124 +172,233 @@ beforeEach(async () => {
   jest.clearAllMocks();
 });
 
-describe("migration_is_idempotent", () => {
-  const OLD = TOKEN_KEY;
-  const NEW = tokenKeyOf("m00000001");
+describe("the relay", () => {
+  /** A saved pairing of the Mac on `host` under `id`, as this version keeps it. */
+  const saved = (id: string, host: string) => ({
+    id,
+    relay: `wss://${relayOf(host)}/`,
+    channel: channelOf(host),
+    hubKey: hubKeyOf(host),
+    deviceName: "iPhone",
+    macName: host,
+  });
 
-  async function legacy(k: ReturnType<typeof stubKeychain>) {
-    k.kept.set(OLD, TOKEN);
-    await saveSettings({ hubUrl: urlOf("studio"), deviceName: "Shubh's iPhone" });
-  }
+  it("pairs with the link's hub key and a key of its own, kept in hex under the pairing's item", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio", "aa".repeat(32));
+    const [pairing, link] = r.keys;
+    // The pairing's own connection and the link after it are made with the same keys.
+    expect(r.keys).toHaveLength(2);
+    expect(pairing).toEqual(link);
+    expect(Buffer.from(link?.hubKey ?? []).toString("hex")).toBe(hubKeyOf("studio"));
+    expect(Buffer.from(link?.device.privateKey ?? []).toString("hex")).toBe("aa".repeat(32));
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("aa".repeat(32));
+    expect((await loadSettings()).pairings).toEqual([saved("m00000001", "studio")]);
+    // The next launch reaches the Mac with the key it kept.
+    r.fleet.setForeground(false);
+    const again = rig();
+    again.fleet.setForeground(true);
+    await again.fleet.init();
+    expect(again.sockets.all.map((s) => s.url)).toEqual([urlOf("studio")]);
+    expect(Buffer.from(again.keys[0]?.device.privateKey ?? []).toString("hex")).toBe("aa".repeat(32));
+    expect(again.keys[0]?.device.publicKey).toEqual(link?.device.publicKey);
+  });
 
-  it("moves today's pairing to pairing 1: copied, read back, then the old entry deleted", async () => {
+  it("a_4404_close_is_offline_and_keeps_the_pairing", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const studio = await pairWith(r, "studio", "aa".repeat(32));
+    // The relay has no hub for the channel (the Mac is asleep, or stopped dialling).
+    studio.drop(4404);
+    await settle();
+    expect(linkOf(r, "m00000001")).toEqual({ state: "offline", tried: true });
+    expect(r.fleet.snapshot()).toMatchObject({ status: "paired", notice: null, macs: [{ id: "m00000001" }] });
+    r.clock.advance(r.clock.delays[0] ?? 0);
+    socketOf(r, "studio").drop(4404);
+    await settle();
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("aa".repeat(32));
+    expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001"]);
+  });
+
+  it("a_close_code_from_the_relay_never_forgets_a_pairing", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio", "aa".repeat(32));
+    for (const code of [4401, 4408, 4409, 4429, 4404]) {
+      socketOf(r, "studio").drop(code);
+      await settle();
+      expect([code, r.fleet.snapshot().status, r.fleet.snapshot().notice]).toEqual([code, "paired", null]);
+      r.clock.advance(r.clock.delays[0] ?? 0);
+    }
+    expect(r.fleet.links.macs()).toEqual(["m00000001"]);
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("aa".repeat(32));
+    expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001"]);
+  });
+
+  it("a_refused_unpaired_forgets_it", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio", "aa".repeat(32));
+    r.fleet.setForeground(false);
+    // A revoked phone: the hub stopped knowing its key, and says so inside the channel.
+    const again = rig();
+    again.fleet.setForeground(true);
+    await again.fleet.init();
+    const socket = socketOf(again, "studio");
+    socket.open();
+    const [hello] = socket.commandsOf("hello");
+    socket.receive({ type: "refused", req: hello?.req, code: "unpaired", reason: "Unknown device; pair it again" });
+    await settle();
+    expect(again.fleet.snapshot()).toMatchObject({ status: "unpaired", notice: unpairedNotice("studio"), macs: [] });
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBeNull();
+    expect((await loadSettings()).pairings).toEqual([]);
+  });
+
+  it("pairing_a_channel_already_held_replaces_it_and_keeps_its_id_and_cursors", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const old = await pairWith(r, "studio", "aa".repeat(32));
+    await pairWith(r, "laptop", "bb".repeat(32));
+    expect(await r.fleet.rename("m00000001", "Studio")).toBe(true);
+    // A session streamed from the first pairing: the store holds it, and the client its cursor.
+    old.receive({ type: "sessions", sessions: [info("1-2")] });
+    r.fleet.links.client("m00000001")?.subscribe("1-2");
+    old.receive({ type: "subscribed", session: "1-2", from: "start", journals: ["j"] });
+    old.receive({ type: "event", session: "1-2", journal: "j", seq: 4, event: { type: "text", data: "kept" } });
+    r.clock.advance(200);
+    const key = keyOf("m00000001", "1-2");
+    expect(JSON.stringify(r.store.getState().bySession.get(key))).toContain("kept");
+
+    // The same channel again (a phone that paired again): the hub's new answer replaces the pairing.
+    const again = await pairWith(r, "studio", "ee".repeat(32));
+    expect(old.closed).toBe(true);
+    expect(r.fleet.snapshot().macs.map((m) => [m.id, m.macName])).toEqual([
+      ["m00000001", "Studio"],
+      ["m00000002", "laptop"],
+    ]);
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("ee".repeat(32));
+    expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001", "m00000002"]);
+    // What the store held of it stays, and the session resumes after its cursor on the new link.
+    expect(JSON.stringify(r.store.getState().bySession.get(key))).toContain("kept");
+    r.fleet.links.client("m00000001")?.subscribe("1-2");
+    expect(again.commandsOf("subscribe")).toEqual([expect.objectContaining({ session: "1-2", after: { journal: "j", seq: 4 } })]);
+  });
+
+  it("a_pairing_that_fails_leaves_the_one_already_held", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const old = await pairWith(r, "studio", "aa".repeat(32));
+    // Refused at the Mac, or cut off on the way: the hub replaced nothing.
+    for (const fail of ["refused", "cut"] as const) {
+      r.next.key = "ee".repeat(32);
+      const pending = r.fleet.pair(linkTo("studio"), "iPhone");
+      const pairing = r.sockets.last;
+      pairing.open();
+      const [command] = pairing.commandsOf("pair");
+      pairing.receive({ type: "pair_code", req: command?.req, code: "482913" });
+      if (fail === "refused") pairing.receive({ type: "refused", req: command?.req, code: "unpaired", reason: "Pairing was refused on the Mac" });
+      if (fail === "cut") pairing.drop(4404);
+      const result = await pending;
+      expect([fail, result.ok]).toEqual([fail, false]);
+      await settle();
+      expect([fail, old.closed]).toEqual([fail, false]);
+      expect([fail, r.fleet.links.client("m00000001")?.state]).toEqual([fail, "ready"]);
+      expect([fail, await SecureStore.getItemAsync(tokenKeyOf("m00000001"))]).toEqual([fail, "aa".repeat(32)]);
+      expect([fail, (await loadSettings()).pairings]).toEqual([fail, [saved("m00000001", "studio")]]);
+    }
+  });
+
+  it("a_fifth_channel_is_refused", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    for (const host of ["a1", "a2", "a3", "a4"]) await pairWith(r, host);
+    const sockets = r.sockets.all.length;
+    // Four Macs on one relay, and a fifth channel there too: refused before any network call.
+    const fifth = pairLinkTo("a5", SECRET, { relay: relayOf("a1") });
+    expect(await r.fleet.pair(fifth, "iPhone")).toEqual({ ok: false, message: TOO_MANY_MACS, clear: false });
+    expect(r.sockets.all).toHaveLength(sockets);
+    // A channel held already pairs again: that replaces, it does not add.
+    await pairWith(r, "a2", "ff".repeat(32));
+    expect(r.fleet.snapshot().macs).toHaveLength(4);
+  });
+
+  it("pairings_and_tokens_from_before_are_dropped_at_first_launch", async () => {
     const k = stubKeychain();
-    await legacy(k);
+    // What the app from before keys left: the one-pairing token, a pairing by its hub's address
+    // with its token under its id, and settings that still carry the old address.
+    k.kept.set(TOKEN_KEY, TOKEN);
+    k.kept.set(tokenKeyOf("m0000000a"), TOKEN);
+    k.kept.set(tokenKeyOf("m00000001"), "aa".repeat(32));
+    await AsyncStorage.setItem(
+      SETTINGS_KEY,
+      JSON.stringify({
+        deviceName: "Shubh's iPhone",
+        hubUrl: null,
+        pairings: [{ id: "m0000000a", hubUrl: "wss://studio.tail1234.ts.net/", deviceName: "Shubh's iPhone", macName: "studio" }, saved("m00000001", "laptop")],
+        forget: [],
+      }),
+    );
     const r = rig(k.keychain);
     r.fleet.setForeground(true);
     await r.fleet.init();
-    // The old token is read, copied, read back, and only then deleted.
-    const at = (call: string, from = 0) => k.calls.indexOf(call, from);
-    const copied = at(`set ${NEW}`);
-    const readBack = at(`get ${NEW}`, copied);
-    expect(at(`get ${OLD}`)).toBeGreaterThanOrEqual(0);
-    expect(at(`get ${OLD}`)).toBeLessThan(copied);
-    expect(copied).toBeLessThan(readBack);
-    expect(readBack).toBeLessThan(at(`delete ${OLD}`));
-    expect(k.kept.get(NEW)).toBe(TOKEN);
-    expect(k.kept.has(OLD)).toBe(false);
-    const s = await loadSettings();
-    expect(s.hubUrl).toBeNull();
-    expect(s.pairings).toEqual([{ id: "m00000001", hubUrl: urlOf("studio"), deviceName: "Shubh's iPhone", macName: "studio" }]);
-    expect(r.fleet.snapshot()).toMatchObject({ status: "paired", macs: [{ id: "m00000001", macName: "studio", host: "studio.tail1234.ts.net" }] });
-    socketOf(r, "studio").open();
-    expect(socketOf(r, "studio").commandsOf("hello")).toEqual([expect.objectContaining({ token: TOKEN })]);
-  });
-
-  it("writes the pairings before the old entry is deleted", async () => {
-    const k = stubKeychain();
-    await legacy(k);
-    let pairingsWhenDeleted: unknown = "never";
-    const del = k.keychain.delete;
-    k.keychain.delete = async (key) => {
-      if (key === OLD) pairingsWhenDeleted = JSON.parse((await AsyncStorage.getItem(SETTINGS_KEY)) ?? "{}").pairings;
-      return del(key);
-    };
-    const r = rig(k.keychain);
-    await r.fleet.init();
-    expect(pairingsWhenDeleted).toEqual([expect.objectContaining({ id: "m00000001" })]);
-  });
-
-  it("a failure at each step in turn: the next launch finishes the move, with exactly one pairing holding the token", async () => {
-    // Count the keychain calls of a clean migration, then fail each one in turn.
-    const probe = stubKeychain();
-    await legacy(probe);
-    await rig(probe.keychain).fleet.init();
-    const steps = probe.calls.length;
-    expect(steps).toBeGreaterThanOrEqual(4);
-    for (let at = 0; at < steps; at++) {
-      await AsyncStorage.clear();
-      const k = stubKeychain();
-      await legacy(k);
-      k.failOnce(at);
-      const first = rig(k.keychain);
-      await first.fleet.init();
-      // Whatever broke, the old token is never gone unless pairing 1's entry holds it.
-      if (!k.kept.has(OLD)) expect([at, k.kept.get(NEW)]).toEqual([at, TOKEN]);
-      first.fleet.setForeground(false);
-      k.healthy();
-      const next = rig(k.keychain);
-      await next.fleet.init();
-      const s = await loadSettings();
-      expect([at, s.pairings.length, s.hubUrl]).toEqual([at, 1, null]);
-      const id = s.pairings[0]!.id;
-      expect([at, k.kept.get(tokenKeyOf(id)), k.kept.has(OLD)]).toEqual([at, TOKEN, false]);
-      expect([at, next.fleet.snapshot().status, next.fleet.snapshot().macs.length]).toEqual([at, "paired", 1]);
-      // No other entry holds a copy of the token.
-      expect([at, [...k.kept.keys()]]).toEqual([at, [tokenKeyOf(id)]]);
-    }
-  });
-
-  it("a settings write that fails leaves the move for the next launch", async () => {
-    for (let fail = 0; fail < 2; fail++) {
-      await AsyncStorage.clear();
-      const k = stubKeychain();
-      await legacy(k);
-      // The `fail`th settings write of this launch fails (0: the pairings, 1: the old address).
-      const setItem = jest.mocked(AsyncStorage.setItem);
-      const real = setItem.getMockImplementation();
-      if (!real) throw new Error("async-storage's mock has no setItem");
-      if (fail === 1) setItem.mockImplementationOnce(real);
-      setItem.mockRejectedValueOnce(new Error("disk full"));
-      await rig(k.keychain).fleet.init();
-      await rig(k.keychain).fleet.init();
-      const s = await loadSettings();
-      expect([fail, s.pairings.length, s.hubUrl, k.kept.has(OLD)]).toEqual([fail, 1, null, false]);
-      expect([fail, k.kept.get(tokenKeyOf(s.pairings[0]!.id))]).toEqual([fail, TOKEN]);
-    }
-  });
-
-  it("with the old token unreadable shows Pair, and the next launch moves it", async () => {
-    const k = stubKeychain();
-    await legacy(k);
-    k.failOnce(0);
-    const first = rig(k.keychain);
-    await first.fleet.init();
-    expect(first.fleet.snapshot().status).toBe("unpaired");
-    expect(k.kept.get(OLD)).toBe(TOKEN);
+    // Only this version's pairing is left, connected; the old one and every token are gone.
+    expect(r.fleet.snapshot()).toMatchObject({ status: "paired", macs: [{ id: "m00000001", macName: "laptop" }] });
+    expect(r.sockets.all.map((s) => s.url)).toEqual([urlOf("laptop")]);
+    expect([...k.kept.keys()]).toEqual([tokenKeyOf("m00000001")]);
+    const raw = JSON.parse((await AsyncStorage.getItem(SETTINGS_KEY)) ?? "{}") as Record<string, unknown>;
+    expect(raw).not.toHaveProperty("hubUrl");
+    expect(raw.forget).toEqual([]);
+    expect((raw.pairings as { id: string }[]).map((p) => p.id)).toEqual(["m00000001"]);
+    expect(raw.deviceName).toBe("Shubh's iPhone");
+    // Once: the next launch has nothing from before to drop.
     k.healthy();
-    const next = rig(k.keychain);
-    await next.fleet.init();
-    expect(next.fleet.snapshot().status).toBe("paired");
-    expect(k.kept.has(OLD)).toBe(false);
+    r.fleet.setForeground(false);
+    await rig(k.keychain).fleet.init();
+    expect(k.calls.filter((c) => c.startsWith("delete"))).toEqual([]);
   });
 
-  it("is nothing to do for a phone that never paired, and leaves a migrated phone alone", async () => {
+  it("a key in the keychain that is not 32 bytes of hex reaches nothing, and goes", async () => {
     const k = stubKeychain();
+    k.kept.set(tokenKeyOf("m00000001"), "not a key");
+    await saveSettings({ pairings: [saved("m00000001", "studio")] });
     const r = rig(k.keychain);
+    r.fleet.setForeground(true);
     await r.fleet.init();
-    expect(r.fleet.snapshot().status).toBe("unpaired");
-    expect(k.calls.filter((c) => c.startsWith("set") || c.startsWith("delete"))).toEqual([]);
-    expect((await loadSettings()).pairings).toEqual([]);
+    expect(r.fleet.snapshot()).toMatchObject({ status: "unpaired", macs: [] });
+    expect(r.sockets.all).toHaveLength(0);
+    expect(k.kept.has(tokenKeyOf("m00000001"))).toBe(false);
+  });
+
+  it("a relay address saved as ws:// is taken only by a development build", async () => {
+    const plain = { ...saved("m00000001", "studio"), relay: "ws://127.0.0.1:9000/" };
+    const dev = globalThis as { __DEV__?: boolean };
+    const before = dev.__DEV__;
+    try {
+      for (const development of [true, false]) {
+        dev.__DEV__ = development;
+        await AsyncStorage.clear();
+        await SecureStore.setItemAsync(tokenKeyOf("m00000001"), "aa".repeat(32));
+        await saveSettings({ pairings: [plain] });
+        const r = rig();
+        r.fleet.setForeground(true);
+        await r.fleet.init();
+        expect([development, r.sockets.all.map((s) => s.url)]).toEqual([
+          development,
+          development ? [`ws://127.0.0.1:9000/v1/phone/${channelOf("studio")}`] : [],
+        ]);
+        r.fleet.setForeground(false);
+      }
+    } finally {
+      dev.__DEV__ = before;
+    }
   });
 });
 
@@ -273,29 +415,12 @@ describe("pairing more than one Mac", () => {
     ]);
     expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("aa".repeat(32));
     expect(await SecureStore.getItemAsync(tokenKeyOf("m00000002"))).toBe("bb".repeat(32));
-    expect((await loadSettings()).pairings.map((p) => [p.id, p.hubUrl, p.macName])).toEqual([
-      ["m00000001", urlOf("studio"), "studio"],
-      ["m00000002", urlOf("laptop"), "laptop"],
+    expect((await loadSettings()).pairings.map((p) => [p.id, p.channel, p.macName])).toEqual([
+      ["m00000001", channelOf("studio"), "studio"],
+      ["m00000002", channelOf("laptop"), "laptop"],
     ]);
     expect(r.fleet.links.macs()).toEqual(["m00000001", "m00000002"]);
-    expect(r.fleet.links.client("m00000002")?.url).toBe(urlOf("laptop"));
-  });
-
-  it("pairing a host that is already paired replaces it and keeps its id (and its name)", async () => {
-    const r = rig();
-    r.fleet.setForeground(true);
-    await r.fleet.init();
-    const old = await pairWith(r, "studio", "aa".repeat(32));
-    await pairWith(r, "laptop", "bb".repeat(32));
-    expect(await r.fleet.rename("m00000001", "Studio")).toBe(true);
-    await pairWith(r, "studio", "ee".repeat(32));
-    expect(old.closed).toBe(true);
-    expect(r.fleet.snapshot().macs.map((m) => [m.id, m.macName])).toEqual([
-      ["m00000001", "Studio"],
-      ["m00000002", "laptop"],
-    ]);
-    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("ee".repeat(32));
-    expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001", "m00000002"]);
+    expect(r.fleet.links.client("m00000002")?.channel).toBe(channelOf("laptop"));
   });
 
   it("refuses a 5th Mac before any network call", async () => {
@@ -343,9 +468,7 @@ describe("pairing more than one Mac", () => {
     r.fleet.setForeground(true);
     await r.fleet.init();
     const pending = r.fleet.pair(linkTo("studio"), "iPhone");
-    const pairing = r.sockets.last;
-    pairing.open();
-    pairing.receive({ type: "paired", req: pairing.commandsOf("pair")[0]?.req, token: TOKEN, device: "iPhone" });
+    accept(r, "studio");
     await pending;
     expect(linkOf(r, "m00000001")).toEqual({ state: "connecting", tried: false });
     socketOf(r, "studio").drop();
@@ -640,20 +763,21 @@ describe("the Mac unpairs this phone", () => {
 });
 
 describe("fix round 1", () => {
-  it("with no random source at all, the move and a pairing both succeed", async () => {
+  it("with no random source for ids at all, two pairings both succeed", async () => {
     const g = globalThis as { crypto?: unknown; expo?: { uuidv4?: () => string } };
     const crypto = g.crypto;
     const expo = g.expo;
+    // What the pairings need of the random source anyway (the keys, the links) is made first.
+    for (const hex of ["aa".repeat(32), "bb".repeat(32)]) keyOfHex(hex);
+    for (const host of ["studio", "laptop"]) linkTo(host);
     try {
       Object.defineProperty(globalThis, "crypto", { value: {}, configurable: true });
       g.expo = {};
       const k = stubKeychain();
-      k.kept.set(TOKEN_KEY, TOKEN);
-      await saveSettings({ hubUrl: urlOf("studio") });
       const r = rig(k.keychain, null);
       r.fleet.setForeground(true);
       await r.fleet.init();
-      expect(r.fleet.snapshot().status).toBe("paired");
+      await pairWith(r, "studio", "aa".repeat(32));
       await pairWith(r, "laptop", "bb".repeat(32));
       const ids = r.fleet.snapshot().macs.map((m) => m.id);
       expect(ids).toHaveLength(2);
@@ -672,10 +796,8 @@ describe("fix round 1", () => {
     await r.fleet.init();
     const pending = r.fleet.pair(linkTo("studio"), "iPhone");
     expect(made).toBe(1); // before any answer from the Mac
-    const pairing = r.sockets.last;
-    pairing.open();
-    pairing.receive({ type: "paired", req: pairing.commandsOf("pair")[0]?.req, token: TOKEN, device: "iPhone" });
-    expect(await pending).toEqual({ ok: true });
+    accept(r, "studio");
+    expect(await pending).toEqual({ ok: true, macName: expect.any(String) });
     expect(made).toBe(1);
   });
 
@@ -684,9 +806,7 @@ describe("fix round 1", () => {
     r.fleet.setForeground(true);
     await r.fleet.init();
     const pending = r.fleet.pair(linkTo("studio"), "iPhone");
-    const pairing = r.sockets.last;
-    pairing.open();
-    pairing.receive({ type: "paired", req: pairing.commandsOf("pair")[0]?.req, token: TOKEN, device: "iPhone" });
+    accept(r, "studio");
     await pending;
     expect(linkOf(r, "m00000001")).toEqual({ state: "connecting", tried: false });
     r.fleet.setForeground(false);
@@ -719,29 +839,27 @@ describe("fix round 1", () => {
     expect(linkOf(r, "m00000001")).toEqual({ state: "offline", tried: true });
   });
 
-  it("an unpair while that host pairs again never deletes the token the pairing just saved", async () => {
+  it("an unpair while that Mac pairs again never deletes the key the pairing just saved", async () => {
     const r = rig();
     r.fleet.setForeground(true);
     await r.fleet.init();
     await pairWith(r, "studio", "aa".repeat(32));
+    r.next.key = "ee".repeat(32);
     const pending = r.fleet.pair(linkTo("studio"), "iPhone");
-    const pairing = r.sockets.last;
     const unpaired = r.fleet.unpair("m00000001");
-    pairing.open();
-    pairing.receive({ type: "paired", req: pairing.commandsOf("pair")[0]?.req, token: "ee".repeat(32), device: "iPhone" });
-    expect(await pending).toEqual({ ok: true });
+    accept(r, "studio");
+    expect(await pending).toEqual({ ok: true, macName: expect.any(String) });
     await unpaired;
     await settle();
     expect(r.fleet.snapshot().macs.map((m) => m.id)).toEqual(["m00000001"]);
     expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("ee".repeat(32));
     expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001"]);
-    // The next launch is paired with the new token.
+    // The next launch is paired with the new key.
     const again = rig();
     again.fleet.setForeground(true);
     await again.fleet.init();
     expect(again.fleet.snapshot().status).toBe("paired");
-    socketOf(again, "studio").open();
-    expect(socketOf(again, "studio").commandsOf("hello")).toEqual([expect.objectContaining({ token: "ee".repeat(32) })]);
+    expect(Buffer.from(again.keys[0]?.device.privateKey ?? []).toString("hex")).toBe("ee".repeat(32));
   });
 
   it("unpairing while turning on is waiting for that Mac ends the wait at once", async () => {
@@ -760,7 +878,7 @@ describe("fix round 1", () => {
     expect(r.clock.pending).toBe(0);
   });
 
-  it("a pairing whose token cannot be read is listed, offline and not tried, and can be unpaired", async () => {
+  it("a pairing whose key cannot be read is listed, offline and not tried, and can be unpaired", async () => {
     const r = rig();
     r.fleet.setForeground(true);
     await r.fleet.init();
@@ -788,33 +906,6 @@ describe("fix round 1", () => {
     expect(again.fleet.snapshot().macs.map((m) => m.id)).toEqual(["m00000001"]);
     expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001"]);
     expect(await SecureStore.getItemAsync(tokenKeyOf("m00000002"))).toBeNull();
-  });
-
-  it("a pairing still waiting for its moved token is listed, and unpairing it ends the move", async () => {
-    const k = stubKeychain();
-    k.kept.set(TOKEN_KEY, TOKEN);
-    await saveSettings({ hubUrl: urlOf("studio") });
-    // The copy into pairing 1's entry fails this launch (get old, get new, then set new).
-    const set = k.keychain.set;
-    k.keychain.set = async () => {
-      throw new Error("locked");
-    };
-    const r = rig(k.keychain);
-    await r.fleet.init();
-    expect(r.fleet.snapshot()).toMatchObject({
-      status: "unpaired",
-      macs: [{ id: "m00000001", macName: "studio" }],
-    });
-    k.keychain.set = set;
-    await r.fleet.unpair("m00000001");
-    expect(r.fleet.snapshot().macs).toEqual([]);
-    expect(k.kept.has(TOKEN_KEY)).toBe(false);
-    const s = await loadSettings();
-    expect([s.pairings, s.hubUrl]).toEqual([[], null]);
-    // Nothing comes back at the next launch.
-    const next = rig(k.keychain);
-    await next.fleet.init();
-    expect(next.fleet.snapshot()).toMatchObject({ status: "unpaired", macs: [] });
   });
 
   it("keeps the Macs list the same object when only a notice changed", async () => {

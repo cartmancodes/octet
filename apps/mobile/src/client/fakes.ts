@@ -1,18 +1,42 @@
-// Test doubles for the hub client: a socket the test drives by hand and a clock that only moves
-// when told to. Not imported by the app.
-import type { Socket, SocketFactory } from "./HubClient";
+// Test doubles for the hub client: a socket the test drives by hand, a clock that only moves
+// when told to, and the identities and pairing links of the Macs tests pair with. Not imported by
+// the app.
+import { sha256 } from "@noble/hashes/sha2.js";
+
+import type { Pairing } from "../macs";
+import type { HubClientOptions, Socket, SocketFactory } from "./HubClient";
+import { toHex } from "./link";
+import { newKeyPair, type KeyPair } from "./noise";
 
 export class FakeSocket implements Socket {
   sent: string[] = [];
   closed = false;
+  /** The encrypted pings the client sent, as the channel counts them. */
+  pings = 0;
+  /** A ping is waiting for its pong: the channel refuses another until it comes. */
+  private awaiting = false;
   onmessage?: (text: string) => void;
   onopen?: () => void;
   onclose?: (code: number) => void;
+  onpong?: () => void;
 
   constructor(readonly url: string) {}
 
   send(text: string): void {
     this.sent.push(text);
+  }
+
+  ping(): boolean {
+    if (this.awaiting) return false;
+    this.awaiting = true;
+    this.pings += 1;
+    return true;
+  }
+
+  /** The hub answers the last ping. */
+  pong(): void {
+    this.awaiting = false;
+    this.onpong?.();
   }
 
   close(): void {
@@ -104,3 +128,62 @@ export class FakeClock {
     this.time = end;
   }
 }
+
+/** The relay of the tests that need only one. */
+export const TEST_RELAY = "wss://relay.test/";
+
+/** The channel id of the Mac on `host`: its own 64 hex digits, the same at every call. */
+export const channelOf = (host: string): string => toHex(sha256(new TextEncoder().encode(host)));
+
+const hubKeys = new Map<string, string>();
+/** The hub key (an X25519 public key) of the Mac on `host`, made once. */
+export function hubKeyOf(host: string): string {
+  let key = hubKeys.get(host);
+  if (key === undefined) {
+    key = toHex(newKeyPair(() => sha256(new TextEncoder().encode(`hub ${host}`))).publicKey);
+    hubKeys.set(host, key);
+  }
+  return key;
+}
+
+/** A device key pair made from `seed`: the same at every call. */
+export const testKey = (seed = 7): KeyPair => newKeyPair(() => new Uint8Array(32).fill(seed));
+
+/** What a `HubClient` needs to reach the Mac on `host` through `TEST_RELAY`, as device `key`. */
+export const identityOf = (host: string, key: KeyPair | null = testKey()): Pick<HubClientOptions, "url" | "channel" | "hubKey" | "key"> => ({
+  url: TEST_RELAY,
+  channel: channelOf(host),
+  hubKey: Uint8Array.from(Buffer.from(hubKeyOf(host), "hex")),
+  key,
+});
+
+/**
+ * The pairing link the Mac on `host` shows, as the hub makes it (crates/octet-hub/src/link.rs):
+ * through the relay at `relay` (a `host` or `host:port`; `host` itself unless given), with
+ * `secret`. Version 1 is `wss`; 0 is `ws`, which only a development build takes.
+ */
+export function pairLinkTo(host: string, secret: string, { relay = host, version = 1 }: { relay?: string; version?: number } = {}): string {
+  const payload = Buffer.concat([
+    Buffer.of(version),
+    Buffer.from(hubKeyOf(host), "hex"),
+    Buffer.from(channelOf(host), "hex"),
+    Buffer.from(secret, "hex"),
+    Buffer.from(relay, "latin1"),
+  ]);
+  return `octet://pair/${payload.toString("base64url")}`;
+}
+
+/** The address a phone socket to the Mac on `host` opens, when its link names relay `relay`. */
+export const phoneUrlOf = (host: string, relay = host): string => `wss://${relay}/v1/phone/${channelOf(host)}`;
+
+/** The pairing of the Mac on `host` under `id`, as the app saves it: reached through the relay at
+ * `relay` (`host` itself unless given), named `host`, paired as `iPhone`. */
+export const pairingOf = (id: string, host: string, relay = host, extra: Partial<Pairing> = {}): Pairing => ({
+  id,
+  relay: `wss://${relay}/`,
+  channel: channelOf(host),
+  hubKey: hubKeyOf(host),
+  deviceName: "iPhone",
+  macName: host,
+  ...extra,
+});

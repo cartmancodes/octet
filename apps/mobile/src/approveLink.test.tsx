@@ -14,13 +14,13 @@ import { redirectSystemPath } from "../app/+native-intent";
 import Pair from "../app/pair";
 import Sessions from "../app/index";
 import Session from "../app/session/[id]";
-import { FakeClock, Sockets } from "./client/fakes";
-import { APPROVE_WAIT_MS, HubContext, Fleet, TOKEN_KEY } from "./hub";
+import { FakeClock, Sockets, pairingOf } from "./client/fakes";
+import { APPROVE_WAIT_MS, HubContext, Fleet, tokenKeyOf } from "./hub";
 import { handOverApproveLink, parseApproveLink, watchApproveLinks } from "./navigation";
 import { saveSettings } from "./persist";
 import type { SessionInfo } from "./protocol";
 import { octetStore } from "./store";
-import { k, newM } from "./testKeys";
+import { M, k, newM } from "./testKeys";
 
 jest.mock("expo-camera", () => ({
   CameraView: () => null,
@@ -96,8 +96,8 @@ describe("the system path of an approve link", () => {
 
 beforeEach(async () => {
   await AsyncStorage.clear();
-  await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-  await saveSettings({ hubUrl: `wss://${HOST}/` });
+  await SecureStore.setItemAsync(tokenKeyOf(M), TOKEN);
+  await saveSettings({ pairings: [pairingOf(M, "mac", HOST)] });
   octetStore.getState().reset();
   auth.authenticateAsync.mockResolvedValue({ success: true });
   auth.authenticateAsync.mockClear();
@@ -115,7 +115,7 @@ async function launch(list: SessionInfo[] | null) {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const hub = new Fleet({
-    factory: sockets.factory,
+    factory: () => sockets.factory,
     store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },

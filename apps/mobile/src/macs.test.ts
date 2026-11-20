@@ -46,8 +46,8 @@ describe("hostOf", () => {
 
 describe("macOfHost", () => {
   const pairings = [
-    { id: "m00000001", hubUrl: "wss://Studio.tail1.ts.net/" },
-    { id: "m00000002", hubUrl: "wss://laptop.tail1.ts.net:8443/" },
+    { id: "m00000001", relay: "wss://Studio.tail1.ts.net/" },
+    { id: "m00000002", relay: "wss://laptop.tail1.ts.net:8443/" },
   ];
 
   it("finds the pairing whose hub host matches, ignoring case", () => {
@@ -60,13 +60,13 @@ describe("macOfHost", () => {
     expect(macOfHost(pairings, "other.tail1.ts.net")).toBeNull();
     expect(macOfHost(pairings, "")).toBeNull();
     expect(macOfHost(pairings, "studio")).toBeNull();
-    expect(macOfHost([{ id: "m1", hubUrl: "not a url" }], "not a url")).toBeNull();
+    expect(macOfHost([{ id: "m1", relay: "not a url" }], "not a url")).toBeNull();
   });
 });
 
 describe("keyFor", () => {
-  const studio = { id: "m00000001", hubUrl: "wss://studio.tail1.ts.net/" };
-  const mini = { id: "m00000002", hubUrl: "wss://mini.tail1.ts.net:8443/" };
+  const studio = { id: "m00000001", relay: "wss://studio.tail1.ts.net/" };
+  const mini = { id: "m00000002", relay: "wss://mini.tail1.ts.net:8443/" };
 
   it("is the phone's key of a raw session on the pairing of the hub's published host", () => {
     expect(keyFor([studio, mini], "mini.tail1.ts.net", "41-1700000000")).toBe("m00000002/41-1700000000");
@@ -93,8 +93,8 @@ describe("keyFor", () => {
 });
 
 describe("tap_routes_by_mac", () => {
-  const studio = { id: "m00000001", hubUrl: "wss://studio.tail1.ts.net/" };
-  const mini = { id: "m00000002", hubUrl: "wss://mini.tail1.ts.net/" };
+  const studio = { id: "m00000001", relay: "wss://studio.tail1.ts.net/" };
+  const mini = { id: "m00000002", relay: "wss://mini.tail1.ts.net/" };
   const live = () => false;
 
   it("a known host opens that Mac's session, whatever the case or a trailing dot", () => {

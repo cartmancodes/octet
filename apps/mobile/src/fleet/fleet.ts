@@ -2,17 +2,22 @@
 // and notifications do to them.
 import { Platform } from "react-native";
 
+import { getRandomBytes } from "expo-crypto";
+
+import { isDevBuild } from "../build";
 import { HubClient, Refusal, type HubClientOptions, type RequestBody, type SocketFactory } from "../client/HubClient";
-import { NOT_A_LINK, isHubUrl, pairLinkProblem, parsePairLink } from "../client/link";
+import { NOT_A_LINK, fromHex, isRelayUrl, pairLinkProblem, parsePairLink } from "../client/link";
+import { newKeyPair, type KeyPair } from "../client/noise";
+import { secureSocketFactory, type LinkKeys } from "../client/secureSocket";
 import { webSocketFactory } from "../client/socket";
 import { DEFAULT_PUSH_KINDS, NOT_SAVED, loadSettings, readSettings, updateSettings, type Settings } from "../persist";
 import { createCoalescer, type Coalescer } from "../coalesce";
-import { MAX_MACS, TOO_MANY_MACS, cleanMacName, hostOf, keyFor, macNameOf, macOfHost, macOfKey, newMacId, tapKey, type Links, type Pairing, type Tap } from "../macs";
+import { MAX_MACS, TOO_MANY_MACS, cleanMacName, hostOf, keyFor, macNameOf, macOfKey, newMacId, tapKey, type Links, type Pairing, type Tap } from "../macs";
 import type { ApproveLink } from "../navigation";
 import { askForToken, currentToken, dropPushRegistration, projectId } from "../notifications";
-import type { PushKinds } from "../protocol";
+import type { Cursor, PushKinds } from "../protocol";
 import { hasEnded, octetStore, type OctetStore } from "../store";
-import { TOKEN_KEY, keepToken, secureStore, tokenKeyOf, tokenStore, type Keychain, type TokenStore } from "./keychain";
+import { TOKEN_KEY, keepKey, keyPairOf, keyStore, secureStore, tokenKeyOf, type Keychain, type KeyStore } from "./keychain";
 import { MacLink, UNREACHABLE, type LinkHost, type MacInfo, type PushResult } from "./macLink";
 
 export { NOT_A_LINK };
@@ -25,7 +30,7 @@ export const HAND_OVER_MS = 10_000;
 export const unpairedNotice = (macName: string): string => `This phone was unpaired on ${macName}`;
 export const UNPAIR_FAILED_NOTICE = "This phone couldn't delete its pairing. Pair again to replace it.";
 /** The Mac took the pairing (its secret is spent and the name is registered) but the phone could
- * not keep the token: only revoking on the Mac frees the name. */
+ * not keep its key: only revoking on the Mac frees the name. */
 const unsaved = (name: string): string =>
   `This phone paired but couldn't save it. On the Mac run \`octet hub revoke ${name}\`, then pair again with a new code.`;
 
@@ -53,12 +58,17 @@ const anyKind = (kinds: PushKinds): boolean => kinds.approvals || kinds.errors |
 /** A failed pairing: `clear` says the link is no good any more (the Mac says its code is spent
  * or expired, or took the secret), so the screen forgets it; any other link is kept, to edit or
  * to try again. */
-export type PairResult = { ok: true } | { ok: false; message: string; clear: boolean };
+export type PairResult = { ok: true; macName: string } | { ok: false; message: string; clear: boolean };
 
 export interface FleetOptions {
-  factory?: SocketFactory;
+  /** Makes the sockets of a link with `keys`: through the relay, end-to-end encrypted, unless a
+   * test gives sockets of its own. */
+  factory?: (keys: LinkKeys) => SocketFactory;
+  /** Makes the key pair a new pairing pairs with; from `expo-crypto`'s randomness unless a test
+   * gives its own. */
+  newKey?: () => KeyPair;
   store?: OctetStore;
-  /** Where the tokens are kept; the phone's keychain unless a test gives its own. */
+  /** Where the private keys are kept; the phone's keychain unless a test gives its own. */
   keychain?: Keychain;
   /** "ios" or "android"; sent to the Mac at pairing and names the default device. */
   platform?: string;
@@ -74,7 +84,8 @@ export interface FleetOptions {
  * most once per 50 ms whichever Macs stream. Notifications are one choice for every Mac.
  */
 export class Fleet {
-  private readonly factory: SocketFactory;
+  private readonly factory: (keys: LinkKeys) => SocketFactory;
+  private readonly newKey: () => KeyPair;
   /** The store every link feeds. */
   readonly store: OctetStore;
   private readonly keychain: Keychain;
@@ -84,7 +95,7 @@ export class Fleet {
   private readonly newId: () => string;
   private readonly coalescer: Coalescer;
 
-  /** The saved pairings, as last saved: a pairing whose token could not be read has no link. */
+  /** The saved pairings, as last saved: a pairing whose key could not be read has no link. */
   private pairings: Pairing[] = [];
   /** The links, in the pairings' order: the one map from Mac to client. */
   private all: MacLink[] = [];
@@ -94,13 +105,11 @@ export class Fleet {
   private savedName: string | null = null;
   /** The client of a pairing in flight, which is no Mac's link until it succeeds. */
   private pairing: HubClient | null = null;
-  /** The id that pairing will keep its token under: an unpair of the same Mac meanwhile must not
+  /** The id that pairing will keep its key under: an unpair of the same Mac meanwhile must not
    * delete what it saves. */
   private pairingId: string | null = null;
-  /** The pairing still waiting for an older version's token (see `migrate`); null when none. */
-  private pending: string | null = null;
-  /** What `macs` shows of each pairing with no link (its token unreadable, or still on its way),
-   * kept so that the list keeps its identity. */
+  /** What `macs` shows of each pairing with no link (its key unreadable), kept so that the list
+   * keeps its identity. */
   private unlinked = new Map<string, MacInfo>();
   private starting: Promise<void> | null = null;
   /** Unpairs whose storage writes are not done: pairing waits for them. */
@@ -112,7 +121,8 @@ export class Fleet {
   private readonly host: LinkHost;
 
   constructor(opts: FleetOptions = {}) {
-    this.factory = opts.factory ?? webSocketFactory;
+    this.factory = opts.factory ?? ((keys) => secureSocketFactory(keys, webSocketFactory));
+    this.newKey = opts.newKey ?? (() => newKeyPair(getRandomBytes));
     this.store = opts.store ?? octetStore;
     this.keychain = opts.keychain ?? secureStore;
     this.platform = opts.platform ?? Platform.OS;
@@ -167,9 +177,10 @@ export class Fleet {
 
   // Lifecycle
 
-  /** Reads the settings and the keychain, once however often it is called: moves the one
-   * pairing of an older version to pairing 1, and connects each pairing whose token is there.
-   * A keychain that cannot be read is no token for now: the pairing stays for the next launch. */
+  /** Reads the settings and the keychain, once however often it is called, and connects each
+   * pairing whose key is there. At the first launch after an app from before keys, its tokens go
+   * (and its pairings, which `readSettings` hands over to be forgotten): the user pairs again. A
+   * keychain that cannot be read is no key for now: the pairing stays for the next launch. */
   init(): Promise<void> {
     this.starting ??= this.load();
     return this.starting;
@@ -178,35 +189,36 @@ export class Fleet {
   private async load(): Promise<void> {
     const read = await readSettings();
     if (!read.ok) {
-      // Settings that could not be read say nothing of the pairings: the tokens stay for the
-      // next launch, and this one shows Pair.
+      // Settings that could not be read say nothing of the pairings: the keys stay for the next
+      // launch, and this one shows Pair.
       this.emit({ status: "unpaired" });
       return;
     }
     const settings = read.settings;
     this.savedName = settings.deviceName;
     await this.finishForgetting(settings);
-    const { pairings, pending } = await this.migrate(settings);
-    this.pending = pending;
-    const tokens = await Promise.all(pairings.map((p) => this.keychain.get(tokenKeyOf(p.id)).then((t) => t, () => undefined)));
+    if (settings.beforeKeys) await this.dropTokenFromBefore();
+    const pairings = settings.pairings;
+    const keys = await Promise.all(pairings.map((p) => this.keychain.get(tokenKeyOf(p.id)).then((t) => t, () => undefined)));
     const kept: Pairing[] = [];
     const links: MacLink[] = [];
     const dropped: string[] = [];
+    const development = isDevBuild();
     pairings.forEach((pairing, i) => {
-      const token = tokens[i];
-      if (!isHubUrl(pairing.hubUrl)) {
-        // An address that is not a pairing host (a tampered value) can reach nowhere it should.
+      const hex = keys[i];
+      const key = typeof hex === "string" ? keyPairOf(hex) : null;
+      if (!isRelayUrl(pairing.relay, development)) {
+        // A relay that is not one a link gives (a tampered value) can reach nowhere it should.
         dropped.push(pairing.id);
-      } else if (token === undefined || ((token === null || token === "") && pairing.id === pending)) {
-        // Unreadable now, or the token is still on its way from the old entry: kept, not connected.
+      } else if (hex === undefined) {
+        // Unreadable now: kept, not connected.
         kept.push(pairing);
-      } else if (token === null || token === "") {
-        // No token: it can reach nothing.
+      } else if (key === null) {
+        // No key, or not one: it can reach nothing.
         dropped.push(pairing.id);
       } else {
         kept.push(pairing);
-        const client = new HubClient({ ...this.clientOptions, url: pairing.hubUrl, token, factory: this.factory });
-        links.push(new MacLink(this.host, pairing, client, tokenStore(this.keychain, pairing.id)));
+        links.push(new MacLink(this.host, pairing, this.clientFor(pairing, key), keyStore(this.keychain, pairing.id)));
       }
     });
     if (dropped.length > 0) {
@@ -220,7 +232,8 @@ export class Fleet {
     if (this.foreground) for (const link of links) link.client.start();
   }
 
-  /** Deletes the keychain entries of pairings that went while the keychain would not let go. */
+  /** Deletes the keychain entries of pairings that went while the keychain would not let go, and
+   * of pairings from before keys. */
   private async finishForgetting(settings: Settings): Promise<void> {
     if (settings.forget.length === 0) return;
     const done: string[] = [];
@@ -232,61 +245,30 @@ export class Fleet {
     if (done.length > 0) await updateSettings((s) => ({ forget: s.forget.filter((id) => !done.includes(id)) }));
   }
 
-  /**
-   * Moves the one pairing of an older version (settings' `hubUrl`, the token in `TOKEN_KEY`) to a
-   * pairing of its own. Each step is safe to repeat, so a launch that dies part-way is finished
-   * by the next: (1) the pairing is saved, with a fresh id, unless one for that host is saved
-   * already; (2) the old token is copied to its entry and read back, unless its entry holds a
-   * token already (an earlier copy, or a newer pairing); (3) only then the old entry is deleted;
-   * (4) and `hubUrl` saved as null. An old token with no usable address is deleted, as before.
-   * `pending` is the pairing still waiting for its token, when the move did not get that far.
-   */
-  private async migrate(settings: Settings): Promise<{ pairings: Pairing[]; pending: string | null }> {
-    let pairings = settings.pairings;
-    const legacy = settings.hubUrl;
-    let old: string | null;
-    try {
-      old = await this.keychain.get(TOKEN_KEY);
-    } catch {
-      return { pairings, pending: null }; // unreadable: everything stays for the next launch
-    }
-    if (old === null || old === "") {
-      if (legacy !== null) await updateSettings(() => ({ hubUrl: null })); // nothing to move
-      return { pairings, pending: null };
-    }
-    if (legacy === null || !isHubUrl(legacy)) {
-      // A token with no usable address (killed between the two saves, a tampered value, or a move
-      // that saved its address as null) can reach nowhere it should: it goes.
-      await this.keychain.delete(TOKEN_KEY).catch(() => undefined);
-      if (legacy !== null) await updateSettings(() => ({ hubUrl: null }));
-      return { pairings, pending: null };
-    }
-    const id = macOfHost(pairings, hostOf(legacy) ?? "");
-    let target = pairings.find((p) => p.id === id);
-    if (!target) {
-      if (pairings.length >= MAX_MACS) {
-        await this.keychain.delete(TOKEN_KEY).catch(() => undefined);
-        await updateSettings(() => ({ hubUrl: null }));
-        return { pairings, pending: null };
-      }
-      target = { id: this.freshId(pairings), hubUrl: legacy, deviceName: settings.deviceName ?? this.defaultName(), macName: macNameOf(legacy) };
-      const next = [...pairings, target];
-      if (!(await updateSettings(() => ({ pairings: next })))) return { pairings, pending: null };
-      pairings = next;
-    }
-    const key = tokenKeyOf(target.id);
-    try {
-      const there = await this.keychain.get(key);
-      if (there === null || there === "") {
-        await this.keychain.set(key, old);
-        if ((await this.keychain.get(key)) !== old) return { pairings, pending: target.id };
-      }
-      await this.keychain.delete(TOKEN_KEY);
-    } catch {
-      return { pairings, pending: target.id };
-    }
-    await updateSettings(() => ({ hubUrl: null }));
-    return { pairings, pending: null };
+  /** Deletes the token the app kept while it had one pairing, before keys, and saves the settings
+   * as this version writes them (with no `hubUrl`), so that this is done once. A keychain that will
+   * not let go leaves both for the next launch. */
+  private async dropTokenFromBefore(): Promise<void> {
+    if (await this.keychain.delete(TOKEN_KEY).then(() => true, () => false)) await updateSettings(() => ({}));
+  }
+
+  /** A client for `pairing` (its relay, channel and hub key), as device `key`. */
+  private clientFor(
+    pairing: Pick<Pairing, "relay" | "channel" | "hubKey">,
+    key: KeyPair,
+    extra: Pick<HubClientOptions, "cursors" | "background"> = {},
+  ): HubClient {
+    // A saved hub key is 64 hex digits (persist.ts), and a link's always is; none reaches nothing.
+    const hubKey = fromHex(pairing.hubKey) ?? new Uint8Array(0);
+    return new HubClient({
+      ...this.clientOptions,
+      ...extra,
+      url: pairing.relay,
+      channel: pairing.channel,
+      hubKey,
+      key,
+      factory: this.factory({ hubKey, device: key }),
+    });
   }
 
   /** The app came to the foreground (connect every link, or skip a backoff wait: the network may
@@ -304,56 +286,68 @@ export class Fleet {
     }
   }
 
-  /** Pairs with the Mac the link names: a new pairing, or, for a host already paired, a new
-   * token for that pairing (its id and name kept). On success the token is in its keychain
-   * entry, the pairing in settings, and the connection is up. A 5th Mac is refused before any
-   * network call. Failures come back as the words to show. */
-  async pair(link: string, name: string): Promise<PairResult> {
+  /**
+   * Pairs with the Mac the link names, through its relay, with a key pair made for it: a new
+   * pairing, or, for a channel already paired, one that replaces it (its id, its name, what the
+   * store holds of its sessions and their cursors kept) once the hub has answered `paired`; until
+   * then the pairing already held is left as it is. `onCode` is handed the hub's six digits when
+   * the Mac holds this phone for its owner's answer, and only then. On success the private key is
+   * in its keychain entry, the pairing in settings, and the link connects again and says hello
+   * (the hub closes the connection it paired on). A 5th channel is refused before any network
+   * call. Failures come back as the words to show.
+   */
+  async pair(link: string, name: string, onCode: (code: string) => void = () => undefined): Promise<PairResult> {
     if (this.pairing) return { ok: false, message: "Already pairing", clear: false };
     if (this.unpairing > 0) return { ok: false, message: "Finishing unpairing. Try again in a moment.", clear: false };
-    const parsed = parsePairLink(link);
-    if (!parsed) return { ok: false, message: pairLinkProblem(link) ?? NOT_A_LINK, clear: false };
-    const sameId = macOfHost(this.pairings, hostOf(parsed.url) ?? "");
-    if (sameId === null && this.pairings.length >= MAX_MACS) return { ok: false, message: TOO_MANY_MACS, clear: false };
+    const development = isDevBuild();
+    const parsed = parsePairLink(link, development);
+    if (!parsed) return { ok: false, message: pairLinkProblem(link, development) ?? NOT_A_LINK, clear: false };
+    const before = this.pairings.find((p) => p.channel === parsed.channel);
+    if (!before && this.pairings.length >= MAX_MACS) return { ok: false, message: TOO_MANY_MACS, clear: false };
     const deviceName = name.trim() === "" ? this.defaultName() : name.trim();
     // The id is made before the Mac spends its code: nothing after the Mac's answer can fail but
     // the saves, which say how to recover.
-    const before = this.pairings.find((p) => p.id === sameId);
     const id = before?.id ?? this.freshId(this.pairings);
-    const client = new HubClient({ ...this.clientOptions, url: parsed.url, token: null, factory: this.factory });
+    const key = this.newKey();
+    const client = this.clientFor(parsed, key);
     this.pairing = client;
     this.pairingId = id;
     if (this.current.notice !== null) this.emit({ notice: null });
     try {
-      const { token } = await client.pair(parsed.secret, deviceName, this.platform);
-      const pairing: Pairing = { id, hubUrl: parsed.url, deviceName, macName: before?.macName ?? macNameOf(parsed.url) };
-      const tokens = tokenStore(this.keychain, pairing.id);
+      const paired = await client.pair(parsed.secret, deviceName, this.platform, onCode);
+      const macName = before?.macName ?? cleanMacName(paired.name) ?? macNameOf(null);
+      const pairing: Pairing = { id, relay: parsed.relay, channel: parsed.channel, hubKey: parsed.hubKey, deviceName, macName };
+      const keys = keyStore(this.keychain, pairing.id);
       let notifications = false;
       const kept =
-        (await keepToken(tokens, token)) &&
+        (await keepKey(keys, key)) &&
         (await updateSettings((s) => {
           notifications = s.notifications;
           return { pairings: withPairing(s.pairings, pairing), deviceName };
         }));
       if (!kept) {
-        await tokens.clear().catch(() => undefined);
+        await keys.clear().catch(() => undefined);
         return { ok: false, message: unsaved(deviceName), clear: true };
       }
       this.pairings = withPairing(this.pairings, pairing);
       this.savedName = deviceName;
-      // The Mac's old link, when it pairs again, gives way to the new one.
+      // The Mac's old link, when it pairs again, gives way to the new one, which picks its sessions
+      // up where the old one had them.
       const old = this.all.find((l) => l.id === pairing.id);
+      let cursors: Record<string, Cursor> | undefined;
       if (old) {
+        cursors = old.client.cursorsNow();
         old.client.stop();
-        this.drop(old);
+        this.drop(old, { keepStore: true });
       }
       // The notifications step, unless they are on already (the new Mac is sent them at ready).
-      this.adopt(pairing, client, tokens, projectId() !== null && !notifications);
-      return { ok: true };
+      this.adopt(pairing, this.clientFor(pairing, key, { cursors }), keys, projectId() !== null && !notifications);
+      return { ok: true, macName };
     } catch (error) {
       if (!(error instanceof Refusal)) return { ok: false, message: "Pairing failed", clear: false };
-      // Only a spent or expired code is refused as `unpaired`; on any other refusal the Mac keeps
-      // the code, and the link is good to try again (another device name, a moment later).
+      // Only a spent or expired code, or a no at the Mac, is refused as `unpaired`; on any other
+      // refusal the Mac keeps the code, and the link is good to try again (another device name, a
+      // moment later).
       return { ok: false, message: error.message, clear: error.code === "unpaired" };
     } finally {
       this.pairing = null;
@@ -385,14 +379,14 @@ export class Fleet {
    * (keys, views, drafts, sent texts and toasts) are dropped at once, and Pair shows, with no
    * notice, when no Mac is left. Each ready link first tells its Mac "notifications off" (see
    * `MacLink.goodbye`); when no Mac is left and none of those unpaired had a link, the phone
-   * drops its push registration instead. Then the pairing leaves settings and its token the keychain (tried
-   * twice). If either will not go, the notice says so; a token left behind is deleted at the next
-   * launch. The device name stays to prefill the next pairing. The Mac keeps listing the phone
+   * drops its push registration instead. Then the pairing leaves settings and its key the keychain
+   * (tried twice). If either will not go, the notice says so; a key left behind is deleted at the
+   * next launch. The device name stays to prefill the next pairing. The Mac keeps listing the phone
    * until `octet hub revoke` there. Pairing waits for the writes, so they cannot delete a new
-   * token.
+   * key.
    */
   async unpair(mac?: string): Promise<void> {
-    // A pairing with no link (its token unreadable, or still on its way) is unpaired too.
+    // A pairing with no link (its key unreadable) is unpaired too.
     const ids = this.pairings.filter((p) => mac === undefined || p.id === mac).map((p) => p.id);
     if (ids.length === 0) return;
     this.unpairing += 1;
@@ -408,8 +402,8 @@ export class Fleet {
         this.drop(link);
       }
       // No Mac is left, and none of these had a link to say "notifications off" on (each had its
-      // token unreadable, or still on its way): the phone drops its push registration itself, so
-      // that any Mac still pushing to it bounces and forgets the token.
+      // key unreadable): the phone drops its push registration itself, so that any Mac still
+      // pushing to it bounces and forgets the token.
       if (last && going.length === 0) void dropPushRegistration();
       const removed = this.removeStored(ids, last);
       // Before any await: a foreground event now finds no client to start.
@@ -420,9 +414,10 @@ export class Fleet {
     }
   }
 
-  /** The Mac refused this phone's token as unpaired or revoked: only its pairing goes (its token
-   * deleted), and the notice names it; Pair shows when no Mac is left. Only the hub's refusal
-   * gets here; a dropped network never does. */
+  /** The Mac refused this phone's key as unpaired or revoked: only its pairing goes (its key
+   * deleted), and the notice names it; Pair shows when no Mac is left. Only the hub's refusal,
+   * inside the encrypted channel, gets here; a dropped network or a close from the relay never
+   * does. */
   private macUnpaired(link: MacLink): void {
     if (!this.all.includes(link)) return;
     const last = this.pairings.every((p) => p.id === link.id);
@@ -435,34 +430,29 @@ export class Fleet {
     this.emit(this.all.length === 0 ? { status: "unpaired", notice, offer: false } : { notice });
   }
 
-  /** Lets go of `link`: it stops feeding the store, and the store forgets what its Mac sent. */
-  private drop(link: MacLink): void {
+  /** Lets go of `link`: it stops feeding the store, and the store forgets what its Mac sent, but
+   * with `keepStore` (a link that a new pairing of its Mac replaces, and feeds on from there). */
+  private drop(link: MacLink, { keepStore = false }: { keepStore?: boolean } = {}): void {
     this.stopHandOvers(link.id);
     link.release();
     this.all = this.all.filter((l) => l !== link);
-    this.store.getState().reset(link.id);
+    if (!keepStore) this.store.getState().reset(link.id);
   }
 
-  /** Removes pairings `ids` from settings and their tokens from the keychain. With `last`, no Mac
+  /** Removes pairings `ids` from settings and their keys from the keychain. With `last`, no Mac
    * is left: notifications go off with the kinds back at the defaults, so that a new pairing
-   * starts there on the Mac (which forgot this phone's token with the phone). False when either
-   * could not be done; a token left is in `forget`, for the next launch. */
+   * starts there on the Mac (which forgot this phone's push token with the phone). False when
+   * either could not be done; a key left is in `forget`, for the next launch. */
   private async removeStored(ids: string[], last: boolean): Promise<boolean> {
     this.pairings = this.pairings.filter((p) => !ids.includes(p.id));
-    // The pairing still waiting for an older version's token: the move ends with it, or the next
-    // launch would make it again.
-    const moving = this.pending !== null && ids.includes(this.pending);
-    if (moving) this.pending = null;
     const settings = await updateSettings((s) => ({
       pairings: s.pairings.filter((p) => !ids.includes(p.id)),
       forget: [...new Set([...s.forget, ...ids])],
-      ...(last || moving ? { hubUrl: null } : {}),
       ...(last ? { notifications: false, pushKinds: DEFAULT_PUSH_KINDS } : {}),
     }));
-    if (moving) await this.keychain.delete(TOKEN_KEY).catch(() => undefined);
     const deleted: string[] = [];
     for (const id of ids) {
-      // The same Mac pairing again meanwhile keeps its id: its new token is not this one's to
+      // The same Mac pairing again meanwhile keeps its id: its new key is not this one's to
       // delete. (The id stays in `forget`, which the next launch drops for a saved pairing.)
       if (id === this.pairingId || this.pairings.some((p) => p.id === id)) continue;
       const clear = () => this.keychain.delete(tokenKeyOf(id)).then(() => true, () => false);
@@ -474,8 +464,8 @@ export class Fleet {
 
   /** Makes `client` Mac `pairing.id`'s link, feeding the store, and connects it if in the
    * foreground. `offer` holds Pair for the notifications step. */
-  private adopt(pairing: Pairing, client: HubClient, tokens: TokenStore, offer: boolean): void {
-    const link = new MacLink(this.host, pairing, client, tokens);
+  private adopt(pairing: Pairing, client: HubClient, keys: KeyStore, offer: boolean): void {
+    const link = new MacLink(this.host, pairing, client, keys);
     const order = (l: MacLink) => this.pairings.findIndex((p) => p.id === l.id);
     this.all = [...this.all, link].sort((a, b) => order(a) - order(b));
     link.attach();
@@ -639,18 +629,15 @@ export class Fleet {
    * acked. Unpairing a Mac stops any send to it that is under way.
    */
   async sendInBackground(macs: readonly string[], body: RequestBody): Promise<string[]> {
-    const targets = this.all.filter((link) => macs.includes(link.id) && link.client.token !== null);
+    const targets = this.all.flatMap((link) => {
+      const key = link.client.key;
+      return macs.includes(link.id) && key !== null ? [{ link, key }] : [];
+    });
     const results = await Promise.all(
       targets.map(
-        (link) =>
+        ({ link, key }) =>
           new Promise<string | null>((resolve) => {
-            const client = new HubClient({
-              ...this.clientOptions,
-              url: link.pairing.hubUrl,
-              token: link.client.token,
-              factory: this.factory,
-              background: true,
-            });
+            const client = this.clientFor(link.pairing, key, { background: true });
             let done = false;
             let asked = false;
             let cancel = () => {};
@@ -724,7 +711,7 @@ export class Fleet {
     const macs = this.pairings.map((p) => {
       const link = this.all.find((l) => l.id === p.id);
       if (link) return link.info();
-      const host = hostOf(p.hubUrl) ?? "";
+      const host = hostOf(p.relay) ?? "";
       const had = this.unlinked.get(p.id);
       const info: MacInfo = had && had.macName === p.macName && had.host === host ? had : { id: p.id, macName: p.macName, host };
       unlinked.set(p.id, info);

@@ -56,10 +56,15 @@ export const rawOf = (key: string): string | null => splitKey(key)?.raw ?? null;
 /** The Mac of a key; null for a string that is not one. */
 export const macOfKey = (key: string): string | null => splitKey(key)?.mac ?? null;
 
-/** One pairing, as the phone keeps it. */
+/** One pairing, as the phone keeps it: the phone's own id for it, and, from the pairing link, the
+ * relay it reaches the Mac through (`wss://<authority>/`), the hub's channel id there and the
+ * hub's static public key (each 64 lowercase hex digits). The private key it pairs with is in the
+ * keychain, under the id. */
 export interface Pairing {
   id: string;
-  hubUrl: string;
+  relay: string;
+  channel: string;
+  hubKey: string;
   deviceName: string;
   macName: string;
 }
@@ -80,11 +85,12 @@ export const hostKey = (host: string): string => host.replace(/\.$/, "").toLower
 /** Whether two hosts are the same, without case or a trailing dot. */
 export const sameHost = (a: string, b: string): boolean => hostKey(a) === hostKey(b);
 
-/** The pairing whose hub host is `host`, compared without case; null when none is. */
-export function macOfHost(pairings: readonly Pick<Pairing, "id" | "hubUrl">[], host: string): string | null {
+/** The pairing whose relay's host is `host`, compared without case; null when none is. (Until the
+ * app names a Mac from outside by its channel id, it is by the host it is reached at.) */
+export function macOfHost(pairings: readonly Pick<Pairing, "id" | "relay">[], host: string): string | null {
   if (host === "") return null;
   for (const p of pairings) {
-    const own = hostOf(p.hubUrl);
+    const own = hostOf(p.relay);
     if (own !== null && sameHost(own, host)) return p.id;
   }
   return null;
@@ -116,7 +122,7 @@ export const isSessionId = (raw: string): boolean => raw.length <= SESSION_ID_CH
  * there is just one. Null for a host no pairing has, no host with several pairings, and a raw id
  * that is not one.
  */
-export function keyFor(pairings: readonly Pick<Pairing, "id" | "hubUrl">[], host: string | null, raw: string): string | null {
+export function keyFor(pairings: readonly Pick<Pairing, "id" | "relay">[], host: string | null, raw: string): string | null {
   if (!isSessionId(raw)) return null;
   const mac = host !== null ? macOfHost(pairings, host) : pairings.length === 1 ? (pairings[0]?.id ?? null) : null;
   return mac === null ? null : keyOf(mac, raw);
@@ -133,7 +139,7 @@ export interface Tap {
  * The key a push tap opens, or null for the Inbox: the tap's session on its Mac, by `keyFor`. No
  * session, any tap `keyFor` finds no key for, or a session `ended` says is over: the Inbox.
  */
-export function tapKey(tap: Tap, pairings: readonly Pick<Pairing, "id" | "hubUrl">[], ended: (key: string) => boolean): string | null {
+export function tapKey(tap: Tap, pairings: readonly Pick<Pairing, "id" | "relay">[], ended: (key: string) => boolean): string | null {
   const key = tap.session === null ? null : keyFor(pairings, tap.host, tap.session);
   return key === null || ended(key) ? null : key;
 }
@@ -186,7 +192,7 @@ export function macStatus(state: HubState, tried: boolean): "asleep" | "connecti
 }
 
 /** What Settings › Machines says of a Mac: "online" when ready; "offline" for a pairing with no
- * link (never tried, and not trying: its token could not be read, or is on its way); else its
+ * link (never tried, and not trying: its key could not be read); else its
  * `macStatus`, "asleep" or "connecting…". */
 export function machineWords(state: HubState, tried: boolean): "online" | "offline" | "asleep" | "connecting…" {
   if (state === "ready") return "online";

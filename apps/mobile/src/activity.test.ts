@@ -19,7 +19,7 @@ import {
   widgetEntries,
   type ActivityRow,
 } from "./activityModel";
-import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
+import { FakeClock, Sockets, pairingOf, phoneUrlOf, type FakeSocket } from "./client/fakes";
 import { FakeLive } from "./liveRig";
 import { Fleet, HAND_OVER_MS, tokenKeyOf } from "./hub";
 import { keyOf } from "./macs";
@@ -34,7 +34,8 @@ const STUDIO = "m00000001";
 const MINI = "m00000002";
 const STUDIO_HOST = "studio.tail1234.ts.net";
 const MINI_HOST = "mini.tail1234.ts.net";
-const urlOf = (host: string) => `wss://${host}/`;
+/** The address of the phone sockets to the Mac on `host`, reached through a relay of that name. */
+const urlOf = (host: string) => phoneUrlOf(host, host);
 const A = "101-1790000000";
 const B = "202-1790000000";
 
@@ -64,13 +65,13 @@ async function rig({ macs = [STUDIO_HOST, MINI_HOST], supported = true }: { macs
   for (const i of macs.keys()) await SecureStore.setItemAsync(tokenKeyOf(ids[i] ?? ""), TOKEN);
   await saveSettings({
     deviceName: "iPhone",
-    pairings: macs.map((host, i) => ({ id: ids[i] ?? "", hubUrl: urlOf(host), deviceName: "iPhone", macName: host.split(".")[0] ?? "" })),
+    pairings: macs.map((host, i) => pairingOf(ids[i] ?? "", host, host, { macName: host.split(".")[0] ?? "" })),
   });
   const sockets = new Sockets();
   const clock = new FakeClock();
   const store = createOctetStore();
   const fleet = new Fleet({
-    factory: sockets.factory,
+    factory: () => sockets.factory,
     store,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
@@ -513,11 +514,11 @@ describe("Deny from the Island", () => {
 
   it("a Deny handed over before the pairings are read is answered once they are", async () => {
     await SecureStore.setItemAsync(tokenKeyOf(STUDIO), TOKEN);
-    await saveSettings({ pairings: [{ id: STUDIO, hubUrl: urlOf(STUDIO_HOST), deviceName: "iPhone", macName: "studio" }] });
+    await saveSettings({ pairings: [pairingOf(STUDIO, STUDIO_HOST, STUDIO_HOST, { macName: "studio" })] });
     const sockets = new Sockets();
     const clock = new FakeClock();
     const store = createOctetStore();
-    const fleet = new Fleet({ factory: sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
+    const fleet = new Fleet({ factory: () => sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
     const api = new FakeLive(clock.now);
     const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
     live.start();
@@ -679,7 +680,7 @@ describe("the switch", () => {
     const sockets = new Sockets();
     const clock = new FakeClock();
     const store = createOctetStore();
-    const fleet = new Fleet({ factory: sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
+    const fleet = new Fleet({ factory: () => sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
     const api = new FakeLive(clock.now);
     const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
     live.start();
@@ -863,11 +864,11 @@ describe("the app is kept running until a background send settles", () => {
 
   it("a Deny handed over before the pairings are read is settled once it is sent", async () => {
     await SecureStore.setItemAsync(tokenKeyOf(STUDIO), TOKEN);
-    await saveSettings({ pairings: [{ id: STUDIO, hubUrl: urlOf(STUDIO_HOST), deviceName: "iPhone", macName: "studio" }] });
+    await saveSettings({ pairings: [pairingOf(STUDIO, STUDIO_HOST, STUDIO_HOST, { macName: "studio" })] });
     const sockets = new Sockets();
     const clock = new FakeClock();
     const store = createOctetStore();
-    const fleet = new Fleet({ factory: sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
+    const fleet = new Fleet({ factory: () => sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
     const api = new FakeLive(clock.now);
     const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
     live.start();
@@ -951,11 +952,11 @@ describe("the app is kept running until a background send settles", () => {
 
   it("a cold launch in the background for a token is settled only after the hand-over it waited for", async () => {
     await SecureStore.setItemAsync(tokenKeyOf(STUDIO), TOKEN);
-    await saveSettings({ deviceName: "iPhone", pairings: [{ id: STUDIO, hubUrl: urlOf(STUDIO_HOST), deviceName: "iPhone", macName: "studio" }] });
+    await saveSettings({ deviceName: "iPhone", pairings: [pairingOf(STUDIO, STUDIO_HOST, STUDIO_HOST, { macName: "studio" })] });
     const sockets = new Sockets();
     const clock = new FakeClock();
     const store = createOctetStore();
-    const fleet = new Fleet({ factory: sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
+    const fleet = new Fleet({ factory: () => sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
     const api = new FakeLive(clock.now);
     const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
     fleet.setForeground(false);
@@ -1043,14 +1044,14 @@ describe("the hand-over in the background", () => {
     await saveSettings({
       deviceName: "iPhone",
       pairings: [
-        { id: STUDIO, hubUrl: urlOf(STUDIO_HOST), deviceName: "iPhone", macName: "studio" },
-        { id: MINI, hubUrl: urlOf(MINI_HOST), deviceName: "iPhone", macName: "mini" },
+        pairingOf(STUDIO, STUDIO_HOST, STUDIO_HOST, { macName: "studio" }),
+        pairingOf(MINI, MINI_HOST, MINI_HOST, { macName: "mini" }),
       ],
     });
     const sockets = new Sockets();
     const clock = new FakeClock();
     const store = createOctetStore();
-    const fleet = new Fleet({ factory: sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
+    const fleet = new Fleet({ factory: () => sockets.factory, store, platform: "ios", clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 } });
     const api = new FakeLive(clock.now);
     const live = new LiveActivity({ api, fleet, store, now: clock.now, schedule: clock.schedule });
     // iOS launches the app in the background: the shell starts, nothing is in the foreground.

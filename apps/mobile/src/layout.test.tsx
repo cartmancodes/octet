@@ -11,7 +11,9 @@ import { AppState, Text } from "react-native";
 
 import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
-import { FakeClock, Sockets } from "./client/fakes";
+import { FakeClock, Sockets, pairLinkTo, pairingOf } from "./client/fakes";
+import { fromHex } from "./client/link";
+import { newKeyPair } from "./client/noise";
 import { HubContext, Fleet, TOKEN_KEY, tokenKeyOf, unpairedNotice } from "./hub";
 import { drawerScreen } from "./drawer";
 import { saveSettings } from "./persist";
@@ -41,9 +43,10 @@ jest.mock("expo-constants", () => ({
   },
 }));
 
+/** The private key, as hex, of the saved pairing and of the key pair a pairing makes. */
 const TOKEN = "cd".repeat(32);
 const n = Notifications as jest.Mocked<typeof Notifications>;
-const LINK = `https://mac.tail1234.ts.net/#pair=${"ab".repeat(32)}`;
+const LINK = pairLinkTo("mac", "ab".repeat(32), { relay: "mac.tail1234.ts.net" });
 
 let changeAppState: (state: string) => void = () => {};
 
@@ -62,15 +65,16 @@ afterEach(() => jest.restoreAllMocks());
 
 async function launch(opts: { paired?: boolean } = {}) {
   if (opts.paired) {
-    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
+    await SecureStore.setItemAsync(tokenKeyOf(M), TOKEN);
+    await saveSettings({ pairings: [pairingOf(M, "mac", "mac.tail1234.ts.net")] });
   }
   const sockets = new Sockets();
   const clock = new FakeClock();
   // The app's store: the screens read each Mac's link from it.
   octetStore.getState().reset();
   const hub = new Fleet({
-    factory: sockets.factory,
+    factory: () => sockets.factory,
+    newKey: () => newKeyPair(() => fromHex(TOKEN) ?? new Uint8Array(32)),
     store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
@@ -105,7 +109,7 @@ async function connected({ sockets }: { sockets: Sockets }): Promise<void> {
 }
 
 describe("the app shell", () => {
-  it("opens on Pair without a token", async () => {
+  it("opens on Pair without a key", async () => {
     const { sockets } = await launch();
     expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
     expect(screen.queryByText("Sessions list")).toBeNull();
@@ -114,7 +118,7 @@ describe("the app shell", () => {
 
   it("a link to Usage before pairing lands on Pair, not Usage", async () => {
     const sockets = new Sockets();
-    const hub = new Fleet({ factory: sockets.factory, store: createOctetStore(), platform: "ios" });
+    const hub = new Fleet({ factory: () => sockets.factory, store: createOctetStore(), platform: "ios" });
     const Layout = () => (
       <HubContext.Provider value={hub}>
         <RootLayout />
@@ -131,7 +135,7 @@ describe("the app shell", () => {
 
   it("a link to a session before pairing lands on Pair, not the session", async () => {
     const sockets = new Sockets();
-    const hub = new Fleet({ factory: sockets.factory, store: createOctetStore(), platform: "ios" });
+    const hub = new Fleet({ factory: () => sockets.factory, store: createOctetStore(), platform: "ios" });
     const Layout = () => (
       <HubContext.Provider value={hub}>
         <RootLayout />
@@ -148,7 +152,7 @@ describe("the app shell", () => {
     expect(sockets.all).toHaveLength(0);
   });
 
-  it("opens on Sessions with a token, and connects once", async () => {
+  it("opens on Sessions with a key, and connects once", async () => {
     const { sockets } = await launch({ paired: true });
     expect(await screen.findByText("Sessions list")).toBeTruthy();
     expect(screen.queryByText("Scan the code from /remote-control pair")).toBeNull();
@@ -183,17 +187,17 @@ describe("the app shell", () => {
     expect(sockets.last.closed).toBe(false);
   });
 
-  it("pairing goes to Sessions and connects with the new token", async () => {
+  it("pairing goes to Sessions and says hello with the new key on a connection of its own", async () => {
     const { sockets } = await launch();
     await fireEvent.changeText(await screen.findByLabelText("Pairing link"), LINK);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     sockets.last.open();
     const [command] = sockets.last.commandsOf("pair");
-    sockets.last.receive({ type: "paired", req: command?.req, token: TOKEN, device: "iPhone" });
+    sockets.last.receive({ type: "paired", req: command?.req, device: "iPhone", name: "mac" });
     expect(await screen.findByText("Sessions list")).toBeTruthy();
     expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
     await act(async () => sockets.last.open());
-    expect(sockets.last.commandsOf("hello")).toEqual([expect.objectContaining({ token: TOKEN })]);
+    expect(sockets.last.commandsOf("hello")).toEqual([{ v: 1, type: "hello", req: expect.any(Number) }]);
   });
 
   it("closes the socket in the background and connects again in the foreground", async () => {
@@ -288,8 +292,11 @@ describe("notifications", () => {
   });
 
   it("keeps the splash up while the saved pairing is being read", async () => {
+    // A saved pairing whose key the keychain is still reading.
+    await saveSettings({ pairings: [pairingOf(M, "mac", "mac.tail1234.ts.net")] });
+    const sockets = new Sockets();
     const hub = new Fleet({
-      factory: new Sockets().factory,
+      factory: () => sockets.factory,
       store: createOctetStore(),
       platform: "ios",
       keychain: { get: () => new Promise(() => {}), set: async () => {}, delete: async () => {} },
@@ -381,7 +388,7 @@ describe("notifications", () => {
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     sockets.last.open();
     const [command] = sockets.last.commandsOf("pair");
-    sockets.last.receive({ type: "paired", req: command?.req, token: TOKEN, device: "iPhone" });
+    sockets.last.receive({ type: "paired", req: command?.req, device: "iPhone", name: "mac" });
     const skip = await screen.findByRole("button", { name: "Not now" });
     await act(async () => listener()?.(tap({ session: SESSION })));
     expect(view.getPathname()).toBe("/pair");
@@ -405,7 +412,7 @@ describe("notifications", () => {
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     sockets.last.open();
     const [command] = sockets.last.commandsOf("pair");
-    sockets.last.receive({ type: "paired", req: command?.req, token: TOKEN, device: "iPhone" });
+    sockets.last.receive({ type: "paired", req: command?.req, device: "iPhone", name: "mac" });
     const skip = await screen.findByRole("button", { name: "Not now" });
     expect(screen.queryByText("Sessions list")).toBeNull();
     expect(view.getPathname()).toBe("/pair");

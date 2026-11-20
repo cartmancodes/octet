@@ -572,7 +572,7 @@ export class LiveActivity {
    * the phone is away. Tried when the token comes, and again once the setting and the pairings are
    * read (a closed app that iOS launched in the background for it), at most once for the same
    * body. This needs iOS to give the app time in the background for the token, and the phone
-   * unlocked (a Mac's device token is in the keychain, readable only then: a locked phone's
+   * unlocked (a Mac's private key is in the keychain, readable only then: a locked phone's
    * pairings have no link); without either the owner gets the token on the next foreground. */
   private handOver(): void {
     if (this.wanted() !== true || this.stopped || this.tokens.token === null) return;

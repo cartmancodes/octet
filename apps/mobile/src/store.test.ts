@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react-native";
 
-import { FakeClock, Sockets } from "./client/fakes";
+import { FakeClock, Sockets, identityOf } from "./client/fakes";
 import { HubClient } from "./client/HubClient";
 import { MAX_SESSION_ROWS, type CatalogInfo, type JournalEvent, type SessionInfo, type StateInfo, type ToPhone } from "./protocol";
 import { entrySize } from "./model/transcript";
@@ -821,7 +821,7 @@ describe("with a client", () => {
   function rig() {
     const sockets = new Sockets();
     const clock = new FakeClock();
-    const client = new HubClient({ url: "wss://mac/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
+    const client = new HubClient({ ...identityOf("mac"), factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
     links = linksOf(new Map([[M, client]]));
     const off = connectStore(store, client, { mac: M, links, now: clock.now, schedule: clock.schedule });
     client.start();
