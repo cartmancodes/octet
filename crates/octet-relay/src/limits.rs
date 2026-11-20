@@ -23,7 +23,9 @@ pub struct Limits {
     /// Hub control sockets (registration attempts) one client address may open per minute; one
     /// more is closed with 4429.
     pub registrations_per_minute: u32,
-    /// The rate at which the relay reads from one connection, in bytes a second, past the burst.
+    /// The rate at which the relay reads from one connection (a hub's control connection, a
+    /// phone, a hub's data connection), in bytes a second, past the burst. Every message counts:
+    /// text, binary, ping and pong alike.
     pub bytes_per_second: u64,
     /// The bytes one connection may send at once before the rate applies: room for a journal
     /// replay.

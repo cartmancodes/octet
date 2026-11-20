@@ -891,3 +891,97 @@ async fn the_probe_passes_against_a_running_relay_and_fails_against_a_closed_por
     let why = probe(&format!("ws://{addr}")).await.unwrap_err();
     assert!(!why.is_empty());
 }
+
+/// A byte rate low enough that 10,000 bytes past a 5,000 byte burst take a quarter second.
+fn slow_rate() -> Config {
+    with_limits(Limits {
+        bytes_per_second: 20_000,
+        burst_bytes: 5_000,
+        ..roomy_limits()
+    })
+}
+
+/// Sends a ping after `before` and waits for its pong: how long the relay took to read its way
+/// to the ping. Its pong is written by the relay's WebSocket layer only when it reads the ping.
+async fn pong_after(socket: &mut Ws, before: Vec<Message>) -> Duration {
+    let started = Instant::now();
+    for message in before {
+        socket.send(message).await.expect("send");
+    }
+    socket
+        .send(Message::Ping(b"rate".to_vec().into()))
+        .await
+        .expect("ping");
+    within(async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Pong(payload))) if payload.as_ref() == b"rate" => return,
+                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Text(_))) => {}
+                other => panic!("expected the pong, got {other:?}"),
+            }
+        }
+    })
+    .await;
+    started.elapsed()
+}
+
+/// Ten unknown control messages of 1,000 bytes each: 10,000 bytes.
+fn junk() -> Vec<Message> {
+    let pad = json!({"pad": "x".repeat(1000 - 10)}).to_string();
+    assert_eq!(pad.len(), 1000);
+    (0..10).map(|_| text(&pad)).collect()
+}
+
+#[tokio::test]
+async fn a_control_socket_is_held_to_the_byte_rate() {
+    let relay = start(slow_rate()).await;
+    let key = new_key();
+
+    // Before registering: the challenge is still unanswered.
+    let mut control = open(relay.addr, &hub_path(&channel_of(&key))).await;
+    let challenge = challenge_of(&mut control).await;
+    let took = pong_after(&mut control, junk()).await;
+    assert!(took >= Duration::from_millis(200), "read at once: {took:?}");
+    control
+        .send(answer(&key, &key, &signed(&challenge)))
+        .await
+        .expect("send");
+    assert_eq!(next_json(&mut control).await, json!({"registered": true}));
+
+    // Registered: a fresh burst has refilled by now only if the meter is per connection and
+    // time has passed; wait it out, then the same again.
+    sleep(Duration::from_millis(300)).await;
+    let took = pong_after(&mut control, junk()).await;
+    assert!(took >= Duration::from_millis(200), "read at once: {took:?}");
+    let _phone = open(relay.addr, &phone_path(&channel_of(&key))).await;
+    next_connect(&mut control).await;
+}
+
+#[tokio::test]
+async fn pings_on_a_spliced_socket_are_held_to_the_byte_rate() {
+    let relay = start(slow_rate()).await;
+    let key = new_key();
+    let channel = channel_of(&key);
+    let mut control = register(relay.addr, &key).await;
+    let (mut phone, mut data) = spliced(relay.addr, &mut control, &channel).await;
+    // 80 pings of 125 bytes (the most a ping may carry): 10,000 bytes of control frames.
+    let started = Instant::now();
+    for _ in 0..80 {
+        phone
+            .send(Message::Ping(vec![0; 125].into()))
+            .await
+            .expect("ping");
+    }
+    phone.send(binary(b"after the pings")).await.expect("send");
+    let reading = async {
+        // The phone must read too, so the relay's pongs to it do not back up.
+        let draining = async { while let Some(Ok(_)) = phone.next().await {} };
+        tokio::select! {
+            () = draining => panic!("the phone's connection ended"),
+            bytes = next_binary(&mut data) => bytes,
+        }
+    };
+    assert_eq!(reading.await, b"after the pings");
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(200), "read at once: {took:?}");
+}

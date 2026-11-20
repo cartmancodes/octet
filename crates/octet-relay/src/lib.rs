@@ -32,8 +32,10 @@
 //!
 //! # Limits
 //!
-//! See [`Limits`]. Every limit refuses the newcomer: none drops an established splice. Nothing
-//! is buffered for a side that is not there: a phone is not read until its hub data connection
+//! See [`Limits`]. Every limit refuses the newcomer: none drops an established splice. Every
+//! connection the relay reads from is held to [`Limits::bytes_per_second`], each message it sends
+//! counting (control text, pings and pongs too); past the rate the relay reads later and drops
+//! nothing. Nothing is buffered for a side that is not there: a phone is not read until its hub data connection
 //! arrives, and a message for a side that has gone goes with the connection.
 //!
 //! # Logging
@@ -1023,8 +1025,14 @@ async fn control(shared: &Arc<Shared>, mut socket: Socket, channel: &str, addres
         return;
     }
     let deadline = Instant::now() + limits.unspliced;
+    let mut rate = ByteRate::new(limits, Instant::now());
     let answer = loop {
-        let message = match timeout_at(deadline, socket.next()).await {
+        let ready_at = rate.ready_at();
+        let read = async {
+            sleep_until(ready_at).await;
+            socket.next().await
+        };
+        let message = match timeout_at(deadline, read).await {
             Err(_) => {
                 shared.count(|counts| &mut counts.unanswered);
                 return close(socket, TOO_LATE, "no answer in time").await;
@@ -1033,6 +1041,7 @@ async fn control(shared: &Arc<Shared>, mut socket: Socket, channel: &str, addres
             Ok(Some(Err(WsError::Capacity(_)))) => return close(socket, TOO_BIG, "").await,
             Ok(_) => return,
         };
+        rate.take(message.len(), Instant::now());
         match hear(message) {
             Heard::Registration(answer) => break answer,
             Heard::Pong | Heard::Other => {}
@@ -1049,7 +1058,7 @@ async fn control(shared: &Arc<Shared>, mut socket: Socket, channel: &str, addres
     };
     let registered = json!({"registered": true}).to_string();
     let end = if send(&mut socket, Message::Text(registered.into()), limits).await {
-        announce(limits, &mut socket, ids).await
+        announce(limits, &mut socket, ids, rate).await
     } else {
         ControlEnd::Gone
     };
@@ -1071,15 +1080,18 @@ async fn control(shared: &Arc<Shared>, mut socket: Socket, channel: &str, addres
 }
 
 /// A registered control connection: sends `{"connect": <id>}` for each phone, pings, and
-/// ignores what the hub says until it ends.
+/// ignores what the hub says until it ends, reading it no faster than `rate` allows.
 async fn announce(
     limits: &Limits,
     socket: &mut Socket,
     mut ids: mpsc::Receiver<String>,
+    mut rate: ByteRate,
 ) -> ControlEnd {
     let mut pings = every(limits.ping_every);
     let mut missed = 0;
     loop {
+        let ready_at = rate.ready_at();
+        let ready = ready_at <= Instant::now();
         tokio::select! {
             id = ids.recv() => {
                 // The ids stop only when the registration is dropped, which a newer one does.
@@ -1100,13 +1112,17 @@ async fn announce(
                     return ControlEnd::Gone;
                 }
             }
-            message = socket.next() => match message {
-                Some(Ok(message)) => match hear(message) {
-                    Heard::Pong => missed = 0,
-                    Heard::Registration(_) | Heard::Other => {}
-                    Heard::Closed => return ControlEnd::Closed,
-                    Heard::Bad(code) => return ControlEnd::Bad(code),
-                },
+            () = sleep_until(ready_at), if !ready => {}
+            message = socket.next(), if ready => match message {
+                Some(Ok(message)) => {
+                    rate.take(message.len(), Instant::now());
+                    match hear(message) {
+                        Heard::Pong => missed = 0,
+                        Heard::Registration(_) | Heard::Other => {}
+                        Heard::Closed => return ControlEnd::Closed,
+                        Heard::Bad(code) => return ControlEnd::Bad(code),
+                    }
+                }
                 Some(Err(WsError::Capacity(_))) => return ControlEnd::Bad(TOO_BIG),
                 Some(Err(_)) | None => return ControlEnd::Gone,
             },
@@ -1224,8 +1240,8 @@ impl SpliceEnd {
 }
 
 /// Passes binary messages both ways between the phone and hub `sockets`, unchanged, reading
-/// each side only as fast as its [`ByteRate`] allows, until one side ends or `ended` (the
-/// registration) does.
+/// each side only as fast as its [`ByteRate`] allows (every message it sends counts), until one
+/// side ends or `ended` (the registration) does.
 async fn pass(
     limits: &Limits,
     sockets: &mut [Socket; 2],
@@ -1265,9 +1281,12 @@ async fn pass(
             continue;
         };
         let other = 1 - side;
+        // Every message counts, pings and pongs too, so control frames are no way round the rate.
+        if let Some(Ok(message)) = &message {
+            rates[side].take(message.len(), Instant::now());
+        }
         match message {
             Some(Ok(Message::Binary(bytes))) => {
-                rates[side].take(bytes.len(), Instant::now());
                 if !send(&mut sockets[other], Message::Binary(bytes), limits).await {
                     return SpliceEnd::Gone(other);
                 }

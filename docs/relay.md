@@ -119,10 +119,11 @@ paired through: phones paired before the change must pair again, and `octet pair
 The defaults (`crates/octet-relay/src/limits.rs`): messages up to 66,560 bytes; 16 phone sockets
 per channel, waiting and spliced alike; 5,000 channels and 20,000 sockets across the relay; 30
 phone connections and 10 registration attempts a minute per client address (an IPv6 address
-counts by its /64); 256 KiB a second per connection after a 4 MiB burst; 10 seconds for a phone's
-hub to connect, for a hub to answer its challenge, and for a client to send its request; a ping
-every 20 seconds, and a connection that leaves two unanswered is dropped. Over a limit the
-newcomer is refused; an established splice is never dropped for one.
+counts by its /64); 256 KiB a second per connection after a 4 MiB burst, every message counting
+(control messages, pings and pongs too); 10 seconds for a phone's hub to connect, for a hub to
+answer its challenge, and for a client to send its request; a ping every 20 seconds, and a
+connection that leaves two unanswered is dropped. Over a limit the newcomer is refused; an
+established splice is never dropped for one.
 
 ## Updating and rolling back
 
