@@ -23,7 +23,7 @@ pub const DEFAULT_RELAY: &str = "wss://relay.octet.invalid";
 /// The loopback port of the TCP listener, which `hub.json` no longer sets. Task 6 deletes this
 /// with the listener.
 pub const DEFAULT_PORT: u16 = 47823;
-/// The environment variable that names a relay in a debug build, `ws://` allowed.
+/// The environment variable that names a relay in a debug build, `ws://` only.
 #[cfg(debug_assertions)]
 const RELAY_ENVIRONMENT: &str = "OCTET_HUB_RELAY_URL";
 /// How long a pairing secret works.
@@ -439,16 +439,18 @@ impl Store {
 
     /// Forgets every device, with every push and Live Activity token it holds: the hub made a new
     /// identity, so none of those phones can connect again, and none may keep getting
-    /// notifications. Nothing is written when there are none.
+    /// notifications. When `devices.json` exists it is rewritten empty, even if every record in
+    /// it was one from before keys (which are already gone from memory) or it is empty already;
+    /// a missing file stays missing.
     ///
     /// # Errors
     ///
     /// Fails if `devices.json` cannot be locked, read or written.
     pub async fn forget_all(&mut self) -> io::Result<()> {
-        self.update(Box::new(|devices: &mut Vec<Device>| {
-            let any = !devices.is_empty();
+        let present = fs::try_exists(self.directory.join("devices.json")).await?;
+        self.update(Box::new(move |devices: &mut Vec<Device>| {
             devices.clear();
-            ((), any)
+            ((), present)
         }))
         .await
     }
@@ -982,10 +984,12 @@ async fn read_config(directory: &Path) -> io::Result<HubConfig> {
     }
     #[cfg(debug_assertions)]
     if let Ok(relay) = std::env::var(RELAY_ENVIRONMENT) {
-        if split_relay(&relay).is_some() {
+        if environment_relay(&relay) {
             config.relay = relay;
         } else {
-            eprintln!("{RELAY_ENVIRONMENT} must be ws:// or wss:// <host>[:<port>] alone; ignored");
+            eprintln!(
+                "{RELAY_ENVIRONMENT} must be ws://<host> or ws://<host>:<port> alone; ignored"
+            );
         }
     }
     if !value["workspaces"].is_null() {
@@ -1005,6 +1009,12 @@ async fn read_config(directory: &Path) -> io::Result<HubConfig> {
         None
     });
     Ok(config)
+}
+
+/// Whether `relay` is an address `OCTET_HUB_RELAY_URL` may name.
+#[cfg(debug_assertions)]
+fn environment_relay(relay: &str) -> bool {
+    matches!(split_relay(relay), Some((false, _)))
 }
 
 /// Whether `relay` is a `wss://` address `hub.json` may name.
@@ -1370,6 +1380,58 @@ mod tests {
         assert!(Store::open(dir.path()).await.is_err());
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_environment_relay_is_a_ws_address_of_the_same_shape() {
+        assert!(environment_relay("ws://127.0.0.1:9000"));
+        assert!(environment_relay("ws://localhost"));
+        // Only `ws://`: `wss://` is what hub.json is for.
+        assert!(!environment_relay("wss://relay.example"));
+        assert!(!environment_relay("wss://relay.example:8443"));
+        for bad in [
+            "",
+            "http://localhost",
+            "ws://",
+            "ws://localhost/",
+            "ws://localhost/v1",
+            "ws://localhost?x=1",
+            "ws://me@localhost",
+            "ws://localhost:0",
+        ] {
+            assert!(!environment_relay(bad), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn forget_all_clears_records_from_before_keys_too() {
+        let dir = TempDir::new("hub-forget-legacy");
+        let hash = "a".repeat(64);
+        let legacy = format!(
+            concat!(
+                r#"{{"devices":[{{"name":"Old","platform":"ios","login":"me@example.com","#,
+                r#""created":1,"last_seen":2,"token_sha256":"{}","push_token":"{}","#,
+                r#""activity":{{"token":"{}","start_token":"{}"}}}}]}}"#
+            ),
+            hash, PUSH, ACTIVITY, START
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let file = dir.path().join("devices.json");
+        std::fs::write(&file, legacy).unwrap();
+        let mut store = store(&dir).await;
+        // The old record is already gone from memory, but not from the file.
+        assert!(store.devices().is_empty());
+        store.forget_all().await.unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        for gone in [PUSH, ACTIVITY, START, "Old", "token_sha256", "push_token"] {
+            assert!(!text.contains(gone), "{gone}: {text}");
+        }
+        assert!(Store::open(dir.path()).await.unwrap().devices().is_empty());
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[tokio::test]
     async fn forget_all_leaves_no_device_and_no_token() {
         let dir = TempDir::new("hub-forget");
@@ -1406,10 +1468,9 @@ mod tests {
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        // With none to forget, nothing is written, and a missing file stays missing.
-        let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+        // Twice is as good as once, and a missing file stays missing.
         store.forget_all().await.unwrap();
-        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+        assert!(Store::open(dir.path()).await.unwrap().devices().is_empty());
         let empty = TempDir::new("hub-forget-none");
         Store::open(empty.path())
             .await
