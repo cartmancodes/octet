@@ -1103,6 +1103,9 @@ impl App {
                 if first {
                     self.overlay.front_changed();
                 }
+                // Keys reach an approval before the palette, so it must not wait under one: the
+                // palette closes, and (taking no keys while an approval is open) stays closed.
+                self.overlay.palette = false;
             }
             Event::ApprovalClosed(id) => {
                 let front = self.overlay.approvals.front().map(|asked| asked.id);
