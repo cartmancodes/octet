@@ -565,3 +565,40 @@ async fn a_hub_that_made_a_new_key_starts_with_no_devices() {
     assert_eq!(env.status().await["devices"], 1);
     relay_state(&env.run, "registered").await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hub_stays_on_the_relay_while_a_phone_waits_to_hear_it_is_paired() {
+    let relay = Relay::start().await;
+    let mut env = Env::new();
+    env.start(&relay.url()).await;
+    let link = pair_link(&env.run).await;
+    relay_state(&env.run, "registered").await;
+    let mut phone = Phone::connect(&link, &PhoneKey::new())
+        .await
+        .expect("connects");
+    // Another process holds the devices file's lock: the pairing's save waits on it, with the
+    // secret spent and nothing paired yet.
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(env.root.join("devices.lock"))
+        .expect("the lock file");
+    lock.lock().expect("the lock");
+    phone
+        .send(
+            &json!({"v": 1, "req": 1, "type": "pair", "secret": link.secret,
+            "name": "Slow phone", "platform": "ios"}),
+        )
+        .await;
+    // Past the hub's every-second look: the phone waits for its answer, so the link stays up.
+    assert!(
+        !phone.closes_within(Duration::from_millis(3_500)).await,
+        "the link went while the phone waited"
+    );
+    assert_eq!(env.status().await["relay"], "registered");
+    drop(lock);
+    let paired = phone.recv().await;
+    assert_eq!(paired["type"], "paired", "{paired}");
+    assert_eq!(env.status().await["devices"], 1);
+}

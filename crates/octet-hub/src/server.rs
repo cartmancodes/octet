@@ -524,6 +524,9 @@ struct Conn {
     key: String,
     /// The device, once `hello` succeeded.
     device: Option<Device>,
+    /// Whether the phone waits for the answer to its `pair`: from a `pair` the hub took until
+    /// `paired` or the refusal goes to it. The relay link stays up meanwhile.
+    awaiting: bool,
     /// The sessions it streams, by id.
     subscriptions: HashMap<String, Subscription>,
     /// Whether its hello said it is the app in the background (handing a Live Activity token
@@ -811,20 +814,31 @@ impl Hub {
         Ok(())
     }
 
-    /// Tells the relay link whether it should be up: while a device is paired or a pairing
-    /// secret is out and unexpired, and for a moment after a revoke, so the revoked phone hears
-    /// it before its socket goes with the link.
+    /// Tells the relay link whether it should be up: while a device is paired, a pairing secret
+    /// is out and unexpired, or a phone waits for the answer to its `pair` (its secret already
+    /// spent, its device not yet saved), and for a moment after a revoke, so the revoked phone
+    /// hears it before its socket goes with the link.
     fn want_relay(&mut self) {
         let now = Instant::now();
         self.lingering = self.lingering.filter(|until| *until > now);
         let wanted = !self.store.devices().is_empty()
             || self.store.pairing_open(SystemTime::now())
+            || self.conns.values().any(|state| state.awaiting)
             || self.lingering.is_some();
         self.wanted.send_if_modified(|was| {
             let changed = *was != wanted;
             *was = wanted;
             changed
         });
+    }
+
+    /// Marks whether `conn`'s phone waits for the answer to its `pair` (see [`Conn::awaiting`]),
+    /// and tells the relay link. A connection that goes stops waiting with it.
+    fn await_answer(&mut self, conn: u64, awaiting: bool) {
+        if let Some(state) = self.conns.get_mut(&conn) {
+            state.awaiting = awaiting;
+        }
+        self.want_relay();
     }
 
     /// A number never handed out before.
@@ -864,6 +878,7 @@ impl Hub {
                 opened: seat.since(),
                 key: hex(&peer.key),
                 device: None,
+                awaiting: false,
                 subscriptions: HashMap::new(),
                 background: false,
                 listings: Listings::default(),
@@ -994,6 +1009,7 @@ impl Hub {
                 ) {
                     // Answered once the device is saved (see `on_saved`).
                     Ok(pairing) => {
+                        self.await_answer(conn, true);
                         let change = pair_change(pairing.device.clone());
                         self.save(change, move |result| AfterSave::Paired {
                             conn,
@@ -1294,12 +1310,13 @@ impl Hub {
                 pairing,
                 result,
             } => {
+                // Answered below either way; the link may go once it is sent.
+                self.await_answer(conn, false);
                 let reason = match result {
                     Ok(Ok(())) => {
                         // Who paired, and when; never the key or the secret.
                         self.store.audit(&pairing.device.name, "", "paired").await;
                         self.send(conn, &paired(&pairing.device.name, &self.name));
-                        self.want_relay();
                         return;
                     }
                     Ok(Err(reason)) => reason,
