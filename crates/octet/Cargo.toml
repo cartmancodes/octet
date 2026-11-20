@@ -13,8 +13,11 @@ octet-hub.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# The terminal's width, so `octet pair` shows its QR code only where it fits.
+crossterm = "0.29.0"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 octet-core = { workspace = true, features = ["testing"] }
 octet-testkit = { workspace = true, features = ["relay"] }
 libc.workspace = true

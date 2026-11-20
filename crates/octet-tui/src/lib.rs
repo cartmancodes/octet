@@ -30,6 +30,7 @@ use octet_core::goal::Next;
 use octet_core::{Command, Config, Session};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use registry::COMMANDS;
+pub use remote::qr_rows;
 use std::{io, path::PathBuf, time::Duration};
 pub(crate) use terminal::write_terminal;
 use terminal::{TerminalGuard, alert};

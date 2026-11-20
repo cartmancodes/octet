@@ -289,3 +289,37 @@ fn hub_serve_announces_itself_and_watch_follows_until_interrupted() {
     signal(&serve, libc::SIGTERM);
     assert_eq!(serve.wait().unwrap().code(), Some(0));
 }
+
+#[test]
+fn pair_help_and_usage_errors_reach_the_shell() {
+    let help = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .args(["pair", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("Usage: octet pair"), "{text}");
+    for gone in ["--port", "--owner", "tailscale", "tailnet"] {
+        assert!(!text.contains(gone), "{gone} in: {text}");
+    }
+    let main = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&main.stdout).contains("octet pair"));
+    // Refused before anything starts: no hub, no service.
+    let dir = octet_testkit::TempDir::new("octet-pair-cli");
+    for flag in ["--port", "--owner"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_octet"))
+            .args(["pair", flag, "x", "--journal-dir"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&format!("Unknown argument {flag}")),
+            "{flag}"
+        );
+        assert!(!dir.path().exists(), "{flag} touched the data directory");
+    }
+}

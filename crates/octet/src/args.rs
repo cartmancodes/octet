@@ -35,6 +35,13 @@ pub(crate) enum Parsed {
     HubHelp,
     /// `octet hub ...`.
     Hub(HubArgs),
+    /// `octet pair --help`.
+    PairHelp,
+    /// `octet pair`: pair a phone, starting the hub first if it is not running.
+    Pair {
+        /// Where the hub's files live (`--journal-dir`).
+        journal_dir: Option<PathBuf>,
+    },
     Run(Box<Args>),
 }
 
@@ -173,6 +180,9 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
     let mut args = args.into_iter().peekable();
     if args.next_if(|first| first == "hub").is_some() {
         return parse_hub(args);
+    }
+    if args.next_if(|first| first == "pair").is_some() {
+        return parse_pair(args);
     }
     let mut engine = "codex".to_owned();
     let mut binary = None;
@@ -351,6 +361,26 @@ fn parse_hub(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
         action,
         journal_dir,
     }))
+}
+
+/// Parses the arguments after `pair`: only where the hub's files live.
+fn parse_pair(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
+    let mut args = args;
+    let mut journal_dir = None;
+    while let Some(arg) = args.next() {
+        let arg = arg.into_string().map_err(|arg| {
+            usage(format!(
+                "Unknown argument {}. Use pair --help.",
+                arg.to_string_lossy()
+            ))
+        })?;
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(Parsed::PairHelp),
+            "--journal-dir" => journal_dir = Some(PathBuf::from(value(&mut args, &arg)?)),
+            other => return Err(usage(format!("Unknown argument {other}. Use pair --help."))),
+        }
+    }
+    Ok(Parsed::Pair { journal_dir })
 }
 
 /// Refuses a prompt the session would refuse, before one opens.

@@ -187,7 +187,7 @@ pub(crate) async fn pairing(run: &Path, within: Duration) -> Pairing {
 }
 
 /// The QR code of `link` as equal-width rows, dark modules on a light quiet zone; None when `link` is too long.
-fn qr_rows(link: &str) -> Option<Vec<String>> {
+pub fn qr_rows(link: &str) -> Option<Vec<String>> {
     let image = QrCode::new(link.as_bytes())
         .ok()?
         .render::<Dense1x2>()

@@ -876,6 +876,7 @@ dependencies = [
 name = "octet"
 version = "0.1.0"
 dependencies = [
+ "crossterm",
  "futures-util",
  "libc",
  "octet-core",
