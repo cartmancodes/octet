@@ -40,10 +40,8 @@ pub(crate) async fn serve(
     port: Option<u16>,
     owner: Option<String>,
 ) -> Result<i32, CliError> {
-    let port = match port {
-        Some(port) => port,
-        None => open(&directory).await?.config().port,
-    };
+    // Task 6 deletes the port with the TCP listener; `hub.json` no longer sets it.
+    let port = port.unwrap_or(octet_hub::DEFAULT_PORT);
     let owner = octet_hub::owner_login(owner).await.map_err(failed)?;
     // Signals are caught before the hub starts, so none is lost in between.
     let stop = interrupted();
@@ -71,12 +69,6 @@ async fn announce(port: u16) {
         None => println!("Publish it on your tailnet: tailscale serve --bg {port}"),
     }
     let _ = std::io::stdout().flush();
-}
-
-async fn open(directory: &Path) -> Result<Store, CliError> {
-    Store::open(directory)
-        .await
-        .map_err(|e| opening(directory, &e))
 }
 
 /// The store for its devices alone: `devices` and `revoke` never need `hub.json`, so a typo
@@ -226,10 +218,10 @@ mod tests {
         let device = Device {
             name: "My\u{1b}[2J phone".into(),
             platform: "ios".into(),
-            login: "me@example.com".into(),
             created: 1_790_000_000,
             last_seen: 1_790_000_000 - 1,
-            token_sha256: String::new(),
+            key: String::new(),
+            relay: String::new(),
             push_token: None,
             push_kinds: octet_core::remote::protocol::PushKinds::default(),
             activity: None,

@@ -902,9 +902,9 @@ impl Activity {
         (now, wall): (Instant, SystemTime),
     ) {
         self.driver
-            .prune(|key| devices.iter().any(|device| device.token_sha256 == key));
+            .prune(|key| devices.iter().any(|device| device.key == key));
         for device in devices {
-            let key = &device.token_sha256;
+            let key = &device.key;
             let tokens = device.activity.as_ref().map(|held| fresh(held, wall));
             let tokens = tokens.as_ref();
             if tokens.is_none() {
@@ -1822,23 +1822,18 @@ mod tests {
             .expect("store");
         let now = SystemTime::now();
         let secret = store.pairing_secret(now);
-        let (_, device) = store
-            .pair(&secret, "Test phone", "ios", "owner@example", now)
+        let device = store
+            .pair(&secret, "Test phone", "ios", &"ab".repeat(32), "", now)
             .await
             .expect("paired");
         let held = ActivityTokens {
             registered: Some(1),
             ..tokens(Some(TOKEN), Some(START))
         };
-        assert!(
-            store
-                .set_activity(&device.token_sha256, held)
-                .await
-                .expect("saved")
-        );
+        assert!(store.set_activity(&device.key, held).await.expect("saved"));
         // The hub ends that activity after five idle minutes; APNs takes the end.
         let end = Report {
-            device: device.token_sha256.clone(),
+            device: device.key.clone(),
             token: TOKEN.into(),
             event: Event::End,
             run: 0,
@@ -1958,10 +1953,10 @@ mod tests {
         Device {
             name: "Test phone".into(),
             platform: "ios".into(),
-            login: "owner@example".into(),
             created: 0,
             last_seen: 0,
-            token_sha256: "dev".into(),
+            key: "dev".into(),
+            relay: String::new(),
             push_token: None,
             push_kinds: octet_core::remote::protocol::PushKinds::default(),
             activity: tokens,

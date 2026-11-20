@@ -147,7 +147,14 @@ async fn hub_devices_lists_and_revokes_a_paired_device() {
     let now = std::time::SystemTime::now();
     let secret = store.pairing_secret(now);
     store
-        .pair(&secret, "My phone", "ios", "me@example.com", now)
+        .pair(
+            &secret,
+            "My phone",
+            "ios",
+            &"ab".repeat(32),
+            "wss://relay.example",
+            now,
+        )
         .await
         .unwrap();
     let path = dir.path().to_owned();
@@ -179,8 +186,15 @@ async fn hub_devices_and_revoke_work_with_a_broken_hub_json_and_revoke_is_audite
     let mut store = octet_hub::Store::open(dir.path()).await.unwrap();
     let now = std::time::SystemTime::now();
     let secret = store.pairing_secret(now);
-    let (token, _) = store
-        .pair(&secret, "Lost phone", "ios", "me@example.com", now)
+    let device = store
+        .pair(
+            &secret,
+            "Lost phone",
+            "ios",
+            &"cd".repeat(32),
+            "wss://relay.example",
+            now,
+        )
         .await
         .unwrap();
     // A typo in the hub's settings must not stand between a stolen phone and its revoke.
@@ -211,7 +225,7 @@ async fn hub_devices_and_revoke_work_with_a_broken_hub_json_and_revoke_is_audite
     let last: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
     assert_eq!(last["device"], "Lost phone");
     assert_eq!(last["what"], "revoked");
-    assert!(!audit.contains(&token), "{audit}");
+    assert!(!audit.contains(&device.key), "{audit}");
 }
 
 /// A short data directory under `/tmp` (socket paths are limited), removed on drop.

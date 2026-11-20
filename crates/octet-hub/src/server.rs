@@ -69,7 +69,7 @@ use crate::{
     store::{
         ActivityTokens, Change, Device, Disk, PAIR_NOT_SAVED, Pairing, SECRET_REFUSED, Store,
         activity_change, activity_clear, activity_token_drop, pair_change, push_change,
-        push_token_drop, seen_change,
+        push_token_drop, random_hex, seen_change, sha256_hex,
     },
     tail::{self, file_name},
 };
@@ -307,6 +307,8 @@ enum AfterSave {
         conn: u64,
         req: u64,
         pairing: Pairing,
+        // Task 6 deletes this with the TCP `pair`: a pairing over the relay has no token.
+        token: String,
         result: std::io::Result<Result<(), &'static str>>,
     },
     /// `register_push` from `device` on `conn`, answering `req`.
@@ -754,15 +756,13 @@ pub struct Hub {
     store: Store,
     /// The sessions the hub can reach.
     sessions: Sessions,
-    /// The tailnet login every connection must come from.
-    owner: String,
     /// The loopback port it listens on.
     port: u16,
     /// Phone connections by id.
     conns: HashMap<u64, Conn>,
     /// Commands sent to sessions and not yet answered, by hub req.
     pending: HashMap<u64, Pending>,
-    /// Each device's command allowance, by token hash.
+    /// Each device's command allowance, by key.
     buckets: HashMap<String, Bucket>,
     /// The last `sessions` frame made, one text shared by every connection given it.
     listed: Utf8Bytes,
@@ -888,7 +888,7 @@ impl Hub {
         let (requests, mut controls) = mpsc::channel(16);
         let (published_in, published) = watch::channel(Publication::Unknown);
         let gate = Admission {
-            owner: owner.clone(),
+            owner,
             room,
             published: published.clone(),
         };
@@ -907,7 +907,6 @@ impl Hub {
             git: Git::new(),
             turns: HashMap::new(),
             index: tail::SharedIndex::default(),
-            owner,
             port,
             conns: HashMap::new(),
             pending: HashMap::new(),
@@ -1095,24 +1094,26 @@ impl Hub {
             PhoneCommand::Hello { token, background } => {
                 // A revoke by the CLI must be seen before the token is believed.
                 self.store.reload_if_changed().await;
-                let Some((device, seen)) = self.store.recognise(token.expose(), &self.owner, now)
-                else {
+                // Task 6 deletes this with the TCP `hello`: until then a device's `key` holds the
+                // SHA-256 of its token, so the token is hashed here to find it.
+                let key = sha256_hex(token.expose());
+                let Some((device, seen)) = self.store.recognise(&key, now) else {
                     self.refuse(conn, req, Code::Unpaired, "Unknown device; pair it again");
                     self.close(conn);
                     return;
                 };
                 if let Some(seen) = seen {
                     // Off the loop; a device revoked meanwhile is let go at the next reload.
-                    self.save(seen_change(&device.token_sha256, seen), |_| AfterSave::Seen);
+                    self.save(seen_change(&device.key, seen), |_| AfterSave::Seen);
                 }
                 let name = device.name.clone();
                 // Judged on news from now. Any hello but a background one is the app in front,
                 // which drives the Live Activity itself while it is; nothing ends.
                 if let Some(activity) = self.activity.as_mut() {
-                    activity.hello(&device.token_sha256);
+                    activity.hello(&device.key);
                     if !background {
                         let tokens = device.activity.as_ref();
-                        activity.connected(&device.token_sha256, tokens, now);
+                        activity.connected(&device.key, tokens, now);
                     }
                 }
                 // Out of the waiting room before the phone hears it is in.
@@ -1130,30 +1131,38 @@ impl Hub {
                 secret,
                 name,
                 platform,
-            } => match self
-                .store
-                .begin_pair(secret.expose(), &name, &platform, &self.owner, now)
-            {
-                // Answered once the device is saved (see `on_saved`).
-                Ok(pairing) => {
-                    let change = pair_change(pairing.device.clone());
-                    self.save(change, move |result| AfterSave::Paired {
-                        conn,
-                        req,
-                        pairing,
-                        result,
-                    });
+            } => {
+                // Task 6 deletes this with the TCP `pair`: until then the phone is given a token,
+                // and its device is kept under the token's SHA-256 in place of a public key, with
+                // no relay.
+                let token = random_hex();
+                let key = sha256_hex(&token);
+                match self
+                    .store
+                    .begin_pair(secret.expose(), &name, &platform, &key, "", now)
+                {
+                    // Answered once the device is saved (see `on_saved`).
+                    Ok(pairing) => {
+                        let change = pair_change(pairing.device.clone());
+                        self.save(change, move |result| AfterSave::Paired {
+                            conn,
+                            req,
+                            pairing,
+                            token,
+                            result,
+                        });
+                    }
+                    Err(reason) => {
+                        let code = if reason == SECRET_REFUSED {
+                            Code::Unpaired
+                        } else {
+                            Code::Invalid
+                        };
+                        self.refuse(conn, req, code, reason);
+                        self.close(conn);
+                    }
                 }
-                Err(reason) => {
-                    let code = if reason == SECRET_REFUSED {
-                        Code::Unpaired
-                    } else {
-                        Code::Invalid
-                    };
-                    self.refuse(conn, req, code, reason);
-                    self.close(conn);
-                }
-            },
+            }
             _ => {
                 self.refuse(conn, req, Code::Unpaired, "Say hello first");
                 self.close(conn);
@@ -1170,7 +1179,7 @@ impl Hub {
             return;
         }
         let req = text.map_or(0, req_of);
-        if !self.take_token(&device.token_sha256) {
+        if !self.take_token(&device.key) {
             self.refuse(conn, req, Code::RateLimited, RATE_REFUSED);
             return;
         }
@@ -1273,7 +1282,7 @@ impl Hub {
         token: Option<String>,
         kinds: Option<PushKinds>,
     ) {
-        let change = push_change(&device.token_sha256, token.clone(), kinds);
+        let change = push_change(&device.key, token.clone(), kinds);
         let device = device.clone();
         self.save(change, move |result| AfterSave::Push {
             conn,
@@ -1313,11 +1322,7 @@ impl Hub {
         let on = token.is_some();
         // The connections of this device carry a copy of it.
         for state in self.conns.values_mut() {
-            if let Some(held) = state
-                .device
-                .as_mut()
-                .filter(|held| held.token_sha256 == device.token_sha256)
-            {
+            if let Some(held) = state.device.as_mut().filter(|held| held.key == device.key) {
                 held.push_token.clone_from(&token);
                 if let Some(kinds) = kinds {
                     held.push_kinds = kinds;
@@ -1338,7 +1343,7 @@ impl Hub {
     /// off the loop; `req` is answered once that is saved ([`activity_saved`](Self::activity_saved)).
     /// Neither a token nor the device's hash reaches the audit line or a log.
     fn activity(&self, conn: u64, device: &Device, req: u64, command: PhoneCommand) {
-        let hash = &device.token_sha256;
+        let hash = &device.key;
         let exposed = |token: Option<Secret>| token.map(|token| token.expose().to_owned());
         let (change, cleared) =
             if let PhoneCommand::RegisterActivity { token, start_token } = command {
@@ -1399,7 +1404,7 @@ impl Hub {
         }
         // Forgotten now, not at the next look: a register just after it starts afresh.
         if cleared && let Some(activity) = self.activity.as_mut() {
-            activity.cleared(&device.token_sha256);
+            activity.cleared(&device.key);
         }
         self.copy_activity_tokens();
         self.store.audit(&device.name, "", what).await;
@@ -1415,7 +1420,7 @@ impl Hub {
             .values_mut()
             .filter_map(|state| state.device.as_mut())
         {
-            if let Some(stored) = devices.iter().find(|d| d.token_sha256 == held.token_sha256) {
+            if let Some(stored) = devices.iter().find(|d| d.key == held.key) {
                 held.activity.clone_from(&stored.activity);
             }
         }
@@ -1443,13 +1448,14 @@ impl Hub {
                 conn,
                 req,
                 pairing,
+                token,
                 result,
             } => {
                 let reason = match result {
                     Ok(Ok(())) => {
                         // Who paired, and when; never the token or the secret.
                         self.store.audit(&pairing.device.name, "", "paired").await;
-                        self.send(conn, &paired(&pairing.token, &pairing.device.name));
+                        self.send(conn, &paired(&token, &pairing.device.name));
                         return;
                     }
                     Ok(Err(reason)) => reason,
@@ -1987,13 +1993,10 @@ impl Hub {
 
     /// Whether `device` is still paired.
     fn paired(&self, device: &Device) -> bool {
-        self.store
-            .devices()
-            .iter()
-            .any(|d| d.token_sha256 == device.token_sha256)
+        self.store.devices().iter().any(|d| d.key == device.key)
     }
 
-    /// Takes one command from the bucket of the device whose token hash is `key`.
+    /// Takes one command from the bucket of the device whose key is `key`.
     fn take_token(&mut self, key: &str) -> bool {
         let now = Instant::now();
         self.buckets
@@ -2073,7 +2076,7 @@ impl Hub {
         }
         for device in self.store.devices() {
             if device.push_token.is_some() {
-                self.pusher.offer(&device.token_sha256, &notices, now);
+                self.pusher.offer(&device.key, &notices, now);
             }
         }
         self.observed = snapshots;
@@ -2087,11 +2090,7 @@ impl Hub {
         self.cap.prune(now);
         let mut batch = Vec::new();
         for key in self.pusher.waiting() {
-            let known = self
-                .store
-                .devices()
-                .iter()
-                .find(|device| device.token_sha256 == key);
+            let known = self.store.devices().iter().find(|device| device.key == key);
             let token = known.and_then(|device| device.push_token.clone());
             let kinds = known.map(|device| device.push_kinds).unwrap_or_default();
             let connected = token.is_none() || in_front(&self.conns, &key);
@@ -2139,7 +2138,7 @@ impl Hub {
             .store
             .devices()
             .iter()
-            .find(|device| device.token_sha256 == report.device)
+            .find(|device| device.key == report.device)
             .and_then(|device| device.activity.as_ref()?.token.clone());
         if !activity.reported(report, stored.as_deref()) {
             return;
@@ -2175,7 +2174,7 @@ impl Hub {
         let state = self.conns.remove(&conn)?;
         self.pending.retain(|_, pending| pending.conn != conn);
         if let Some(device) = &state.device {
-            let key = &device.token_sha256;
+            let key = &device.key;
             // A background connection going was never the app in front.
             let still_here = state.background || in_front(&self.conns, key);
             // The app leaves the front: what its activity shows is current as of now.
@@ -2184,7 +2183,7 @@ impl Hub {
                     .store
                     .devices()
                     .iter()
-                    .find(|known| &known.token_sha256 == key)
+                    .find(|known| &known.key == key)
                     .and_then(|known| known.activity.as_ref());
                 activity.left(key, tokens, (Instant::now(), SystemTime::now()));
             }
@@ -2193,7 +2192,7 @@ impl Hub {
                 .store
                 .devices()
                 .iter()
-                .any(|known| &known.token_sha256 == key && known.push_token.is_some());
+                .any(|known| &known.key == key && known.push_token.is_some());
             if !still_here && reachable {
                 self.pusher.disconnected(key, Instant::now());
             }
@@ -2435,15 +2434,11 @@ enum Publication {
 /// The hub's [`Publication`], as last asked.
 type Published = watch::Receiver<Publication>;
 
-/// Whether the device whose token hash is `key` has the app in front: a connection of it whose
+/// Whether the device whose key is `key` has the app in front: a connection of it whose
 /// hello was not a background one, on any screen. The pusher and the Live Activity share it.
 fn in_front(conns: &HashMap<u64, Conn>, key: &str) -> bool {
     conns.values().any(|conn| {
-        !conn.background
-            && conn
-                .device
-                .as_ref()
-                .is_some_and(|device| device.token_sha256 == key)
+        !conn.background && conn.device.as_ref().is_some_and(|device| device.key == key)
     })
 }
 
@@ -3195,12 +3190,13 @@ mod tests {
         let dir = octet_testkit::TempDir::new("hub-writeorder");
         let mut store = Store::open(dir.path()).await.expect("the store");
         let secret = store.pairing_secret(SystemTime::now());
-        let (_, device) = store
+        let device = store
             .pair(
                 &secret,
                 "Order phone",
                 "ios",
-                "owner@example",
+                &"ab".repeat(32),
+                "",
                 SystemTime::now(),
             )
             .await
@@ -3218,7 +3214,7 @@ mod tests {
             let (writer, saves, device) = (writer.clone(), saves.clone(), device.clone());
             tokio::spawn(async move {
                 for n in [2 * round + 1, 2 * round + 2] {
-                    let change = activity_change(&device.token_sha256, tokens(n));
+                    let change = activity_change(&device.key, tokens(n));
                     let device = device.clone();
                     queue_save(&writer, &saves, change, move |result| AfterSave::Activity {
                         conn: n,

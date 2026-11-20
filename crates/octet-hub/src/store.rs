@@ -1,5 +1,5 @@
 //! Devices, pairing secrets, hub config and the audit log.
-use crate::apns::ApnsConfig;
+use crate::{apns::ApnsConfig, link::split_relay};
 use octet_core::remote::protocol::{PushKinds, is_activity_token, is_push_token};
 use octet_store::{create_private, create_private_dir, sync_directory};
 use sha2::{Digest, Sha256};
@@ -18,8 +18,14 @@ use tokio::{
     sync::mpsc,
 };
 
-/// The loopback port when `hub.json` names none.
-const DEFAULT_PORT: u16 = 47823;
+/// The relay a hub dials when `hub.json` names none: a placeholder until the owner names the host.
+pub const DEFAULT_RELAY: &str = "wss://relay.octet.invalid";
+/// The loopback port of the TCP listener, which `hub.json` no longer sets. Task 6 deletes this
+/// with the listener.
+pub const DEFAULT_PORT: u16 = 47823;
+/// The environment variable that names a relay in a debug build, `ws://` allowed.
+#[cfg(debug_assertions)]
+const RELAY_ENVIRONMENT: &str = "OCTET_HUB_RELAY_URL";
 /// How long a pairing secret works.
 const SECRET_LIFETIME: Duration = Duration::from_mins(10);
 /// Pairing secrets that can wait at once; the oldest give way.
@@ -38,14 +44,16 @@ pub struct Device {
     pub name: String,
     /// The phone's platform.
     pub platform: String,
-    /// The tailnet login seen at pairing.
-    pub login: String,
     /// When it paired, in seconds since the epoch.
     pub created: u64,
     /// When it last connected, in seconds since the epoch.
     pub last_seen: u64,
-    /// The hex SHA-256 of its token; the token itself is never stored.
-    pub token_sha256: String,
+    /// The phone's public key, 64 lowercase hex digits; a device is its key. (Until the hub's TCP
+    /// listener goes in Task 6, the hex SHA-256 of the device token takes its place.)
+    pub key: String,
+    /// The relay address it paired through, as the hub's config gave it; empty for a pairing over
+    /// the TCP listener.
+    pub relay: String,
     /// The Expo push token notifications go to, if the phone turned them on.
     pub push_token: Option<String>,
     /// What it is pushed: the defaults for a new pairing, every kind for one from before kinds,
@@ -105,16 +113,16 @@ impl std::fmt::Debug for ActivityTokens {
     }
 }
 
-/// Shows the device without its token hash, push token or activity tokens.
+/// Shows the device without its key, push token or activity tokens.
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Device")
             .field("name", &self.name)
             .field("platform", &self.platform)
-            .field("login", &self.login)
             .field("created", &self.created)
             .field("last_seen", &self.last_seen)
-            .field("token_sha256", &"<redacted>")
+            .field("key", &"<redacted>")
+            .field("relay", &self.relay)
             .field(
                 "push_token",
                 &self.push_token.as_ref().map(|_| "<redacted>"),
@@ -128,8 +136,10 @@ impl std::fmt::Debug for Device {
 /// The hub's settings from `hub.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HubConfig {
-    /// The loopback port.
-    pub port: u16,
+    /// The relay the hub dials: `wss://<host>` or `wss://<host>:<port>`, with no path, query or
+    /// user name. A debug build also takes a `ws://` address of the same shape from
+    /// `OCTET_HUB_RELAY_URL`.
+    pub relay: String,
     /// The workspaces a phone may start sessions in.
     pub workspaces: Vec<PathBuf>,
     /// APNs for the Live Activity, when `hub.json` names a well-formed `apns` block; off
@@ -232,15 +242,14 @@ impl Writer {
     }
 }
 
-/// A pairing under way: its device token (shown once), the device to save, and the secret it
-/// spent, which goes back ([`Store::unspend`]) if the save fails.
+/// A pairing under way: the device to save, and the secret it spent, which goes back
+/// ([`Store::unspend`]) if the save fails.
 pub(crate) struct Pairing {
-    pub(crate) token: String,
     pub(crate) device: Device,
     secret: Secret,
 }
 
-// The token is the phone's credential: only the device's name shows.
+// The secret spent is a credential: only the device's name shows.
 impl std::fmt::Debug for Pairing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pairing")
@@ -304,26 +313,27 @@ impl Store {
         secret
     }
 
-    /// Pairs a phone: spends `secret` and returns the new device token, which
-    /// is shown once and not stored, and the device. A refusal that is the
-    /// phone's to fix leaves the secret unspent.
+    /// Pairs a phone: spends `secret` and returns the new device, known by `key` (the phone's
+    /// public key, 64 lowercase hex digits) and the `relay` it paired through. A refusal that is
+    /// the phone's to fix leaves the secret unspent.
     ///
     /// # Errors
     ///
-    /// Fails with the reason to show the phone when the secret is unknown,
-    /// used or older than 10 minutes, a field is empty or too long, the name
-    /// is taken, or the device cannot be saved.
+    /// Fails with the reason to show the phone when the secret is unknown, used or older than 10
+    /// minutes, a field is empty or too long, the key is not a key, the name or key is taken, or
+    /// the device cannot be saved.
     pub async fn pair(
         &mut self,
         secret: &str,
         name: &str,
         platform: &str,
-        login: &str,
+        key: &str,
+        relay: &str,
         now: SystemTime,
-    ) -> Result<(String, Device), &'static str> {
-        let pairing = self.begin_pair(secret, name, platform, login, now)?;
+    ) -> Result<Device, &'static str> {
+        let pairing = self.begin_pair(secret, name, platform, key, relay, now)?;
         match self.update(pair_change(pairing.device.clone())).await {
-            Ok(Ok(())) => Ok((pairing.token, pairing.device)),
+            Ok(Ok(())) => Ok(pairing.device),
             Ok(Err(reason)) => {
                 self.unspend(pairing);
                 Err(reason)
@@ -342,13 +352,14 @@ impl Store {
     /// # Errors
     ///
     /// Fails with the reason to show the phone when the secret is unknown, used or older than 10
-    /// minutes, or a field is empty or too long.
+    /// minutes, a field is empty or too long, or `key` is not 64 lowercase hex digits.
     pub(crate) fn begin_pair(
         &mut self,
         secret: &str,
         name: &str,
         platform: &str,
-        login: &str,
+        key: &str,
+        relay: &str,
         now: SystemTime,
     ) -> Result<Pairing, &'static str> {
         let hash = sha256_hex(secret);
@@ -367,28 +378,23 @@ impl Store {
             "Device platform must be 1 to 64 characters",
             "Device platform can't contain control characters",
         )?;
-        if login.is_empty() {
-            return Err("Tailnet login is missing");
+        if !is_key(key) {
+            return Err("Device key must be 64 lowercase hex digits");
         }
-        let token = random_hex();
         let seconds = seconds(now);
         let device = Device {
             name: name.to_owned(),
             platform: platform.to_owned(),
-            login: login.to_owned(),
             created: seconds,
             last_seen: seconds,
-            token_sha256: sha256_hex(&token),
+            key: key.to_owned(),
+            relay: relay.to_owned(),
             push_token: None,
             push_kinds: PushKinds::default(),
             activity: None,
         };
         let secret = self.secrets.swap_remove(position);
-        Ok(Pairing {
-            token,
-            device,
-            secret,
-        })
+        Ok(Pairing { device, secret })
     }
 
     /// A pairing whose device was not saved gives its secret back, for a retry.
@@ -396,19 +402,13 @@ impl Store {
         self.secrets.push(pairing.secret);
     }
 
-    /// The device whose token this is, if it also connects from the login it
-    /// paired with. Records the time it was seen.
-    pub async fn authenticate(
-        &mut self,
-        token: &str,
-        login: &str,
-        now: SystemTime,
-    ) -> Option<Device> {
-        let (device, seen) = self.recognise(token, login, now)?;
+    /// The device whose key this is. Records the time it was seen.
+    pub async fn authenticate(&mut self, key: &str, now: SystemTime) -> Option<Device> {
+        let (device, seen) = self.recognise(key, now)?;
         if let Some(seen) = seen {
             // The write re-reads the file, so a device revoked elsewhere is
             // refused here; a failed write only leaves last_seen older on disk.
-            let written = self.update(seen_change(&device.token_sha256, seen)).await;
+            let written = self.update(seen_change(&device.key, seen)).await;
             if matches!(written, Ok(false)) {
                 return None;
             }
@@ -420,26 +420,37 @@ impl Store {
     /// `devices.json` should be told ([`seen_change`]), at most once a minute.
     pub(crate) fn recognise(
         &mut self,
-        token: &str,
-        login: &str,
+        key: &str,
         now: SystemTime,
     ) -> Option<(Device, Option<u64>)> {
-        let hash = sha256_hex(token);
         // Every device is compared, so the time taken does not say which matched.
         let mut found = None;
         for (index, device) in self.devices.iter().enumerate() {
-            if same(&device.token_sha256, &hash) {
+            if same(&device.key, key) {
                 found = Some(index);
             }
         }
         let device = self.devices.get_mut(found?)?;
-        if device.login != login {
-            return None;
-        }
         let seen = seconds(now).max(device.last_seen);
         let stale = seen >= device.last_seen.saturating_add(SEEN_WRITE_GAP);
         device.last_seen = seen;
         Some((device.clone(), stale.then_some(seen)))
+    }
+
+    /// Forgets every device, with every push and Live Activity token it holds: the hub made a new
+    /// identity, so none of those phones can connect again, and none may keep getting
+    /// notifications. Nothing is written when there are none.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `devices.json` cannot be locked, read or written.
+    pub async fn forget_all(&mut self) -> io::Result<()> {
+        self.update(Box::new(|devices: &mut Vec<Device>| {
+            let any = !devices.is_empty();
+            devices.clear();
+            ((), any)
+        }))
+        .await
     }
 
     /// Deletes the device called `name`; false if there is none or the file
@@ -456,22 +467,18 @@ impl Store {
         .unwrap_or(false)
     }
 
-    /// Sets, or with `None` clears, the push token of the device whose token hash is
-    /// `token_sha256`, keeping its kinds: [`set_push`](Self::set_push) without kinds.
+    /// Sets, or with `None` clears, the push token of the device whose key is
+    /// `key`, keeping its kinds: [`set_push`](Self::set_push) without kinds.
     ///
     /// # Errors
     ///
     /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
-    pub async fn set_push_token(
-        &mut self,
-        token_sha256: &str,
-        token: Option<String>,
-    ) -> io::Result<bool> {
-        self.set_push(token_sha256, token, None).await
+    pub async fn set_push_token(&mut self, key: &str, token: Option<String>) -> io::Result<bool> {
+        self.set_push(key, token, None).await
     }
 
-    /// Sets, or with `None` clears, the push token of the device whose token hash is
-    /// `token_sha256`, and its kinds when `kinds` says them (`None` keeps them), in one write.
+    /// Sets, or with `None` clears, the push token of the device whose key is
+    /// `key`, and its kinds when `kinds` says them (`None` keeps them), in one write.
     /// False if there is no such device. A token is on one device only: any other device holding
     /// it loses it, in the same write.
     ///
@@ -480,11 +487,11 @@ impl Store {
     /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
     pub async fn set_push(
         &mut self,
-        token_sha256: &str,
+        key: &str,
         token: Option<String>,
         kinds: Option<PushKinds>,
     ) -> io::Result<bool> {
-        self.update(push_change(token_sha256, token, kinds)).await
+        self.update(push_change(key, token, kinds)).await
     }
 
     /// Clears the push token `token` from the device holding it, in the locked write; returns
@@ -498,7 +505,7 @@ impl Store {
         self.update(push_token_drop(token)).await
     }
 
-    /// Sets the `ActivityKit` tokens of the device whose token hash is `token_sha256` to the ones
+    /// Sets the `ActivityKit` tokens of the device whose key is `key` to the ones
     /// the phone has now, replacing both it had: a token left out (`None`) is one it no longer
     /// has, and with neither the device has no activity. False if there is no such device. A
     /// token is on one device only, the newest to register it, as a push token is: another device
@@ -510,15 +517,11 @@ impl Store {
     /// # Errors
     ///
     /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
-    pub async fn set_activity(
-        &mut self,
-        token_sha256: &str,
-        activity: ActivityTokens,
-    ) -> io::Result<bool> {
-        self.update(activity_change(token_sha256, activity)).await
+    pub async fn set_activity(&mut self, key: &str, activity: ActivityTokens) -> io::Result<bool> {
+        self.update(activity_change(key, activity)).await
     }
 
-    /// Removes every `ActivityKit` token of the device whose token hash is `token_sha256`, for a
+    /// Removes every `ActivityKit` token of the device whose key is `key`, for a
     /// phone that turned its Live Activity off (`clear_activity`). False if there is no such
     /// device; a device with none is left as it is, unwritten. A token APNs says is gone is
     /// [`drop_activity_token`](Self::drop_activity_token)'s.
@@ -526,8 +529,8 @@ impl Store {
     /// # Errors
     ///
     /// Fails if `devices.json` cannot be locked, read or written; the error names no token.
-    pub async fn drop_activity(&mut self, token_sha256: &str) -> io::Result<bool> {
-        self.update(activity_clear(token_sha256)).await
+    pub async fn drop_activity(&mut self, key: &str) -> io::Result<bool> {
+        self.update(activity_clear(key)).await
     }
 
     /// Clears the `ActivityKit` token `token` wherever a device holds it, as its activity token
@@ -642,10 +645,10 @@ async fn locked_update<R>(directory: &Path, change: Change<R>) -> io::Result<(R,
                 let mut entry = serde_json::json!({
                     "name": device.name,
                     "platform": device.platform,
-                    "login": device.login,
                     "created": device.created,
                     "last_seen": device.last_seen,
-                    "token_sha256": device.token_sha256,
+                    "key": device.key,
+                    "relay": device.relay,
                 });
                 if let Some(push) = &device.push_token {
                     entry["push_token"] = serde_json::json!(push);
@@ -685,26 +688,26 @@ async fn locked_update<R>(directory: &Path, change: Change<R>) -> io::Result<(R,
 /// Why a pairing was not saved, when the file could not be written.
 pub(crate) const PAIR_NOT_SAVED: &str = "Could not save the device";
 
-/// Saves the new `device` of a pairing, unless a device of its name is already paired.
+/// Saves the new `device` of a pairing, unless a device of its name or key is already paired.
 pub(crate) fn pair_change(device: Device) -> Change<Result<(), &'static str>> {
     Box::new(move |devices| {
         if devices.iter().any(|kept| kept.name == device.name) {
             return (Err("A device with that name is already paired"), false);
+        }
+        if devices.iter().any(|kept| kept.key == device.key) {
+            return (Err("That device's key is already paired"), false);
         }
         devices.push(device);
         (Ok(()), true)
     })
 }
 
-/// Records that the device whose token hash is `token_sha256` was seen at `seen`; false if it
+/// Records that the device whose key is `key` was seen at `seen`; false if it
 /// is not paired (any more).
-pub(crate) fn seen_change(token_sha256: &str, seen: u64) -> Change<bool> {
-    let token_sha256 = token_sha256.to_owned();
+pub(crate) fn seen_change(key: &str, seen: u64) -> Change<bool> {
+    let key = key.to_owned();
     Box::new(move |devices| {
-        let Some(kept) = devices
-            .iter_mut()
-            .find(|kept| kept.token_sha256 == token_sha256)
-        else {
+        let Some(kept) = devices.iter_mut().find(|kept| kept.key == key) else {
             return (false, false);
         };
         kept.last_seen = kept.last_seen.max(seen);
@@ -714,21 +717,18 @@ pub(crate) fn seen_change(token_sha256: &str, seen: u64) -> Change<bool> {
 
 /// [`Store::set_push`]'s change.
 pub(crate) fn push_change(
-    token_sha256: &str,
+    key: &str,
     token: Option<String>,
     kinds: Option<PushKinds>,
 ) -> Change<bool> {
-    let token_sha256 = token_sha256.to_owned();
+    let key = key.to_owned();
     Box::new(move |devices| {
-        if !devices
-            .iter()
-            .any(|device| device.token_sha256 == token_sha256)
-        {
+        if !devices.iter().any(|device| device.key == key) {
             return (false, false);
         }
         let mut changed = false;
         for device in devices.iter_mut() {
-            let wanted = if device.token_sha256 == token_sha256 {
+            let wanted = if device.key == key {
                 token.clone()
             } else if token.is_some() && device.push_token == token {
                 None
@@ -739,9 +739,7 @@ pub(crate) fn push_change(
             device.push_token = wanted;
         }
         if let Some(kinds) = kinds
-            && let Some(device) = devices
-                .iter_mut()
-                .find(|device| device.token_sha256 == token_sha256)
+            && let Some(device) = devices.iter_mut().find(|device| device.key == key)
         {
             changed |= device.push_kinds != kinds;
             device.push_kinds = kinds;
@@ -768,19 +766,16 @@ pub(crate) fn push_token_drop(token: &str) -> Change<Option<String>> {
 }
 
 /// [`Store::set_activity`]'s change.
-pub(crate) fn activity_change(token_sha256: &str, activity: ActivityTokens) -> Change<bool> {
-    let token_sha256 = token_sha256.to_owned();
+pub(crate) fn activity_change(key: &str, activity: ActivityTokens) -> Change<bool> {
+    let key = key.to_owned();
     Box::new(move |devices| {
-        if !devices
-            .iter()
-            .any(|device| device.token_sha256 == token_sha256)
-        {
+        if !devices.iter().any(|device| device.key == key) {
             return (false, false);
         }
         let ours = |token: &str| activity.holds(token);
         let mut changed = false;
         for device in devices.iter_mut() {
-            let wanted = if device.token_sha256 == token_sha256 {
+            let wanted = if device.key == key {
                 let mut wanted = activity.clone();
                 if let Some(held) = &device.activity
                     && held.token == wanted.token
@@ -801,13 +796,10 @@ pub(crate) fn activity_change(token_sha256: &str, activity: ActivityTokens) -> C
 }
 
 /// [`Store::drop_activity`]'s change.
-pub(crate) fn activity_clear(token_sha256: &str) -> Change<bool> {
-    let token_sha256 = token_sha256.to_owned();
+pub(crate) fn activity_clear(key: &str) -> Change<bool> {
+    let key = key.to_owned();
     Box::new(move |devices| {
-        let Some(device) = devices
-            .iter_mut()
-            .find(|device| device.token_sha256 == token_sha256)
-        else {
+        let Some(device) = devices.iter_mut().find(|device| device.key == key) else {
             return (false, false);
         };
         let changed = device.activity.take().is_some();
@@ -888,33 +880,42 @@ async fn read_devices(directory: &Path) -> io::Result<(Vec<Device>, Option<Stamp
     let list = value["devices"]
         .as_array()
         .ok_or_else(|| invalid("devices.json has no devices list"))?;
-    let devices = list
-        .iter()
-        .map(|entry| {
-            let text = |key: &str| entry[key].as_str().map(str::to_owned);
-            Some(Device {
-                name: text("name")?,
-                platform: text("platform")?,
-                login: text("login")?,
-                created: entry["created"].as_u64()?,
-                last_seen: entry["last_seen"].as_u64()?,
-                token_sha256: text("token_sha256")?,
-                push_token: text("push_token").filter(|token| is_push_token(token)),
-                push_kinds: push_kinds(&entry["push_kinds"]),
-                activity: activity(&entry["activity"]),
-            })
-            .filter(|device| {
-                !device.login.is_empty()
-                    && device.token_sha256.len() == 64
-                    && device
-                        .token_sha256
-                        .bytes()
-                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-            })
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| invalid("devices.json has a malformed device"))?;
+    let mut devices = Vec::with_capacity(list.len());
+    for entry in list {
+        // A record from before keys names its device by token hash: no phone can use it now, so it
+        // is let go here (and from the file, at the next write).
+        if entry["key"].is_null() && !entry["token_sha256"].is_null() {
+            continue;
+        }
+        let device =
+            stored_device(entry).ok_or_else(|| invalid("devices.json has a malformed device"))?;
+        devices.push(device);
+    }
     Ok((devices, stamp))
+}
+
+/// The device a `devices.json` entry says, or none if a field is missing or malformed.
+fn stored_device(entry: &serde_json::Value) -> Option<Device> {
+    let text = |key: &str| entry[key].as_str().map(str::to_owned);
+    Some(Device {
+        name: text("name")?,
+        platform: text("platform")?,
+        created: entry["created"].as_u64()?,
+        last_seen: entry["last_seen"].as_u64()?,
+        key: text("key").filter(|key| is_key(key))?,
+        relay: text("relay")?,
+        push_token: text("push_token").filter(|token| is_push_token(token)),
+        push_kinds: push_kinds(&entry["push_kinds"]),
+        activity: activity(&entry["activity"]),
+    })
+}
+
+/// Whether `text` is a device key: 64 lowercase hex digits.
+fn is_key(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A device's stored kinds: each one the file says as a boolean, and on for the rest. A device
@@ -947,11 +948,11 @@ fn activity(stored: &serde_json::Value) -> Option<ActivityTokens> {
     .or_none()
 }
 
-/// The settings when `hub.json` names none: port 47823, no extra workspaces and no APNs.
+/// The settings when `hub.json` names none: the default relay, no extra workspaces and no APNs.
 impl Default for HubConfig {
     fn default() -> Self {
         Self {
-            port: DEFAULT_PORT,
+            relay: DEFAULT_RELAY.to_owned(),
             workspaces: Vec::new(),
             apns: None,
         }
@@ -968,12 +969,24 @@ async fn read_config(directory: &Path) -> io::Result<HubConfig> {
     };
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| invalid("hub.json is not valid JSON"))?;
-    if !value["port"].is_null() {
-        config.port = value["port"]
-            .as_u64()
-            .and_then(|port| u16::try_from(port).ok())
-            .filter(|port| *port != 0)
-            .ok_or_else(|| invalid("hub.json port must be 1 to 65535"))?;
+    // A `port` left over from before the relay is ignored. A `relay` that is not `wss://host` or
+    // `wss://host:port` is ignored too, with one line naming the field; the hub still starts.
+    if !value["relay"].is_null() {
+        match value["relay"].as_str().filter(|relay| secure_relay(relay)) {
+            Some(relay) => relay.clone_into(&mut config.relay),
+            None => eprintln!(
+                "hub.json relay must be wss://<host> or wss://<host>:<port>, with no path, query or \
+                 user name; using {DEFAULT_RELAY}"
+            ),
+        }
+    }
+    #[cfg(debug_assertions)]
+    if let Ok(relay) = std::env::var(RELAY_ENVIRONMENT) {
+        if split_relay(&relay).is_some() {
+            config.relay = relay;
+        } else {
+            eprintln!("{RELAY_ENVIRONMENT} must be ws:// or wss:// <host>[:<port>] alone; ignored");
+        }
     }
     if !value["workspaces"].is_null() {
         config.workspaces = value["workspaces"]
@@ -992,6 +1005,11 @@ async fn read_config(directory: &Path) -> io::Result<HubConfig> {
         None
     });
     Ok(config)
+}
+
+/// Whether `relay` is a `wss://` address `hub.json` may name.
+fn secure_relay(relay: &str) -> bool {
+    matches!(split_relay(relay), Some((true, _)))
 }
 
 /// Whether a secret issued at `issued` is past its 10 minutes at `now`; a
@@ -1025,14 +1043,14 @@ fn seconds(time: SystemTime) -> u64 {
 }
 
 /// 32 random bytes as 64 hex digits.
-fn random_hex() -> String {
+pub(crate) fn random_hex() -> String {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes).expect("the operating system gave no random bytes");
     hex(&bytes)
 }
 
 /// Lowercase hex digits of `bytes`.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::new(), |mut text, byte| {
         let _ = write!(text, "{byte:02x}");
@@ -1040,8 +1058,27 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// The `N` bytes that `text`, exactly `2 * N` lowercase hex digits, spells.
+pub(crate) fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let digits = text.as_bytes();
+    if digits.len() != N * 2
+        || !digits
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut bytes = [0; N];
+    let (pairs, _) = digits.as_chunks::<2>();
+    for (byte, [high, low]) in bytes.iter_mut().zip(pairs) {
+        let digit = |digit: u8| char::from(digit).to_digit(16);
+        *byte = u8::try_from(digit(*high)? << 4 | digit(*low)?).ok()?;
+    }
+    Some(bytes)
+}
+
 /// The hex SHA-256 of `text`.
-fn sha256_hex(text: &str) -> String {
+pub(crate) fn sha256_hex(text: &str) -> String {
     hex(Sha256::digest(text.as_bytes()).as_slice())
 }
 
@@ -1060,7 +1097,12 @@ mod tests {
     use octet_testkit::TempDir;
     use std::{os::unix::fs::PermissionsExt, time::Duration};
 
-    const LOGIN: &str = "me@example.com";
+    const RELAY: &str = "wss://relay.example";
+
+    /// A device key made from `name`: a stand-in for a phone's public key.
+    fn key_of(name: &str) -> String {
+        sha256_hex(name)
+    }
 
     async fn store(dir: &TempDir) -> Store {
         Store::open(dir.path()).await.unwrap()
@@ -1070,13 +1112,14 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
     }
 
+    /// Pairs `name` and returns its key.
     async fn paired(store: &mut Store, name: &str, now: SystemTime) -> String {
         let secret = store.pairing_secret(now);
         store
-            .pair(&secret, name, "ios", LOGIN, now)
+            .pair(&secret, name, "ios", &key_of(name), RELAY, now)
             .await
             .unwrap()
-            .0
+            .key
     }
 
     #[tokio::test]
@@ -1086,24 +1129,31 @@ mod tests {
         let now = epoch(1_000_000);
         let secret = store.pairing_secret(now);
         assert_eq!(secret.len(), 64);
-        let (token, device) = store
-            .pair(&secret, "Gemini 10", "ios", LOGIN, now)
+        let device = store
+            .pair(
+                &secret,
+                "Gemini 10",
+                "ios",
+                &key_of("Gemini 10"),
+                RELAY,
+                now,
+            )
             .await
             .unwrap();
-        assert_eq!(token.len(), 64);
         assert_eq!(
             (
                 device.name.as_str(),
                 device.platform.as_str(),
-                device.login.as_str()
+                device.key.as_str(),
+                device.relay.as_str()
             ),
-            ("Gemini 10", "ios", LOGIN)
+            ("Gemini 10", "ios", key_of("Gemini 10").as_str(), RELAY)
         );
         assert_eq!((device.created, device.last_seen), (1_000_000, 1_000_000));
         let refusal = Err("Pairing code already used or expired");
         assert_eq!(
             store
-                .pair(&secret, "Again", "ios", LOGIN, now)
+                .pair(&secret, "Again", "ios", &key_of("Again"), RELAY, now)
                 .await
                 .map(|_| ()),
             refusal
@@ -1112,7 +1162,7 @@ mod tests {
         let late = now + Duration::from_mins(11);
         assert_eq!(
             store
-                .pair(&stale, "Late", "ios", LOGIN, late)
+                .pair(&stale, "Late", "ios", &key_of("Late"), RELAY, late)
                 .await
                 .map(|_| ()),
             refusal
@@ -1121,13 +1171,13 @@ mod tests {
         let edge = now + Duration::from_mins(10);
         assert!(
             store
-                .pair(&nearly, "Edge", "ios", LOGIN, edge)
+                .pair(&nearly, "Edge", "ios", &key_of("Edge"), RELAY, edge)
                 .await
                 .is_ok()
         );
         assert_eq!(
             store
-                .pair("0", "Guess", "ios", LOGIN, now)
+                .pair("0", "Guess", "ios", &key_of("Guess"), RELAY, now)
                 .await
                 .map(|_| ()),
             refusal
@@ -1145,53 +1195,239 @@ mod tests {
         let secret = store.pairing_secret(now);
         assert!(
             store
-                .pair(&secret, "Phone", "ios", LOGIN, now)
+                .pair(&secret, "Phone", "ios", &key_of("Phone"), RELAY, now)
                 .await
                 .is_err()
         );
-        assert!(store.pair(&secret, "", "ios", LOGIN, now).await.is_err());
-        assert!(store.pair(&secret, "Other", "ios", "", now).await.is_err());
         assert!(
             store
-                .pair(&secret, "Other", "ios", LOGIN, now)
+                .pair(&secret, "", "ios", &key_of(""), RELAY, now)
+                .await
+                .is_err()
+        );
+        // A key that is not 64 lowercase hex digits is the phone's to fix.
+        for bad in [
+            "",
+            "abc",
+            &"AB".repeat(32),
+            &"g".repeat(64),
+            &"ab".repeat(33),
+        ] {
+            let refused = store.pair(&secret, "Other", "ios", bad, RELAY, now).await;
+            assert_eq!(
+                refused.map(|_| ()),
+                Err("Device key must be 64 lowercase hex digits")
+            );
+        }
+        assert!(
+            store
+                .pair(&secret, "Other", "ios", &key_of("Other"), RELAY, now)
                 .await
                 .is_ok()
         );
     }
 
     #[tokio::test]
-    async fn a_token_needs_its_pairing_login() {
-        let dir = TempDir::new("hub-login");
+    async fn a_device_is_recognised_by_its_key() {
+        let dir = TempDir::new("hub-key");
         let mut store = store(&dir).await;
-        let token = paired(&mut store, "Gemini 10", epoch(100)).await;
-        let device = store.authenticate(&token, LOGIN, epoch(200)).await.unwrap();
+        let key = paired(&mut store, "Gemini 10", epoch(100)).await;
+        let other = paired(&mut store, "Other", epoch(100)).await;
+        let device = store.authenticate(&key, epoch(200)).await.unwrap();
         assert_eq!(device.name, "Gemini 10");
+        assert_eq!(
+            (device.key.as_str(), device.relay.as_str()),
+            (key.as_str(), RELAY)
+        );
         assert_eq!(device.last_seen, 200);
         assert_eq!(store.devices()[0].last_seen, 200);
-        assert!(
-            store
-                .authenticate(&token, "other@example.com", epoch(300))
-                .await
-                .is_none()
+        // The key is what finds it: the other device is its own.
+        assert_eq!(
+            store.authenticate(&other, epoch(250)).await.unwrap().name,
+            "Other"
         );
+        // It is kept on disk, with the relay it paired through.
+        let reopened = Store::open(dir.path()).await.unwrap();
+        assert_eq!(reopened.devices()[0].key, key);
+        assert_eq!(reopened.devices()[0].relay, RELAY);
+        let text = std::fs::read_to_string(dir.path().join("devices.json")).unwrap();
         assert!(
-            store
-                .authenticate(&"0".repeat(64), LOGIN, epoch(300))
-                .await
-                .is_none()
+            !text.contains("login") && !text.contains("token_sha256"),
+            "{text}"
         );
-        assert!(store.authenticate("", LOGIN, epoch(300)).await.is_none());
-        assert_eq!(store.devices()[0].last_seen, 200);
+        // Not twice within a minute, in memory: `recognise` says when the file should be told.
+        let (_, told) = store.recognise(&key, epoch(210)).unwrap();
+        assert_eq!(told, None);
+        let (_, told) = store.recognise(&key, epoch(400)).unwrap();
+        assert_eq!(told, Some(400));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_is_not() {
+        let dir = TempDir::new("hub-nokey");
+        let mut store = store(&dir).await;
+        let key = paired(&mut store, "Gemini 10", epoch(100)).await;
+        for unknown in [
+            &"0".repeat(64),
+            "",
+            &key[..63],
+            &key.to_uppercase(),
+            &format!("{key}0"),
+        ] {
+            assert!(
+                store.authenticate(unknown, epoch(300)).await.is_none(),
+                "{unknown:?}"
+            );
+            assert!(
+                store.recognise(unknown, epoch(300)).is_none(),
+                "{unknown:?}"
+            );
+        }
+        assert_eq!(store.devices()[0].last_seen, 100);
+    }
+
+    #[tokio::test]
+    async fn a_key_already_paired_is_refused_and_keeps_the_secret() {
+        let dir = TempDir::new("hub-samekey");
+        let mut store = store(&dir).await;
+        let key = paired(&mut store, "Gemini 10", epoch(1)).await;
+        let secret = store.pairing_secret(epoch(2));
+        let refused = store
+            .pair(&secret, "Another", "ios", &key, RELAY, epoch(2))
+            .await;
+        assert_eq!(
+            refused.map(|_| ()),
+            Err("That device's key is already paired")
+        );
+        assert_eq!(store.devices().len(), 1);
+        let again = store
+            .pair(
+                &secret,
+                "Another",
+                "ios",
+                &key_of("Another"),
+                RELAY,
+                epoch(2),
+            )
+            .await;
+        assert!(again.is_ok());
+    }
+
+    #[tokio::test]
+    async fn records_from_before_keys_are_dropped_at_load() {
+        let dir = TempDir::new("hub-before-keys");
+        let old = |name: &str, c: &str| {
+            format!(
+                concat!(
+                    r#"{{"name":"{}","platform":"ios","login":"me@example.com","created":1,"#,
+                    r#""last_seen":2,"token_sha256":"{}","push_token":"{}"}}"#
+                ),
+                name,
+                c.repeat(64),
+                PUSH
+            )
+        };
+        let new = format!(
+            concat!(
+                r#"{{"name":"New","platform":"ios","created":1,"last_seen":2,"#,
+                r#""key":"{}","relay":"{}"}}"#
+            ),
+            "c".repeat(64),
+            RELAY
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let file = dir.path().join("devices.json");
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"devices":[{},{new},{}]}}"#,
+                old("A", "a"),
+                old("B", "b")
+            ),
+        )
+        .unwrap();
+        let mut store = store(&dir).await;
+        let names: Vec<_> = store.devices().iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["New"]);
+        // Dropped for good at the next write, with their push tokens.
+        let secret = store.pairing_secret(epoch(1));
+        store
+            .pair(&secret, "Next", "ios", &key_of("Next"), RELAY, epoch(1))
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains("token_sha256") && !text.contains(PUSH),
+            "{text}"
+        );
+        assert_eq!(Store::open(dir.path()).await.unwrap().devices().len(), 2);
+        // A record with neither a key nor a token hash is not one from before: the file is bad.
+        std::fs::write(
+            &file,
+            r#"{"devices":[{"name":"n","platform":"p","created":1,"last_seen":1}]}"#,
+        )
+        .unwrap();
+        assert!(Store::open(dir.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn forget_all_leaves_no_device_and_no_token() {
+        let dir = TempDir::new("hub-forget");
+        let mut store = store(&dir).await;
+        let key = paired(&mut store, "One", epoch(1)).await;
+        paired(&mut store, "Two", epoch(1)).await;
+        store.set_push_token(&key, Some(PUSH.into())).await.unwrap();
+        store
+            .set_activity(&key, activity(Some(ACTIVITY), Some(START)))
+            .await
+            .unwrap();
+        let file = dir.path().join("devices.json");
+        let before = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            before.contains(PUSH) && before.contains(ACTIVITY),
+            "{before}"
+        );
+        store.forget_all().await.unwrap();
+        assert!(store.devices().is_empty());
+        let text = std::fs::read_to_string(&file).unwrap();
+        for gone in [
+            PUSH,
+            ACTIVITY,
+            START,
+            "One",
+            "Two",
+            key.as_str(),
+            "push_token",
+        ] {
+            assert!(!text.contains(gone), "{gone}: {text}");
+        }
+        assert!(Store::open(dir.path()).await.unwrap().devices().is_empty());
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // With none to forget, nothing is written, and a missing file stays missing.
+        let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+        store.forget_all().await.unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+        let empty = TempDir::new("hub-forget-none");
+        Store::open(empty.path())
+            .await
+            .unwrap()
+            .forget_all()
+            .await
+            .unwrap();
+        assert!(!empty.path().join("devices.json").exists());
     }
 
     #[tokio::test]
     async fn revoking_removes_a_device_and_the_file_says_so() {
         let dir = TempDir::new("hub-revoke");
         let mut store = store(&dir).await;
-        let token = paired(&mut store, "Gemini 10", epoch(1)).await;
+        let key = paired(&mut store, "Gemini 10", epoch(1)).await;
         let file = dir.path().join("devices.json");
         let text = std::fs::read_to_string(&file).unwrap();
-        assert!(text.contains("Gemini 10") && !text.contains(&token));
+        assert!(text.contains("Gemini 10") && text.contains(&key));
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1199,14 +1435,14 @@ mod tests {
         assert_eq!(Store::open(dir.path()).await.unwrap().devices().len(), 1);
         assert!(!store.revoke("Nobody").await);
         assert!(store.revoke("Gemini 10").await);
-        assert!(store.authenticate(&token, LOGIN, epoch(2)).await.is_none());
+        assert!(store.authenticate(&key, epoch(2)).await.is_none());
         let reopened = Store::open(dir.path()).await.unwrap();
         assert!(reopened.devices().is_empty());
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(!std::fs::read_to_string(&file).unwrap().contains(&token));
+        assert!(!std::fs::read_to_string(&file).unwrap().contains(&key));
     }
 
     const PUSH: &str = "ExpoPushToken[Zk3_secretvalue-77]";
@@ -1216,13 +1452,13 @@ mod tests {
         let dir = TempDir::new("hub-push");
         let mut store = store(&dir).await;
         let token = paired(&mut store, "Gemini 10", epoch(1)).await;
-        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        let device = store.authenticate(&token, epoch(2)).await.unwrap();
         assert_eq!(device.push_token, None);
 
         // Setting stores it in the 0600 file as `push_token`, and it reads back.
         assert!(
             store
-                .set_push_token(&device.token_sha256, Some(PUSH.to_owned()))
+                .set_push_token(&device.key, Some(PUSH.to_owned()))
                 .await
                 .unwrap()
         );
@@ -1236,13 +1472,13 @@ mod tests {
         );
         let reopened = Store::open(dir.path()).await.unwrap();
         assert_eq!(reopened.devices()[0].push_token.as_deref(), Some(PUSH));
-        let seen = store.authenticate(&token, LOGIN, epoch(3)).await.unwrap();
+        let seen = store.authenticate(&token, epoch(3)).await.unwrap();
         assert_eq!(seen.push_token.as_deref(), Some(PUSH));
 
-        // Debug shows neither the push token nor the token hash.
+        // Debug shows neither the push token nor the key.
         let shown = format!("{:?}", reopened.devices()[0]);
         assert!(!shown.contains("secretvalue"), "{shown}");
-        assert!(!shown.contains(&device.token_sha256), "{shown}");
+        assert!(!shown.contains(&device.key), "{shown}");
         assert!(
             shown.contains("Gemini 10"),
             "the name is not a secret: {shown}"
@@ -1251,21 +1487,16 @@ mod tests {
 
         // Clearing drops the key; another device is not touched.
         let other = paired(&mut store, "Other", epoch(4)).await;
-        assert!(
-            store
-                .set_push_token(&device.token_sha256, None)
-                .await
-                .unwrap()
-        );
+        assert!(store.set_push_token(&device.key, None).await.unwrap());
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(
             !text.contains("push_token") && !text.contains(PUSH),
             "{text}"
         );
-        assert!(store.authenticate(&other, LOGIN, epoch(5)).await.is_some());
+        assert!(store.authenticate(&other, epoch(5)).await.is_some());
         assert!(
             store
-                .set_push_token(&device.token_sha256, Some(PUSH.to_owned()))
+                .set_push_token(&device.key, Some(PUSH.to_owned()))
                 .await
                 .unwrap()
         );
@@ -1295,7 +1526,7 @@ mod tests {
         let hash = |c: &str| c.repeat(64);
         let entry = |name: &str, c: &str, push: &str| {
             format!(
-                r#"{{"name":"{name}","platform":"ios","login":"{LOGIN}","created":1,"last_seen":2,"token_sha256":"{}","push_token":{push}}}"#,
+                r#"{{"name":"{name}","platform":"ios","created":1,"last_seen":2,"relay":"","key":"{}","push_token":{push}}}"#,
                 hash(c)
             )
         };
@@ -1330,15 +1561,15 @@ mod tests {
         let dir = TempDir::new("hub-two");
         let mut a = store(&dir).await;
         let mut b = Store::open(dir.path()).await.unwrap();
-        let (_, one) = {
+        let one = {
             let secret = a.pairing_secret(epoch(1));
-            a.pair(&secret, "One", "ios", LOGIN, epoch(1))
+            a.pair(&secret, "One", "ios", &key_of("One"), RELAY, epoch(1))
                 .await
                 .unwrap()
         };
-        let (_, two) = {
+        let two = {
             let secret = b.pairing_secret(epoch(2));
-            b.pair(&secret, "Two", "ios", LOGIN, epoch(2))
+            b.pair(&secret, "Two", "ios", &key_of("Two"), RELAY, epoch(2))
                 .await
                 .unwrap()
         };
@@ -1346,16 +1577,8 @@ mod tests {
         assert_eq!(Store::open(dir.path()).await.unwrap().devices().len(), 2);
 
         let (p1, p2) = ("ExpoPushToken[one-1]", "ExpoPushToken[two-2]");
-        assert!(
-            a.set_push_token(&one.token_sha256, Some(p1.into()))
-                .await
-                .unwrap()
-        );
-        assert!(
-            b.set_push_token(&two.token_sha256, Some(p2.into()))
-                .await
-                .unwrap()
-        );
+        assert!(a.set_push_token(&one.key, Some(p1.into())).await.unwrap());
+        assert!(b.set_push_token(&two.key, Some(p2.into())).await.unwrap());
         let on_disk = Store::open(dir.path()).await.unwrap();
         let tokens: Vec<_> = on_disk
             .devices()
@@ -1366,24 +1589,16 @@ mod tests {
 
         // b revokes One; a, which has not looked, cannot set a token on it, and keeps Two's.
         assert!(b.revoke("One").await);
-        assert!(
-            !a.set_push_token(&one.token_sha256, Some(p1.into()))
-                .await
-                .unwrap()
-        );
+        assert!(!a.set_push_token(&one.key, Some(p1.into())).await.unwrap());
         assert_eq!(a.devices().len(), 1);
         assert_eq!(a.devices()[0].push_token.as_deref(), Some(p2));
 
         // A store that never wrote sees the token after a reload.
         let mut c = Store::open(dir.path()).await.unwrap();
-        assert!(b.set_push_token(&two.token_sha256, None).await.unwrap());
+        assert!(b.set_push_token(&two.key, None).await.unwrap());
         assert!(c.reload_if_changed().await);
         assert_eq!(c.devices()[0].push_token, None);
-        assert!(
-            a.set_push_token(&two.token_sha256, Some(p1.into()))
-                .await
-                .unwrap()
-        );
+        assert!(a.set_push_token(&two.key, Some(p1.into())).await.unwrap());
         assert!(b.reload_if_changed().await);
         assert_eq!(b.devices()[0].push_token.as_deref(), Some(p1));
     }
@@ -1395,11 +1610,11 @@ mod tests {
         let mut hashes = Vec::new();
         for name in ["One", "Two", "Three"] {
             let secret = store.pairing_secret(epoch(1));
-            let (_, device) = store
-                .pair(&secret, name, "ios", LOGIN, epoch(1))
+            let device = store
+                .pair(&secret, name, "ios", &key_of(name), RELAY, epoch(1))
                 .await
                 .unwrap();
-            hashes.push(device.token_sha256);
+            hashes.push(device.key);
         }
         assert!(
             store
@@ -1454,11 +1669,11 @@ mod tests {
         let mut hashes = Vec::new();
         for name in ["One", "Two"] {
             let secret = store.pairing_secret(epoch(1));
-            let (_, device) = store
-                .pair(&secret, name, "ios", LOGIN, epoch(1))
+            let device = store
+                .pair(&secret, name, "ios", &key_of(name), RELAY, epoch(1))
                 .await
                 .unwrap();
-            hashes.push(device.token_sha256);
+            hashes.push(device.key);
         }
         let other = "ExpoPushToken[other]";
         store
@@ -1500,8 +1715,8 @@ mod tests {
         let dir = TempDir::new("hub-pushfail");
         let mut store = store(&dir).await;
         let secret = store.pairing_secret(epoch(1));
-        let (_, device) = store
-            .pair(&secret, "One", "ios", LOGIN, epoch(1))
+        let device = store
+            .pair(&secret, "One", "ios", &key_of("One"), RELAY, epoch(1))
             .await
             .unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -1511,14 +1726,12 @@ mod tests {
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             return;
         }
-        let result = store
-            .set_push_token(&device.token_sha256, Some(PUSH.into()))
-            .await;
+        let result = store.set_push_token(&device.key, Some(PUSH.into())).await;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = result.expect_err("the directory is read-only");
         let shown = format!("{error} {error:?}");
         assert!(
-            !shown.contains("secretvalue") && !shown.contains(&device.token_sha256),
+            !shown.contains("secretvalue") && !shown.contains(&device.key),
             "{shown}"
         );
         // The list in memory still says what is on disk.
@@ -1530,7 +1743,7 @@ mod tests {
         let dir = TempDir::new("hub-legacy");
         let hash = "ab".repeat(32);
         let legacy = format!(
-            r#"{{"devices":[{{"name":"Old","platform":"ios","login":"{LOGIN}","created":1,"last_seen":2,"token_sha256":"{hash}"}}]}}"#
+            r#"{{"devices":[{{"name":"Old","platform":"ios","created":1,"last_seen":2,"relay":"","key":"{hash}"}}]}}"#
         );
         std::fs::create_dir_all(dir.path()).unwrap();
         std::fs::write(dir.path().join("devices.json"), legacy).unwrap();
@@ -1555,17 +1768,12 @@ mod tests {
         let dir = TempDir::new("hub-activitylong");
         let mut store = store(&dir).await;
         let token = paired(&mut store, "Gemini 10", epoch(1)).await;
-        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        let device = store.authenticate(&token, epoch(2)).await.unwrap();
         // iOS 26.5 issues 128-byte tokens: 256 hex digits.
         let ios = "0123456789abcdef".repeat(16);
         let longest = "c".repeat(1024);
         let held = activity(Some(&ios), Some(&longest));
-        assert!(
-            store
-                .set_activity(&device.token_sha256, held.clone())
-                .await
-                .unwrap()
-        );
+        assert!(store.set_activity(&device.key, held.clone()).await.unwrap());
         let reopened = Store::open(dir.path()).await.unwrap();
         assert_eq!(reopened.devices()[0].activity, Some(held));
 
@@ -1585,17 +1793,12 @@ mod tests {
         let dir = TempDir::new("hub-activitywhen");
         let mut store = store(&dir).await;
         let token = paired(&mut store, "Gemini 10", epoch(1)).await;
-        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        let device = store.authenticate(&token, epoch(2)).await.unwrap();
         let when = ActivityTokens {
             registered: Some(1_790_000_000),
             ..activity(Some(ACTIVITY), Some(START))
         };
-        assert!(
-            store
-                .set_activity(&device.token_sha256, when.clone())
-                .await
-                .unwrap()
-        );
+        assert!(store.set_activity(&device.key, when.clone()).await.unwrap());
         let text = std::fs::read_to_string(dir.path().join("devices.json")).unwrap();
         assert!(text.contains("\"registered\""), "{text}");
         let reopened = Store::open(dir.path()).await.unwrap();
@@ -1631,12 +1834,12 @@ mod tests {
         let dir = TempDir::new("hub-activityagain");
         let mut store = store(&dir).await;
         let token = paired(&mut store, "Gemini 11", epoch(1)).await;
-        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        let device = store.authenticate(&token, epoch(2)).await.unwrap();
         let at = |registered: u64, start: &str| ActivityTokens {
             registered: Some(registered),
             ..activity(Some(ACTIVITY), Some(start))
         };
-        let hash = &device.token_sha256;
+        let hash = &device.key;
         assert!(
             store
                 .set_activity(hash, at(1_790_000_000, START))
@@ -1692,13 +1895,13 @@ mod tests {
         let mut store = store(&dir).await;
         let token = paired(&mut store, "Gemini 10", epoch(1)).await;
         let other = paired(&mut store, "Other", epoch(1)).await;
-        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        let device = store.authenticate(&token, epoch(2)).await.unwrap();
         assert_eq!(device.activity, None);
 
         // Setting stores both in the 0600 file, and they read back.
         assert!(
             store
-                .set_activity(&device.token_sha256, activity(Some(ACTIVITY), Some(START)))
+                .set_activity(&device.key, activity(Some(ACTIVITY), Some(START)))
                 .await
                 .unwrap()
         );
@@ -1723,7 +1926,7 @@ mod tests {
                 ("Other", None)
             ]
         );
-        let seen = store.authenticate(&token, LOGIN, epoch(3)).await.unwrap();
+        let seen = store.authenticate(&token, epoch(3)).await.unwrap();
         assert_eq!(seen.activity, Some(activity(Some(ACTIVITY), Some(START))));
 
         // Debug shows neither token, on the device or on its own.
@@ -1740,7 +1943,7 @@ mod tests {
         let newer = "0123456789abcdef5ec7e7cccc";
         assert!(
             store
-                .set_activity(&device.token_sha256, activity(Some(newer), None))
+                .set_activity(&device.key, activity(Some(newer), None))
                 .await
                 .unwrap()
         );
@@ -1759,7 +1962,7 @@ mod tests {
         );
         assert!(
             store
-                .set_activity(&device.token_sha256, activity(None, Some(START)))
+                .set_activity(&device.key, activity(None, Some(START)))
                 .await
                 .unwrap()
         );
@@ -1776,14 +1979,14 @@ mod tests {
         // Neither token is no activity at all.
         assert!(
             store
-                .set_activity(&device.token_sha256, activity(None, None))
+                .set_activity(&device.key, activity(None, None))
                 .await
                 .unwrap()
         );
         assert_eq!(store.devices()[0].activity, None);
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(!text.contains("\"activity\""), "{text}");
-        assert!(store.authenticate(&other, LOGIN, epoch(4)).await.is_some());
+        assert!(store.authenticate(&other, epoch(4)).await.is_some());
         assert_eq!(store.devices()[1].activity, None);
     }
 
@@ -1793,7 +1996,7 @@ mod tests {
         let mut store = store(&dir).await;
         let token = paired(&mut store, "Gemini 10", epoch(1)).await;
         paired(&mut store, "Other", epoch(1)).await;
-        let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
+        let device = store.authenticate(&token, epoch(2)).await.unwrap();
         let file = dir.path().join("devices.json");
         let newer = "0123456789abcdef5ec7e7cccc";
         // An unknown device is reported and nothing is written.
@@ -1808,7 +2011,7 @@ mod tests {
         // A revoke drops the tokens with the device.
         assert!(
             store
-                .set_activity(&device.token_sha256, activity(Some(newer), Some(START)))
+                .set_activity(&device.key, activity(Some(newer), Some(START)))
                 .await
                 .unwrap()
         );
@@ -1829,23 +2032,23 @@ mod tests {
         let mut store = store(&dir).await;
         let one = paired(&mut store, "One", epoch(1)).await;
         let two = paired(&mut store, "Two", epoch(1)).await;
-        let one = store.authenticate(&one, LOGIN, epoch(2)).await.unwrap();
-        let two = store.authenticate(&two, LOGIN, epoch(2)).await.unwrap();
+        let one = store.authenticate(&one, epoch(2)).await.unwrap();
+        let two = store.authenticate(&two, epoch(2)).await.unwrap();
         let theirs = "0123456789abcdef5ec7e7dddd";
         assert!(
             store
-                .set_activity(&one.token_sha256, activity(Some(ACTIVITY), Some(START)))
+                .set_activity(&one.key, activity(Some(ACTIVITY), Some(START)))
                 .await
                 .unwrap()
         );
         assert!(
             store
-                .set_activity(&two.token_sha256, activity(Some(theirs), None))
+                .set_activity(&two.key, activity(Some(theirs), None))
                 .await
                 .unwrap()
         );
         let file = dir.path().join("devices.json");
-        assert!(store.drop_activity(&one.token_sha256).await.unwrap());
+        assert!(store.drop_activity(&one.key).await.unwrap());
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(
             !text.contains(ACTIVITY) && !text.contains(START) && text.contains(theirs),
@@ -1867,7 +2070,7 @@ mod tests {
         );
         // Dropping again finds the device with nothing to drop, and writes nothing.
         let before = std::fs::metadata(&file).unwrap().modified().unwrap();
-        assert!(store.drop_activity(&one.token_sha256).await.unwrap());
+        assert!(store.drop_activity(&one.key).await.unwrap());
         assert_eq!(
             std::fs::metadata(&file).unwrap().modified().unwrap(),
             before
@@ -1886,19 +2089,19 @@ mod tests {
         let mut store = store(&dir).await;
         let one = paired(&mut store, "One", epoch(1)).await;
         let two = paired(&mut store, "Two", epoch(1)).await;
-        let one = store.authenticate(&one, LOGIN, epoch(2)).await.unwrap();
-        let two = store.authenticate(&two, LOGIN, epoch(2)).await.unwrap();
+        let one = store.authenticate(&one, epoch(2)).await.unwrap();
+        let two = store.authenticate(&two, epoch(2)).await.unwrap();
         let theirs = "0123456789abcdef5ec7e7dddd";
         let rotated = "0123456789abcdef5ec7e7ffff";
         assert!(
             store
-                .set_activity(&one.token_sha256, activity(Some(ACTIVITY), Some(START)))
+                .set_activity(&one.key, activity(Some(ACTIVITY), Some(START)))
                 .await
                 .unwrap()
         );
         assert!(
             store
-                .set_activity(&two.token_sha256, activity(Some(theirs), None))
+                .set_activity(&two.key, activity(Some(theirs), None))
                 .await
                 .unwrap()
         );
@@ -1924,7 +2127,7 @@ mod tests {
         // A 410 on a stale token leaves a newer registration intact, unwritten.
         assert!(
             store
-                .set_activity(&one.token_sha256, activity(Some(rotated), Some(START)))
+                .set_activity(&one.key, activity(Some(rotated), Some(START)))
                 .await
                 .unwrap()
         );
@@ -1967,8 +2170,8 @@ mod tests {
         let mut hashes = Vec::new();
         for name in ["One", "Two", "Three"] {
             let token = paired(&mut store, name, epoch(1)).await;
-            let device = store.authenticate(&token, LOGIN, epoch(2)).await.unwrap();
-            hashes.push(device.token_sha256);
+            let device = store.authenticate(&token, epoch(2)).await.unwrap();
+            hashes.push(device.key);
         }
         let held = |store: &Store| -> Vec<Option<ActivityTokens>> {
             store.devices().iter().map(|d| d.activity.clone()).collect()
@@ -2033,7 +2236,7 @@ mod tests {
         let dir = TempDir::new("hub-oldactivity");
         let entry = |name: &str, c: &str, extra: &str| {
             format!(
-                r#"{{"name":"{name}","platform":"ios","login":"{LOGIN}","created":1,"last_seen":2,"token_sha256":"{}","push_token":"{PUSH}","push_kinds":{{"approvals":true,"errors":true,"turns":false}}{extra}}}"#,
+                r#"{{"name":"{name}","platform":"ios","created":1,"last_seen":2,"relay":"","key":"{}","push_token":"{PUSH}","push_kinds":{{"approvals":true,"errors":true,"turns":false}}{extra}}}"#,
                 c.repeat(64)
             )
         };
@@ -2106,7 +2309,7 @@ mod tests {
         // still is: the defaults are for new pairings only.
         let entry = |name: &str, hash: &str, extra: &str| {
             format!(
-                r#"{{"name":"{name}","platform":"ios","login":"{LOGIN}","created":1,"last_seen":2,"token_sha256":"{hash}"{extra}}}"#
+                r#"{{"name":"{name}","platform":"ios","created":1,"last_seen":2,"relay":"","key":"{hash}"{extra}}}"#
             )
         };
         let legacy = format!(
@@ -2192,7 +2395,7 @@ mod tests {
         assert!(cli.revoke("Gemini 10").await);
         assert!(hub.reload_if_changed().await);
         assert!(hub.devices().is_empty());
-        assert!(hub.authenticate(&token, LOGIN, epoch(2)).await.is_none());
+        assert!(hub.authenticate(&token, epoch(2)).await.is_none());
         assert!(!hub.reload_if_changed().await);
     }
 
@@ -2203,24 +2406,94 @@ mod tests {
         assert_eq!(
             store.config(),
             &HubConfig {
-                port: 47823,
+                relay: DEFAULT_RELAY.to_owned(),
                 workspaces: Vec::new(),
                 apns: None
             }
         );
         std::fs::write(
             dir.path().join("hub.json"),
-            r#"{"port":50000,"workspaces":["/a","/b"]}"#,
+            r#"{"relay":"wss://relay.example:8443","workspaces":["/a","/b"]}"#,
         )
         .unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-        assert_eq!(store.config().port, 50000);
+        assert_eq!(store.config().relay, "wss://relay.example:8443");
         assert_eq!(
             store.config().workspaces,
             [PathBuf::from("/a"), PathBuf::from("/b")]
         );
-        std::fs::write(dir.path().join("hub.json"), r#"{"port":70000}"#).unwrap();
+        std::fs::write(dir.path().join("hub.json"), r#"{"workspaces":7}"#).unwrap();
         assert!(Store::open(dir.path()).await.is_err());
+    }
+
+    /// The relay the hub would dial for a `hub.json` that says `text`.
+    async fn relay_of(dir: &TempDir, text: &str) -> String {
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("hub.json"), text).unwrap();
+        Store::open(dir.path())
+            .await
+            .unwrap()
+            .config()
+            .relay
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn a_port_left_in_hub_json_is_ignored() {
+        let dir = TempDir::new("hub-oldport");
+        // Whatever it says, even what once stopped the hub.
+        for port in ["50000", "70000", "0", r#""x""#, "null"] {
+            let relay = relay_of(&dir, &format!(r#"{{"port":{port}}}"#)).await;
+            assert_eq!(relay, DEFAULT_RELAY, "{port}");
+        }
+        let both = relay_of(&dir, r#"{"port":50000,"relay":"wss://relay.example"}"#).await;
+        assert_eq!(both, "wss://relay.example");
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_is_not_wss_is_ignored_for_the_default() {
+        let dir = TempDir::new("hub-relay-scheme");
+        for bad in [
+            r#""ws://relay.example""#,
+            r#""https://relay.example""#,
+            r#""relay.example""#,
+            r#""WSS://relay.example""#,
+            r#""""#,
+            "7",
+            "true",
+            r#"["wss://relay.example"]"#,
+        ] {
+            let relay = relay_of(&dir, &format!(r#"{{"relay":{bad}}}"#)).await;
+            assert_eq!(relay, DEFAULT_RELAY, "{bad}");
+        }
+        assert_eq!(
+            relay_of(&dir, r#"{"relay":"wss://relay.example"}"#).await,
+            "wss://relay.example"
+        );
+        assert_eq!(
+            relay_of(&dir, r#"{"relay":"wss://relay.example:443"}"#).await,
+            "wss://relay.example:443"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_with_a_path_a_query_or_a_user_name_is_ignored_for_the_default() {
+        let dir = TempDir::new("hub-relay-shape");
+        for bad in [
+            "wss://relay.example/",
+            "wss://relay.example/v1",
+            "wss://relay.example:8443/v1/hub",
+            "wss://relay.example?token=1",
+            "wss://relay.example#x",
+            "wss://me@relay.example",
+            "wss://me:secret@relay.example:8443",
+            "wss://relay.example:",
+            "wss://relay.example:99999",
+            "wss://",
+        ] {
+            let relay = relay_of(&dir, &format!(r#"{{"relay":"{bad}"}}"#)).await;
+            assert_eq!(relay, DEFAULT_RELAY, "{bad}");
+        }
     }
 
     #[tokio::test]
@@ -2252,7 +2525,6 @@ mod tests {
         write(r#"{"team_id":"team","key_id":"KEY1234567","key_path":"/k","sandbox":true}"#);
         let store = Store::open(dir.path()).await.unwrap();
         assert_eq!(store.config().apns, None);
-        assert_eq!(store.config().port, 50001);
         write(r#""on""#);
         assert_eq!(Store::open(dir.path()).await.unwrap().config().apns, None);
         write("null");
@@ -2310,7 +2582,7 @@ mod tests {
         let b = paired(&mut x, "B", epoch(100)).await;
         let mut y = Store::open(dir.path()).await.unwrap();
         assert!(y.revoke("A").await);
-        let device = x.authenticate(&b, LOGIN, epoch(1000)).await.unwrap();
+        let device = x.authenticate(&b, epoch(1000)).await.unwrap();
         assert_eq!(device.last_seen, 1000);
         let names = |store: &Store| {
             store
@@ -2325,14 +2597,14 @@ mod tests {
         assert_eq!(reopened.devices()[0].last_seen, 1000);
         // A pairing from the stale store keeps the revoke too.
         let secret = x.pairing_secret(epoch(1000));
-        x.pair(&secret, "C", "ios", LOGIN, epoch(1000))
+        x.pair(&secret, "C", "ios", &key_of("C"), RELAY, epoch(1000))
             .await
             .unwrap();
         assert_eq!(names(&Store::open(dir.path()).await.unwrap()), ["B", "C"]);
         // And a device revoked elsewhere cannot authenticate when it would write.
         assert!(y.reload_if_changed().await);
         assert!(x.revoke("B").await);
-        assert!(y.authenticate(&b, LOGIN, epoch(5000)).await.is_none());
+        assert!(y.authenticate(&b, epoch(5000)).await.is_none());
         assert_eq!(names(&Store::open(dir.path()).await.unwrap()), ["C"]);
         let lock = dir.path().join("devices.lock");
         assert_eq!(
@@ -2346,7 +2618,9 @@ mod tests {
         let dir = TempDir::new("hub-clock");
         let mut store = store(&dir).await;
         let secret = store.pairing_secret(epoch(10_000));
-        let earlier = store.pair(&secret, "Phone", "ios", LOGIN, epoch(100)).await;
+        let earlier = store
+            .pair(&secret, "Phone", "ios", &key_of("Phone"), RELAY, epoch(100))
+            .await;
         assert_eq!(
             earlier.map(|_| ()),
             Err("Pairing code already used or expired")
@@ -2367,16 +2641,28 @@ mod tests {
         ] {
             assert!(
                 store
-                    .pair(&secret, name, platform, LOGIN, now)
+                    .pair(&secret, name, platform, &key_of(name), RELAY, now)
                     .await
                     .is_err(),
                 "{name:?}"
             );
         }
         let long = "x".repeat(65);
-        assert!(store.pair(&secret, &long, "ios", LOGIN, now).await.is_err());
-        let (_, device) = store
-            .pair(&secret, "  Gemini 10 ", " ios ", LOGIN, now)
+        assert!(
+            store
+                .pair(&secret, &long, "ios", &key_of(&long), RELAY, now)
+                .await
+                .is_err()
+        );
+        let device = store
+            .pair(
+                &secret,
+                "  Gemini 10 ",
+                " ios ",
+                &key_of("  Gemini 10 "),
+                RELAY,
+                now,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2402,19 +2688,22 @@ mod tests {
         let dir = TempDir::new("hub-bad");
         std::fs::create_dir(dir.path()).unwrap();
         let hash = "ab".repeat(32);
-        let device = |login: &str, hash: &str| {
+        let device = |relay: &str, key: &str| {
             format!(
-                r#"{{"devices":[{{"name":"n","platform":"p","login":"{login}","created":1,"last_seen":1,"token_sha256":"{hash}"}}]}}"#
+                r#"{{"devices":[{{"name":"n","platform":"p","created":1,"last_seen":1,{relay}"key":"{key}"}}]}}"#
             )
         };
+        let relay = r#""relay":"","#;
         let file = dir.path().join("devices.json");
-        std::fs::write(&file, device(LOGIN, &hash)).unwrap();
+        std::fs::write(&file, device(relay, &hash)).unwrap();
         assert!(Store::open(dir.path()).await.is_ok());
         for bad in [
+            // No relay, and keys that are not 64 lowercase hex digits.
             device("", &hash),
-            device(LOGIN, "abc"),
-            device(LOGIN, &hash.to_uppercase()),
-            device(LOGIN, &"g".repeat(64)),
+            device(relay, "abc"),
+            device(relay, &hash.to_uppercase()),
+            device(relay, &"g".repeat(64)),
+            device(r#""relay":7,"#, &hash),
         ] {
             std::fs::write(&file, bad).unwrap();
             let error = Store::open(dir.path()).await.unwrap_err();

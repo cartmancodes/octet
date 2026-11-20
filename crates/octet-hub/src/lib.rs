@@ -4,7 +4,23 @@
 mod activity;
 pub mod apns;
 mod git;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the relay link (plan Task 6) is the first caller outside the tests"
+    )
+)]
+mod keys;
 mod launch;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the pairing flow (plan Task 6) is the first caller outside the tests"
+    )
+)]
+mod link;
 mod owner;
 mod push;
 #[cfg_attr(
@@ -22,5 +38,5 @@ mod tail;
 mod watch;
 pub use owner::{owner_login, published_url};
 pub use server::{Hub, Publisher};
-pub use store::{ActivityTokens, Device, HubConfig, Store};
+pub use store::{ActivityTokens, DEFAULT_PORT, DEFAULT_RELAY, Device, HubConfig, Store};
 pub use watch::{Lines, NOT_RUNNING, plain, watch};
