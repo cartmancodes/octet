@@ -5,8 +5,11 @@ import * as Notifications from "expo-notifications";
 import { Platform, StyleSheet } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import { redirectSystemPath } from "../app/+native-intent";
 import Pair from "../app/pair";
-import { FakeClock, Sockets } from "./client/fakes";
+import { FakeClock, Sockets, channelOf, hubKeyOf, pairLinkTo } from "./client/fakes";
+import { fromHex } from "./client/link";
+import { newKeyPair } from "./client/noise";
 import { DEV_BUILD_WARNING } from "./components/DevBuildBanner";
 import { HubContext, Fleet, TOKEN_KEY, tokenKeyOf } from "./hub";
 import { TOO_MANY_MACS } from "./macs";
@@ -49,7 +52,8 @@ jest.mock("expo-constants", () => ({
 
 const METRICS = { frame: { x: 0, y: 0, width: 390, height: 844 }, insets: { top: 47, left: 0, right: 0, bottom: 34 } };
 const SECRET = "ab".repeat(32);
-const LINK = `https://mac.tail1234.ts.net/#pair=${SECRET}`;
+const LINK = pairLinkTo("mac", SECRET, { relay: "relay.example.test" });
+/** The private key, as hex, of the key pair the phone makes when it pairs. */
 const TOKEN = "cd".repeat(32);
 const GRANTED = { granted: true, canAskAgain: true, status: "granted" };
 const DENIED = { granted: false, canAskAgain: false, status: "denied" };
@@ -59,7 +63,8 @@ async function open(permission: Permission = GRANTED) {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const hub = new Fleet({
-    factory: sockets.factory,
+    factory: () => sockets.factory,
+    newKey: () => newKeyPair(() => fromHex(TOKEN) ?? new Uint8Array(32)),
     store: createOctetStore(),
     clientOptions: { now: clock.now, schedule: clock.schedule },
     newId: newM,
@@ -75,12 +80,26 @@ async function open(permission: Permission = GRANTED) {
   return { sockets, hub };
 }
 
-/** The Mac accepts the pairing the app just sent. */
-function accept({ sockets }: { sockets: Sockets }): void {
+/** The Mac holds the pairing the app just sent for the owner's answer: it sends its code. */
+async function holdIt({ sockets }: { sockets: Sockets }, code = "482913"): Promise<void> {
   const socket = sockets.last;
-  socket.open();
-  const [command] = socket.commandsOf("pair");
-  socket.receive({ type: "paired", req: command?.req, token: TOKEN, device: "iPhone" });
+  await act(async () => {
+    socket.open();
+    const [command] = socket.commandsOf("pair");
+    socket.receive({ type: "pair_code", req: command?.req, code });
+  });
+}
+
+/** The Mac accepts the pairing the app just sent: its code, then `paired` under its name `mac`. */
+async function accept({ sockets }: { sockets: Sockets }): Promise<void> {
+  const socket = sockets.last;
+  await act(async () => {
+    socket.open();
+    const [command] = socket.commandsOf("pair");
+    socket.receive({ type: "pair_code", req: command?.req, code: "482913" });
+    socket.receive({ type: "paired", req: command?.req, device: "iPhone", name: "mac" });
+    socket.drop(1000);
+  });
 }
 
 /** "Enter code instead": the paste and name fields (a scan or a missing camera shows them too). */
@@ -111,10 +130,10 @@ beforeEach(async () => {
 });
 
 describe("the Pair screen", () => {
-  it("is a panel with 'Scan the code from /remote-control pair', with a hint,, the camera in four accent corner brackets, and a sheet", async () => {
+  it("is a panel with 'Scan the code from octet pair', with a hint,, the camera in four accent corner brackets, and a sheet", async () => {
     await open();
-    expect(screen.getByText("Scan the code from /remote-control pair")).toBeTruthy();
-    expect(screen.getByText("On your Mac, run /remote-control pair in Octet.")).toBeTruthy();
+    expect(screen.getByText("Scan the code from octet pair")).toBeTruthy();
+    expect(screen.getByText("On your Mac, run octet pair in a terminal.")).toBeTruthy();
     const style = (el: { props: { style?: unknown } }) => StyleSheet.flatten(el.props.style as never) as Record<string, unknown>;
     const frame = style(screen.getByTestId("scan-frame"));
     expect(frame.width).toBe(240);
@@ -161,20 +180,39 @@ describe("the Pair screen", () => {
     await paste(LINK);
     expect(toastStore.getState().toast).toBeNull();
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    accept(rig);
+    await accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
     expect(toastStore.getState().toast?.text).toBe("Paired with mac");
   });
 
-  it("pairing a Mac again toasts the name it kept, not its host's", async () => {
+  it("pairing a Mac again toasts the name it kept, not the hub's", async () => {
     await SecureStore.setItemAsync(tokenKeyOf("m000000aa"), TOKEN);
-    await saveSettings({ pairings: [{ id: "m000000aa", hubUrl: "wss://mac.tail1234.ts.net/", deviceName: "iPhone", macName: "Desk" }] });
+    await saveSettings({
+      pairings: [
+        { id: "m000000aa", relay: "wss://relay.example.test/", channel: channelOf("mac"), hubKey: hubKeyOf("mac"), deviceName: "iPhone", macName: "Desk" },
+      ],
+    });
     const rig = await open();
     await paste(LINK);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    accept(rig);
+    await accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
     expect(toastStore.getState().toast?.text).toBe("Paired with Desk");
+  });
+
+  it("a link to a Mac paired already asks for no name: the one the Mac knows stays", async () => {
+    await SecureStore.setItemAsync(tokenKeyOf("m000000aa"), TOKEN);
+    await saveSettings({
+      pairings: [
+        { id: "m000000aa", relay: "wss://relay.example.test/", channel: channelOf("mac"), hubKey: hubKeyOf("mac"), deviceName: "iPhone", macName: "Desk" },
+      ],
+    });
+    await open();
+    await enter();
+    expect(screen.getByLabelText("Device name")).toBeTruthy();
+    await paste(LINK);
+    expect(screen.queryByLabelText("Device name")).toBeNull();
+    expect(screen.getByText("Desk keeps the name it knows this phone by.")).toBeTruthy();
   });
 
   it("toasts nothing when the pairing fails", async () => {
@@ -210,37 +248,37 @@ describe("the Pair screen", () => {
   it("a scanned link asks which Mac before it pairs, and pairs only after the tap", async () => {
     const rig = await open();
     await scan(LINK);
-    expect(screen.getByText("Pair with mac.tail1234.ts.net?")).toBeTruthy();
+    expect(screen.getByText("Pair with this Mac?")).toBeTruthy();
     expect(screen.getByLabelText("Pairing link").props.value).toBe(LINK);
     expect(rig.sockets.all).toHaveLength(0);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    accept(rig);
+    await accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
     expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
-    expect((await loadSettings()).pairings.map((p) => p.hubUrl)).toEqual(["wss://mac.tail1234.ts.net/"]);
+    expect((await loadSettings()).pairings.map((p) => p.channel)).toEqual([channelOf("mac")]);
   });
 
   it("Cancel drops a scanned link without pairing", async () => {
     const rig = await open();
     await scan(LINK);
     await fireEvent.press(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByText("Pair with mac.tail1234.ts.net?")).toBeNull();
+    expect(screen.queryByText("Pair with this Mac?")).toBeNull();
     expect(screen.getByLabelText("Pairing link").props.value).toBe("");
     expect(rig.sockets.all).toHaveLength(0);
     // The camera still sees the same code: it does not ask again until it sees another.
     await scan(LINK);
-    expect(screen.queryByText("Pair with mac.tail1234.ts.net?")).toBeNull();
+    expect(screen.queryByText("Pair with this Mac?")).toBeNull();
   });
 
-  it("a pasted link shows its host, and Pair is off until there is a valid link", async () => {
+  it("a pasted link asks, and Pair is off until there is a valid link", async () => {
     const rig = await open();
     await enter();
     expect(screen.getByRole("button", { name: "Pair" }).props.accessibilityState.disabled).toBe(true);
     await paste(LINK);
-    expect(screen.getByText("Pair with mac.tail1234.ts.net?")).toBeTruthy();
+    expect(screen.getByText("Pair with this Mac?")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Pair" }).props.accessibilityState.disabled).toBe(false);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    accept(rig);
+    await accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
     expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
   });
@@ -255,16 +293,73 @@ describe("the Pair screen", () => {
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
-  it("a link to a host that is not a .ts.net name says where pair links come from, and opens nothing", async () => {
+  it("a link of the Tailscale days is not a pairing link, and opens nothing", async () => {
     const { sockets } = await open();
-    await scan(`https://mac.tail1234.ts.net.evil.example/#pair=${SECRET}`);
-    expect(screen.getByText("Pair links come from tailscale serve (a .ts.net name)")).toBeTruthy();
+    await scan(`https://mac.tail1234.ts.net/#pair=${SECRET}`);
+    expect(screen.getByText("That isn't an Octet pairing link")).toBeTruthy();
     await paste(`https://100.64.0.7:8443/#pair=${SECRET}`);
-    expect(screen.getByText("Pair links come from tailscale serve (a .ts.net name)")).toBeTruthy();
+    expect(screen.getByText("That isn't an Octet pairing link")).toBeTruthy();
     expect(screen.queryByText(/^Pair with .*\?$/)).toBeNull();
     expect(screen.getByRole("button", { name: "Pair" }).props.accessibilityState.disabled).toBe(true);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
     expect(sockets.all).toHaveLength(0);
+  });
+
+  it("no_code_is_shown_until_pair_code_arrives, and then the hub's own code is", async () => {
+    const rig = await open();
+    await paste(LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    await act(async () => rig.sockets.last.open());
+    // Connected, and the pair command sent: still no code, since the Mac has not held the phone.
+    expect(rig.sockets.last.commandsOf("pair")).toHaveLength(1);
+    expect(screen.queryByText("Check this code on your Mac")).toBeNull();
+    expect(screen.queryByText(/^[0-9]{3} [0-9]{3}$/)).toBeNull();
+    await holdIt(rig, "048213");
+    expect(screen.getByText("Check this code on your Mac")).toBeTruthy();
+    expect(screen.getByText("048 213")).toBeTruthy();
+    // The owner says yes at the Mac: the code goes with the pairing screen.
+    const [command] = rig.sockets.last.commandsOf("pair");
+    await act(async () => rig.sockets.last.receive({ type: "paired", req: command?.req, device: "iPhone", name: "mac" }));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
+  });
+
+  it("the code goes when the Mac says no, and the hub's words show", async () => {
+    const rig = await open();
+    await paste(LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    await holdIt(rig);
+    expect(screen.getByText("482 913")).toBeTruthy();
+    const [command] = rig.sockets.last.commandsOf("pair");
+    await act(async () =>
+      rig.sockets.last.receive({ type: "refused", req: command?.req, code: "unpaired", reason: "Pairing was refused on the Mac" }),
+    );
+    expect(await screen.findByText("Pairing was refused on the Mac")).toBeTruthy();
+    expect(screen.queryByText("482 913")).toBeNull();
+    expect(screen.queryByText("Check this code on your Mac")).toBeNull();
+  });
+
+  it("a_pair_link_the_system_opens_goes_to_pairing, filled in, and pairs only after the tap", async () => {
+    // The camera app, a tap in Messages, or a paste into Safari opens the link: the app's own
+    // scheme, which the router is handed as the Pair screen with the link to confirm.
+    const target = redirectSystemPath({ path: LINK, initial: true });
+    expect(target).toBe(`/pair?add=1&link=${encodeURIComponent(LINK)}`);
+    expect(redirectSystemPath({ path: LINK, initial: false })).toBe(target);
+    const rig = await (async () => {
+      mockParams = { add: "1", link: LINK };
+      return open();
+    })();
+    expect(screen.getByLabelText("Pairing link").props.value).toBe(LINK);
+    expect(screen.getByText("Pair with this Mac?")).toBeTruthy();
+    expect(rig.sockets.all).toHaveLength(0);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    await accept(rig);
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
+    // A link the app cannot take still lands on Pair, which says why.
+    const bad = "octet://pair/AAAA";
+    expect(redirectSystemPath({ path: bad, initial: true })).toBe(`/pair?add=1&link=${encodeURIComponent(bad)}`);
+    mockParams = { link: bad };
+    await open();
+    expect(screen.getByText("That isn't an Octet pairing link")).toBeTruthy();
   });
 
   it("an invalid scan says so, once however often the camera sees it", async () => {
@@ -285,20 +380,20 @@ describe("the Pair screen", () => {
     rig.sockets.last.receive({ type: "refused", req: command?.req, reason: "That pairing code has expired", code: "unpaired" });
     expect(await screen.findByText("That pairing code has expired")).toBeTruthy();
     expect(screen.getByLabelText("Pairing link").props.value).toBe("");
-    expect(screen.queryByText("Pair with mac.tail1234.ts.net?")).toBeNull();
+    expect(screen.queryByText("Pair with this Mac?")).toBeNull();
     await scan(LINK);
-    expect(screen.getByText("Pair with mac.tail1234.ts.net?")).toBeTruthy();
+    expect(screen.getByText("Pair with this Mac?")).toBeTruthy();
     expect(rig.sockets.all).toHaveLength(1); // asked, not tried
   });
 
-  it("tells how to recover when the phone cannot keep the token, and forgets the link", async () => {
+  it("tells how to recover when the phone cannot keep its key, and forgets the link", async () => {
     jest.mocked(SecureStore.setItemAsync).mockRejectedValueOnce(new Error("locked")).mockRejectedValueOnce(new Error("locked"));
     const rig = await open();
     await paste(LINK);
     await enter();
     await fireEvent.changeText(screen.getByLabelText("Device name"), "Work phone");
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    accept(rig);
+    await accept(rig);
     expect(
       await screen.findByText(
         "This phone paired but couldn't save it. On the Mac run `octet hub revoke Work phone`, then pair again with a new code.",
@@ -348,7 +443,7 @@ describe("the Pair screen", () => {
     expect(screen.getByText("Camera access is off — paste the link instead")).toBeTruthy();
     await paste(LINK);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    accept(rig);
+    await accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
   });
 
@@ -413,7 +508,7 @@ describe("the notifications step after pairing", () => {
     rig.hub.setForeground(true);
     await paste(LINK);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    accept(rig);
+    await accept(rig);
     await screen.findByRole("button", { name: "Turn on notifications" });
     await act(async () => {
       rig.sockets.last.open();
@@ -467,7 +562,7 @@ describe("the notifications step after pairing", () => {
     const rig = await open();
     await paste(LINK);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    accept(rig);
+    await accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
     expect(screen.queryByRole("button", { name: "Turn on notifications" })).toBeNull();
   });
@@ -476,7 +571,14 @@ describe("the notifications step after pairing", () => {
 describe("pairing another machine", () => {
   /** A phone paired with `hosts` already, each pairing's token in its keychain entry. */
   async function pairedWith(...hosts: string[]) {
-    const pairings = hosts.map((host, i) => ({ id: `m0000000${(10 + i).toString(16)}`, hubUrl: `wss://${host}.tail1234.ts.net/`, deviceName: "iPhone", macName: host }));
+    const pairings = hosts.map((host, i) => ({
+      id: `m0000000${(10 + i).toString(16)}`,
+      relay: `wss://${host}.relay.example.test/`,
+      channel: channelOf(host),
+      hubKey: hubKeyOf(host),
+      deviceName: "iPhone",
+      macName: host,
+    }));
     for (const p of pairings) await SecureStore.setItemAsync(tokenKeyOf(p.id), TOKEN);
     await saveSettings({ pairings });
     return pairings;
@@ -491,7 +593,7 @@ describe("pairing another machine", () => {
     expect(screen.queryByText("No Mac yet")).toBeNull();
     await paste(LINK);
     await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
-    accept(rig);
+    await accept(rig);
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith("/"));
     expect(rig.hub.snapshot().macs.map((m) => m.id)).toEqual([studio?.id, M]);
     expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBe(TOKEN);
@@ -519,7 +621,7 @@ describe("pairing another machine", () => {
   it("is the first pairing's screen without the add mode, however many Macs", async () => {
     await pairedWith("studio-mac");
     await open();
-    expect(screen.getByText("Scan the code from /remote-control pair")).toBeTruthy();
+    expect(screen.getByText("Scan the code from octet pair")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Cancel adding a Mac" })).toBeNull();
   });
 });

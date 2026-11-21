@@ -8,8 +8,8 @@ import Foundation
 // it in the app check availability first.
 @available(iOS 17.2, *)
 struct OctetActivity: ActivityAttributes {
-  // Exactly the hub's "content-state". `session` is the hub's raw session id or "", and `mac` its
-  // published host or "". `kind` stays a String so an unknown kind still decodes.
+  // Exactly the hub's "content-state". `session` is the hub's raw session id or "", and `mac` the
+  // Mac's channel id or "". `kind` stays a String so an unknown kind still decodes.
   struct ContentState: Codable, Hashable {
     let kind: String
     let session: String

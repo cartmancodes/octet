@@ -43,6 +43,8 @@ enum Wake {
     Shell(Result<shell::Ran, shell::ShellError>),
     /// A hub sent a command.
     Remote(Remote),
+    /// The pairing `/remote-control pair` opened told something; `None` once it stopped.
+    Pairing(Option<crate::remote::Told>),
     /// The external editor exited.
     Editor(io::Result<ExitStatus>),
     /// A key, paste or resize; `None` once the terminal closed.
@@ -132,6 +134,7 @@ impl Loop<'_> {
             _ => None,
         };
         let models = &mut app.models;
+        let pairing = &mut app.pairing;
         let editing = &mut self.editing;
         let input = &mut self.input;
         let bridge = &mut *self.bridge;
@@ -154,6 +157,12 @@ impl Loop<'_> {
                     None => std::future::pending().await,
                 }
             } => Wake::Shell(ran),
+            told = async {
+                match pairing.as_mut() {
+                    Some(wait) => wait.next().await,
+                    None => std::future::pending().await,
+                }
+            } => Wake::Pairing(told),
             status = async {
                 match editing.as_mut() {
                     Some((child, _)) => child.wait().await,
@@ -218,6 +227,7 @@ impl Loop<'_> {
                 refresh_completion(app);
             }
             Wake::Shell(ran) => shell_finished(app, ran),
+            Wake::Pairing(told) => crate::remote::apply(app, told),
             Wake::Remote(remote) => {
                 let (peer, req) = (remote.peer, remote.req);
                 let (result, action) =

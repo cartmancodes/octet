@@ -1,14 +1,16 @@
 # `/remote-control`: mobile access to a live Rust session
 
 Planning date: 2026-10-04. Status: superseded. The web client this proposes
-was removed on 2026-10-04 (Rust terminal UI only); phone access is the SSH
-setup in [Use Octet from your phone](../remote-control.md).
+was removed on 2026-10-04 (Rust terminal UI only). Phone access is now the Octet phone
+app, which reaches the hub through a relay (end-to-end encrypted, no Tailscale); see
+[Use Octet from your phone](../remote-control.md). The relay is described in
+[the relay connectivity design](../superpowers/specs/2026-11-19-relay-connectivity-design.md).
 Original requirement: connect over the internet from anywhere.
 
 A zero-code alternative for a single user, the full TUI over tmux + Tailscale
 SSH + mosh from Blink or Termius, is evaluated in
 [remote-control-ssh.md](remote-control-ssh.md). It also covers a thin
-`/remote-control` setup helper.
+`/remote-control` setup helper, since removed.
 
 ## Recommendation and effort
 

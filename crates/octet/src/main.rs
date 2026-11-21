@@ -6,6 +6,7 @@ use std::{io::IsTerminal, path::PathBuf};
 mod args;
 mod headless;
 mod hub;
+mod pair;
 mod service;
 
 /// Where journals and goals go under the data directory. Named when the Rust
@@ -14,12 +15,12 @@ const JOURNAL_DIR: &str = "octet/rust-preview";
 
 /// `octet hub --help`.
 fn hub_help() -> &'static str {
-    "Octet hub — your terminal sessions on your phone, over your tailnet\n\
+    "Octet hub — your terminal sessions on your phone, through a relay, end-to-end encrypted\n\
 \n\
-Usage: octet hub [ACTION] [--journal-dir PATH] [--port N] [--owner LOGIN] [--print]\n\
+Usage: octet hub [ACTION] [--journal-dir PATH] [--print]\n\
 \n\
 Actions:\n\
-  serve          Run the hub on 127.0.0.1 until interrupted (the default)\n\
+  serve          Run the hub until interrupted (the default)\n\
   devices        List the paired phones\n\
   revoke NAME    Unpair the phone called NAME (a running hub drops it within 2 s)\n\
   watch          Print what every session is doing until Ctrl+C\n\
@@ -27,12 +28,22 @@ Actions:\n\
   uninstall      Stop that service and remove it\n\
 \n\
 Options:\n\
-  --port N       serve: the loopback port (default: hub.json's, else 47823)\n\
-  --owner LOGIN  serve: the tailnet login that may connect (default: this Mac's, from Tailscale)\n\
   --print        install: show the service file without installing it\n\
-  --journal-dir PATH  Where journals and the hub's files live (install keeps it)\n\
+  --journal-dir PATH  Where journals and the hub's files live (install keeps it)\n"
+}
+
+/// `octet pair --help`.
+fn pair_help() -> &'static str {
+    "Octet pair — pair a phone with this Mac, starting the hub first if it is not running\n\
 \n\
-Publish the hub to your tailnet with: tailscale serve --bg <port>\n"
+Usage: octet pair [--journal-dir PATH]\n\
+\n\
+Shows a QR code and a link, valid once and for 10 minutes. Scan it with the Octet app; when\n\
+the phone shows a code, check it matches and answer y to pair it. If the hub is not running\n\
+it is installed as a per-user service first, as octet hub install does.\n\
+\n\
+Options:\n\
+  --journal-dir PATH  Where journals and the hub's files live\n"
 }
 
 /// `--help`: fixed usage and keys, then every command from the registry.
@@ -45,6 +56,7 @@ fn help() -> String {
         "                 [--no-remote]",
         "                 [--print PROMPT|- [--output text|json] | --rpc]",
         "       octet hub [serve|devices|revoke NAME|watch|install|uninstall] (the phone hub; octet hub --help)",
+        "       octet pair [--journal-dir PATH] (pair a phone; octet pair --help)",
         "       octet --version | --help",
         "",
         "Headless: --print (-p) runs one prompt and writes the reply; - reads it",
@@ -158,13 +170,23 @@ async fn run() -> Result<i32, CliError> {
         Parsed::Hub(args) => {
             let directory = data_dir(args.journal_dir)?;
             return match args.action {
-                HubAction::Serve => hub::serve(directory, args.port, args.owner).await,
+                HubAction::Serve => hub::serve(directory).await,
                 HubAction::Devices => hub::devices(&directory).await,
                 HubAction::Revoke(name) => hub::revoke(&directory, &name).await,
                 HubAction::Watch => hub::watch(&directory).await,
                 HubAction::Install { print } => hub::install(directory, print).await,
                 HubAction::Uninstall => hub::uninstall(directory).await,
             };
+        }
+        Parsed::PairHelp => {
+            print!("{}", pair_help());
+            return Ok(0);
+        }
+        Parsed::Pair { journal_dir } => {
+            let directory = data_dir(journal_dir)?;
+            let input = pair::stdin_reader()
+                .map_err(|e| CliError::Run(format!("Couldn't read the terminal: {e}")))?;
+            return pair::pair(directory, input, std::io::stdout()).await;
         }
         Parsed::Run(args) => args,
     };

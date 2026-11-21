@@ -1,17 +1,18 @@
-// The app's links to its Macs: up to `MAX_MACS` pairings, each a `MacLink` (its client, its device
-// token in the keychain, its push registration and its notice), and the `Fleet` that owns them:
+// The app's links to its Macs: up to `MAX_MACS` pairings, each a `MacLink` (its client, its private
+// key in the keychain, its push registration and its notice), and the `Fleet` that owns them:
 // where the pairings come from, how pairing and unpairing keep them, and what the app's lifecycle
 // does to every link. No JSX here; `app/_layout.tsx` provides the Fleet to screens.
 //
 // The parts are in src/fleet/: the keychain (`keychain.ts`), one link (`macLink.ts`), the Fleet
 // (`fleet.ts`) and the hooks (`hooks.ts`). This module names them all, as it always has.
-export { TOKEN_KEY, tokenKey, tokenKeyOf, type Keychain, type TokenStore } from "./fleet/keychain";
+export { TOKEN_KEY, tokenKey, tokenKeyOf, type Keychain, type KeyStore } from "./fleet/keychain";
 export { MacLink, type MacInfo, type PushResult } from "./fleet/macLink";
 export {
   APPROVE_WAIT_MS,
   Fleet,
   HAND_OVER_MS,
   NOT_A_LINK,
+  NOT_FROM_THAT_MAC,
   UNPAIR_FAILED_NOTICE,
   unpairedNotice,
   type FleetOptions,

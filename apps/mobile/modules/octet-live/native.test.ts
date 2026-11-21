@@ -298,11 +298,10 @@ describe("the widget's buttons and links", () => {
     expect([...widgetSwift.matchAll(/octet:\/\/approve/g)].length).toBe(1);
   });
 
-  it("looks an entry up by the host lowercased, without a trailing dot, as the app writes it", () => {
-    expect(widgetSwift).toMatch(/Shown\.entry\(forKey: hostKey\(state\.mac\) \+ "\/" \+ state\.session\)/);
-    const key = block(widgetSwift, /private func hostKey\(_ host: String\) -> String/);
-    expect(key).toMatch(/lowercased\(\)/);
-    expect(key).toMatch(/hasSuffix\("\."\)/);
+  it("looks an entry up by the content state's mac as it is, an opaque string, as the app writes it", () => {
+    expect(widgetSwift).toMatch(/Shown\.entry\(forKey: state\.mac \+ "\/" \+ state\.session\)/);
+    // Nothing in the widget reads the mac as a host.
+    expect(widgetSwift).not.toMatch(/lowercased\(\)|hasSuffix\("\."\)|host/i);
   });
 
   it("marks the session's name and command privacy-sensitive, so iOS can redact them on a locked phone", () => {

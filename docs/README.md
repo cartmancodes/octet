@@ -4,8 +4,11 @@
 
 - [Using the terminal UI](tui.md): install, keys, commands, permission
   modes, switching models and providers, journals and limits.
-- [Use Octet from your phone](remote-control.md): tmux, Tailscale and mosh
-  setup step by step, and the `/remote-control` reference.
+- [Use Octet from your phone](remote-control.md): pair the phone app with
+  `octet pair` in three steps, what the relay can and cannot see, revoking a
+  phone, and the hub's security notes.
+- [Running the relay](relay.md): hosting the relay that carries a phone's
+  connection, for the owner or for self-hosting.
 - [Persistent goals](rust/goals.md): how `/goal` keeps working across turns
   and how it decides it is done.
 
@@ -31,7 +34,7 @@ code as it was when written, so the guides above win where they disagree.
   [implementation plans](superpowers/plans/), named by date.
 - [Code reviews](reviews/), named by date.
 - [Phone access evaluation](rust/remote-control-ssh.md), the analysis behind
-  the tmux, Tailscale and mosh approach, and a
+  the tmux, SSH and mosh route (documentation only), and a
   [proposal for a browser-based remote client](rust/remote-control-plan.md)
   that has not been built.
 - An earlier Python harness and web UI were removed on 2026-10-04. They

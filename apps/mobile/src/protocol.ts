@@ -203,19 +203,28 @@ export interface FileChange {
   status: FileStatus;
 }
 
-/** A known device connected. */
+/** A known device connected: its name, and the Mac's own host name (at most 64 characters, for display only). */
 export interface WelcomeFrame {
   v: 1;
   type: "welcome";
   device: string;
+  name: string;
 }
 
-/** A pairing succeeded; keep the token. */
+/** A pairing succeeded: the device's name, and the Mac's own host name (at most 64 characters, for display only). The phone keeps the key it paired with. */
 export interface PairedFrame {
   v: 1;
   type: "paired";
-  token: string;
   device: string;
+  name: string;
+}
+
+/** The hub holds this phone's `pair` (`req`) for the owner's answer at the Mac, which shows the same `code`: six digits the hub drew at random. The phone shows it while it waits, and never works one out for itself; `paired` or a refusal follows. */
+export interface PairCodeFrame {
+  v: 1;
+  type: "pair_code";
+  req: number;
+  code: string;
 }
 
 /** The live sessions, oldest first: at most `MAX_SESSION_ROWS`, the most recently active, in a frame of at most `MAX_MESSAGE` bytes. Past that, rows lose their `approval`, `usage`, `now` and `goal`, in that order and least recently active first, and then the least recently active rows go. Sent when a row changes, at most four times a second. */
@@ -309,16 +318,16 @@ export interface RefusedFrame {
   code?: RefusalCode | null;
 }
 
-/** Connect with a device token. `background: true` marks a connection the app makes from the background (to hand a Live Activity token over, or to send a Deny): it is not the app in front. Left out, the connection is the app in front. */
+/** Say who this is: the hub knows the phone by the key its handshake proved, so a `token` (sent by an app from before keys) is ignored. `background: true` marks a connection the app makes from the background (to hand a Live Activity token over, or to send a Deny): it is not the app in front. Left out, the connection is the app in front. */
 export interface HelloCommand {
   v: 1;
   type: "hello";
   req: number;
-  token: string;
+  token?: string | null;
   background?: boolean | null;
 }
 
-/** Pair a new device with a pairing secret. */
+/** Pair a new device with a pairing secret. The hub holds it for the owner's answer at the Mac (sending `pair_code`), then answers `paired` or refuses it; the secret is spent either way. */
 export interface PairCommand {
   v: 1;
   type: "pair";
@@ -602,6 +611,7 @@ export interface BridgeRefusedFrame {
 export type ToPhone =
   | WelcomeFrame
   | PairedFrame
+  | PairCodeFrame
   | SessionsFrame
   | SubscribedFrame
   | EventFrame

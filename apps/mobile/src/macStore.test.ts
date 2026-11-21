@@ -1,6 +1,6 @@
 // The store with more than one Mac: every session keyed by its Mac, so that two Macs that report
 // the same raw id (`{pid}-{started}`) never share a row, a view or an answer.
-import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
+import { FakeClock, Sockets, identityOf, type FakeSocket } from "./client/fakes";
 import { HubClient, Refusal } from "./client/HubClient";
 import { sendVia } from "./components/send";
 import type { Links } from "./macs";
@@ -36,8 +36,7 @@ function macs(...ids: string[]) {
   for (const mac of ids) {
     const sockets = new Sockets();
     const client = new HubClient({
-      url: `wss://${mac}.tail1.ts.net/`,
-      token: "t",
+      ...identityOf(mac),
       factory: sockets.factory,
       now: clock.now,
       schedule: clock.schedule,
@@ -210,7 +209,7 @@ describe("a new client for the same Mac", () => {
     const clock = new FakeClock();
     const connect = () => {
       const sockets = new Sockets();
-      const client = new HubClient({ url: "wss://m1.tail1.ts.net/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
+      const client = new HubClient({ ...identityOf("m1"), factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
       const off = connectStore(store, client, { mac: "m1", links: { client: () => client, macs: () => ["m1"] }, now: clock.now, schedule: clock.schedule });
       client.start();
       sockets.last.open();
@@ -271,7 +270,7 @@ describe("the view budget", () => {
   it("finds each key's client through the links alone: a Mac with no feed of its own is still asked", () => {
     const clock = new FakeClock();
     const sockets = new Sockets();
-    const client = new HubClient({ url: "wss://m3.tail1.ts.net/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
+    const client = new HubClient({ ...identityOf("m3"), factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
     const links: Links = { client: (mac) => (mac === "m3" ? client : null), macs: () => ["m3"] };
     const forget = jest.spyOn(client, "forget");
     const ids = ["a", "b", "c", "d", "e"];
@@ -361,7 +360,7 @@ describe("link state per Mac", () => {
   it("is the one place a link's state is kept: whether an attempt of its run ended follows the client", () => {
     const clock = new FakeClock();
     const sockets = new Sockets();
-    const client = new HubClient({ url: "wss://m1.tail1.ts.net/", token: "t", factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
+    const client = new HubClient({ ...identityOf("m1"), factory: sockets.factory, now: clock.now, schedule: clock.schedule, random: () => 1 });
     const off = connectStore(store, client, { mac: "m1", links: { client: () => client, macs: () => ["m1"] }, now: clock.now, schedule: clock.schedule });
     const link = () => [store.getState().hubs.get("m1"), store.getState().tried.has("m1")];
     expect(link()).toEqual(["offline", false]);

@@ -859,71 +859,15 @@ fn a_new_approval_rings_and_notifies() {
 }
 
 #[test]
-fn remote_control_reports_a_ready_host_with_the_phone_command() {
-    // Stand-ins for tmux, tailscale and mosh-server, first on the PATH, so
-    // the real binary's checks run end to end without those tools installed.
+fn no_tailscale_ssh_or_mosh_command_is_run() {
+    // Stand-ins for every program the old checks ran, first on the PATH, each recording that it
+    // ran. `/remote-control` only speaks to the hub's socket, so none of them may run.
     let tools = octet_testkit::TempDir::new("octet-remote-tools");
     fs::create_dir_all(tools.path()).unwrap();
-    octet_testkit::write_script(
-        tools.path(),
-        "tmux",
-        r#"case "$1 $3" in
-  "display-message "*) echo octet ;;
-  "show-options terminal-features") echo 'terminal-features[0] ,xterm-256color:RGB' ;;
-esac"#,
-    );
-    octet_testkit::write_script(
-        tools.path(),
-        "tailscale",
-        r#"echo '{"BackendState":"Running","Self":{"DNSName":"test-mac.tail0000.ts.net.","TailscaleIPs":["127.0.0.1"]}}'"#,
-    );
-    octet_testkit::write_script(
-        tools.path(),
-        "mosh-server",
-        "echo 'mosh-server (mosh 1.4.0) [build mosh-1.4.0]'",
-    );
-    let path = octet_testkit::path_with(tools.path());
-    let mut p = Pty::spawn_with_env(
-        &[],
-        &[("PATH", path.as_str()), ("TMUX", "/tmp/tmux-test,1,0")],
-    );
-    p.wait(|p| p.shows("● ready"));
-    // The checks share a 2-second deadline; on a machine busy with the
-    // parallel suite a stand-in can miss it, so ask again before failing.
-    // Each attempt first runs a ! command, which replaces the status line,
-    // so "Remote control:" there can only mean the new report.
-    for attempt in 1..=3 {
-        p.send(format!("!!echo attempt-{attempt}\r").as_bytes());
-        p.wait(|p| p.row_shows(35, &format!("echo attempt-{attempt} · exit 0")));
-        p.send(b"/remote-control\r");
-        p.wait(|p| p.row_shows(35, "Remote control: "));
-        if p.screen_shows("[ok] mosh-server 1.4.0") {
-            break;
-        }
-        assert!(attempt < 3, "{}", p.screen().join("\n"));
-    }
-    assert!(p.screen_shows("[ok] Running in tmux session \"octet\""));
-    assert!(p.screen_shows("[ok] Tailscale connected: test-mac.tail0000.ts.net"));
-    assert!(!p.screen_shows("tmux reduces colours"));
-    // Port 22 on 127.0.0.1 answers only if this machine runs an SSH server,
-    // so either outcome is valid; the phone command follows it.
-    if p.screen_shows("[ok] SSH answers") {
-        assert!(p.screen_shows("tmux new -A -s octet"));
-    } else {
-        assert!(p.screen_shows("[!!] SSH doesn't answer"));
-    }
-    p.quit();
-    p.finish();
-}
-
-#[test]
-fn remote_control_keeps_the_screen_live_while_checks_run() {
-    // Every check hangs to its deadline. The screen must keep painting and
-    // taking keys meanwhile, then show the report when the checks end.
-    let tools = octet_testkit::TempDir::new("octet-remote-slow");
-    fs::create_dir_all(tools.path()).unwrap();
-    for name in ["tmux", "tailscale", "mosh-server"] {
-        octet_testkit::write_script(tools.path(), name, "exec sleep 10");
+    let record = tools.path().join("ran");
+    for name in ["tmux", "tailscale", "ssh", "mosh", "mosh-server"] {
+        let body = format!("echo \"{name} $*\" >> '{}'", record.display());
+        octet_testkit::write_script(tools.path(), name, &body);
     }
     let path = octet_testkit::path_with(tools.path());
     let mut p = Pty::spawn_with_env(
@@ -932,19 +876,14 @@ fn remote_control_keeps_the_screen_live_while_checks_run() {
     );
     p.wait(|p| p.shows("● ready"));
     p.send(b"/remote-control\r");
-    // Within 2 s, still inside the 2.5 s the checks take: the screen is live.
-    p.wait_for(Duration::from_secs(2), |p| {
-        p.screen_shows("Checking phone access")
-    });
-    p.send(b"typed meanwhile");
-    // Keys echo whether or not the checks are still running.
-    p.wait(|p| p.screen_shows("typed meanwhile"));
-    // The status line is painted after the conversation, so once the
-    // summary shows, the whole report has.
-    p.wait(|p| p.row_shows(35, "Remote control: 3 problems (report above)"));
-    assert!(p.screen_shows("tmux didn't answer"));
+    p.wait(|p| p.screen_shows("Phones paired: unknown"));
+    assert!(p.screen_shows("Hub: not running"));
+    p.send(b"/remote-control pair\r");
+    p.wait(|p| p.screen_shows("The hub isn't running. Run \"octet pair\" in a terminal"));
     p.quit();
     p.finish();
+    let ran = fs::read_to_string(&record).unwrap_or_default();
+    assert!(ran.is_empty(), "ran: {ran}");
 }
 
 #[test]

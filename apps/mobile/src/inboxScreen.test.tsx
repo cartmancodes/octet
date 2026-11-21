@@ -10,15 +10,15 @@ import { AccessibilityInfo, AppState, StyleSheet, Text } from "react-native";
 import RootLayout from "../app/_layout";
 import Inbox from "../app/index";
 import Pair from "../app/pair";
-import { FakeClock, Sockets } from "./client/fakes";
-import { HubContext, Fleet, TOKEN_KEY } from "./hub";
+import { FakeClock, Sockets, pairingOf } from "./client/fakes";
+import { HubContext, Fleet, tokenKeyOf } from "./hub";
 import { closeDrawer } from "./drawer";
 import * as inboxWords from "./inbox";
 import * as navigation from "./navigation";
 import { saveSettings } from "./persist";
 import type { ApprovalInfo, SessionInfo } from "./protocol";
 import { bestHub, octetStore } from "./store";
-import { k, newM } from "./testKeys";
+import { M, k, newM } from "./testKeys";
 import { hideToast } from "./toast";
 import { dark, light } from "./theme";
 
@@ -52,8 +52,8 @@ const waiting = (id: string, approval: ApprovalInfo, extra: Partial<SessionInfo>
 
 beforeEach(async () => {
   await AsyncStorage.clear();
-  await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-  await saveSettings({ hubUrl: "wss://studio-mac.tail1234.ts.net/", faceId: false });
+  await SecureStore.setItemAsync(tokenKeyOf(M), TOKEN);
+  await saveSettings({ pairings: [pairingOf(M, "studio-mac", "studio-relay.example.test")], faceId: false });
   octetStore.getState().reset();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
   auth.hasHardwareAsync.mockResolvedValue(true);
@@ -73,7 +73,7 @@ async function launch(list: SessionInfo[] | null) {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const hub = new Fleet({
-    factory: sockets.factory,
+    factory: () => sockets.factory,
     store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },

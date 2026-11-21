@@ -121,8 +121,8 @@ public final class OctetLiveModule: Module, @unchecked Sendable {
       }
     }
 
-    // The app's cleaned and bounded {"<host>/<raw>": {name, command, approval}} as JSON. Anything
-    // larger or of another shape is refused, and what the widget had stays as it was.
+    // The app's cleaned and bounded {"<channel id>/<raw>": {name, command, approval}} as JSON.
+    // Anything larger or of another shape is refused, and what the widget had stays as it was.
     AsyncFunction("setEntries") { (json: String) throws in
       guard json.utf8.count <= entriesByteLimit,
         let entries = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],

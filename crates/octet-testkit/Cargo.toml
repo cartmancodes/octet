@@ -14,9 +14,20 @@ path = "src/lib.rs"
 name = "protocol-child"
 path = "src/bin/protocol-child/main.rs"
 
+[features]
+# An in-process relay, a phone that speaks Noise to a hub through it, and the pairing link:
+# the hub's end-to-end tests.
+relay = ["dep:octet-relay", "dep:snow", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:getrandom"]
+
 [dependencies]
 serde_json.workspace = true
 libc.workspace = true
+octet-relay = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+getrandom = { version = "0.4.3", optional = true }
+snow = { version = "0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"], optional = true }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"], optional = true }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"], optional = true }
 
 [lints]
 workspace = true

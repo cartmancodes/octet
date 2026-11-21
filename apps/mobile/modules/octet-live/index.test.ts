@@ -28,7 +28,7 @@ import native from "./src/OctetLiveModule";
 const state: ActivityState = {
   kind: "approval",
   session: "6101-1790000000",
-  mac: "mac.tail1234.ts.net",
+  mac: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   since: 1790000059,
   approvals: 2,
 };
@@ -67,15 +67,15 @@ describe("the wrapper without a native module", () => {
 });
 
 describe("the App Group key", () => {
-  it("is the content state's mac, a slash, and its raw session", () => {
-    expect(entryKey("mac.tail1234.ts.net", "6101-1790000000")).toBe("mac.tail1234.ts.net/6101-1790000000");
+  it("is the content state's mac (the Mac's channel id), a slash, and its raw session", () => {
+    expect(entryKey(state.mac, "6101-1790000000")).toBe(`${state.mac}/6101-1790000000`);
   });
 
-  it("lowercases the host and drops a trailing dot, as the widget does, so a host's case loses nothing", () => {
-    expect(entryKey("Mac.Tail1234.TS.net.", "6101-1790000000")).toBe("mac.tail1234.ts.net/6101-1790000000");
+  it("keeps the mac as it is, as the widget does: an opaque string", () => {
+    expect(entryKey(state.mac.toUpperCase(), "6101-1790000000")).toBe(`${state.mac.toUpperCase()}/6101-1790000000`);
   });
 
-  it("is a slash and the session when the hub published no host", () => {
+  it("is a slash and the session when the content state names no Mac", () => {
     expect(entryKey("", "6101-1790000000")).toBe("/6101-1790000000");
   });
 
@@ -85,8 +85,8 @@ describe("the App Group key", () => {
 });
 
 describe("events from the native side", () => {
-  it("passes a deny with a host, a raw session and an approval id", () => {
-    const deny: DenyEvent = { mac: "mac.tail1234.ts.net", session: "6101-1790000000", approval: "a1" };
+  it("passes a deny with a channel id, a raw session and an approval id", () => {
+    const deny: DenyEvent = { mac: state.mac, session: "6101-1790000000", approval: "a1" };
     expect(asDenyEvent({ ...deny })).toEqual(deny);
     expect(asDenyEvent({ ...deny, mac: "" })).toEqual({ ...deny, mac: "" });
   });

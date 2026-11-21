@@ -17,10 +17,32 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
-# One crate, not the whole tree: `subtle` (constant-time helpers that every
-# RustCrypto curve crate needs, here through p256 for the hub's APNs JWT) is
-# BSD-3-Clause only.
-exceptions = [{ allow = ["BSD-3-Clause"], crate = "subtle" }]
+# One crate each, not the whole tree. Every entry names the crate that needs
+# the licence and why it is in the tree; see docs/rust/relay-dependencies.md.
+exceptions = [
+    # `subtle`: constant-time helpers that every RustCrypto curve crate needs,
+    # here through p256 for the hub's APNs JWT. BSD-3-Clause only.
+    { allow = ["BSD-3-Clause"], crate = "subtle" },
+    # `curve25519-dalek`: X25519 for the relay link's Noise handshake (through
+    # snow) and the Ed25519 arithmetic under ed25519-dalek. BSD-3-Clause only.
+    { allow = ["BSD-3-Clause"], crate = "curve25519-dalek" },
+    # `ed25519-dalek`: the hub signs the relay's challenge with its Ed25519
+    # key, and the relay verifies it. BSD-3-Clause only.
+    { allow = ["BSD-3-Clause"], crate = "ed25519-dalek" },
+    # `ring`: rustls's crypto provider for the hub's outbound wss:// client
+    # (chosen over aws-lc-rs, which needs cmake and a C++ toolchain). The
+    # licence is `Apache-2.0 AND ISC`, so both are required; Apache-2.0 is
+    # already allowed.
+    { allow = ["ISC"], crate = "ring" },
+    # `rustls-webpki`: certificate verification for that client. ISC only.
+    { allow = ["ISC"], crate = "rustls-webpki" },
+    # `untrusted`: the byte reader ring and rustls-webpki parse with. ISC only.
+    { allow = ["ISC"], crate = "untrusted" },
+    # `webpki-roots`: the Mozilla root certificates compiled into the hub, so
+    # a hub run as a service needs nothing from the environment. Data under
+    # CDLA-Permissive-2.0 only.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
 
 [licenses.private]
 # The workspace's own crates are not published (publish = false).

@@ -213,13 +213,15 @@ Commands: `/help`, `/model`, `/skills`, `/mode`, `/goal`, `/session`, `/new`, `/
 Help (F1) and the command palette (Ctrl+P) scroll when the screen is short;
 in the palette, typing filters the list (by name or summary) and Backspace
 edits the filter.
-`/remote-control` checks, without changing anything, whether this session can be
-reached from a phone over tmux, Tailscale SSH and mosh, and prints the phone
-command. Setup steps: [Use Octet from your phone](remote-control.md).
-`/remote-control pair` asks a running `octet hub` for a pairing code and shows
-it as a QR code and a link for the phone app (it works once and expires after
-10 minutes); plain `/remote-control` also reports the hub. See
-[Phone app (hub)](remote-control.md#phone-app-hub).
+`/remote-control` reports whether the hub is running, whether the relay has
+it, and how many phones are paired; it changes nothing. `/remote-control pair`
+asks a running `octet hub` for a pairing link and shows it as a QR code and a
+link for the phone app (it works once and expires after 10 minutes). When a
+phone uses it, the screen asks `Phone shows 482 913? Pair "NAME" (ios)? [y/N]`:
+check the code matches the one on the phone, then press `Y` (`N`, Enter or Esc
+refuse). It never starts or installs the hub; with no hub running it says to run
+`octet pair` in a terminal, which does both. See
+[Use Octet from your phone](remote-control.md).
 The preview also supports persistent multi-turn goals through `/goal`.
 Changing sessions or exporting requires an idle turn, and `/compact` a
 connected one; a refused command explains why on the status line and its

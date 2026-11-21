@@ -9,6 +9,7 @@ import { confirmBiometric } from "../src/auth";
 import { DevBuildBanner } from "../src/components/DevBuildBanner";
 import { useAlive } from "../src/components/send";
 import { confirmUnpair } from "../src/components/unpair";
+import { runCryptoBench } from "../src/dev/cryptoBench";
 import { openDrawer } from "../src/drawer";
 import { useHubController, useMacs, useNotices, type MacInfo } from "../src/hub";
 import { MAC_NAME_CHARS, MAX_MACS, cleanMacName, machineWords } from "../src/macs";
@@ -24,7 +25,7 @@ const TURN_OFF_REASON = "Turn off Face ID for allowing";
 export const MACS_FULL = "4 Macs is the most";
 
 /** The footer's words, after the app's name and version. */
-const FOOTER = "talks to your Macs directly over your tailnet; nothing passes through a relay.";
+const FOOTER = "reaches your Macs through a relay, end-to-end encrypted.";
 
 /** This phone's settings: the Macs it is paired with (each to rename or unpair, and another to
  * pair), what to notify it about, and whether Allow asks for Face ID. */
@@ -227,6 +228,8 @@ export default function Settings() {
           ) : null}
         </Card>
 
+        <CryptoSpeed />
+
         <Text style={[type.caption, { color: theme.muted }]}>{version ? `Octet v${version} · ${FOOTER}` : `Octet · ${FOOTER}`}</Text>
       </ScrollView>
     </View>
@@ -243,7 +246,7 @@ interface MachineRowProps {
   onUnpair: (mac: MacInfo) => void;
 }
 
-/** One paired Mac: its name and its own link's state, its host (muted) under it, and Rename and
+/** One paired Mac: its name and its own link's state, its relay (muted) under it, and Rename and
  * Unpair. Rename opens a field in place: 1 to 40 characters, cleaned as the Fleet keeps them. */
 const MachineRow = memo(function MachineRow({ mac, first, onRename, onUnpair }: MachineRowProps) {
   const theme = useTheme();
@@ -286,7 +289,7 @@ const MachineRow = memo(function MachineRow({ mac, first, onRename, onUnpair }: 
         <Text style={[type.body, { color: theme.muted }]}>{machineWords(hub, tried)}</Text>
       </View>
       <Text numberOfLines={1} style={[type.label, { color: theme.muted }]}>
-        {mac.host}
+        {mac.relay}
       </Text>
       {draft === null ? (
         <View style={styles.actions}>
@@ -316,6 +319,49 @@ const MachineRow = memo(function MachineRow({ mac, first, onRename, onUnpair }: 
         </View>
       ) : null}
     </View>
+  );
+});
+
+/** How fast this phone encrypts: Measure runs the speed measurement here and shows the mean
+ * handshake time and the rate. In every build, because the number that counts is the optimised
+ * build's, and the preview build is the one in daily use. */
+const CryptoSpeed = memo(function CryptoSpeed() {
+  const theme = useTheme();
+  const alive = useAlive();
+  const [words, setWords] = useState<string | null>(null);
+  const [measuring, setMeasuring] = useState(false);
+  const measure = useCallback(() => {
+    setMeasuring(true);
+    setWords("Measuring…");
+    // After a frame, so "Measuring…" is on screen before the measurement holds the JS thread.
+    setTimeout(() => {
+      let result: string;
+      try {
+        const { handshakeMs, megabytesPerSecond } = runCryptoBench();
+        result = `Handshake ${handshakeMs.toFixed(1)} ms · ${megabytesPerSecond.toFixed(1)} MiB/s`;
+      } catch {
+        result = "Could not measure";
+      }
+      if (!alive()) return;
+      setWords(result);
+      setMeasuring(false);
+    }, 50);
+  }, [alive]);
+  return (
+    <Card title="Encryption speed">
+      <View style={styles.row}>
+        <Text style={[type.body, styles.grow, { color: words === null ? theme.muted : theme.fg }]}>
+          {words ?? "Not measured"}
+        </Text>
+        <Button
+          label="Measure"
+          accessibilityLabel="Measure encryption speed"
+          disabled={measuring}
+          busy={measuring}
+          onPress={measure}
+        />
+      </View>
+    </Card>
   );
 });
 

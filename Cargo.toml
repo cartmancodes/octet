@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/octet-proc", "crates/octet-testkit", "crates/octet-engine", "crates/octet-gate", "crates/octet-store", "crates/octet-core", "crates/octet-tui", "crates/octet-hub", "crates/octet"]
+members = ["crates/octet-proc", "crates/octet-testkit", "crates/octet-engine", "crates/octet-gate", "crates/octet-store", "crates/octet-core", "crates/octet-tui", "crates/octet-hub", "crates/octet-relay", "crates/octet"]
 resolver = "2"
 
 [workspace.package]
@@ -21,6 +21,7 @@ octet-engine = { path = "crates/octet-engine" }
 octet-gate = { path = "crates/octet-gate" }
 octet-hub = { path = "crates/octet-hub" }
 octet-proc = { path = "crates/octet-proc" }
+octet-relay = { path = "crates/octet-relay" }
 octet-store = { path = "crates/octet-store" }
 octet-testkit = { path = "crates/octet-testkit" }
 octet-tui = { path = "crates/octet-tui" }

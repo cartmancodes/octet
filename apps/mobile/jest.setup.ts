@@ -17,6 +17,13 @@ jest.mock("expo-secure-store", () => {
   };
 });
 
+// Random bytes come from Node's generator: expo-crypto's own is native, and outside a phone it falls
+// back to Math.random. A plain function, so `restoreAllMocks` leaves it working.
+jest.mock("expo-crypto", () => ({
+  getRandomBytes: (count: number) =>
+    Uint8Array.from(jest.requireActual<typeof import("node:crypto")>("node:crypto").randomBytes(count)),
+}));
+
 // FlashList 2 measures its parent and rows through native layout, which a test renderer cannot do.
 // (Its own `jestSetup` still points at a component that FlashList 2 no longer exports.) The path
 // is private to FlashList: src/flashListMock.test.tsx fails by name if an upgrade moves it.

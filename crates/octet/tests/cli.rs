@@ -92,8 +92,12 @@ fn hub_help_lists_the_actions() {
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
     let help = String::from_utf8_lossy(&output.stdout);
-    for word in ["serve", "devices", "revoke", "watch", "--port", "--owner"] {
+    for word in ["serve", "devices", "revoke", "watch", "install"] {
         assert!(help.contains(word), "{word} missing from: {help}");
+    }
+    // The hub listens on no port and knows nothing of a tailnet.
+    for gone in ["--port", "--owner", "tailscale", "tailnet"] {
+        assert!(!help.contains(gone), "{gone} in: {help}");
     }
     let main = Command::new(env!("CARGO_BIN_EXE_octet"))
         .arg("--help")
@@ -122,11 +126,16 @@ fn hub_revoke_of_an_unknown_device_fails() {
 }
 
 #[test]
-fn hub_port_zero_is_a_usage_error() {
+fn hub_port_and_owner_are_usage_errors() {
     let dir = octet_testkit::TempDir::new("octet-hub-cli");
-    let output = hub(&["--port", "0"], dir.path());
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Port must be"));
+    for (flag, value) in [("--port", "47823"), ("--owner", "me@example.com")] {
+        let output = hub(&[flag, value], dir.path());
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&format!("Unknown argument {flag}")),
+            "{flag}"
+        );
+    }
 }
 
 #[test]
@@ -147,7 +156,14 @@ async fn hub_devices_lists_and_revokes_a_paired_device() {
     let now = std::time::SystemTime::now();
     let secret = store.pairing_secret(now);
     store
-        .pair(&secret, "My phone", "ios", "me@example.com", now)
+        .pair(
+            &secret,
+            "My phone",
+            "ios",
+            &"ab".repeat(32),
+            "wss://relay.example",
+            now,
+        )
         .await
         .unwrap();
     let path = dir.path().to_owned();
@@ -179,8 +195,15 @@ async fn hub_devices_and_revoke_work_with_a_broken_hub_json_and_revoke_is_audite
     let mut store = octet_hub::Store::open(dir.path()).await.unwrap();
     let now = std::time::SystemTime::now();
     let secret = store.pairing_secret(now);
-    let (token, _) = store
-        .pair(&secret, "Lost phone", "ios", "me@example.com", now)
+    let device = store
+        .pair(
+            &secret,
+            "Lost phone",
+            "ios",
+            &"cd".repeat(32),
+            "wss://relay.example",
+            now,
+        )
         .await
         .unwrap();
     // A typo in the hub's settings must not stand between a stolen phone and its revoke.
@@ -211,7 +234,7 @@ async fn hub_devices_and_revoke_work_with_a_broken_hub_json_and_revoke_is_audite
     let last: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
     assert_eq!(last["device"], "Lost phone");
     assert_eq!(last["what"], "revoked");
-    assert!(!audit.contains(&token), "{audit}");
+    assert!(!audit.contains(&device.key), "{audit}");
 }
 
 /// A short data directory under `/tmp` (socket paths are limited), removed on drop.
@@ -236,27 +259,17 @@ fn hub_serve_announces_itself_and_watch_follows_until_interrupted() {
         "/tmp/ohcli{}",
         std::process::id()
     )));
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let mut serve = Command::new(env!("CARGO_BIN_EXE_octet"))
-        .args(["hub", "serve", "--owner", "me@example.com", "--port"])
-        .arg(port.to_string())
-        .arg("--journal-dir")
+        .args(["hub", "serve", "--journal-dir"])
         .arg(&dir.0)
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
     let lines = octet_testkit::line_reader(serve.stdout.take().unwrap());
     let first = lines.recv_timeout(octet_testkit::QUICK).unwrap();
-    assert_eq!(first, format!("Octet hub on 127.0.0.1:{port}"));
-    let second = lines.recv_timeout(octet_testkit::QUICK).unwrap();
-    assert!(
-        second == format!("Publish it on your tailnet: tailscale serve --bg {port}")
-            || second.starts_with("Published at https://"),
-        "{second}"
+    assert_eq!(
+        first,
+        "Octet hub running; phones reach it through the relay once one is paired"
     );
 
     let mut watch = Command::new(env!("CARGO_BIN_EXE_octet"))
@@ -275,4 +288,38 @@ fn hub_serve_announces_itself_and_watch_follows_until_interrupted() {
 
     signal(&serve, libc::SIGTERM);
     assert_eq!(serve.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn pair_help_and_usage_errors_reach_the_shell() {
+    let help = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .args(["pair", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("Usage: octet pair"), "{text}");
+    for gone in ["--port", "--owner", "tailscale", "tailnet"] {
+        assert!(!text.contains(gone), "{gone} in: {text}");
+    }
+    let main = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&main.stdout).contains("octet pair"));
+    // Refused before anything starts: no hub, no service.
+    let dir = octet_testkit::TempDir::new("octet-pair-cli");
+    for flag in ["--port", "--owner"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_octet"))
+            .args(["pair", flag, "x", "--journal-dir"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&format!("Unknown argument {flag}")),
+            "{flag}"
+        );
+        assert!(!dir.path().exists(), "{flag} touched the data directory");
+    }
 }
