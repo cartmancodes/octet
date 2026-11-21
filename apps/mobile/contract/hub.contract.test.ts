@@ -32,6 +32,7 @@ import { type BatchItem, HubClient } from "../src/client/HubClient";
 import { activityRegistration } from "../src/activityModel";
 import { sendVia } from "../src/sendVia";
 import { fromHex, parsePairLink, type PairLink } from "../src/client/link";
+import { Fleet, type Keychain } from "../src/hub";
 import { newKeyPair, type KeyPair } from "../src/client/noise";
 import { secureSocketFactory } from "../src/client/secureSocket";
 import { keyOf, linksOf, tapKey } from "../src/macs";
@@ -39,6 +40,16 @@ import { tapFromData } from "../src/notifications";
 import type { EventFrame, ToPhone } from "../src/protocol";
 import { connectStore, createOctetStore, entriesNow, watch } from "../src/store";
 import { nodeSocketFactory } from "./nodeSocket";
+
+// The Fleet keeps its settings in async-storage, here in memory.
+jest.mock("@react-native-async-storage/async-storage", () =>
+  jest.requireActual("@react-native-async-storage/async-storage/jest/async-storage-mock"),
+);
+
+// Each Fleet link listens for a new push token; none comes here, and nothing reaches a native module.
+jest.mock("expo-notifications", () => ({
+  addPushTokenListener: () => ({ remove: () => undefined }),
+}));
 
 // expo-crypto's randomness is native; here it is Node's.
 jest.mock("expo-crypto", () => ({
@@ -1086,6 +1097,82 @@ run("two Macs on one relay: the phone's store fed by two real hubs", () => {
       code: "unsent",
     });
     expect(studio.bridge.lines.filter((l) => l.type === "answer")).toEqual([]);
+  });
+});
+
+run("pairing a Mac again through the Fleet", () => {
+  let relay: RelayProcess | null = null;
+  let mac: MacHub | null = null;
+  let fleet: Fleet | null = null;
+  const sockets: WebSocket[] = [];
+  /** Every key pair the Fleet made, in order. */
+  const made: KeyPair[] = [];
+  const kept = new Map<string, string>();
+  const keychain: Keychain = {
+    get: async (key) => kept.get(key) ?? null,
+    set: async (key, value) => {
+      kept.set(key, value);
+    },
+    delete: async (key) => {
+      kept.delete(key);
+    },
+  };
+
+  beforeAll(async () => {
+    relay = await startRelay();
+    mac = await startMacHub("studio", relay.url);
+  });
+
+  afterAll(async () => {
+    fleet?.setForeground(false);
+    for (const ws of sockets) ws.terminate();
+    await stopMacHub(mac);
+    await stopChild(relay?.child ?? null);
+  });
+
+  /** Pairs the Fleet through a fresh link from the hub, typing `name`; returns what the hub asked
+   * its owner. */
+  async function pairAs(name: string): Promise<Obj> {
+    if (!fleet || !mac) throw new Error("no fleet");
+    const opening = await control(mac.socket, { type: "pair_secret" });
+    const paired = fleet.pair(String(opening.link), name);
+    const question = await control(mac.socket, { type: "pair_wait" });
+    const answer = await control(mac.socket, { type: "pair_answer", pending: question.pending, accept: true });
+    expect(answer).toMatchObject({ paired: true });
+    expect(await paired).toEqual({ ok: true, macName: expect.any(String) });
+    return question;
+  }
+
+  it("a second pairing under another typed name keeps the first name: the hub holds one device, and the old key is refused", async () => {
+    if (!mac) throw new Error("no hub");
+    fleet = new Fleet({
+      factory: (keys) => secureSocketFactory(keys, nodeSocketFactory(sockets), random),
+      newKey: () => {
+        const key = newKeyPair(random);
+        made.push(key);
+        return key;
+      },
+      keychain,
+      platform: "ios",
+      newId: () => "m0000000c",
+    });
+    await fleet.init();
+    fleet.setForeground(true);
+
+    expect(await pairAs("iPhone")).toMatchObject({ name: "iPhone", replaces: false });
+    const again = await pairAs("Work iPhone");
+    expect(again).toMatchObject({ name: "iPhone", replaces: true });
+    expect((await control(mac.socket, { type: "status" })).devices).toBe(1);
+
+    // The first key, as a phone that kept it would use it: the hub no longer knows it.
+    const [first] = made;
+    const current = fleet.links.client("m0000000c");
+    if (!first || !current) throw new Error("not paired");
+    const link: PairLink = { relay: current.url, channel: current.channel, hubKey: Buffer.from(current.hubKey).toString("hex"), secret: "" };
+    const old = clientOf({ link, key: first }, sockets);
+    old.start();
+    await until("the old key to be refused", () => old.state === "unpaired", 10_000);
+    old.stop();
   });
 });
 

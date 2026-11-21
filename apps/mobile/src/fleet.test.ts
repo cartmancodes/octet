@@ -291,6 +291,26 @@ describe("the relay", () => {
     expect(again.commandsOf("subscribe")).toEqual([expect.objectContaining({ session: "1-2", after: { journal: "j", seq: 4 } })]);
   });
 
+  it("a_repair_sends_the_name_already_paired_not_the_one_typed", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    await pairWith(r, "studio", "aa".repeat(32));
+    // The hub replaces the device of the name it is sent: another name would leave the old key
+    // paired there, and the phone would forget it.
+    r.next.key = "ee".repeat(32);
+    const pending = r.fleet.pair(linkTo("studio"), "Work iPhone");
+    const pairing = r.sockets.last;
+    pairing.open();
+    const [command] = pairing.commandsOf("pair");
+    expect(command).toMatchObject({ name: "iPhone" });
+    pairing.receive({ type: "pair_code", req: command?.req, code: "482913" });
+    pairing.receive({ type: "paired", req: command?.req, device: "iPhone", name: "studio" });
+    pairing.drop(1000);
+    expect(await pending).toEqual({ ok: true, macName: "studio" });
+    expect((await loadSettings()).pairings).toEqual([saved("m00000001", "studio")]);
+  });
+
   it("a_re_pair_survives_its_old_link_being_refused_unpaired_while_it_saves", async () => {
     /** Runs once, as the new key is written: between the hub's `paired` and the settings write. */
     let midSave: (() => void) | null = null;

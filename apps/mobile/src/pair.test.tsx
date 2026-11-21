@@ -200,6 +200,21 @@ describe("the Pair screen", () => {
     expect(toastStore.getState().toast?.text).toBe("Paired with Desk");
   });
 
+  it("a link to a Mac paired already asks for no name: the one the Mac knows stays", async () => {
+    await SecureStore.setItemAsync(tokenKeyOf("m000000aa"), TOKEN);
+    await saveSettings({
+      pairings: [
+        { id: "m000000aa", relay: "wss://relay.example.test/", channel: channelOf("mac"), hubKey: hubKeyOf("mac"), deviceName: "iPhone", macName: "Desk" },
+      ],
+    });
+    await open();
+    await enter();
+    expect(screen.getByLabelText("Device name")).toBeTruthy();
+    await paste(LINK);
+    expect(screen.queryByLabelText("Device name")).toBeNull();
+    expect(screen.getByText("Desk keeps the name it knows this phone by.")).toBeTruthy();
+  });
+
   it("toasts nothing when the pairing fails", async () => {
     const rig = await open();
     await paste(LINK);

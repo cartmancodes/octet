@@ -29,7 +29,8 @@ const CORNER_LINE = 3;
  * the system opened). While the Mac asks its owner, the code the hub sent shows under "Check this
  * code on your Mac", and no code shows before the hub sends one. The hub's refusals and every
  * failure are shown as plain text. Opened with `?add=1` on a paired phone, it pairs another
- * machine: the Macs paired already stay, and Cancel goes back. With no Mac linked, a pairing that
+ * machine: the Macs paired already stay, and Cancel goes back. A link to a Mac paired already asks
+ * for no device name: the Mac keeps the one it knows this phone by. With no Mac linked, a pairing that
  * is still saved (its key could not be read) is listed with Unpair, so the phone can be cleared. */
 export default function Pair() {
   const theme = useTheme();
@@ -72,6 +73,8 @@ export default function Pair() {
   }, [permission?.status]);
 
   const parsed = useMemo(() => parsePairLink(link, isDevBuild()), [link]);
+  // A Mac paired already is sent the name it knows this phone by, so no name is asked for.
+  const again = parsed === null ? undefined : macs.find((m) => m.channel === parsed.channel);
   const pasted = link.trim() !== "";
   const shownError = error ?? (pasted && parsed === null ? (pairLinkProblem(link, isDevBuild()) ?? NOT_A_LINK) : null);
 
@@ -235,15 +238,21 @@ export default function Pair() {
                 accessibilityLabel="Pairing link"
               />
 
-              <Text style={[type.label, { color: theme.muted }]}>Device name</Text>
-              <TextInput
-                style={field}
-                value={name}
-                onChangeText={setName}
-                maxLength={NAME_CHARS}
-                autoCorrect={false}
-                accessibilityLabel="Device name"
-              />
+              {again ? (
+                <Text style={[type.body, { color: theme.muted }]}>{`${again.macName} keeps the name it knows this phone by.`}</Text>
+              ) : (
+                <>
+                  <Text style={[type.label, { color: theme.muted }]}>Device name</Text>
+                  <TextInput
+                    style={field}
+                    value={name}
+                    onChangeText={setName}
+                    maxLength={NAME_CHARS}
+                    autoCorrect={false}
+                    accessibilityLabel="Device name"
+                  />
+                </>
+              )}
 
               {parsed !== null && <Text style={[type.title, { color: theme.fg }]}>Pair with this Mac?</Text>}
               {busy && code !== null ? (

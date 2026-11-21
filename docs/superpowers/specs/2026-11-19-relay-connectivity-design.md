@@ -144,7 +144,8 @@ where it stores a device token today.
   phone's name decides: when a pairing is confirmed under a name the hub already holds, the new
   key replaces the old one in one step. The old key's connections close and its push and Live
   Activity tokens are dropped. The prompt at the Mac says `Replace` in place of `Pair`, so the
-  owner sees it. This is how a phone comes back after a relay move, a lost `paired`, or a wiped
+  owner sees it. A phone pairing again with a channel it holds sends the name it paired under,
+  whatever is typed (the app asks for no name then), so the old key never stays. This is how a phone comes back after a relay move, a lost `paired`, or a wiped
   app, without leaving its old key authorised.
 - **A Mac's name on the phone** was its hostname. `paired` and `welcome` now carry `name`, the
   Mac's own host name (at most 64 characters, display only), which the app shows and never

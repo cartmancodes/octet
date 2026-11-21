@@ -296,8 +296,9 @@ export class Fleet {
 
   /**
    * Pairs with the Mac the link names, through its relay, with a key pair made for it: a new
-   * pairing, or, for a channel already paired, one that replaces it (its id, its name, what the
-   * store holds of its sessions and their cursors kept) once the hub has answered `paired`; until
+   * pairing, or, for a channel already paired, one that replaces it (its id, its name, the device
+   * name the Mac knows it by whatever `name` says, what the store holds of its sessions and their
+   * cursors kept) once the hub has answered `paired`; until
    * then the pairing already held is left as it is. `onCode` is handed the hub's six digits when
    * the Mac holds this phone for its owner's answer, and only then. On success the private key is
    * in its keychain entry, the pairing in settings, and the link connects again and says hello
@@ -314,7 +315,9 @@ export class Fleet {
     const before = this.pairings.find((p) => p.channel === parsed.channel);
     if (!before && this.pairings.length >= MAX_MACS) return { ok: false, message: TOO_MANY_MACS, clear: false };
     if (before && before.hubKey !== parsed.hubKey) return { ok: false, message: NOT_FROM_THAT_MAC, clear: false };
-    const deviceName = name.trim() === "" ? this.defaultName() : name.trim();
+    // A Mac paired again is sent the name it knows this phone by: the hub replaces the device of
+    // that name, and under another one the old key would stay paired there.
+    const deviceName = before?.deviceName ?? (name.trim() === "" ? this.defaultName() : name.trim());
     // The id is made before the Mac spends its code: nothing after the Mac's answer can fail but
     // the saves, which say how to recover.
     const id = before?.id ?? this.freshId(this.pairings);
