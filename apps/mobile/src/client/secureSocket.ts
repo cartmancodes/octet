@@ -36,7 +36,9 @@ export const BROKEN = 1002;
  * never handed on, and `ping` sends the channel's own ping, whose answer is `onpong`. A frame
  * past 256 KiB is dropped by the channel, and the next one arrives. Anything that breaks the
  * channel closes the relay socket and is one `onclose` (`BROKEN`); the relay's own close passes
- * its code on (4404: no hub there). A hub key that makes no handshake never dials the relay.
+ * its code on (4404: no hub there). A write that fails (a frame, a pong or a ping) breaks it too:
+ * its message was sealed, so the next would use a nonce the hub cannot take. A hub key that makes
+ * no handshake never dials the relay.
  * `random` makes each connection's ephemeral key and the ping bytes.
  */
 export function secureSocketFactory(
@@ -51,19 +53,34 @@ export function secureSocketFactory(
     let over = false;
     let ws: RawSocket | null = null;
 
-    const say = (code: number): void => {
-      if (over) return;
+    /** Ends the socket: nothing more is sent or handed on. False when it had ended already. */
+    const end = (): boolean => {
+      if (over) return false;
       over = true;
       if (ws) ws.onopen = ws.onmessage = ws.onclose = undefined;
-      socket.onclose?.(code);
+      return true;
     };
-    const fail = (): void => {
+    const say = (code: number): void => {
+      if (end()) socket.onclose?.(code);
+    };
+    const closeRaw = (): void => {
       try {
         ws?.close();
       } catch {
         // Already closed.
       }
+    };
+    const fail = (): void => {
+      closeRaw();
       say(BROKEN);
+    };
+    /** A write failed after its message was sealed: the send nonce has moved past what the hub
+     * has had, so the channel is done. The relay socket closes now, and `onclose` comes once the
+     * caller has seen the failure (a request it fails is unsent, not lost). */
+    const writeFailed = (): void => {
+      if (!end()) return;
+      closeRaw();
+      void Promise.resolve().then(() => socket.onclose?.(BROKEN));
     };
     const live = (): Channel => {
       if (over || channel === null || ws === null) throw new Error("the channel is not open");
@@ -73,7 +90,13 @@ export function secureSocketFactory(
     const socket: Socket = {
       send: (text) => {
         const open = live();
-        for (const message of open.seal(text)) ws?.send(message);
+        const messages = open.seal(text);
+        try {
+          for (const message of messages) ws?.send(message);
+        } catch (error) {
+          writeFailed();
+          throw error;
+        }
       },
       close: () => {
         over = true;
@@ -89,6 +112,7 @@ export function secureSocketFactory(
           ws.send(message);
           return true;
         } catch {
+          writeFailed();
           return false;
         }
       },
@@ -113,7 +137,13 @@ export function secureSocketFactory(
       const got = channel.open(bytes);
       if (got === null) fail();
       else if (got === "pong") socket.onpong?.();
-      else if (got !== "more" && "reply" in got) opened.send(got.reply);
+      else if (got !== "more" && "reply" in got) {
+        try {
+          opened.send(got.reply);
+        } catch {
+          writeFailed();
+        }
+      }
       else if (got !== "more") socket.onmessage?.(got.frame);
     };
     opened.onclose = (code) => say(code);

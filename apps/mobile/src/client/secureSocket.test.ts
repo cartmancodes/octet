@@ -4,7 +4,8 @@ import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { randomBytes } from "node:crypto";
 
-import type { Socket } from "./HubClient";
+import { FakeClock } from "./fakes";
+import { HubClient, type Socket } from "./HubClient";
 import { MAX_FRAME_BYTES } from "./frames";
 import { newKeyPair, type KeyPair } from "./noise";
 import { secureSocketFactory, type RawSocket } from "./secureSocket";
@@ -90,11 +91,15 @@ function respond(hub: KeyPair, message1: Uint8Array) {
 class FakeRaw implements RawSocket {
   sent: Uint8Array[] = [];
   closed = false;
+  /** How many more sends go through before every send throws, as a socket the network dropped
+   * does; null for no failure. */
+  failAfter: number | null = null;
   onopen?: () => void;
   onmessage?: (bytes: Uint8Array) => void;
   onclose?: (code: number) => void;
   constructor(readonly url: string) {}
   send(bytes: Uint8Array): void {
+    if (this.failAfter !== null && this.failAfter-- <= 0) throw new Error("the socket is not open");
     this.sent.push(bytes.slice());
   }
   close(): void {
@@ -267,6 +272,97 @@ describe("secureSocketFactory", () => {
     late.handshake();
     late.raw().onclose?.(4409);
     expect(late.seen).toEqual(["open", { close: 4409 }]);
+  });
+
+  it("a_write_that_fails_closes_the_channel", async () => {
+    const r = rig();
+    r.handshake();
+    // The second chunk of a frame fails: the nonces of the whole frame were spent.
+    r.raw().failAfter = 1;
+    expect(() => r.socket.send(JSON.stringify({ v: 1, type: "prompt", text: "x".repeat(70_000) }))).toThrow();
+    expect(r.raw().closed).toBe(true);
+    await Promise.resolve();
+    expect(r.seen).toEqual(["open", { close: 1002 }]);
+    const sent = r.raw().sent.length;
+    r.raw().failAfter = null;
+    expect(() => r.socket.send("{}")).toThrow();
+    expect(r.socket.ping()).toBe(false);
+    expect(r.raw().sent).toHaveLength(sent);
+    r.raw().onclose?.(1006);
+    expect(r.seen).toEqual(["open", { close: 1002 }]);
+  });
+
+  it("a_pong_that_fails_to_send_closes_the_channel", async () => {
+    const r = rig();
+    const { end } = r.handshake();
+    r.raw().failAfter = 0;
+    r.raw().onmessage?.(end.seal(concat([Uint8Array.of(2), Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8)])));
+    expect(r.raw().closed).toBe(true);
+    await Promise.resolve();
+    expect(r.seen).toEqual(["open", { close: 1002 }]);
+    r.raw().failAfter = null;
+    expect(() => r.socket.send("{}")).toThrow();
+    expect(r.raw().sent).toHaveLength(1);
+  });
+
+  it("a_ping_that_fails_to_send_closes_the_channel", async () => {
+    const r = rig();
+    r.handshake();
+    r.raw().failAfter = 0;
+    expect(r.socket.ping()).toBe(false);
+    expect(r.raw().closed).toBe(true);
+    await Promise.resolve();
+    expect(r.seen).toEqual(["open", { close: 1002 }]);
+    r.raw().failAfter = null;
+    expect(() => r.socket.send("{}")).toThrow();
+    expect(r.raw().sent).toHaveLength(1);
+  });
+
+  it("a_failed_send_makes_the_client_reconnect_with_a_new_handshake", async () => {
+    const hub = newKeyPair(random);
+    const device = newKeyPair(random);
+    const raws: FakeRaw[] = [];
+    const clock = new FakeClock();
+    const client = new HubClient({
+      url: "wss://relay.example/",
+      channel: "ab".repeat(32),
+      hubKey: hub.publicKey,
+      key: device,
+      factory: secureSocketFactory({ hubKey: hub.publicKey, device }, (url) => {
+        const raw = new FakeRaw(url);
+        raws.push(raw);
+        return raw;
+      }, random),
+      now: clock.now,
+      schedule: clock.schedule,
+      random: () => 0,
+    });
+    const last = (): FakeRaw => {
+      const raw = raws[raws.length - 1];
+      if (!raw) throw new Error("no relay socket was opened");
+      return raw;
+    };
+    /** The relay socket opens, the hub finishes the handshake and welcomes the phone. */
+    const welcome = () => {
+      last().onopen?.();
+      const { message2, end } = respond(hub, last().sent[0] ?? EMPTY);
+      last().onmessage?.(message2);
+      for (const chunk of end.frame(utf8(JSON.stringify({ v: 1, type: "welcome", device: "iPhone" })))) last().onmessage?.(chunk);
+    };
+    client.start();
+    welcome();
+    expect(client.state).toBe("ready");
+    last().failAfter = 0;
+    await expect(client.request({ type: "prompt", session: "1-1", text: "hi" })).rejects.toMatchObject({ code: "unsent" });
+    await Promise.resolve();
+    expect(raws[0]?.closed).toBe(true);
+    expect(client.state).toBe("offline");
+    // The backoff runs out: a new relay socket, a new handshake, and ready again.
+    clock.advance(clock.delays[0] ?? 0);
+    expect(raws).toHaveLength(2);
+    welcome();
+    expect(client.state).toBe("ready");
+    client.stop();
   });
 
   it("closes the relay socket when the client closes, and says nothing more", () => {
