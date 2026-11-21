@@ -184,7 +184,10 @@ first use): an X25519 key that phones pin at pairing, and an Ed25519 key whose h
 channel id. To reset it, delete `hub.key` and restart the hub. The hub makes
 new keys, and because every paired phone pinned the old identity and could never connect
 again, it empties `devices.json` first, with every push and Live Activity token in it, so
-no old phone keeps getting notifications. Pair each phone again afterwards. A `hub.key`
+no old phone keeps getting notifications. The new Ed25519 key also gives the Mac a new
+channel id, so to the app it is a different Mac: on each phone, remove the old entry
+(**Settings › Machines › Unpair**), which otherwise stays at "Can't reach your Mac" and
+takes one of the 4 places, and pair the phone again. A `hub.key`
 that exists but cannot be read stops the hub with an error naming the file; it is never
 replaced silently.
 
@@ -536,7 +539,8 @@ above; for each next one, open **Settings › Machines › + Pair another
 machine** and scan the code `octet pair` shows on that Mac. A Mac is known by its channel
 id, not its address: every Mac behind the same relay shares the relay's hostname. Pairing
 a Mac the phone already has (the same channel id) replaces its pairing, once the hub has
-answered `paired`, and keeps its name, its sessions and their cursors. A
+answered `paired`, and keeps its name, its sessions and their cursors. A link with that
+channel id but another hub key is refused before anything is sent, since no Mac makes one. A
 5th is refused (`Unpair a Mac first (4 at most)`), and the button is off at 4
 (`4 Macs is the most`).
 
@@ -672,9 +676,10 @@ It then creates no socket and no file, and the hub and the phone never see it.
   check is gone. A phone's stored key is now the whole of its authority: someone who
   extracts it can connect from anywhere until you revoke the device, and removing a
   device from a tailnet no longer cuts it off. The key is kept in the phone's keychain
-  (this device only, readable while the phone is unlocked). The typed confirmation for
-  `full-access` and the biometric check are the app's own; a program written to hold a
-  stolen key could skip the second and supply the first. That is what dropping Tailscale
+  (this device only, readable while the phone is unlocked). The hub requires the typed
+  confirmation for `full-access`, but it is words any client holding the key can send; the
+  biometric check is the app's own. A program written to hold a stolen key could send the
+  first and skip the second. That is what dropping Tailscale
   gives up. The pairing confirmation at the Mac (above) is what restores a second check
   when a phone pairs.
 - **The hub listens on no port.** It dials out to the relay, and only while a phone is
