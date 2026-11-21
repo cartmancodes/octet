@@ -160,12 +160,17 @@ export const identityOf = (host: string, key: KeyPair | null = testKey()): Pick<
 /**
  * The pairing link the Mac on `host` shows, as the hub makes it (crates/octet-hub/src/link.rs):
  * through the relay at `relay` (a `host` or `host:port`; `host` itself unless given), with
- * `secret`. Version 1 is `wss`; 0 is `ws`, which only a development build takes.
+ * `secret`. Version 1 is `wss`; 0 is `ws`, which only a development build takes. `hubKey` (hex)
+ * stands in for the Mac's own key, as a forged link would.
  */
-export function pairLinkTo(host: string, secret: string, { relay = host, version = 1 }: { relay?: string; version?: number } = {}): string {
+export function pairLinkTo(
+  host: string,
+  secret: string,
+  { relay = host, version = 1, hubKey = hubKeyOf(host) }: { relay?: string; version?: number; hubKey?: string } = {},
+): string {
   const payload = Buffer.concat([
     Buffer.of(version),
-    Buffer.from(hubKeyOf(host), "hex"),
+    Buffer.from(hubKey, "hex"),
     Buffer.from(channelOf(host), "hex"),
     Buffer.from(secret, "hex"),
     Buffer.from(relay, "latin1"),

@@ -29,6 +29,10 @@ export const HAND_OVER_MS = 10_000;
 /** The Mac revoked this phone: only that pairing goes. */
 export const unpairedNotice = (macName: string): string => `This phone was unpaired on ${macName}`;
 export const UNPAIR_FAILED_NOTICE = "This phone couldn't delete its pairing. Pair again to replace it.";
+/** A link with the channel id of a Mac this phone is paired with but another hub key. One `hub.key`
+ * holds both, so no Mac makes such a link; the phone cannot check the channel id against the key
+ * (the id is the hash of a key the link does not carry), so it holds to the key it paired with. */
+export const NOT_FROM_THAT_MAC = "That link names a Mac this phone is paired with, but it isn't from that Mac";
 /** The Mac took the pairing (its secret is spent and the name is registered) but the phone could
  * not keep its key: only revoking on the Mac frees the name. */
 const unsaved = (name: string): string =>
@@ -297,8 +301,9 @@ export class Fleet {
    * then the pairing already held is left as it is. `onCode` is handed the hub's six digits when
    * the Mac holds this phone for its owner's answer, and only then. On success the private key is
    * in its keychain entry, the pairing in settings, and the link connects again and says hello
-   * (the hub closes the connection it paired on). A 5th channel is refused before any network
-   * call. Failures come back as the words to show.
+   * (the hub closes the connection it paired on). A 5th channel, or a channel already paired
+   * with another hub key, is refused before any network call. Failures come back as the words to
+   * show.
    */
   async pair(link: string, name: string, onCode: (code: string) => void = () => undefined): Promise<PairResult> {
     if (this.pairing) return { ok: false, message: "Already pairing", clear: false };
@@ -308,6 +313,7 @@ export class Fleet {
     if (!parsed) return { ok: false, message: pairLinkProblem(link, development) ?? NOT_A_LINK, clear: false };
     const before = this.pairings.find((p) => p.channel === parsed.channel);
     if (!before && this.pairings.length >= MAX_MACS) return { ok: false, message: TOO_MANY_MACS, clear: false };
+    if (before && before.hubKey !== parsed.hubKey) return { ok: false, message: NOT_FROM_THAT_MAC, clear: false };
     const deviceName = name.trim() === "" ? this.defaultName() : name.trim();
     // The id is made before the Mac spends its code: nothing after the Mac's answer can fail but
     // the saves, which say how to recover.

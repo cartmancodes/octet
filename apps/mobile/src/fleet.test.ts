@@ -7,7 +7,7 @@ import * as SecureStore from "expo-secure-store";
 import { FakeClock, Sockets, channelOf, hubKeyOf, pairLinkTo, phoneUrlOf, type FakeSocket } from "./client/fakes";
 import { fromHex } from "./client/link";
 import { newKeyPair } from "./client/noise";
-import { Fleet, TOKEN_KEY, tokenKeyOf, unpairedNotice, type Keychain } from "./hub";
+import { Fleet, NOT_FROM_THAT_MAC, TOKEN_KEY, tokenKeyOf, unpairedNotice, type Keychain } from "./hub";
 import { MAC_ID, TOO_MANY_MACS, keyOf, macStatus } from "./macs";
 import { SETTINGS_KEY, loadSettings, saveSettings } from "./persist";
 import { createOctetStore } from "./store";
@@ -352,6 +352,27 @@ describe("the relay", () => {
     await next.fleet.init();
     expect(next.fleet.snapshot().status).toBe("paired");
     expect(Buffer.from(next.keys[0]?.device.privateKey ?? []).toString("hex")).toBe("ee".repeat(32));
+  });
+
+  it("a_link_that_names_a_held_mac_with_another_hub_key_is_refused_before_any_network_call", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const old = await pairWith(r, "studio", "aa".repeat(32));
+    const sockets = r.sockets.all.length;
+    // The studio's channel id, but a key that is not the studio's: no Mac makes such a link.
+    const forged = pairLinkTo("studio", SECRET, { relay: RELAY, hubKey: hubKeyOf("intruder") });
+    expect(await r.fleet.pair(forged, "iPhone")).toEqual({ ok: false, message: NOT_FROM_THAT_MAC, clear: false });
+    expect(r.sockets.all).toHaveLength(sockets);
+    // The pairing held is as it was.
+    expect(old.closed).toBe(false);
+    expect(r.fleet.links.client("m00000001")?.state).toBe("ready");
+    expect(r.fleet.snapshot()).toMatchObject({ status: "paired", notice: null, macs: [{ id: "m00000001", macName: "studio" }] });
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("aa".repeat(32));
+    expect((await loadSettings()).pairings).toEqual([saved("m00000001", "studio")]);
+    // The same Mac's own link still pairs again.
+    await pairWith(r, "studio", "ee".repeat(32));
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("ee".repeat(32));
   });
 
   it("a_pairing_that_fails_leaves_the_one_already_held", async () => {

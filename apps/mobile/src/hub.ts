@@ -12,6 +12,7 @@ export {
   Fleet,
   HAND_OVER_MS,
   NOT_A_LINK,
+  NOT_FROM_THAT_MAC,
   UNPAIR_FAILED_NOTICE,
   unpairedNotice,
   type FleetOptions,
