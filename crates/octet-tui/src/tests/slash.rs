@@ -137,6 +137,9 @@ mod remote_control {
     /// The question `octet pair` asks about the stand-in phone.
     const ASKS: &str = "Phone shows 482 913? Pair \"Pixel\" (ios)? [y/N]";
 
+    /// The opening the scripted hub's `pair_secret` names.
+    const ATTEMPT: u64 = 3;
+
     /// A hub that answers from a script, keeping every request.
     #[derive(Clone)]
     struct Hub {
@@ -220,7 +223,11 @@ mod remote_control {
             self.asked.lock().unwrap().push(request.clone());
             Some(match request["type"].as_str()? {
                 "status" => self.status.clone(),
-                "pair_secret" => json!({"link": LINK}),
+                "pair_secret" => json!({"link": LINK, "attempt": ATTEMPT}),
+                // A wait names the opening it is for, as the hub requires.
+                "pair_wait" if request["attempt"] != ATTEMPT => {
+                    json!({"error": "pair_wait needs attempt"})
+                }
                 "pair_wait" => {
                     let mut waits = self.waits.lock().unwrap();
                     if waits.len() > 1 {

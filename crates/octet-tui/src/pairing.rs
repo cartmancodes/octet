@@ -4,7 +4,8 @@
 //!
 //! The hub never says when a held phone leaves, so while the question is open the hub is asked
 //! `pair_wait` again about once a second, one request at a time on a connection of its own (the
-//! hub keeps one waiter): the same pairing means the phone is still there.
+//! hub keeps one waiter): the same pairing means the phone is still there. Every `pair_wait` names
+//! the attempt `pair_secret` gave, so a newer opening elsewhere ends this one as expired.
 use qrcode::{QrCode, render::unicode::Dense1x2};
 use serde_json::{Value, json};
 use std::{
@@ -96,6 +97,18 @@ pub async fn answers(control: &impl Control) -> bool {
     within(STATUS_WITHIN, control.call(&json!({"type": "status"})))
         .await
         .is_some()
+}
+
+/// The link and attempt of a `pair_secret` answer; `None` when it gave no link.
+#[must_use]
+pub fn opened_link(opened: &Value) -> Option<(&str, u64)> {
+    Some((opened["link"].as_str()?, opened["attempt"].as_u64()?))
+}
+
+/// The `pair_wait` request for the opening `attempt`.
+#[must_use]
+pub fn wait_request(attempt: u64) -> Value {
+    json!({"type": "pair_wait", "attempt": attempt})
 }
 
 /// What to say when `pair_secret` gave no link: the hub's reason or error, shown plain.
@@ -203,15 +216,17 @@ pub enum Heard<A> {
     Gone,
 }
 
-/// Waits for the owner's `answer` to the question about the held pairing `pending`, for two
-/// minutes, asking the hub about once a second whether it still holds the phone.
+/// Waits for the owner's `answer` to the question about the held pairing `pending` of the
+/// opening `attempt`, for two minutes, asking the hub about once a second whether it still holds
+/// the phone.
 pub async fn hear<A>(
     control: &impl Control,
+    attempt: u64,
     pending: u64,
     answer: impl Future<Output = A>,
 ) -> Heard<A> {
     let deadline = Instant::now() + ANSWER_WITHIN;
-    let poll = still_held(control, pending);
+    let poll = still_held(control, attempt, pending);
     tokio::pin!(answer, poll);
     loop {
         tokio::select! {
@@ -222,7 +237,7 @@ pub async fn hear<A>(
                 if !held {
                     break Heard::Gone;
                 }
-                poll.set(still_held(control, pending));
+                poll.set(still_held(control, attempt, pending));
             }
         }
     }
@@ -231,9 +246,9 @@ pub async fn hear<A>(
 /// Whether the hub, asked after [`POLL_EVERY`], still holds the pairing `pending`. A hub that
 /// holds a phone tells of it at once; anything else (no answer, an expired secret, another
 /// pairing, another waiter) means it has let this one go.
-async fn still_held(control: &impl Control, pending: u64) -> bool {
+async fn still_held(control: &impl Control, attempt: u64, pending: u64) -> bool {
     sleep(POLL_EVERY).await;
-    let answer = within(POLL_WITHIN, control.call(&json!({"type": "pair_wait"}))).await;
+    let answer = within(POLL_WITHIN, control.call(&wait_request(attempt))).await;
     answer.is_some_and(|answer| answer["pending"].as_u64() == Some(pending))
 }
 

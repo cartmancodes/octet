@@ -5,6 +5,10 @@
 //! too, as does a save that fails. A held pairing is bound to its connection and the key its
 //! handshake proved: the answer can pair that key and no other, and the connection closing ends
 //! it. One pairing is held at a time, and a `pair` meanwhile is refused `busy` with no code.
+//!
+//! Each `pair_secret` is an attempt, numbered: its link comes back with the number, and its
+//! `pair_wait` names it. A wait for any attempt but the newest hears `expired`, so two openers
+//! (`octet pair` and the terminal UI, say) never take each other's phone.
 use super::{AfterSave, Hub};
 use crate::{
     link::{pair_link, split_relay},
@@ -47,6 +51,8 @@ struct Held {
     req: u64,
     /// The device to save: the key the connection's handshake proved, with the phone's claims.
     pairing: Pairing,
+    /// The attempt whose secret the phone used.
+    attempt: u64,
     /// The six digits the phone and the Mac show.
     code: String,
     /// Whether a device of its name was paired when it was held.
@@ -79,13 +85,19 @@ pub(super) struct Pairings {
     waiter: Option<oneshot::Sender<Value>>,
     /// The id of the last held pairing to end unanswered, and what an answer to it is told.
     ended: Option<(u64, &'static str)>,
+    /// The newest attempt: the number of the last `pair_secret` that made a secret.
+    attempt: u64,
 }
 
 /// What `pair_secret` came to.
 pub(super) enum Opened {
-    /// A new secret: its link, shown once the relay has the hub, and the relay's host, which the
-    /// reason names when it never does.
-    Link { link: String, host: String },
+    /// A new secret: its link, shown once the relay has the hub, the relay's host, which the
+    /// reason names when it never does, and the attempt it opens.
+    Link {
+        link: String,
+        host: String,
+        attempt: u64,
+    },
     /// The relay's address cannot go in a pairing link.
     Unlinkable,
     /// A phone is held: no new secret.
@@ -96,9 +108,10 @@ pub(super) enum Opened {
 impl std::fmt::Debug for Opened {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Link { host, .. } => f
+            Self::Link { host, attempt, .. } => f
                 .debug_struct("Link")
                 .field("host", host)
+                .field("attempt", attempt)
                 .finish_non_exhaustive(),
             Self::Unlinkable => f.write_str("Unlinkable"),
             Self::Waiting => f.write_str("Waiting"),
@@ -151,6 +164,7 @@ impl Hub {
             conn,
             req,
             pairing,
+            attempt: self.pairings.attempt,
             code: draw_code(),
             replaces,
             deadline: Instant::now() + ANSWER_WITHIN,
@@ -167,11 +181,14 @@ impl Hub {
     }
 
     /// `pair_secret`: a new secret in place of any no phone has used (a `pair_wait` on that one
-    /// hears it expired), which brings the relay link up; none while a phone is held.
+    /// hears it expired), under a new attempt, which brings the relay link up; none while a
+    /// phone is held.
     pub(super) fn open_pairing(&mut self) -> Opened {
         if self.pairings.held.is_some() {
             return Opened::Waiting;
         }
+        self.pairings.attempt += 1;
+        let attempt = self.pairings.attempt;
         let secret = self.store.replace_pairing_secret(SystemTime::now());
         if let Some(waiter) = self.pairings.waiter.take() {
             let _ = waiter.send(expired());
@@ -183,15 +200,29 @@ impl Hub {
             (Some(link), Some((_, host))) => Opened::Link {
                 link,
                 host: host.to_owned(),
+                attempt,
             },
             _ => Opened::Unlinkable,
         }
     }
 
-    /// `pair_wait`: the held phone's question at once; `expired` with no pairing open; another
-    /// waiter's refusal; or else, `reply` kept, the question once a phone is held.
-    pub(super) fn wait_for_phone(&mut self, reply: oneshot::Sender<Value>) {
-        if let Some(held) = self.pairings.held.as_ref().filter(|h| h.saving.is_none()) {
+    /// Whether `attempt` is the newest: an opening no later `pair_secret` has replaced.
+    pub(super) fn current_attempt(&self, attempt: u64) -> bool {
+        attempt == self.pairings.attempt
+    }
+
+    /// `pair_wait` for `attempt`: `expired` for any attempt but the newest, or a phone held
+    /// through another; else the held phone's question at once; `expired` with no pairing open;
+    /// another waiter's refusal; or else, `reply` kept, the question once a phone is held.
+    pub(super) fn wait_for_phone(&mut self, attempt: u64, reply: oneshot::Sender<Value>) {
+        let held_elsewhere = self
+            .pairings
+            .held
+            .as_ref()
+            .is_some_and(|held| held.attempt != attempt);
+        if !self.current_attempt(attempt) || held_elsewhere {
+            let _ = reply.send(expired());
+        } else if let Some(held) = self.pairings.held.as_ref().filter(|h| h.saving.is_none()) {
             let _ = reply.send(question(held));
         } else if !self.store.pairing_open(SystemTime::now()) {
             let _ = reply.send(expired());
@@ -393,6 +424,7 @@ mod tests {
         let opened = Opened::Link {
             link: "octet://pair/AQID-secret".into(),
             host: "relay.example".into(),
+            attempt: 1,
         };
         let shown = format!("{opened:?}");
         assert!(

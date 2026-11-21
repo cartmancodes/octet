@@ -190,7 +190,7 @@ function clientOf(identity: Identity, opened: WebSocket[], extra: { background?:
 
 /**
  * Pairs a phone called `name` with the hub whose control socket is `socket`, as the app does and
- * as `octet pair` answers: a pairing link from the hub (once the relay has it), the phone's `pair`
+ * as `octet pair` answers: a pairing link and its attempt from the hub (once the relay has it), the phone's `pair`
  * with a key made for it, the question the hub holds it for (whose code the phone was shown too),
  * and the owner's yes. Returns the phone's identity and what the hub and the phone each said.
  */
@@ -206,7 +206,8 @@ async function pairThrough(socket: string, name: string, opened: WebSocket[]) {
   const pairing = clientOf(identity, opened);
   const codes: string[] = [];
   const paired = pairing.pair(link.secret, name, "ios", (code) => codes.push(code));
-  const question = await control(socket, { type: "pair_wait" });
+  // The wait names the opening it is for, as `octet pair` does.
+  const question = await control(socket, { type: "pair_wait", attempt: opening.attempt });
   await until("the phone to be shown the code", () => codes.length > 0);
   const answer = await control(socket, { type: "pair_answer", pending: question.pending, accept: true });
   return { identity, question, codes, answer, paired: await paired };
@@ -1136,7 +1137,7 @@ run("pairing a Mac again through the Fleet", () => {
     if (!fleet || !mac) throw new Error("no fleet");
     const opening = await control(mac.socket, { type: "pair_secret" });
     const paired = fleet.pair(String(opening.link), name);
-    const question = await control(mac.socket, { type: "pair_wait" });
+    const question = await control(mac.socket, { type: "pair_wait", attempt: opening.attempt });
     const answer = await control(mac.socket, { type: "pair_answer", pending: question.pending, accept: true });
     expect(answer).toMatchObject({ paired: true });
     expect(await paired).toEqual({ ok: true, macName: expect.any(String) });

@@ -210,6 +210,9 @@ pub struct Link {
     pub secret: String,
     /// The relay's `host` or `host:port`.
     pub authority: String,
+    /// The opening it came from, as `pair_secret` numbered it, which `pair_wait` names; 0 for a
+    /// link only parsed from its text.
+    pub attempt: u64,
 }
 
 impl Link {
@@ -232,6 +235,7 @@ impl Link {
             channel,
             secret,
             authority,
+            attempt: 0,
         })
     }
 
@@ -309,7 +313,11 @@ pub async fn pair_link(run: &Path) -> Link {
     let link = answer["link"]
         .as_str()
         .unwrap_or_else(|| panic!("{answer}"));
-    Link::parse(link).unwrap_or_else(|| panic!("not a pairing link: {link}"))
+    let attempt = answer["attempt"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no attempt: {answer}"));
+    let link = Link::parse(link).unwrap_or_else(|| panic!("not a pairing link: {link}"));
+    Link { attempt, ..link }
 }
 
 /// Asks the hub whose run directory is `run` for a pairing secret without waiting for its answer
@@ -325,13 +333,13 @@ pub fn pair_frame(secret: &str, name: &str) -> Value {
     json!({"v": 1, "req": 1, "type": "pair", "secret": secret, "name": name, "platform": "ios"})
 }
 
-/// The answer to `pair_wait` on the hub whose run directory is `run`.
+/// The answer to `pair_wait` for the opening `attempt` on the hub whose run directory is `run`.
 ///
 /// # Panics
 ///
 /// If the hub gives none within [`WAIT`].
-pub async fn pair_wait(run: &Path) -> Value {
-    control(run, &json!({"type": "pair_wait"}))
+pub async fn pair_wait(run: &Path, attempt: u64) -> Value {
+    control(run, &json!({"type": "pair_wait", "attempt": attempt}))
         .await
         .expect("the hub answers pair_wait")
 }
@@ -407,7 +415,7 @@ pub async fn pair(run: &Path, name: &str) -> (Link, PhoneKey, Value) {
         mut phone,
         ..
     } = hold(run, name).await;
-    let question = pair_wait(run).await;
+    let question = pair_wait(run, link.attempt).await;
     let pending = question["pending"]
         .as_u64()
         .unwrap_or_else(|| panic!("{question}"));

@@ -361,6 +361,9 @@ async fn yes_pairs_and_no_does_not() {
     }
 }
 
+/// The opening the scripted hub's `pair_secret` names.
+const ATTEMPT: u64 = 3;
+
 /// A control socket that answers from a script: `pair_secret` with `link`, `pair_wait` with
 /// `question`, and `pair_answer` with `answer`, keeping every request.
 #[derive(Clone)]
@@ -398,7 +401,11 @@ impl Control for Scripted {
         self.asked.lock().unwrap().push(request.clone());
         Some(match request["type"].as_str()? {
             "status" => json!({"relay": "registered", "devices": 0}),
-            "pair_secret" => json!({"link": self.link}),
+            "pair_secret" => json!({"link": self.link, "attempt": ATTEMPT}),
+            // A wait names the opening it is for, as the hub requires.
+            "pair_wait" if request["attempt"] != ATTEMPT => {
+                json!({"error": "pair_wait needs attempt"})
+            }
             "pair_wait" => self.question.clone(),
             "pair_answer" => self.answer.clone(),
             _ => json!({"error": "Unknown request"}),

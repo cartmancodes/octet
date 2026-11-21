@@ -102,12 +102,12 @@ where
     let Some(opened) = pairing::within(REQUEST_WITHIN, control.call(&request)).await else {
         return Opened::Refused(HUB_SILENT.to_owned());
     };
-    let Some(link) = opened["link"].as_str() else {
+    let Some((link, attempt)) = pairing::opened_link(&opened) else {
         return Opened::Refused(pairing::no_link(&opened));
     };
     Opened::Link {
         link: link.to_owned(),
-        wait: PairWait::spawn(control),
+        wait: PairWait::spawn(control, attempt),
     }
 }
 
@@ -138,15 +138,15 @@ pub(crate) struct PairWait {
 }
 
 impl PairWait {
-    /// Starts waiting for a phone on the hub at `control`.
-    pub(crate) fn spawn<C>(control: C) -> Self
+    /// Starts waiting for a phone on the hub at `control`, for the opening `attempt`.
+    pub(crate) fn spawn<C>(control: C, attempt: u64) -> Self
     where
         C: Control + Send + Sync + 'static,
     {
         let (tell, told) = mpsc::channel(2);
         let (answer, answered) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let said = wait(&control, &tell, answered).await;
+            let said = wait(&control, attempt, &tell, answered).await;
             let _ = tell.send(Told::Ended(said)).await;
         });
         Self {
@@ -205,10 +205,11 @@ impl Drop for PairWait {
 /// passing, or the phone leaving) and answers the hub; what to say about how it ended.
 async fn wait(
     control: &impl Control,
+    attempt: u64,
     tell: &mpsc::Sender<Told>,
     answered: oneshot::Receiver<bool>,
 ) -> String {
-    let Some(waited) = control.call(&json!({"type": "pair_wait"})).await else {
+    let Some(waited) = control.call(&pairing::wait_request(attempt)).await else {
         return HUB_SILENT.to_owned();
     };
     let question = match Waited::read(&waited) {
@@ -223,7 +224,7 @@ async fn wait(
     }
     // An interface gone without answering said no.
     let answer = async { answered.await.unwrap_or(false) };
-    match pairing::hear(control, pending, answer).await {
+    match pairing::hear(control, attempt, pending, answer).await {
         Heard::Answer(yes) => match pairing::answer(control, pending, yes).await {
             Some(reply) => Outcome::read(&reply).said,
             None => HUB_SILENT.to_owned(),

@@ -28,10 +28,12 @@
 //!
 //! `<run>/hub.sock` answers one request line with one answer line, the request read within 5
 //! seconds: `status`; `watch` (a line for each change, until the client leaves); and pairing's
-//! three. `pair_secret` opens a pairing (in place of one no phone has used) and gives its link
-//! once the relay has the hub, waiting up to 10 seconds; `pair_wait` answers when a phone is held,
-//! or the secret runs out, and ends if the client leaves (closes its side); `pair_answer` says yes
-//! or no for the phone held under its `pending` id.
+//! three. `pair_secret` opens a pairing (in place of one no phone has used) under a new attempt
+//! and gives its link and attempt once the relay has the hub, waiting up to 10 seconds; an
+//! opening that a newer one replaced meanwhile gets no link and `expired`. `pair_wait` names its
+//! attempt (an error without one): it answers `expired` at once for any but the newest, and
+//! otherwise when a phone is held, or the secret runs out, and ends if the client leaves (closes
+//! its side); `pair_answer` says yes or no for the phone held under its `pending` id.
 //!
 //! # Subscriptions
 //!
@@ -174,6 +176,8 @@ const CONTROL_LIMIT: u64 = 4096;
 const CONTROL_WITHIN: Duration = Duration::from_secs(5);
 /// How long `pair_secret` waits for the relay to have the hub before giving up on it.
 const REGISTERED_WITHIN: Duration = Duration::from_secs(10);
+/// Why `pair_secret` gives no link when a newer opening replaced it while it waited.
+const SUPERSEDED: &str = "Another pairing was opened in its place";
 /// The refusal for a device past its bucket.
 const RATE_REFUSED: &str = "Too many commands; wait a minute";
 /// The refusal sent to a phone whose device was unpaired, just before it is closed.
@@ -603,8 +607,16 @@ impl Bucket {
 enum Control {
     /// `pair_secret`: a new pairing secret, as a pairing link, unless a phone is held.
     PairSecret(oneshot::Sender<Opened>),
-    /// `pair_wait`: the question for the Mac once a phone is held, or `expired`.
-    PairWait(oneshot::Sender<Value>),
+    /// `pair_wait` for an attempt: the question for the Mac once a phone is held, or `expired`.
+    PairWait {
+        attempt: u64,
+        reply: oneshot::Sender<Value>,
+    },
+    /// Whether an attempt is still the newest opening.
+    PairCurrent {
+        attempt: u64,
+        reply: oneshot::Sender<bool>,
+    },
     /// `pair_answer`: yes or no for the held pairing `pending`.
     PairAnswer {
         pending: u64,
@@ -1777,7 +1789,10 @@ impl Hub {
             Control::PairSecret(reply) => {
                 let _ = reply.send(self.open_pairing());
             }
-            Control::PairWait(reply) => self.wait_for_phone(reply),
+            Control::PairWait { attempt, reply } => self.wait_for_phone(attempt, reply),
+            Control::PairCurrent { attempt, reply } => {
+                let _ = reply.send(self.current_attempt(attempt));
+            }
             Control::PairAnswer {
                 pending,
                 accept,
@@ -2390,7 +2405,11 @@ async fn control_client(
     }
     match request_kind(&line).as_str() {
         "watch" => return watch_stream(&mut reader, &mut write, &hub).await,
-        "pair_wait" => return pair_wait(&mut reader, &mut write, &hub).await,
+        "pair_wait" => {
+            if let Some(attempt) = pair_wait_request(&line) {
+                return pair_wait(&mut reader, &mut write, &hub, attempt).await;
+            }
+        }
         _ => {}
     }
     let answer = control_answer(&line, &hub, &relay).await;
@@ -2447,9 +2466,14 @@ async fn pair_wait(
     reader: &mut (impl AsyncReadExt + Unpin),
     write: &mut OwnedWriteHalf,
     hub: &mpsc::Sender<Control>,
+    attempt: u64,
 ) {
     let (reply, mut answer) = oneshot::channel();
-    let answer = if hub.send(Control::PairWait(reply)).await.is_err() {
+    let answer = if hub
+        .send(Control::PairWait { attempt, reply })
+        .await
+        .is_err()
+    {
         stopping()
     } else {
         let mut ignored = [0u8; 64];
@@ -2478,6 +2502,14 @@ fn stopping() -> Value {
     json!({"error": "The hub is stopping"})
 }
 
+/// The attempt a `pair_wait` request line names.
+fn pair_wait_request(line: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get("attempt")?
+        .as_u64()
+}
+
 /// The `pending` id and the yes or no of a `pair_answer` request line.
 fn pair_answer_request(line: &str) -> Option<(u64, bool)> {
     let request: Value = serde_json::from_str(line).ok()?;
@@ -2488,7 +2520,9 @@ fn pair_answer_request(line: &str) -> Option<(u64, bool)> {
 }
 
 /// The answer to one control request: `pair_secret` opens a pairing (which brings the relay link
-/// up) and gives its link once the relay has the hub; `pair_answer` says yes or no for the held
+/// up) and gives its link and attempt once the relay has the hub, unless a newer opening has
+/// replaced it by then; a `pair_wait` that names no attempt is refused; `pair_answer` says yes or
+/// no for the held
 /// phone and hears how that went; `status` gives where the hub stands with the relay and how many
 /// phones are paired.
 async fn control_answer(
@@ -2504,14 +2538,36 @@ async fn control_answer(
                 return stopping();
             }
             match opened.await {
-                Ok(Opened::Link { link, host }) => {
+                Ok(Opened::Link {
+                    link,
+                    host,
+                    attempt,
+                }) => {
                     let mut relay = relay.clone();
                     let registered = relay.wait_for(|state| *state == RelayState::Registered);
                     if timeout(REGISTERED_WITHIN, registered)
                         .await
                         .is_ok_and(|registered| registered.is_ok())
                     {
-                        json!({"link": link})
+                        // Another opening meanwhile replaced this one's secret: its link is dead.
+                        let (reply, current) = oneshot::channel();
+                        if hub
+                            .send(Control::PairCurrent { attempt, reply })
+                            .await
+                            .is_err()
+                        {
+                            return stopping();
+                        }
+                        match current.await {
+                            Ok(true) => json!({"link": link, "attempt": attempt}),
+                            Ok(false) => json!({
+                                "link": null,
+                                "expired": true,
+                                "attempt": attempt,
+                                "reason": SUPERSEDED,
+                            }),
+                            Err(_) => stopping(),
+                        }
                     } else {
                         json!({"link": null, "reason": format!("Can't reach the relay at {host}")})
                     }
@@ -2538,6 +2594,7 @@ async fn control_answer(
             }
             answer.await.unwrap_or_else(|_| stopping())
         }
+        "pair_wait" => json!({"error": "pair_wait needs attempt"}),
         "status" => {
             let (reply, devices) = oneshot::channel();
             if hub.send(Control::Status(reply)).await.is_err() {

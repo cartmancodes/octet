@@ -5,12 +5,13 @@
 //!
 //! The hub never says when a held phone leaves, so while the question is open the command asks
 //! `pair_wait` again about once a second (one request at a time: the hub keeps one waiter): the
-//! same pairing means the phone is still there.
+//! same pairing means the phone is still there. Each `pair_wait` names the attempt `pair_secret`
+//! gave, so a pairing opened elsewhere meanwhile ends this one as expired.
 use crate::args::CliError;
 use octet_hub::Store;
 use octet_tui::pairing::{
     Control, HUB_SILENT, Heard, Outcome, REQUEST_WITHIN, Socket, Waited, answer, answers, hear,
-    let_go, no_link, pair_lines, within,
+    let_go, no_link, opened_link, pair_lines, wait_request, within,
 };
 use serde_json::json;
 use std::{
@@ -110,7 +111,7 @@ where
     )
     .await
     .ok_or_else(no_answer)?;
-    let Some(link) = opened["link"].as_str() else {
+    let Some((link, attempt)) = opened_link(&opened) else {
         say(out, &no_link(&opened))?;
         return Ok(1);
     };
@@ -127,7 +128,7 @@ where
     }
     say(out, "Waiting for a phone…")?;
     let waited = control
-        .call(&json!({"type": "pair_wait"}))
+        .call(&wait_request(attempt))
         .await
         .ok_or_else(no_answer)?;
     let question = match Waited::read(&waited) {
@@ -141,13 +142,14 @@ where
             return Ok(1);
         }
     };
-    ask(&control, &mut input, out, &question).await
+    ask(&control, attempt, &mut input, out, &question).await
 }
 
 /// Asks the owner about `question` on `input` until a line, the end of the input, two minutes,
 /// or the phone leaving, and answers the hub.
 async fn ask(
     control: &impl Control,
+    attempt: u64,
     input: &mut (impl AsyncBufRead + Unpin),
     out: &mut impl Write,
     question: &octet_tui::pairing::Question,
@@ -164,7 +166,7 @@ async fn ask(
             .await
             .is_ok_and(|n| n > 0 && line.ends_with('\n'))
     };
-    let heard = hear(control, question.pending, read).await;
+    let heard = hear(control, attempt, question.pending, read).await;
     // The prompt's line ends here, unless the owner's Enter ended it.
     if heard != Heard::Answer(true) {
         say(out, "")?;
