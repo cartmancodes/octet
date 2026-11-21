@@ -116,6 +116,10 @@ export const REQUEST_TIMEOUT_MS = 45_000;
 /** How long a pairing waits for `paired`: the two minutes the owner has to answer at the Mac, and a
  * margin. */
 export const PAIR_TIMEOUT_MS = 130_000;
+/** How long a pairing waits for its channel to open (the Noise handshake through the relay): the
+ * hub's own deadline from a phone's connect to its first frame (`FIRST_FRAME_WITHIN`,
+ * crates/octet-hub/src/relay.rs), past which the hub has let the connection go. */
+export const PAIR_HANDSHAKE_TIMEOUT_MS = 10_000;
 /** A request that times out takes the link down only if nothing came over it for this long. */
 export const QUIET_MS = 10_000;
 export const HANDSHAKE_TIMEOUT_MS = 15_000;
@@ -284,8 +288,9 @@ export class HubClient {
    * one-time `secret`, the phone's `name` and `platform`, and hands `onCode` the six digits of the
    * hub's `pair_code` (the code the Mac shows its owner) when it comes; never before. Resolves
    * with the device's name and the Mac's (as the hub sent it, untrusted) on `paired`, rejects with
-   * the hub's refusal, or `lost` when the connection goes or no answer comes in 130 s. The hub
-   * closes the paired connection: `start()` then connects again and says hello.
+   * the hub's refusal, or `lost` when the connection goes, its channel has not opened in 10 s, or
+   * no answer comes in 130 s. The hub closes the paired connection: `start()` then connects again
+   * and says hello.
    */
   pair(secret: string, name: string, platform: string, onCode: (code: string) => void): Promise<{ device: string; name: string }> {
     if (this.keyValue === null) return Promise.reject(new Refusal("unsent", "Can't reach your Mac"));
@@ -297,10 +302,14 @@ export class HubClient {
         () => finish(() => reject(new Refusal("lost", "The Mac did not answer in time"))),
         PAIR_TIMEOUT_MS,
       );
+      // Until the channel opens: a handshake that has not finished by the hub's deadline never will.
+      let cancelHandshake: (() => void) | null = this.schedule(() => abort(), PAIR_HANDSHAKE_TIMEOUT_MS);
       const finish = (settle: () => void): void => {
         if (done) return;
         done = true;
         cancelTimer();
+        cancelHandshake?.();
+        cancelHandshake = null;
         this.pairings.delete(abort);
         socket.onopen = socket.onmessage = socket.onclose = undefined;
         try {
@@ -314,6 +323,8 @@ export class HubClient {
       this.pairings.add(abort);
 
       socket.onopen = () => {
+        cancelHandshake?.();
+        cancelHandshake = null;
         const command = { v: PROTOCOL_VERSION, type: "pair", req, secret, name, platform };
         try {
           socket.send(JSON.stringify(command));

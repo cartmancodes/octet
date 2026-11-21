@@ -3,6 +3,7 @@ import { FakeClock, Sockets, TEST_RELAY, channelOf, identityOf, testKey } from "
 import { MAX_FRAME_BYTES, utf8Length } from "./frames";
 import {
   HubClient,
+  PAIR_HANDSHAKE_TIMEOUT_MS,
   PAIR_TIMEOUT_MS,
   PING_INTERVAL_MS,
   PING_TIMEOUT_MS,
@@ -202,6 +203,24 @@ describe("pairing", () => {
     r.clock.advance(1);
     await expect(pending).rejects.toMatchObject({ code: "lost", message: "The Mac did not answer in time" });
     expect(r.sockets.last.closed).toBe(true);
+  });
+
+  it("a_pairing_whose_handshake_never_completes_fails_in_10_seconds", async () => {
+    // The hub drops a phone not past its first frame 10 s after its connect: a channel that has not
+    // opened by then never will (a relay that took the socket and is gone, say).
+    expect(PAIR_HANDSHAKE_TIMEOUT_MS).toBe(10_000);
+    const r = rig();
+    let settled = false;
+    const pending = r.client.pair("s", "p", "ios", () => undefined);
+    pending.catch(() => undefined).finally(() => (settled = true));
+    r.clock.advance(PAIR_HANDSHAKE_TIMEOUT_MS - 1);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    r.clock.advance(1);
+    await expect(pending).rejects.toMatchObject({ code: "lost", message: "Can't reach your Mac" });
+    expect(r.sockets.last.closed).toBe(true);
+    expect(r.clock.pending).toBe(0);
+    expect(r.states).toEqual([]);
   });
 
   it("a refused pairing rejects with the hub's code and leaves the main state alone", async () => {
