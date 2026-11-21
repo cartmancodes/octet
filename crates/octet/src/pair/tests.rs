@@ -361,8 +361,10 @@ async fn yes_pairs_and_no_does_not() {
     }
 }
 
-/// The opening the scripted hub's `pair_secret` names.
-const ATTEMPT: u64 = 3;
+/// The opening the scripted hub's `pair_secret` names: an id as the hub makes them.
+const ATTEMPT: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+/// The pairing the scripted hub holds.
+const HELD: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
 
 /// A control socket that answers from a script: `pair_secret` with `link`, `pair_wait` with
 /// `question`, and `pair_answer` with `answer`, keeping every request.
@@ -415,7 +417,7 @@ impl Control for Scripted {
 
 /// The hub's question about a phone called `name`.
 fn question(name: &str, replaces: bool) -> Value {
-    json!({"pending": 7, "code": "482913", "name": name, "platform": "ios", "replaces": replaces})
+    json!({"pending": HELD, "code": "482913", "name": name, "platform": "ios", "replaces": replaces})
 }
 
 /// An input the owner never types in, and the end that keeps it open.
@@ -461,7 +463,7 @@ async fn the_prompt_times_out_with_pairing_timed_out() {
     assert_eq!(kinds.last().map(String::as_str), Some("pair_answer"));
     let last = control.asked.lock().unwrap().last().cloned().unwrap();
     assert_eq!(last["accept"], false);
-    assert_eq!(last["pending"], 7);
+    assert_eq!(last["pending"], HELD);
 }
 
 #[tokio::test]

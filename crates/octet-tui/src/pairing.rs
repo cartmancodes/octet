@@ -5,7 +5,9 @@
 //! The hub never says when a held phone leaves, so while the question is open the hub is asked
 //! `pair_wait` again about once a second, one request at a time on a connection of its own (the
 //! hub keeps one waiter): the same pairing means the phone is still there. Every `pair_wait` names
-//! the attempt `pair_secret` gave, so a newer opening elsewhere ends this one as expired.
+//! the attempt `pair_secret` gave, so a newer opening elsewhere ends this one as expired. The
+//! attempt and the pairing's `pending` id are random strings, so neither matches anything once
+//! the hub has restarted.
 use qrcode::{QrCode, render::unicode::Dense1x2};
 use serde_json::{Value, json};
 use std::{
@@ -101,13 +103,13 @@ pub async fn answers(control: &impl Control) -> bool {
 
 /// The link and attempt of a `pair_secret` answer; `None` when it gave no link.
 #[must_use]
-pub fn opened_link(opened: &Value) -> Option<(&str, u64)> {
-    Some((opened["link"].as_str()?, opened["attempt"].as_u64()?))
+pub fn opened_link(opened: &Value) -> Option<(&str, &str)> {
+    Some((opened["link"].as_str()?, opened["attempt"].as_str()?))
 }
 
 /// The `pair_wait` request for the opening `attempt`.
 #[must_use]
-pub fn wait_request(attempt: u64) -> Value {
+pub fn wait_request(attempt: &str) -> Value {
     json!({"type": "pair_wait", "attempt": attempt})
 }
 
@@ -153,7 +155,7 @@ impl Waited {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
     /// The pairing's id, which the answer names.
-    pub pending: u64,
+    pub pending: String,
     /// The six digits the phone shows.
     pub code: String,
     /// The phone's name, as it claims.
@@ -174,7 +176,7 @@ impl Question {
             return None;
         }
         Some(Self {
-            pending: answer["pending"].as_u64()?,
+            pending: answer["pending"].as_str()?.to_owned(),
             code: code.to_owned(),
             name: answer["name"].as_str()?.to_owned(),
             platform: answer["platform"].as_str()?.to_owned(),
@@ -221,8 +223,8 @@ pub enum Heard<A> {
 /// the phone.
 pub async fn hear<A>(
     control: &impl Control,
-    attempt: u64,
-    pending: u64,
+    attempt: &str,
+    pending: &str,
     answer: impl Future<Output = A>,
 ) -> Heard<A> {
     let deadline = Instant::now() + ANSWER_WITHIN;
@@ -246,14 +248,14 @@ pub async fn hear<A>(
 /// Whether the hub, asked after [`POLL_EVERY`], still holds the pairing `pending`. A hub that
 /// holds a phone tells of it at once; anything else (no answer, an expired secret, another
 /// pairing, another waiter) means it has let this one go.
-async fn still_held(control: &impl Control, attempt: u64, pending: u64) -> bool {
+async fn still_held(control: &impl Control, attempt: &str, pending: &str) -> bool {
     sleep(POLL_EVERY).await;
     let answer = within(POLL_WITHIN, control.call(&wait_request(attempt))).await;
-    answer.is_some_and(|answer| answer["pending"].as_u64() == Some(pending))
+    answer.is_some_and(|answer| answer["pending"].as_str() == Some(pending))
 }
 
 /// The hub's answer to `pair_answer` for `pending`.
-pub async fn answer(control: &impl Control, pending: u64, accept: bool) -> Option<Value> {
+pub async fn answer(control: &impl Control, pending: &str, accept: bool) -> Option<Value> {
     let request = json!({"type": "pair_answer", "pending": pending, "accept": accept});
     within(REQUEST_WITHIN, control.call(&request)).await
 }
@@ -262,7 +264,7 @@ pub async fn answer(control: &impl Control, pending: u64, accept: bool) -> Optio
 /// [`Heard::Gone`]): refuses the phone with one `pair_answer`, and says why the question ended.
 /// The hub remembers how the pairing it last let go ended, so a phone gone because its two
 /// minutes ran out says so.
-pub async fn let_go(control: &impl Control, pending: u64, timed_out: bool) -> &'static str {
+pub async fn let_go(control: &impl Control, pending: &str, timed_out: bool) -> &'static str {
     let answer = answer(control, pending, false).await;
     let hub_timed_out = answer
         .as_ref()
@@ -374,8 +376,11 @@ mod tests {
 
     /// The hub's question about a phone called `name`.
     fn question(name: &str, replaces: bool) -> Value {
-        json!({"pending": 7, "code": "482913", "name": name, "platform": "ios", "replaces": replaces})
+        json!({"pending": PENDING, "code": "482913", "name": name, "platform": "ios", "replaces": replaces})
     }
+
+    /// The id of the pairing the hub holds, as the hub makes them.
+    const PENDING: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
 
     #[test]
     fn the_prompt_shows_the_code_spaced_and_the_phones_claims_plain() {
@@ -397,6 +402,23 @@ mod tests {
         let long = Question::read(&question(&"x".repeat(70), false)).unwrap();
         assert!(long.prompt().contains(&format!("\"{}…\"", "x".repeat(64))));
         assert_eq!(code_shown("482913"), "482 913");
+    }
+
+    #[test]
+    fn a_question_or_a_link_with_a_numeric_id_is_none() {
+        let mut asked = question("Pixel", false);
+        asked["pending"] = json!(7);
+        assert_eq!(Question::read(&asked), None);
+        assert_eq!(
+            Question::read(&question("Pixel", false)).unwrap().pending,
+            PENDING
+        );
+        let opened = |attempt: Value| json!({"link": "octet://pair/AQID", "attempt": attempt});
+        assert_eq!(opened_link(&opened(json!(3))), None);
+        assert_eq!(
+            opened_link(&opened(json!(PENDING))),
+            Some(("octet://pair/AQID", PENDING))
+        );
     }
 
     #[test]

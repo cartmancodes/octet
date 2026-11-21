@@ -329,11 +329,13 @@ control socket, which today answers one line and closes. Pairing needs three req
 pairing and get the link; wait for a phone (answered when one is held, or when the secret
 expires); answer yes or no for that one held phone. One pairing is open at a time: opening
 another replaces a secret no phone has used yet, and is refused while a phone waits for an
-answer. Each opening has a number, its attempt, which the link comes back with and the wait
+answer. Each opening has an id, its attempt, which the link comes back with and the wait
 must name. An opening replaced while it waited for the relay gets no link, and is told it
 expired; a wait that names any attempt but the newest is told the same, so a phone that came
-through the newer link is asked about only in the terminal that opened it. If the device cannot
-be saved, the answer says so and the phone is refused.
+through the newer link is asked about only in the terminal that opened it. The held phone has
+an id too, which the answer names. Both ids are 32 random hex digits, never a count, so a
+terminal still showing a question from before the hub restarted cannot answer for a phone held
+since. If the device cannot be saved, the answer says so and the phone is refused.
 
 **Moving relays.** A phone keeps the relay address it paired through. If the hub's relay
 changes (the default moves, or `"relay"` is added to `hub.json`), paired phones can no longer

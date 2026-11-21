@@ -400,20 +400,30 @@ both platforms) is a change to this plan.
 **Interfaces:**
 - Consumes: Task 5 `pair_link`, `begin_pair`; Task 6 arrivals.
 - Produces, on `hub.sock` (one request line each):
-  - `{"type":"pair_secret"}` → makes the secret (which sets `wanted`, so an unpaired hub dials),
-    then answers `{"link": <string>}` once the relay has registered, waiting at most 10 seconds;
-    else `{"link": null, "reason": "Can't reach the relay at <host>"}`. A secret no phone has
-    used is replaced, and a `pair_wait` on it answers `{"expired": true}`. While a phone waits
-    for an answer: `{"link": null, "reason": "A phone is waiting for an answer"}`.
-  - `{"type":"pair_wait"}` → answers when a phone's `pair` is held, or after the secret's 10
-    minutes: `{"pending": <u64>, "code": "482913", "name": <string>, "platform": <string>,
-    "replaces": <bool>}` or `{"expired": true}`. `replaces` is true when a device of that name is
-    already paired. Not bound by `CONTROL_WITHIN`; ends if the client leaves. One waiter at a
-    time; a second gets `{"error": "Another pairing is open"}`.
-  - `{"type":"pair_answer","pending":<u64>,"accept":<bool>}` → `{"paired": true, "device": <name>}`,
-    `{"paired": false}`, `{"error": "Pairing timed out"}`, `{"error": "The phone left"}` when
-    its connection closed while the question was open, or
-    `{"error": "Could not save the device"}`.
+  - Every `attempt` and `pending` is a fresh id: 16 random bytes as 32 lowercase hex digits, a
+    JSON string. Never a count, so none means anything after the hub restarts.
+  - `{"type":"pair_secret"}` → makes the secret under a new attempt (which sets `wanted`, so an
+    unpaired hub dials), then answers `{"link": <string>, "attempt": <string>}` once the relay has
+    registered, waiting at most 10 seconds; else
+    `{"link": null, "reason": "Can't reach the relay at <host>"}`. A secret no phone has used is
+    replaced, and a `pair_wait` on it answers `{"expired": true}`. An opening that a newer one
+    replaced while it waited for the relay gets `{"link": null, "expired": true, "attempt":
+    <string>, "reason": "Another pairing was opened in its place"}`. While a phone waits for an
+    answer: `{"link": null, "reason": "A phone is waiting for an answer"}`.
+  - `{"type":"pair_wait","attempt":<string>}` → for any attempt but the newest, or one whose
+    phone came through another, `{"expired": true}` at once. Otherwise answers when a phone's
+    `pair` is held, or after the secret's 10 minutes: `{"pending": <string>, "code": "482913",
+    "name": <string>, "platform": <string>, "replaces": <bool>}` or `{"expired": true}`.
+    `replaces` is true when a device of that name is already paired. Not bound by
+    `CONTROL_WITHIN`; ends if the client leaves. One waiter at a time; a second gets
+    `{"error": "Another pairing is open"}`. Without a string `attempt`:
+    `{"error": "pair_wait needs attempt"}`.
+  - `{"type":"pair_answer","pending":<string>,"accept":<bool>}` →
+    `{"paired": true, "device": <name>}`, `{"paired": false}`, `{"error": "Pairing timed out"}`,
+    `{"error": "The phone left"}` when its connection closed while the question was open,
+    `{"error": "Could not save the device"}`, or `{"error": "No phone is waiting for that
+    answer"}` for a `pending` the hub does not hold. Without a string `pending` and a bool
+    `accept`: `{"error": "pair_answer needs pending and accept"}`.
   - To the phone, in order: `pair_code` (`{"type":"pair_code","req":<n>,"code":"482913"}`) the
     moment its `pair` is held, then `paired` on accept. On refusal, timeout or a failed save:
     `refused` with code `unpaired` and reason `Pairing was refused on the Mac`,

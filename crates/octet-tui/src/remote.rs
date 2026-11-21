@@ -107,7 +107,7 @@ where
     };
     Opened::Link {
         link: link.to_owned(),
-        wait: PairWait::spawn(control, attempt),
+        wait: PairWait::spawn(control, attempt.to_owned()),
     }
 }
 
@@ -139,14 +139,14 @@ pub(crate) struct PairWait {
 
 impl PairWait {
     /// Starts waiting for a phone on the hub at `control`, for the opening `attempt`.
-    pub(crate) fn spawn<C>(control: C, attempt: u64) -> Self
+    pub(crate) fn spawn<C>(control: C, attempt: String) -> Self
     where
         C: Control + Send + Sync + 'static,
     {
         let (tell, told) = mpsc::channel(2);
         let (answer, answered) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let said = wait(&control, attempt, &tell, answered).await;
+            let said = wait(&control, &attempt, &tell, answered).await;
             let _ = tell.send(Told::Ended(said)).await;
         });
         Self {
@@ -205,7 +205,7 @@ impl Drop for PairWait {
 /// passing, or the phone leaving) and answers the hub; what to say about how it ended.
 async fn wait(
     control: &impl Control,
-    attempt: u64,
+    attempt: &str,
     tell: &mpsc::Sender<Told>,
     answered: oneshot::Receiver<bool>,
 ) -> String {
@@ -217,21 +217,21 @@ async fn wait(
         Waited::Expired => return LINK_EXPIRED.to_owned(),
         Waited::Not(said) => return said,
     };
-    let pending = question.pending;
+    let pending = question.pending.clone();
     if tell.send(Told::Asked(question)).await.is_err() {
         // The interface is gone; the hub refuses the phone on its own clock.
         return String::new();
     }
     // An interface gone without answering said no.
     let answer = async { answered.await.unwrap_or(false) };
-    match pairing::hear(control, attempt, pending, answer).await {
-        Heard::Answer(yes) => match pairing::answer(control, pending, yes).await {
+    match pairing::hear(control, attempt, &pending, answer).await {
+        Heard::Answer(yes) => match pairing::answer(control, &pending, yes).await {
             Some(reply) => Outcome::read(&reply).said,
             None => HUB_SILENT.to_owned(),
         },
         heard @ (Heard::TimedOut | Heard::Gone) => {
             let timed_out = heard == Heard::TimedOut;
-            pairing::let_go(control, pending, timed_out)
+            pairing::let_go(control, &pending, timed_out)
                 .await
                 .to_owned()
         }

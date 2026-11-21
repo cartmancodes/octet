@@ -210,9 +210,9 @@ pub struct Link {
     pub secret: String,
     /// The relay's `host` or `host:port`.
     pub authority: String,
-    /// The opening it came from, as `pair_secret` numbered it, which `pair_wait` names; 0 for a
-    /// link only parsed from its text.
-    pub attempt: u64,
+    /// The opening it came from, the id `pair_secret` gave it, which `pair_wait` names; empty
+    /// for a link only parsed from its text.
+    pub attempt: String,
 }
 
 impl Link {
@@ -235,7 +235,7 @@ impl Link {
             channel,
             secret,
             authority,
-            attempt: 0,
+            attempt: String::new(),
         })
     }
 
@@ -314,8 +314,9 @@ pub async fn pair_link(run: &Path) -> Link {
         .as_str()
         .unwrap_or_else(|| panic!("{answer}"));
     let attempt = answer["attempt"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("no attempt: {answer}"));
+        .as_str()
+        .unwrap_or_else(|| panic!("no attempt: {answer}"))
+        .to_owned();
     let link = Link::parse(link).unwrap_or_else(|| panic!("not a pairing link: {link}"));
     Link { attempt, ..link }
 }
@@ -338,7 +339,7 @@ pub fn pair_frame(secret: &str, name: &str) -> Value {
 /// # Panics
 ///
 /// If the hub gives none within [`WAIT`].
-pub async fn pair_wait(run: &Path, attempt: u64) -> Value {
+pub async fn pair_wait(run: &Path, attempt: &str) -> Value {
     control(run, &json!({"type": "pair_wait", "attempt": attempt}))
         .await
         .expect("the hub answers pair_wait")
@@ -349,7 +350,7 @@ pub async fn pair_wait(run: &Path, attempt: u64) -> Value {
 /// # Panics
 ///
 /// If the hub gives none within [`WAIT`].
-pub async fn pair_answer(run: &Path, pending: u64, accept: bool) -> Value {
+pub async fn pair_answer(run: &Path, pending: &str, accept: bool) -> Value {
     let request = json!({"type": "pair_answer", "pending": pending, "accept": accept});
     control(run, &request)
         .await
@@ -415,9 +416,9 @@ pub async fn pair(run: &Path, name: &str) -> (Link, PhoneKey, Value) {
         mut phone,
         ..
     } = hold(run, name).await;
-    let question = pair_wait(run, link.attempt).await;
+    let question = pair_wait(run, &link.attempt).await;
     let pending = question["pending"]
-        .as_u64()
+        .as_str()
         .unwrap_or_else(|| panic!("{question}"));
     let answer = pair_answer(run, pending, true).await;
     assert_eq!(answer, json!({"paired": true, "device": name}));

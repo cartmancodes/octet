@@ -33,7 +33,9 @@
 //! opening that a newer one replaced meanwhile gets no link and `expired`. `pair_wait` names its
 //! attempt (an error without one): it answers `expired` at once for any but the newest, and
 //! otherwise when a phone is held, or the secret runs out, and ends if the client leaves (closes
-//! its side); `pair_answer` says yes or no for the phone held under its `pending` id.
+//! its side); `pair_answer` says yes or no for the phone held under its `pending` id (an error
+//! without one). An attempt and a `pending` id are each 32 random hex digits, as JSON strings,
+//! so neither names anything once the hub restarts.
 //!
 //! # Subscriptions
 //!
@@ -300,7 +302,7 @@ enum AfterSave {
     Seen,
     /// The device of the held pairing `pending`, and the key of the device it replaced.
     Paired {
-        pending: u64,
+        pending: String,
         result: std::io::Result<Result<Option<String>, &'static str>>,
     },
     /// `register_push` from `device` on `conn`, answering `req`.
@@ -609,17 +611,17 @@ enum Control {
     PairSecret(oneshot::Sender<Opened>),
     /// `pair_wait` for an attempt: the question for the Mac once a phone is held, or `expired`.
     PairWait {
-        attempt: u64,
+        attempt: String,
         reply: oneshot::Sender<Value>,
     },
     /// Whether an attempt is still the newest opening.
     PairCurrent {
-        attempt: u64,
+        attempt: String,
         reply: oneshot::Sender<bool>,
     },
     /// `pair_answer`: yes or no for the held pairing `pending`.
     PairAnswer {
-        pending: u64,
+        pending: String,
         accept: bool,
         reply: oneshot::Sender<Value>,
     },
@@ -1789,9 +1791,9 @@ impl Hub {
             Control::PairSecret(reply) => {
                 let _ = reply.send(self.open_pairing());
             }
-            Control::PairWait { attempt, reply } => self.wait_for_phone(attempt, reply),
+            Control::PairWait { attempt, reply } => self.wait_for_phone(&attempt, reply),
             Control::PairCurrent { attempt, reply } => {
-                let _ = reply.send(self.current_attempt(attempt));
+                let _ = reply.send(self.current_attempt(&attempt));
             }
             Control::PairAnswer {
                 pending,
@@ -2466,7 +2468,7 @@ async fn pair_wait(
     reader: &mut (impl AsyncReadExt + Unpin),
     write: &mut OwnedWriteHalf,
     hub: &mpsc::Sender<Control>,
-    attempt: u64,
+    attempt: String,
 ) {
     let (reply, mut answer) = oneshot::channel();
     let answer = if hub
@@ -2502,19 +2504,17 @@ fn stopping() -> Value {
     json!({"error": "The hub is stopping"})
 }
 
-/// The attempt a `pair_wait` request line names.
-fn pair_wait_request(line: &str) -> Option<u64> {
-    serde_json::from_str::<Value>(line)
-        .ok()?
-        .get("attempt")?
-        .as_u64()
+/// The attempt a `pair_wait` request line names: a string.
+fn pair_wait_request(line: &str) -> Option<String> {
+    let request: Value = serde_json::from_str(line).ok()?;
+    Some(request.get("attempt")?.as_str()?.to_owned())
 }
 
-/// The `pending` id and the yes or no of a `pair_answer` request line.
-fn pair_answer_request(line: &str) -> Option<(u64, bool)> {
+/// The `pending` id (a string) and the yes or no of a `pair_answer` request line.
+fn pair_answer_request(line: &str) -> Option<(String, bool)> {
     let request: Value = serde_json::from_str(line).ok()?;
     Some((
-        request.get("pending")?.as_u64()?,
+        request.get("pending")?.as_str()?.to_owned(),
         request.get("accept")?.as_bool()?,
     ))
 }
@@ -2551,11 +2551,11 @@ async fn control_answer(
                     {
                         // Another opening meanwhile replaced this one's secret: its link is dead.
                         let (reply, current) = oneshot::channel();
-                        if hub
-                            .send(Control::PairCurrent { attempt, reply })
-                            .await
-                            .is_err()
-                        {
+                        let asked = Control::PairCurrent {
+                            attempt: attempt.clone(),
+                            reply,
+                        };
+                        if hub.send(asked).await.is_err() {
                             return stopping();
                         }
                         match current.await {

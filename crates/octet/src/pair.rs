@@ -149,7 +149,7 @@ where
 /// or the phone leaving, and answers the hub.
 async fn ask(
     control: &impl Control,
-    attempt: u64,
+    attempt: &str,
     input: &mut (impl AsyncBufRead + Unpin),
     out: &mut impl Write,
     question: &octet_tui::pairing::Question,
@@ -166,7 +166,7 @@ async fn ask(
             .await
             .is_ok_and(|n| n > 0 && line.ends_with('\n'))
     };
-    let heard = hear(control, attempt, question.pending, read).await;
+    let heard = hear(control, attempt, &question.pending, read).await;
     // The prompt's line ends here, unless the owner's Enter ended it.
     if heard != Heard::Answer(true) {
         say(out, "")?;
@@ -174,7 +174,7 @@ async fn ask(
     match heard {
         Heard::Answer(whole) => {
             let yes = whole && is_yes(&line);
-            let reply = answer(control, question.pending, yes)
+            let reply = answer(control, &question.pending, yes)
                 .await
                 .ok_or_else(no_answer)?;
             let outcome = Outcome::read(&reply);
@@ -182,7 +182,7 @@ async fn ask(
             Ok(i32::from(!outcome.paired))
         }
         Heard::TimedOut | Heard::Gone => {
-            let said = let_go(control, question.pending, heard == Heard::TimedOut).await;
+            let said = let_go(control, &question.pending, heard == Heard::TimedOut).await;
             say(out, said)?;
             Ok(1)
         }

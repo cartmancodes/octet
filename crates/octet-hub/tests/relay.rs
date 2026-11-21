@@ -608,7 +608,7 @@ async fn the_hub_stays_on_the_relay_while_a_phone_waits_to_hear_it_is_paired() {
     let Held {
         mut phone, link, ..
     } = hold(&env.run, "Slow phone").await;
-    let pending = pending(&env, link.attempt).await;
+    let pending = pending(&env, &link.attempt).await;
     // Another process holds the devices file's lock: the yes's save waits on it, with the secret
     // spent and nothing paired yet.
     let lock = std::fs::OpenOptions::new()
@@ -619,7 +619,7 @@ async fn the_hub_stays_on_the_relay_while_a_phone_waits_to_hear_it_is_paired() {
         .expect("the lock file");
     lock.lock().expect("the lock");
     let run = env.run.clone();
-    let answer = tokio::spawn(async move { pair_answer(&run, pending, true).await });
+    let answer = tokio::spawn(async move { pair_answer(&run, &pending, true).await });
     // Past the hub's every-second look: the phone waits for its answer, so the link stays up.
     assert!(
         !phone.closes_within(Duration::from_millis(3_500)).await,
@@ -635,11 +635,12 @@ async fn the_hub_stays_on_the_relay_while_a_phone_waits_to_hear_it_is_paired() {
 }
 
 /// The pairing the hub holds for the opening `attempt`, as `pair_wait` gives it: its id.
-async fn pending(env: &Env, attempt: u64) -> u64 {
+async fn pending(env: &Env, attempt: &str) -> String {
     let question = pair_wait(&env.run, attempt).await;
     question["pending"]
-        .as_u64()
+        .as_str()
         .unwrap_or_else(|| panic!("{question}"))
+        .to_owned()
 }
 
 /// The names of the devices paired with `env`'s hub, as `devices.json` has them.
@@ -650,7 +651,7 @@ async fn names(env: &Env) -> Vec<String> {
 
 /// Waits until the hub holds no phone: `pair_wait` for the opening `attempt` has no question,
 /// and with the secret spent, answers `expired`.
-async fn no_phone_held(env: &Env, attempt: u64) {
+async fn no_phone_held(env: &Env, attempt: &str) {
     timeout(WAIT, async {
         while pair_wait(&env.run, attempt).await != json!({"expired": true}) {
             sleep(Duration::from_millis(20)).await;
@@ -662,10 +663,10 @@ async fn no_phone_held(env: &Env, attempt: u64) {
 
 /// A `pair_wait` for the opening `attempt` the hub has taken: two are asked, the hub refuses the
 /// one it sees second, and the other is the one that waits.
-async fn waiting(env: &Env, attempt: u64) -> tokio::task::JoinHandle<Value> {
+async fn waiting(env: &Env, attempt: &str) -> tokio::task::JoinHandle<Value> {
     let ask = || {
-        let run = env.run.clone();
-        tokio::spawn(async move { pair_wait(&run, attempt).await })
+        let (run, attempt) = (env.run.clone(), attempt.to_owned());
+        tokio::spawn(async move { pair_wait(&run, &attempt).await })
     };
     let (mut first, mut second) = (ask(), ask());
     let (refused, waits) = tokio::select! {
@@ -697,9 +698,9 @@ async fn an_accepted_pairing_stores_the_key_and_answers_paired() {
     } = hold(&env.run, "Test phone").await;
     // Nothing is stored before the answer.
     assert_eq!(env.status().await["devices"], 0);
-    let pending = pending(&env, link.attempt).await;
+    let pending = pending(&env, &link.attempt).await;
     assert_eq!(
-        pair_answer(&env.run, pending, true).await,
+        pair_answer(&env.run, &pending, true).await,
         json!({"paired": true, "device": "Test phone"})
     );
     let paired = phone.recv().await;
@@ -723,7 +724,7 @@ async fn an_accepted_pairing_stores_the_key_and_answers_paired() {
     assert_eq!(again.recv().await["type"], "welcome");
     // The answer was for that phone alone.
     assert_eq!(
-        pair_answer(&env.run, pending, true).await,
+        pair_answer(&env.run, &pending, true).await,
         json!({"error": "No phone is waiting for that answer"})
     );
 }
@@ -738,9 +739,9 @@ async fn a_refused_pairing_stores_nothing_and_spends_the_secret() {
     let Held {
         link, mut phone, ..
     } = hold(&env.run, "Second phone").await;
-    let pending = pending(&env, link.attempt).await;
+    let pending = pending(&env, &link.attempt).await;
     assert_eq!(
-        pair_answer(&env.run, pending, false).await,
+        pair_answer(&env.run, &pending, false).await,
         json!({"paired": false})
     );
     assert_eq!(
@@ -785,7 +786,7 @@ async fn an_unanswered_pairing_times_out_after_two_minutes() {
     let mut env = Env::new();
     env.start(&relay.url()).await;
     let Held { phone, link, .. } = hold(&env.run, "Slow phone").await;
-    let pending = pending(&env, link.attempt).await;
+    let pending = pending(&env, &link.attempt).await;
     // The phone reads in a task of its own, answering the hub's pings as the clock moves.
     let (frames, mut heard) = mpsc::unbounded_channel();
     let reader = tokio::spawn(async move {
@@ -816,7 +817,7 @@ async fn an_unanswered_pairing_times_out_after_two_minutes() {
         .expect("the connection ends")
         .expect("the reader");
     assert_eq!(
-        pair_answer(&env.run, pending, true).await,
+        pair_answer(&env.run, &pending, true).await,
         json!({"error": "Pairing timed out"})
     );
     assert_eq!(env.status().await["devices"], 0);
@@ -861,7 +862,7 @@ async fn the_held_phone_gets_the_code_the_mac_is_shown() {
     let mut env = Env::new();
     env.start(&relay.url()).await;
     let link = pair_link(&env.run).await;
-    let question = waiting(&env, link.attempt).await;
+    let question = waiting(&env, &link.attempt).await;
     let Held { code, .. } = hold_with(&link, "Test phone").await;
     let question = question.await.expect("answered");
     let digits = question["code"].as_str().expect("a code").to_owned();
@@ -873,14 +874,14 @@ async fn the_held_phone_gets_the_code_the_mac_is_shown() {
         code,
         json!({"v": 1, "type": "pair_code", "req": 1, "code": digits})
     );
-    let pending = question["pending"].as_u64().expect("an id");
+    let pending = question["pending"].as_str().expect("an id");
     assert_eq!(
         question,
         json!({"pending": pending, "code": digits, "name": "Test phone", "platform": "ios",
             "replaces": false})
     );
     // Asked again, the hub gives the same question.
-    assert_eq!(pair_wait(&env.run, link.attempt).await, question);
+    assert_eq!(pair_wait(&env.run, &link.attempt).await, question);
 }
 
 #[tokio::test]
@@ -901,9 +902,9 @@ async fn a_second_pair_while_one_waits_is_refused_busy_and_gets_no_code() {
     );
     assert!(second.closes().await);
     // The first is still the one waiting, and a yes pairs it alone.
-    let pending = pending(&env, link.attempt).await;
+    let pending = pending(&env, &link.attempt).await;
     assert_eq!(
-        pair_answer(&env.run, pending, true).await,
+        pair_answer(&env.run, &pending, true).await,
         json!({"paired": true, "device": "First phone"})
     );
     assert_eq!(phone.recv().await["type"], "paired");
@@ -984,7 +985,7 @@ async fn a_first_message_replayed_fifty_times_gets_no_code_and_pairs_nothing() {
     phone.send(&pair_frame(&link.secret, "Real phone")).await;
     assert_eq!(phone.recv().await["type"], "pair_code");
     assert_eq!(
-        pair_wait(&env.run, attempt_of(&answer)).await["name"],
+        pair_wait(&env.run, &attempt_of(&answer)).await["name"],
         "Real phone"
     );
     assert_eq!(env.status().await["devices"], 0);
@@ -999,11 +1000,11 @@ async fn a_phone_that_leaves_while_the_question_is_open_makes_the_answer_fail_wi
     let Held {
         mut phone, link, ..
     } = hold(&env.run, "Leaving phone").await;
-    let pending = pending(&env, link.attempt).await;
+    let pending = pending(&env, &link.attempt).await;
     phone.close().await;
-    no_phone_held(&env, link.attempt).await;
+    no_phone_held(&env, &link.attempt).await;
     assert_eq!(
-        pair_answer(&env.run, pending, true).await,
+        pair_answer(&env.run, &pending, true).await,
         json!({"error": "The phone left"})
     );
     assert_eq!(env.status().await["devices"], 0);
@@ -1020,7 +1021,7 @@ async fn the_secret_stays_spent_after_the_held_phone_leaves() {
         link, mut phone, ..
     } = hold(&env.run, "Leaving phone").await;
     phone.close().await;
-    no_phone_held(&env, link.attempt).await;
+    no_phone_held(&env, &link.attempt).await;
     let mut again = Phone::connect(&link, &PhoneKey::new())
         .await
         .expect("connects");
@@ -1053,9 +1054,9 @@ async fn a_pairing_under_a_name_already_held_says_replaces_and_swaps_the_key() {
         link,
         ..
     } = hold(&env.run, "Test phone").await;
-    let question = pair_wait(&env.run, link.attempt).await;
+    let question = pair_wait(&env.run, &link.attempt).await;
     assert_eq!(question["replaces"], true, "{question}");
-    let pending = question["pending"].as_u64().expect("an id");
+    let pending = question["pending"].as_str().expect("an id");
     assert_eq!(
         pair_answer(&env.run, pending, true).await,
         json!({"paired": true, "device": "Test phone"})
@@ -1089,11 +1090,11 @@ async fn a_device_that_cannot_be_saved_refuses_the_phone_and_says_so() {
     let Held {
         mut phone, link, ..
     } = hold(&env.run, "Test phone").await;
-    let pending = pending(&env, link.attempt).await;
+    let pending = pending(&env, &link.attempt).await;
     // The devices file goes bad under the hub: the yes's save fails.
     std::fs::write(env.root.join("devices.json"), "not json").expect("written");
     assert_eq!(
-        pair_answer(&env.run, pending, true).await,
+        pair_answer(&env.run, &pending, true).await,
         json!({"error": "Could not save the device"})
     );
     assert_eq!(
@@ -1114,7 +1115,7 @@ async fn pair_secret_while_a_phone_waits_is_refused() {
         Some(json!({"link": null, "reason": "A phone is waiting for an answer"}))
     );
     assert_eq!(
-        pair_wait(&env.run, held.link.attempt).await["name"],
+        pair_wait(&env.run, &held.link.attempt).await["name"],
         "Test phone"
     );
 }
@@ -1125,7 +1126,7 @@ async fn a_new_pair_secret_expires_the_wait_on_the_old() {
     let mut env = Env::new();
     env.start(&relay.url()).await;
     let old = pair_link(&env.run).await;
-    let wait = waiting(&env, old.attempt).await;
+    let wait = waiting(&env, &old.attempt).await;
     let new = pair_link(&env.run).await;
     assert_eq!(wait.await.expect("answered"), json!({"expired": true}));
     // The old secret was replaced: a phone with it is refused.
@@ -1138,10 +1139,11 @@ async fn a_new_pair_secret_expires_the_wait_on_the_old() {
 }
 
 /// The attempt a `pair_secret` answer names.
-fn attempt_of(answer: &Value) -> u64 {
+fn attempt_of(answer: &Value) -> String {
     answer["attempt"]
-        .as_u64()
+        .as_str()
         .unwrap_or_else(|| panic!("no attempt: {answer}"))
+        .to_owned()
 }
 
 #[tokio::test]
@@ -1164,10 +1166,13 @@ async fn a_superseded_opening_gets_no_link_and_its_wait_is_expired() {
     let (old, new) = (attempt_of(&first), attempt_of(&second));
     assert_ne!(old, new);
     // The first opener's wait is expired at once and takes no waiter: the second's hears the phone.
-    assert_eq!(pair_wait_for(&env.run, old).await, json!({"expired": true}));
+    assert_eq!(
+        pair_wait_for(&env.run, &old).await,
+        json!({"expired": true})
+    );
     let wait = {
         let run = env.run.clone();
-        tokio::spawn(async move { pair_wait_for(&run, new).await })
+        tokio::spawn(async move { pair_wait_for(&run, &new).await })
     };
     sleep(Duration::from_millis(100)).await;
     connect(&mut control, &id(0)).await;
@@ -1180,11 +1185,14 @@ async fn a_superseded_opening_gets_no_link_and_its_wait_is_expired() {
     assert_eq!(code["type"], "pair_code", "{code}");
     assert_eq!(wait.await.expect("answered")["code"], code["code"]);
     // With that phone held, the first opener still hears only that its link expired.
-    assert_eq!(pair_wait_for(&env.run, old).await, json!({"expired": true}));
+    assert_eq!(
+        pair_wait_for(&env.run, &old).await,
+        json!({"expired": true})
+    );
 }
 
 /// `pair_wait` for the opening `attempt`, answered within [`WAIT`].
-async fn pair_wait_for(run: &std::path::Path, attempt: u64) -> Value {
+async fn pair_wait_for(run: &std::path::Path, attempt: &str) -> Value {
     ask(run, &json!({"type": "pair_wait", "attempt": attempt}), WAIT).await
 }
 
@@ -1196,7 +1204,7 @@ async fn pair_wait_without_an_attempt_is_refused() {
     let _link = pair_link(&env.run).await;
     for request in [
         json!({"type": "pair_wait"}),
-        json!({"type": "pair_wait", "attempt": "1"}),
+        json!({"type": "pair_wait", "attempt": 1}),
     ] {
         assert_eq!(
             ask(&env.run, &request, WAIT).await,
@@ -1206,6 +1214,79 @@ async fn pair_wait_without_an_attempt_is_refused() {
     }
 }
 
+/// Whether `value` is an id as the hub makes them: 32 lowercase hex digits.
+fn is_random_id(value: &Value) -> bool {
+    value.as_str().is_some_and(|id| {
+        id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+#[tokio::test]
+async fn pending_and_attempt_are_random_strings() {
+    let relay = Relay::start().await;
+    let mut env = Env::new();
+    env.start(&relay.url()).await;
+    let secret = json!({"type": "pair_secret"});
+    let first = ask(&env.run, &secret, WAIT).await;
+    let second = ask(&env.run, &secret, WAIT).await;
+    assert!(is_random_id(&first["attempt"]), "{first}");
+    assert!(is_random_id(&second["attempt"]), "{second}");
+    assert_ne!(first["attempt"], second["attempt"]);
+    let held = hold(&env.run, "Test phone").await;
+    let wait = json!({"type": "pair_wait", "attempt": &held.link.attempt});
+    let question = ask(&env.run, &wait, WAIT).await;
+    assert!(is_random_id(&question["pending"]), "{question}");
+}
+
+#[tokio::test]
+async fn a_pair_answer_with_a_numeric_pending_is_refused() {
+    let relay = Relay::start().await;
+    let mut env = Env::new();
+    env.start(&relay.url()).await;
+    let held = hold(&env.run, "Test phone").await;
+    let wait = json!({"type": "pair_wait", "attempt": &held.link.attempt});
+    let question = ask(&env.run, &wait, WAIT).await;
+    assert_eq!(question["name"], "Test phone", "{question}");
+    // A number, however small, names no question.
+    for pending in 0..=20 {
+        let request = json!({"type": "pair_answer", "pending": pending, "accept": true});
+        assert_eq!(
+            ask(&env.run, &request, WAIT).await,
+            json!({"error": "pair_answer needs pending and accept"}),
+            "{request}"
+        );
+    }
+    assert_eq!(ask(&env.run, &wait, WAIT).await, question);
+    assert_eq!(env.status().await["devices"], 0);
+}
+
+#[tokio::test]
+async fn an_answer_from_before_a_restart_leaves_the_new_phone_waiting() {
+    let relay = Relay::start().await;
+    let mut env = Env::new();
+    env.start(&relay.url()).await;
+    let first = hold(&env.run, "Phone A").await;
+    let wait = json!({"type": "pair_wait", "attempt": &first.link.attempt});
+    let asked = ask(&env.run, &wait, WAIT).await;
+    assert_eq!(asked["name"], "Phone A", "{asked}");
+    let old = asked["pending"].clone();
+    drop(first);
+    env.stop().await;
+    // The terminal still shows A's question when the hub comes back and holds B.
+    env.start(&relay.url()).await;
+    let second = hold(&env.run, "Phone B").await;
+    let wait = json!({"type": "pair_wait", "attempt": &second.link.attempt});
+    let question = ask(&env.run, &wait, WAIT).await;
+    assert_eq!(question["name"], "Phone B", "{question}");
+    let late = json!({"type": "pair_answer", "pending": old, "accept": true});
+    assert_eq!(
+        ask(&env.run, &late, WAIT).await,
+        json!({"error": "No phone is waiting for that answer"})
+    );
+    assert_eq!(ask(&env.run, &wait, WAIT).await, question);
+    assert_eq!(env.status().await["devices"], 0);
+}
+
 #[tokio::test]
 async fn a_second_pair_wait_is_refused() {
     let relay = Relay::start().await;
@@ -1213,7 +1294,7 @@ async fn a_second_pair_wait_is_refused() {
     env.start(&relay.url()).await;
     let link = pair_link(&env.run).await;
     // Of two waits, the hub refuses one; the other still waits, and hears of the phone.
-    let wait = waiting(&env, link.attempt).await;
+    let wait = waiting(&env, &link.attempt).await;
     let Held { code, .. } = hold_with(&link, "Test phone").await;
     let question = wait.await.expect("answered");
     assert_eq!(question["code"], code["code"]);

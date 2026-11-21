@@ -188,6 +188,9 @@ function clientOf(identity: Identity, opened: WebSocket[], extra: { background?:
   });
 }
 
+/** A pairing id as the hub makes them: 32 random lowercase hex digits. */
+const RANDOM_ID = /^[0-9a-f]{32}$/;
+
 /**
  * Pairs a phone called `name` with the hub whose control socket is `socket`, as the app does and
  * as `octet pair` answers: a pairing link and its attempt from the hub (once the relay has it), the phone's `pair`
@@ -196,6 +199,8 @@ function clientOf(identity: Identity, opened: WebSocket[], extra: { background?:
  */
 async function pairThrough(socket: string, name: string, opened: WebSocket[]) {
   const opening = await control(socket, { type: "pair_secret" });
+  // The opening and the held pairing are named by random ids, never counts.
+  expect(opening.attempt).toMatch(RANDOM_ID);
   const text = String(opening.link);
   expect(text).toMatch(/^octet:\/\/pair\/[A-Za-z0-9_-]+$/);
   // A debug hub dials the relay over ws: only a development build of the app takes its link.
@@ -208,6 +213,7 @@ async function pairThrough(socket: string, name: string, opened: WebSocket[]) {
   const paired = pairing.pair(link.secret, name, "ios", (code) => codes.push(code));
   // The wait names the opening it is for, as `octet pair` does.
   const question = await control(socket, { type: "pair_wait", attempt: opening.attempt });
+  expect(question.pending).toMatch(RANDOM_ID);
   await until("the phone to be shown the code", () => codes.length > 0);
   const answer = await control(socket, { type: "pair_answer", pending: question.pending, accept: true });
   return { identity, question, codes, answer, paired: await paired };
@@ -1138,6 +1144,7 @@ run("pairing a Mac again through the Fleet", () => {
     const opening = await control(mac.socket, { type: "pair_secret" });
     const paired = fleet.pair(String(opening.link), name);
     const question = await control(mac.socket, { type: "pair_wait", attempt: opening.attempt });
+    expect(question.pending).toMatch(RANDOM_ID);
     const answer = await control(mac.socket, { type: "pair_answer", pending: question.pending, accept: true });
     expect(answer).toMatchObject({ paired: true });
     expect(await paired).toEqual({ ok: true, macName: expect.any(String) });

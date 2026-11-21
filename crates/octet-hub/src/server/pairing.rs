@@ -6,13 +6,15 @@
 //! handshake proved: the answer can pair that key and no other, and the connection closing ends
 //! it. One pairing is held at a time, and a `pair` meanwhile is refused `busy` with no code.
 //!
-//! Each `pair_secret` is an attempt, numbered: its link comes back with the number, and its
-//! `pair_wait` names it. A wait for any attempt but the newest hears `expired`, so two openers
-//! (`octet pair` and the terminal UI, say) never take each other's phone.
+//! Each `pair_secret` is an attempt, with an id of its own: its link comes back with the id, and
+//! its `pair_wait` names it. A wait for any attempt but the newest hears `expired`, so two openers
+//! (`octet pair` and the terminal UI, say) never take each other's phone. Attempts and held
+//! pairings have random ids ([`fresh_id`]), never a count: a terminal still showing a question
+//! from before the hub restarted cannot answer for a phone held since.
 use super::{AfterSave, Hub};
 use crate::{
     link::{pair_link, split_relay},
-    store::{PAIR_NOT_SAVED, Pairing, SECRET_REFUSED, pair_change},
+    store::{PAIR_NOT_SAVED, Pairing, SECRET_REFUSED, hex, pair_change},
 };
 use octet_core::remote::protocol::{Code, pair_code, paired};
 use serde_json::{Value, json};
@@ -44,15 +46,15 @@ pub(super) const PHONE_WAITS: &str = "A phone is waiting for an answer";
 /// The pairing the hub holds for the owner's answer.
 struct Held {
     /// Its id, which the answer names.
-    pending: u64,
+    pending: String,
     /// The phone's connection; the answer goes to it and to no other.
     conn: u64,
     /// The phone's `pair` req, which `pair_code`, `paired` and the refusals answer.
     req: u64,
     /// The device to save: the key the connection's handshake proved, with the phone's claims.
     pairing: Pairing,
-    /// The attempt whose secret the phone used.
-    attempt: u64,
+    /// The attempt whose secret the phone used; `None` for one from before any opening.
+    attempt: Option<String>,
     /// The six digits the phone and the Mac show.
     code: String,
     /// Whether a device of its name was paired when it was held.
@@ -84,9 +86,9 @@ pub(super) struct Pairings {
     /// The `pair_wait` waiting for a phone to be held.
     waiter: Option<oneshot::Sender<Value>>,
     /// The id of the last held pairing to end unanswered, and what an answer to it is told.
-    ended: Option<(u64, &'static str)>,
-    /// The newest attempt: the number of the last `pair_secret` that made a secret.
-    attempt: u64,
+    ended: Option<(String, &'static str)>,
+    /// The newest attempt: the id of the last `pair_secret` that made a secret.
+    attempt: Option<String>,
 }
 
 /// What `pair_secret` came to.
@@ -96,7 +98,7 @@ pub(super) enum Opened {
     Link {
         link: String,
         host: String,
-        attempt: u64,
+        attempt: String,
     },
     /// The relay's address cannot go in a pairing link.
     Unlinkable,
@@ -160,11 +162,11 @@ impl Hub {
             .iter()
             .any(|device| device.name == pairing.device.name);
         let held = Held {
-            pending: self.next_id(),
+            pending: fresh_id(),
             conn,
             req,
             pairing,
-            attempt: self.pairings.attempt,
+            attempt: self.pairings.attempt.clone(),
             code: draw_code(),
             replaces,
             deadline: Instant::now() + ANSWER_WITHIN,
@@ -187,8 +189,8 @@ impl Hub {
         if self.pairings.held.is_some() {
             return Opened::Waiting;
         }
-        self.pairings.attempt += 1;
-        let attempt = self.pairings.attempt;
+        let attempt = fresh_id();
+        self.pairings.attempt = Some(attempt.clone());
         let secret = self.store.replace_pairing_secret(SystemTime::now());
         if let Some(waiter) = self.pairings.waiter.take() {
             let _ = waiter.send(expired());
@@ -207,19 +209,19 @@ impl Hub {
     }
 
     /// Whether `attempt` is the newest: an opening no later `pair_secret` has replaced.
-    pub(super) fn current_attempt(&self, attempt: u64) -> bool {
-        attempt == self.pairings.attempt
+    pub(super) fn current_attempt(&self, attempt: &str) -> bool {
+        self.pairings.attempt.as_deref() == Some(attempt)
     }
 
     /// `pair_wait` for `attempt`: `expired` for any attempt but the newest, or a phone held
     /// through another; else the held phone's question at once; `expired` with no pairing open;
     /// another waiter's refusal; or else, `reply` kept, the question once a phone is held.
-    pub(super) fn wait_for_phone(&mut self, attempt: u64, reply: oneshot::Sender<Value>) {
+    pub(super) fn wait_for_phone(&mut self, attempt: &str, reply: oneshot::Sender<Value>) {
         let held_elsewhere = self
             .pairings
             .held
             .as_ref()
-            .is_some_and(|held| held.attempt != attempt);
+            .is_some_and(|held| held.attempt.as_deref() != Some(attempt));
         if !self.current_attempt(attempt) || held_elsewhere {
             let _ = reply.send(expired());
         } else if let Some(held) = self.pairings.held.as_ref().filter(|h| h.saving.is_none()) {
@@ -240,14 +242,14 @@ impl Hub {
 
     /// `pair_answer` for the held pairing `pending`: no refuses the phone; yes saves its device
     /// off the loop, and `reply` hears once it is saved ([`paired_saved`](Self::paired_saved)).
-    pub(super) fn answer(&mut self, pending: u64, accept: bool, reply: oneshot::Sender<Value>) {
+    pub(super) fn answer(&mut self, pending: String, accept: bool, reply: oneshot::Sender<Value>) {
         let Some(mut held) = self
             .pairings
             .held
             .take_if(|held| held.pending == pending && held.saving.is_none())
         else {
             let error = match self.pairings.ended {
-                Some((ended, reason)) if ended == pending => reason,
+                Some((ref ended, reason)) if *ended == pending => reason,
                 _ => NOT_WAITING,
             };
             let _ = reply.send(json!({ "error": error }));
@@ -270,7 +272,7 @@ impl Hub {
     /// key it replaced are closed; or the phone is refused. The Mac hears either way.
     pub(super) async fn paired_saved(
         &mut self,
-        pending: u64,
+        pending: String,
         result: std::io::Result<Result<Option<String>, &'static str>>,
     ) {
         let Some(mut held) = self.pairings.held.take_if(|held| held.pending == pending) else {
@@ -314,7 +316,7 @@ impl Hub {
             .held
             .take_if(|held| held.saving.is_none() && now >= held.deadline)
         {
-            self.pairings.ended = Some((held.pending, TIMED_OUT));
+            self.pairings.ended = Some((held.pending.clone(), TIMED_OUT));
             self.let_go(&held, TIMED_OUT);
         }
         if self
@@ -384,6 +386,18 @@ fn expired() -> Value {
     json!({ "expired": true })
 }
 
+/// A pairing id: 16 random bytes as 32 lowercase hex digits, from the operating system's
+/// randomness as the code is. Unguessable, and never one a hub made before it restarted.
+///
+/// # Panics
+///
+/// Panics if the operating system has no random bytes to give.
+fn fresh_id() -> String {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).expect("the operating system gave no random bytes");
+    hex(&bytes)
+}
+
 /// Six digits from the operating system's randomness, every code equally likely: a draw past
 /// the last whole million a `u32` holds is drawn again, never folded onto the codes below it.
 ///
@@ -424,13 +438,25 @@ mod tests {
         let opened = Opened::Link {
             link: "octet://pair/AQID-secret".into(),
             host: "relay.example".into(),
-            attempt: 1,
+            attempt: fresh_id(),
         };
         let shown = format!("{opened:?}");
         assert!(
             !shown.contains("secret") && shown.contains("relay.example"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn ids_are_32_hex_digits_and_differ() {
+        let ids: HashSet<String> = (0..200).map(|_| fresh_id()).collect();
+        assert_eq!(ids.len(), 200);
+        for id in &ids {
+            assert!(
+                id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{id}"
+            );
+        }
     }
 
     #[test]

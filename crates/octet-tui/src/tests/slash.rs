@@ -137,8 +137,11 @@ mod remote_control {
     /// The question `octet pair` asks about the stand-in phone.
     const ASKS: &str = "Phone shows 482 913? Pair \"Pixel\" (ios)? [y/N]";
 
-    /// The opening the scripted hub's `pair_secret` names.
-    const ATTEMPT: u64 = 3;
+    /// The opening the scripted hub's `pair_secret` names: an id as the hub makes them.
+    const ATTEMPT: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    /// The pairing the scripted hub holds, and another it might hold in its place.
+    const HELD: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+    const OTHER: &str = "ffeeddccbbaa99887766554433221100";
 
     /// A hub that answers from a script, keeping every request.
     #[derive(Clone)]
@@ -244,7 +247,7 @@ mod remote_control {
     }
 
     /// The hub's question about the phone called Pixel, held as pairing `pending`.
-    fn question(pending: u64, replaces: bool) -> Value {
+    fn question(pending: &str, replaces: bool) -> Value {
         json!({"pending": pending, "code": "482913", "name": "Pixel", "platform": "ios", "replaces": replaces})
     }
 
@@ -306,7 +309,7 @@ mod remote_control {
     #[tokio::test]
     async fn pair_shows_the_qr_then_asks_with_the_code() {
         let dir = octet_testkit::TempDir::new("octet-rc-ask");
-        let hub = Hub::new(vec![question(7, false)]);
+        let hub = Hub::new(vec![question(HELD, false)]);
         let _served = hub.serve(dir.path());
         let mut app = app_in(dir.path());
         let action = command(&mut app, "/remote-control pair").await;
@@ -360,7 +363,7 @@ mod remote_control {
             (KeyCode::Enter, false),
             (KeyCode::Esc, false),
         ] {
-            let hub = Hub::new(vec![question(7, false)]);
+            let hub = Hub::new(vec![question(HELD, false)]);
             let mut app = app();
             open(&mut app, &hub).await;
             told(&mut app).await;
@@ -385,7 +388,7 @@ mod remote_control {
             assert_eq!(last_said(&app), said, "{code:?}");
             assert_eq!(
                 hub.answered(),
-                [json!({"type": "pair_answer", "pending": 7, "accept": pairs})],
+                [json!({"type": "pair_answer", "pending": HELD, "accept": pairs})],
                 "{code:?}"
             );
         }
@@ -397,7 +400,7 @@ mod remote_control {
             (KeyCode::Char('y'), "Paired \"Pixel\""),
             (KeyCode::Char('n'), NOT_PAIRED),
         ] {
-            let hub = Hub::new(vec![question(7, false)]);
+            let hub = Hub::new(vec![question(HELD, false)]);
             let mut app = app();
             open(&mut app, &hub).await;
             // The owner opens the palette while waiting for a phone; then the phone comes.
@@ -428,7 +431,7 @@ mod remote_control {
             assert_eq!(
                 hub.answered(),
                 [
-                    json!({"type": "pair_answer", "pending": 7, "accept": code == KeyCode::Char('y')})
+                    json!({"type": "pair_answer", "pending": HELD, "accept": code == KeyCode::Char('y')})
                 ]
             );
         }
@@ -436,7 +439,7 @@ mod remote_control {
 
     #[tokio::test(start_paused = true)]
     async fn a_pairing_that_replaces_asks_replace() {
-        let hub = Hub::new(vec![question(7, true)]);
+        let hub = Hub::new(vec![question(HELD, true)]);
         let mut app = app();
         open(&mut app, &hub).await;
         told(&mut app).await;
@@ -452,7 +455,7 @@ mod remote_control {
 
     #[tokio::test(start_paused = true)]
     async fn the_prompt_ends_when_the_pairing_times_out() {
-        let hub = Hub::new(vec![question(7, false)]);
+        let hub = Hub::new(vec![question(HELD, false)]);
         let mut app = app();
         open(&mut app, &hub).await;
         told(&mut app).await;
@@ -475,16 +478,22 @@ mod remote_control {
         assert!((100..=122).contains(&polls), "{polls} asks");
         assert_eq!(
             hub.answered(),
-            [json!({"type": "pair_answer", "pending": 7, "accept": false})]
+            [json!({"type": "pair_answer", "pending": HELD, "accept": false})]
         );
         assert_eq!(hub.kinds().last().map(String::as_str), Some("pair_answer"));
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_prompt_ends_when_the_phone_leaves() {
-        let held = || vec![question(7, false), question(7, false), question(7, false)];
+        let held = || {
+            vec![
+                question(HELD, false),
+                question(HELD, false),
+                question(HELD, false),
+            ]
+        };
         let expired = [held(), vec![json!({"expired": true})]].concat();
-        let another = [held(), vec![question(8, false)]].concat();
+        let another = [held(), vec![question(OTHER, false)]].concat();
         let left = json!({"error": "The phone left"});
         let late = json!({"error": "Pairing timed out"});
         for (waits, refusal, said) in [
@@ -510,7 +519,7 @@ mod remote_control {
             // One refusal, for that pairing, after the poll that found it gone.
             assert_eq!(
                 hub.answered(),
-                [json!({"type": "pair_answer", "pending": 7, "accept": false})]
+                [json!({"type": "pair_answer", "pending": HELD, "accept": false})]
             );
             assert_eq!(hub.kinds().last().map(String::as_str), Some("pair_answer"));
         }
