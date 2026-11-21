@@ -15,7 +15,7 @@ import { createCoalescer, type Coalescer } from "../coalesce";
 import { MAX_MACS, TOO_MANY_MACS, UNNAMED_MAC, cleanMacName, keyFor, macOfKey, newMacId, tapKey, type Links, type Pairing, type Tap } from "../macs";
 import type { ApproveLink } from "../navigation";
 import { askForToken, currentToken, dropPushRegistration, projectId } from "../notifications";
-import type { Cursor, PushKinds } from "../protocol";
+import type { PushKinds } from "../protocol";
 import { hasEnded, octetStore, type OctetStore } from "../store";
 import { TOKEN_KEY, keepKey, keyPairOf, keyStore, secureStore, tokenKeyOf, type Keychain, type KeyStore } from "./keychain";
 import { MacLink, UNREACHABLE, macInfoOf, type LinkHost, type MacInfo, type PushResult } from "./macLink";
@@ -108,6 +108,10 @@ export class Fleet {
   /** The id that pairing will keep its key under: an unpair of the same Mac meanwhile must not
    * delete what it saves. */
   private pairingId: string | null = null;
+  /** The link a pairing of its Mac has just replaced at the hub (whose `paired` came), stopped,
+   * while the pairing saves: the hub no longer knows its key, so its refusal says nothing of the
+   * pairing that replaced it. */
+  private replaced: MacLink | null = null;
   /** What `macs` shows of each pairing with no link (its key unreadable), kept so that the list
    * keeps its identity. */
   private unlinked = new Map<string, MacInfo>();
@@ -315,6 +319,14 @@ export class Fleet {
     if (this.current.notice !== null) this.emit({ notice: null });
     try {
       const paired = await client.pair(parsed.secret, deviceName, this.platform, onCode);
+      // The hub has replaced the old key (and closed its connections): the Mac's old link stops
+      // now, before the saves, so that it cannot come back meanwhile to be refused as unpaired.
+      const old = this.all.find((l) => l.id === id);
+      const cursors = old?.client.cursorsNow();
+      if (old) {
+        old.client.stop();
+        this.replaced = old;
+      }
       const macName = before?.macName ?? cleanMacName(paired.name) ?? UNNAMED_MAC;
       const pairing: Pairing = { id, relay: parsed.relay, channel: parsed.channel, hubKey: parsed.hubKey, deviceName, macName };
       const keys = keyStore(this.keychain, pairing.id);
@@ -327,19 +339,17 @@ export class Fleet {
         }));
       if (!kept) {
         await keys.clear().catch(() => undefined);
+        // Nothing was replaced on the phone: the old link goes on as it was, and hears from its Mac
+        // itself whether the hub still knows it.
+        this.replaced = null;
+        if (old && this.all.includes(old) && this.foreground) old.client.start();
         return { ok: false, message: unsaved(deviceName), clear: true };
       }
       this.pairings = withPairing(this.pairings, pairing);
       this.savedName = deviceName;
-      // The Mac's old link, when it pairs again, gives way to the new one, which picks its sessions
-      // up where the old one had them.
-      const old = this.all.find((l) => l.id === pairing.id);
-      let cursors: Record<string, Cursor> | undefined;
-      if (old) {
-        cursors = old.client.cursorsNow();
-        old.client.stop();
-        this.drop(old, { keepStore: true });
-      }
+      // The Mac's old link gives way to the new one, which picks its sessions up where the old one
+      // had them.
+      if (old && this.all.includes(old)) this.drop(old, { keepStore: true });
       // The notifications step, unless they are on already (the new Mac is sent them at ready).
       this.adopt(pairing, this.clientFor(pairing, key, { cursors }), keys, projectId() !== null && !notifications);
       return { ok: true, macName };
@@ -352,6 +362,7 @@ export class Fleet {
     } finally {
       this.pairing = null;
       this.pairingId = null;
+      this.replaced = null;
     }
   }
 
@@ -417,9 +428,9 @@ export class Fleet {
   /** The Mac refused this phone's key as unpaired or revoked: only its pairing goes (its key
    * deleted), and the notice names it; Pair shows when no Mac is left. Only the hub's refusal,
    * inside the encrypted channel, gets here; a dropped network or a close from the relay never
-   * does. */
+   * does. Nor does the refusal of a link a pairing of its Mac has just replaced. */
   private macUnpaired(link: MacLink): void {
-    if (!this.all.includes(link)) return;
+    if (!this.all.includes(link) || link === this.replaced) return;
     const last = this.pairings.every((p) => p.id === link.id);
     this.drop(link);
     this.unpairing += 1;

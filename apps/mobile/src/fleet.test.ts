@@ -291,6 +291,69 @@ describe("the relay", () => {
     expect(again.commandsOf("subscribe")).toEqual([expect.objectContaining({ session: "1-2", after: { journal: "j", seq: 4 } })]);
   });
 
+  it("a_re_pair_survives_its_old_link_being_refused_unpaired_while_it_saves", async () => {
+    /** Runs once, as the new key is written: between the hub's `paired` and the settings write. */
+    let midSave: (() => void) | null = null;
+    const hooked: Keychain = {
+      get: (key) => SecureStore.getItemAsync(key),
+      set: async (key, value) => {
+        const run = midSave;
+        midSave = null;
+        run?.();
+        await SecureStore.setItemAsync(key, value);
+      },
+      delete: (key) => SecureStore.deleteItemAsync(key),
+    };
+    const r = rig(hooked);
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const old = await pairWith(r, "studio", "aa".repeat(32));
+    old.receive({ type: "sessions", sessions: [info("1-2")] });
+    r.fleet.links.client("m00000001")?.subscribe("1-2");
+    old.receive({ type: "subscribed", session: "1-2", from: "start", journals: ["j"] });
+    old.receive({ type: "event", session: "1-2", journal: "j", seq: 4, event: { type: "text", data: "kept" } });
+    r.clock.advance(200);
+    const key = keyOf("m00000001", "1-2");
+
+    // The hub replaced the old key at `paired` and closed its connection; the old link comes back
+    // during the saves and is refused `unpaired`, as the hub refuses any key it no longer knows.
+    midSave = () => {
+      const [hello] = old.commandsOf("hello");
+      old.receive({ type: "refused", req: hello?.req, code: "unpaired", reason: "Unknown device; pair it again" });
+      const before = r.sockets.all.length;
+      old.drop(1000);
+      r.clock.advance(r.clock.delays[0] ?? 0);
+      for (const back of r.sockets.all.slice(before)) {
+        back.open();
+        const [again] = back.commandsOf("hello");
+        back.receive({ type: "refused", req: again?.req, code: "unpaired", reason: "Unknown device; pair it again" });
+      }
+    };
+    const notices: string[] = [];
+    r.fleet.subscribe(() => {
+      const { notice } = r.fleet.snapshot();
+      if (notice !== null) notices.push(notice);
+    });
+    const again = await pairWith(r, "studio", "ee".repeat(32));
+    await settle();
+    expect(midSave).toBeNull();
+    expect(notices).toEqual([]);
+    expect(r.fleet.snapshot()).toMatchObject({ status: "paired", notice: null, macs: [{ id: "m00000001" }] });
+    expect(JSON.stringify(r.store.getState().bySession.get(key))).toContain("kept");
+    r.fleet.links.client("m00000001")?.subscribe("1-2");
+    expect(again.commandsOf("subscribe")).toEqual([expect.objectContaining({ session: "1-2", after: { journal: "j", seq: 4 } })]);
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("ee".repeat(32));
+    expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001"]);
+    expect((await loadSettings()).forget).toEqual([]);
+    // The next launch is paired with the new key.
+    r.fleet.setForeground(false);
+    const next = rig();
+    next.fleet.setForeground(true);
+    await next.fleet.init();
+    expect(next.fleet.snapshot().status).toBe("paired");
+    expect(Buffer.from(next.keys[0]?.device.privateKey ?? []).toString("hex")).toBe("ee".repeat(32));
+  });
+
   it("a_pairing_that_fails_leaves_the_one_already_held", async () => {
     const r = rig();
     r.fleet.setForeground(true);
