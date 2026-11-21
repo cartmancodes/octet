@@ -35,6 +35,24 @@ const flip = (data: Uint8Array, at: number): void => {
   data[at] = (data[at] ?? 0) ^ 1;
 };
 
+/** The hub's handshake answer, in bytes. */
+const SECOND_BYTES = 48;
+
+/** A mulberry32 sequence from `seed`: the same numbers, unsigned 32-bit, every run. */
+function seeded(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let z = state;
+    z = Math.imul(z ^ (z >>> 15), z | 1);
+    z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
+    return (z ^ (z >>> 14)) >>> 0;
+  };
+}
+
+/** `n` bytes from `next`. */
+const seededBytes = (next: () => number, n: number): Uint8Array => Uint8Array.from({ length: n }, () => next() & 0xff);
+
 const concat = (parts: Uint8Array[]): Uint8Array => Uint8Array.from(Buffer.concat(parts));
 /** A transport plaintext: `kind`, then `body`. */
 const plain = (kind: number, body: Uint8Array | string = new Uint8Array(0)): Uint8Array =>
@@ -364,6 +382,53 @@ describe("noise", () => {
       );
       handshake.finish(message2);
       expect(ephemeral.every((b) => b === 0)).toBe(true);
+    }
+  });
+
+  // Spec §9: random and mutated input, from a fixed seed and in bounded rounds, so that it is the
+  // same run every time and stays quick. Null is the module's one refusal: nothing throws.
+  it("random_and_mutated_second_messages_make_no_channel_and_never_throw", () => {
+    const next = seeded(0x6f637465);
+    const good = bytes(vectors.message2);
+    expect(vectorHandshake().finish(good)).not.toBeNull();
+    for (let round = 0; round < 200; round++) {
+      const at = next() % SECOND_BYTES;
+      let message: Uint8Array;
+      if (round % 4 === 0) message = seededBytes(next, next() % 100); // random, of any length
+      else if (round % 4 === 1) message = seededBytes(next, SECOND_BYTES); // random, the right length
+      else if (round % 4 === 2) {
+        message = good.slice(); // the good one replayed, with one bit flipped
+        message[at] = (message[at] ?? 0) ^ (1 << next() % 8);
+      } else {
+        // The good one cut short, or run on.
+        message = next() % 2 === 0 ? good.slice(0, at) : concat([good, seededBytes(next, 1 + (next() % 32))]);
+      }
+      let channel: Channel | null | undefined;
+      expect(() => (channel = vectorHandshake().finish(message))).not.toThrow();
+      expect([round, channel]).toEqual([round, null]);
+    }
+  });
+
+  it("random_and_mutated_transport_messages_open_as_null_and_never_throw", () => {
+    const next = seeded(0x70686f6e);
+    const kinds = [0, 1, 2, 3];
+    for (let round = 0; round < 1_000; round++) {
+      const { phone, hub } = connected();
+      const kind = kinds[next() % kinds.length] ?? 1;
+      const sealed = hub.seal(plain(kind, kind >= 2 ? seededBytes(next, 8) : "{}"));
+      const at = next() % sealed.length;
+      let message: Uint8Array;
+      if (round % 4 === 0) message = seededBytes(next, next() % 200); // random, of any length
+      else if (round % 4 === 1) {
+        message = sealed.slice(); // a good message with one bit flipped
+        message[at] = (message[at] ?? 0) ^ (1 << next() % 8);
+      } else if (round % 4 === 2) message = sealed.slice(0, at); // cut short
+      else message = concat([sealed, seededBytes(next, 1 + (next() % 32))]); // run on
+      let opened: ReturnType<Channel["open"]> | undefined;
+      expect(() => (opened = phone.open(message))).not.toThrow();
+      expect([round, opened]).toEqual([round, null]);
+      // Failed, it stays failed: the good message no longer opens either.
+      expect(phone.open(sealed)).toBeNull();
     }
   });
 

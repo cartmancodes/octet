@@ -1192,6 +1192,64 @@ mod tests {
         bytes
     }
 
+    /// Spec §9: whatever comes as a first message (random bytes of any length, or a good one
+    /// replayed with a bit flipped, bytes overwritten, cut short or run on), the hub never panics
+    /// and never makes a channel of it. Seeded, and a few hundred handshakes, so it stays quick.
+    #[tokio::test]
+    async fn random_and_mutated_first_messages_are_refused_and_never_panic() {
+        let mut state = 0x6875_622d_6669_7273;
+        let (good, _) = first(PROLOGUE);
+        let mut refused = 0;
+        for round in 0..400 {
+            let roll = splitmix(&mut state);
+            let at = usize::try_from(roll % 96).unwrap();
+            let message = match round % 5 {
+                // Random bytes, of any length up to twice a first message's.
+                0 => noise_bytes(&mut state, usize::try_from((roll >> 8) % 193).unwrap()),
+                // Random bytes of exactly a first message's length.
+                1 => noise_bytes(&mut state, FIRST),
+                // The good message replayed with one bit flipped.
+                2 => {
+                    let mut flipped = good.clone();
+                    flipped[at] ^= 1 << ((roll >> 8) % 8);
+                    flipped
+                }
+                // The good message with a run of bytes overwritten.
+                3 => {
+                    let mut overwritten = good.clone();
+                    let end = (at + 1 + usize::try_from((roll >> 8) % 16).unwrap()).min(96);
+                    let random = noise_bytes(&mut state, end - at);
+                    for (byte, new) in overwritten[at..end].iter_mut().zip(random) {
+                        *byte ^= new | 1;
+                    }
+                    overwritten
+                }
+                // The good message cut short, or run on with random bytes.
+                _ => {
+                    let mut changed = good[..at].to_vec();
+                    if roll & (1 << 40) != 0 {
+                        changed.clone_from(&good);
+                        let more = 1 + usize::try_from((roll >> 8) % 64).unwrap();
+                        changed.extend(noise_bytes(&mut state, more));
+                    }
+                    changed
+                }
+            };
+            assert_ne!(message, good, "round {round} made the good message");
+            let answer = answer_to(Message::binary(message)).await;
+            assert_eq!(answer, None, "round {round} made a channel");
+            refused += 1;
+        }
+        assert_eq!(refused, 400);
+        // The harness itself is sound: the good message, unchanged, is answered.
+        assert_eq!(
+            answer_to(Message::binary(good)).await,
+            Some(Peer {
+                key: public(&PHONE)
+            })
+        );
+    }
+
     #[tokio::test]
     async fn random_messages_never_panic() {
         const KINDS: [u8; 6] = [MORE, LAST, PING, PONG, 4, 0xff];
