@@ -27,5 +27,10 @@ octet-testkit = { workspace = true, features = ["relay"] }
 octet-relay.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
+# rustls is named only to pick ring as its crypto provider for the relay link's wss:// client;
+# no code uses it, so cargo-machete would call it unused.
+[package.metadata.cargo-machete]
+ignored = ["rustls"]
+
 [lints]
 workspace = true
