@@ -52,9 +52,9 @@ then "Nothing to commit", notifications on (a push to a local fake, never to Exp
 content-free body), notifications off, and a revoke. The fake session's workspace is a git
 repository the test makes in its temp directory, with its own `user.name`, `user.email` and
 `commit.gpgsign=false` (the hub takes every `GIT_*` variable out of git's environment), so the
-test needs `git` on the `PATH`. It builds nothing:
-run `scripts/rust-env.sh cargo build -p octet -p octet-relay` first. Without those binaries it
-skips. The hub posts push with `curl`, so `curl` must be on the `PATH`. Its pushes name the hub's
+test needs `git` on the `PATH`. `npm run contract` builds nothing: run
+`scripts/rust-env.sh cargo build -p octet -p octet-relay` first (`make mobile-contract` does). It
+looks for them in `CARGO_TARGET_DIR` when that is set, and fails without them, never skips. The hub posts push with `curl`, so `curl` must be on the `PATH`. Its pushes name the hub's
 channel id as `mac`. A second part runs two hubs at once on one relay, as two Macs (each with its
 own temp directory and fake session, the same session id on both), feeds one store from both
 clients and checks that both are listed apart, that an answer reaches only its own Mac's session,

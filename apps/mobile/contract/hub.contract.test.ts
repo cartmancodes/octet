@@ -45,8 +45,11 @@ jest.mock("expo-crypto", () => ({
   getRandomBytes: (count: number) => Uint8Array.from(jest.requireActual<typeof import("node:crypto")>("node:crypto").randomBytes(count)),
 }));
 
-const BINARY = path.resolve(__dirname, "../../../target/debug/octet");
-const RELAY_BINARY = path.resolve(__dirname, "../../../target/debug/octet-relay");
+/** Where cargo puts its builds: `CARGO_TARGET_DIR` when set, as cargo reads it, or the workspace's
+ * `target`. */
+const TARGET = process.env.CARGO_TARGET_DIR ? path.resolve(process.env.CARGO_TARGET_DIR) : path.resolve(__dirname, "../../../target");
+const BINARY = path.join(TARGET, "debug/octet");
+const RELAY_BINARY = path.join(TARGET, "debug/octet-relay");
 const PHONE = "Contract phone";
 const JOURNAL = "session-1-1.jsonl";
 const PUSH_TOKEN = "ExponentPushToken[contract-test-token]";
@@ -59,7 +62,18 @@ const TEAM_ID = "ABCDE12345";
 const KEY_ID = "KEY1234567";
 /** The test key: a P-256 key that signs nothing real (its file says so above the PEM block). */
 const TEST_KEY = path.resolve(__dirname, "../../../crates/octet-hub/tests/data/apns-test.p8");
-const run = existsSync(BINARY) && existsSync(RELAY_BINARY) ? describe : describe.skip;
+const MISSING = [BINARY, RELAY_BINARY].filter((binary) => !existsSync(binary));
+const run = MISSING.length === 0 ? describe : describe.skip;
+
+// `npm run contract` (which `make mobile-contract` and CI run) sets OCTET_CONTRACT=1: a run meant
+// to test fails without its binaries, never skips.
+if (MISSING.length > 0 && process.env.OCTET_CONTRACT === "1") {
+  describe("the contract test's binaries", () => {
+    it("are built", () => {
+      throw new Error(`missing ${MISSING.join(" and ")}: run scripts/rust-env.sh cargo build -p octet -p octet-relay`);
+    });
+  });
+}
 
 type Obj = Record<string, unknown>;
 

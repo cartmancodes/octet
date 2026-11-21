@@ -12,7 +12,8 @@ rust-check: ## Check formatting, lint, docs and tests for the Rust workspace
 mobile-check: ## Type-check, lint and test the mobile app (needs Node 22)
 	cd apps/mobile && npm ci && npm run typecheck && npm run lint && npm test -- --ci
 
-mobile-contract: ## Run the app's hub client against the real octet hub (build it first: cargo build -p octet)
+mobile-contract: ## Build octet and octet-relay, then run the app's hub client against them
+	scripts/rust-env.sh cargo build --locked -p octet -p octet-relay
 	cd apps/mobile && npm run contract
 
 mobile-export: ## Bundle the mobile app for iOS and Android (no native build)

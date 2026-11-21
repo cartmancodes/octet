@@ -10,7 +10,7 @@
     "test": "jest",
     "mascot": "node scripts/mascot.mjs",
     "export:check": "expo export --platform ios --platform android --output-dir /tmp/octet-export",
-    "contract": "jest --config contract/jest.config.js --runInBand"
+    "contract": "OCTET_CONTRACT=1 jest --config contract/jest.config.js --runInBand"
   },
   "dependencies": {
     "@noble/ciphers": "2.4.0",
