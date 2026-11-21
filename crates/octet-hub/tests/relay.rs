@@ -365,6 +365,34 @@ async fn status_reports_the_relay_state() {
     relay_state(&env.run, "registered").await;
 }
 
+/// A relay whose side of the control connection is gone with no FIN reaching the Mac (a laptop
+/// that slept, a new Wi-Fi network) leaves the socket open and silent: no pings, nothing. The hub
+/// gives it up 50 seconds on, two of the relay's 20-second pings and a margin, says it is no
+/// longer registered, and dials again.
+#[tokio::test]
+async fn a_relay_that_goes_silent_is_dropped_after_50_seconds_and_dialled_again() {
+    let mut fake = FakeRelay::start().await;
+    let mut env = Env::new();
+    env.start(&fake.url).await;
+    let _pairing = open_pairing(&env.run);
+    // Registered, then never another word; the socket is kept open, and never read.
+    let (_, silent) = fake.register().await;
+    relay_state(&env.run, "registered").await;
+    tokio::time::pause();
+    let gave_up = crawl(Duration::from_secs(120), || env.logged("Lost the relay")).await;
+    tokio::time::resume();
+    let gave_up = gave_up.expect("the hub gives up a silent relay");
+    assert!(
+        (Duration::from_secs(49)..=Duration::from_secs(51)).contains(&gave_up),
+        "{gave_up:?}"
+    );
+    // No longer registered, and it dials again.
+    relay_state(&env.run, "connecting").await;
+    let _again = fake.register().await;
+    relay_state(&env.run, "registered").await;
+    drop(silent);
+}
+
 #[tokio::test]
 async fn a_replaced_hub_backs_off_and_logs_another_hub_took_this_channel() {
     let mut fake = FakeRelay::start().await;

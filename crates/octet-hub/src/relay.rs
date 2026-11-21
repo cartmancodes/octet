@@ -8,7 +8,9 @@
 //! pairing is open), answers the relay's `{"challenge"}` with its key and a signature, and waits
 //! for `{"registered": true}`, all within [`REGISTER_WITHIN`]. A lost control connection is
 //! dialled again on the app's schedule: 0.5 seconds doubling to 30, each cut by up to half at
-//! random, started over once a registration has held for [`STABLE`]. A registration closed with
+//! random, started over once a registration has held for [`STABLE`]. A registration silent for
+//! [`SILENT_WITHIN`], two of the relay's pings and a margin, is taken for lost: the relay's side is
+//! gone with no FIN reaching the Mac (it slept, or moved network). A registration closed with
 //! 4409 was replaced by another hub holding the same key: the hub says so and waits the longest
 //! step before trying again, so two such hubs never spin.
 //!
@@ -64,6 +66,14 @@ const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How long a registration must hold for its loss to start the waits over.
 const STABLE: Duration = Duration::from_secs(10);
+/// How often the relay pings every WebSocket: octet-relay's `Limits::default().ping_every`, which
+/// a test holds this to.
+const RELAY_PINGS_EVERY: Duration = Duration::from_secs(20);
+/// How long a registered control connection may go without a message (a ping counts) before it
+/// is taken for lost: two of the relay's pings and a margin for a busy relay.
+const SILENT_WITHIN: Duration = RELAY_PINGS_EVERY
+    .saturating_mul(2)
+    .saturating_add(Duration::from_secs(10));
 /// The relay's close code for a registration a newer one replaced.
 const REPLACED: u16 = 4409;
 /// The span [`CONNECTS_PER_MINUTE`] counts over, and how long an id is remembered.
@@ -352,7 +362,8 @@ async fn next_text(ws: &mut WebSocketStream<Stream>) -> Result<String, String> {
 }
 
 impl Dialer {
-    /// One control connection: dial, register, then take `connect`s until it ends.
+    /// One control connection: dial, register, then take `connect`s until it ends, or until it
+    /// has been silent for [`SILENT_WITHIN`].
     async fn session(&mut self, state: &watch::Sender<RelayState>, log: &Log) -> Ending {
         let mut ws = match timeout(REGISTER_WITHIN, self.register()).await {
             Ok(Ok(ws)) => ws,
@@ -363,7 +374,12 @@ impl Dialer {
         log("Registered with the relay");
         let registered = Instant::now();
         loop {
-            match ws.next().await {
+            let Ok(next) = timeout(SILENT_WITHIN, ws.next()).await else {
+                return Ending::Lost {
+                    held: registered.elapsed(),
+                };
+            };
+            match next {
                 Some(Ok(Message::Text(text))) => self.connect(text.as_str()),
                 Some(Ok(Message::Close(Some(frame)))) if u16::from(frame.code) == REPLACED => {
                     return Ending::Replaced;
@@ -516,6 +532,12 @@ mod tests {
         ] {
             assert_eq!(connect_id(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_registration_is_given_up_after_two_of_the_relays_pings_and_a_margin() {
+        assert_eq!(RELAY_PINGS_EVERY, octet_relay::Limits::default().ping_every);
+        assert_eq!(SILENT_WITHIN, Duration::from_secs(50));
     }
 
     #[test]
