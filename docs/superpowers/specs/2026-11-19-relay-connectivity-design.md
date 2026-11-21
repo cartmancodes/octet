@@ -221,7 +221,9 @@ carry binary only.
 - **Limits** (the relay enforces all of them, and the numbers are the builder's to tune):
   a message size cap a little over 65,535 bytes; at most 16 phone sockets per channel, counting
   waiting and spliced, foreground and background alike; a ceiling on channels and on sockets
-  across the whole relay; a per-address limit on new connections and on channel registrations; a
+  across the whole relay, and one on connections still sending their HTTP request (counted from
+  the moment they are accepted, so a flood of slow requests cannot use up file descriptors); a
+  per-address limit on new connections and on channel registrations; a
   byte-rate limit per connection with a burst allowance large enough for a journal replay; and a
   10 second limit on an unspliced phone socket. Over a limit, the relay refuses the newcomer and
   never drops an established splice.

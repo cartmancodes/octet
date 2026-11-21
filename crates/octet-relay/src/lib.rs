@@ -28,7 +28,8 @@
 //! data socket whose registration ends is closed with 1001; a text message where binary belongs,
 //! or binary on a control connection, with 1003; a message over its cap with 1009. Before the
 //! upgrade: 404 for an unknown path or connection id, 403 for an `Origin` naming another host
-//! than `Host`, 503 at the socket ceiling.
+//! than `Host`, 503 at the socket ceiling. A connection accepted while
+//! [`Limits::handshakes`] others are still sending their request is closed unread.
 //!
 //! # Limits
 //!
@@ -180,9 +181,13 @@ pub async fn serve(
         tokio::select! {
             () = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, peer)) => {
-                    tasks.spawn(connection(Arc::clone(&shared), stream, peer));
-                }
+                Ok((stream, peer)) => match Handshake::take(&shared) {
+                    Some(handshake) => {
+                        tasks.spawn(connection(Arc::clone(&shared), stream, peer, handshake));
+                    }
+                    // At the ceiling the connection goes unread: no task, no buffer.
+                    None => drop(stream),
+                },
                 Err(error) => {
                     shared.log(&format!("octet-relay: accept failed: {error}"));
                     sleep(ACCEPT_BACKOFF).await;
@@ -252,6 +257,8 @@ struct Shared {
 struct State {
     /// WebSocket connections open.
     sockets: usize,
+    /// Connections still sending their HTTP request.
+    handshakes: usize,
     /// The registered hubs, by channel id.
     channels: HashMap<String, Registration>,
     /// Phone sockets per client address.
@@ -301,6 +308,7 @@ struct Counts {
     spliced: u64,
     limited: u64,
     full: u64,
+    crowded: u64,
     silent: u64,
     broken: u64,
 }
@@ -311,7 +319,7 @@ impl fmt::Display for Counts {
             formatter,
             "registered {}, replaced {}, bad registrations {}, unanswered challenges {}, phones {}, \
              phones with no hub {}, unspliced {}, spliced {}, refused by a limit {}, refused at the \
-             socket ceiling {}, silent {}, broken {}",
+             socket ceiling {}, dropped at the handshake ceiling {}, silent {}, broken {}",
             self.registered,
             self.replaced,
             self.bad_registrations,
@@ -322,6 +330,7 @@ impl fmt::Display for Counts {
             self.spliced,
             self.limited,
             self.full,
+            self.crowded,
             self.silent,
             self.broken,
         )
@@ -332,6 +341,7 @@ impl Shared {
     fn new(config: Config) -> Self {
         let state = State {
             sockets: 0,
+            handshakes: 0,
             channels: HashMap::new(),
             connects: Addresses::new(config.limits.connects_per_minute),
             registrations: Addresses::new(config.limits.registrations_per_minute),
@@ -373,9 +383,12 @@ impl Shared {
             let mut state = self.state();
             let counts = std::mem::take(&mut state.counts);
             format!(
-                "octet-relay: sockets {} of {}, channels {} of {}; since the last report: {counts}",
+                "octet-relay: sockets {} of {}, handshakes {} of {}, channels {} of {}; since the \
+                 last report: {counts}",
                 state.sockets,
                 self.limits.sockets,
+                state.handshakes,
+                self.limits.handshakes,
                 state.channels.len(),
                 self.limits.channels,
             )
@@ -564,6 +577,29 @@ impl Drop for Seat {
     }
 }
 
+/// A connection still sending its HTTP request, counted against [`Limits::handshakes`] until
+/// dropped.
+struct Handshake(Arc<Shared>);
+
+impl Handshake {
+    fn take(shared: &Arc<Shared>) -> Option<Self> {
+        let mut state = shared.state();
+        if state.handshakes >= shared.limits.handshakes {
+            state.counts.crowded += 1;
+            return None;
+        }
+        state.handshakes += 1;
+        Some(Self(Arc::clone(shared)))
+    }
+}
+
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        let mut state = self.0.state();
+        state.handshakes = state.handshakes.saturating_sub(1);
+    }
+}
+
 /// What a request asks for.
 enum Target {
     /// `/healthz`.
@@ -632,10 +668,19 @@ enum Upgrading {
     Data(oneshot::Sender<Upgraded>),
 }
 
-/// One accepted TCP connection, from its HTTP request to its end.
-async fn connection(shared: Arc<Shared>, mut stream: TcpStream, peer: SocketAddr) {
+/// One accepted TCP connection, from its HTTP request to its end. It holds `handshake` while
+/// its request comes, and no longer.
+async fn connection(
+    shared: Arc<Shared>,
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    handshake: Handshake,
+) {
     let _ = stream.set_nodelay(true);
-    let head = match timeout(shared.limits.unspliced, read_head(&mut stream)).await {
+    let head = timeout(shared.limits.unspliced, read_head(&mut stream)).await;
+    // The request is read, or never came: the place goes back before any answer or seat.
+    drop(handshake);
+    let head = match head {
         Ok(Head::Complete(head)) => head,
         Ok(Head::TooLarge) => return respond(stream, 400, false).await,
         Ok(Head::Gone) | Err(_) => return,

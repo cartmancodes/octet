@@ -18,6 +18,10 @@ pub struct Limits {
     pub channels: usize,
     /// WebSocket connections open across the relay; an upgrade past it is answered 503.
     pub sockets: usize,
+    /// Connections still sending their HTTP request, across the relay; one more is closed as it
+    /// is accepted, unread. A connection gives its place back once its request is read (or it
+    /// sent none within [`Limits::unspliced`]), before it takes a socket.
+    pub handshakes: usize,
     /// Phone sockets one client address may open per minute; one more is closed with 4429.
     pub connects_per_minute: u32,
     /// Hub control sockets (registration attempts) one client address may open per minute; one
@@ -45,6 +49,7 @@ impl Default for Limits {
             phones_per_channel: 16,
             channels: 5_000,
             sockets: 20_000,
+            handshakes: 2_000,
             connects_per_minute: 30,
             registrations_per_minute: 10,
             bytes_per_second: 262_144,

@@ -107,9 +107,11 @@ paired through: phones paired before the change must pair again, and `octet pair
   process answers, nothing more.
 - **The probe**: `octet-relay probe wss://<host>` after every deploy, and on a schedule (every
   few minutes) from somewhere outside the platform, alerting when it exits non-zero.
-- **Sockets against the ceiling**: the five-minute log line reads `sockets N of 20000, channels
-  N of 5000`. Near the ceiling, new connections are refused (503 before the upgrade, 4429 after
-  it) while established ones carry on.
+- **Sockets against the ceiling**: the five-minute log line reads `sockets N of 20000,
+  handshakes N of 2000, channels N of 5000`. Near the ceiling, new connections are refused (503
+  before the upgrade, 4429 after it) while established ones carry on. A climbing `dropped at the
+  handshake ceiling` count means many connections that open and send their request slowly or
+  never: a flood, not phones.
 - **Egress**: the platform's bandwidth graph. Each connection is read at up to 256 KiB a second
   after a 4 MiB burst, so a sustained climb means many busy phones, or someone using the relay as
   a pipe.
@@ -117,7 +119,8 @@ paired through: phones paired before the change must pair again, and `octet pair
 ## Limits
 
 The defaults (`crates/octet-relay/src/limits.rs`): messages up to 66,560 bytes; 16 phone sockets
-per channel, waiting and spliced alike; 5,000 channels and 20,000 sockets across the relay; 30
+per channel, waiting and spliced alike; 5,000 channels and 20,000 sockets across the relay; 2,000
+connections still sending their request (one more is closed as it is accepted, unread); 30
 phone connections and 10 registration attempts a minute per client address (an IPv6 address
 counts by its /64); 256 KiB a second per connection after a 4 MiB burst, every message counting
 (control messages, pings and pongs too); 10 seconds for a phone's hub to connect, for a hub to

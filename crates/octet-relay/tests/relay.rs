@@ -525,6 +525,93 @@ async fn the_socket_ceiling_answers_503() {
     }
 }
 
+/// Whether the relay has closed `stream`: it reads the end (or a reset) within a second.
+async fn closed_at_once(stream: &mut TcpStream) -> bool {
+    let mut byte = [0; 1];
+    matches!(
+        timeout(Duration::from_secs(1), stream.read(&mut byte)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
+#[tokio::test]
+async fn connections_past_the_handshake_limit_are_dropped_at_accept() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&lines);
+    let relay = start(Config {
+        limits: Limits {
+            handshakes: 2,
+            ..roomy_limits()
+        },
+        log: Log::new(move |line| sink.lock().unwrap().push(line.to_owned())),
+        ..Config::default()
+    })
+    .await;
+    // Two connections that never send their request hold both places.
+    let mut slow = Vec::new();
+    for _ in 0..2 {
+        slow.push(TcpStream::connect(relay.addr).await.expect("connect"));
+    }
+    sleep(Duration::from_millis(100)).await;
+    let mut third = TcpStream::connect(relay.addr).await.expect("connect");
+    assert!(closed_at_once(&mut third).await, "the third was held");
+    // Once they go, the places are free again, and so is a seat.
+    drop(slow);
+    let no_hub = phone_path(&channel_of(&new_key()));
+    let started = Instant::now();
+    while status(relay.addr, &no_hub, &[]).await != 101 {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the places were not given back"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    drop(relay);
+    let started = Instant::now();
+    while !lines
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("stopped"))
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the relay did not stop"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    let lines = lines.lock().unwrap().clone();
+    let counts = lines
+        .iter()
+        .find(|line| line.contains("sockets"))
+        .expect("a counts line");
+    assert!(counts.contains("handshakes 0 of 2"), "{counts}");
+    assert!(
+        counts.contains("dropped at the handshake ceiling 1"),
+        "{counts}"
+    );
+}
+
+#[tokio::test]
+async fn a_finished_head_frees_its_handshake_slot() {
+    let relay = start(with_limits(Limits {
+        handshakes: 1,
+        ..roomy_limits()
+    }))
+    .await;
+    // Each upgraded socket stays open, past its head: the one place serves the next request.
+    let key = new_key();
+    let _control = register(relay.addr, &key).await;
+    let mut phones = Vec::new();
+    for _ in 0..3 {
+        phones.push(open(relay.addr, &phone_path(&channel_of(&key))).await);
+    }
+    let response = http(relay.addr, "GET /healthz HTTP/1.1\r\nHost: relay\r\n\r\n").await;
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    let mut idle = TcpStream::connect(relay.addr).await.expect("connect");
+    assert!(!closed_at_once(&mut idle).await, "a free place was refused");
+}
+
 #[tokio::test]
 async fn a_message_over_the_cap_closes() {
     let cap = Limits::default().message_bytes;
