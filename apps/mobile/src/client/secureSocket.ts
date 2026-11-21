@@ -126,7 +126,14 @@ export function secureSocketFactory(
 
     const opened = raw(url);
     ws = opened;
-    opened.onopen = () => opened.send(handshake.message1);
+    opened.onopen = () => {
+      // A first message that cannot be written ends the channel before it began.
+      try {
+        opened.send(handshake.message1);
+      } catch {
+        fail();
+      }
+    };
     opened.onmessage = (bytes) => {
       if (channel === null) {
         channel = handshake.finish(bytes);

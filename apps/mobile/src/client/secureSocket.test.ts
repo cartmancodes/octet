@@ -91,6 +91,8 @@ function respond(hub: KeyPair, message1: Uint8Array) {
 class FakeRaw implements RawSocket {
   sent: Uint8Array[] = [];
   closed = false;
+  /** How many times it was closed. */
+  closes = 0;
   /** How many more sends go through before every send throws, as a socket the network dropped
    * does; null for no failure. */
   failAfter: number | null = null;
@@ -104,6 +106,7 @@ class FakeRaw implements RawSocket {
   }
   close(): void {
     this.closed = true;
+    this.closes += 1;
   }
 }
 
@@ -137,6 +140,41 @@ function rig(hub = newKeyPair(random)) {
     return answered;
   };
   return { hub, device, raws, raw, socket, seen, handshake };
+}
+
+/** A real `HubClient` over secure sockets on fake relay sockets, and a hub that answers them. */
+function clientRig() {
+  const hub = newKeyPair(random);
+  const device = newKeyPair(random);
+  const raws: FakeRaw[] = [];
+  const clock = new FakeClock();
+  const client = new HubClient({
+    url: "wss://relay.example/",
+    channel: "ab".repeat(32),
+    hubKey: hub.publicKey,
+    key: device,
+    factory: secureSocketFactory({ hubKey: hub.publicKey, device }, (url) => {
+      const raw = new FakeRaw(url);
+      raws.push(raw);
+      return raw;
+    }, random),
+    now: clock.now,
+    schedule: clock.schedule,
+    random: () => 0,
+  });
+  const last = (): FakeRaw => {
+    const raw = raws[raws.length - 1];
+    if (!raw) throw new Error("no relay socket was opened");
+    return raw;
+  };
+  /** The relay socket opens, the hub finishes the handshake and welcomes the phone. */
+  const welcome = () => {
+    last().onopen?.();
+    const { message2, end } = respond(hub, last().sent[0] ?? EMPTY);
+    last().onmessage?.(message2);
+    for (const chunk of end.frame(utf8(JSON.stringify({ v: 1, type: "welcome", device: "iPhone" })))) last().onmessage?.(chunk);
+  };
+  return { client, raws, last, welcome, clock };
 }
 
 describe("secureSocketFactory", () => {
@@ -318,37 +356,41 @@ describe("secureSocketFactory", () => {
     expect(r.raw().sent).toHaveLength(1);
   });
 
+  it("a_handshake_write_that_fails_closes_once", async () => {
+    const r = rig();
+    r.raw().failAfter = 0;
+    expect(() => r.raw().onopen?.()).not.toThrow();
+    expect(r.raw().closes).toBe(1);
+    await Promise.resolve();
+    expect(r.seen).toEqual([{ close: 1002 }]);
+    // Nothing else is sent, and a late close of the relay socket is not said again.
+    r.raw().failAfter = null;
+    expect(() => r.socket.send("{}")).toThrow();
+    expect(r.socket.ping()).toBe(false);
+    expect(r.raw().sent).toHaveLength(0);
+    r.raw().onclose?.(1006);
+    await Promise.resolve();
+    expect(r.seen).toEqual([{ close: 1002 }]);
+    expect(r.raw().closes).toBe(1);
+  });
+
+  it("a_failed_handshake_write_makes_the_client_reconnect", () => {
+    const { client, raws, last, welcome, clock } = clientRig();
+    client.start();
+    last().failAfter = 0;
+    expect(() => last().onopen?.()).not.toThrow();
+    expect(raws[0]?.closed).toBe(true);
+    expect(client.state).toBe("offline");
+    // The backoff runs out: a new relay socket, a new handshake, and ready.
+    clock.advance(clock.delays[0] ?? 0);
+    expect(raws).toHaveLength(2);
+    welcome();
+    expect(client.state).toBe("ready");
+    client.stop();
+  });
+
   it("a_failed_send_makes_the_client_reconnect_with_a_new_handshake", async () => {
-    const hub = newKeyPair(random);
-    const device = newKeyPair(random);
-    const raws: FakeRaw[] = [];
-    const clock = new FakeClock();
-    const client = new HubClient({
-      url: "wss://relay.example/",
-      channel: "ab".repeat(32),
-      hubKey: hub.publicKey,
-      key: device,
-      factory: secureSocketFactory({ hubKey: hub.publicKey, device }, (url) => {
-        const raw = new FakeRaw(url);
-        raws.push(raw);
-        return raw;
-      }, random),
-      now: clock.now,
-      schedule: clock.schedule,
-      random: () => 0,
-    });
-    const last = (): FakeRaw => {
-      const raw = raws[raws.length - 1];
-      if (!raw) throw new Error("no relay socket was opened");
-      return raw;
-    };
-    /** The relay socket opens, the hub finishes the handshake and welcomes the phone. */
-    const welcome = () => {
-      last().onopen?.();
-      const { message2, end } = respond(hub, last().sent[0] ?? EMPTY);
-      last().onmessage?.(message2);
-      for (const chunk of end.frame(utf8(JSON.stringify({ v: 1, type: "welcome", device: "iPhone" })))) last().onmessage?.(chunk);
-    };
+    const { client, raws, last, welcome, clock } = clientRig();
     client.start();
     welcome();
     expect(client.state).toBe("ready");
