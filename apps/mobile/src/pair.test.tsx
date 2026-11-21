@@ -608,6 +608,35 @@ describe("pairing another machine", () => {
     expect(rig.sockets.all).toHaveLength(0);
   });
 
+  it("Cancel while the Mac asks stops the pairing: a yes after it adds no Mac", async () => {
+    const [studio] = await pairedWith("studio-mac");
+    mockParams = { add: "1" };
+    const rig = await open();
+    const before = await loadSettings();
+    await paste(LINK);
+    await fireEvent.press(screen.getByRole("button", { name: "Pair" }));
+    await holdIt(rig);
+    expect(await screen.findByText("Check this code on your Mac")).toBeTruthy();
+    const pairing = rig.sockets.last;
+    await fireEvent.press(screen.getByRole("button", { name: "Cancel adding a Mac" }));
+    expect(mockRouter.back).toHaveBeenCalledTimes(1);
+    // The Mac's owner says yes after all.
+    await act(async () => {
+      const [command] = pairing.commandsOf("pair");
+      pairing.receive({ type: "paired", req: command?.req, device: "iPhone", name: "mac" });
+      pairing.drop(1000);
+    });
+    await act(async () => {
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+    });
+    expect(rig.hub.snapshot().macs.map((m) => m.id)).toEqual([studio?.id]);
+    expect(await loadSettings()).toEqual(before);
+    expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBeNull();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(toastStore.getState().toast).toBeNull();
+    expect(pairing.closed).toBe(true);
+  });
+
   it("a 5th Mac is refused in so many words, before any network call", async () => {
     await pairedWith("a1", "a2", "a3", "a4");
     mockParams = { add: "1" };

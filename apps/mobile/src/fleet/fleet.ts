@@ -61,8 +61,11 @@ const anyKind = (kinds: PushKinds): boolean => kinds.approvals || kinds.errors |
 
 /** A failed pairing: `clear` says the link is no good any more (the Mac says its code is spent
  * or expired, or took the secret), so the screen forgets it; any other link is kept, to edit or
- * to try again. */
-export type PairResult = { ok: true; macName: string } | { ok: false; message: string; clear: boolean };
+ * to try again. `cancelled` says `cancelPair` stopped it: there is nothing to show. */
+export type PairResult = { ok: true; macName: string } | { ok: false; message: string; clear: boolean; cancelled?: true };
+
+/** What a pairing that `cancelPair` stopped comes to. */
+const CANCELLED: PairResult = { ok: false, message: "", clear: false, cancelled: true };
 
 export interface FleetOptions {
   /** Makes the sockets of a link with `keys`: through the relay, end-to-end encrypted, unless a
@@ -109,6 +112,10 @@ export class Fleet {
   private savedName: string | null = null;
   /** The client of a pairing in flight, which is no Mac's link until it succeeds. */
   private pairing: HubClient | null = null;
+  /** `cancelPair` stopped the pairing in flight: whatever the hub answers after, it keeps nothing. */
+  private cancelled = false;
+  /** The pairing in flight heard `paired` and is saving: too late for `cancelPair`. */
+  private saving = false;
   /** The id that pairing will keep its key under: an unpair of the same Mac meanwhile must not
    * delete what it saves. */
   private pairingId: string | null = null;
@@ -304,7 +311,7 @@ export class Fleet {
    * in its keychain entry, the pairing in settings, and the link connects again and says hello
    * (the hub closes the connection it paired on). A 5th channel, or a channel already paired
    * with another hub key, is refused before any network call. Failures come back as the words to
-   * show.
+   * show; a pairing `cancelPair` stopped comes back `cancelled`.
    */
   async pair(link: string, name: string, onCode: (code: string) => void = () => undefined): Promise<PairResult> {
     if (this.pairing) return { ok: false, message: "Already pairing", clear: false };
@@ -325,9 +332,14 @@ export class Fleet {
     const client = this.clientFor(parsed, key);
     this.pairing = client;
     this.pairingId = id;
+    this.cancelled = false;
     if (this.current.notice !== null) this.emit({ notice: null });
     try {
       const paired = await client.pair(parsed.secret, deviceName, this.platform, onCode);
+      // A `paired` that came with the cancel, or just before it, is not kept: no key, no pairing,
+      // and the Mac's old link (of a pairing again) goes on as it was.
+      if (this.cancelled) return CANCELLED;
+      this.saving = true;
       // The hub has replaced the old key (and closed its connections): the Mac's old link stops
       // now, before the saves, so that it cannot come back meanwhile to be refused as unpaired.
       const old = this.all.find((l) => l.id === id);
@@ -363,6 +375,7 @@ export class Fleet {
       this.adopt(pairing, this.clientFor(pairing, key, { cursors }), keys, projectId() !== null && !notifications);
       return { ok: true, macName };
     } catch (error) {
+      if (this.cancelled) return CANCELLED;
       if (!(error instanceof Refusal)) return { ok: false, message: "Pairing failed", clear: false };
       // Only a spent or expired code, or a no at the Mac, is refused as `unpaired`; on any other
       // refusal the Mac keeps the code, and the link is good to try again (another device name, a
@@ -372,7 +385,25 @@ export class Fleet {
       this.pairing = null;
       this.pairingId = null;
       this.replaced = null;
+      this.cancelled = false;
+      this.saving = false;
     }
+  }
+
+  /**
+   * Stops the pairing in flight, if any: its socket closes, and its `pair()` comes back
+   * `cancelled`, keeping no key and no pairing, whatever the hub answers after. A pairing of a Mac
+   * paired already leaves that pairing and its link as they were. Once the phone has heard
+   * `paired` and begun to save, the save goes on: the hub has the device by then.
+   *
+   * The hub may have said yes all the same: it then lists a device this phone never kept, which
+   * the owner can revoke at the Mac (`octet hub revoke`). For a Mac paired again, that yes
+   * replaced the old key there, and the old link hears it is unpaired.
+   */
+  cancelPair(): void {
+    if (!this.pairing || this.saving) return;
+    this.cancelled = true;
+    this.pairing.stop();
   }
 
   /** A new pairing id, not one of `taken`'s. */

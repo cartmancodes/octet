@@ -581,6 +581,61 @@ describe("pairing more than one Mac", () => {
   });
 });
 
+describe("cancelling a pairing", () => {
+  const CANCELLED = { ok: false, message: "", clear: false, cancelled: true };
+
+  /** Starts pairing with `host`; the Mac holds the phone and sends its code. The pairing's socket,
+   * its `pair` command and the pairing's answer to come. */
+  function heldBy(r: Rig, host: string) {
+    const pending = r.fleet.pair(linkTo(host), "iPhone");
+    const pairing = r.sockets.last;
+    pairing.open();
+    const [command] = pairing.commandsOf("pair");
+    pairing.receive({ type: "pair_code", req: command?.req, code: "482913" });
+    return { pending, pairing, req: command?.req };
+  }
+
+  it("cancelPair_racing_a_paired_answer_keeps_nothing", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const { pending, pairing, req } = heldBy(r, "studio");
+    // The Mac's yes and the cancel land together: the cancel wins.
+    pairing.receive({ type: "paired", req, device: "iPhone", name: "studio" });
+    r.fleet.cancelPair();
+    expect(await pending).toEqual(CANCELLED);
+    await settle();
+    expect(pairing.closed).toBe(true);
+    expect(r.fleet.snapshot().macs).toEqual([]);
+    expect((await loadSettings()).pairings).toEqual([]);
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBeNull();
+    // The next pairing is not refused as one already in flight.
+    await pairWith(r, "studio");
+    expect(r.fleet.snapshot().macs.map((m) => m.macName)).toEqual(["studio"]);
+  });
+
+  it("cancelPair_of_a_re_pair_keeps_the_old_pairing", async () => {
+    const r = rig();
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const old = await pairWith(r, "studio", "aa".repeat(32));
+    const before = await loadSettings();
+    r.next.key = "ee".repeat(32);
+    const { pending, pairing, req } = heldBy(r, "studio");
+    r.fleet.cancelPair();
+    expect(await pending).toEqual(CANCELLED);
+    expect(pairing.closed).toBe(true);
+    // A yes after the cancel is not heard.
+    pairing.receive({ type: "paired", req, device: "iPhone", name: "studio" });
+    await settle();
+    expect(await loadSettings()).toEqual(before);
+    expect(await SecureStore.getItemAsync(tokenKeyOf("m00000001"))).toBe("aa".repeat(32));
+    expect(r.fleet.snapshot().macs.map((m) => m.id)).toEqual(["m00000001"]);
+    expect(old.closed).toBe(false);
+    expect(linkOf(r, "m00000001").state).toBe("ready");
+  });
+});
+
 describe("keyFor", () => {
   it("resolves the channel id a hub sends and a raw id to the phone's key, through the pairings", async () => {
     const r = rig();

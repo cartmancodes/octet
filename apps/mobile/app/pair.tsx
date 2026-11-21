@@ -29,7 +29,8 @@ const CORNER_LINE = 3;
  * the system opened). While the Mac asks its owner, the code the hub sent shows under "Check this
  * code on your Mac", and no code shows before the hub sends one. The hub's refusals and every
  * failure are shown as plain text. Opened with `?add=1` on a paired phone, it pairs another
- * machine: the Macs paired already stay, and Cancel goes back. A link to a Mac paired already asks
+ * machine: the Macs paired already stay, and Cancel goes back, stopping a pairing in flight (as
+ * leaving the screen does), which then shows and saves nothing. A link to a Mac paired already asks
  * for no device name: the Mac keeps the one it knows this phone by. With no Mac linked, a pairing that
  * is still saved (its key could not be read) is listed with Unpair, so the phone can be cleared. */
 export default function Pair() {
@@ -55,6 +56,8 @@ export default function Pair() {
   // The six digits the hub sent while the Mac asks its owner; null until it sends them.
   const [code, setCode] = useState<string | null>(null);
   const attempting = useRef(false);
+  // The pairing in flight was stopped by Cancel or by leaving: its answer shows nothing.
+  const cancelled = useRef(false);
   const lastScan = useRef<string | null>(null);
 
   // Another link the system opens while Pair is up takes the place of what was there.
@@ -81,12 +84,16 @@ export default function Pair() {
   const pair = useCallback(async () => {
     if (attempting.current || parsed === null) return;
     attempting.current = true;
+    cancelled.current = false;
     setBusy(true);
     setError(null);
+    // Still on screen, and not cancelled.
+    const here = () => alive() && !cancelled.current;
     try {
       const result = await hub.pair(link, name, (sent) => {
-        if (alive()) setCode(sent);
+        if (here()) setCode(sent);
       });
+      if (!here()) return;
       if (result.ok) {
         // The name the pairing has: a Mac paired again keeps the one it was given.
         showToast(`Paired with ${result.macName}`);
@@ -102,12 +109,20 @@ export default function Pair() {
       }
     } finally {
       attempting.current = false;
-      if (alive()) {
+      if (here()) {
         setBusy(false);
         setCode(null);
       }
     }
   }, [alive, hub, link, name, parsed, router]);
+
+  // Leaving the screen, or Cancel, stops a pairing in flight: the Mac's answer then keeps nothing.
+  const stopPairing = useCallback(() => {
+    if (!attempting.current) return;
+    cancelled.current = true;
+    hub.cancelPair();
+  }, [hub]);
+  useEffect(() => stopPairing, [stopPairing]);
   // Not the promise itself: a press handler's returned promise would be awaited by the caller.
   const onPair = useCallback(() => void pair(), [pair]);
 
@@ -142,9 +157,10 @@ export default function Pair() {
   const onEnter = useCallback(() => setEntering(true), []);
 
   const onBack = useCallback(() => {
+    stopPairing();
     if (router.canGoBack()) router.back();
     else router.replace("/");
-  }, [router]);
+  }, [router, stopPairing]);
 
   if (offer) return <NotificationsStep />;
 
