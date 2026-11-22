@@ -1,6 +1,6 @@
 # Fleet workflows: a self-improving multi-provider loop
 
-Status: revision 4 (2026-11-22). The owner approved the Rust architecture (the `octet-fleet`
+Status: revision 5 (2026-11-22). The owner approved the Rust architecture (the `octet-fleet`
 crate, a pure `machine`, independent roles and profiles, headless first, provider replies kept
 apart from the evidence Octet collects) and has twice requested changes to the execution
 contract. Both reviews and a builder check are folded in; see "Changed after review" at the end.
@@ -28,8 +28,9 @@ whether coding may start and whether the run may finish.
 Everything below exists to make one rule executable. The run is recorded `Completed` only when:
 
 > **The final reviewer approved candidate K with tree T, under evidence record E and the
-> document approvals A (the plan's, and through it the research's); E is a complete passing
-> record for T (every command started on T, and the tree was T when each command ended); E and
+> document approvals A (in the shipped workflow, the plan's and through it the research's); E is
+> a complete passing record for T (for every command, the tree Octet observed immediately before
+> releasing it and immediately after it exited, both persisted in E, equals T); E and
 > the approval were produced under A, each of which is the current approval of the current
 > document; and the runner's last observation of the live workspace,
 > taken immediately before writing `completed` and persisted in that record, equals T.**
@@ -89,8 +90,11 @@ by asking which parts are not yet satisfied, so no path can skip it.
 ## Constraints
 
 - **Built on `octet_core::Session`**: `Session::open(Config, dir)`, `Event`s in, `Command::Answer`
-  for approvals, `Session::shutdown`. The one addition below `octet-fleet`: a session reports its
-  vendor's process identity (see "Process ownership").
+  for approvals, `Session::shutdown`. No change below `octet-fleet` is needed: vendors are
+  launched through a per-attempt gate set as `Config.binary` (see "Process ownership"). No engine
+  derives anything from the binary's path (checked: Antigravity's `--cli_dir_name` is relative to
+  its app data folder), and opencode's extra launches of the same binary (`debug config`,
+  `session delete`) pass through the gate like the main one.
 - **No read-only mode exists** in Octet (ask, accept-edits, auto, full-access), and a vendor's own
   allowlist can skip an approval request.
 - **Git is required**: snapshots are git trees, the workspace must be in a git work tree.
@@ -231,7 +235,14 @@ A run refuses to start unless:
 - **The approval gate**: every `inputs` entry names a document step and an `approval_from` verdict
   step whose `reviews` is that same document step; every change step has at least one input. A
   step cannot run until every approval it requires, directly or through its inputs' inputs, is
-  current, so the coder waits for both the research and the plan approval.
+  current. An entry with `from` and no `approval_from` is a validation error.
+- **Scope of the research guarantee.** The generic guarantee is: *a change step runs only when
+  every document in its input chain has a current approval.* Workflows stay generic, so a minimal
+  workflow with one document, its review and a coder is valid. "Implementation starts only when
+  the research **and** the plan are approved" is a property of the shipped
+  `research-plan-build` workflow, which the validator checks for that file by the same rule
+  (its coder's chain is plan → research). A project that edits the research input out of its plan
+  step has changed its workflow, and the trust prompt shows the changed content before it runs.
 - **The completion gate**: the last step is a verdict reviewing a change step, with
   `evidence_from` a tests step whose `change_from` is that same change step.
 - Document and verdict profiles have mode `ask` (or none); anything else is rejected, not
@@ -427,61 +438,95 @@ finished runs.)*
 
 The tests step has two halves:
 
-1. **The tester's turn** (write, in the live workspace) authors or selects tests. If it changed
-   the tree, the result is a derived candidate (origin `tests`).
-2. **Octet's evidence runner**, on the tip K with tree T. **The guarantee: every command started
-   on T, and the tree was T when each command ended.**
-   - Snapshot; it must equal T (otherwise `Drift`).
-   - For each command in order: register it (see "Process ownership"), run it with `sh -c` in the
-     workspace (own process group, killed at `timeout`), then **snapshot at the command boundary**.
-   - On the first boundary where the tree is not T, the record so far is void: the new tree
-     becomes a derived candidate (origin `evidence`) and the **whole** list starts again on it. At
-     most 2 such restarts per tests attempt; a third pauses (`UnstableTests`).
-   - When every command has run with every boundary equal to T: the evidence record `E(K)` lists
-     each command, exit status (or timeout), duration, and the last 16 KiB of output. All zero →
-     `TestsPassed`; any other → `TestsFailed`.
+1. **The tester's turn** (write, in the live workspace) authors or selects tests.
+2. **The handoff.** When the turn has finished (background work included), Octet snapshots. If
+   the tree changed, a derived candidate (origin `tests`) is proposed; otherwise the candidate is
+   the input tip. Octet then makes **`evidence_started {attempt, candidate, restart: 0}`** durable.
+   This record is what **commits** the tester's edits and ends the tester phase: before it, the
+   attempt is a tester turn; after it, the attempt is an evidence run on that candidate.
+3. **Octet's evidence runner**, on that candidate K with tree T. **The guarantee: for every
+   command, the tree Octet observed immediately before releasing it and immediately after it
+   exited equals T, and both observations are persisted in the evidence record.**
+   - For each command in order: spawn it held (see "Process ownership"); **observe** the tree
+     (`pre_tree`); make `evidence_command {…, identity, pre_tree}` durable; release it; wait (own
+     process group, killed at `timeout`); **observe** again (`post_tree`); make
+     `evidence_result {…, exit, post_tree}` durable.
+   - On the first observation that is not T, the record so far is void: the observed tree is
+     proposed as a derived candidate (origin `evidence`), and
+     `evidence_started {attempt, candidate', restart: n + 1}` commits it and starts the **whole**
+     list again. At most 2 restarts per tests attempt; a third pauses (`UnstableTests`).
+   - When every command has run with every observation equal to T: the evidence record `E(K)`
+     lists each command, exit status (or timeout), duration, `pre_tree`, `post_tree`, and the last
+     16 KiB of output. All zero → `TestsPassed`; any other → `TestsFailed`.
 
-This catches a command that changes a fixture and a later one that restores it (the first
-boundary differs). It does not see a change that a single command makes and undoes within its own
-run; the documentation states the guarantee in exactly the words above. Running commands in an
-immutable checkout was rejected for v1: it loses the work tree's build caches, so every round
-rebuilds from nothing.
+This catches a command that changes a fixture and a later one that uses and restores it (the
+first post-observation differs), and an edit made by anyone between two commands (the next
+pre-observation differs). It cannot see a change made and undone within a single command's
+lifetime, by that command or by anyone else; the documentation states the guarantee in exactly
+the words above. Running commands in an immutable checkout was rejected for v1: it loses the work
+tree's build caches, so every round rebuilds from nothing.
 
 The tester's own turn is never evidence. Only this runner writes evidence, and only an evidence
 record for the tip counts.
 
 ### Process ownership
 
-**No writer before registration.** Every process that can write the workspace is registered in
-the log before it is given anything to do:
+**No execution before registration.** No vendor binary and no test command runs until its
+identity is durable in the log. Both are started **held** by an Octet-controlled gate and released
+only afterwards.
 
-- **Vendors**: `attempt_started` is durable before `Session::open`. The session reports the
-  vendor's identity (process group, leader PID, and the leader's start time) through a new
-  read-only accessor; `octet-proc` already spawns vendors with `process_group(0)`. The runner
-  makes `attempt_session {attempt, identity}` durable, and **only then sends the first prompt**.
-  A vendor that has had no prompt has done no work, and its stdin pipe closes when Octet dies, so
-  it exits.
-- **Test commands**: each is spawned as `sh -c 'read _ || exit 125; exec sh -c "$1"' sh CMD` with
-  a stdin pipe. The runner makes `evidence_command {attempt, command, identity}` durable, then
-  writes the go line and closes stdin. If Octet dies before that, `read` sees end of file and the
+- **Vendors.** For each attempt Octet writes an owner-only gate script `<attempt>/gate` and sets
+  it as `Config.binary`. The gate exports `OCTET_FLEET_ATTEMPT=<run>/<attempt>`, appends its own
+  PID (`$$`) to `<attempt>/processes`, then waits for `<attempt>/go`, checking every 50 ms that
+  Octet (whose PID it was given) is still alive and giving up after 120 s; on either it exits 125
+  without running anything. When `go` exists it `exec`s the real binary (absolute path, written
+  into the script) with its arguments, keeping its PID. The sequence:
+  1. `attempt_started` durable; gate written; `Session::open` (the engine spawns the gate, as the
+     leader of its own process group).
+  2. Octet reads the PIDs in `<attempt>/processes`, reads each one's start time, and makes
+     `attempt_session {attempt, journal, identities}` durable.
+  3. Octet creates `<attempt>/go`. Only now can the vendor run. The first prompt follows.
+
+  Later launches of the same binary within the attempt (opencode's `debug config`,
+  `session delete`) find `go` already present: they append their PID and run at once. A crash
+  between those two steps leaves a PID in `processes` that is not in the log, which recovery reads
+  from the file as well (the file survives an Octet crash; an OS crash leaves no process alive).
+- **Test commands.** Each is spawned held as
+  `sh -c 'read _ || exit 125; exec sh -c "$1"' sh CMD`, with `OCTET_FLEET_ATTEMPT` set and a stdin
+  pipe. Octet observes the tree, makes `evidence_command {…, identity, pre_tree}` durable, then
+  writes the go line and closes stdin. If Octet dies first, `read` sees end of file and the
   command never starts.
 
 **Locks.** While driving a run, Octet holds OS locks (`File::lock`) on `<run>/lock` and on
 `<data_dir>/fleet/worktrees/<hash of canonical top level>.lock`. Locks die with the process.
 
-**The worktree ownership record**, `<data_dir>/fleet/worktrees/<hash>.json`, names the run that
-last drove the work tree and whether it has an unfinished write attempt. It is written before the
-first write attempt and on every change. A **new run** on that work tree is refused while the lock
-is held, or while the record names a run with an unfinished write attempt or registered processes
-not yet shown to be gone; the message names the run and says to `resume` or `stop` it.
+**The worktree ownership record**, `<data_dir>/fleet/worktrees/<hash>.json`, lists **every run
+with unresolved ownership** of the work tree: an unfinished write attempt, or registered processes
+not yet shown to be gone. It is changed only under the worktree lock: an entry is added before a
+run's first write attempt and updated at each attempt's start and end. **Every entry point
+reconciles it before admitting a writer**: `run`, `resume` and `stop` each take the worktree lock,
+then check every listed run's processes (below). A writer is admitted only when no run other than
+the one being driven is listed. So an older paused run cannot resume while a newer run that
+crashed still has an unresolved writer; the refusal names the newer run and says to `resume` or
+`stop` it first.
 
-**Leftover processes.** Before a recovery snapshot or any new writer, the runner checks every
-registered identity of unfinished attempts. A process counts as Octet's only if a process with
-the logged leader PID exists **and** its start time matches the logged one; a group whose leader
-is gone is checked member by member the same way. *(Builder's call: reading start times on macOS
-and Linux, for example `ps -o lstart=`.)* If any is alive, the run pauses (`ProcessesRunning`)
-naming them. `--decision kill` signals only processes verified this way (SIGTERM, SIGKILL after
-5 s, then checks again); a group that cannot be verified is reported and left alone.
+**Leftover processes.** Before a recovery snapshot or any new writer, Octet looks for processes
+belonging to unfinished attempts of every listed run. A live process is **verified** as Octet's
+when it carries that attempt's `OCTET_FLEET_ATTEMPT` value in its environment, or its PID and
+start time match a registered identity. The marker is inherited, so it covers members that
+outlive their group leader: a vendor's shell, a build it started. A live process in a registered
+process group that has neither the marker nor a matching identity is **unverified**: it may be
+the run's (a child that cleared its environment) or a stranger (a reused PID).
+*(Builder's call: listing processes with their environment and start time on macOS and Linux,
+for example `ps -E -o pid=,pgid=,lstart=,command=` and `/proc/<pid>/environ`.)*
+
+- Any verified process alive: pause (`ProcessesRunning`). `kill` signals **only verified
+  processes** (SIGTERM, SIGKILL after 5 s), then the check runs again.
+- Only unverified processes alive: pause (`ProcessesUnverified`), listing each with its command.
+  Octet never signals them. `release` is the user stating that they are not the run's writers; the
+  decision is logged with the PIDs, and those processes are ignored from then on.
+- `stop` removes the run from the worktree record only when no verified process is alive and
+  every unverified one has been released. Until then `stop` is refused, with the reason.
 
 **Drift.** At every transition (before each attempt, before acceptance, on resume, and the final
 observation before `completed`), the live tree is compared with the tip's tree. A difference the
@@ -514,13 +559,21 @@ pass, reusing the `Background` tracker from `headless.rs` (moved into `octet-cor
   On replay, a torn trailing record is cut back to the last newline before anything is appended.
   - `attempt_started {attempt, step, round, input_candidate, requires, history}`, before
     `Session::open`; the attempt directory `<run>/attempts/<attempt>/` is derived from the ID.
-  - `attempt_session {attempt, journal, identity}`, before the first prompt;
+  - `attempt_session {attempt, journal, identities}`, before `go` is created;
     `vendor_session {attempt, id}`, as soon as known (the latest non-empty `Event::Ready`).
-  - `candidate {id, tree, parent, origin}`, after its ref exists.
-  - `evidence_command {attempt, run, index, command, identity}`, before the go line;
-    `evidence_result {attempt, run, index, exit, boundary_tree}`.
+  - `candidate {id, tree, parent, origin}`, after its ref exists. **A candidate record is only a
+    proposal.** It joins the lineage, and can become the tip, only when a committing record names
+    it: `attempt_finished` (a change step's candidate), `evidence_started` (a tester's edits, or an
+    evidence restart), or `decision {adopt}` (Reconcile or Drift). Replay ignores a candidate no
+    committing record names.
+  - `evidence_started {attempt, candidate, restart}`: the tester-to-evidence handoff and each
+    restart.
+  - `evidence_command {attempt, restart, index, command, identity, pre_tree}`, before the go line;
+    `evidence_result {attempt, restart, index, exit, post_tree}`.
   - `attempt_finished {attempt, outcome, candidate, artifacts}`, only after its artifact files are
     synced and its candidate is recorded.
+  - `attempt_interrupted {attempt, signal}`: Ctrl+C or SIGTERM ended the attempt. It does not
+    finish it.
   - `retry {attempt, class, count, eligible_at}`, `paused {reason, detail}`, `decision {kind}`,
     `completed {candidate, tree, evidence, approval, observed_tree}`, `stopped`, `failed {error}`.
 - `artifacts/`: plans, verdicts, patches, evidence, by artifact ID.
@@ -534,17 +587,27 @@ that finished just before the parent crashed is an unfinished attempt and goes t
 
 ### Recovery and decisions
 
-`octet fleet resume <id>` takes the locks, replays the log, checks leftover processes, takes a
-snapshot, then acts on the last unfinished thing:
+`octet fleet resume <id>` takes the locks, reconciles the worktree ownership record (every listed
+run, not only this one), replays the log, checks leftover processes, takes a snapshot, then acts
+on the last unfinished thing. The same table applies whether the attempt ended in a crash or a
+clean interrupt:
 
 | State found | What happens |
 |---|---|
 | last attempt durable | drift check, then `machine::next` |
 | read-only attempt unfinished | discard its clone; a new attempt of the same step |
-| write attempt unfinished, no `attempt_session` | its vendor never had a prompt: a new attempt |
-| write attempt unfinished, tree unchanged | a new attempt, continuing its vendor session if logged |
-| write attempt unfinished, tree changed (crash, signal, **or** transient failure) | pause `Reconcile` |
-| evidence run unfinished | pause `ProcessesRunning` if a command is alive, else the whole list again on a fresh snapshot |
+| write attempt unfinished, `go` never created | the vendor never ran; tree unchanged → a new attempt; tree changed → `Drift` |
+| change attempt unfinished, released, tree unchanged | a new attempt, continuing its vendor session if logged |
+| change attempt unfinished, released, tree changed (crash, signal, **or** transient failure) | pause `Reconcile` |
+| tests attempt, no `evidence_started`, tree unchanged | a new tester attempt (the tester may already have finished; running it again is safe and the log says why) |
+| tests attempt, no `evidence_started`, tree changed | pause `Reconcile` |
+| tests attempt, `evidence_started` durable | the evidence phase: tree equals its candidate → the whole command list from command zero, same restart count; otherwise → `Drift`. The tester does not run again |
+
+A clean interrupt (Ctrl+C, SIGTERM) interrupts the running turn or command, logs
+`attempt_interrupted` and `paused {interrupted}`, and exits 130 or 143. **`resume` needs no
+decision for it**: the interrupt is history, and resume goes straight to the table above. Release
+tests cover three cases: during a read-only turn (a new attempt), after a coder edit
+(`Reconcile`), and during evidence (the evidence phase from command zero).
 
 Every pause has its decisions and, after the decision is logged, an exact next action:
 
@@ -557,15 +620,17 @@ Every pause has its decisions and, after the decision is logged, an exact next a
 | `Drift` | `adopt` → a derived candidate (origin `drift`); next is `machine::next` · `stop` |
 | `AccessViolation` | `retry` → a new attempt of the same step in a fresh clone · `stop` |
 | `ProcessesRunning` | `kill` → verified processes signalled, then the check runs again · `wait` → the check runs again · `stop` (refused while verified processes are alive) |
+| `ProcessesUnverified` | `release` → the listed PIDs are logged as not the run's, then the check runs again · `wait` → the check runs again · `stop` (refused until released) |
+| `interrupted` | no decision: the "State found" table decides |
 | `InvalidOutput` | `retry` → a new attempt of the same step · `stop` |
 | `Transient` exhausted, `LocalFailure`, `Unknown` | `retry` → a new attempt of the same step (if the tree changed, `Reconcile` first) · `stop` |
 
-No decision produces `TestsPassed` or `Approved`. `stop` records `stopped`, clears the work tree's
-ownership record once no registered process is alive, and leaves the tree as it is, printing the
-command that would discard the run's changes. `octet fleet stop RUN_ID` is `resume --decision stop`.
+No decision produces `TestsPassed` or `Approved`. `stop` records `stopped`, removes the run from
+the worktree ownership record under the rule in "Leftover processes" (no verified process alive,
+every unverified one released), and leaves the tree as it is, printing the command that would
+discard the run's changes. `octet fleet stop RUN_ID` is `resume --decision stop`.
 
-On a terminal the user picks interactively; otherwise `--decision` is required. Ctrl+C interrupts
-the running turn, records `paused {interrupted}`, exits 130; SIGTERM the same, 143.
+On a terminal the user picks interactively; otherwise `--decision` is required.
 
 ### Write steps' approvals
 
@@ -597,28 +662,42 @@ wrapped with step and attempt. Exit codes: 0 completed, 1 failed, 2 usage or val
 
 ### Testing
 
-**Milestone 1 (before any provider is wired): the artifact transitions.** The pure machine,
-driven by a scripted step executor, runs the trace `coder(K1) → tester adds a file (K2) →
-evidence(K2) passes → reviewer approves R(K2) → Completed`, asserting: the coder ran once, the
-reviewed patch contains the tester's file, the approval names the exact evidence ID, and replaying
-every durable prefix of the log gives the same next action as the uninterrupted run. The other
-worked traces in "Artifacts, candidates and the machine" are milestone-1 tests too.
+**Build order** (owner's):
 
-- **Unit (pure):** validation (the approval gate, including a change step whose input names a
-  document without its approval step, and a plan whose input skips the research approval; the
-  completion gate; producer-only edges; wrong-kind references); the machine: requires vs history,
-  the `D1 → rejection → D2 → review_research(D2)` and `P1 → rejection → P2 → review_plan(P2)`
-  traces, implement never next before both approvals, derived candidates, staleness, rounds, every stall rule, every pause's decision and next
-  action, the invariant; verdict validation order and precedence; torn-tail repair.
+1. **Milestone 1, the pure machine and validation.** The machine, driven by a scripted step
+   executor, runs the trace `coder(K1) → tester adds a file (K2) → evidence(K2) passes → reviewer
+   approves R(K2) → Completed`, asserting: the coder ran once, the reviewed patch contains the
+   tester's file, the approval names the exact evidence ID, and replaying every durable prefix of
+   the log gives the same next action as the uninterrupted run. The other worked traces in
+   "Artifacts, candidates and the machine" and the research-gate scope tests are milestone-1 tests
+   too.
+2. **Milestone 2, registration and recovery as one vertical slice**, with one fake vendor (through
+   the gate) and one real shell command, before any provider-specific behaviour: crashes before
+   release, at the tester-to-evidence handoff, and after a group leader exits, asserting which
+   process can write and which phase resumes.
+3. **Milestone 3, the four providers**, then the release suite, with real-provider runs as the final
+   integration check.
+
+- **Unit (pure):** validation (the approval gate, including an input with `from` and no
+  `approval_from`; the completion gate; producer-only edges; wrong-kind references); **the
+  research-gate scope**: the shipped `research-plan-build` workflow validates and its coder's
+  chain requires both the plan and the research approvals, and a minimal custom workflow (one
+  document, its review, a coder, tests, final review) validates and requires only its one
+  approval; the machine: requires vs history, the `D1 → rejection → D2 → review_research(D2)` and
+  `P1 → rejection → P2 → review_plan(P2)` traces, implement never next before its chain's
+  approvals, derived candidates, uncommitted candidate records ignored on replay, staleness,
+  rounds, every stall rule, every pause's decision and next action, the invariant; verdict
+  validation order and precedence; torn-tail repair.
 - **Snapshots** against real `git init` repos: tracked-but-ignored files kept, staged additions
   kept, an `assume-unchanged` file edited `v1 → v2` captured as `v2`, a sparse checkout refused,
   untracked files, deletions, the user's index and HEAD byte-identical afterwards, `--cwd` below
   the top level, refs created, a scratch clone checks out the candidate.
 - **Scripted providers.** `protocol-child` gains a script-file mode: `OCTET_FLEET_SCRIPT` names a
   JSON file keyed by `<step>#<round>` (from the runner's prompt header) whose entries say which
-  files to write, what to reply, or to hold (before or after its first write); every turn appends
-  its prompt, its cwd and whether it was resumed to a log the test reads. It works under the
-  codex and claude dialects.
+  files to write, what to reply, or to hold (before or after its first write), to write a startup
+  marker as soon as the process starts (before reading stdin), and to spawn a child that outlives
+  it; every turn appends its prompt, its cwd and whether it was resumed to a log the test reads.
+  It works under the codex and claude dialects.
 - **Release tests** (process tests, `crates/octet/tests/fleet.rs`; fake Claude researching and
   reviewing, fake Codex coding and testing):
   1. **The full run**: review_research rejects the first research → research revises → approved
@@ -636,10 +715,12 @@ worked traces in "Artifacts, candidates and the machine" are milestone-1 tests t
   4. **Crash at the acceptance boundary**: kill after the child finishes but before
      `attempt_finished` is durable → reconciliation; kill after it is durable → the step is
      skipped.
-  5. **Crash before registration**: kill Octet after the coder's vendor is spawned and before
-     `attempt_session` is durable, with the fake holding before its first write; then both
-     `resume` and a new `run` on the same work tree. Neither admits a second writer while ownership
-     is unresolved; the held fake exits on its closed stdin and never writes.
+  5. **Crash before registration**: the fake coder writes a startup marker the moment its process
+     starts. Kill Octet after the gate is spawned and before `attempt_session` is durable, then
+     both `resume` and a new `run` on the same work tree. **The marker is absent** (the vendor
+     never executed), the waiting gate exits on its own, and neither entry point admits a second
+     writer while the gate is alive. Repeat with the kill after `attempt_session` and before `go`:
+     the marker is still absent.
   6. **Interrupted tester**: kill after the tester writes a file, before any command → no
      `--decision` yields passing evidence without the commands running.
   7. **Workspace ownership**: a second run on the same work tree is refused; an edit to a paused
@@ -647,6 +728,26 @@ worked traces in "Artifacts, candidates and the machine" are milestone-1 tests t
   8. **The completion boundary**: an edit to the workspace after the final approval, before
      completion → `Drift`, not `Completed`; the `completed` record of a clean run carries the
      observed tree.
+  9. **The tester-to-evidence handoff**: kill immediately before and immediately after
+     `evidence_started` is durable, once with a tester that edited the tree and once with one that
+     did not. Before the handoff: unchanged → a new tester attempt, edited → `Reconcile`. After it:
+     the evidence phase from command zero on the committed candidate, and the tester does not run
+     again.
+  10. **A user edit during evidence**: between command A's exit and B's release, the test edits a
+      fixture; B's `pre_tree` differs and the record is void. (A change made and undone inside one
+      command's lifetime is documented as unobserved; no test claims otherwise.)
+  11. **A leader that exits before its child**: the fake coder spawns a child that keeps running,
+      then exits; Octet is killed. On resume the child is found by its `OCTET_FLEET_ATTEMPT` marker
+      → `ProcessesRunning`; `kill` signals it and nothing else. A process in the same group with
+      the marker removed is reported as unverified and never signalled; `stop` is refused until it
+      is released.
+  12. **An older run behind a newer one**: run X pauses between attempts (nothing unresolved, so it
+      is not listed); run Y starts on the same work tree and is killed mid-implement. `resume X` is
+      refused, naming Y, until Y is resumed or stopped; once Y is stopped, `resume X` reports Y's
+      leftover changes as `Drift`.
+  13. **Clean interrupts**: Ctrl+C during a read-only turn → resume runs a new attempt; after a coder
+      edit → `Reconcile`; during evidence → the evidence phase from command zero. None asks for a
+      decision about the interrupt itself.
   Plus: a stall pause (exit 3), a round-limit pause, an access violation (a reviewer that writes a
   file in its clone), a leftover test process found on resume, a transient retry that survives a
   restart and waits out its backoff, `UnstableTests → retry`.
@@ -655,13 +756,36 @@ worked traces in "Artifacts, candidates and the machine" are milestone-1 tests t
 
 ## Left to the builder
 
-Marked inline: ref cleanup, the run ID format, the per-provider error patterns, reading process
-start times per platform. Also: module boundaries below the table, prompt wording (the JSON
+Marked inline: ref cleanup, the run ID format, the per-provider error patterns, listing processes
+with their environment and start times per platform. Also: module boundaries below the table, prompt wording (the JSON
 contract is fixed), text layout, `FleetEvent` naming, and Antigravity's workspace-config trust in
 scratch clones (they are new paths, so their `.agents` configuration does not load there; v1
 accepts that).
 
 ## Changed after review
+
+From the owner's third review (revision 5); all six findings applied to revision 4:
+
+- **Vendors start held**: a per-attempt gate is `Config.binary`; it records its PID, waits for
+  `go`, and only then `exec`s the vendor, so nothing executes before `attempt_session` is durable.
+  This replaces the planned process-identity accessor in `octet-core`; no core change is needed.
+  Release test 5 uses a startup marker that must stay absent.
+- **Ownership when a leader exits**: processes carry an inherited `OCTET_FLEET_ATTEMPT` marker;
+  verified processes (marker or PID plus start time) may be killed, unverified ones never are and
+  need an explicit `release`; `stop` clears the record only then. The worktree record lists every
+  run with unresolved ownership, and `run`, `resume` and `stop` all reconcile it. Release tests 11
+  and 12.
+- **The tester-to-evidence handoff** is the durable `evidence_started` record, which commits the
+  tester's edits; candidate records are proposals until a committing record names them. Release
+  test 9 kills on both sides of it, with and without edits.
+- **Evidence observations before release and after exit** of every command, persisted, with the
+  invariant stated in those terms and the remaining blind spot stated. Release test 10.
+- **The research guarantee's scope**: generic workflows stay generic; the two-approval guarantee
+  belongs to `research-plan-build`; tests for both, and `from` without `approval_from` rejected.
+- **Clean interrupts** need no decision: `attempt_interrupted` leaves the attempt unfinished and
+  resume uses the recovery table. Release test 13.
+- **Build order**: pure machine first, then registration and recovery as one vertical slice, then
+  providers.
 
 From the owner's request after revision 3 (revision 4):
 
