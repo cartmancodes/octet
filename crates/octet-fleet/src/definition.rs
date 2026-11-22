@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A workflow file could not be read into a [`Workflow`].
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +41,7 @@ pub struct Workflow {
 }
 
 /// Loop and retry limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Backward jumps allowed per edge.
@@ -93,7 +93,7 @@ pub struct Profile {
 }
 
 /// What a role's step produces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// A document (reply text): research, a plan.
@@ -117,7 +117,7 @@ pub struct Role {
 }
 
 /// Whether a step starts a new vendor session or continues the last.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPolicy {
     /// Start a new session.
@@ -311,6 +311,57 @@ steps:
         match parse(&yaml) {
             Err(DefinitionError::Yaml(msg)) => assert!(msg.contains("approval_form"), "{msg}"),
             other => panic!("expected a Yaml error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_typo_is_rejected_and_named_at_every_struct_level() {
+        let cases: [(&str, &str, &str, &str); 6] = [
+            (
+                "Workflow",
+                "steps:\n  - id: research",
+                "nmae: x\nsteps:\n  - id: research",
+                "nmae",
+            ),
+            (
+                "Limits",
+                "transient_retries: 3",
+                "transient_retries: 3\n  max_round: 5",
+                "max_round",
+            ),
+            (
+                "Profile",
+                "claude-review:   { engine: claude, model: claude-opus-5-5 }",
+                "claude-review:   { engine: claude, modle: x }",
+                "modle",
+            ),
+            (
+                "Role",
+                "tester:     { kind: tests,    instructions:",
+                "tester:     { kind: tests, instrucions: x, instructions:",
+                "instrucions",
+            ),
+            (
+                "StepDef",
+                "    profile: claude-research\n  - id: review_research",
+                "    profile: claude-research\n    reviwes: x\n  - id: review_research",
+                "reviwes",
+            ),
+            (
+                "InputRef",
+                "{ from: research, approval_from: review_research }",
+                "{ from: research, approval_from: review_research, aproval_from: x }",
+                "aproval_from",
+            ),
+        ];
+        for (level, from, to, key) in cases {
+            assert!(SHIPPED.contains(from), "{level}: fixture drifted");
+            match parse(&SHIPPED.replacen(from, to, 1)) {
+                Err(DefinitionError::Yaml(msg)) => {
+                    assert!(msg.contains(key), "{level}: {msg}");
+                }
+                other => panic!("{level}: expected a Yaml error, got {other:?}"),
+            }
         }
     }
 
