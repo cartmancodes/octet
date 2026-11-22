@@ -2,8 +2,8 @@
 
 Status: revision 5 (2026-11-22). The owner approved the Rust architecture (the `octet-fleet`
 crate, a pure `machine`, independent roles and profiles, headless first, provider replies kept
-apart from the evidence Octet collects) and has twice requested changes to the execution
-contract. Both reviews and a builder check are folded in; see "Changed after review" at the end.
+apart from the evidence Octet collects) and has three times requested changes to the execution
+contract. All three reviews and a builder check are folded in; see "Changed after review" at the end.
 Fulfils the `octet-fleet` crate named in [the harness v3 design](2026-09-30-rust-harness-v3-design.md)
 §2 and replaces its §9 (the legacy Python fleet's config aliases, quota routing and
 model-as-orchestrator are not carried over).
