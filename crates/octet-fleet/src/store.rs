@@ -9,14 +9,15 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use octet_store::{create_private, create_private_dir, sync_directory};
 use serde::{Deserialize, Serialize};
-use tokio::fs::{DirBuilder, File, OpenOptions};
+use tokio::fs::{DirBuilder, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::record::{ArtifactId, ArtifactMeta, AttemptId, CandidateId, Record};
@@ -47,6 +48,10 @@ pub enum StoreError {
     /// A run with this ID already exists.
     #[error("run {0} already exists")]
     RunExists(String),
+    /// An append failed and the log could not be restored to its last whole
+    /// record, so nothing more is written to it.
+    #[error("log.jsonl is poisoned: an append failed and could not be rolled back")]
+    Poisoned,
     /// Git could not hash the workflow.
     #[error(transparent)]
     Git(#[from] SnapshotError),
@@ -161,10 +166,39 @@ pub async fn open(data_dir: &Path, id: &str) -> Result<(RunDir, RunFile), StoreE
     Ok((RunDir { root }, serde_json::from_slice(&bytes)?))
 }
 
+/// How a line reaches the log; swapped in tests to fail a write partway.
+type Writer = fn(&std::fs::File, &[u8]) -> io::Result<()>;
+
+/// Writes `line` at the end of the (append-mode) log and syncs it.
+fn write_synced(file: &std::fs::File, line: &[u8]) -> io::Result<()> {
+    let mut file = file;
+    file.write_all(line)?;
+    file.sync_data()
+}
+
+/// Appends `line` after the first `len` bytes. When the write or sync fails
+/// the file is cut back to `len`; the flag says whether even that failed.
+fn append_line(
+    file: &std::fs::File,
+    len: u64,
+    line: &[u8],
+    write: Writer,
+) -> Result<(), (io::Error, bool)> {
+    write(file, line).map_err(|error| {
+        let rolled_back = file.set_len(len).and_then(|()| file.sync_all());
+        (error, rolled_back.is_err())
+    })
+}
+
 /// The open `log.jsonl`, for appending.
 #[derive(Debug)]
 pub struct Log {
-    file: File,
+    file: Arc<std::fs::File>,
+    /// The length of the log's whole records: where the next one goes.
+    len: u64,
+    /// Set when a failed append could not be undone.
+    poisoned: bool,
+    write: Writer,
 }
 
 impl Log {
@@ -202,22 +236,50 @@ impl Log {
             })?;
             records.push(record);
         }
-        Ok((Self { file }, records))
+        let log = Self {
+            file: Arc::new(file.into_std().await),
+            len: whole as u64,
+            poisoned: false,
+            write: write_synced,
+        };
+        Ok((log, records))
     }
 
-    /// Appends `record` as one line and syncs it before returning.
+    /// Appends `record` as one line and syncs it before returning. A failed
+    /// append is rolled back (the log is cut to its last whole record), so the
+    /// record is simply not in the log and the log stays usable.
     ///
     /// # Errors
     ///
     /// [`StoreError::Json`] if it cannot be serialized; [`StoreError::Io`] if
-    /// the write or sync fails (a partial line is then a torn tail).
+    /// the write or sync fails; [`StoreError::Poisoned`] if an earlier failure
+    /// could not be rolled back (this one included: it returns the I/O error,
+    /// and every later call returns `Poisoned` without writing).
     pub async fn append(&mut self, record: &Record) -> Result<(), StoreError> {
+        if self.poisoned {
+            return Err(StoreError::Poisoned);
+        }
         // Compact JSON has no raw newline: they are escaped inside strings.
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
-        self.file.write_all(&line).await?;
-        self.file.sync_data().await?;
-        Ok(())
+        let (file, len, write) = (Arc::clone(&self.file), self.len, self.write);
+        let size = line.len() as u64;
+        let done = tokio::task::spawn_blocking(move || append_line(&file, len, &line, write)).await;
+        match done {
+            Ok(Ok(())) => {
+                self.len += size;
+                Ok(())
+            }
+            Ok(Err((error, unrecoverable))) => {
+                self.poisoned = unrecoverable;
+                Err(error.into())
+            }
+            Err(joined) => {
+                // The blocking task died; what it left in the file is unknown.
+                self.poisoned = true;
+                Err(io::Error::other(joined).into())
+            }
+        }
     }
 }
 
@@ -226,21 +288,46 @@ fn artifact_path(dir: &RunDir, id: ArtifactId, ext: &str) -> PathBuf {
     dir.root.join("artifacts").join(format!("{}.{ext}", id.0))
 }
 
+/// Writes `bytes` to `path` through a `.tmp` sibling: created owner-only
+/// (an orphan from a crash is truncated), synced, then renamed into place.
+async fn put(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&tmp, path).await
+}
+
 /// Writes an artifact's body (`artifacts/<id>.<ext>`) and metadata
 /// (`artifacts/<id>.json`), both synced, then the directory. Nothing may name
 /// the artifact before this returns.
 ///
+/// Each file is written to a `.tmp` sibling and renamed into place, body
+/// first, so the metadata's rename is the commit point. A crash leaves at most
+/// orphans, and calling this again for the same artifact replaces them.
+/// Overwriting is safe because the runner writes an artifact only before any
+/// `attempt_finished` record names it.
+///
 /// # Errors
 ///
-/// [`StoreError::Io`] when `ext` is not a plain extension, a file exists
-/// already, or a write or sync fails.
+/// [`StoreError::Io`] when `ext` is not a plain extension (`json` is the
+/// metadata's) or a write, sync or rename fails.
 pub async fn write_artifact(
     dir: &RunDir,
     meta: &ArtifactMeta,
     body: &[u8],
     ext: &str,
 ) -> Result<(), StoreError> {
-    if ext.is_empty() || !ext.bytes().all(|b| b.is_ascii_alphanumeric()) {
+    if ext.is_empty() || ext == "json" || !ext.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
             format!("{ext:?} is not an extension"),
@@ -248,14 +335,8 @@ pub async fn write_artifact(
         .into());
     }
     let meta_json = serde_json::to_vec(meta)?;
-    for (path, bytes) in [
-        (artifact_path(dir, meta.id, ext), body),
-        (artifact_path(dir, meta.id, "json"), &meta_json[..]),
-    ] {
-        let mut file = create_private(&path).await?;
-        file.write_all(bytes).await?;
-        file.sync_all().await?;
-    }
+    put(&artifact_path(dir, meta.id, ext), body).await?;
+    put(&artifact_path(dir, meta.id, "json"), &meta_json).await?;
     sync_directory(&dir.root.join("artifacts")).await?;
     Ok(())
 }
@@ -291,6 +372,7 @@ pub async fn workflow_hash(repo_top: &Path, resolved_json: &[u8]) -> Result<Stri
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -497,10 +579,103 @@ mod tests {
             .await
             .expect_err("absent");
         assert!(matches!(err, StoreError::Io(_)), "{err}");
-        let again = write_artifact(&dir, &meta, b"x", "md")
+        let mode = std::fs::metadata(dir.root.join("artifacts/3.md"))
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let err = write_artifact(&dir, &meta, b"x", "json")
             .await
-            .expect_err("never overwritten");
-        assert!(matches!(again, StoreError::Io(_)), "{again}");
+            .expect_err("the body cannot be the metadata's file");
+        assert!(matches!(err, StoreError::Io(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_artifact_write_can_be_retried_after_a_crash() {
+        let data = TempDir::new("octet-fleet-store");
+        let dir = made(data.path(), "f1-0000").await;
+        let artifacts = dir.root.join("artifacts");
+        let meta = ArtifactMeta {
+            id: ArtifactId(3),
+            step: 1,
+            requires: vec![],
+            candidate: None,
+        };
+        // A crash after the body's rename, and one mid-write of each temporary.
+        std::fs::write(artifacts.join("3.md"), b"old body").expect("orphan body");
+        std::fs::write(artifacts.join("3.md.tmp"), b"half a bo").expect("orphan tmp");
+        std::fs::write(artifacts.join("3.json.tmp"), b"{\"id\":").expect("orphan tmp");
+        assert!(read_artifact_meta(&dir, ArtifactId(3)).await.is_err());
+
+        write_artifact(&dir, &meta, b"new body", "md")
+            .await
+            .expect("retry");
+        assert_eq!(
+            std::fs::read(artifacts.join("3.md")).expect("body"),
+            b"new body"
+        );
+        assert_eq!(
+            read_artifact_meta(&dir, ArtifactId(3)).await.expect("meta"),
+            meta
+        );
+        let mut names: Vec<_> = std::fs::read_dir(&artifacts)
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["3.json", "3.md"], "no temporary is left behind");
+    }
+
+    /// A write that puts half the line down, then fails: a full disk.
+    fn half_then_fail(file: &std::fs::File, line: &[u8]) -> io::Result<()> {
+        let mut file = file;
+        file.write_all(&line[..line.len() / 2])?;
+        Err(io::Error::other("disk full"))
+    }
+
+    #[tokio::test]
+    async fn a_failed_append_is_rolled_back() {
+        let data = TempDir::new("octet-fleet-store");
+        let dir = made(data.path(), "f1-0000").await;
+        let (mut log, _) = Log::open(&dir).await.expect("open");
+        log.append(&started(0)).await.expect("append");
+
+        log.write = half_then_fail;
+        let err = log.append(&candidate(1)).await.expect_err("fails");
+        assert!(matches!(err, StoreError::Io(_)), "{err}");
+        assert_eq!(
+            std::fs::read(dir.root.join("log.jsonl")).expect("read"),
+            line(&started(0)),
+            "the torn half line is gone"
+        );
+
+        // The log is still usable, and nothing glued onto the torn bytes.
+        log.write = write_synced;
+        log.append(&started(1))
+            .await
+            .expect("append after rollback");
+        let (_, records) = Log::open(&dir).await.expect("reopen");
+        assert_eq!(records, vec![started(0), started(1)]);
+    }
+
+    #[tokio::test]
+    async fn an_append_that_cannot_roll_back_poisons_the_log() {
+        let data = TempDir::new("octet-fleet-store");
+        let dir = made(data.path(), "f1-0000").await;
+        let path = dir.root.join("log.jsonl");
+        std::fs::write(&path, b"").expect("log");
+        // A read-only handle: the write fails, and so does the rollback.
+        let mut log = Log {
+            file: Arc::new(std::fs::File::open(&path).expect("read-only")),
+            len: 0,
+            poisoned: false,
+            write: write_synced,
+        };
+        let err = log.append(&started(0)).await.expect_err("cannot write");
+        assert!(matches!(err, StoreError::Io(_)), "{err}");
+        let err = log.append(&started(1)).await.expect_err("poisoned");
+        assert!(matches!(err, StoreError::Poisoned), "{err}");
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 0);
     }
 
     #[test]
