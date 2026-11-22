@@ -2,6 +2,7 @@
 //! review, implement, test) that Octet drives under approval gates.
 #![forbid(unsafe_code)]
 
+pub mod contract;
 pub mod definition;
 pub mod machine;
 pub mod record;
