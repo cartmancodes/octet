@@ -5,7 +5,7 @@
 //! proposed or a finding ID that is not the next one is a [`ReplayError`], not
 //! a state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::record::{
     Accepted, ArtifactId, ArtifactMeta, AttemptId, CandidateId, Decision, Failure, Finding, Origin,
@@ -74,6 +74,11 @@ pub struct RunState {
     pub latest: Vec<Option<ArtifactId>>,
     /// Whether each step's latest artifact was rejected.
     pub needs_revision: Vec<bool>,
+    /// The step whose rejection set each step's `needs_revision` mark; `None`
+    /// while unmarked.
+    pub rejected_by: Vec<Option<usize>>,
+    /// Evidence artifacts accepted as `tests_passed`.
+    pub tests_passed: BTreeSet<ArtifactId>,
     /// Every finding of the run, with its current status.
     pub findings: BTreeMap<String, (Finding, Status)>,
     /// Backward jumps taken, by rejecting step.
@@ -179,6 +184,8 @@ pub fn replay(
             attempts: BTreeMap::new(),
             latest: vec![None; steps],
             needs_revision: vec![false; steps],
+            rejected_by: vec![None; steps],
+            tests_passed: BTreeSet::new(),
             findings: BTreeMap::new(),
             jumps: BTreeMap::new(),
             sessions: vec![None; steps],
@@ -444,6 +451,8 @@ impl Replayer<'_> {
                 self.state.latest[step] = Some(*evidence);
                 if matches!(outcome, Accepted::TestsFailed { .. }) {
                     self.reject(step);
+                } else {
+                    self.state.tests_passed.insert(*evidence);
                 }
             }
         }
@@ -456,12 +465,15 @@ impl Replayer<'_> {
         self.own_artifact(artifact, step)?;
         self.state.latest[step] = Some(artifact);
         self.state.needs_revision[step] = false;
+        self.state.rejected_by[step] = None;
         Ok(())
     }
 
     /// Marks `rejector`'s producer and counts the jump.
     fn reject(&mut self, rejector: usize) {
-        self.state.needs_revision[self.def.producer_of(rejector)] = true;
+        let producer = self.def.producer_of(rejector);
+        self.state.needs_revision[producer] = true;
+        self.state.rejected_by[producer] = Some(rejector);
         *self.state.jumps.entry(rejector).or_insert(0) += 1;
     }
 
@@ -1023,6 +1035,8 @@ mod tests {
         ];
         let state = replay(&def, &log, &metas).unwrap();
         assert!(state.needs_revision[implement]);
+        assert_eq!(state.rejected_by[implement], Some(test));
+        assert!(state.tests_passed.is_empty());
         assert_eq!(state.jumps[&test], 1);
         assert_eq!(state.latest[test], Some(ArtifactId(1)));
         assert_eq!(state.latest[implement], Some(ArtifactId(0)));
@@ -1036,6 +1050,18 @@ mod tests {
         ));
         let state = replay(&def, &log, &metas).unwrap();
         assert!(!state.needs_revision[implement]);
+        assert_eq!(state.rejected_by[implement], None);
+
+        log.push(start(3, "test"));
+        log.push(finish(
+            3,
+            Accepted::TestsPassed {
+                evidence: ArtifactId(3),
+            },
+        ));
+        let metas = [metas.as_slice(), &[art(&def, 3, "test")]].concat();
+        let state = replay(&def, &log, &metas).unwrap();
+        assert_eq!(state.tests_passed, BTreeSet::from([ArtifactId(3)]));
     }
 
     #[test]

@@ -406,6 +406,8 @@ pub struct ArtifactMeta {
     pub step: usize,
     /// The artifacts it requires to stay current.
     pub requires: Vec<ArtifactId>,
-    /// The candidate it names, for a change.
+    /// The candidate it names: for a change, the candidate its step made; for
+    /// evidence and a change approval, the candidate they bind to. `None` for
+    /// documents and document approvals.
     pub candidate: Option<CandidateId>,
 }

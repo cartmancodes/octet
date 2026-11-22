@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod definition;
+pub mod machine;
 pub mod record;
 pub mod state;
 pub mod validate;
