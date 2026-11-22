@@ -5,5 +5,9 @@
 pub mod definition;
 pub mod machine;
 pub mod record;
+pub mod recover;
 pub mod state;
 pub mod validate;
+
+#[cfg(test)]
+mod sim;

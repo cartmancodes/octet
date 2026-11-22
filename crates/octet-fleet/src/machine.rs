@@ -14,7 +14,7 @@ use crate::definition::{Kind, SessionPolicy};
 use crate::record::{
     Accepted, ArtifactId, AttemptId, CandidateId, Decision, Failure, PauseReason, Status,
 };
-use crate::state::{AttemptState, RunState};
+use crate::state::{AttemptInfo, AttemptState, RunState};
 use crate::validate::{Refs, Resolved};
 
 /// One attempt the runner should start.
@@ -52,6 +52,15 @@ pub enum Next {
         candidate: CandidateId,
         /// The restart count.
         restart: u32,
+    },
+    /// Finish an unfinished change attempt with the candidate a `Reconcile`
+    /// pause adopted: the runner writes the change artifact, then
+    /// `attempt_finished { change_produced, candidate }`.
+    FinishAdopted {
+        /// The change attempt.
+        attempt: AttemptId,
+        /// The adopted candidate.
+        candidate: CandidateId,
     },
     /// Wait for the user's decision.
     Pause(PauseReason, String),
@@ -304,7 +313,8 @@ fn outcomes_of(
         .filter(move |(attempt, _)| state.attempts.get(attempt).is_some_and(|i| i.step == step))
 }
 
-fn tree_of(state: &RunState, candidate: CandidateId) -> Option<&str> {
+/// The tree of a committed candidate.
+pub(crate) fn tree_of(state: &RunState, candidate: CandidateId) -> Option<&str> {
     state
         .candidates
         .iter()
@@ -365,7 +375,7 @@ fn same_failure_twice(state: &RunState, tests: usize) -> bool {
 /// Whether a decision lets the run go on from its pause. `wait`, `kill` and
 /// `release` leave it waiting on its processes, and `stop` ends it (its
 /// `stopped` record may not be durable yet); the others resume.
-fn ends_the_wait(decision: &Decision) -> bool {
+pub(crate) fn ends_the_wait(decision: &Decision) -> bool {
     match decision {
         Decision::Keep
         | Decision::Adopt { .. }
@@ -418,22 +428,32 @@ fn current(
     requirements
 }
 
-/// The latest unfinished tests attempt whose evidence phase began.
+/// The latest attempt, when it is an unfinished tests attempt whose evidence
+/// phase began. Only the latest attempt can be live: a later
+/// `attempt_started` supersedes every earlier unfinished attempt.
 fn evidence_in_progress(def: &Resolved, state: &RunState) -> Option<Next> {
-    state.attempts.iter().rev().find_map(|(attempt, info)| {
-        let AttemptState::Unfinished {
-            evidence: Some((candidate, restart)),
-            ..
-        } = info.state
-        else {
-            return None;
-        };
-        matches!(def.steps[info.step].refs, Refs::Tests { .. }).then_some(Next::Evidence {
-            attempt: *attempt,
-            candidate,
-            restart,
-        })
+    let (attempt, info) = state.attempts.iter().next_back()?;
+    let AttemptState::Unfinished {
+        evidence: Some((candidate, restart)),
+        ..
+    } = info.state
+    else {
+        return None;
+    };
+    matches!(def.steps[info.step].refs, Refs::Tests { .. }).then_some(Next::Evidence {
+        attempt: *attempt,
+        candidate,
+        restart,
     })
+}
+
+/// A new attempt of `info`'s step in `info`'s round: the dispatch [`next`]
+/// builds for the step, from the tip.
+pub(crate) fn again(def: &Resolved, state: &RunState, info: &AttemptInfo) -> Dispatch {
+    Dispatch {
+        round: info.round,
+        ..dispatch(def, state, info.step, None)
+    }
 }
 
 fn dispatch(def: &Resolved, state: &RunState, step: usize, not_before: Option<u64>) -> Dispatch {
@@ -1261,6 +1281,21 @@ mod tests {
                 restart: 1,
             }
         );
+    }
+
+    #[test]
+    fn a_superseded_evidence_phase_is_not_resumed() {
+        let mut log = Log::new();
+        let (_, _, k1) = log.implemented();
+        let (stale, dispatch) = log.run("test");
+        log.start_evidence(stale, k1, 0);
+        // A later attempt of the step supersedes the unfinished one.
+        let (test, _) = log.start(dispatch);
+        // Only the latest attempt can be live: `next` never resumes the
+        // superseded evidence phase (`recover` owns the unfinished latest one).
+        assert_eq!(log.next_step().as_deref(), Some("test"));
+        log.tests(test, true);
+        assert_eq!(log.next_step().as_deref(), Some("review_change"));
     }
 
     #[test]

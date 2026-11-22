@@ -57,6 +57,8 @@ pub struct AttemptInfo {
     pub requires: Vec<ArtifactId>,
     /// The artifacts kept to explain it.
     pub history: Vec<ArtifactId>,
+    /// The latest vendor session ID it logged.
+    pub vendor_session: Option<String>,
     /// Where it stands.
     pub state: AttemptState,
 }
@@ -106,6 +108,8 @@ pub struct RunState {
     pub pending_pause: Option<PauseReason>,
     /// The decisions logged since that pause.
     pub decisions_since_pause: Vec<Decision>,
+    /// The PIDs a `release` decision stated are not the run's.
+    pub released_pids: BTreeSet<u32>,
     /// The run completed.
     pub completed: bool,
     /// The user stopped the run.
@@ -212,6 +216,7 @@ pub fn replay(
             artifacts: artifacts.iter().map(|m| (m.id, m.clone())).collect(),
             pending_pause: None,
             decisions_since_pause: Vec::new(),
+            released_pids: BTreeSet::new(),
             completed: false,
             stopped: false,
             failed: None,
@@ -252,7 +257,9 @@ impl Replayer<'_> {
                 Ok(())
             }
             Record::VendorSession { attempt, id } => {
-                let step = self.attempt(*attempt)?.step;
+                let info = self.attempt(*attempt)?;
+                info.vendor_session = Some(id.clone());
+                let step = info.step;
                 self.state.sessions[step] = Some(id.clone());
                 Ok(())
             }
@@ -339,8 +346,10 @@ impl Replayer<'_> {
                 Ok(())
             }
             Record::Decision { decision } => {
-                if let Decision::Adopt { candidate } = decision {
-                    self.commit(*candidate)?;
+                match decision {
+                    Decision::Adopt { candidate } => self.commit(*candidate)?,
+                    Decision::Release { pids } => self.state.released_pids.extend(pids),
+                    _ => {}
                 }
                 self.past_the_limit(decision);
                 self.state.decisions_since_pause.push(decision.clone());
@@ -400,6 +409,7 @@ impl Replayer<'_> {
                 input_candidate,
                 requires: requires.to_vec(),
                 history: history.to_vec(),
+                vendor_session: None,
                 state: AttemptState::Unfinished {
                     released: false,
                     interrupted: false,
@@ -1185,6 +1195,10 @@ mod tests {
             }
         );
         assert_eq!(state.sessions[research].as_deref(), Some("v-1"));
+        assert_eq!(
+            state.attempts[&AttemptId(0)].vendor_session.as_deref(),
+            Some("v-1")
+        );
         assert_eq!(state.pending_pause, Some(PauseReason::Interrupted));
         assert_eq!(state.latest[research], None);
     }
@@ -1235,6 +1249,22 @@ mod tests {
         );
         assert_eq!(state.pending_pause, Some(PauseReason::Unknown));
         assert_eq!(state.decisions_since_pause, vec![Decision::Retry]);
+        assert!(state.released_pids.is_empty());
+
+        // Released PIDs are kept across pauses.
+        let mut released = log.clone();
+        released.push(Record::Decision {
+            decision: Decision::Release { pids: vec![7, 9] },
+        });
+        released.push(Record::Paused {
+            reason: PauseReason::ProcessesUnverified,
+            detail: String::new(),
+        });
+        released.push(Record::Decision {
+            decision: Decision::Release { pids: vec![11] },
+        });
+        let state = run(&released, &[]).unwrap();
+        assert_eq!(state.released_pids, BTreeSet::from([7, 9, 11]));
 
         // A later pause forgets the decisions made at the earlier one.
         let mut log = log;
