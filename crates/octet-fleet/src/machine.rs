@@ -9,7 +9,7 @@
 //! on this (`not_before` is where retry state will go).
 
 use crate::definition::SessionPolicy;
-use crate::record::{ArtifactId, AttemptId, CandidateId, PauseReason};
+use crate::record::{ArtifactId, AttemptId, CandidateId, Decision, PauseReason};
 use crate::state::{AttemptState, RunState};
 use crate::validate::{Refs, Resolved};
 
@@ -69,7 +69,8 @@ pub enum Next {
 
 /// Decides what runs next from the replayed log.
 ///
-/// In order: a run that ended is done; a pause with no decision since waits;
+/// In order: a run that ended is done; a pause waits unless its latest
+/// decision resumes the run (keep, adopt, continue, rounds, retry);
 /// a tests attempt whose evidence phase began resumes it; otherwise the first
 /// step whose latest artifact is missing, not current or needs revision runs;
 /// with every step settled, the run is ready to complete if the final
@@ -83,7 +84,10 @@ pub fn next(def: &Resolved, state: &RunState) -> Next {
         return Next::Done;
     }
     if let Some(reason) = state.pending_pause
-        && state.decisions_since_pause.is_empty()
+        && !state
+            .decisions_since_pause
+            .last()
+            .is_some_and(ends_the_wait)
     {
         return Next::Pause(reason, format!("paused ({reason:?}); awaiting a decision"));
     }
@@ -98,6 +102,20 @@ pub fn next(def: &Resolved, state: &RunState) -> Next {
         }
     }
     ready_to_complete(def, state)
+}
+
+/// Whether a decision lets the run go on from its pause. `wait`, `kill` and
+/// `release` leave it waiting on its processes, and `stop` ends it (its
+/// `stopped` record may not be durable yet); the others resume.
+fn ends_the_wait(decision: &Decision) -> bool {
+    match decision {
+        Decision::Keep
+        | Decision::Adopt { .. }
+        | Decision::Continue
+        | Decision::Rounds { .. }
+        | Decision::Retry => true,
+        Decision::Kill | Decision::Wait | Decision::Release { .. } | Decision::Stop => false,
+    }
 }
 
 /// Whether `artifact` is current: the latest of its step, everything it
@@ -730,12 +748,21 @@ mod tests {
         let k2 = log.tester_edit(test);
         let failing = log.tests(test, false);
 
-        let (_, dispatch) = log.run("implement");
+        let (attempt, dispatch) = log.run("implement");
         assert_eq!(dispatch.input_candidate, k2);
         assert_eq!(dispatch.round, 2);
         assert_eq!(dispatch.resume_session.as_deref(), Some("coder-1"));
         assert_eq!(dispatch.requires, [plan]);
         assert_eq!(dispatch.history, [c1, failing]);
+
+        // The revision makes K3 from K2; the failing evidence is stale.
+        let (c2, k3) = log.change(attempt);
+        assert_eq!(log.state().candidates.last().unwrap().parent, Some(k2));
+        assert!(!log.current(failing));
+        let (_, dispatch) = log.run("test");
+        assert_eq!(dispatch.input_candidate, k3);
+        assert_eq!(dispatch.requires, [c2]);
+        assert!(dispatch.history.is_empty());
     }
 
     #[test]
@@ -866,6 +893,83 @@ mod tests {
             log.next(),
             Next::Pause(PauseReason::Interrupted, _)
         ));
+    }
+
+    /// A log paused for `reason` after the coder's change, with `decision`
+    /// logged (and its adopted candidate proposed, for `adopt`).
+    fn paused_with(reason: PauseReason, decision: Option<Decision>) -> Log {
+        let mut log = Log::new();
+        log.implemented();
+        log.records.push(Record::Paused {
+            reason,
+            detail: String::new(),
+        });
+        if let Some(decision) = decision {
+            if let Decision::Adopt { candidate } = decision {
+                assert_eq!(log.propose(Origin::Drift), candidate);
+            }
+            log.records.push(Record::Decision { decision });
+        }
+        log
+    }
+
+    #[test]
+    fn wait_kill_release_and_stop_keep_the_pause() {
+        let waiting = [
+            (PauseReason::ProcessesRunning, Decision::Wait),
+            (PauseReason::ProcessesRunning, Decision::Kill),
+            (
+                PauseReason::ProcessesUnverified,
+                Decision::Release { pids: vec![42] },
+            ),
+            (PauseReason::Stalled, Decision::Stop),
+        ];
+        for (reason, decision) in waiting {
+            let log = paused_with(reason, Some(decision.clone()));
+            assert!(
+                matches!(log.next(), Next::Pause(r, _) if r == reason),
+                "{decision:?}: {:?}",
+                log.next()
+            );
+        }
+        // No decision at all waits too.
+        let log = paused_with(PauseReason::Drift, None);
+        assert!(matches!(log.next(), Next::Pause(PauseReason::Drift, _)));
+        // A resuming decision followed by a waiting one waits.
+        let mut log = paused_with(PauseReason::ProcessesRunning, Some(Decision::Retry));
+        log.records.push(Record::Decision {
+            decision: Decision::Wait,
+        });
+        assert!(matches!(
+            log.next(),
+            Next::Pause(PauseReason::ProcessesRunning, _)
+        ));
+    }
+
+    #[test]
+    fn adopt_keep_continue_rounds_and_retry_end_the_wait() {
+        let resuming = [
+            (
+                PauseReason::Drift,
+                Decision::Adopt {
+                    candidate: CandidateId(2),
+                },
+            ),
+            (PauseReason::Reconcile, Decision::Keep),
+            (PauseReason::RoundLimit, Decision::Continue),
+            (PauseReason::RoundLimit, Decision::Rounds { n: 2 }),
+            (PauseReason::TransientExhausted, Decision::Retry),
+        ];
+        for (reason, decision) in resuming {
+            let log = paused_with(reason, Some(decision.clone()));
+            assert_eq!(log.next_step().as_deref(), Some("test"), "{decision:?}");
+        }
+        // A waiting decision followed by a resuming one resumes.
+        let mut log = paused_with(PauseReason::ProcessesRunning, Some(Decision::Wait));
+        log.records.push(Record::Decision {
+            decision: Decision::Retry,
+        });
+        assert_eq!(log.next_step().as_deref(), Some("test"));
     }
 
     #[test]
