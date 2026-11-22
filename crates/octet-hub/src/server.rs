@@ -30,12 +30,12 @@
 //! seconds: `status`; `watch` (a line for each change, until the client leaves); and pairing's
 //! three. `pair_secret` opens a pairing (in place of one no phone has used) under a new attempt
 //! and gives its link and attempt once the relay has the hub, waiting up to 10 seconds; an
-//! opening that a newer one replaced meanwhile gets no link and `expired`. `pair_wait` names its
-//! attempt (an error without one): it answers `expired` at once for any but the newest, and
-//! otherwise when a phone is held, or the secret runs out, and ends if the client leaves (closes
-//! its side); `pair_answer` says yes or no for the phone held under its `pending` id (an error
-//! without one). An attempt and a `pending` id are each 32 random hex digits, as JSON strings,
-//! so neither names anything once the hub restarts.
+//! opening that a newer one replaces meanwhile hears at once, with no link and `expired`.
+//! `pair_wait` names its attempt (an error without one): it answers `expired` at once for any
+//! but the newest, and otherwise when a phone is held, or the secret runs out, and ends if the
+//! client leaves (closes its side); `pair_answer` says yes or no for the phone held under its
+//! `pending` id (an error without one). An attempt and a `pending` id are each 32 random hex
+//! digits, as JSON strings, so neither names anything once the hub restarts.
 //!
 //! # Subscriptions
 //!
@@ -2504,6 +2504,17 @@ fn stopping() -> Value {
     json!({"error": "The hub is stopping"})
 }
 
+/// The answer to `pair_secret` for `attempt`, which a newer opening replaced while it waited:
+/// no link, as its secret is gone.
+fn superseded(attempt: &str) -> Value {
+    json!({
+        "link": null,
+        "expired": true,
+        "attempt": attempt,
+        "reason": SUPERSEDED,
+    })
+}
+
 /// The attempt a `pair_wait` request line names: a string.
 fn pair_wait_request(line: &str) -> Option<String> {
     let request: Value = serde_json::from_str(line).ok()?;
@@ -2520,11 +2531,10 @@ fn pair_answer_request(line: &str) -> Option<(String, bool)> {
 }
 
 /// The answer to one control request: `pair_secret` opens a pairing (which brings the relay link
-/// up) and gives its link and attempt once the relay has the hub, unless a newer opening has
-/// replaced it by then; a `pair_wait` that names no attempt is refused; `pair_answer` says yes or
-/// no for the held
-/// phone and hears how that went; `status` gives where the hub stands with the relay and how many
-/// phones are paired.
+/// up) and gives its link and attempt once the relay has the hub, unless a newer opening
+/// replaces it first, which it hears at once; a `pair_wait` that names no attempt is refused;
+/// `pair_answer` says yes or no for the held phone and hears how that went; `status` gives where
+/// the hub stands with the relay and how many phones are paired.
 async fn control_answer(
     line: &str,
     hub: &mpsc::Sender<Control>,
@@ -2542,13 +2552,24 @@ async fn control_answer(
                     link,
                     host,
                     attempt,
+                    replaced,
                 }) => {
                     let mut relay = relay.clone();
                     let registered = relay.wait_for(|state| *state == RelayState::Registered);
-                    if timeout(REGISTERED_WITHIN, registered)
-                        .await
-                        .is_ok_and(|registered| registered.is_ok())
-                    {
+                    // A newer opening while the relay link comes up: this one's opener hears at
+                    // once. A hub that stops drops the word unsent, and only the relay answers.
+                    let replaced = async {
+                        if replaced.await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    let registered = tokio::select! {
+                        registered = timeout(REGISTERED_WITHIN, registered) => {
+                            registered.is_ok_and(|registered| registered.is_ok())
+                        }
+                        () = replaced => return superseded(&attempt),
+                    };
+                    if registered {
                         // Another opening meanwhile replaced this one's secret: its link is dead.
                         let (reply, current) = oneshot::channel();
                         let asked = Control::PairCurrent {
@@ -2560,12 +2581,7 @@ async fn control_answer(
                         }
                         match current.await {
                             Ok(true) => json!({"link": link, "attempt": attempt}),
-                            Ok(false) => json!({
-                                "link": null,
-                                "expired": true,
-                                "attempt": attempt,
-                                "reason": SUPERSEDED,
-                            }),
+                            Ok(false) => superseded(&attempt),
                             Err(_) => stopping(),
                         }
                     } else {

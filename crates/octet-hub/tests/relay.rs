@@ -1155,13 +1155,16 @@ async fn a_superseded_opening_gets_no_link_and_its_wait_is_expired() {
     let first = open_pairing(&env.run);
     relay_state(&env.run, "connecting").await;
     let second = open_pairing(&env.run);
-    // The hub reads the second request before the relay has it.
-    sleep(Duration::from_millis(300)).await;
-    let (_, mut control) = fake.register().await;
+    // The first opener hears at once that the second replaced it, before the relay has the hub.
     let first = first.await.expect("asked").expect("answered");
-    let second = second.await.expect("asked").expect("answered");
     assert_eq!(first["link"], Value::Null, "{first}");
     assert_eq!(first["expired"], true, "{first}");
+    assert_eq!(
+        first["reason"], "Another pairing was opened in its place",
+        "{first}"
+    );
+    let (_, mut control) = fake.register().await;
+    let second = second.await.expect("asked").expect("answered");
     let link = Link::parse(second["link"].as_str().expect("a link")).expect("a pairing link");
     let (old, new) = (attempt_of(&first), attempt_of(&second));
     assert_ne!(old, new);
@@ -1174,7 +1177,7 @@ async fn a_superseded_opening_gets_no_link_and_its_wait_is_expired() {
         let run = env.run.clone();
         tokio::spawn(async move { pair_wait_for(&run, &new).await })
     };
-    sleep(Duration::from_millis(100)).await;
+    // The wait may come before the hold or after it: either way it hears the question.
     connect(&mut control, &id(0)).await;
     let (_, ws) = fake.next_within(WAIT).await.expect("dialled");
     let mut phone = Phone::over(ws, &link.identity, &PhoneKey::new())

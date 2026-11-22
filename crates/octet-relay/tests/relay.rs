@@ -534,7 +534,21 @@ async fn closed_at_once(stream: &mut TcpStream) -> bool {
     )
 }
 
-#[tokio::test]
+/// The HTTP status of an upgrade to `path`, 101 when it went through, or `None` when the relay
+/// closed the connection without an answer (as it does at the handshake ceiling).
+async fn status_or_closed(addr: SocketAddr, path: &str) -> Option<u16> {
+    let request = format!("ws://{addr}{path}")
+        .into_client_request()
+        .expect("request");
+    match within(Box::pin(connect_async(request))).await {
+        Ok(_) => Some(101),
+        Err(Error::Http(response)) => Some(response.status().as_u16()),
+        Err(Error::Io(_) | Error::Protocol(_) | Error::ConnectionClosed) => None,
+        Err(error) => panic!("the upgrade failed: {error}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connections_past_the_handshake_limit_are_dropped_at_accept() {
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&lines);
@@ -547,19 +561,26 @@ async fn connections_past_the_handshake_limit_are_dropped_at_accept() {
         ..Config::default()
     })
     .await;
-    // Two connections that never send their request hold both places.
+    // Two connections that never send their request hold both places. The relay takes the
+    // places as it accepts, in the order the connections came, so the third finds none.
     let mut slow = Vec::new();
     for _ in 0..2 {
         slow.push(TcpStream::connect(relay.addr).await.expect("connect"));
     }
-    sleep(Duration::from_millis(100)).await;
     let mut third = TcpStream::connect(relay.addr).await.expect("connect");
     assert!(closed_at_once(&mut third).await, "the third was held");
-    // Once they go, the places are free again, and so is a seat.
+    // Once they go, the places are free again, and so is a seat. A probe that comes before the
+    // relay has seen them go is closed at accept too, and counted, so it is tried again.
     drop(slow);
     let no_hub = phone_path(&channel_of(&new_key()));
     let started = Instant::now();
-    while status(relay.addr, &no_hub, &[]).await != 101 {
+    let mut closed = 0;
+    loop {
+        match status_or_closed(relay.addr, &no_hub).await {
+            Some(101) => break,
+            Some(status) => panic!("the probe was refused with {status}"),
+            None => closed += 1,
+        }
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the places were not given back"
@@ -586,10 +607,8 @@ async fn connections_past_the_handshake_limit_are_dropped_at_accept() {
         .find(|line| line.contains("sockets"))
         .expect("a counts line");
     assert!(counts.contains("handshakes 0 of 2"), "{counts}");
-    assert!(
-        counts.contains("dropped at the handshake ceiling 1"),
-        "{counts}"
-    );
+    let dropped = format!("dropped at the handshake ceiling {},", 1 + closed);
+    assert!(counts.contains(&dropped), "{counts}");
 }
 
 #[tokio::test]

@@ -89,16 +89,21 @@ pub(super) struct Pairings {
     ended: Option<(String, &'static str)>,
     /// The newest attempt: the id of the last `pair_secret` that made a secret.
     attempt: Option<String>,
+    /// Tells the newest attempt's opener, still waiting for the relay, that a newer one replaced
+    /// it.
+    replaced: Option<oneshot::Sender<()>>,
 }
 
 /// What `pair_secret` came to.
 pub(super) enum Opened {
     /// A new secret: its link, shown once the relay has the hub, the relay's host, which the
-    /// reason names when it never does, and the attempt it opens.
+    /// reason names when it never does, the attempt it opens, and word when a newer opening
+    /// replaces it.
     Link {
         link: String,
         host: String,
         attempt: String,
+        replaced: oneshot::Receiver<()>,
     },
     /// The relay's address cannot go in a pairing link.
     Unlinkable,
@@ -183,8 +188,8 @@ impl Hub {
     }
 
     /// `pair_secret`: a new secret in place of any no phone has used (a `pair_wait` on that one
-    /// hears it expired), under a new attempt, which brings the relay link up; none while a
-    /// phone is held.
+    /// hears it expired, and so does its opener if it still waits for the relay), under a new
+    /// attempt, which brings the relay link up; none while a phone is held.
     pub(super) fn open_pairing(&mut self) -> Opened {
         if self.pairings.held.is_some() {
             return Opened::Waiting;
@@ -195,6 +200,11 @@ impl Hub {
         if let Some(waiter) = self.pairings.waiter.take() {
             let _ = waiter.send(expired());
         }
+        if let Some(opener) = self.pairings.replaced.take() {
+            let _ = opener.send(());
+        }
+        let (opener, replaced) = oneshot::channel();
+        self.pairings.replaced = Some(opener);
         self.want_relay();
         let identity = self.keys.identity_public();
         let link = pair_link(&self.relay, &identity, self.keys.channel(), &secret);
@@ -203,6 +213,7 @@ impl Hub {
                 link,
                 host: host.to_owned(),
                 attempt,
+                replaced,
             },
             _ => Opened::Unlinkable,
         }
@@ -439,6 +450,7 @@ mod tests {
             link: "octet://pair/AQID-secret".into(),
             host: "relay.example".into(),
             attempt: fresh_id(),
+            replaced: oneshot::channel().1,
         };
         let shown = format!("{opened:?}");
         assert!(
