@@ -112,9 +112,10 @@ export class Fleet {
   private savedName: string | null = null;
   /** The client of a pairing in flight, which is no Mac's link until it succeeds. */
   private pairing: HubClient | null = null;
-  /** `cancelPair` stopped the pairing in flight: whatever the hub answers after, it keeps nothing. */
+  /** `cancelPair` was called on the pairing in flight: before `paired` it keeps nothing, whatever
+   * the hub answers after; while it saves, it shows nothing. */
   private cancelled = false;
-  /** The pairing in flight heard `paired` and is saving: too late for `cancelPair`. */
+  /** The pairing in flight heard `paired` and is saving: too late for `cancelPair` to stop it. */
   private saving = false;
   /** The id that pairing will keep its key under: an unpair of the same Mac meanwhile must not
    * delete what it saves. */
@@ -371,8 +372,10 @@ export class Fleet {
       // The Mac's old link gives way to the new one, which picks its sessions up where the old one
       // had them.
       if (old && this.all.includes(old)) this.drop(old, { keepStore: true });
-      // The notifications step, unless they are on already (the new Mac is sent them at ready).
-      this.adopt(pairing, this.clientFor(pairing, key, { cursors }), keys, projectId() !== null && !notifications);
+      // The notifications step, unless they are on already (the new Mac is sent them at ready), or
+      // the user cancelled while it saved: nothing shows for a pairing they left.
+      const offer = !this.cancelled && projectId() !== null && !notifications;
+      this.adopt(pairing, this.clientFor(pairing, key, { cursors }), keys, offer);
       return { ok: true, macName };
     } catch (error) {
       if (this.cancelled) return CANCELLED;
@@ -394,16 +397,17 @@ export class Fleet {
    * Stops the pairing in flight, if any: its socket closes, and its `pair()` comes back
    * `cancelled`, keeping no key and no pairing, whatever the hub answers after. A pairing of a Mac
    * paired already leaves that pairing and its link as they were. Once the phone has heard
-   * `paired` and begun to save, the save goes on: the hub has the device by then.
+   * `paired` and begun to save, the save goes on, as the hub has the device by then, but it
+   * shows nothing: no notifications step.
    *
    * The hub may have said yes all the same: it then lists a device this phone never kept, which
    * the owner can revoke at the Mac (`octet hub revoke`). For a Mac paired again, that yes
    * replaced the old key there, and the old link hears it is unpaired.
    */
   cancelPair(): void {
-    if (!this.pairing || this.saving) return;
+    if (!this.pairing) return;
     this.cancelled = true;
-    this.pairing.stop();
+    if (!this.saving) this.pairing.stop();
   }
 
   /** A new pairing id, not one of `taken`'s. */

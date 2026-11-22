@@ -614,6 +614,43 @@ describe("cancelling a pairing", () => {
     expect(r.fleet.snapshot().macs.map((m) => m.macName)).toEqual(["studio"]);
   });
 
+  it("cancelPair_while_the_pairing_saves_keeps_it_and_offers_no_notifications", async () => {
+    // A keychain that holds the key's save until the test lets it go.
+    const kept = new Map<string, string>();
+    let saving!: () => void;
+    const started = new Promise<void>((resolve) => (saving = resolve));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const keychain: Keychain = {
+      get: async (key) => kept.get(key) ?? null,
+      set: async (key, value) => {
+        saving();
+        await gate;
+        kept.set(key, value);
+      },
+      delete: async (key) => {
+        kept.delete(key);
+      },
+    };
+    const r = rig(keychain);
+    r.fleet.setForeground(true);
+    await r.fleet.init();
+    const { pending, pairing, req } = heldBy(r, "studio");
+    pairing.receive({ type: "paired", req, device: "iPhone", name: "studio" });
+    pairing.drop(1000);
+    // The phone heard `paired` and is saving the key: the cancel comes too late to stop it.
+    await started;
+    r.fleet.cancelPair();
+    release();
+    expect(await pending).toEqual({ ok: true, macName: "studio" });
+    // The Mac holds the device, so the phone keeps it: it works, and it is in the list.
+    expect(kept.get(tokenKeyOf("m00000001"))).toBe(TOKEN);
+    expect((await loadSettings()).pairings.map((p) => p.id)).toEqual(["m00000001"]);
+    expect(r.fleet.snapshot().macs.map((m) => m.macName)).toEqual(["studio"]);
+    // But nothing shows for a pairing the user cancelled: no notifications step.
+    expect(r.fleet.snapshot().offer).toBe(false);
+  });
+
   it("cancelPair_of_a_re_pair_keeps_the_old_pairing", async () => {
     const r = rig();
     r.fleet.setForeground(true);
