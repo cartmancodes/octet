@@ -733,9 +733,14 @@ wrapped with step and attempt. Exit codes: 0 completed, 1 failed, 2 usage or val
      did not. Before the handoff: unchanged → a new tester attempt, edited → `Reconcile`. After it:
      the evidence phase from command zero on the committed candidate, and the tester does not run
      again.
-  10. **A user edit during evidence**: between command A's exit and B's release, the test edits a
-      fixture; B's `pre_tree` differs and the record is void. (A change made and undone inside one
-      command's lifetime is documented as unobserved; no test claims otherwise.)
+  10. **An edit between commands**: A finishes on T; while B is spawned and held, before its
+      pre-observation, the test edits a fixture (through a test-only pause point after each held
+      spawn, *builder's call* on its mechanism). B's `pre_tree` differs, so Octet voids the record
+      **before B runs**: B's first action appends `B ran (restart <n>)` to a marker file, and there
+      is no line for restart 0. The suite restarts on the edited tree and passes; the passing
+      evidence record has a `pre_tree` and a `post_tree` for every command, all equal to its tree.
+      (A change made and undone inside one command's lifetime is documented as unobserved; no
+      test claims otherwise.)
   11. **A leader that exits before its child**: the fake coder spawns a child that keeps running,
       then exits; Octet is killed. On resume the child is found by its `OCTET_FLEET_ATTEMPT` marker
       → `ProcessesRunning`; `kill` signals it and nothing else. A process in the same group with
@@ -744,9 +749,15 @@ wrapped with step and attempt. Exit codes: 0 completed, 1 failed, 2 usage or val
   12. **An older run behind a newer one**: run X pauses between attempts (nothing unresolved, so it
       is not listed); run Y starts on the same work tree and is killed mid-implement. `resume X` is
       refused, naming Y, until Y is resumed or stopped; once Y is stopped, `resume X` reports Y's
-      leftover changes as `Drift`.
-  13. **Clean interrupts**: Ctrl+C during a read-only turn → resume runs a new attempt; after a coder
-      edit → `Reconcile`; during evidence → the evidence phase from command zero. None asks for a
+      leftover changes as `Drift`. **Repeat with Y's coder leader exiting before its child**, and
+      Octet killed while the child runs: `resume X` and a new `run` are both refused, because the
+      surviving child carries Y's marker; `stop Y` is refused while it is alive; after `resume Y`
+      kills it (`ProcessesRunning → kill`) and Y is stopped, `resume X` proceeds to `Drift`. In
+      neither case does any second writer start while Y's writer may be alive.
+  13. **Clean interrupts**: Ctrl+C during **research** → `resume` runs a new research attempt in a
+      fresh clone; after a coder edit → `Reconcile`; during evidence → the evidence phase from
+      command zero, the tester not invoked. In each case the persisted log (`attempt_interrupted`,
+      `paused {interrupted}`) maps to exactly one row of the recovery table, and none asks for a
       decision about the interrupt itself.
   Plus: a stall pause (exit 3), a round-limit pause, an access violation (a reviewer that writes a
   file in its clone), a leftover test process found on resume, a transient retry that survives a
