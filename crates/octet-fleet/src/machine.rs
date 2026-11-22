@@ -3,13 +3,17 @@
 //!
 //! [`next`] reads a [`RunState`] and nothing else: no I/O, no clock. It runs
 //! the first step, in order, whose latest artifact is missing, not current
-//! or needs revision, and reports the run ready to complete once every step's
-//! artifact is current and the final approval binds passing evidence to the
-//! tip. Retry timing, rounds, stalls and the decisions taken at a pause build
-//! on this (`not_before` is where retry state will go).
+//! or needs revision, and reports the run ready to complete once the logged
+//! parts of the invariant hold. On the way it retries transient failures,
+//! pauses on the other failures, on a stall and on a jump past the round
+//! cap, and honours the decisions taken at a pause.
 
-use crate::definition::SessionPolicy;
-use crate::record::{ArtifactId, AttemptId, CandidateId, Decision, PauseReason};
+use std::collections::BTreeSet;
+
+use crate::definition::{Kind, SessionPolicy};
+use crate::record::{
+    Accepted, ArtifactId, AttemptId, CandidateId, Decision, Failure, PauseReason, Status,
+};
 use crate::state::{AttemptState, RunState};
 use crate::validate::{Refs, Resolved};
 
@@ -63,6 +67,9 @@ pub enum Next {
         /// The final approval.
         approval: ArtifactId,
     },
+    /// The run cannot go on: the runner records `failed` with this error and
+    /// exits 1.
+    Fail(String),
     /// The run completed, stopped or failed.
     Done,
 }
@@ -70,11 +77,13 @@ pub enum Next {
 /// Decides what runs next from the replayed log.
 ///
 /// In order: a run that ended is done; a pause waits unless its latest
-/// decision resumes the run (keep, adopt, continue, rounds, retry);
-/// a tests attempt whose evidence phase began resumes it; otherwise the first
-/// step whose latest artifact is missing, not current or needs revision runs;
-/// with every step settled, the run is ready to complete if the final
-/// approval binds passing evidence to the tip.
+/// decision resumes the run (keep, adopt, continue, rounds, retry); the
+/// latest attempt's failure is retried, paused on or fails the run; a tests
+/// attempt whose evidence phase began resumes it; a stall the user has not
+/// gone past pauses; otherwise the first step whose latest artifact is
+/// missing, not current or needs revision runs, unless it is a revision whose
+/// jump exceeds the round cap; with every step settled, the run is ready to
+/// complete if the logged parts of the invariant hold.
 ///
 /// `state` must be [`crate::state::replay`]'s output for this `def`; step
 /// indices are trusted.
@@ -91,17 +100,266 @@ pub fn next(def: &Resolved, state: &RunState) -> Next {
     {
         return Next::Pause(reason, format!("paused ({reason:?}); awaiting a decision"));
     }
+    if let Some(next) = after_a_failure(def, state) {
+        return next;
+    }
     if let Some(evidence) = evidence_in_progress(def, state) {
         return evidence;
     }
-    for step in 0..def.steps.len() {
-        let settled = state.latest[step].is_some_and(|artifact| is_current(def, state, artifact))
-            && !state.needs_revision[step];
-        if !settled {
-            return Next::Run(dispatch(def, state, step));
+    if let Some(stall) = stall(def, state) {
+        return Next::Pause(PauseReason::Stalled, stall.detail);
+    }
+    match first_unsettled(def, state) {
+        Some(step) => round_limit(def, state, step)
+            .unwrap_or_else(|| Next::Run(dispatch(def, state, step, None))),
+        None => ready_to_complete(def, state),
+    }
+}
+
+/// The first step, in order, whose latest artifact is missing, not current
+/// or needs revision.
+fn first_unsettled(def: &Resolved, state: &RunState) -> Option<usize> {
+    (0..def.steps.len()).find(|&step| {
+        let current = state.latest[step].is_some_and(|artifact| is_current(def, state, artifact));
+        !current || state.needs_revision[step]
+    })
+}
+
+/// The rejector whose jump the run would take next: the one that marked the
+/// first unsettled step for revision.
+pub(crate) fn revising_rejector(def: &Resolved, state: &RunState) -> Option<usize> {
+    let step = first_unsettled(def, state)?;
+    if state.needs_revision[step] {
+        state.rejected_by[step]
+    } else {
+        None
+    }
+}
+
+/// The cap on `rejector`'s jumps: `max_rounds`, or the cap a `rounds N` set,
+/// plus one per `continue` taken past it.
+fn round_cap(def: &Resolved, state: &RunState, rejector: usize) -> u32 {
+    let base = state
+        .round_caps
+        .get(&rejector)
+        .copied()
+        .unwrap_or(def.limits.max_rounds);
+    base.saturating_add(state.extra_rounds.get(&rejector).copied().unwrap_or(0))
+}
+
+/// A revision of `step` whose jump exceeds the cap on its edge pauses.
+fn round_limit(def: &Resolved, state: &RunState, step: usize) -> Option<Next> {
+    if !state.needs_revision[step] {
+        return None;
+    }
+    let rejector = state.rejected_by[step]?;
+    let jumps = state.jumps.get(&rejector).copied().unwrap_or(0);
+    let cap = round_cap(def, state, rejector);
+    (jumps > cap).then(|| {
+        Next::Pause(
+            PauseReason::RoundLimit,
+            format!(
+                "{} sent {} back {jumps} times; the cap is {cap}",
+                def.steps[rejector].id, def.steps[step].id
+            ),
+        )
+    })
+}
+
+/// What follows the latest attempt when it failed: a config error fails the
+/// run; a `retry` decision at the pause runs the step again; a transient
+/// failure is retried (at its logged eligible time) until the retries are
+/// used up; an interrupted one runs the step again through the normal
+/// dispatch; every other failure pauses.
+fn after_a_failure(def: &Resolved, state: &RunState) -> Option<Next> {
+    let (attempt, info) = state.attempts.iter().next_back()?;
+    let AttemptState::Failed(failure) = &info.state else {
+        return None;
+    };
+    let step = &def.steps[info.step].id;
+    if let Failure::ConfigError { detail } = failure {
+        return Some(Next::Fail(format!("{step}: {detail}")));
+    }
+    let retried = state.pending_pause.is_some()
+        && state.decisions_since_pause.last() == Some(&Decision::Retry);
+    if retried {
+        return Some(Next::Run(dispatch(def, state, info.step, None)));
+    }
+    let (reason, detail) = match failure {
+        Failure::Transient { detail } => {
+            let failures = transient_streak(state, info.step);
+            if failures <= def.limits.transient_retries {
+                let not_before = state.retry.get(attempt).map(|&(_, at)| at);
+                return Some(Next::Run(dispatch(def, state, info.step, not_before)));
+            }
+            (
+                PauseReason::TransientExhausted,
+                format!("{step} failed transiently {failures} times in a row: {detail}"),
+            )
+        }
+        Failure::Invalid { detail } => (
+            PauseReason::InvalidOutput,
+            format!("{step}'s output is invalid: {detail}"),
+        ),
+        Failure::LocalFailure { detail } => (
+            PauseReason::LocalFailure,
+            format!("{step} failed on this machine: {detail}"),
+        ),
+        Failure::Unknown { detail } => (PauseReason::Unknown, format!("{step} failed: {detail}")),
+        Failure::AccessViolation { diff_stat } => (
+            PauseReason::AccessViolation,
+            format!("{step} is read-only but changed the tree: {diff_stat}"),
+        ),
+        Failure::Interrupted { .. } | Failure::ConfigError { .. } => return None,
+    };
+    Some(Next::Pause(reason, detail))
+}
+
+/// The transient failures of `step` in a row, newest first, back to its last
+/// accepted attempt or a failure of another class. Unfinished attempts (a
+/// crash, an interrupt) neither count nor end the streak, so they cannot
+/// reset the retries.
+fn transient_streak(state: &RunState, step: usize) -> u32 {
+    let mut failures: u32 = 0;
+    for info in state
+        .attempts
+        .values()
+        .rev()
+        .filter(|info| info.step == step)
+    {
+        match &info.state {
+            AttemptState::Failed(Failure::Transient { .. }) => {
+                failures = failures.saturating_add(1);
+            }
+            AttemptState::Unfinished { .. } => {}
+            AttemptState::Finished | AttemptState::Failed(_) => break,
         }
     }
-    ready_to_complete(def, state)
+    failures
+}
+
+/// A stall: the point it is waived at and a line for the user.
+struct Stall {
+    point: (usize, u32),
+    detail: String,
+}
+
+/// The first stall the user has not gone past.
+fn stall(def: &Resolved, state: &RunState) -> Option<Stall> {
+    stalls(def, state)
+        .into_iter()
+        .find(|stall| !state.stall_waived.contains(&stall.point))
+}
+
+/// The point of the stall the run would pause on, for replay to waive at a
+/// `continue`.
+pub(crate) fn stall_point(def: &Resolved, state: &RunState) -> Option<(usize, u32)> {
+    stall(def, state).map(|stall| stall.point)
+}
+
+/// Every stall rule that holds, waived or not: a change given feedback that
+/// left its input's tree; and, for the rejection the run would revise next,
+/// a verdict that resolved none of its step's earlier open findings or the
+/// same tests failing twice on the same tree.
+fn stalls(def: &Resolved, state: &RunState) -> Vec<Stall> {
+    let mut stalls: Vec<Stall> = (0..def.steps.len())
+        .filter(|&step| def.steps[step].kind == Kind::Change)
+        .filter_map(|step| unchanged_tree(def, state, step))
+        .collect();
+    if let Some(rejector) = revising_rejector(def, state) {
+        let jumps = state.jumps.get(&rejector).copied().unwrap_or(0);
+        let step = &def.steps[rejector];
+        let detail = match step.kind {
+            Kind::Verdict => resolved_nothing(state, rejector).then(|| {
+                format!(
+                    "{} asked for changes again without resolving any of its open findings",
+                    step.id
+                )
+            }),
+            Kind::Tests => same_failure_twice(state, rejector).then(|| {
+                format!(
+                    "{} failed the same commands twice on the same tree",
+                    step.id
+                )
+            }),
+            Kind::Document | Kind::Change => None,
+        };
+        stalls.extend(detail.map(|detail| Stall {
+            point: (rejector, jumps),
+            detail,
+        }));
+    }
+    stalls
+}
+
+/// The accepted outcomes of `step`, newest first.
+fn outcomes_of(
+    state: &RunState,
+    step: usize,
+) -> impl Iterator<Item = (&AttemptId, &(Accepted, Option<CandidateId>))> {
+    state
+        .outcomes
+        .iter()
+        .rev()
+        .filter(move |(attempt, _)| state.attempts.get(attempt).is_some_and(|i| i.step == step))
+}
+
+fn tree_of(state: &RunState, candidate: CandidateId) -> Option<&str> {
+    state
+        .candidates
+        .iter()
+        .find(|c| c.id == candidate)
+        .map(|c| c.tree.as_str())
+}
+
+/// The change step's latest accepted attempt was given feedback and made a
+/// candidate whose tree is its input's.
+fn unchanged_tree(def: &Resolved, state: &RunState, step: usize) -> Option<Stall> {
+    let (attempt, (outcome, candidate)) = outcomes_of(state, step).next()?;
+    let info = &state.attempts[attempt];
+    if !matches!(outcome, Accepted::ChangeProduced { .. }) || info.history.is_empty() {
+        return None;
+    }
+    let tree = tree_of(state, (*candidate)?)?;
+    if tree != tree_of(state, info.input_candidate)? {
+        return None;
+    }
+    let accepted = u32::try_from(outcomes_of(state, step).count()).unwrap_or(u32::MAX);
+    Some(Stall {
+        point: (step, accepted),
+        detail: format!(
+            "{} was given feedback and left the tree unchanged",
+            def.steps[step].id
+        ),
+    })
+}
+
+/// The verdict step's latest outcome asks for changes and resolves none of
+/// the earlier open findings it accounts for (there must be some).
+fn resolved_nothing(state: &RunState, verdict: usize) -> bool {
+    match outcomes_of(state, verdict).next() {
+        Some((_, (Accepted::ChangesRequested { previous, .. }, _))) => {
+            !previous.is_empty() && previous.iter().all(|(_, s)| *s == Status::Open)
+        }
+        _ => false,
+    }
+}
+
+/// The tests step's two latest outcomes both failed the same commands, on
+/// candidates with the same tree.
+fn same_failure_twice(state: &RunState, tests: usize) -> bool {
+    let failed = |outcome: &Accepted| match outcome {
+        Accepted::TestsFailed { evidence, failing } => {
+            let candidate = state.artifacts.get(evidence)?.candidate?;
+            Some((tree_of(state, candidate)?.to_owned(), failing.clone()))
+        }
+        _ => None,
+    };
+    let mut latest = outcomes_of(state, tests).map(|(_, (outcome, _))| failed(outcome));
+    match (latest.next(), latest.next()) {
+        (Some(Some(last)), Some(Some(before))) => last == before,
+        _ => false,
+    }
 }
 
 /// Whether a decision lets the run go on from its pause. `wait`, `kill` and
@@ -178,7 +436,7 @@ fn evidence_in_progress(def: &Resolved, state: &RunState) -> Option<Next> {
     })
 }
 
-fn dispatch(def: &Resolved, state: &RunState, step: usize) -> Dispatch {
+fn dispatch(def: &Resolved, state: &RunState, step: usize, not_before: Option<u64>) -> Dispatch {
     let accepted = state
         .attempts
         .values()
@@ -195,7 +453,7 @@ fn dispatch(def: &Resolved, state: &RunState, step: usize) -> Dispatch {
         requires: requires(def, state, step),
         history: history(def, state, step),
         resume_session,
-        not_before: None,
+        not_before,
     }
 }
 
@@ -234,61 +492,103 @@ fn history(def: &Resolved, state: &RunState, step: usize) -> Vec<ArtifactId> {
     history
 }
 
-/// Every step is settled: ready when the final approval is for the tip and
-/// requires passing evidence for the tip.
+/// Every step is settled: ready when the logged parts of the invariant
+/// hold. The final step is a change review whose latest approval is current
+/// and for the tip; it requires the change step's latest change and current,
+/// passing evidence for the tip; and every document approval the change step
+/// needs is current and required, through the change, by both the evidence
+/// and the approval. Anything else pauses naming the part that fails.
 fn ready_to_complete(def: &Resolved, state: &RunState) -> Next {
-    let unsatisfied = || {
-        Next::Pause(
+    match invariant(def, state) {
+        Ok(ready) => ready,
+        Err(part) => Next::Pause(
             PauseReason::Unknown,
-            "every step is settled but the logged artifacts do not satisfy the completion invariant"
-                .into(),
-        )
-    };
-    let Some((last, step)) = def.steps.iter().enumerate().next_back() else {
-        return unsatisfied();
-    };
+            format!("every step is settled but {part}"),
+        ),
+    }
+}
+
+/// [`ready_to_complete`]'s checks, failing with the part that does not hold.
+fn invariant(def: &Resolved, state: &RunState) -> Result<Next, String> {
+    let (last, step) = def
+        .steps
+        .iter()
+        .enumerate()
+        .next_back()
+        .ok_or("the workflow has no steps")?;
     let Refs::ReviewChange {
+        change: change_step,
         evidence: tests_step,
-        ..
     } = step.refs
     else {
-        return unsatisfied();
+        return Err(format!(
+            "the last step, {}, is not a change review",
+            step.id
+        ));
     };
-    let Some(approval) = state.latest[last] else {
-        return unsatisfied();
-    };
-    let for_tip = |artifact: ArtifactId| {
-        state
-            .artifacts
-            .get(&artifact)
-            .is_some_and(|meta| meta.candidate == Some(state.tip))
-    };
-    let evidence = state.artifacts.get(&approval).and_then(|meta| {
-        meta.requires.iter().copied().find(|required| {
-            state
-                .artifacts
-                .get(required)
-                .is_some_and(|meta| meta.step == tests_step)
+    let approval = state.latest[last].ok_or("there is no final approval")?;
+    let meta = |artifact: ArtifactId| state.artifacts.get(&artifact);
+    let for_tip =
+        |artifact: ArtifactId| meta(artifact).is_some_and(|m| m.candidate == Some(state.tip));
+    if !is_current(def, state, approval) || !for_tip(approval) {
+        return Err("the final approval is not current for the tip".into());
+    }
+    let required = |step: usize| {
+        meta(approval).and_then(|m| {
+            m.requires
+                .iter()
+                .copied()
+                .find(|&r| meta(r).is_some_and(|m| m.step == step))
         })
-    });
-    let tree = state
-        .candidates
-        .iter()
-        .find(|candidate| candidate.id == state.tip)
-        .map(|candidate| candidate.tree.clone());
-    match (evidence, tree) {
-        (Some(evidence), Some(tree))
-            if for_tip(approval) && for_tip(evidence) && state.tests_passed.contains(&evidence) =>
-        {
-            Next::ReadyToComplete {
-                candidate: state.tip,
-                tree,
-                evidence,
-                approval,
+    };
+    let evidence = required(tests_step).ok_or("the final approval names no evidence")?;
+    if !is_current(def, state, evidence)
+        || !for_tip(evidence)
+        || !state.tests_passed.contains(&evidence)
+    {
+        return Err(
+            "the final approval's evidence is not a current passing record for the tip".into(),
+        );
+    }
+    if required(change_step).is_none() || required(change_step) != state.latest[change_step] {
+        return Err("the final approval is not for the latest change".into());
+    }
+    let under_approval = requirements(state, approval);
+    let under_evidence = requirements(state, evidence);
+    for approval_step in def.approvals_required(change_step) {
+        let document_approval = state.latest[approval_step]
+            .filter(|&a| is_current(def, state, a))
+            .filter(|a| under_approval.contains(a) && under_evidence.contains(a));
+        if document_approval.is_none() {
+            return Err(format!(
+                "{}'s approval is not current, or the change was not made under it",
+                def.steps[approval_step].id
+            ));
+        }
+    }
+    let tree = tree_of(state, state.tip).ok_or("the tip has no tree")?;
+    Ok(Next::ReadyToComplete {
+        candidate: state.tip,
+        tree: tree.to_owned(),
+        evidence,
+        approval,
+    })
+}
+
+/// Everything `artifact` requires, transitively.
+fn requirements(state: &RunState, artifact: ArtifactId) -> BTreeSet<ArtifactId> {
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![artifact];
+    while let Some(next) = pending.pop() {
+        if let Some(meta) = state.artifacts.get(&next) {
+            for &required in &meta.requires {
+                if seen.insert(required) {
+                    pending.push(required);
+                }
             }
         }
-        _ => unsatisfied(),
     }
+    seen
 }
 
 #[cfg(test)]
@@ -299,7 +599,7 @@ mod tests {
     use super::*;
     use crate::definition::{Kind, parse};
     use crate::record::{
-        Accepted, ArtifactMeta, Decision, Finding, Origin, Record, Severity, Status,
+        Accepted, ArtifactMeta, Decision, Failure, Finding, Origin, Record, Severity, Status,
     };
     use crate::state::replay;
     use crate::validate::{Host, Refs, validate};
@@ -379,16 +679,28 @@ mod tests {
 
         /// Asserts `next` runs `step` and logs the attempt's start.
         fn run(&mut self, step: &str) -> (AttemptId, Dispatch) {
+            self.run_after(step, None)
+        }
+
+        /// Asserts `next` runs `step` not before `not_before` and logs the
+        /// attempt's start.
+        fn run_after(&mut self, step: &str, not_before: Option<u64>) -> (AttemptId, Dispatch) {
             let next = self.next();
             let Next::Run(dispatch) = next else {
                 panic!("expected Run({step}), got {next:?}");
             };
             assert_eq!(self.def.steps[dispatch.step].id, step, "{dispatch:?}");
-            assert_eq!(dispatch.not_before, None);
+            assert_eq!(dispatch.not_before, not_before);
+            self.start(dispatch)
+        }
+
+        /// Logs the start of `dispatch`'s attempt.
+        fn start(&mut self, dispatch: Dispatch) -> (AttemptId, Dispatch) {
+            let step = self.def.steps[dispatch.step].id.clone();
             let attempt = AttemptId(u32::try_from(self.dispatched.len()).unwrap());
             self.records.push(Record::AttemptStarted {
                 attempt,
-                step: step.into(),
+                step,
                 round: dispatch.round,
                 input_candidate: dispatch.input_candidate,
                 requires: dispatch.requires.clone(),
@@ -427,15 +739,79 @@ mod tests {
 
         /// Proposes a candidate derived from the tip.
         fn propose(&mut self, origin: Origin) -> CandidateId {
+            let tree = format!("t{}", self.next_candidate);
+            self.propose_tree(origin, &tree)
+        }
+
+        /// Proposes a candidate with `tree`, derived from the tip.
+        fn propose_tree(&mut self, origin: Origin, tree: &str) -> CandidateId {
             let id = CandidateId(self.next_candidate);
             self.next_candidate += 1;
             self.records.push(Record::Candidate {
                 id,
-                tree: format!("t{}", id.0),
+                tree: tree.into(),
                 parent: Some(self.state().tip),
                 origin,
             });
             id
+        }
+
+        /// Logs an attempt of `step` the machine did not dispatch, accepting
+        /// `outcome` for a new artifact with `requires` and `candidate`.
+        fn forge(
+            &mut self,
+            step: &str,
+            requires: Vec<ArtifactId>,
+            candidate: Option<CandidateId>,
+            outcome: impl FnOnce(ArtifactId) -> Accepted,
+        ) -> ArtifactId {
+            let state = self.state();
+            let (attempt, _) = self.start(Dispatch {
+                step: self.idx(step),
+                round: 1,
+                input_candidate: state.tip,
+                requires,
+                history: vec![],
+                resume_session: None,
+                not_before: None,
+            });
+            let artifact = self.artifact(attempt, candidate);
+            self.finish(attempt, outcome(artifact), None);
+            artifact
+        }
+
+        fn fail(&mut self, attempt: AttemptId, failure: Failure) {
+            self.records
+                .push(Record::AttemptFailed { attempt, failure });
+        }
+
+        fn retry(&mut self, attempt: AttemptId, count: u32, eligible_at: u64) {
+            self.records.push(Record::Retry {
+                attempt,
+                class: "transient".into(),
+                count,
+                eligible_at,
+            });
+        }
+
+        /// The runner logs the pause `next` asked for.
+        fn pause(&mut self, reason: PauseReason) {
+            self.records.push(Record::Paused {
+                reason,
+                detail: String::new(),
+            });
+        }
+
+        fn decide(&mut self, decision: Decision) {
+            self.records.push(Record::Decision { decision });
+        }
+
+        /// Asserts `next` pauses for `reason` and returns its detail.
+        fn paused(&self, reason: PauseReason) -> String {
+            match self.next() {
+                Next::Pause(r, detail) if r == reason => detail,
+                other => panic!("expected Pause({reason:?}), got {other:?}"),
+            }
         }
 
         fn vendor_session(&mut self, attempt: AttemptId, id: &str) {
@@ -452,7 +828,13 @@ mod tests {
         }
 
         fn change(&mut self, attempt: AttemptId) -> (ArtifactId, CandidateId) {
-            let candidate = self.propose(Origin::Change);
+            let tree = format!("t{}", self.next_candidate);
+            self.change_tree(attempt, &tree)
+        }
+
+        /// The change step's candidate, with `tree`.
+        fn change_tree(&mut self, attempt: AttemptId, tree: &str) -> (ArtifactId, CandidateId) {
+            let candidate = self.propose_tree(Origin::Change, tree);
             let change = self.artifact(attempt, Some(candidate));
             self.finish(
                 attempt,
@@ -504,6 +886,12 @@ mod tests {
 
         /// One new blocking finding; the earlier ones stay open.
         fn request_changes(&mut self, attempt: AttemptId) {
+            self.request_changes_resolving(attempt, 0);
+        }
+
+        /// One new blocking finding; the first `resolved` earlier open
+        /// findings are resolved, the rest stay open.
+        fn request_changes_resolving(&mut self, attempt: AttemptId, resolved: usize) {
             let step = self.def.steps[self.dispatched[&attempt].step].id.clone();
             let state = self.state();
             let previous = state
@@ -512,7 +900,15 @@ mod tests {
                 .filter(|(id, (_, status))| {
                     id.starts_with(&format!("{step}/")) && *status == Status::Open
                 })
-                .map(|(id, _)| (id.clone(), Status::Open))
+                .enumerate()
+                .map(|(n, (id, _))| {
+                    let status = if n < resolved {
+                        Status::Resolved
+                    } else {
+                        Status::Open
+                    };
+                    (id.clone(), status)
+                })
                 .collect();
             let new_findings = state
                 .next_finding_ids(&step, 1)
@@ -551,8 +947,14 @@ mod tests {
         }
 
         /// The evidence runs on the tip (starting it if the tester did not
-        /// edit) and passes or fails.
+        /// edit) and passes or fails command 0.
         fn tests(&mut self, attempt: AttemptId, pass: bool) -> ArtifactId {
+            self.tests_failing(attempt, if pass { vec![] } else { vec![0] })
+        }
+
+        /// The evidence runs on the tip (starting it if the tester did not
+        /// edit); the `failing` commands fail, and it passes if none do.
+        fn tests_failing(&mut self, attempt: AttemptId, failing: Vec<usize>) -> ArtifactId {
             let state = self.state();
             let started = matches!(
                 state.attempts[&attempt].state,
@@ -565,13 +967,10 @@ mod tests {
                 self.start_evidence(attempt, state.tip, 0);
             }
             let evidence = self.artifact(attempt, Some(state.tip));
-            let outcome = if pass {
+            let outcome = if failing.is_empty() {
                 Accepted::TestsPassed { evidence }
             } else {
-                Accepted::TestsFailed {
-                    evidence,
-                    failing: vec![0],
-                }
+                Accepted::TestsFailed { evidence, failing }
             };
             self.finish(attempt, outcome, None);
             evidence
@@ -972,19 +1371,21 @@ mod tests {
         assert_eq!(log.next_step().as_deref(), Some("test"));
     }
 
-    #[test]
-    fn a_finished_run_is_done() {
-        for end in [Record::Stopped, Record::Failed { error: "x".into() }] {
-            let mut log = Log::new();
-            log.records.push(end);
-            assert_eq!(log.next(), Next::Done);
-        }
-        let mut log = Log::new();
-        let (_, _, _) = log.implemented();
+    /// The whole happy path: `(A(P), C, E, R)`, ready to complete.
+    fn ready(log: &mut Log) -> (ArtifactId, ArtifactId, ArtifactId, ArtifactId) {
+        let (plan, change, _) = log.implemented();
         let (test, _) = log.run("test");
         let evidence = log.tests(test, true);
         let (review, _) = log.run("review_change");
         let approval = log.approve(review);
+        assert!(matches!(log.next(), Next::ReadyToComplete { .. }));
+        (plan, change, evidence, approval)
+    }
+
+    #[test]
+    fn a_completed_run_is_done() {
+        let mut log = Log::new();
+        let (_, _, evidence, approval) = ready(&mut log);
         log.records.push(Record::Completed {
             candidate: CandidateId(1),
             tree: "t1".into(),
@@ -993,6 +1394,433 @@ mod tests {
             observed_tree: "t1".into(),
         });
         assert_eq!(log.next(), Next::Done);
+    }
+
+    #[test]
+    fn a_stopped_run_is_done() {
+        let mut log = paused_with(PauseReason::Stalled, Some(Decision::Stop));
+        log.records.push(Record::Stopped);
+        assert_eq!(log.next(), Next::Done);
+        let mut log = Log::new();
+        log.records.push(Record::Stopped);
+        assert_eq!(log.next(), Next::Done);
+    }
+
+    #[test]
+    fn a_failed_run_is_done() {
+        let mut log = Log::new();
+        log.records.push(Record::Failed { error: "x".into() });
+        assert_eq!(log.next(), Next::Done);
+    }
+
+    /// Tests pass, then `review_change` asks for changes, resolving every
+    /// finding still open.
+    fn rejected_round(log: &mut Log) {
+        let (test, _) = log.run("test");
+        log.tests(test, true);
+        let (review, _) = log.run("review_change");
+        log.request_changes_resolving(review, usize::MAX);
+    }
+
+    /// The coder's revision, which `next` must dispatch.
+    fn revised(log: &mut Log) {
+        let (attempt, _) = log.run("implement");
+        log.change(attempt);
+    }
+
+    #[test]
+    fn five_jumps_then_a_round_limit() {
+        let mut log = Log::new();
+        log.implemented();
+        let review = log.idx("review_change");
+        for jump in 1..=5 {
+            rejected_round(&mut log);
+            assert_eq!(log.state().jumps[&review], jump);
+            revised(&mut log);
+        }
+        // The sixth jump would exceed max_rounds.
+        rejected_round(&mut log);
+        assert_eq!(log.state().jumps[&review], 6);
+        let detail = log.paused(PauseReason::RoundLimit);
+        assert!(
+            detail.contains("review_change") && detail.contains("implement"),
+            "{detail}"
+        );
+        log.pause(PauseReason::RoundLimit);
+        log.paused(PauseReason::RoundLimit);
+
+        // continue: one round past the limit.
+        log.decide(Decision::Continue);
+        revised(&mut log);
+        rejected_round(&mut log);
+        log.paused(PauseReason::RoundLimit);
+        log.pause(PauseReason::RoundLimit);
+
+        // rounds 8: the cap is 8 jumps.
+        log.decide(Decision::Rounds { n: 8 });
+        revised(&mut log);
+        rejected_round(&mut log);
+        assert_eq!(log.state().jumps[&review], 8);
+        revised(&mut log);
+        rejected_round(&mut log);
+        log.paused(PauseReason::RoundLimit);
+        assert_eq!(log.attempts_of("implement"), 9);
+    }
+
+    #[test]
+    fn rounds_below_the_jumps_still_take_the_jump() {
+        let mut log = Log::new();
+        log.implemented();
+        for _ in 0..5 {
+            rejected_round(&mut log);
+            revised(&mut log);
+        }
+        rejected_round(&mut log);
+        log.pause(PauseReason::RoundLimit);
+        log.decide(Decision::Rounds { n: 2 });
+        // A second decision under the same pause changes nothing.
+        log.decide(Decision::Continue);
+        revised(&mut log);
+        let review = log.idx("review_change");
+        assert_eq!(log.state().round_caps[&review], 6);
+        rejected_round(&mut log);
+        log.paused(PauseReason::RoundLimit);
+    }
+
+    #[test]
+    fn a_round_limit_is_per_edge() {
+        let mut log = Log::new();
+        log.implemented();
+        for _ in 0..5 {
+            rejected_round(&mut log);
+            revised(&mut log);
+        }
+        // The tests edge has its own count: a failure is the first jump on it.
+        let (test, _) = log.run("test");
+        log.tests(test, false);
+        revised(&mut log);
+    }
+
+    /// Two review rounds on the coder's change; the second resolves
+    /// `resolved` of the first's findings and raises one more.
+    fn second_rejection(resolved: usize) -> Log {
+        let mut log = Log::new();
+        log.implemented();
+        let (test, _) = log.run("test");
+        log.tests(test, true);
+        let (review, _) = log.run("review_change");
+        log.request_changes(review);
+        // The first rejection had no earlier findings: no stall.
+        revised(&mut log);
+        let (test, _) = log.run("test");
+        log.tests(test, true);
+        let (review, _) = log.run("review_change");
+        log.request_changes_resolving(review, resolved);
+        log
+    }
+
+    #[test]
+    fn a_reviewer_that_resolves_nothing_stalls() {
+        // Round 2: F1 stays open, F2 is new.
+        let mut log = second_rejection(0);
+        let detail = log.paused(PauseReason::Stalled);
+        assert!(detail.contains("review_change"), "{detail}");
+        log.pause(PauseReason::Stalled);
+        log.paused(PauseReason::Stalled);
+        // continue takes the jump past the stall, and only that stall.
+        log.decide(Decision::Continue);
+        revised(&mut log);
+        let (test, _) = log.run("test");
+        log.tests(test, true);
+        let (review, _) = log.run("review_change");
+        log.request_changes(review);
+        log.paused(PauseReason::Stalled);
+
+        // Resolving one of them is progress.
+        let mut log = second_rejection(1);
+        revised(&mut log);
+    }
+
+    #[test]
+    fn no_stall_without_previous_findings() {
+        let mut log = Log::new();
+        let (attempt, _) = log.run("research");
+        log.produce(attempt);
+        let (review, _) = log.run("review_research");
+        log.request_changes(review);
+        assert_eq!(log.next_step().as_deref(), Some("research"));
+
+        // Two approvals, each with nothing earlier to account for.
+        let mut log = Log::new();
+        log.approved_plan();
+        assert_eq!(log.next_step().as_deref(), Some("implement"));
+
+        // A plan review's open findings are not the change review's.
+        let mut log = Log::new();
+        let (attempt, _) = log.run("research");
+        log.produce(attempt);
+        let (review, _) = log.run("review_research");
+        log.approve(review);
+        let (attempt, _) = log.run("plan");
+        log.produce(attempt);
+        let (review, _) = log.run("review_plan");
+        log.request_changes(review);
+        let (attempt, _) = log.run("plan");
+        log.produce(attempt);
+        let (review, _) = log.run("review_plan");
+        log.approve(review);
+        revised(&mut log);
+        rejected_round(&mut log);
+        assert_eq!(log.next_step().as_deref(), Some("implement"));
+    }
+
+    #[test]
+    fn an_unchanged_tree_after_feedback_stalls() {
+        let mut log = Log::new();
+        let (_, _, k1) = log.implemented();
+        let (test, _) = log.run("test");
+        log.tests(test, false);
+        let (attempt, dispatch) = log.run("implement");
+        assert_eq!(dispatch.input_candidate, k1);
+        assert!(!dispatch.history.is_empty());
+        log.change_tree(attempt, "t1");
+        let detail = log.paused(PauseReason::Stalled);
+        assert!(detail.contains("implement"), "{detail}");
+        log.pause(PauseReason::Stalled);
+        log.decide(Decision::Continue);
+        assert_eq!(log.next_step().as_deref(), Some("test"));
+
+        // Without feedback, an unchanged tree is not a stall.
+        let mut log = Log::new();
+        log.approved_plan();
+        let (attempt, dispatch) = log.run("implement");
+        assert!(dispatch.history.is_empty());
+        log.change_tree(attempt, "t0");
+        assert_eq!(log.next_step().as_deref(), Some("test"));
+    }
+
+    /// Two failing test rounds: the tester leaves `first` then `second` as
+    /// the tree, failing `failing` then `again`.
+    fn failed_twice(first: &str, failing: Vec<usize>, second: &str, again: Vec<usize>) -> Log {
+        let mut log = Log::new();
+        log.implemented();
+        let (test, _) = log.run("test");
+        let candidate = log.propose_tree(Origin::Tests, first);
+        log.start_evidence(test, candidate, 0);
+        log.tests_failing(test, failing);
+        revised(&mut log);
+        let (test, _) = log.run("test");
+        let candidate = log.propose_tree(Origin::Tests, second);
+        log.start_evidence(test, candidate, 0);
+        log.tests_failing(test, again);
+        log
+    }
+
+    #[test]
+    fn the_same_failure_twice_stalls() {
+        let log = failed_twice("x", vec![0, 1], "x", vec![0, 1]);
+        let detail = log.paused(PauseReason::Stalled);
+        assert!(detail.contains("test"), "{detail}");
+        // Different failing commands, or a different tree, is not a stall.
+        let log = failed_twice("x", vec![0, 1], "x", vec![1]);
+        assert_eq!(log.next_step().as_deref(), Some("implement"));
+        let log = failed_twice("x", vec![0], "y", vec![0]);
+        assert_eq!(log.next_step().as_deref(), Some("implement"));
+    }
+
+    #[test]
+    fn invalid_never_counts() {
+        let mut log = Log::new();
+        log.implemented();
+        let (test, _) = log.run("test");
+        log.tests(test, true);
+        let (review, _) = log.run("review_change");
+        let invalid = || Failure::Invalid {
+            detail: "no verdict block".into(),
+        };
+        log.fail(review, invalid());
+        log.paused(PauseReason::InvalidOutput);
+        log.pause(PauseReason::InvalidOutput);
+        log.decide(Decision::Retry);
+        let (review, _) = log.run("review_change");
+        log.fail(review, invalid());
+        let detail = log.paused(PauseReason::InvalidOutput);
+        assert!(detail.contains("no verdict block"), "{detail}");
+        assert!(log.state().jumps.is_empty());
+    }
+
+    #[test]
+    fn transient_failures_retry_then_pause() {
+        let mut log = Log::new();
+        let (mut attempt, _) = log.run("research");
+        for (count, at) in [(1, 60), (2, 300), (3, 900)] {
+            log.fail(
+                attempt,
+                Failure::Transient {
+                    detail: "rate limited".into(),
+                },
+            );
+            log.retry(attempt, count, at);
+            attempt = log.run_after("research", Some(at)).0;
+        }
+        log.fail(
+            attempt,
+            Failure::Transient {
+                detail: "rate limited".into(),
+            },
+        );
+        let detail = log.paused(PauseReason::TransientExhausted);
+        assert!(detail.contains("rate limited"), "{detail}");
+        log.pause(PauseReason::TransientExhausted);
+        log.decide(Decision::Retry);
+        let (attempt, _) = log.run("research");
+        log.produce(attempt);
+
+        // A finished attempt starts the count again; no retry record, no wait.
+        let (review, _) = log.run("review_research");
+        log.fail(
+            review,
+            Failure::Transient {
+                detail: "overloaded".into(),
+            },
+        );
+        log.run("review_research");
+    }
+
+    #[test]
+    fn each_failure_pauses_and_retry_runs_the_step_again() {
+        let failures = [
+            (
+                Failure::Invalid {
+                    detail: "bad".into(),
+                },
+                PauseReason::InvalidOutput,
+            ),
+            (
+                Failure::LocalFailure {
+                    detail: "disk full".into(),
+                },
+                PauseReason::LocalFailure,
+            ),
+            (
+                Failure::Unknown {
+                    detail: "???".into(),
+                },
+                PauseReason::Unknown,
+            ),
+            (
+                Failure::AccessViolation {
+                    diff_stat: "1 file changed".into(),
+                },
+                PauseReason::AccessViolation,
+            ),
+        ];
+        for (failure, reason) in failures {
+            let mut log = Log::new();
+            let (attempt, _) = log.run("research");
+            log.produce(attempt);
+            let (review, _) = log.run("review_research");
+            log.fail(review, failure);
+            log.paused(reason);
+            log.pause(reason);
+            log.paused(reason);
+            log.decide(Decision::Retry);
+            log.run("review_research");
+        }
+    }
+
+    #[test]
+    fn a_config_error_fails_the_run() {
+        let mut log = Log::new();
+        let (attempt, _) = log.run("research");
+        log.fail(
+            attempt,
+            Failure::ConfigError {
+                detail: "model not found".into(),
+            },
+        );
+        let Next::Fail(error) = log.next() else {
+            panic!("{:?}", log.next());
+        };
+        assert!(
+            error.contains("research") && error.contains("model not found"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_failure_runs_the_step_again() {
+        let mut log = Log::new();
+        let (attempt, _) = log.run("research");
+        log.fail(
+            attempt,
+            Failure::Interrupted {
+                signal: "SIGTERM".into(),
+            },
+        );
+        log.run("research");
+    }
+
+    fn not_ready(log: &Log) {
+        let state = log.state();
+        assert!(
+            !matches!(next(&log.def, &state), Next::ReadyToComplete { .. }),
+            "{:?}",
+            next(&log.def, &state)
+        );
+        assert!(
+            !matches!(
+                ready_to_complete(&log.def, &state),
+                Next::ReadyToComplete { .. }
+            ),
+            "{:?}",
+            ready_to_complete(&log.def, &state)
+        );
+    }
+
+    #[test]
+    fn ready_requires_every_part() {
+        // An approval for K2 over evidence for K1.
+        let mut log = Log::new();
+        let (_, c1, _) = log.implemented();
+        let (test, _) = log.run("test");
+        let e1 = log.tests(test, true);
+        let k2 = log.adopt_drift();
+        log.forge("review_change", vec![c1, e1], Some(k2), |approval| {
+            Accepted::ChangeApproved {
+                approval,
+                new_findings: vec![],
+                previous: vec![],
+            }
+        });
+        not_ready(&log);
+
+        // An approval over failing evidence.
+        let mut log = Log::new();
+        let (_, c1, k1) = log.implemented();
+        let (test, _) = log.run("test");
+        let e1 = log.tests(test, false);
+        log.forge("review_change", vec![c1, e1], Some(k1), |approval| {
+            Accepted::ChangeApproved {
+                approval,
+                new_findings: vec![],
+                previous: vec![],
+            }
+        });
+        not_ready(&log);
+
+        // A stale plan approval: a newer plan document exists.
+        let mut log = Log::new();
+        let (plan, ..) = ready(&mut log);
+        let state = log.state();
+        let document = state.artifacts[&plan].requires[0];
+        let research = state.artifacts[&document].requires.clone();
+        log.forge("plan", research, None, |document| {
+            Accepted::DocumentProduced { document }
+        });
+        assert!(!log.current(plan));
+        not_ready(&log);
+        assert_eq!(log.next_step().as_deref(), Some("review_plan"));
     }
 
     #[test]

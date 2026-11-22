@@ -223,7 +223,8 @@ pub enum Decision {
     Continue,
     /// Raise the round cap, then continue.
     Rounds {
-        /// How many more rounds.
+        /// The new cap on the paused edge's jumps, replacing `max_rounds`
+        /// for it (never below the jumps already taken).
         n: u32,
     },
     /// Try again.

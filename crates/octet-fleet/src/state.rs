@@ -83,6 +83,21 @@ pub struct RunState {
     pub findings: BTreeMap<String, (Finding, Status)>,
     /// Backward jumps taken, by rejecting step.
     pub jumps: BTreeMap<usize, u32>,
+    /// Jumps allowed past the cap, by rejecting step: one per `continue`
+    /// taken at a round limit.
+    pub extra_rounds: BTreeMap<usize, u32>,
+    /// The cap a `rounds N` decision set, by rejecting step, replacing
+    /// `max_rounds` for it.
+    pub round_caps: BTreeMap<usize, u32>,
+    /// Stalls a `continue` (or `rounds N`) went past: the stalled step (the
+    /// rejector, or the change step) and its jumps (or accepted attempts) at
+    /// the time.
+    pub stall_waived: BTreeSet<(usize, u32)>,
+    /// The latest `retry` record of each failed attempt: its count and when
+    /// the retry is eligible, in seconds since the Unix epoch.
+    pub retry: BTreeMap<AttemptId, (u32, u64)>,
+    /// Every accepted outcome, with the candidate it named.
+    pub outcomes: BTreeMap<AttemptId, (Accepted, Option<CandidateId>)>,
     /// The latest vendor session ID of each step.
     pub sessions: Vec<Option<String>>,
     /// Metadata of every artifact supplied to replay.
@@ -188,6 +203,11 @@ pub fn replay(
             tests_passed: BTreeSet::new(),
             findings: BTreeMap::new(),
             jumps: BTreeMap::new(),
+            extra_rounds: BTreeMap::new(),
+            round_caps: BTreeMap::new(),
+            stall_waived: BTreeSet::new(),
+            retry: BTreeMap::new(),
+            outcomes: BTreeMap::new(),
             sessions: vec![None; steps],
             artifacts: artifacts.iter().map(|m| (m.id, m.clone())).collect(),
             pending_pause: None,
@@ -271,22 +291,24 @@ impl Replayer<'_> {
                 }
                 Ok(())
             }
-            Record::EvidenceCommand { attempt, .. }
-            | Record::EvidenceResult { attempt, .. }
-            | Record::Retry { attempt, .. } => self.attempt(*attempt).map(|_| ()),
+            Record::EvidenceCommand { attempt, .. } | Record::EvidenceResult { attempt, .. } => {
+                self.attempt(*attempt).map(|_| ())
+            }
+            Record::Retry {
+                attempt,
+                count,
+                eligible_at,
+                ..
+            } => {
+                self.attempt(*attempt)?;
+                self.state.retry.insert(*attempt, (*count, *eligible_at));
+                Ok(())
+            }
             Record::AttemptFinished {
                 attempt,
                 outcome,
                 candidate,
-            } => {
-                self.open_attempt(*attempt)?;
-                if let Some(candidate) = candidate {
-                    self.commit(*candidate)?;
-                }
-                self.accept(*attempt, outcome)?;
-                self.attempt(*attempt)?.state = AttemptState::Finished;
-                Ok(())
-            }
+            } => self.attempt_finished(*attempt, outcome, *candidate),
             Record::AttemptFailed { attempt, failure } => {
                 self.open_attempt(*attempt)?;
                 self.attempt(*attempt)?.state = AttemptState::Failed(failure.clone());
@@ -320,6 +342,7 @@ impl Replayer<'_> {
                 if let Decision::Adopt { candidate } = decision {
                     self.commit(*candidate)?;
                 }
+                self.past_the_limit(decision);
                 self.state.decisions_since_pause.push(decision.clone());
                 Ok(())
             }
@@ -384,6 +407,24 @@ impl Replayer<'_> {
                 },
             },
         );
+        Ok(())
+    }
+
+    fn attempt_finished(
+        &mut self,
+        attempt: AttemptId,
+        outcome: &Accepted,
+        candidate: Option<CandidateId>,
+    ) -> Result<(), String> {
+        self.open_attempt(attempt)?;
+        if let Some(candidate) = candidate {
+            self.commit(candidate)?;
+        }
+        self.accept(attempt, outcome)?;
+        self.attempt(attempt)?.state = AttemptState::Finished;
+        self.state
+            .outcomes
+            .insert(attempt, (outcome.clone(), candidate));
         Ok(())
     }
 
@@ -533,6 +574,43 @@ impl Replayer<'_> {
         }
         self.state.tip = id;
         Ok(())
+    }
+
+    /// Applies a `continue` or `rounds N` taken at a round limit or a stall.
+    /// A round decision is for the rejector whose jump the run waits to take;
+    /// `rounds N` never sets a cap below the jumps already taken, so the
+    /// pending jump is always taken. A stall decision waives exactly the stall
+    /// the run paused on. Only the first such decision under a pause counts,
+    /// so a decision logged twice does not grant two rounds.
+    fn past_the_limit(&mut self, decision: &Decision) {
+        let reason = self.state.pending_pause;
+        let already = self
+            .state
+            .decisions_since_pause
+            .iter()
+            .any(|d| matches!(d, Decision::Continue | Decision::Rounds { .. }));
+        if already || !matches!(reason, Some(PauseReason::RoundLimit | PauseReason::Stalled)) {
+            return;
+        }
+        let rejector = crate::machine::revising_rejector(self.def, &self.state);
+        match (reason, decision, rejector) {
+            (Some(PauseReason::RoundLimit), Decision::Continue, Some(rejector)) => {
+                let extra = self.state.extra_rounds.entry(rejector).or_insert(0);
+                *extra = extra.saturating_add(1);
+            }
+            (_, Decision::Rounds { n }, Some(rejector)) => {
+                let jumps = self.state.jumps.get(&rejector).copied().unwrap_or(0);
+                self.state.round_caps.insert(rejector, (*n).max(jumps));
+                self.state.extra_rounds.remove(&rejector);
+            }
+            _ => {}
+        }
+        if reason == Some(PauseReason::Stalled)
+            && matches!(decision, Decision::Continue | Decision::Rounds { .. })
+            && let Some(point) = crate::machine::stall_point(self.def, &self.state)
+        {
+            self.state.stall_waived.insert(point);
+        }
     }
 
     fn resume_from_pause(&mut self) {
