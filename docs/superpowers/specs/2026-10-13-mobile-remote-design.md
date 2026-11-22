@@ -1,5 +1,15 @@
 # Octet on your phone: a hub and a mobile app for live sessions — design
 
+> **Superseded in part (2026-11-19).** The transport and pairing described here, which
+> depend on Tailscale, are replaced by [the relay connectivity
+> design](2026-11-19-relay-connectivity-design.md): the hub no longer listens on
+> loopback or sits behind `tailscale serve`; `owner.rs`, the tailnet-login gate, the
+> `Origin` check and the "published" state are gone; a phone is a key pair, not a device
+> token; a Mac is named by its channel id, not its hostname; and pairing is `octet pair`
+> with a confirmation at the Mac. The bridge, the hub's session model, the wire frames and
+> push stand as written. The current guide is
+> [Use Octet from your phone](../../remote-control.md).
+
 **Date:** 2026-10-13. **Branch:** `feat/mobile-remote`.
 **Builds on:** `/remote-control` and [Use Octet from your phone](../../remote-control.md) (tmux,
 Tailscale SSH, mosh); the earlier evaluation in

@@ -1,25 +1,25 @@
-// The app's real HubClient against the real `octet hub` binary: a fake bridge (a Unix socket, a
-// registration and a journal, written the way the terminal UI writes them) stands in for a session.
+// The app's real HubClient, through the real `octet-relay`, against the real `octet hub` binary:
+// the phone's end of the encrypted channel (src/client/secureSocket.ts) over Node's WebSocket,
+// paired the way the app pairs (the owner's yes given on the hub's control socket, as `octet pair`
+// gives it), and a fake bridge (a Unix socket, a registration and a journal, written the way the
+// terminal UI writes them) standing in for a session.
 //
-// Test-only fakes, all in temp directories that afterAll removes:
-// - `tailscale` on the hub's PATH answers `serve status --json` with the hub's own port, so the
-//   hub sees itself as published. Nothing here touches the real Tailscale. The hub tries
-//   `/Applications/Tailscale.app/...` if `tailscale` on PATH fails (crates/octet-hub/src/owner.rs), so
-//   the stand-in logs every call it gets and the test asserts the lookup reached it and nothing else
-//   was asked of it; a stand-in that fails would fall through to the real app, and so fails the test.
+// Test-only stand-ins, all in temp directories that afterAll removes:
+// - the relay is the built binary, on a free loopback port; a debug hub dials it over `ws://`
+//   (`OCTET_HUB_RELAY_URL`, honoured by debug builds only), and makes a version 0 pairing link,
+//   which the app takes in a development build.
 // - `OCTET_HUB_PUSH_URL` points the hub's pushes at a local HTTP server instead of exp.host (the
-//   hub honours it only for `http://127.0.0.1:<port>`). The hub posts with `curl`, so the real
-//   one stays on its PATH behind the stand-in directory. Nothing here reaches Expo.
+//   hub honours it only for `http://127.0.0.1:<port>`). The hub posts with `curl`. Nothing here
+//   reaches Expo.
 // - `OCTET_HUB_APNS_URL` (honoured by debug builds only, for `http://127.0.0.1:<port>`) points the
 //   hub's Live Activity sends at a local HTTP server instead of APNs, and `hub.json` names a test
 //   key (crates/octet-hub/tests/data/apns-test.p8, which signs nothing real) in a private 0600 copy.
 //   `curl --http2` against plain http speaks HTTP/1.1, which the stand-in answers. Nothing here
 //   reaches Apple.
-// - the WebSocket factory sets `Tailscale-User-Login`, which `tailscale serve` adds in real life.
-//   The app itself never sends that header.
-// The last part runs two hubs at once, as two Macs, each with its own run dir, port, journal dir,
-// stand-in `tailscale` (its own host) and fake bridge, and the phone's store fed by both.
+// The last part runs two hubs at once on one relay, as two Macs, each with its own data dir,
+// journal and fake bridge, and the phone's store fed by both.
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import http from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, appendFileSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import net from "node:net";
@@ -31,14 +31,36 @@ import WebSocket from "ws";
 import { type BatchItem, HubClient } from "../src/client/HubClient";
 import { activityRegistration } from "../src/activityModel";
 import { sendVia } from "../src/sendVia";
-import { parsePairLink } from "../src/client/link";
-import { keyFor, keyOf, linksOf, tapKey } from "../src/macs";
+import { fromHex, parsePairLink, type PairLink } from "../src/client/link";
+import { Fleet, type Keychain } from "../src/hub";
+import { newKeyPair, type KeyPair } from "../src/client/noise";
+import { secureSocketFactory } from "../src/client/secureSocket";
+import { keyOf, linksOf, tapKey } from "../src/macs";
+import { tapFromData } from "../src/notifications";
 import type { EventFrame, ToPhone } from "../src/protocol";
 import { connectStore, createOctetStore, entriesNow, watch } from "../src/store";
 import { nodeSocketFactory } from "./nodeSocket";
 
-const BINARY = path.resolve(__dirname, "../../../target/debug/octet");
-const OWNER = "test@example";
+// The Fleet keeps its settings in async-storage, here in memory.
+jest.mock("@react-native-async-storage/async-storage", () =>
+  jest.requireActual("@react-native-async-storage/async-storage/jest/async-storage-mock"),
+);
+
+// Each Fleet link listens for a new push token; none comes here, and nothing reaches a native module.
+jest.mock("expo-notifications", () => ({
+  addPushTokenListener: () => ({ remove: () => undefined }),
+}));
+
+// expo-crypto's randomness is native; here it is Node's.
+jest.mock("expo-crypto", () => ({
+  getRandomBytes: (count: number) => Uint8Array.from(jest.requireActual<typeof import("node:crypto")>("node:crypto").randomBytes(count)),
+}));
+
+/** Where cargo puts its builds: `CARGO_TARGET_DIR` when set, as cargo reads it, or the workspace's
+ * `target`. */
+const TARGET = process.env.CARGO_TARGET_DIR ? path.resolve(process.env.CARGO_TARGET_DIR) : path.resolve(__dirname, "../../../target");
+const BINARY = path.join(TARGET, "debug/octet");
+const RELAY_BINARY = path.join(TARGET, "debug/octet-relay");
 const PHONE = "Contract phone";
 const JOURNAL = "session-1-1.jsonl";
 const PUSH_TOKEN = "ExponentPushToken[contract-test-token]";
@@ -51,7 +73,18 @@ const TEAM_ID = "ABCDE12345";
 const KEY_ID = "KEY1234567";
 /** The test key: a P-256 key that signs nothing real (its file says so above the PEM block). */
 const TEST_KEY = path.resolve(__dirname, "../../../crates/octet-hub/tests/data/apns-test.p8");
-const run = existsSync(BINARY) ? describe : describe.skip;
+const MISSING = [BINARY, RELAY_BINARY].filter((binary) => !existsSync(binary));
+const run = MISSING.length === 0 ? describe : describe.skip;
+
+// `npm run contract` (which `make mobile-contract` and CI run) sets OCTET_CONTRACT=1: a run meant
+// to test fails without its binaries, never skips.
+if (MISSING.length > 0 && process.env.OCTET_CONTRACT === "1") {
+  describe("the contract test's binaries", () => {
+    it("are built", () => {
+      throw new Error(`missing ${MISSING.join(" and ")}: run scripts/rust-env.sh cargo build -p octet -p octet-relay`);
+    });
+  });
+}
 
 type Obj = Record<string, unknown>;
 
@@ -76,12 +109,12 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-/** One request on the hub's control socket and its one-line answer. */
-function control(socket: string, request: Obj): Promise<Obj> {
+/** One request on the hub's control socket and its one-line answer, within `ms`. */
+function control(socket: string, request: Obj, ms = 15_000): Promise<Obj> {
   return new Promise((resolve, reject) => {
     const conn = net.createConnection(socket);
     let text = "";
-    conn.setTimeout(5000, () => conn.destroy(new Error("the control socket did not answer")));
+    conn.setTimeout(ms, () => conn.destroy(new Error("the control socket did not answer")));
     conn.on("connect", () => conn.write(`${JSON.stringify(request)}\n`));
     conn.on("data", (chunk) => {
       text += chunk.toString();
@@ -96,6 +129,94 @@ function control(socket: string, request: Obj): Promise<Obj> {
     });
     conn.on("error", reject);
   });
+}
+
+/** Node's randomness, for the phone's keys and handshakes. */
+const random = (n: number): Uint8Array => Uint8Array.from(randomBytes(n));
+
+/** The relay binary, serving on a free loopback port until stopped. */
+interface RelayProcess {
+  /** Its address, as a hub dials it: `ws://127.0.0.1:<port>`. */
+  url: string;
+  child: ChildProcess;
+  log: () => string;
+}
+
+/** Starts `octet-relay` on a free port and waits for its health check to answer. */
+async function startRelay(): Promise<RelayProcess> {
+  const port = await freePort();
+  const child = spawn(RELAY_BINARY, [], { env: { ...process.env, PORT: String(port) }, stdio: ["ignore", "pipe", "pipe"] });
+  process.once("exit", () => child.kill("SIGKILL"));
+  let out = "";
+  child.stdout?.on("data", (d: Buffer) => (out += d.toString()));
+  child.stderr?.on("data", (d: Buffer) => (out += d.toString()));
+  const healthy = () =>
+    new Promise<boolean>((resolve) => {
+      const req = http.get({ host: "127.0.0.1", port, path: "/healthz" }, (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      });
+      req.on("error", () => resolve(false));
+    });
+  const end = Date.now() + 8000;
+  while (!(await healthy())) {
+    if (!running(child)) throw new Error(`the relay exited\n${out}`);
+    if (Date.now() > end) throw new Error(`timed out waiting for the relay\n${out}`);
+    await sleep(50);
+  }
+  return { url: `ws://127.0.0.1:${port}`, child, log: () => out };
+}
+
+/** Where a phone reaches a hub through the relay, and as whom: what a pairing link gives, with the
+ * phone's own key. */
+interface Identity {
+  link: PairLink;
+  key: KeyPair;
+}
+
+/** A client for the hub `identity.link` names, as `identity.key`, over relay sockets pushed on
+ * `opened` (their close codes on `codes`). */
+function clientOf(identity: Identity, opened: WebSocket[], extra: { background?: boolean; codes?: number[] } = {}): HubClient {
+  const hubKey = fromHex(identity.link.hubKey) ?? new Uint8Array(0);
+  return new HubClient({
+    url: identity.link.relay,
+    channel: identity.link.channel,
+    hubKey,
+    key: identity.key,
+    factory: secureSocketFactory({ hubKey, device: identity.key }, nodeSocketFactory(opened, extra.codes), random),
+    ...(extra.background ? { background: true } : {}),
+  });
+}
+
+/** A pairing id as the hub makes them: 32 random lowercase hex digits. */
+const RANDOM_ID = /^[0-9a-f]{32}$/;
+
+/**
+ * Pairs a phone called `name` with the hub whose control socket is `socket`, as the app does and
+ * as `octet pair` answers: a pairing link and its attempt from the hub (once the relay has it), the phone's `pair`
+ * with a key made for it, the question the hub holds it for (whose code the phone was shown too),
+ * and the owner's yes. Returns the phone's identity and what the hub and the phone each said.
+ */
+async function pairThrough(socket: string, name: string, opened: WebSocket[]) {
+  const opening = await control(socket, { type: "pair_secret" });
+  // The opening and the held pairing are named by random ids, never counts.
+  expect(opening.attempt).toMatch(RANDOM_ID);
+  const text = String(opening.link);
+  expect(text).toMatch(/^octet:\/\/pair\/[A-Za-z0-9_-]+$/);
+  // A debug hub dials the relay over ws: only a development build of the app takes its link.
+  expect(parsePairLink(text, false)).toBeNull();
+  const link = parsePairLink(text, true);
+  if (!link) throw new Error(`not a pairing link: ${text}`);
+  const identity: Identity = { link, key: newKeyPair(random) };
+  const pairing = clientOf(identity, opened);
+  const codes: string[] = [];
+  const paired = pairing.pair(link.secret, name, "ios", (code) => codes.push(code));
+  // The wait names the opening it is for, as `octet pair` does.
+  const question = await control(socket, { type: "pair_wait", attempt: opening.attempt });
+  expect(question.pending).toMatch(RANDOM_ID);
+  await until("the phone to be shown the code", () => codes.length > 0);
+  const answer = await control(socket, { type: "pair_answer", pending: question.pending, accept: true });
+  return { identity, question, codes, answer, paired: await paired };
 }
 
 /** A local stand-in for Expo's push endpoint: keeps every body posted and answers `ok`. */
@@ -238,11 +359,9 @@ async function stopChild(child: ChildProcess | null): Promise<void> {
 
 run("the app's hub client against the real octet hub", () => {
   let root = "";
-  let binDir = "";
-  let standInLog = "";
+  let relay: RelayProcess | null = null;
   let hub: ChildProcess | null = null;
   let hubLog = "";
-  let port = 0;
   let sessionId = "";
   /** The session's workspace: a git repository with one commit, made in the temp root. */
   let workspace = "";
@@ -251,9 +370,8 @@ run("the app's hub client against the real octet hub", () => {
   let apnsFake: ApnsFake | null = null;
   let seq = 0;
   let client: HubClient | null = null;
-  /** The pairing link the Mac shows for the secret the phone paired with, as the terminal UI
-   * builds it (crates/octet-tui/src/remote.rs). */
-  let pairLink = "";
+  /** The phone's identity from its pairing: the link it scanned, and its key. */
+  let identity: Identity | null = null;
   const sockets: WebSocket[] = [];
   const batches: BatchItem[] = [];
 
@@ -271,27 +389,12 @@ run("the app's hub client against the real octet hub", () => {
   for (const name of Object.keys(gitEnv)) if (name.startsWith("GIT_")) delete gitEnv[name];
   const git = (args: string[]): string => execFileSync("git", ["-C", workspace, ...args], { encoding: "utf8", env: gitEnv });
 
+  const sock = () => path.join(root, "run", "hub.sock");
+
   beforeAll(async () => {
     root = mkdtempSync(path.join(tmpdir(), "omc"));
-    binDir = mkdtempSync(path.join(tmpdir(), "omb"));
-    const sock = path.join(root, "run", "hub.sock");
-    if (sock.length > 100) throw new Error(`the temp path is too long for a Unix socket: ${sock}`);
-    port = await freePort();
-
-    // A stand-in `tailscale`: `serve status --json` shows the hub published; anything else fails.
-    // Each call's arguments are appended to `tailscale.log`, for the test to check.
-    const serveStatus = JSON.stringify({
-      TCP: { "443": { HTTPS: true } },
-      Web: { "mac.test.ts.net:443": { Handlers: { "/": { Proxy: `http://127.0.0.1:${port}` } } } },
-    });
-    const script = path.join(binDir, "tailscale");
-    standInLog = path.join(binDir, "tailscale.log");
-    writeFileSync(
-      script,
-      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${standInLog}'\n` +
-        `if [ "$1 $2 $3" = "serve status --json" ]; then printf '%s' '${serveStatus}'; else exit 1; fi\n`,
-    );
-    chmodSync(script, 0o755);
+    if (sock().length > 100) throw new Error(`the temp path is too long for a Unix socket: ${sock()}`);
+    relay = await startRelay();
 
     // The fake bridge: a journal with three records, a socket, and the registration the hub finds.
     const runDir = path.join(root, "run");
@@ -351,10 +454,10 @@ run("the app's hub client against the real octet hub", () => {
       JSON.stringify({ apns: { team_id: TEAM_ID, key_id: KEY_ID, key_path: keyPath, sandbox: true } }),
     );
 
-    hub = spawn(BINARY, ["hub", "--journal-dir", root, "--port", String(port), "--owner", OWNER], {
+    hub = spawn(BINARY, ["hub", "--journal-dir", root], {
       env: {
         ...process.env,
-        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        OCTET_HUB_RELAY_URL: relay.url,
         // curl must reach the local fake directly, whatever proxy the machine's environment names.
         NO_PROXY: "127.0.0.1",
         no_proxy: "127.0.0.1",
@@ -368,7 +471,7 @@ run("the app's hub client against the real octet hub", () => {
     hub.stderr?.on("data", (d: Buffer) => (hubLog += d.toString()));
     await untilAsync("the hub's control socket", async () => {
       try {
-        return (await control(sock, { type: "status" })).published === true;
+        return typeof (await control(sock(), { type: "status" })).relay === "string";
       } catch {
         return false;
       }
@@ -382,54 +485,73 @@ run("the app's hub client against the real octet hub", () => {
     pushFake?.close();
     apnsFake?.close();
     await stopChild(hub);
+    await stopChild(relay?.child ?? null);
     if (root) rmSync(root, { recursive: true, force: true });
-    if (binDir) rmSync(binDir, { recursive: true, force: true });
   });
 
   async function untilAsync(what: string, read: () => Promise<boolean>, ms = 8000): Promise<void> {
     const end = Date.now() + ms;
     while (!(await read())) {
-      if (Date.now() > end) throw new Error(`timed out waiting for ${what}\n${hubLog}`);
+      if (Date.now() > end) throw new Error(`timed out waiting for ${what}\n${hubLog}\n${relay?.log() ?? ""}`);
       await sleep(50);
     }
   }
 
   // The tests below run in order, on purpose, and share state: the paired client, the session's
   // journal and the events collected so far. Each builds on the one before; run the file whole.
-  it("refuses a connection without the tailnet login header, as the app never sends it", async () => {
-    const status = await new Promise<number>((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${port}/`);
-      ws.on("unexpected-response", (_req, res) => resolve(res.statusCode ?? 0));
-      ws.on("open", () => reject(new Error("the hub let a login-less connection in")));
-      ws.on("error", () => undefined);
-    });
-    expect(status).toBe(403);
+  it("a phone to a channel no hub holds is closed 4404 by the relay: offline, never unpaired", async () => {
+    // A hub nobody has paired with makes no outbound connection, so no channel is held yet.
+    expect((await control(sock(), { type: "status" })).relay).toBe("off");
+    const nowhere: Identity = {
+      link: { relay: `${relay?.url ?? ""}/`, channel: Buffer.from(random(32)).toString("hex"), hubKey: Buffer.from(newKeyPair(random).publicKey).toString("hex"), secret: "" },
+      key: newKeyPair(random),
+    };
+    const codes: number[] = [];
+    const lost = clientOf(nowhere, sockets, { codes });
+    lost.start();
+    await until("the relay's close", () => codes.includes(4404));
+    expect(lost.state).toBe("offline");
+    expect(lost.key).not.toBeNull();
+    lost.stop();
   });
 
-  it("pairs, says hello and lists the session", async () => {
-    const secret = await control(path.join(root, "run", "hub.sock"), { type: "pair_secret" });
-    expect(typeof secret.secret).toBe("string");
-    expect(secret.url).toBe("https://mac.test.ts.net");
-    pairLink = `${String(secret.url).replace(/\/$/, "")}/#pair=${String(secret.secret)}`;
-    // The hub's publish lookup went to the stand-in, and asked it only the one read-only question.
-    const asked = readFileSync(standInLog, "utf8").split("\n").filter((line) => line !== "");
-    expect(asked.length).toBeGreaterThan(0);
-    expect(asked.every((line) => line === "serve status --json")).toBe(true);
+  it("pairs through the relay: the Mac and the phone show the same code, and the phone says hello on a connection of its own", async () => {
+    const before = sockets.length;
+    const paired = await pairThrough(sock(), PHONE, sockets);
+    identity = paired.identity;
+    // The hub held the phone with a code of six digits, and the phone was shown that code: the
+    // hub's, never one it made.
+    expect(paired.question).toMatchObject({ code: expect.stringMatching(/^[0-9]{6}$/), name: PHONE, platform: "ios", replaces: false });
+    expect(paired.codes).toEqual([paired.question.code]);
+    expect(paired.answer).toEqual({ paired: true, device: PHONE });
+    expect(paired.paired).toEqual({ device: PHONE, name: expect.any(String) });
+    expect(paired.paired.name).not.toBe("");
+    // The hub closed the connection it paired on.
+    const pairingSocket = sockets[before];
+    await until("the pairing socket to close", () => pairingSocket?.readyState === WebSocket.CLOSED);
+    expect((await control(sock(), { type: "status" })).devices).toBe(1);
 
-    const factory = nodeSocketFactory(OWNER, sockets);
-    const url = `ws://127.0.0.1:${port}/`;
-    const pairing = new HubClient({ url, token: null, factory });
-    const paired = await pairing.pair(String(secret.secret), PHONE, "ios");
-    expect(paired.device).toBe(PHONE);
-    expect(paired.token).toHaveLength(64);
-
-    client = new HubClient({ url, token: paired.token, factory });
+    client = clientOf(paired.identity, sockets);
     client.onBatch((items) => batches.push(...items));
     client.start();
     await until("the client to be ready", () => client?.state === "ready");
+    expect(sockets.length).toBe(before + 2);
     const sessions = await until("the sessions frame", () => frames("sessions")[0]);
     if (sessions.type !== "sessions") throw new Error("not sessions");
     expect(sessions.sessions.map((s) => [s.id, s.engine])).toEqual([[sessionId, "claude"]]);
+  });
+
+  it("a hub key the link did not name never gets in: the handshake fails and nothing is welcomed", async () => {
+    if (!identity) throw new Error("not paired");
+    const forged: Identity = { link: { ...identity.link, hubKey: Buffer.from(newKeyPair(random).publicKey).toString("hex") }, key: identity.key };
+    const states: string[] = [];
+    const impostor = clientOf(forged, sockets);
+    impostor.onState((state) => states.push(state));
+    impostor.start();
+    await until("a failed attempt", () => states.includes("offline"), 10_000);
+    expect(states).not.toContain("authenticating");
+    expect(states).not.toContain("ready");
+    impostor.stop();
   });
 
   it("replays a session, then streams a live event", async () => {
@@ -468,7 +590,8 @@ run("the app's hub client against the real octet hub", () => {
     const before = eventSeqs();
     expect(before).toEqual([0, 1, 2, 3, 4]);
     const connections = sockets.length;
-    sockets[sockets.length - 1]?.terminate(); // the network drops
+    // The network drops: the client's socket is the one still open.
+    for (const ws of sockets) if (ws.readyState === WebSocket.OPEN) ws.terminate();
     await until("the client to see it", () => client?.state !== "ready");
     journal("text", "while away"); // 5
     journal("text", "still away"); // 6
@@ -573,24 +696,22 @@ run("the app's hub client against the real octet hub", () => {
         to: PUSH_TOKEN,
         title: "Octet",
         body: "Approval waiting",
-        // The host the hub is published at (the stand-in's), which the phone paired with.
-        data: { session: sessionId, mac: "mac.test.ts.net" },
+        // The Mac by its channel id: every Mac now shares the relay's host.
+        data: { session: sessionId, mac: identity?.link.channel },
         sound: "default",
         priority: "high",
         channelId: "approvals",
       },
     ]);
-    // A tap routes by that host, through the resolver the app uses (`tapKey` on `keyFor`), to the
-    // pairing made from this hub's own pairing link: the host match is the whole of push routing.
-    const [pushed] = JSON.parse(body) as [{ data: { mac: string; session: string } }];
-    const hubUrl = parsePairLink(pairLink)?.url;
-    expect(hubUrl).toBe("wss://mac.test.ts.net/");
+    // A tap routes by that channel id, through the resolvers the app uses (`tapFromData`, then
+    // `tapKey` on `keyFor`), to the pairing made from this hub's own pairing link, and not to
+    // another Mac's on the same relay: the channel is the whole of push routing.
+    const [pushed] = JSON.parse(body) as [{ data: unknown }];
     const pairings = [
-      { id: "m0000000c", hubUrl: "wss://other.test.ts.net/" },
-      { id: "m0000000d", hubUrl: hubUrl ?? "" },
+      { id: "m0000000c", channel: randomBytes(32).toString("hex") },
+      { id: "m0000000d", channel: identity?.link.channel ?? "" },
     ];
-    expect(keyFor(pairings, pushed.data.mac, pushed.data.session)).toBe(keyOf("m0000000d", sessionId));
-    expect(tapKey({ host: pushed.data.mac, session: pushed.data.session }, pairings, () => false)).toBe(keyOf("m0000000d", sessionId));
+    expect(tapKey(tapFromData(pushed.data), pairings, () => false)).toBe(keyOf("m0000000d", sessionId));
     // Nothing of the approval, the workspace, the model or the engine is in it, and it came once.
     for (const secret of ["/work", workspace, "rm -rf", "secret-dir", "private", "opus", "claude"]) {
       expect(body).not.toContain(secret);
@@ -639,8 +760,7 @@ run("the app's hub client against the real octet hub", () => {
         to: PUSH_TOKEN,
         title: "Octet",
         body: "Session error",
-        // The host the hub is published at (the stand-in's), which the phone paired with.
-        data: { session: sessionId, mac: "mac.test.ts.net" },
+        data: { session: sessionId, mac: identity?.link.channel },
         priority: "high",
         channelId: "errors",
       },
@@ -691,7 +811,7 @@ run("the app's hub client against the real octet hub", () => {
       aps: {
         timestamp: expect.any(Number),
         event: "start",
-        "content-state": { kind: "approval", session: sessionId, mac: "mac.test.ts.net", since: expect.any(Number), approvals: 1 },
+        "content-state": { kind: "approval", session: sessionId, mac: identity?.link.channel, since: expect.any(Number), approvals: 1 },
         "attributes-type": "OctetActivity",
         attributes: {},
         alert: { title: "Octet", body: "Approval waiting" },
@@ -716,12 +836,8 @@ run("the app's hub client against the real octet hub", () => {
     // The app, woken in the background with that activity's token, hands it over as
     // Fleet.sendInBackground does: a connection of its own whose hello says `background: true` (so
     // the hub doesn't count it as the app in front), which registers, and closes.
-    const handOver = new HubClient({
-      url: `ws://127.0.0.1:${port}/`,
-      token: client?.token ?? null,
-      factory: nodeSocketFactory(OWNER, sockets),
-      background: true,
-    });
+    if (!identity) throw new Error("not paired");
+    const handOver = clientOf(identity, sockets, { background: true });
     handOver.start();
     await until("the hand-over connection", () => handOver.state === "ready");
     const both = activityRegistration({ token: ACTIVITY_TOKEN, start: START_TOKEN });
@@ -734,7 +850,7 @@ run("the app's hub client against the real octet hub", () => {
     const updated = await until("the update to the handed-over token", () => apnsFake?.requests.find((r) => r.path === `/3/device/${ACTIVITY_TOKEN}`), 15_000);
     const update = JSON.parse(updated.body) as { aps: Record<string, unknown> };
     expect(update.aps.event).toBe("update");
-    expect(update.aps["content-state"]).toEqual({ kind: "done", session: sessionId, mac: "mac.test.ts.net", since: expect.any(Number), approvals: 0 });
+    expect(update.aps["content-state"]).toEqual({ kind: "done", session: sessionId, mac: identity.link.channel, since: expect.any(Number), approvals: 0 });
     expect(update.aps).not.toHaveProperty("alert");
     expect(update.aps["stale-date"]).toBe((update.aps.timestamp as number) + 900);
     for (const secret of ["/work", workspace, "opus", "claude", PHONE]) expect(updated.body).not.toContain(secret);
@@ -748,12 +864,7 @@ run("the app's hub client against the real octet hub", () => {
 
     // The phone turns the Live Activity off (here on a background connection, so the streaming
     // client's return below can't race it): the hub forgets the tokens and acks.
-    const off = new HubClient({
-      url: `ws://127.0.0.1:${port}/`,
-      token: client?.token ?? null,
-      factory: nodeSocketFactory(OWNER, sockets),
-      background: true,
-    });
+    const off = clientOf(identity, sockets, { background: true });
     off.start();
     await until("the clearing connection", () => off.state === "ready");
     expect(await off.request({ type: "clear_activity" })).toMatchObject({ type: "ack" });
@@ -773,24 +884,22 @@ run("the app's hub client against the real octet hub", () => {
     });
     expect(code).toBe(0);
     await until("the client to be unpaired", () => client?.state === "unpaired", 10_000);
-    expect(client?.token).toBeNull();
+    expect(client?.key).toBeNull();
   });
 });
 
-/** One more real hub, as one Mac of several: its own temp root (journal dir and run dir), port,
- * stand-in `tailscale` publishing it at `host`, and fake bridge with session `sessionId`. */
+/** One more real hub, as one Mac of several: its own temp root (data dir, run dir and journal),
+ * dialling the relay at `relay`, and a fake bridge with session `sessionId`. */
 interface MacHub {
-  host: string;
+  name: string;
   root: string;
-  binDir: string;
-  port: number;
   sessionId: string;
   bridge: FakeBridge;
   child: ChildProcess;
   log: () => string;
   /** Appends a record to the session's journal; returns its seq. */
   journal: (type: string, data: unknown) => number;
-  control: (request: Obj) => Promise<Obj>;
+  socket: string;
 }
 
 /** What a start made, filled in as it goes, so that a test can check a failed start left none of
@@ -804,20 +913,19 @@ interface StartSeen {
 interface StartOptions {
   /** The `octet` to run; the built one unless a test gives a stand-in. */
   binary?: string;
-  /** How long to wait for the hub to say it is published. */
+  /** How long to wait for the hub's control socket to answer. */
   readyMs?: number;
   seen?: StartSeen;
 }
 
-/** Starts `octet hub` on a fresh port and temp root, published (to the stand-in) at `host`, with
- * a fake bridge whose one session is `${pid}-1790000000`: two of these list the same raw id. A
- * start that fails (the hub exits, or never says it is published within `readyMs`) stops the
- * child, closes the bridge and removes both temp dirs before it rejects, so nothing is left to
+/** Starts `octet hub` on a fresh temp root, dialling `relay` once it has something to dial for,
+ * with a fake bridge whose one session is `${pid}-1790000000`: two of these list the same raw id.
+ * A start that fails (the hub exits, or its control socket never answers within `readyMs`) stops
+ * the child, closes the bridge and removes the temp dir before it rejects, so nothing is left to
  * keep jest running. */
-async function startMacHub(host: string, { binary = BINARY, readyMs = 8000, seen = {} }: StartOptions = {}): Promise<MacHub> {
+async function startMacHub(name: string, relay: string, { binary = BINARY, readyMs = 8000, seen = {} }: StartOptions = {}): Promise<MacHub> {
   const root = mkdtempSync(path.join(tmpdir(), "omd"));
-  const binDir = mkdtempSync(path.join(tmpdir(), "omb"));
-  seen.dirs = [root, binDir];
+  seen.dirs = [root];
   let bridge: FakeBridge | null = null;
   let child: ChildProcess | null = null;
   let out = "";
@@ -826,23 +934,12 @@ async function startMacHub(host: string, { binary = BINARY, readyMs = 8000, seen
     const sock = path.join(runDir, "hub.sock");
     if (sock.length > 100) throw new Error(`the temp path is too long for a Unix socket: ${sock}`);
     mkdirSync(runDir, { recursive: true });
-    const port = await freePort();
-    const serveStatus = JSON.stringify({
-      TCP: { "443": { HTTPS: true } },
-      Web: { [`${host}:443`]: { Handlers: { "/": { Proxy: `http://127.0.0.1:${port}` } } } },
-    });
-    const script = path.join(binDir, "tailscale");
-    writeFileSync(
-      script,
-      `#!/bin/sh\nif [ "$1 $2 $3" = "serve status --json" ]; then printf '%s' '${serveStatus}'; else exit 1; fi\n`,
-    );
-    chmodSync(script, 0o755);
     let seq = 0;
     const journal = (type: string, data: unknown): number => {
       appendFileSync(path.join(root, JOURNAL), `${JSON.stringify({ format: "octet-preview-1", seq, type, data })}\n`);
       return seq++;
     };
-    journal("text", `hello from ${host}`);
+    journal("text", `hello from ${name}`);
     const pid = process.pid;
     const sessionId = `${pid}-1790000000`;
     bridge = new FakeBridge(path.join(runDir, `${pid}.sock`), (line) => ({ v: 1, type: "ack", req: line.req, message: "answered" }));
@@ -864,8 +961,8 @@ async function startMacHub(host: string, { binary = BINARY, readyMs = 8000, seen
         from_phone: false,
       }),
     );
-    const started = spawn(binary, ["hub", "--journal-dir", root, "--port", String(port), "--owner", OWNER], {
-      env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}`, NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" },
+    const started = spawn(binary, ["hub", "--journal-dir", root], {
+      env: { ...process.env, OCTET_HUB_RELAY_URL: relay, NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     child = started;
@@ -875,22 +972,21 @@ async function startMacHub(host: string, { binary = BINARY, readyMs = 8000, seen
     started.stderr?.on("data", (d: Buffer) => (out += d.toString()));
     const end = Date.now() + readyMs;
     for (;;) {
-      const published = await control(sock, { type: "status" }).then(
-        (status) => status.published === true,
+      const answered = await control(sock, { type: "status" }, 1000).then(
+        (status) => typeof status.relay === "string",
         () => false,
       );
-      if (published) break;
-      if (!running(started)) throw new Error(`the hub at ${host} exited before it was published\n${out}`);
-      if (Date.now() > end) throw new Error(`timed out waiting for the hub at ${host}\n${out}`);
+      if (answered) break;
+      if (!running(started)) throw new Error(`the hub of ${name} exited before it answered\n${out}`);
+      if (Date.now() > end) throw new Error(`timed out waiting for the hub of ${name}\n${out}`);
       await sleep(50);
     }
     const hubBridge = bridge;
-    return { host, root, binDir, port, sessionId, bridge: hubBridge, child: started, log: () => out, journal, control: (request) => control(sock, request) };
+    return { name, root, sessionId, bridge: hubBridge, child: started, log: () => out, journal, socket: sock };
   } catch (error) {
     await stopChild(child);
     bridge?.close();
     rmSync(root, { recursive: true, force: true });
-    rmSync(binDir, { recursive: true, force: true });
     throw error;
   }
 }
@@ -900,13 +996,13 @@ async function stopMacHub(mac: MacHub | null): Promise<void> {
   mac.bridge.close();
   await stopChild(mac.child);
   rmSync(mac.root, { recursive: true, force: true });
-  rmSync(mac.binDir, { recursive: true, force: true });
 }
 
-run("two Macs: the phone's store fed by two real hubs", () => {
+run("two Macs on one relay: the phone's store fed by two real hubs", () => {
   /** The phone's ids for the two pairings. */
   const STUDIO = "m0000000a";
   const MINI = "m0000000b";
+  let relay: RelayProcess | null = null;
   let studio: MacHub | null = null;
   let mini: MacHub | null = null;
   const sockets: WebSocket[] = [];
@@ -914,15 +1010,14 @@ run("two Macs: the phone's store fed by two real hubs", () => {
   const clients = new Map<string, HubClient>();
   const links = linksOf(clients);
   const feeds = new Map<string, () => void>();
+  const channels = new Map<string, string>();
 
   /** Pairs with `mac`'s hub as the app does, and feeds the store from it as Mac `id`. */
   async function pairWith(id: string, mac: MacHub): Promise<HubClient> {
-    const secret = await mac.control({ type: "pair_secret" });
-    expect(secret.url).toBe(`https://${mac.host}`);
-    const factory = nodeSocketFactory(OWNER, sockets);
-    const url = `ws://127.0.0.1:${mac.port}/`;
-    const paired = await new HubClient({ url, token: null, factory }).pair(String(secret.secret), PHONE, "ios");
-    const client = new HubClient({ url, token: paired.token, factory });
+    const paired = await pairThrough(mac.socket, PHONE, sockets);
+    expect(paired.answer).toEqual({ paired: true, device: PHONE });
+    channels.set(id, paired.identity.link.channel);
+    const client = clientOf(paired.identity, sockets);
     clients.set(id, client);
     feeds.set(id, connectStore(store, client, { mac: id, links }));
     client.start();
@@ -932,8 +1027,10 @@ run("two Macs: the phone's store fed by two real hubs", () => {
   const transcript = (key: string): string => JSON.stringify(entriesNow(store, key));
 
   beforeAll(async () => {
+    relay = await startRelay();
+    const at = relay.url;
     // Each start is kept whether or not the other fails, so afterAll stops whichever came up.
-    const [a, b] = await Promise.allSettled([startMacHub("studio.test.ts.net"), startMacHub("mini.test.ts.net")]);
+    const [a, b] = await Promise.allSettled([startMacHub("studio", at), startMacHub("mini", at)]);
     studio = a.status === "fulfilled" ? a.value : null;
     mini = b.status === "fulfilled" ? b.value : null;
     for (const start of [a, b]) if (start.status === "rejected") throw start.reason;
@@ -944,14 +1041,17 @@ run("two Macs: the phone's store fed by two real hubs", () => {
     for (const off of feeds.values()) off();
     for (const ws of sockets) ws.terminate();
     await Promise.all([stopMacHub(studio), stopMacHub(mini)]);
+    await stopChild(relay?.child ?? null);
   });
 
   // In order, on purpose: each step builds on the one before.
-  it("lists both Macs' sessions, the same raw id keyed apart", async () => {
+  it("lists both Macs' sessions, the same raw id keyed apart, each Mac its own channel on the one relay", async () => {
     if (!studio || !mini) throw new Error("no hubs");
     expect(studio.sessionId).toBe(mini.sessionId);
     const a = await pairWith(STUDIO, studio);
     const b = await pairWith(MINI, mini);
+    expect(a.url).toBe(b.url);
+    expect(channels.get(STUDIO)).not.toBe(channels.get(MINI));
     await until("both links ready", () => a.state === "ready" && b.state === "ready");
     await until("both Macs listed", () => store.getState().listed.size === 2);
     const raw = studio.sessionId;
@@ -1007,8 +1107,85 @@ run("two Macs: the phone's store fed by two real hubs", () => {
   });
 });
 
+run("pairing a Mac again through the Fleet", () => {
+  let relay: RelayProcess | null = null;
+  let mac: MacHub | null = null;
+  let fleet: Fleet | null = null;
+  const sockets: WebSocket[] = [];
+  /** Every key pair the Fleet made, in order. */
+  const made: KeyPair[] = [];
+  const kept = new Map<string, string>();
+  const keychain: Keychain = {
+    get: async (key) => kept.get(key) ?? null,
+    set: async (key, value) => {
+      kept.set(key, value);
+    },
+    delete: async (key) => {
+      kept.delete(key);
+    },
+  };
+
+  beforeAll(async () => {
+    relay = await startRelay();
+    mac = await startMacHub("studio", relay.url);
+  });
+
+  afterAll(async () => {
+    fleet?.setForeground(false);
+    for (const ws of sockets) ws.terminate();
+    await stopMacHub(mac);
+    await stopChild(relay?.child ?? null);
+  });
+
+  /** Pairs the Fleet through a fresh link from the hub, typing `name`; returns what the hub asked
+   * its owner. */
+  async function pairAs(name: string): Promise<Obj> {
+    if (!fleet || !mac) throw new Error("no fleet");
+    const opening = await control(mac.socket, { type: "pair_secret" });
+    const paired = fleet.pair(String(opening.link), name);
+    const question = await control(mac.socket, { type: "pair_wait", attempt: opening.attempt });
+    expect(question.pending).toMatch(RANDOM_ID);
+    const answer = await control(mac.socket, { type: "pair_answer", pending: question.pending, accept: true });
+    expect(answer).toMatchObject({ paired: true });
+    expect(await paired).toEqual({ ok: true, macName: expect.any(String) });
+    return question;
+  }
+
+  it("a second pairing under another typed name keeps the first name: the hub holds one device, and the old key is refused", async () => {
+    if (!mac) throw new Error("no hub");
+    fleet = new Fleet({
+      factory: (keys) => secureSocketFactory(keys, nodeSocketFactory(sockets), random),
+      newKey: () => {
+        const key = newKeyPair(random);
+        made.push(key);
+        return key;
+      },
+      keychain,
+      platform: "ios",
+      newId: () => "m0000000c",
+    });
+    await fleet.init();
+    fleet.setForeground(true);
+
+    expect(await pairAs("iPhone")).toMatchObject({ name: "iPhone", replaces: false });
+    const again = await pairAs("Work iPhone");
+    expect(again).toMatchObject({ name: "iPhone", replaces: true });
+    expect((await control(mac.socket, { type: "status" })).devices).toBe(1);
+
+    // The first key, as a phone that kept it would use it: the hub no longer knows it.
+    const [first] = made;
+    const current = fleet.links.client("m0000000c");
+    if (!first || !current) throw new Error("not paired");
+    const link: PairLink = { relay: current.url, channel: current.channel, hubKey: Buffer.from(current.hubKey).toString("hex"), secret: "" };
+    const old = clientOf({ link, key: first }, sockets);
+    old.start();
+    await until("the old key to be refused", () => old.state === "unpaired", 10_000);
+    old.stop();
+  });
+});
+
 // The helpers above, on their own: a start that fails leaves nothing behind, and stopping a hub
-// that already died returns at once. Neither needs the octet binary.
+// that already died returns at once. Neither needs the octet binaries.
 describe("the contract's hub helpers", () => {
   const scratch: string[] = [];
   afterAll(() => {
@@ -1025,17 +1202,17 @@ describe("the contract's hub helpers", () => {
   }
 
   it.each([
-    ["never publishes", "exec sleep 30"],
+    ["never answers", "exec sleep 30"],
     ["exits at once", "exit 3"],
-  ])("a hub that %s: the start rejects, the child is stopped, the bridge closed and the temp dirs gone", async (_what, body) => {
+  ])("a hub that %s: the start rejects, the child is stopped, the bridge closed and the temp dir gone", async (_what, body) => {
     const seen: StartSeen = {};
-    await expect(startMacHub("dead.test.ts.net", { binary: fakeBinary(body), readyMs: 1500, seen })).rejects.toThrow(
-      /timed out waiting for the hub at dead\.test\.ts\.net|the hub at dead\.test\.ts\.net exited/,
+    await expect(startMacHub("dead", "ws://127.0.0.1:9", { binary: fakeBinary(body), readyMs: 1500, seen })).rejects.toThrow(
+      /timed out waiting for the hub of dead|the hub of dead exited/,
     );
     expect(seen.child).toBeDefined();
     expect(seen.child && running(seen.child)).toBe(false);
     expect(seen.bridge?.server.listening).toBe(false);
-    expect(seen.dirs?.length).toBe(2);
+    expect(seen.dirs?.length).toBe(1);
     for (const dir of seen.dirs ?? []) expect(existsSync(dir)).toBe(false);
   });
 

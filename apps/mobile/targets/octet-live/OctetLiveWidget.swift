@@ -5,8 +5,8 @@ import WidgetKit
 
 // The Live Activity in the Dynamic Island and on the Lock Screen. Its text comes only from the
 // content state (kind, approvals, since) and from the App Group, where the app writes
-// {"<host>/<raw session>": {name, command, approval}}; the push itself names nothing. The keys match
-// modules/octet-live/ios/OctetLiveModule.swift.
+// {"<channel id>/<raw session>": {name, command, approval}}; the push itself names nothing. The
+// keys match modules/octet-live/ios/OctetLiveModule.swift.
 private let appGroup = "group.dev.octet.mobile"
 private let entriesKey = "entries"
 /// The module refuses anything larger; a store past this is not read at all.
@@ -39,11 +39,6 @@ private func linkPart(_ text: String) -> String {
   text.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
 }
 
-/// A host as the app keys the App Group by it: lowercased, without a trailing dot.
-private func hostKey(_ host: String) -> String {
-  (host.hasSuffix(".") ? String(host.dropLast()) : host).lowercased()
-}
-
 private func clip(_ text: String, _ limit: Int) -> String? {
   let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
   return trimmed.isEmpty ? nil : String(trimmed.prefix(limit))
@@ -60,7 +55,7 @@ private struct Shown {
   init(_ state: OctetActivity.ContentState, stale: Bool) {
     self.state = state
     self.stale = stale
-    self.entry = Shown.entry(forKey: hostKey(state.mac) + "/" + state.session)
+    self.entry = Shown.entry(forKey: state.mac + "/" + state.session)
   }
 
   /// Reads only this session's entry, so another malformed entry hides nothing here.

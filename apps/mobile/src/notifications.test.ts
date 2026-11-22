@@ -13,6 +13,8 @@ import {
   watchTaps,
   type Tap,
 } from "./notifications";
+import { channelOf } from "./client/fakes";
+import { tapKey } from "./macs";
 
 let mockExtra: { eas?: { projectId?: string } } | undefined;
 let mockEas: { projectId?: string } | undefined;
@@ -193,51 +195,44 @@ describe("what a tap names", () => {
 });
 
 describe("what a tap names of its Mac", () => {
-  it("is the session and the host the push names as its mac", () => {
-    expect(tapFromData({ session: "4821-1790000000", mac: "studio.tail1.ts.net" })).toEqual({
-      host: "studio.tail1.ts.net",
-      session: "4821-1790000000",
-    });
+  const STUDIO = channelOf("studio");
+
+  it("is the session and the channel id the push names as its mac", () => {
+    expect(tapFromData({ session: "4821-1790000000", mac: STUDIO })).toEqual({ channel: STUDIO, session: "4821-1790000000" });
   });
 
-  it("is no host from a hub that does not name one", () => {
-    expect(tapFromData({ session: "4821-1790000000" })).toEqual({ host: null, session: "4821-1790000000" });
+  it("a_tap_naming_a_hostname_names_no_mac", () => {
+    // A push from before the relay named its Mac by the host it was published at.
+    const tap = tapFromData({ session: "4821-1790000000", mac: "studio.tail1.ts.net" });
+    expect(tap).toEqual({ channel: null, session: "4821-1790000000" });
+    // Not even the only Mac paired: the tap opens the app and nothing more.
+    expect(tapKey(tap, [{ id: "m00000001", channel: STUDIO }], () => false)).toBeNull();
   });
 
-  it("keeps the host of a tap whose session is not valid: it still names the Mac", () => {
-    expect(tapFromData({ session: "../x", mac: "studio.tail1.ts.net" })).toEqual({ host: "studio.tail1.ts.net", session: null });
-    expect(tapFromData(undefined)).toEqual({ host: null, session: null });
+  it("is no channel from data that names none", () => {
+    expect(tapFromData({ session: "4821-1790000000" })).toEqual({ channel: null, session: "4821-1790000000" });
   });
 
-  it("allows a name of any case, 253 characters at most", () => {
-    const label = "a".repeat(63);
-    const longest = `${label}.${label}.${label}.${"b".repeat(61)}`;
-    expect(longest).toHaveLength(253);
-    expect(tapFromData({ session: "1-2", mac: longest }).host).toBe(longest);
-    expect(tapFromData({ session: "1-2", mac: "Studio.Tail1.TS.net" }).host).toBe("Studio.Tail1.TS.net");
+  it("keeps the channel of a tap whose session is not valid: it still names the Mac", () => {
+    expect(tapFromData({ session: "../x", mac: STUDIO })).toEqual({ channel: STUDIO, session: null });
+    expect(tapFromData(undefined)).toEqual({ channel: null, session: null });
   });
 
   it.each([
     ["a number", 7],
-    ["an object", { host: "studio" }],
+    ["an object", { channel: STUDIO }],
     ["an empty string", ""],
-    ["a URL", "wss://studio.tail1.ts.net/"],
-    ["a port", "studio.tail1.ts.net:443"],
-    ["a path", "studio/../x"],
-    ["user info", "me@studio.ts.net"],
-    ["user info with a password", "user:pass@studio.ts.net"],
-    ["user info that looks like a host and port", "evil.com:x@studio.ts.net"],
-    ["a space", "stu dio.ts.net"],
-    ["a newline", "studio.ts.net\n"],
-    ["a leading hyphen", "-studio.ts.net"],
-    ["a trailing hyphen", "studio-.ts.net"],
-    ["an empty label", "studio..ts.net"],
-    ["a trailing dot, which the hub never sends", "studio.ts.net."],
-    ["a label over 63", `${"a".repeat(64)}.ts.net`],
-    ["over 253 characters", `${"a.".repeat(127)}a`],
-    ["a bidi control", "studio\u202e.ts.net"],
-  ])("is no host for %s", (_name, mac) => {
-    expect(tapFromData({ session: "1-2", mac })).toEqual({ host: null, session: "1-2" });
+    ["upper case", STUDIO.toUpperCase()],
+    ["63 digits", STUDIO.slice(1)],
+    ["65 digits", `${STUDIO}0`],
+    ["a letter past f", `${STUDIO.slice(1)}g`],
+    ["a space", ` ${STUDIO.slice(1)}`],
+    ["a newline", `${STUDIO}\n`],
+    ["a URL", `wss://relay.example.test/v1/phone/${STUDIO}`],
+    ["a path", `${STUDIO}/../x`],
+    ["a bidi control", `${STUDIO.slice(1)}\u202e`],
+  ])("is no channel for %s", (_name, mac) => {
+    expect(tapFromData({ session: "1-2", mac })).toEqual({ channel: null, session: "1-2" });
   });
 });
 
@@ -258,12 +253,12 @@ describe("watching taps", () => {
     stop();
   });
 
-  it("hands over the Mac's host with the session", () => {
+  it("hands over the Mac's channel id with the session", () => {
     const taps: Tap[] = [];
     watchTaps((tap) => taps.push(tap));
     const listener = n.addNotificationResponseReceivedListener.mock.calls[0]?.[0];
-    listener?.(response({ session: "3-4", mac: "mini.tail1.ts.net" }, "n9") as never);
-    expect(taps).toEqual([{ host: "mini.tail1.ts.net", session: "3-4" }]);
+    listener?.(response({ session: "3-4", mac: channelOf("mini") }, "n9") as never);
+    expect(taps).toEqual([{ channel: channelOf("mini"), session: "3-4" }]);
   });
 
   it("clears the last response once it is taken, so that no later start sees it again", () => {

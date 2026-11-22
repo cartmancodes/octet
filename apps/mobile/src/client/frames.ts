@@ -50,7 +50,9 @@ export function parseFrame(text: string): ToPhone | null {
       case "welcome":
         return isStr(value.device);
       case "paired":
-        return isStr(value.token) && isStr(value.device);
+        return isStr(value.device);
+      case "pair_code":
+        return isUint(value.req) && isStr(value.code) && /^[0-9]{6}$/.test(value.code);
       case "sessions":
         return Array.isArray(value.sessions);
       case "subscribed":

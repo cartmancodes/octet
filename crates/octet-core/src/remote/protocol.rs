@@ -480,14 +480,24 @@ pub static MESSAGES: &[Message] = &[
     message(
         "welcome",
         ToPhone,
-        &[req("device", Str)],
-        "A known device connected.",
+        &[req("device", Str), req("name", Str)],
+        "A known device connected: its name, and the Mac's own host name (at most 64 \
+         characters, for display only).",
     ),
     message(
         "paired",
         ToPhone,
-        &[req("token", Str), req("device", Str)],
-        "A pairing succeeded; keep the token.",
+        &[req("device", Str), req("name", Str)],
+        "A pairing succeeded: the device's name, and the Mac's own host name (at most 64 \
+         characters, for display only). The phone keeps the key it paired with.",
+    ),
+    message(
+        "pair_code",
+        ToPhone,
+        &[req("req", U64), req("code", Str)],
+        "The hub holds this phone's `pair` (`req`) for the owner's answer at the Mac, which shows \
+         the same `code`: six digits the hub drew at random. The phone shows it while it waits, \
+         and never works one out for itself; `paired` or a refusal follows.",
     ),
     message(
         "sessions",
@@ -587,16 +597,19 @@ pub static MESSAGES: &[Message] = &[
     message(
         "hello",
         FromPhone,
-        &[req("token", Str), opt("background", Bool)],
-        "Connect with a device token. `background: true` marks a connection the app makes from \
-         the background (to hand a Live Activity token over, or to send a Deny): it is not the \
-         app in front. Left out, the connection is the app in front.",
+        &[opt("token", Str), opt("background", Bool)],
+        "Say who this is: the hub knows the phone by the key its handshake proved, so a `token` \
+         (sent by an app from before keys) is ignored. `background: true` marks a connection the \
+         app makes from the background (to hand a Live Activity token over, or to send a Deny): \
+         it is not the app in front. Left out, the connection is the app in front.",
     ),
     message(
         "pair",
         FromPhone,
         &[req("secret", Str), req("name", Str), req("platform", Str)],
-        "Pair a new device with a pairing secret.",
+        "Pair a new device with a pairing secret. The hub holds it for the owner's answer at the \
+         Mac (sending `pair_code`), then answers `paired` or refuses it; the secret is spent \
+         either way.",
     ),
     message(
         "register_push",
@@ -1069,10 +1082,8 @@ const UNKNOWN_MODE: &str = "Unknown mode; use ask, accept-edits, auto or full-ac
 /// A phone → hub command, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhoneCommand {
-    /// Connect with a device token.
+    /// Say who this is: the key the handshake proved.
     Hello {
-        /// The device token.
-        token: Secret,
         /// Whether this connection is the app in the background (handing a Live Activity token
         /// over, or sending a Deny) rather than the app in front; left out, it is in front.
         background: bool,
@@ -1547,7 +1558,6 @@ pub fn parse_phone(text_in: &str) -> Result<(u64, PhoneCommand), String> {
     let m = &map;
     let command = match message.kind {
         "hello" => PhoneCommand::Hello {
-            token: Secret(text(m, "token")),
             background: flag(m, "background"),
         },
         "pair" => PhoneCommand::Pair {
@@ -1713,13 +1723,17 @@ fn frame(kind: &str, fields: Value) -> Value {
     frame
 }
 
-/// The `welcome` frame for a known device.
-pub fn welcome(device: &str) -> Value {
-    frame("welcome", json!({ "device": device }))
+/// The `welcome` frame for the known device `device`, from the Mac whose host name is `name`.
+pub fn welcome(device: &str, name: &str) -> Value {
+    frame("welcome", json!({ "device": device, "name": name }))
 }
-/// The `paired` frame carrying the new device token.
-pub fn paired(token: &str, device: &str) -> Value {
-    frame("paired", json!({ "token": token, "device": device }))
+/// The `paired` frame for the new device `device`, from the Mac whose host name is `name`.
+pub fn paired(device: &str, name: &str) -> Value {
+    frame("paired", json!({ "device": device, "name": name }))
+}
+/// The `pair_code` frame for the held `pair` `req`: the six digits the Mac shows.
+pub fn pair_code(req: u64, code: &str) -> Value {
+    frame("pair_code", json!({ "req": req, "code": code }))
 }
 /// The `sessions` frame: each row is a `SessionInfo`.
 pub fn sessions_frame(sessions: &[Value]) -> Value {
@@ -1997,6 +2011,7 @@ mod tests {
             r#"{"v":1,"req":16,"type":"changes","session":"12-34"}"#,
             r#"{"v":1,"req":17,"type":"diff","session":"12-34","path":"src/a b.rs"}"#,
             r#"{"v":1,"req":18,"type":"commit","session":"12-34","message":"Fix it\n\nWhy"}"#,
+            r#"{"v":1,"req":19,"type":"hello"}"#,
         ];
         for (n, case) in cases.iter().enumerate() {
             let (req, _) = parse_phone(case).unwrap_or_else(|e| panic!("{case}: {e}"));
@@ -2202,8 +2217,9 @@ mod tests {
         for (frame, direction) in [
             (changes_frame(5, &changes), Direction::ToPhone),
             (diff_frame(6, &diff), Direction::ToPhone),
-            (welcome("Gemini 10"), Direction::ToPhone),
-            (paired("tok", "Gemini 10"), Direction::ToPhone),
+            (welcome("Gemini 10", "Studio"), Direction::ToPhone),
+            (paired("Gemini 10", "Studio"), Direction::ToPhone),
+            (pair_code(2, "482913"), Direction::ToPhone),
             (sessions_frame(&[session]), Direction::ToPhone),
             (
                 subscribed_frame("1-2", false, &["session-1.jsonl".into()]),
@@ -2588,12 +2604,13 @@ mod tests {
         let pair = format!(
             r#"{{"v":1,"req":2,"type":"pair","secret":"{secret}","name":"Gemini 10","platform":"android"}}"#
         );
-        for text in [hello, pair] {
-            let (_, command) = parse_phone(&text).unwrap();
-            let shown = format!("{command:?}");
-            assert!(!shown.contains(&secret), "{shown}");
-            assert!(shown.contains("redacted"), "{shown}");
-        }
+        // A hello's token is not kept at all; a pairing secret is kept, and redacted.
+        let (_, command) = parse_phone(&hello).unwrap();
+        assert!(!format!("{command:?}").contains(&secret), "{command:?}");
+        let (_, command) = parse_phone(&pair).unwrap();
+        let shown = format!("{command:?}");
+        assert!(!shown.contains(&secret), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
         let (_, command) = parse_phone(&format!(
             r#"{{"v":1,"req":2,"type":"pair","secret":"{secret}","name":"Gemini 10","platform":"android"}}"#
         ))

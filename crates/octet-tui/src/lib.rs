@@ -15,6 +15,7 @@ mod input;
 mod jobs;
 mod mascot;
 mod models;
+pub mod pairing;
 mod reconnect;
 mod registry;
 mod remote;
@@ -270,11 +271,13 @@ async fn stopped(stopping: Vec<tokio::task::JoinHandle<()>>) {
         let _ = stop.await;
     }
 }
-/// What an interface that is replaced hands the next: its running job and
-/// its model lists.
+/// What an interface that is replaced hands the next: its running job, its
+/// pairing and its model lists.
 #[derive(Default)]
 struct Carried {
     job: Option<jobs::Running>,
+    /// The pairing `/remote-control pair` opened, still waiting.
+    pairing: Option<remote::PairWait>,
     models: Option<models::Models>,
     /// The mode the user last chose (`App::mode_chosen`).
     mode_chosen: Option<octet_core::Mode>,
@@ -283,6 +286,7 @@ impl Carried {
     /// Takes what moves on from `app`, which is about to be replaced.
     fn take(&mut self, app: &mut App) {
         self.job = app.job.take();
+        self.pairing = app.pairing.take();
         self.models = Some(std::mem::take(&mut app.models));
         self.mode_chosen = Some(app.mode_chosen);
     }
@@ -290,6 +294,9 @@ impl Carried {
     fn give(&mut self, app: &mut App) {
         if let Some(job) = self.job.take() {
             app.job = Some(job);
+        }
+        if let Some(pairing) = self.pairing.take() {
+            app.pairing = Some(pairing);
         }
         if let Some(mode) = self.mode_chosen.take() {
             app.mode_chosen = mode;

@@ -1087,8 +1087,8 @@ fn help_rows_match_what_is_drawn() {
         );
     }
 }
-#[test]
-fn an_approval_hidden_behind_help_is_armed_only_once_seen() {
+#[tokio::test]
+async fn an_approval_hidden_behind_help_is_armed_only_once_seen() {
     let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
     app.event(approval(1, "rm -rf build"));
     // Help covers the dialog while the approval arrives and waits.
@@ -1099,17 +1099,56 @@ fn an_approval_hidden_behind_help_is_armed_only_once_seen() {
     // Help just closed: the dialog is first seen now, so it is not armed.
     screen(100, 30, &mut app);
     assert!(!app.overlay.approval_armed(), "armed before it was seen");
-    // Seen long enough, it arms; covered again and shown again, it waits anew.
+    // Seen long enough, it arms.
     std::thread::sleep(crate::app::APPROVAL_ARM);
     assert!(app.overlay.approval_armed());
-    app.overlay.palette = true;
+    // The palette cannot cover it (Ctrl+P goes to the dialog), so it stays armed.
+    let vendor = crate::vendor::RecordingVendor::default();
+    let ctrl_p = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('p'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    let _ = crate::input::key_action(&mut app, &vendor, ctrl_p).await;
+    assert!(!app.overlay.palette);
     screen(100, 30, &mut app);
-    app.overlay.palette = false;
+    assert!(app.overlay.approval_armed(), "the dialog was never covered");
+    // Covered by help again and shown again, it waits anew.
+    app.overlay.help = true;
+    screen(100, 30, &mut app);
+    app.overlay.help = false;
     screen(100, 30, &mut app);
     assert!(
         !app.overlay.approval_armed(),
         "re-shown dialog was armed at once"
     );
+}
+#[tokio::test]
+async fn an_approval_that_arrives_over_the_palette_is_seen_and_answered() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let vendor = crate::vendor::RecordingVendor::default();
+    let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+    let mut app = crate::test_support::app_for(octet_core::Engine::DEMO);
+    // The palette is open when the approval arrives.
+    let _ = crate::input::key_action(&mut app, &vendor, ctrl_p).await;
+    assert!(app.overlay.palette);
+    app.event(approval(7, "rm -rf build"));
+    // The approval is on top: drawn, and what the keys answer.
+    let rows = screen(100, 30, &mut app).join("\n");
+    assert!(rows.contains("Permission required"), "{rows}");
+    assert!(!rows.contains("Commands · ↑ ↓ choose"), "{rows}");
+    // Nor can the palette open over it.
+    let _ = crate::input::key_action(&mut app, &vendor, ctrl_p).await;
+    assert!(!app.overlay.palette);
+    // Shown a moment ago, and drawn again with nothing over it, it stays armed.
+    app.overlay.approval_shown = std::time::Instant::now().checked_sub(crate::app::APPROVAL_ARM);
+    screen(100, 30, &mut app);
+    assert!(app.overlay.approval_armed());
+    let _ = crate::input::key_action(&mut app, &vendor, KeyEvent::from(KeyCode::Char('a'))).await;
+    assert!(matches!(
+        vendor.sent.borrow().as_slice(),
+        [octet_core::Command::Answer { id: 7, allow: true }]
+    ));
+    assert!(app.overlay.approvals.is_empty());
 }
 #[test]
 fn the_model_list_merges_every_provider() {

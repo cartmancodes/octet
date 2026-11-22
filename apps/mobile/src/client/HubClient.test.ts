@@ -1,10 +1,22 @@
 import { MAX_MESSAGE, MAX_SESSION_ROWS, type Cursor } from "../protocol";
-import { FakeClock, Sockets } from "./fakes";
+import { FakeClock, Sockets, TEST_RELAY, channelOf, identityOf, testKey } from "./fakes";
 import { MAX_FRAME_BYTES, utf8Length } from "./frames";
-import { HubClient, PING_INTERVAL_MS, PING_TIMEOUT_MS, REQUEST_TIMEOUT_MS, Refusal, type BatchItem, type HubState } from "./HubClient";
+import {
+  HubClient,
+  PAIR_HANDSHAKE_TIMEOUT_MS,
+  PAIR_TIMEOUT_MS,
+  PING_INTERVAL_MS,
+  PING_TIMEOUT_MS,
+  REQUEST_TIMEOUT_MS,
+  Refusal,
+  type BatchItem,
+  type HubState,
+} from "./HubClient";
+import type { KeyPair } from "./noise";
 
-const URL = "wss://mac.tail1234.ts.net/";
-const TOKEN = "device-token";
+/** The phone socket's address: the relay, then the Mac's channel. */
+const URL = `${TEST_RELAY}v1/phone/${channelOf("mac")}`;
+const KEY = testKey();
 
 interface Rig {
   client: HubClient;
@@ -15,13 +27,12 @@ interface Rig {
   cursors: [string, Cursor | null][];
 }
 
-function rig(opts: { token?: string | null; cursors?: Record<string, Cursor>; random?: () => number; background?: boolean } = {}): Rig {
+function rig(opts: { key?: KeyPair | null; cursors?: Record<string, Cursor>; random?: () => number; background?: boolean } = {}): Rig {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const cursors: [string, Cursor | null][] = [];
   const client = new HubClient({
-    url: URL,
-    token: opts.token === undefined ? TOKEN : opts.token,
+    ...identityOf("mac", opts.key === undefined ? KEY : opts.key),
     factory: sockets.factory,
     now: clock.now,
     schedule: clock.schedule,
@@ -77,7 +88,7 @@ describe("connecting", () => {
 
     r.sockets.last.open();
     expect(r.states).toEqual(["connecting", "authenticating"]);
-    expect(r.sockets.last.commands()).toEqual([{ v: 1, type: "hello", req: expect.any(Number), token: TOKEN }]);
+    expect(r.sockets.last.commands()).toEqual([{ v: 1, type: "hello", req: expect.any(Number) }]);
 
     r.sockets.last.receive({ type: "welcome", device: "iPhone" });
     expect(r.states).toEqual(["connecting", "authenticating", "ready"]);
@@ -86,13 +97,22 @@ describe("connecting", () => {
     expect(delivered(r).map((f) => f.type)).toEqual(["sessions"]);
   });
 
-  it("start is idempotent and does nothing without a token", () => {
+  it("hello_carries_no_token: the phone is the key its handshake proved", () => {
+    const r = rig();
+    r.client.start();
+    r.sockets.last.open();
+    const [hello] = r.sockets.last.commands();
+    expect(Object.keys(hello ?? {}).sort()).toEqual(["req", "type", "v"]);
+    expect(r.sockets.last.sent[0]).not.toContain("token");
+  });
+
+  it("start is idempotent and does nothing without a key", () => {
     const r = rig();
     r.client.start();
     r.client.start();
     expect(r.sockets.all).toHaveLength(1);
 
-    const bare = rig({ token: null });
+    const bare = rig({ key: null });
     bare.client.start();
     expect(bare.sockets.all).toHaveLength(0);
   });
@@ -112,47 +132,125 @@ describe("connecting", () => {
 });
 
 describe("pairing", () => {
-  it("pairing_returns_the_token", async () => {
-    const r = rig({ token: null });
-    const pending = r.client.pair("s3cret", "My phone", "ios");
+  /** The pair command a pairing socket sent. */
+  const pairOf = (r: Rig) => r.sockets.last.commandsOf("pair")[0];
+
+  it("pairs with its key, and says hello on a connection of its own once paired", async () => {
+    const r = rig();
+    const codes: string[] = [];
+    const pending = r.client.pair("s3cret", "My phone", "ios", (code) => codes.push(code));
     const socket = r.sockets.last;
     expect(socket.url).toBe(URL);
     socket.open();
     expect(socket.commands()).toEqual([
       { v: 1, type: "pair", req: expect.any(Number), secret: "s3cret", name: "My phone", platform: "ios" },
     ]);
-    socket.receive({ type: "paired", token: "fresh-token", device: "My phone" });
-    await expect(pending).resolves.toEqual({ token: "fresh-token", device: "My phone" });
-    expect(socket.closed).toBe(true); // the hub keeps a paired socket unauthenticated
+    socket.receive({ type: "pair_code", req: pairOf(r)?.req, code: "482913" });
+    socket.receive({ type: "paired", device: "My phone", name: "studio" });
+    await expect(pending).resolves.toEqual({ device: "My phone", name: "studio" });
+    expect(codes).toEqual(["482913"]);
+    expect(socket.closed).toBe(true);
+    // The hub closes the paired connection: that is no failure, and the client is not started by it.
+    socket.drop(1000);
+    expect(r.states).toEqual([]);
+    expect(r.sockets.all).toHaveLength(1);
 
-    // The client now holds the token and says hello on a new connection.
+    // The phone says hello on a new connection, with the same key, and is welcomed.
     r.client.start();
     expect(r.sockets.all).toHaveLength(2);
     r.sockets.last.open();
-    expect(r.sockets.last.commands()[0]).toMatchObject({ type: "hello", token: "fresh-token" });
+    expect(r.sockets.last.commands()).toEqual([{ v: 1, type: "hello", req: expect.any(Number) }]);
+    r.sockets.last.receive({ type: "welcome", device: "My phone", name: "studio" });
+    expect(r.client.state).toBe("ready");
+    expect(r.client.key).toBe(KEY);
   });
 
-  it("a refused pairing rejects with the hub's code and leaves the main state alone", async () => {
-    const r = rig({ token: null });
-    const pending = r.client.pair("bad", "p", "ios");
+  it("pair_reports_the_hubs_code_before_paired", async () => {
+    const r = rig();
+    const seen: string[] = [];
+    const pending = r.client.pair("s", "p", "ios", (code) => seen.push(`code ${code}`));
+    void pending.then(() => seen.push("paired"));
     r.sockets.last.open();
-    const req = r.sockets.last.commands()[0]?.req;
-    r.sockets.last.receive({ type: "refused", req, code: "unpaired", reason: "That code is not valid" });
-    await expect(pending).rejects.toMatchObject({ name: "Refusal", code: "unpaired", message: "That code is not valid" });
+    const req = pairOf(r)?.req;
+    // A code for another req, or one that is not six digits, is not this pairing's.
+    r.sockets.last.receive({ type: "pair_code", req: (req as number) + 1, code: "111111" });
+    r.sockets.last.receive({ type: "pair_code", req, code: "12345" });
+    r.sockets.last.receive({ type: "pair_code", req, code: "12345a" });
+    await Promise.resolve();
+    expect(seen).toEqual([]);
+    r.sockets.last.receive({ type: "pair_code", req, code: "007431" });
+    expect(seen).toEqual(["code 007431"]);
+    r.sockets.last.receive({ type: "paired", device: "p", name: "mac" });
+    await pending;
+    expect(seen).toEqual(["code 007431", "paired"]);
+  });
+
+  it("pair_waits_130_seconds_and_not_45", async () => {
+    expect(PAIR_TIMEOUT_MS).toBe(130_000);
+    const r = rig();
+    let settled = false;
+    const pending = r.client.pair("s", "p", "ios", () => undefined);
+    pending.catch(() => undefined).finally(() => (settled = true));
+    r.sockets.last.open();
+    r.sockets.last.receive({ type: "pair_code", req: pairOf(r)?.req, code: "482913" });
+    r.clock.advance(REQUEST_TIMEOUT_MS);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(r.sockets.last.closed).toBe(false);
+    r.clock.advance(PAIR_TIMEOUT_MS - REQUEST_TIMEOUT_MS - 1);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    r.clock.advance(1);
+    await expect(pending).rejects.toMatchObject({ code: "lost", message: "The Mac did not answer in time" });
+    expect(r.sockets.last.closed).toBe(true);
+  });
+
+  it("a_pairing_whose_handshake_never_completes_fails_in_10_seconds", async () => {
+    // The hub drops a phone not past its first frame 10 s after its connect: a channel that has not
+    // opened by then never will (a relay that took the socket and is gone, say).
+    expect(PAIR_HANDSHAKE_TIMEOUT_MS).toBe(10_000);
+    const r = rig();
+    let settled = false;
+    const pending = r.client.pair("s", "p", "ios", () => undefined);
+    pending.catch(() => undefined).finally(() => (settled = true));
+    r.clock.advance(PAIR_HANDSHAKE_TIMEOUT_MS - 1);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    r.clock.advance(1);
+    await expect(pending).rejects.toMatchObject({ code: "lost", message: "Can't reach your Mac" });
+    expect(r.sockets.last.closed).toBe(true);
+    expect(r.clock.pending).toBe(0);
     expect(r.states).toEqual([]);
   });
 
-  it("a pairing that is cut off or silent rejects", async () => {
-    const r = rig({ token: null });
-    const cut = r.client.pair("s", "p", "ios");
+  it("a refused pairing rejects with the hub's code and leaves the main state alone", async () => {
+    const r = rig();
+    const pending = r.client.pair("bad", "p", "ios", () => undefined);
     r.sockets.last.open();
-    r.sockets.last.drop();
+    const req = r.sockets.last.commands()[0]?.req;
+    r.sockets.last.receive({ type: "refused", req, code: "unpaired", reason: "Pairing was refused on the Mac" });
+    await expect(pending).rejects.toMatchObject({ name: "Refusal", code: "unpaired", message: "Pairing was refused on the Mac" });
+    expect(r.states).toEqual([]);
+    expect(r.client.key).toBe(KEY);
+  });
+
+  it("a pairing that is cut off or silent rejects", async () => {
+    const r = rig();
+    const cut = r.client.pair("s", "p", "ios", () => undefined);
+    r.sockets.last.open();
+    r.sockets.last.drop(4404);
     await expect(cut).rejects.toMatchObject({ code: "lost" });
 
-    const silent = r.client.pair("s", "p", "ios");
-    r.clock.advance(REQUEST_TIMEOUT_MS);
+    const silent = r.client.pair("s", "p", "ios", () => undefined);
+    r.clock.advance(PAIR_TIMEOUT_MS);
     await expect(silent).rejects.toMatchObject({ code: "lost" });
     expect(r.sockets.last.closed).toBe(true);
+  });
+
+  it("a client with no key cannot pair", async () => {
+    const r = rig({ key: null });
+    await expect(r.client.pair("s", "p", "ios", () => undefined)).rejects.toMatchObject({ code: "unsent" });
+    expect(r.sockets.all).toHaveLength(0);
   });
 });
 
@@ -199,8 +297,8 @@ describe("requests", () => {
     expect(failed[0]?.startsWith("Not allowed!")).toBe(true);
     expect(failed[0]?.length).toBe(512);
 
-    const p = rig({ token: null });
-    const pairing = p.client.pair("bad", "p", "ios");
+    const p = rig();
+    const pairing = p.client.pair("bad", "p", "ios", () => undefined);
     p.sockets.last.open();
     p.sockets.last.receive({ type: "refused", req: p.sockets.last.commands()[0]?.req, code: "invalid", reason: hostile });
     const pairRefusal = (await pairing.catch((e: unknown) => e)) as Refusal;
@@ -478,8 +576,8 @@ describe("requests", () => {
   });
 
   it("a pairing whose socket throws on send or close rejects unsent", async () => {
-    const r = rig({ token: null });
-    const pending = r.client.pair("s", "p", "ios");
+    const r = rig();
+    const pending = r.client.pair("s", "p", "ios", () => undefined);
     const socket = r.sockets.last;
     socket.send = () => {
       throw new Error("closed");
@@ -790,27 +888,29 @@ function welcomed(r: Rig): void {
   r.sockets.last.receive({ type: "welcome", device: "iPhone" });
 }
 
-/** The ping commands a socket has been sent. */
-const pings = (socket: { commandsOf(type: string): Record<string, unknown>[] }) => socket.commandsOf("ping");
+/** The encrypted pings a socket has been sent. */
+const pings = (socket: { pings: number }) => socket.pings;
 
 describe("keepalive", () => {
-  it("pings every 25 s while ready, and an ack keeps the link", () => {
+  it("pings through the channel every 25 s while ready, and a pong keeps the link", () => {
     const r = rig();
     welcomed(r);
     const socket = r.sockets.last;
     r.clock.advance(PING_INTERVAL_MS - 1);
-    expect(pings(socket)).toHaveLength(0);
+    expect(pings(socket)).toBe(0);
     r.clock.advance(1);
-    expect(pings(socket)).toHaveLength(1);
-    socket.receive({ type: "ack", req: pings(socket)[0]?.req, message: "pong" });
+    expect(pings(socket)).toBe(1);
+    // The liveness check is the channel's own: no command goes to the hub for it.
+    expect(socket.commandsOf("ping")).toEqual([]);
+    socket.pong();
     r.clock.advance(PING_TIMEOUT_MS + 1);
     expect(r.states.at(-1)).toBe("ready"); // answered in time
     r.clock.advance(PING_INTERVAL_MS - PING_TIMEOUT_MS - 1);
-    expect(pings(socket)).toHaveLength(2);
+    expect(pings(socket)).toBe(2);
     expect(r.sockets.all).toHaveLength(1);
   });
 
-  it("a_missed_ping_reconnects: no ack in 10 s is a dead link, with the request timeout's path", async () => {
+  it("a_missed_ping_reconnects: no pong in 10 s is a dead link, with the request timeout's path", async () => {
     const r = rig();
     welcomed(r);
     r.client.subscribe("s1");
@@ -819,7 +919,7 @@ describe("keepalive", () => {
     first.receive(event("s1", "a", 1));
     flush(r);
     r.clock.advance(PING_INTERVAL_MS - 50); // the flush above took 50 ms of the interval
-    expect(pings(first)).toHaveLength(1);
+    expect(pings(first)).toBe(1);
     const waiting = r.client.request({ type: "cancel", session: "s1" }).catch((e: unknown) => e);
     r.clock.advance(PING_TIMEOUT_MS - 1);
     expect(first.closed).toBe(false);
@@ -836,51 +936,70 @@ describe("keepalive", () => {
     expect(second.commandsOf("subscribe").map((c) => [c.session, c.after])).toEqual([["s1", { journal: "a", seq: 1 }]]);
     // The new link pings on its own schedule.
     r.clock.advance(PING_INTERVAL_MS);
-    expect(pings(second)).toHaveLength(1);
+    expect(pings(second)).toBe(1);
   });
 
-  it("a link that speaks just before the deadline and then goes quiet is found dead ~35 s after that frame", () => {
+  it("a link that speaks just before the deadline and then goes quiet is found dead ~25 s after that frame", () => {
     const r = rig();
     welcomed(r);
     const socket = r.sockets.last;
     r.clock.advance(PING_INTERVAL_MS); // the ping goes out; its deadline is 10 s on
     r.clock.advance(PING_TIMEOUT_MS - 1);
     socket.receive({ type: "sessions", sessions: [] }); // any frame is proof of life, 1 ms before the deadline
-    r.clock.advance(1); // the deadline passes: the next ping counts from that frame, not from now
+    r.clock.advance(1); // the deadline passes: the next look counts from that frame, not from now
     r.clock.advance(PING_INTERVAL_MS - 2);
-    expect(pings(socket)).toHaveLength(1);
-    r.clock.advance(1);
-    expect(pings(socket)).toHaveLength(2); // 25 s after the frame, not 25 s after the deadline
-    r.clock.advance(PING_TIMEOUT_MS - 1);
     expect(socket.closed).toBe(false);
     r.clock.advance(1);
-    expect(socket.closed).toBe(true); // 35 s after the last frame
+    // 25 s of quiet after the frame with the ping still unanswered: the channel will not send
+    // another, and the link is dead.
+    expect(pings(socket)).toBe(1);
+    expect(socket.closed).toBe(true);
     expect(r.states.at(-1)).toBe("offline");
   });
 
-  it("a ping the hub refuses still proves the link is alive", () => {
+  it("a pong is a sign of life too: a link that answers its pings stays, however quiet", () => {
     const r = rig();
     welcomed(r);
-    r.clock.advance(PING_INTERVAL_MS);
-    r.sockets.last.receive({ type: "refused", req: pings(r.sockets.last)[0]?.req, code: "rate_limited", reason: "slow" });
-    r.clock.advance(PING_TIMEOUT_MS + 1);
+    const socket = r.sockets.last;
+    for (let i = 1; i <= 4; i++) {
+      // Each ping goes out 25 s after the pong before it (the first, after the welcome), and is
+      // answered 5 s later.
+      r.clock.advance(PING_INTERVAL_MS - 1);
+      expect(pings(socket)).toBe(i - 1);
+      r.clock.advance(1);
+      expect(pings(socket)).toBe(i);
+      r.clock.advance(5_000);
+      socket.pong();
+    }
+    expect(socket.closed).toBe(false);
     expect(r.states.at(-1)).toBe("ready");
   });
 
-  it("is internal: no batch carries a ping's ack, and a late ack after teardown is dropped", () => {
+  it("is internal: no batch carries a pong, and a late pong after teardown is dropped", () => {
     const r = rig();
     welcomed(r);
     const first = r.sockets.last;
     r.clock.advance(PING_INTERVAL_MS);
-    const req = pings(first)[0]?.req;
-    first.receive({ type: "ack", req, message: "pong" });
+    first.pong();
     flush(r);
     expect(delivered(r)).toEqual([]);
     r.clock.advance(PING_INTERVAL_MS);
     r.clock.advance(PING_TIMEOUT_MS); // missed: reconnects
-    first.receive({ type: "ack", req: pings(first)[1]?.req, message: "pong" });
+    expect(first.closed).toBe(true);
+    first.pong();
     flush(r);
     expect(delivered(r)).toEqual([]);
+    expect(r.states.at(-1)).toBe("offline");
+  });
+
+  it("a socket that cannot ping is dead", () => {
+    const r = rig();
+    welcomed(r);
+    const socket = r.sockets.last;
+    jest.spyOn(socket, "ping").mockReturnValue(false);
+    r.clock.advance(PING_INTERVAL_MS);
+    expect(socket.closed).toBe(true);
+    expect(r.states.at(-1)).toBe("offline");
   });
 
   it("after a missed ping a request is unsent, not lost", async () => {
@@ -899,12 +1018,12 @@ describe("keepalive", () => {
     r.client.stop();
     expect(r.clock.pending).toBe(0);
     r.clock.advance(PING_INTERVAL_MS * 4);
-    expect(pings(socket)).toHaveLength(1);
+    expect(pings(socket)).toBe(1);
     expect(r.sockets.all).toHaveLength(1);
     // Connecting again: no ping before the welcome.
     r.client.start();
     r.clock.advance(PING_INTERVAL_MS - 1);
-    expect(pings(r.sockets.last)).toHaveLength(0);
+    expect(pings(r.sockets.last)).toBe(0);
   });
 
   it("any inbound frame is proof of life: a pong that is slow behind a replay does not drop the link", () => {
@@ -914,7 +1033,7 @@ describe("keepalive", () => {
     const socket = r.sockets.last;
     socket.receive({ type: "subscribed", session: "s1", from: "start", journals: ["a"] });
     r.clock.advance(PING_INTERVAL_MS);
-    expect(pings(socket)).toHaveLength(1);
+    expect(pings(socket)).toBe(1);
     // The replay streams on for 15 s, well past the ping's 10 s, with the pong still queued behind it.
     for (let seq = 1; seq <= 5; seq++) {
       r.clock.advance(3_000);
@@ -923,10 +1042,11 @@ describe("keepalive", () => {
     expect(socket.closed).toBe(false);
     expect(r.states.at(-1)).toBe("ready");
     r.clock.advance(PING_TIMEOUT_MS); // the old deadline passes: the link spoke since the ping
-    socket.receive({ type: "ack", req: pings(socket)[0]?.req, message: "pong" }); // the late pong is dropped
+    socket.pong(); // the late pong
     expect(socket.closed).toBe(false);
     // Silence from here on is dead again, a full interval and deadline later.
     r.clock.advance(PING_INTERVAL_MS + PING_TIMEOUT_MS);
+    expect(pings(socket)).toBe(2);
     expect(socket.closed).toBe(true);
   });
 
@@ -940,7 +1060,7 @@ describe("keepalive", () => {
 
 describe("unpairing", () => {
   it.each(["unpaired", "revoked"] as const)(
-    "unpaired_and_revoked_move_to_unpaired_and_forget_the_token (%s)",
+    "unpaired_and_revoked_move_to_unpaired_and_forget_the_key (%s)",
     (code) => {
       const r = rig();
       ready(r);
@@ -948,7 +1068,7 @@ describe("unpairing", () => {
       expect(r.states.at(-1)).toBe("unpaired");
       expect(r.sockets.last.closed).toBe(true);
       expect(r.clock.pending).toBe(0);
-      expect(r.client.token).toBeNull();
+      expect(r.client.key).toBeNull();
 
       // The socket closing afterwards does not start a reconnect, and start() has nothing to say.
       r.sockets.last.drop(1008);
@@ -969,22 +1089,22 @@ describe("unpairing", () => {
     const req = r.sockets.last.commands()[0]?.req;
     r.sockets.last.receive({ type: "refused", req, code: "unpaired", reason: "Unknown device; pair it again" });
     expect(r.states.at(-1)).toBe("unpaired");
-    expect(r.client.token).toBeNull();
+    expect(r.client.key).toBeNull();
   });
 
-  it("a network close never unpairs, and the token is kept", () => {
+  it("a network or relay close never unpairs, and the key is kept", () => {
     const r = rig();
     ready(r);
-    for (const code of [1000, 1001, 1006, 1008, 1011, 4401]) {
+    for (const code of [1000, 1001, 1006, 1008, 1011, 4401, 4404, 4408, 4409, 4429]) {
       r.sockets.last.drop(code);
       expect(r.states.at(-1)).toBe("offline");
       r.clock.advance(r.clock.delays[0] ?? 0); // the reconnect wait
       r.sockets.last.open();
-      expect(r.sockets.last.commands()[0]).toMatchObject({ type: "hello", token: TOKEN });
+      expect(r.sockets.last.commands()[0]).toEqual({ v: 1, type: "hello", req: expect.any(Number) });
       r.sockets.last.receive({ type: "welcome", device: "iPhone" });
     }
     expect(r.states).not.toContain("unpaired");
-    expect(r.client.token).toBe(TOKEN);
+    expect(r.client.key).toBe(KEY);
   });
 
   it("other refusals, matched or not, leave the connection alone", () => {
@@ -1032,8 +1152,7 @@ describe("unpairing", () => {
     const sockets = new Sockets();
     const clock = new FakeClock();
     const client = new HubClient({
-      url: URL,
-      token: TOKEN,
+      ...identityOf("mac"),
       factory: sockets.factory,
       now: clock.now,
       schedule: clock.schedule,
@@ -1435,7 +1554,7 @@ describe("a background connection", () => {
     const r = rig({ background: true });
     r.client.start();
     r.sockets.last.open();
-    expect(r.sockets.last.commands()).toEqual([{ v: 1, type: "hello", req: expect.any(Number), token: TOKEN, background: true }]);
+    expect(r.sockets.last.commands()).toEqual([{ v: 1, type: "hello", req: expect.any(Number), background: true }]);
     r.sockets.last.receive({ type: "welcome", device: "iPhone" });
     expect(r.client.state).toBe("ready");
   });

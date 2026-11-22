@@ -14,16 +14,23 @@ import { cleanChanges, cleanDiff, type ChangesAnswer } from "./answers";
 import { Backoff } from "./backoff";
 import { Cursors } from "./cursors";
 import { parseFrame } from "./frames";
+import type { KeyPair } from "./noise";
 
 export type HubState = "connecting" | "authenticating" | "ready" | "offline" | "unpaired";
 
-/** What the client needs of a WebSocket; React Native wraps the global one, tests use a fake. */
+/** What the client needs of a socket to the hub: whole JSON frames each way over the encrypted
+ * channel (secureSocket.ts), opened once its handshake is done. Tests use a fake. */
 export interface Socket {
   send(text: string): void;
   close(): void;
+  /** Sends the channel's own ping, which the hub answers with `onpong`; false when it cannot (the
+   * last ping is still unanswered, or the channel failed): the link is dead. */
+  ping(): boolean;
   onmessage?: (text: string) => void;
   onopen?: () => void;
   onclose?: (code: number) => void;
+  /** The hub answered the last `ping`. */
+  onpong?: () => void;
 }
 export type SocketFactory = (url: string) => Socket;
 
@@ -73,9 +80,16 @@ export type RequestBody = FromPhone extends infer C
   : never;
 
 export interface HubClientOptions {
+  /** The relay the pairing link named, `wss://<authority>/` (`ws://` in development). */
   url: string;
-  /** The device token, or null before pairing. */
-  token: string | null;
+  /** The hub's channel id at the relay: 64 lowercase hex digits. */
+  channel: string;
+  /** The hub's static public key, pinned from the pairing link. */
+  hubKey: Uint8Array;
+  /** This phone's key pair for the pairing; null for a pairing the hub has forgotten. */
+  key: KeyPair | null;
+  /** Makes sockets that carry whole frames: in the app, encrypted ones made with `key` for
+   * `hubKey` (secureSocket.ts), given `<url>v1/phone/<channel>`. */
   factory: SocketFactory;
   now?: () => number;
   /** Runs `fn` after `ms`; returns the function that cancels it. */
@@ -99,13 +113,21 @@ export const SUBSCRIBE_RETRY_MS = 5_000;
 
 /** Past the hub's own deadline for an answer (30 s, swept every 1 s), and the trip back. */
 export const REQUEST_TIMEOUT_MS = 45_000;
+/** How long a pairing waits for `paired`: the two minutes the owner has to answer at the Mac, and a
+ * margin. */
+export const PAIR_TIMEOUT_MS = 130_000;
+/** How long a pairing waits for its channel to open (the Noise handshake through the relay): the
+ * hub's own deadline from a phone's connect to its first frame (`FIRST_FRAME_WITHIN`,
+ * crates/octet-hub/src/relay.rs), past which the hub has let the connection go. */
+export const PAIR_HANDSHAKE_TIMEOUT_MS = 10_000;
 /** A request that times out takes the link down only if nothing came over it for this long. */
 export const QUIET_MS = 10_000;
 export const HANDSHAKE_TIMEOUT_MS = 15_000;
 export const BATCH_INTERVAL_MS = 50;
 /** A link ready this long counts as good: its drop starts the backoff over. */
 export const STABLE_MS = 10_000;
-/** While ready, a `ping` goes out this often; with no answer within `PING_TIMEOUT_MS` the link is dead. */
+/** While ready and quiet, the channel's ping goes out this often; with no answer within
+ * `PING_TIMEOUT_MS` the link is dead. */
 export const PING_INTERVAL_MS = 25_000;
 export const PING_TIMEOUT_MS = 10_000;
 
@@ -136,24 +158,30 @@ const isUnpaired = (code: RefusalCode | null | undefined): boolean =>
 /**
  * The phone's side of the hub protocol, with no React Native in it.
  *
- * `start()` connects, says `hello` with the device token, and on `welcome` is `ready` and
- * re-subscribes every wanted session after its cursor. A lost connection reconnects with a
+ * `start()` connects through the relay to `<url>v1/phone/<channel>` (the socket runs the handshake
+ * with the device key), says `hello`, and on `welcome` is `ready` and re-subscribes every wanted
+ * session after its cursor. A lost connection reconnects with a
  * jittered backoff (started over once a link has been ready for 10 s) until `stop()` (the app went to the background), which closes the socket
  * and leaves no timer behind. Only a `refused` with code `unpaired` or `revoked` forgets the
- * token and ends in the `unpaired` state; a closed socket never does.
+ * key and ends in the `unpaired` state; a closed socket never does, whatever its code (the relay's
+ * 4404 for a Mac it has no hub for is `offline`).
  *
  * Frames reach `onBatch` listeners in order, at most once per 50 ms. A session's events are
  * deduplicated by `(journal, seq)`. `subscribed` frames are passed on as they come, so a
  * consumer sees `from: "start"` (a reset) in its place in the stream.
  *
- * While ready, a keepalive `ping` goes out every 25 s; no answer within 10 s takes the link for
- * dead, as a request timeout does. Pings are the client's own: they are never in a batch, and no
- * caller's request rides on them.
+ * While ready, the channel's encrypted ping goes out after 25 s of quiet; no pong within 10 s takes
+ * the link for dead, as a request timeout does. Pings are the channel's: they are never frames,
+ * and no caller's request rides on them.
  */
 export class HubClient {
-  /** The hub's address, wss://... */
+  /** The relay's address, wss://.../ */
   readonly url: string;
-  private tokenValue: string | null;
+  /** The hub's channel id at the relay. */
+  readonly channel: string;
+  /** The hub's static public key. */
+  readonly hubKey: Uint8Array;
+  private keyValue: KeyPair | null;
   private readonly factory: SocketFactory;
   private readonly now: () => number;
   private readonly schedule: (fn: () => void, ms: number) => () => void;
@@ -174,8 +202,8 @@ export class HubClient {
   private readyAt: number | null = null;
   /** The next ping, or the deadline of the one sent; at most one is ever armed. */
   private cancelPing: (() => void) | null = null;
-  /** The req of the ping awaiting its answer; null between pings. */
-  private pingReq: number | null = null;
+  /** A ping awaits its pong. */
+  private pinging = false;
   /** When a frame last came in on the current socket. */
   private lastHeard = 0;
 
@@ -207,7 +235,9 @@ export class HubClient {
 
   constructor(opts: HubClientOptions) {
     this.url = opts.url;
-    this.tokenValue = opts.token;
+    this.channel = opts.channel;
+    this.hubKey = opts.hubKey;
+    this.keyValue = opts.key;
     this.background = opts.background === true;
     this.factory = opts.factory;
     this.now = opts.now ?? Date.now;
@@ -215,7 +245,7 @@ export class HubClient {
     this.onCursor = opts.onCursor;
     this.backoff = new Backoff(opts.random);
     this.cursors = new Cursors(opts.cursors);
-    this.stateValue = opts.token === null ? "unpaired" : "offline";
+    this.stateValue = opts.key === null ? "unpaired" : "offline";
   }
 
   get state(): HubState {
@@ -223,14 +253,24 @@ export class HubClient {
   }
 
   /** Which run the client is in: a new number at each `start()` that connects, and null while it
-   * is stopped (by `stop()`, or the hub refusing the token). Every attempt to connect is of a run. */
+   * is stopped (by `stop()`, or the hub refusing the key). Every attempt to connect is of a run. */
   get run(): number | null {
     return this.running ? this.started : null;
   }
 
-  /** The device token; null before pairing and after the hub unpaired this phone. */
-  get token(): string | null {
-    return this.tokenValue;
+  /** The device key; null once the hub unpaired this phone. */
+  get key(): KeyPair | null {
+    return this.keyValue;
+  }
+
+  /** Where each session's stream has got to, for a client that takes over this pairing. */
+  cursorsNow(): Record<string, Cursor> {
+    return this.cursors.snapshot();
+  }
+
+  /** The address of the phone's sockets: the relay's phone path for the hub's channel. */
+  private get socketUrl(): string {
+    return `${this.url}v1/phone/${this.channel}`;
   }
 
   /** Frames dropped for being too big, not JSON, of an unknown type or version, or malformed. */
@@ -243,21 +283,33 @@ export class HubClient {
     return this.duplicates;
   }
 
-  /** Pairs with the Mac. Uses its own connection: the hub leaves a paired socket
-   * unauthenticated, so `start()` then connects and says hello with the new token. */
-  pair(secret: string, name: string, platform: string): Promise<{ token: string; device: string }> {
+  /**
+   * Pairs this client's key with the Mac, on a connection of its own: sends `pair` with the
+   * one-time `secret`, the phone's `name` and `platform`, and hands `onCode` the six digits of the
+   * hub's `pair_code` (the code the Mac shows its owner) when it comes; never before. Resolves
+   * with the device's name and the Mac's (as the hub sent it, untrusted) on `paired`, rejects with
+   * the hub's refusal, or `lost` when the connection goes, its channel has not opened in 10 s, or
+   * no answer comes in 130 s. The hub closes the paired connection: `start()` then connects again
+   * and says hello.
+   */
+  pair(secret: string, name: string, platform: string, onCode: (code: string) => void): Promise<{ device: string; name: string }> {
+    if (this.keyValue === null) return Promise.reject(new Refusal("unsent", "Can't reach your Mac"));
     return new Promise((resolve, reject) => {
-      const socket = this.factory(this.url);
+      const socket = this.factory(this.socketUrl);
       const req = this.nextReq++;
       let done = false;
       const cancelTimer = this.schedule(
         () => finish(() => reject(new Refusal("lost", "The Mac did not answer in time"))),
-        REQUEST_TIMEOUT_MS,
+        PAIR_TIMEOUT_MS,
       );
+      // Until the channel opens: a handshake that has not finished by the hub's deadline never will.
+      let cancelHandshake: (() => void) | null = this.schedule(() => abort(), PAIR_HANDSHAKE_TIMEOUT_MS);
       const finish = (settle: () => void): void => {
         if (done) return;
         done = true;
         cancelTimer();
+        cancelHandshake?.();
+        cancelHandshake = null;
         this.pairings.delete(abort);
         socket.onopen = socket.onmessage = socket.onclose = undefined;
         try {
@@ -271,6 +323,8 @@ export class HubClient {
       this.pairings.add(abort);
 
       socket.onopen = () => {
+        cancelHandshake?.();
+        cancelHandshake = null;
         const command = { v: PROTOCOL_VERSION, type: "pair", req, secret, name, platform };
         try {
           socket.send(JSON.stringify(command));
@@ -282,9 +336,15 @@ export class HubClient {
         const frame = parseFrame(text);
         if (!frame) {
           this.garbage += 1;
+        } else if (frame.type === "pair_code" && frame.req === req) {
+          try {
+            onCode(frame.code);
+          } catch {
+            // The screen's failure is not the pairing's.
+          }
         } else if (frame.type === "paired") {
-          this.tokenValue = frame.token;
-          finish(() => resolve({ token: frame.token, device: frame.device }));
+          const mac = typeof frame.name === "string" ? frame.name : "";
+          finish(() => resolve({ device: frame.device, name: mac }));
         } else if (frame.type === "refused") {
           finish(() => reject(refusalOf(frame)));
         }
@@ -293,9 +353,9 @@ export class HubClient {
     });
   }
 
-  /** Connects (foreground). Does nothing when running already, or with no token. */
+  /** Connects (foreground). Does nothing when running already, or with no key. */
   start(): void {
-    if (this.running || this.tokenValue === null) return;
+    if (this.running || this.keyValue === null) return;
     this.running = true;
     this.started += 1;
     this.backoff.reset();
@@ -418,7 +478,7 @@ export class HubClient {
   // Connection
 
   private connect(): void {
-    const socket = this.factory(this.url);
+    const socket = this.factory(this.socketUrl);
     this.socket = socket;
     this.setState("connecting");
     this.cancelHandshake = this.schedule(() => {
@@ -430,20 +490,23 @@ export class HubClient {
 
     // A socket that is no longer `this.socket` was replaced or stopped; what it still says is moot.
     socket.onopen = () => {
-      if (this.socket !== socket || this.tokenValue === null) return;
+      if (this.socket !== socket || this.keyValue === null) return;
       this.setState("authenticating");
+      // No token: the hub knows the phone by the key its handshake proved.
       socket.send(
         JSON.stringify({
           v: PROTOCOL_VERSION,
           type: "hello",
           req: this.nextReq++,
-          token: this.tokenValue,
           ...(this.background ? { background: true } : {}),
         }),
       );
     };
     socket.onmessage = (text) => {
       if (this.socket === socket) this.handle(text);
+    };
+    socket.onpong = () => {
+      if (this.socket === socket) this.ponged();
     };
     socket.onclose = () => {
       if (this.socket === socket) this.lost();
@@ -470,12 +533,12 @@ export class HubClient {
     this.cancelHandshake = null;
     this.cancelPing?.();
     this.cancelPing = null;
-    this.pingReq = null;
+    this.pinging = false;
     this.readyAt = null;
     const socket = this.socket;
     this.socket = null;
     if (socket) {
-      socket.onopen = socket.onmessage = socket.onclose = undefined;
+      socket.onopen = socket.onmessage = socket.onclose = socket.onpong = undefined;
       try {
         socket.close();
       } catch {
@@ -497,48 +560,49 @@ export class HubClient {
   }
 
   /** Arms the keepalive: a ping when the link has been silent for `delay` (the full interval after
-   * a welcome or an answer). Any inbound frame is proof of life, so a link that spoke since is not
+   * a welcome or a pong). Any inbound frame is proof of life, so a link that spoke since is not
    * pinged yet, and one that spoke since a ping went out is not dead: a pong queued behind a heavy
-   * replay is no reason to drop the link. */
+   * replay is no reason to drop the link. A link silent for a whole interval with its last ping
+   * unanswered is dead: the channel sends no second ping before the first's pong. */
   private armPing(delay = PING_INTERVAL_MS): void {
     this.cancelPing?.();
     const socket = this.socket;
     this.cancelPing = this.schedule(() => {
       this.cancelPing = null;
-      if (this.socket !== socket) return;
+      if (this.socket !== socket || socket === null) return;
       const quiet = this.now() - this.lastHeard;
       if (quiet < PING_INTERVAL_MS) {
         this.armPing(PING_INTERVAL_MS - quiet);
         return;
       }
       const sentAt = this.now();
-      this.pingReq = this.send({ type: "ping" });
-      if (this.pingReq === null) {
-        this.lost(); // a socket that cannot send is as good as dead
+      if (!socket.ping()) {
+        this.lost(); // a channel that cannot ping is as good as dead
         return;
       }
+      this.pinging = true;
       this.cancelPing = this.schedule(() => {
         this.cancelPing = null;
-        this.pingReq = null;
         if (this.socket !== socket) return;
         // It spoke since the ping: count the quiet from its last frame, not from now, so that a link
-        // that went silent just after speaking is still found dead within ~35 s of that frame.
+        // that went silent just after speaking is still found dead within ~25 s of that frame.
         if (this.lastHeard > sentAt) this.armPing(Math.max(0, PING_INTERVAL_MS - (this.now() - this.lastHeard)));
         else this.lost();
       }, PING_TIMEOUT_MS);
     }, delay);
   }
 
-  /** True when `req` answers the ping in flight (and then the next one is armed). */
-  private pinged(req: number): boolean {
-    if (this.pingReq === null || req !== this.pingReq) return false;
-    this.pingReq = null;
+  /** The hub answered the channel's ping: the link is alive, and the next ping is armed. A late
+   * pong, after its deadline let the link stay, is still a sign of life. */
+  private ponged(): void {
+    this.lastHeard = this.now();
+    if (!this.pinging) return;
+    this.pinging = false;
     this.armPing();
-    return true;
   }
 
   private unpair(): void {
-    this.tokenValue = null;
+    this.keyValue = null;
     this.running = false;
     this.cancelReconnect?.();
     this.cancelReconnect = null;
@@ -578,10 +642,10 @@ export class HubClient {
         for (const session of this.wanted) this.sendSubscribe(session);
         return;
       case "paired":
-        return; // only answers a pairing, which has its own connection
+      case "pair_code":
+        return; // only answer a pairing, which has its own connection
       case "ack":
       case "recent": {
-        if (this.pinged(frame.req)) return;
         const entry = this.pending.get(frame.req);
         const subscribed = this.subscribeReqs.get(frame.req);
         if (entry) {
@@ -600,7 +664,6 @@ export class HubClient {
       case "changes":
       case "diff": {
         // Only ever an answer to a request: a late one (it timed out) is dropped.
-        if (this.pinged(frame.req)) return;
         const entry = this.pending.get(frame.req);
         if (!entry) return;
         this.pending.delete(frame.req);
@@ -633,7 +696,6 @@ export class HubClient {
   }
 
   private refused(frame: RefusedFrame): void {
-    if (this.pinged(frame.req)) return; // any answer shows the link is alive
     const entry = this.pending.get(frame.req);
     const session = this.subscribeReqs.get(frame.req);
     if (entry) {

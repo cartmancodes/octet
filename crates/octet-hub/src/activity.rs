@@ -44,8 +44,7 @@
 //! (other than with a 410) is sent again, a few times at most.
 //!
 //! The payload ([`Due::payload`]) names no session name, workspace, command or file: only the
-//! kind, the hub's raw session id, the host the hub is published at (`mac`), two times and a
-//! count.
+//! kind, the hub's raw session id, the hub's channel id (`mac`), two times and a count.
 //!
 //! [`Activity`] runs it: it holds the APNs key, sends in the background with `curl`
 //! ([`crate::apns::send`]), and reports a 410 or a start that did not go out to the hub. The only
@@ -192,11 +191,11 @@ impl Due {
         }
     }
 
-    /// The APNs payload at wall-clock time `wall`, naming `mac` (the host the hub is published
-    /// at, or nothing): the event and the content state, whose `since` is the wall-clock time
-    /// stored with it; a start adds the attributes and an alert ("Approval waiting" for an
-    /// approval, else "Session running"), and an end a `dismissal-date`. Nothing else.
-    pub(crate) fn payload(&self, mac: Option<&str>, wall: SystemTime) -> Value {
+    /// The APNs payload at wall-clock time `wall`, naming `mac` (the hub's channel id): the event
+    /// and the content state, whose `since` is the wall-clock time stored with it; a start adds
+    /// the attributes and an alert ("Approval waiting" for an approval, else "Session running"),
+    /// and an end a `dismissal-date`. Nothing else.
+    pub(crate) fn payload(&self, mac: &str, wall: SystemTime) -> Value {
         let seconds = |at: SystemTime| at.duration_since(UNIX_EPOCH).map_or(0, |at| at.as_secs());
         let timestamp = seconds(wall);
         let since = self.content.since_wall.map_or(timestamp, seconds);
@@ -206,7 +205,7 @@ impl Due {
             "content-state": {
                 "kind": self.content.kind.label(),
                 "session": self.content.session,
-                "mac": mac.unwrap_or_default(),
+                "mac": mac,
                 "since": since,
                 "approvals": self.content.approvals,
             },
@@ -898,13 +897,13 @@ impl Activity {
         devices: &[Device],
         connected: impl Fn(&str) -> bool,
         cap: &mut Limiter,
-        mac: Option<&str>,
+        mac: &str,
         (now, wall): (Instant, SystemTime),
     ) {
         self.driver
-            .prune(|key| devices.iter().any(|device| device.token_sha256 == key));
+            .prune(|key| devices.iter().any(|device| device.key == key));
         for device in devices {
-            let key = &device.token_sha256;
+            let key = &device.key;
             let tokens = device.activity.as_ref().map(|held| fresh(held, wall));
             let tokens = tokens.as_ref();
             if tokens.is_none() {
@@ -973,8 +972,8 @@ mod tests {
     /// The activity token and the push-to-start token of the device under test.
     const TOKEN: &str = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
     const START: &str = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
-    /// The host the tests' hub is published at.
-    const MAC: &str = "mac.tail1234.ts.net";
+    /// The tests' hub's channel id, which names it in a payload.
+    const MAC: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     /// Where the tests' sessions keep their journals: a name the payload must never carry.
     const JOURNAL: &str = "/work/secret-project/session-1-1.jsonl";
 
@@ -1822,23 +1821,18 @@ mod tests {
             .expect("store");
         let now = SystemTime::now();
         let secret = store.pairing_secret(now);
-        let (_, device) = store
-            .pair(&secret, "Test phone", "ios", "owner@example", now)
+        let device = store
+            .pair(&secret, "Test phone", "ios", &"ab".repeat(32), "", now)
             .await
             .expect("paired");
         let held = ActivityTokens {
             registered: Some(1),
             ..tokens(Some(TOKEN), Some(START))
         };
-        assert!(
-            store
-                .set_activity(&device.token_sha256, held)
-                .await
-                .expect("saved")
-        );
+        assert!(store.set_activity(&device.key, held).await.expect("saved"));
         // The hub ends that activity after five idle minutes; APNs takes the end.
         let end = Report {
-            device: device.token_sha256.clone(),
+            device: device.key.clone(),
             token: TOKEN.into(),
             event: Event::End,
             run: 0,
@@ -1958,10 +1952,10 @@ mod tests {
         Device {
             name: "Test phone".into(),
             platform: "ios".into(),
-            login: "owner@example".into(),
             created: 0,
             last_seen: 0,
-            token_sha256: "dev".into(),
+            key: "dev".into(),
+            relay: String::new(),
             push_token: None,
             push_kinds: octet_core::remote::protocol::PushKinds::default(),
             activity: tokens,
@@ -1983,23 +1977,11 @@ mod tests {
         let busy = Arc::clone(&activity.slots)
             .try_acquire_many_owned(u32::try_from(SENDS_AT_ONCE).expect("small"))
             .expect("the slots");
-        activity.flush(
-            &devices,
-            |_| false,
-            &mut cap,
-            None,
-            (later(base, 1.0), wall),
-        );
+        activity.flush(&devices, |_| false, &mut cap, MAC, (later(base, 1.0), wall));
         assert_eq!(cap.remembered(), 0);
         // With a slot free, the start goes, and takes one.
         drop(busy);
-        activity.flush(
-            &devices,
-            |_| false,
-            &mut cap,
-            None,
-            (later(base, 2.0), wall),
-        );
+        activity.flush(&devices, |_| false, &mut cap, MAC, (later(base, 2.0), wall));
         assert_eq!(cap.remembered(), 1);
         // The `curl` that is not there fails it, and the hub hears so; the start is forgotten.
         let report = timeout(Duration::from_secs(5), received.recv())
@@ -2016,13 +1998,7 @@ mod tests {
             (later(base, 3.0), wall),
         );
         let mut cap = Limiter::default();
-        activity.flush(
-            &devices,
-            |_| false,
-            &mut cap,
-            None,
-            (later(base, 3.0), wall),
-        );
+        activity.flush(&devices, |_| false, &mut cap, MAC, (later(base, 3.0), wall));
         assert_eq!(cap.remembered(), 1, "started again");
     }
 
@@ -2228,15 +2204,15 @@ mod tests {
         };
         let fixture = fixture();
         assert_eq!(
-            due(Event::Start, Kind::Approval, 2).payload(Some(MAC), wall),
+            due(Event::Start, Kind::Approval, 2).payload(MAC, wall),
             fixture["start"]
         );
         assert_eq!(
-            due(Event::Update, Kind::Running, 0).payload(Some(MAC), wall),
+            due(Event::Update, Kind::Running, 0).payload(MAC, wall),
             fixture["update"]
         );
         assert_eq!(
-            due(Event::End, Kind::Done, 0).payload(Some(MAC), wall),
+            due(Event::End, Kind::Done, 0).payload(MAC, wall),
             fixture["end"]
         );
         assert_eq!(fixture.as_object().map(serde_json::Map::len), Some(3));
@@ -2254,7 +2230,7 @@ mod tests {
             Priority::Normal
         );
         // A start for a turn says so; one for an approval says that instead.
-        let running = due(Event::Start, Kind::Running, 0).payload(Some(MAC), wall);
+        let running = due(Event::Start, Kind::Running, 0).payload(MAC, wall);
         assert_eq!(
             running["aps"]["alert"],
             json!({"title": "Octet", "body": "Session running"})
@@ -2281,11 +2257,11 @@ mod tests {
                 "{event}"
             );
         }
-        // Unpublished, `mac` is empty; with no session leading, so is `session`.
+        // With no session leading, `session` is empty.
         let mut lone = due(Event::Update, Kind::Done, 0);
         lone.content.session.clear();
-        let payload = lone.payload(None, wall);
-        assert_eq!(payload["aps"]["content-state"]["mac"], "");
+        let payload = lone.payload(MAC, wall);
+        assert_eq!(payload["aps"]["content-state"]["mac"], MAC);
         assert_eq!(payload["aps"]["content-state"]["session"], "");
     }
 
@@ -2300,7 +2276,7 @@ mod tests {
             rig.observe(at, &[snap("s1", Some("idle"), approvals)]);
             let due = rig.away(at).expect("an update");
             assert_eq!(due.event, Event::Update);
-            let payload = due.payload(Some(MAC), rig.wall_at(at));
+            let payload = due.payload(MAC, rig.wall_at(at));
             sinces.push(payload["aps"]["content-state"]["since"].as_u64());
         }
         assert_eq!(sinces, [Some(1_790_000_001); 3]);
@@ -2323,7 +2299,7 @@ mod tests {
             (update, &["stale-date"][..]),
             (end, &["dismissal-date"][..]),
         ] {
-            let payload = due.payload(Some(MAC), wall);
+            let payload = due.payload(MAC, wall);
             let text = payload.to_string();
             for secret in ["/work", "secret", "jsonl", "session-1", TOKEN, START] {
                 assert!(!text.contains(secret), "{secret} in {text}");

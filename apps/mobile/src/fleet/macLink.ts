@@ -1,12 +1,12 @@
 // One pairing's link: its client, what it feeds the store, and its push registration.
 import { Refusal, type HubClient } from "../client/HubClient";
 import type { Coalescer } from "../coalesce";
-import { hostOf, type Links, type Pairing } from "../macs";
+import type { Links, Pairing } from "../macs";
 import { DENIED, currentToken, dropPushRegistration, onTokenChange } from "../notifications";
 import { loadSettings } from "../persist";
 import type { PushKinds } from "../protocol";
 import { connectStore, type OctetStore } from "../store";
-import type { TokenStore } from "./keychain";
+import type { KeyStore } from "./keychain";
 
 /** One paired Mac, as screens show it. Its link's state is the store's (`useHub`, `useTried`):
  * kept in one place, so no screen can read two that disagree. */
@@ -14,8 +14,17 @@ export interface MacInfo {
   /** The phone's id for the pairing: every key of the Mac's sessions starts `<id>/`. */
   id: string;
   macName: string;
-  /** The hub's host, as the pairing link gave it. */
-  host: string;
+  /** The Mac's channel id: what names it outside the app (a push, the Island). */
+  channel: string;
+  /** The relay the Mac is reached through, as the pairing link gave it (`host` or `host:port`):
+   * shown, and never what tells one Mac from another. */
+  relay: string;
+}
+
+/** What screens show of `pairing`. */
+export function macInfoOf(pairing: Pairing): MacInfo {
+  const relay = /^wss?:\/\/([^/]*)\/$/.exec(pairing.relay)?.[1] ?? pairing.relay;
+  return { id: pairing.id, macName: pairing.macName, channel: pairing.channel, relay };
 }
 
 /** The outcome of turning notifications on or off: done, or the words for why not. */
@@ -38,12 +47,12 @@ export interface LinkHost {
   inTurn<T>(job: () => Promise<T>): Promise<T>;
   /** The link's push notice changed. */
   changed(link: MacLink): void;
-  /** The Mac refused this phone's token as unpaired or revoked. */
+  /** The Mac refused this phone's key as unpaired or revoked. */
   unpaired(link: MacLink): void;
 }
 
 /**
- * One pairing: its client, its token in the keychain, and its push registration (sent after each
+ * One pairing: its client, its private key in the keychain, and its push registration (sent after each
  * ready, on a token rotation, and when notifications are turned on or off), with the notice of
  * the last one that did not work. What it feeds the store is keyed by its id.
  */
@@ -63,7 +72,7 @@ export class MacLink {
     private readonly host: LinkHost,
     public pairing: Pairing,
     readonly client: HubClient,
-    readonly tokens: TokenStore,
+    readonly keys: KeyStore,
   ) {
     this.shown = this.describe();
   }
@@ -83,11 +92,11 @@ export class MacLink {
   }
 
   private describe(): MacInfo {
-    return { id: this.id, macName: this.pairing.macName, host: hostOf(this.pairing.hubUrl) ?? "" };
+    return macInfoOf(this.pairing);
   }
 
   /** Feeds the store from the client, keyed by this Mac (its link's state included), and follows
-   * its state for the push registration and a refused token, and the push token. */
+   * its state for the push registration and a refused key, and the push token. */
   attach(): void {
     const { client } = this;
     const offStore = connectStore(this.host.store, client, { mac: this.id, links: this.host.links, coalescer: this.host.coalescer });

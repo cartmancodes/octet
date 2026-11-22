@@ -4,8 +4,11 @@ import * as SecureStore from "expo-secure-store";
 import * as Notifications from "expo-notifications";
 import { Alert } from "react-native";
 
-import { FakeClock, Sockets } from "./client/fakes";
+import { FakeClock, Sockets, channelOf, hubKeyOf, pairLinkTo, phoneUrlOf } from "./client/fakes";
+import { fromHex } from "./client/link";
+import { newKeyPair } from "./client/noise";
 import { Fleet, TOKEN_KEY, UNPAIR_FAILED_NOTICE, tokenKeyOf, unpairedNotice } from "./hub";
+import type { Pairing } from "./macs";
 import { loadSettings, saveSettings } from "./persist";
 import { createOctetStore } from "./store";
 import { M, newM } from "./testKeys";
@@ -21,33 +24,52 @@ jest.mock("expo-constants", () => ({
 }));
 
 const SECRET = "ab".repeat(32);
-const LINK = `https://mac.tail1234.ts.net/#pair=${SECRET}`;
+/** The one Mac, reached through the relay `relay.example.test`. */
+const RELAY = "relay.example.test";
+const LINK = pairLinkTo("mac", SECRET, { relay: RELAY });
+/** Where its phone sockets go. */
+const URL_ = phoneUrlOf("mac", RELAY);
+/** The private key, as hex, of the key pair the phone makes when it pairs. */
 const TOKEN = "cd".repeat(32);
-/** The one pairing's keychain entry; `TOKEN_KEY` is where an older version kept its token. */
+/** The one pairing's keychain entry; `TOKEN_KEY` is where a version from before keys kept its token. */
 const KEY = tokenKeyOf(M);
 const UNPAIRED_NOTICE = unpairedNotice("mac");
+/** The one Mac's pairing as this version saves it. */
+const PAIRING: Pairing = { id: M, relay: `wss://${RELAY}/`, channel: channelOf("mac"), hubKey: hubKeyOf("mac"), deviceName: "iPhone", macName: "mac" };
+
+/** A paired phone's storage: the pairing in settings (with `extra`), its private key in the keychain. */
+async function savedMac(extra: object = {}): Promise<void> {
+  await SecureStore.setItemAsync(KEY, TOKEN);
+  await saveSettings({ pairings: [PAIRING], ...extra });
+}
 
 function rig() {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const store = createOctetStore();
+  /** The private key, as hex, the next pairing makes. */
+  const next = { key: TOKEN };
   const hub = new Fleet({
-    factory: sockets.factory,
+    factory: () => sockets.factory,
+    newKey: () => newKeyPair(() => fromHex(next.key) ?? new Uint8Array(32)),
     store,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
     newId: newM,
   });
-  return { sockets, clock, store, hub };
+  return { sockets, clock, store, hub, next };
 }
 type Rig = ReturnType<typeof rig>;
 
-/** The Mac accepts the pairing the controller just sent. */
-function accept(r: Rig, token = TOKEN): void {
+/** The Mac accepts the pairing the controller just sent: its code, `paired`, and the paired
+ * connection closed. */
+function accept(r: Rig): void {
   const socket = r.sockets.last;
   socket.open();
   const [command] = socket.commandsOf("pair");
-  socket.receive({ type: "paired", req: command?.req, token, device: "iPhone" });
+  socket.receive({ type: "pair_code", req: command?.req, code: "482913" });
+  socket.receive({ type: "paired", req: command?.req, device: "iPhone", name: "mac" });
+  socket.drop(1000);
 }
 
 /** Pairs, and walks the new connection to ready. */
@@ -55,7 +77,7 @@ async function paired(r: Rig): Promise<void> {
   await r.hub.init();
   const pending = r.hub.pair(LINK, "iPhone");
   accept(r);
-  expect(await pending).toEqual({ ok: true });
+  expect(await pending).toEqual({ ok: true, macName: expect.any(String) });
   r.sockets.last.open();
   r.sockets.last.receive({ type: "welcome", device: "iPhone" });
 }
@@ -77,43 +99,32 @@ describe("starting", () => {
     expect(r.hub.links.macs()).toEqual([]);
   });
 
-  it("is unpaired, and drops the token, with a token but no hub address", async () => {
-    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-    const r = rig();
-    await r.hub.init();
-    expect(r.hub.snapshot().status).toBe("unpaired");
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
-    expect(r.sockets.all).toHaveLength(0);
-  });
-
-  it("does not trust a saved hub address that is not a pairing host: unpaired, token dropped", async () => {
-    for (const hubUrl of ["ws://mac.ts.net/", "wss://evil.example/path", "https://mac.ts.net/", "wss://mac.ts.net:99999/"]) {
-      await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-      await saveSettings({ hubUrl });
+  it("does not trust a saved relay address that is not one a link gives: unpaired, key dropped", async () => {
+    for (const relay of ["wss://evil.example/path", "https://relay.example.test/", "wss://relay.example.test:99999/", "wss://relay.example.test", "javascript:x"]) {
+      await SecureStore.setItemAsync(KEY, TOKEN);
+      await saveSettings({ pairings: [{ ...PAIRING, relay }] });
       const r = rig();
       r.hub.setForeground(true);
       await r.hub.init();
-      expect(r.hub.snapshot().status).toBe("unpaired");
-      expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+      expect([relay, r.hub.snapshot().status]).toEqual([relay, "unpaired"]);
+      expect(await SecureStore.getItemAsync(KEY)).toBeNull();
       expect(r.sockets.all).toHaveLength(0);
     }
   });
 
-  it("connects with the saved token and hub address, when the app is in the foreground", async () => {
-    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
+  it("connects with the saved key through the saved relay, when the app is in the foreground", async () => {
+    await savedMac();
     const r = rig();
     r.hub.setForeground(true);
     await r.hub.init();
     expect(r.hub.snapshot().status).toBe("paired");
-    expect(r.sockets.last.url).toBe("wss://mac.tail1234.ts.net/");
+    expect(r.sockets.last.url).toBe(URL_);
     r.sockets.last.open();
-    expect(r.sockets.last.commandsOf("hello")).toEqual([expect.objectContaining({ token: TOKEN })]);
+    expect(r.sockets.last.commandsOf("hello")).toEqual([{ v: 1, type: "hello", req: expect.any(Number) }]);
   });
 
   it("does not connect while the app is in the background", async () => {
-    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
+    await savedMac();
     const r = rig();
     r.hub.setForeground(false);
     await r.hub.init();
@@ -123,66 +134,69 @@ describe("starting", () => {
     expect(r.sockets.all).toHaveLength(1);
   });
 
-  it("keeps a good token when the settings cannot be read once at launch", async () => {
-    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
+  it("keeps a good key when the settings cannot be read once at launch", async () => {
+    await savedMac();
     jest.mocked(AsyncStorage.getItem).mockRejectedValueOnce(new Error("busy"));
     const first = rig();
     await first.hub.init();
     expect(first.hub.snapshot().status).toBe("unpaired");
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBe(TOKEN);
+    expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
     // The next launch reads them and is paired again, with no new pairing.
     const second = rig();
     await second.hub.init();
     expect(second.hub.snapshot().status).toBe("paired");
   });
 
-  it("takes garbled settings for the defaults: no hub address, so the token goes and Pair shows", async () => {
-    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
+  it("takes garbled settings for the defaults: no pairing, so Pair shows and nothing connects", async () => {
+    await SecureStore.setItemAsync(KEY, TOKEN);
     await AsyncStorage.setItem("octet.settings.v1", "{not json");
     const r = rig();
+    r.hub.setForeground(true);
     await r.hub.init();
     expect(r.hub.snapshot().status).toBe("unpaired");
-    expect(await SecureStore.getItemAsync(TOKEN_KEY)).toBeNull();
+    expect(r.sockets.all).toHaveLength(0);
   });
 
   it("pairs over garbled settings: the save replaces them, and the pairing is kept", async () => {
     for (const junk of ["not json", "[]", "null"]) {
       await AsyncStorage.setItem("octet.settings.v1", junk);
-      await SecureStore.deleteItemAsync(TOKEN_KEY);
+      await SecureStore.deleteItemAsync(KEY);
       const r = rig();
       await r.hub.init();
       const pending = r.hub.pair(LINK, "iPhone");
       accept(r);
-      expect([junk, await pending]).toEqual([junk, { ok: true }]);
-      expect((await loadSettings()).pairings.map((p) => p.hubUrl)).toEqual(["wss://mac.tail1234.ts.net/"]);
+      expect([junk, await pending]).toEqual([junk, { ok: true, macName: expect.any(String) }]);
+      expect((await loadSettings()).pairings.map((p) => p.relay)).toEqual([`wss://${RELAY}/`]);
       expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
       r.hub.setForeground(false);
     }
   });
 
-  it("is unpaired when the keychain cannot be read", async () => {
+  it("is unpaired when the keychain cannot be read, and keeps the pairing for the next launch", async () => {
+    await savedMac();
     jest.mocked(SecureStore.getItemAsync).mockRejectedValueOnce(new Error("locked"));
     const r = rig();
     await r.hub.init();
     expect(r.hub.snapshot().status).toBe("unpaired");
+    expect((await loadSettings()).pairings).toEqual([PAIRING]);
+    expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
   });
 });
 
 describe("pairing", () => {
-  it("sends the secret, name and platform, then keeps the token in the keychain and the hub address in settings", async () => {
+  it("sends the secret, name and platform, then keeps the private key in the keychain and the relay, channel and hub key in settings", async () => {
     const r = rig();
     await r.hub.init();
     const pending = r.hub.pair(` ${LINK}\n`, "Shubho's iPhone");
-    expect(r.sockets.last.url).toBe("wss://mac.tail1234.ts.net/");
+    expect(r.sockets.last.url).toBe(URL_);
     accept(r);
-    expect(await pending).toEqual({ ok: true });
+    expect(await pending).toEqual({ ok: true, macName: expect.any(String) });
     expect(r.sockets.last.closed).toBe(true); // the pairing socket is done
     expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
     const settings = await loadSettings();
-    expect(settings.pairings).toEqual([{ id: M, hubUrl: "wss://mac.tail1234.ts.net/", deviceName: "Shubho's iPhone", macName: "mac" }]);
+    expect(settings.pairings).toEqual([{ ...PAIRING, deviceName: "Shubho's iPhone" }]);
     expect(settings.deviceName).toBe("Shubho's iPhone");
-    // The token is nowhere else on disk.
+    // The private key is nowhere else on disk.
     expect(JSON.stringify(await AsyncStorage.getAllKeys())).not.toContain(TOKEN);
     expect(JSON.stringify(await AsyncStorage.multiGet(await AsyncStorage.getAllKeys()))).not.toContain(TOKEN);
     expect(r.hub.snapshot().status).toBe("paired");
@@ -198,16 +212,21 @@ describe("pairing", () => {
     ]);
   });
 
-  it("connects to the hub with the new token once paired", async () => {
+  it("says hello on a connection of its own once paired: the hub closes the one it paired on", async () => {
     const r = rig();
     r.hub.setForeground(true);
     await r.hub.init();
     const pending = r.hub.pair(LINK, "iPhone");
+    const pairing = r.sockets.last;
     accept(r);
     await pending;
     const socket = r.sockets.last;
+    expect(socket).not.toBe(pairing);
+    expect(socket.url).toBe(URL_);
     socket.open();
-    expect(socket.commandsOf("hello")).toEqual([expect.objectContaining({ token: TOKEN })]);
+    expect(socket.commandsOf("hello")).toEqual([{ v: 1, type: "hello", req: expect.any(Number) }]);
+    socket.receive({ type: "welcome", device: "iPhone", name: "mac" });
+    expect(r.store.getState().hubs.get(M)).toBe("ready");
   });
 
   it("refuses a link that is not a pairing link without opening a socket", async () => {
@@ -219,12 +238,27 @@ describe("pairing", () => {
     expect(await SecureStore.getItemAsync(KEY)).toBeNull();
   });
 
-  it("refuses a pair link to a host that is not a .ts.net name, without opening a socket", async () => {
+  it("refuses a link of the Tailscale days, without opening a socket", async () => {
     const r = rig();
     await r.hub.init();
-    const result = await r.hub.pair(`https://mac.example.com/#pair=${SECRET}`, "iPhone");
-    expect(result).toEqual({ ok: false, message: "Pair links come from tailscale serve (a .ts.net name)", clear: false });
+    const result = await r.hub.pair(`https://mac.tail1234.ts.net/#pair=${SECRET}`, "iPhone");
+    expect(result).toEqual({ ok: false, message: "That isn't an Octet pairing link", clear: false });
     expect(r.sockets.all).toHaveLength(0);
+  });
+
+  it("shows the hub's code while the Mac asks, and only once the hub has sent it", async () => {
+    const r = rig();
+    await r.hub.init();
+    const codes: string[] = [];
+    const pending = r.hub.pair(LINK, "iPhone", (code) => codes.push(code));
+    const socket = r.sockets.last;
+    socket.open();
+    expect(codes).toEqual([]);
+    const [command] = socket.commandsOf("pair");
+    socket.receive({ type: "pair_code", req: command?.req, code: "482913" });
+    expect(codes).toEqual(["482913"]);
+    socket.receive({ type: "paired", req: command?.req, device: "iPhone", name: "mac" });
+    expect(await pending).toEqual({ ok: true, macName: expect.any(String) });
   });
 
   it("shows the hub's words when it refuses", async () => {
@@ -270,7 +304,7 @@ describe("pairing", () => {
     expect(r.sockets.last.commandsOf("pair")).toEqual([expect.objectContaining({ name: "iPhone" })]);
   });
 
-  it("keeps the token on this phone only: it never rides a backup to another handset", async () => {
+  it("the_private_key_is_this_device_only: it never rides a backup to another handset", async () => {
     const only = { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY };
     const r = rig();
     r.hub.setForeground(true);
@@ -294,14 +328,14 @@ describe("pairing", () => {
     await r.hub.init();
     const pending = r.hub.pair(LINK, "iPhone");
     accept(r);
-    expect(await pending).toEqual({ ok: true });
+    expect(await pending).toEqual({ ok: true, macName: expect.any(String) });
     expect(SecureStore.setItemAsync).toHaveBeenCalledTimes(2);
     expect(SecureStore.deleteItemAsync).toHaveBeenCalledWith(KEY, expect.anything());
     expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN);
     expect(r.hub.snapshot().status).toBe("paired");
   });
 
-  it("tells the user how to recover when the keychain refuses the token twice", async () => {
+  it("tells the user how to recover when the keychain refuses the key twice", async () => {
     jest.mocked(SecureStore.setItemAsync).mockRejectedValueOnce(new Error("locked")).mockRejectedValueOnce(new Error("locked"));
     const r = rig();
     await r.hub.init();
@@ -318,7 +352,7 @@ describe("pairing", () => {
     expect(await SecureStore.getItemAsync(KEY)).toBeNull();
   });
 
-  it("treats a hub address that cannot be saved like a keychain failure", async () => {
+  it("treats a pairing that cannot be saved like a keychain failure", async () => {
     jest.mocked(AsyncStorage.setItem).mockRejectedValueOnce(new Error("full"));
     const r = rig();
     await r.hub.init();
@@ -349,7 +383,7 @@ describe("pairing", () => {
     const r = rig();
     expect(r.hub.defaultName()).toBe("iPhone");
     const android = new Fleet({
-      factory: r.sockets.factory,
+      factory: () => r.sockets.factory,
       store: createOctetStore(),
       platform: "android",
     });
@@ -358,7 +392,7 @@ describe("pairing", () => {
 });
 
 describe("unpaired by the Mac", () => {
-  it("revoked_unpairs: a revoked or unpaired refusal deletes the token and goes to Pair with a notice", async () => {
+  it("revoked_unpairs: a revoked or unpaired refusal deletes the key and goes to Pair with a notice", async () => {
     for (const code of ["revoked", "unpaired"] as const) {
       const r = rig();
       r.hub.setForeground(true);
@@ -374,8 +408,7 @@ describe("unpaired by the Mac", () => {
   });
 
   it("revoked_unpairs: a refused hello does the same", async () => {
-    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
+    await savedMac();
     const r = rig();
     r.hub.setForeground(true);
     await r.hub.init();
@@ -423,9 +456,10 @@ describe("unpaired by the Mac", () => {
     await paired(r);
     r.sockets.last.receive({ type: "refused", req: 0, reason: "revoked", code: "revoked" });
     await new Promise((done) => setImmediate(done));
+    r.next.key = "ef".repeat(32);
     const pending = r.hub.pair(LINK, "iPhone");
     expect(r.hub.snapshot().notice).toBeNull();
-    accept(r, "ef".repeat(32));
+    accept(r);
     await pending;
     expect(await SecureStore.getItemAsync(KEY)).toBe("ef".repeat(32));
   });
@@ -497,7 +531,7 @@ describe("the app's lifecycle", () => {
 });
 
 describe("unpair", () => {
-  it("clears the token and the hub address, forgets the Mac's sessions, and shows Pair with no notice", async () => {
+  it("clears the key and the pairing, forgets the Mac's sessions, and shows Pair with no notice", async () => {
     const r = rig();
     r.hub.setForeground(true);
     await paired(r);
@@ -547,7 +581,7 @@ describe("unpair", () => {
     expect(await SecureStore.getItemAsync(KEY)).toBeNull();
   });
 
-  it("says so when the keychain will not clear: Pair shows a notice, and the next start drops the token", async () => {
+  it("says so when the keychain will not clear: Pair shows a notice, and the next start drops the key", async () => {
     const r = rig();
     r.hub.setForeground(true);
     await paired(r);
@@ -559,11 +593,12 @@ describe("unpair", () => {
     expect(r.hub.snapshot()).toEqual({ status: "unpaired", notice: UNPAIR_FAILED_NOTICE, offer: false, macs: [], notices: [] });
     expect(await SecureStore.getItemAsync(KEY)).toBe(TOKEN); // still there...
     const again = rig();
-    await again.hub.init(); // ...but with no hub address it is dropped
+    await again.hub.init(); // ...but the next launch deletes it
     expect(again.hub.snapshot().status).toBe("unpaired");
+    expect(await SecureStore.getItemAsync(KEY)).toBeNull();
   });
 
-  it("says so when the hub address cannot be cleared either", async () => {
+  it("says so when the pairing cannot be cleared from settings either", async () => {
     const r = rig();
     r.hub.setForeground(true);
     await paired(r);
@@ -627,8 +662,7 @@ const answer = (r: Rig, message = "Notifications on") => {
 
 /** A paired app with notifications saved on, its connection ready. */
 async function readyWithPush(on = true): Promise<Rig> {
-  await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-  await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/", notifications: on });
+  await savedMac({ notifications: on });
   const r = rig();
   r.hub.setForeground(true);
   await r.hub.init();
@@ -1165,7 +1199,7 @@ describe("unpair and push", () => {
     expect(r.store.getState().sessions).toHaveLength(0);
     const pending = r.hub.pair(LINK, "iPhone");
     accept(r);
-    await expect(pending).resolves.toEqual({ ok: true });
+    await expect(pending).resolves.toEqual({ ok: true, macName: "mac" });
   });
 });
 
@@ -1173,8 +1207,7 @@ describe("push operations run one at a time", () => {
   it("a turn-off during the registration made at ready is sent after it, so the Mac ends off", async () => {
     let giveToken: (t: { type: string; data: string }) => void = () => {};
     n.getExpoPushTokenAsync.mockReturnValueOnce(new Promise((resolve) => (giveToken = resolve)) as never);
-    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/", notifications: true });
+    await savedMac({ notifications: true });
     const r = rig();
     r.hub.setForeground(true);
     await r.hub.init();
@@ -1197,8 +1230,7 @@ describe("push operations run one at a time", () => {
   it("a registration that finds notifications turned off while it waited for the token sends nothing", async () => {
     let giveToken: (t: { type: string; data: string }) => void = () => {};
     n.getExpoPushTokenAsync.mockReturnValueOnce(new Promise((resolve) => (giveToken = resolve)) as never);
-    await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-    await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/", notifications: true });
+    await savedMac({ notifications: true });
     const r = rig();
     r.hub.setForeground(true);
     await r.hub.init();

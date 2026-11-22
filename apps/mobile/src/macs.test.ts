@@ -1,4 +1,5 @@
-import { MAC_ID, cleanMacName, hostOf, keyFor, keyOf, linksOf, machineWords, macNameOf, macOfHost, newMacId, rawOf, splitKey, tapKey } from "./macs";
+import { channelOf } from "./client/fakes";
+import { MAC_ID, cleanMacName, isChannelId, keyFor, keyOf, linksOf, machineWords, macOfChannel, newMacId, rawOf, splitKey, tapKey } from "./macs";
 
 describe("session keys", () => {
   it("round-trip a Mac and a raw id", () => {
@@ -20,107 +21,103 @@ describe("session keys", () => {
   });
 });
 
-describe("hostOf", () => {
-  it("is the host of a hub address, without its port or path", () => {
-    expect(hostOf("wss://studio.tail1.ts.net/")).toBe("studio.tail1.ts.net");
-    expect(hostOf("wss://studio.tail1.ts.net:8443/")).toBe("studio.tail1.ts.net");
-    expect(hostOf("wss://studio.tail1.ts.net")).toBe("studio.tail1.ts.net");
-    expect(hostOf("wss://[::1]:443/")).toBe("[::1]");
-  });
+const STUDIO = channelOf("studio");
+const MINI = channelOf("mini");
 
-  it.each([
-    "wss://user@studio.tail1.ts.net/",
-    "wss://user:pass@studio.tail1.ts.net/",
-    "wss://evil.com:x@studio.tail1.ts.net/",
-    "wss://studio.tail1.ts.net@evil.com/",
-    "wss://studio.tail1.ts.net:/",
-    "wss://studio.tail1.ts.net:notaport/",
-    "wss://studio.tail1.ts.net:443:1/",
-    "wss://studio.tail1.ts.net:123456/",
-    "studio.tail1.ts.net",
-    "",
-  ])("is null for user info, a port that is not 1 to 5 digits, or no scheme: %s", (url) => {
-    expect(hostOf(url)).toBeNull();
+describe("isChannelId", () => {
+  it("is 64 lowercase hex digits, and nothing else", () => {
+    expect(isChannelId(STUDIO)).toBe(true);
+    expect(isChannelId("0".repeat(64))).toBe(true);
+    for (const bad of [
+      "",
+      STUDIO.toUpperCase(),
+      STUDIO.slice(1),
+      `${STUDIO}0`,
+      `${STUDIO.slice(1)}g`,
+      ` ${STUDIO.slice(1)}`,
+      `${STUDIO.slice(1)}\n`,
+      "studio.tail1.ts.net",
+      "wss://relay.example.test/",
+    ]) {
+      expect(isChannelId(bad)).toBe(false);
+    }
   });
 });
 
-describe("macOfHost", () => {
+describe("macOfChannel", () => {
   const pairings = [
-    { id: "m00000001", hubUrl: "wss://Studio.tail1.ts.net/" },
-    { id: "m00000002", hubUrl: "wss://laptop.tail1.ts.net:8443/" },
+    { id: "m00000001", channel: STUDIO },
+    { id: "m00000002", channel: MINI },
   ];
 
-  it("finds the pairing whose hub host matches, ignoring case", () => {
-    expect(macOfHost(pairings, "studio.tail1.ts.net")).toBe("m00000001");
-    expect(macOfHost(pairings, "STUDIO.TAIL1.TS.NET")).toBe("m00000001");
-    expect(macOfHost(pairings, "Laptop.Tail1.ts.net")).toBe("m00000002");
+  it("is the pairing whose channel id it is", () => {
+    expect(macOfChannel(pairings, STUDIO)).toBe("m00000001");
+    expect(macOfChannel(pairings, MINI)).toBe("m00000002");
   });
 
-  it("is null for a host no pairing has, and for junk", () => {
-    expect(macOfHost(pairings, "other.tail1.ts.net")).toBeNull();
-    expect(macOfHost(pairings, "")).toBeNull();
-    expect(macOfHost(pairings, "studio")).toBeNull();
-    expect(macOfHost([{ id: "m1", hubUrl: "not a url" }], "not a url")).toBeNull();
+  it("is null for a channel no pairing has, a channel id in another case, a hostname and junk", () => {
+    expect(macOfChannel(pairings, channelOf("air"))).toBeNull();
+    expect(macOfChannel(pairings, MINI.toUpperCase())).toBeNull();
+    expect(macOfChannel(pairings, "studio.tail1.ts.net")).toBeNull();
+    expect(macOfChannel(pairings, "")).toBeNull();
+    expect(macOfChannel([{ id: "m1", channel: "studio" }], "studio")).toBeNull();
   });
 });
 
 describe("keyFor", () => {
-  const studio = { id: "m00000001", hubUrl: "wss://studio.tail1.ts.net/" };
-  const mini = { id: "m00000002", hubUrl: "wss://mini.tail1.ts.net:8443/" };
+  const studio = { id: "m00000001", channel: STUDIO };
+  const mini = { id: "m00000002", channel: MINI };
 
-  it("is the phone's key of a raw session on the pairing of the hub's published host", () => {
-    expect(keyFor([studio, mini], "mini.tail1.ts.net", "41-1700000000")).toBe("m00000002/41-1700000000");
-    expect(keyFor([studio, mini], "STUDIO.tail1.ts.net.", "41-1700000000")).toBe("m00000001/41-1700000000");
+  it("is the phone's key of a raw session on the pairing of the channel the hub sent", () => {
+    expect(keyFor([studio, mini], MINI, "41-1700000000")).toBe("m00000002/41-1700000000");
+    expect(keyFor([studio, mini], STUDIO, "41-1700000000")).toBe("m00000001/41-1700000000");
   });
 
-  it("with no host, the only pairing; with several, none", () => {
-    expect(keyFor([mini], null, "1-2")).toBe("m00000002/1-2");
+  it("names no Mac without a channel, even with only one pairing", () => {
+    expect(keyFor([mini], null, "1-2")).toBeNull();
     expect(keyFor([studio, mini], null, "1-2")).toBeNull();
     expect(keyFor([], null, "1-2")).toBeNull();
   });
 
-  it("null for a host no pairing has", () => {
-    expect(keyFor([studio, mini], "air.tail1.ts.net", "1-2")).toBeNull();
-    expect(keyFor([studio], "studio", "1-2")).toBeNull();
+  it("null for a channel no pairing has, and for a hostname", () => {
+    expect(keyFor([studio, mini], channelOf("air"), "1-2")).toBeNull();
+    expect(keyFor([studio], "studio.tail1.ts.net", "1-2")).toBeNull();
     expect(keyFor([studio], "", "1-2")).toBeNull();
   });
 
   it("null for a raw id that is not the hub's: never a key that splits elsewhere", () => {
     for (const raw of ["", "a", "1-2/3", "../1-2", "m00000002/1-2", "1-2 ", `${"1".repeat(128)}-2`]) {
-      expect(keyFor([studio], "studio.tail1.ts.net", raw)).toBeNull();
+      expect(keyFor([studio], STUDIO, raw)).toBeNull();
     }
   });
 });
 
 describe("tap_routes_by_mac", () => {
-  const studio = { id: "m00000001", hubUrl: "wss://studio.tail1.ts.net/" };
-  const mini = { id: "m00000002", hubUrl: "wss://mini.tail1.ts.net/" };
+  const studio = { id: "m00000001", channel: STUDIO };
+  const mini = { id: "m00000002", channel: MINI };
   const live = () => false;
 
-  it("a known host opens that Mac's session, whatever the case or a trailing dot", () => {
-    expect(tapKey({ host: "mini.tail1.ts.net", session: "1-2" }, [studio, mini], live)).toBe("m00000002/1-2");
-    expect(tapKey({ host: "Studio.Tail1.ts.net.", session: "1-2" }, [studio, mini], live)).toBe("m00000001/1-2");
+  it("a_tap_naming_a_channel_opens_that_macs_session", () => {
+    expect(tapKey({ channel: MINI, session: "1-2" }, [studio, mini], live)).toBe("m00000002/1-2");
+    expect(tapKey({ channel: STUDIO, session: "1-2" }, [studio, mini], live)).toBe("m00000001/1-2");
   });
 
-  it("a known host whose session has ended opens the Inbox", () => {
+  it("a known channel whose session has ended opens the Inbox", () => {
     const ended = (key: string) => key === "m00000002/1-2";
-    expect(tapKey({ host: "mini.tail1.ts.net", session: "1-2" }, [studio, mini], ended)).toBeNull();
-    expect(tapKey({ host: "studio.tail1.ts.net", session: "1-2" }, [studio, mini], ended)).toBe("m00000001/1-2");
+    expect(tapKey({ channel: MINI, session: "1-2" }, [studio, mini], ended)).toBeNull();
+    expect(tapKey({ channel: STUDIO, session: "1-2" }, [studio, mini], ended)).toBe("m00000001/1-2");
   });
 
-  it("an unknown host opens the Inbox, even with one Mac", () => {
-    expect(tapKey({ host: "air.tail1.ts.net", session: "1-2" }, [studio, mini], live)).toBeNull();
-    expect(tapKey({ host: "air.tail1.ts.net", session: "1-2" }, [studio], live)).toBeNull();
-  });
-
-  it("no host with two Macs opens the Inbox; with one Mac, that Mac", () => {
-    expect(tapKey({ host: null, session: "1-2" }, [studio, mini], live)).toBeNull();
-    expect(tapKey({ host: null, session: "1-2" }, [mini], live)).toBe("m00000002/1-2");
+  it("an unknown channel, or none, opens the Inbox, even with one Mac", () => {
+    expect(tapKey({ channel: channelOf("air"), session: "1-2" }, [studio, mini], live)).toBeNull();
+    expect(tapKey({ channel: channelOf("air"), session: "1-2" }, [studio], live)).toBeNull();
+    expect(tapKey({ channel: null, session: "1-2" }, [studio, mini], live)).toBeNull();
+    expect(tapKey({ channel: null, session: "1-2" }, [mini], live)).toBeNull();
   });
 
   it("no session, or no Mac paired, opens the Inbox", () => {
-    expect(tapKey({ host: "mini.tail1.ts.net", session: null }, [studio, mini], live)).toBeNull();
-    expect(tapKey({ host: null, session: "1-2" }, [], live)).toBeNull();
+    expect(tapKey({ channel: MINI, session: null }, [studio, mini], live)).toBeNull();
+    expect(tapKey({ channel: MINI, session: "1-2" }, [], live)).toBeNull();
   });
 });
 
@@ -132,24 +129,6 @@ describe("machineWords", () => {
     expect(machineWords("connecting", true)).toBe("asleep");
     expect(machineWords("connecting", false)).toBe("connecting…");
     expect(machineWords("authenticating", false)).toBe("connecting…");
-  });
-});
-
-describe("macNameOf", () => {
-  it("is the first DNS label of the hub host", () => {
-    expect(macNameOf("wss://studio.tail1.ts.net/")).toBe("studio");
-    expect(macNameOf("wss://studio.tail1.ts.net/hub?x=1")).toBe("studio");
-    expect(macNameOf("wss://studio-mac.tail1234.ts.net:8443/")).toBe("studio-mac");
-    expect(macNameOf("wss://studio-mac.tail1234.ts.net:8443/hub")).toBe("studio-mac");
-    expect(macNameOf("ws://mac/")).toBe("mac");
-  });
-
-  it("keeps an IP address whole, and is Mac with no address", () => {
-    expect(macNameOf("ws://100.64.0.7:7777/")).toBe("100.64.0.7");
-    expect(macNameOf("wss://[fd7a::1]:8443/")).toBe("[fd7a::1]");
-    expect(macNameOf(null)).toBe("Mac");
-    expect(macNameOf("")).toBe("Mac");
-    expect(macNameOf("not a url")).toBe("Mac");
   });
 });
 

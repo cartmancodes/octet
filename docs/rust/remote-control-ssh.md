@@ -1,9 +1,17 @@
 # Phone access over tmux, Tailscale SSH and mosh
 
-Evaluation date: 2026-10-05. Status: the `/remote-control` helper and the
-three phone fixes below are implemented; testing on real phones is still
-pending. Step-by-step setup: [Use Octet from your phone](../remote-control.md).
-Companion to the [web-client plan](remote-control-plan.md).
+Evaluation date: 2026-10-05. Status: the three phone fixes below are implemented;
+testing on real phones is still pending. Companion to the
+[web-client plan](remote-control-plan.md).
+
+**This is the notes for the SSH route, and the route is documentation only.** The
+terminal UI works over any SSH connection you already have, inside tmux; Tailscale is one
+example of a network you may already have, not something Octet needs, sets up or checks.
+The `/remote-control` helper this evaluation describes (its tmux, Tailscale, SSH and mosh
+checks) was removed when the phone app moved to a relay. `/remote-control` now reports the
+hub and pairs a phone, and the phone app is the way to reach a session from a phone: see
+[Use Octet from your phone](../remote-control.md). Read the rest of this page as the
+evaluation it was written as.
 
 ## Question and answer
 
@@ -25,7 +33,7 @@ product:**
   on-screen keyboard open, the conversation shrank to a single row. Now an
   empty prompt box takes 4 rows instead of 7.
 
-The `/remote-control` helper and those three changes are implemented. The 20–28-day web
+Those three changes are implemented. The 20–28-day web
 client remains the route to a guided, multi-device product.
 
 | Option | Effort | What you get | What you give up |
@@ -119,7 +127,11 @@ This works with the App Store Tailscale app.
    set -g bell-action any
    ```
 
-6. Run `/remote-control` in Octet to check all of the above.
+6. On an Apple silicon Mac, Homebrew installs into `/opt/homebrew/bin`, which an SSH login
+   doesn't search, so the phone gets `mosh-server: command not found`. Add it to
+   `~/.zshenv` once: `echo 'export PATH="/opt/homebrew/bin:$PATH"' >> ~/.zshenv`. To let
+   `/copy` reach the phone's clipboard, add `set -g set-clipboard on` to `~/.tmux.conf`.
+7. Check the pieces by hand: `tmux ls`, `mosh-server --version`, and a login from the phone.
 
 ## Phone setup
 
@@ -193,42 +205,14 @@ with `stty size` on each phone.
   leave `mosh-server` processes on the host until they time out. Clear them
   with `pkill mosh-server` if needed.
 
-## What `/remote-control` does
+## What `/remote-control` did
 
-A read-only command that sets nothing up by itself, and never edits system or
-tailnet configuration. It checks what is there and prints the next step:
-
-1. **Session:** is Octet running inside tmux (`$TMUX`), and under which
-   session name? If not, show the `tmux new -A -s octet …` line to restart in.
-2. **Tailnet:** is the `tailscale` CLI present and connected? Read this
-   host's tailnet name and address from `tailscale status --json`.
-3. **Login:** is Tailscale SSH on (asked from `tailscale debug prefs`), or
-   does SSH answer on the tailnet address (Remote Login)? Tailscale SSH serves
-   only connections arriving through the tunnel, so the Mac can't test it by
-   connecting to itself. If neither, it names the ways to turn SSH on:
-   Remote Login, or `tailscale set --ssh` unless only the App Store app is
-   installed, which can't run Tailscale SSH.
-4. **mosh:** is `mosh-server` installed and at least version 1.4.0?
-5. **Colour:** do tmux's server options give `xterm-256color`, the name the
-   phone arrives under over mosh, 24-bit colour (an `RGB` terminal feature,
-   or a `Tc` override on older tmux)? If not, show the
-   `.tmux.conf` lines; if tmux reports neither option, say nothing.
-6. **Phone command:** print the exact Blink and Termius commands for this
-   host, user and tmux session, ready to copy.
-
-All the commands share one 2-second deadline, and the SSH check then gets
-half a second, so the report arrives within about 2.5 seconds. The checks
-run in the background, so the screen keeps drawing and taking keys. The
-results appear as a note in the conversation, with a count of problems on
-the status line. It starts no listener and holds no
-secrets. The App Store Tailscale app is found inside its app bundle when
-`tailscale` isn't on the PATH.
-
-`/remote-control status` shows the same checks. Every report line, its fix,
-what the check can't see and phone-side troubleshooting are in
-[the setup guide](../remote-control.md#the-remote-control-check). Pairing,
-QR codes and grants belong to the [web plan](remote-control-plan.md), not
-here.
+The first version of this route came with a read-only `/remote-control` command that
+checked the setup (tmux session, tailnet, SSH login, mosh version, tmux colour) and printed
+the phone commands. It has been removed: Octet no longer reads, checks or names a network
+for this route. The checks above are the ones to do by hand. Pairing, QR codes and the
+phone app belong to [the relay design](../superpowers/specs/2026-11-19-relay-connectivity-design.md),
+not here.
 
 ## Phone fixes
 

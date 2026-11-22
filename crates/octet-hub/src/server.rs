@@ -1,26 +1,41 @@
-//! The hub's network side: an authenticated WebSocket API on `127.0.0.1` for phones, and a
-//! local control socket, `<run>/hub.sock`, for the CLI.
+//! The hub's network side: phones through the relay ([`crate::relay`]), each over its own
+//! end-to-end encrypted channel ([`crate::secure`]), and a local control socket,
+//! `<run>/hub.sock`, for the CLI. The hub listens on no network port.
 //!
 //! # Connections
 //!
-//! A connection must finish its WebSocket upgrade within 5 seconds of being accepted, and at
-//! most 32 upgrade at once (a new one lets the oldest go), so sockets that stall mid-request
-//! cannot keep a phone out. The handshake turns away any request whose `Tailscale-User-Login`
-//! header is not exactly the owner's login, or whose `Origin` names a host that is neither the
-//! request's (`Host`, `X-Forwarded-Host`) nor that of the hub's published URL as last asked (a
-//! web page of another site; the app sends none, or the hub's own), with 403, and one the hub
-//! has no room for (64 open) with 503. A connection then starts unauthenticated and accepts
-//! only `hello` (a device token) and `pair` (a pairing secret); anything else, or a failed
-//! `hello` or `pair`, is refused and the socket closed, as is one silent for 10 seconds. At most
-//! 32 wait for their `hello` at once: a newer one lets the oldest go if that one has waited 2
-//! seconds, and is turned away with 503 (to try again) if every one is younger, so neither
-//! sockets that never speak nor a storm of reconnects can push out a phone about to say hello.
-//! After `hello` it is authenticated as that device: every frame, text or not, first checks
-//! that the device is still paired (a revoked one is told `revoked`, then closed) and takes a
-//! token from the device's bucket (60 a minute; an empty bucket refuses, it does not close).
-//! Every connection is pinged every 20 seconds, and one that misses two pongs is let go.
-//! Bridge commands go to the session under a hub-wide req and the reply comes back under the
-//! phone's own; one unanswered for 30 seconds is refused for it.
+//! A phone's connection arrives from the relay link past its Noise handshake, with the key the
+//! handshake proved and the seat it took in the hub's room at its `connect`. It starts
+//! unauthenticated and accepts only `hello` (from a known key) and `pair` (a pairing secret); an
+//! unknown key that says hello is refused `unpaired` and closed, and anything else, or a failed
+//! `pair`, is refused and closed, as is one with no accepted frame 10 seconds after its
+//! `connect`. A good `pair` is held for the owner's answer at the Mac ([`pairing`]): the phone,
+//! sent its code, waits up to two minutes past those 10 seconds, still counted as not past its
+//! first frame, and is then told `paired` and closed (it says hello on a connection of its own),
+//! or refused and closed. After `hello` it is authenticated as that device: every frame first
+//! checks that the device is still paired (a revoked one is told `revoked`, then closed) and
+//! takes a token from the device's bucket (60 a minute; an empty bucket refuses, it does not
+//! close). Every connection is sent an encrypted ping every 20 seconds, and one whose last ping
+//! is still unanswered when the next falls due is let go. Bridge commands go to the session
+//! under a hub-wide req and the reply comes back under the phone's own; one unanswered for 30
+//! seconds is refused for it.
+//!
+//! The hub dials the relay only while it is wanted: a device is paired, a pairing secret is out
+//! and unexpired, or a phone is held for its answer; and for 3 seconds after a phone was revoked
+//! or refused its pairing, so it hears that before its socket goes with the link.
+//!
+//! # The control socket
+//!
+//! `<run>/hub.sock` answers one request line with one answer line, the request read within 5
+//! seconds: `status`; `watch` (a line for each change, until the client leaves); and pairing's
+//! three. `pair_secret` opens a pairing (in place of one no phone has used) under a new attempt
+//! and gives its link and attempt once the relay has the hub, waiting up to 10 seconds; an
+//! opening that a newer one replaces meanwhile hears at once, with no link and `expired`.
+//! `pair_wait` names its attempt (an error without one): it answers `expired` at once for any
+//! but the newest, and otherwise when a phone is held, or the secret runs out, and ends if the
+//! client leaves (closes its side); `pair_answer` says yes or no for the phone held under its
+//! `pending` id (an error without one). An attempt and a `pending` id are each 32 random hex
+//! digits, as JSON strings, so neither names anything once the hub restarts.
 //!
 //! # Subscriptions
 //!
@@ -62,60 +77,53 @@ use crate::{
     activity::{Activity, Report},
     apns::{Outcome, Signer},
     git::{self, Git},
+    keys::HubKeys,
     launch::{self, Launches, StartRequest, clip as clip_to},
-    owner::published_url,
     push::{self, Limiter, Pusher, Sender, Snapshot},
+    relay::{self, Arrival, FIRST_FRAME_WITHIN, Log, RelayState, Room, Seat, Stream},
+    secure::{Incoming, Secure},
     sessions::{SessionUpdate, Sessions},
     store::{
-        ActivityTokens, Change, Device, Disk, PAIR_NOT_SAVED, Pairing, SECRET_REFUSED, Store,
-        activity_change, activity_clear, activity_token_drop, pair_change, push_change,
-        push_token_drop, seen_change,
+        ActivityTokens, Change, Device, Disk, Store, activity_change, activity_clear,
+        activity_token_drop, hex, push_change, push_token_drop, seen_change,
     },
     tail::{self, file_name},
 };
-use futures_util::{SinkExt, StreamExt};
 use octet_core::PROMPT_LIMIT;
 use octet_core::remote::{
     protocol::{
-        BridgeCommand, Code, Cursor, MAX_MESSAGE, PhoneCommand, PushKinds, Secret, ack,
-        catalog_frame, event_frame, full_access_confirmed, paired, parse_phone, recent_frame,
-        refused, req_of, state_frame, subscribed_frame, welcome,
+        BridgeCommand, Code, Cursor, PhoneCommand, PushKinds, Secret, ack, catalog_frame,
+        event_frame, full_access_confirmed, parse_phone, recent_frame, refused, req_of,
+        state_frame, subscribed_frame, welcome,
     },
     run::run_dir,
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     future::Future,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, UnixListener, UnixStream, unix::OwnedWriteHalf},
+    net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
     sync::{mpsc, oneshot, watch},
     task::AbortHandle,
     time::{Instant, Interval, MissedTickBehavior, interval_at, sleep_until, timeout},
 };
-use tokio_tungstenite::{
-    WebSocketStream, accept_hdr_async_with_config,
-    tungstenite::{
-        Message, Utf8Bytes,
-        handshake::server::{Callback, ErrorResponse, Request, Response},
-        http::{HeaderMap, StatusCode},
-        protocol::WebSocketConfig,
-    },
-};
+use tokio_tungstenite::tungstenite::Utf8Bytes;
 
 mod git_commands;
+mod pairing;
 
 use git_commands::Listings;
+use pairing::{Opened, PHONE_WAITS, Pairings};
 
 /// Frames waiting for one `octet hub watch`; a watcher that lets it fill is dropped.
 const WATCH_QUEUE: usize = 256;
@@ -148,44 +156,34 @@ const RELOAD_EVERY: Duration = Duration::from_secs(2);
 const REFRESH_EVERY: Duration = Duration::from_secs(1);
 /// How often unanswered commands are checked against their deadline.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
-/// How long a connection may take to say hello (or pair) before it is closed.
-const HELLO_WITHIN: Duration = Duration::from_secs(10);
-/// How long a connection may take from accept to a finished WebSocket upgrade.
-const HANDSHAKE_WITHIN: Duration = Duration::from_secs(5);
-/// Upgrades under way at once; a connection accepted past it lets the oldest go.
-const MAX_HANDSHAKES: usize = 32;
-/// How often the hub asks Tailscale again whether it is published.
-const PUBLISH_EVERY: Duration = Duration::from_secs(10);
 /// How long the closing handshake may take.
 const CLOSE_WITHIN: Duration = Duration::from_secs(2);
 /// How long a revoked phone has to take its refusal before its connection is cut.
 const REVOKED_GRACE: Duration = Duration::from_secs(1);
-/// Connections open at once; more are turned away at accept.
-const MAX_CONNECTIONS: usize = 64;
-/// Connections that may wait for their hello at once; a new one past it lets the oldest go, if
-/// that one has waited [`WAIT_KEPT`], and is turned away (503) otherwise.
-const MAX_WAITING: usize = 32;
-/// How long a connection waiting for its hello is safe from being let go to make room: a phone
-/// on a slow link takes a moment to say hello, and a storm of reconnects must not push it out.
-const WAIT_KEPT: Duration = Duration::from_secs(2);
-/// How often a connection is pinged; one that misses two pongs is let go.
+/// How often a connection is sent an encrypted ping; one whose last ping is still unanswered
+/// when the next falls due is let go.
 const PING_EVERY: Duration = Duration::from_secs(20);
-/// Unanswered pings after which a connection is let go.
-const MISSED_PONGS: u32 = 2;
-/// How long accepting waits after a failure (out of descriptors, say) before trying again.
+/// How long accepting control clients waits after a failure (out of descriptors, say) before
+/// trying again.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Messages from connection tasks waiting for the hub loop.
 const EVENT_QUEUE: usize = 256;
+/// Phones past their handshake waiting for the hub loop.
+const ARRIVAL_QUEUE: usize = 16;
+/// The longest Mac name `welcome` and `paired` carry, in characters.
+const NAME_LIMIT: usize = 64;
 /// The longest control request, in bytes.
 const CONTROL_LIMIT: u64 = 4096;
 /// How long a control client may take to ask or to read the answer.
 const CONTROL_WITHIN: Duration = Duration::from_secs(5);
+/// How long `pair_secret` waits for the relay to have the hub before giving up on it.
+const REGISTERED_WITHIN: Duration = Duration::from_secs(10);
+/// Why `pair_secret` gives no link when a newer opening replaced it while it waited.
+const SUPERSEDED: &str = "Another pairing was opened in its place";
 /// The refusal for a device past its bucket.
 const RATE_REFUSED: &str = "Too many commands; wait a minute";
 /// The refusal sent to a phone whose device was unpaired, just before it is closed.
 const REVOKED_REFUSED: &str = "This phone was unpaired on the Mac";
-/// The refusal for a frame that is not text.
-const NOT_TEXT: &str = "Send each message as a text frame";
 /// The refusal for a command whose session ended before it answered.
 const SESSION_ENDED: &str = "The session ended";
 /// The refusal for a command whose session is still there but whose link closed before it
@@ -224,8 +222,8 @@ const AUDIT_TEXT: usize = 64;
 
 /// What a connection task tells the hub loop.
 enum ConnEvent {
-    /// A frame arrived: its text, or `None` for one that is not text.
-    Message { conn: u64, text: Option<String> },
+    /// A frame arrived.
+    Message { conn: u64, text: String },
     /// The writer sent a replay's last frame; `sent` is the last `seq` it held of each journal.
     Replayed {
         conn: u64,
@@ -302,12 +300,10 @@ struct Saved {
 enum AfterSave {
     /// The time a hello was seen.
     Seen,
-    /// A pairing on `conn`, answering `req`.
+    /// The device of the held pairing `pending`, and the key of the device it replaced.
     Paired {
-        conn: u64,
-        req: u64,
-        pairing: Pairing,
-        result: std::io::Result<Result<(), &'static str>>,
+        pending: String,
+        result: std::io::Result<Result<Option<String>, &'static str>>,
     },
     /// `register_push` from `device` on `conn`, answering `req`.
     Push {
@@ -386,15 +382,15 @@ fn take_listing(listing: &Listing) -> Option<Utf8Bytes> {
         .take()
 }
 
-// A frame can hold a device token, a pairing secret or a `paired` token, so the Debug output
-// of what carries frames shows only their size.
+// A frame can hold a pairing secret or a push token, so the Debug output of what carries frames
+// shows only their size.
 impl std::fmt::Debug for ConnEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Message { conn, text } => f
                 .debug_struct("Message")
                 .field("conn", conn)
-                .field("text", &text.as_ref().map(|t| Redacted(t.len())))
+                .field("text", &Redacted(text.len()))
                 .finish(),
             Self::Replayed {
                 conn,
@@ -461,140 +457,6 @@ impl std::fmt::Debug for Redacted {
         write!(f, "<{} bytes>", self.0)
     }
 }
-
-/// Whether a connection still answers pings.
-#[derive(Debug, Default)]
-struct Liveness {
-    /// Pings sent since the last pong.
-    unanswered: u32,
-}
-
-impl Liveness {
-    /// Counts a ping about to be sent; false if too many went unanswered to send another.
-    fn ping(&mut self) -> bool {
-        if self.unanswered >= MISSED_PONGS {
-            return false;
-        }
-        self.unanswered += 1;
-        true
-    }
-
-    /// A pong arrived.
-    fn pong(&mut self) {
-        self.unanswered = 0;
-    }
-}
-
-/// The connections the hub holds. A handshake takes a [`Seat`] before it upgrades, so a socket
-/// the hub has no room for (64 open) is turned away (503) rather than upgraded and then dropped,
-/// and one that never finishes its request holds no place at all. The room also keeps the
-/// connections not past `hello` yet, [`MAX_WAITING`] at most: a new one past that lets the
-/// oldest of them go if it has waited [`WAIT_KEPT`] (the hub then drops it, see
-/// [`Hub::accept`]), and is itself turned away (503) when every one is younger, so that neither
-/// silent sockets nor a storm of reconnects can push out a phone about to say hello.
-#[derive(Debug, Default)]
-struct Room {
-    open: AtomicUsize,
-    /// The connections waiting for their hello.
-    waiting: Mutex<Vec<Waiter>>,
-    /// The last ticket given to a seat.
-    tickets: AtomicU64,
-}
-
-/// A connection waiting for its hello, as the [`Room`] keeps it.
-#[derive(Debug)]
-struct Waiter {
-    ticket: u64,
-    since: Instant,
-    /// Raised when the room let it go to make room for a newer one.
-    evicted: Arc<AtomicBool>,
-}
-
-impl Room {
-    /// A place for one more connection, waiting for its hello; `None` when the hub has
-    /// [`MAX_CONNECTIONS`] open, or [`MAX_WAITING`] waiting none of which has waited
-    /// [`WAIT_KEPT`].
-    fn seat(self: &Arc<Self>) -> Option<Seat> {
-        self.seat_at(Instant::now())
-    }
-
-    /// [`seat`](Self::seat), at `now`.
-    fn seat_at(self: &Arc<Self>, now: Instant) -> Option<Seat> {
-        if self.open.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
-            self.open.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
-        let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
-        while waiting.len() >= MAX_WAITING {
-            let oldest = waiting
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, waiter)| waiter.since)
-                .filter(|(_, waiter)| now.saturating_duration_since(waiter.since) >= WAIT_KEPT)
-                .map(|(at, _)| at);
-            let Some(oldest) = oldest else {
-                drop(waiting);
-                self.open.fetch_sub(1, Ordering::AcqRel);
-                return None;
-            };
-            waiting
-                .swap_remove(oldest)
-                .evicted
-                .store(true, Ordering::Release);
-        }
-        let ticket = self.tickets.fetch_add(1, Ordering::AcqRel) + 1;
-        let evicted = Arc::new(AtomicBool::new(false));
-        waiting.push(Waiter {
-            ticket,
-            since: now,
-            evicted: Arc::clone(&evicted),
-        });
-        Some(Seat {
-            room: Arc::clone(self),
-            ticket,
-            evicted,
-        })
-    }
-
-    /// The seat with `ticket` waits no more.
-    fn leave_waiting(&self, ticket: u64) {
-        self.waiting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|waiter| waiter.ticket != ticket);
-    }
-}
-
-/// One connection's place in the [`Room`], given back when it drops.
-#[derive(Debug)]
-struct Seat {
-    room: Arc<Room>,
-    ticket: u64,
-    /// Whether the room let it go, while it waited, to make room for a newer connection.
-    evicted: Arc<AtomicBool>,
-}
-
-impl Seat {
-    /// It said hello: it no longer waits, and is never let go to make room.
-    fn admitted(&self) {
-        self.room.leave_waiting(self.ticket);
-    }
-
-    /// Whether the room let it go to make room; the hub then drops its connection.
-    fn evicted(&self) -> bool {
-        self.evicted.load(Ordering::Acquire)
-    }
-}
-
-impl Drop for Seat {
-    fn drop(&mut self) {
-        self.room.leave_waiting(self.ticket);
-        self.room.open.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// An upgraded connection and its place.
-type Upgraded = (WebSocketStream<TcpStream>, Seat);
 
 /// What a replay task has a connection's writer send.
 #[derive(Debug)]
@@ -675,10 +537,16 @@ struct Conn {
     replay: mpsc::Sender<ReplayItem>,
     /// The connection task.
     task: AbortHandle,
-    /// When the connection was accepted.
+    /// When the relay said `connect` for it: its first frame is due 10 seconds on.
     opened: Instant,
+    /// The phone's key as its handshake proved it, 64 lowercase hex digits.
+    key: String,
     /// The device, once `hello` succeeded.
     device: Option<Device>,
+    /// Whether the phone waits for the answer to its `pair`: from the `pair` the hub held until
+    /// `paired` or the refusal goes to it. The relay link stays up meanwhile, and its 10 seconds
+    /// do not run.
+    awaiting: bool,
     /// The sessions it streams, by id.
     subscriptions: HashMap<String, Subscription>,
     /// Whether its hello said it is the app in the background (handing a Live Activity token
@@ -739,10 +607,26 @@ impl Bucket {
 /// A control-socket request the hub loop answers.
 #[derive(Debug)]
 enum Control {
-    /// A new pairing secret.
-    PairSecret(oneshot::Sender<String>),
-    /// The port and the number of paired devices.
-    Status(oneshot::Sender<(u16, usize)>),
+    /// `pair_secret`: a new pairing secret, as a pairing link, unless a phone is held.
+    PairSecret(oneshot::Sender<Opened>),
+    /// `pair_wait` for an attempt: the question for the Mac once a phone is held, or `expired`.
+    PairWait {
+        attempt: String,
+        reply: oneshot::Sender<Value>,
+    },
+    /// Whether an attempt is still the newest opening.
+    PairCurrent {
+        attempt: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// `pair_answer`: yes or no for the held pairing `pending`.
+    PairAnswer {
+        pending: String,
+        accept: bool,
+        reply: oneshot::Sender<Value>,
+    },
+    /// The number of paired devices.
+    Status(oneshot::Sender<usize>),
     /// A watcher: the lines it is to be sent, first the rows as they stand.
     Watch(mpsc::Sender<String>),
 }
@@ -754,15 +638,19 @@ pub struct Hub {
     store: Store,
     /// The sessions the hub can reach.
     sessions: Sessions,
-    /// The tailnet login every connection must come from.
-    owner: String,
-    /// The loopback port it listens on.
-    port: u16,
+    /// The hub's identity and relay keys.
+    keys: Arc<HubKeys>,
+    /// The relay it dials, which a pairing records.
+    relay: String,
+    /// The Mac's own host name, which `welcome` and `paired` carry.
+    name: String,
+    /// Whether the relay link should be up: a device is paired or a pairing is open.
+    wanted: watch::Sender<bool>,
     /// Phone connections by id.
     conns: HashMap<u64, Conn>,
     /// Commands sent to sessions and not yet answered, by hub req.
     pending: HashMap<u64, Pending>,
-    /// Each device's command allowance, by token hash.
+    /// Each device's command allowance, by key.
     buckets: HashMap<String, Bucket>,
     /// The last `sessions` frame made, one text shared by every connection given it.
     listed: Utf8Bytes,
@@ -804,99 +692,94 @@ pub struct Hub {
     activity: Option<Activity>,
     /// The snapshots the pushes and the Live Activity last looked at.
     observed: Vec<Snapshot>,
-    /// Where the hub is published, as Tailscale last said: each push names its host as `mac`.
-    published: Published,
+    /// Until when the relay link stays up for revoked or refused phones still to be told so,
+    /// though nothing else wants it.
+    lingering: Option<Instant>,
+    /// The pairing held for the owner's answer, and the Mac waiting to hear of one.
+    pairings: Pairings,
     /// The last id given to a connection, hub req or replay.
     ids: u64,
 }
 
-/// What tells the control socket whether, and where, the hub is published on the tailnet: given
-/// the loopback port, the HTTPS URL `tailscale serve` shows it at, or `None`.
-pub type Publisher = fn(u16) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>;
-
-/// The real [`Publisher`]: asks `tailscale serve status`.
-fn tailscale_publisher(port: u16) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
-    Box::pin(published_url(port))
-}
-
 impl Hub {
-    /// Binds `127.0.0.1:<port>` and the local control socket; runs until `shutdown` resolves.
+    /// Serves the hub's control socket and, while a device is paired or a pairing is open, its
+    /// link to the relay `hub.json` names; runs until `shutdown` resolves.
     ///
     /// # Errors
     ///
-    /// Fails if `owner` is empty, the hub's files cannot be opened, another hub answers on the
-    /// control socket, or either socket cannot be bound.
+    /// Fails if the hub's files or its key file cannot be opened, another hub answers on the
+    /// control socket, or the control socket cannot be bound.
     pub async fn serve(
         directory: PathBuf,
-        port: u16,
-        owner: String,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), String> {
-        Self::serve_notify(directory, port, owner, shutdown, oneshot::channel().0).await
+        Self::serve_notify(directory, shutdown, oneshot::channel().0).await
     }
 
-    /// Like [`serve`](Self::serve), and sends the bound port on `ready` once the hub is
-    /// answering (it is dropped unsent when the hub fails to start).
+    /// Like [`serve`](Self::serve), and says on `ready` once the hub is answering (it is dropped
+    /// unsent when the hub fails to start).
     ///
     /// # Errors
     ///
     /// The same as [`serve`](Self::serve).
     pub async fn serve_notify(
         directory: PathBuf,
-        port: u16,
-        owner: String,
         shutdown: impl Future<Output = ()>,
-        ready: oneshot::Sender<u16>,
+        ready: oneshot::Sender<()>,
     ) -> Result<(), String> {
-        let publishing = (tailscale_publisher as Publisher, PUBLISH_EVERY);
-        Self::serve_with(directory, port, owner, shutdown, ready, publishing).await
+        Self::run(directory, None, relay::stderr(), shutdown, ready).await
     }
 
-    /// Like [`serve_notify`](Self::serve_notify), asking `publisher` instead of Tailscale whether
-    /// the hub is published, at start and then every `recheck` (for tests, which cannot depend
-    /// on the machine's Tailscale).
+    /// Like [`serve_notify`](Self::serve_notify), dialling the relay at `relay` (a `ws://`
+    /// address on loopback, say) whatever `hub.json` says, and writing the relay link's log lines
+    /// to `log`: for the hub's own tests, which run a relay in process. Debug builds only.
     ///
     /// # Errors
     ///
     /// The same as [`serve`](Self::serve).
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
     pub async fn serve_with(
         directory: PathBuf,
-        port: u16,
-        owner: String,
+        relay: String,
+        log: Arc<dyn Fn(&str) + Send + Sync>,
         shutdown: impl Future<Output = ()>,
-        ready: oneshot::Sender<u16>,
-        (publisher, recheck): (Publisher, Duration),
+        ready: oneshot::Sender<()>,
     ) -> Result<(), String> {
-        if owner.is_empty() {
-            return Err("The tailnet owner's login is unknown".into());
-        }
-        let Bound {
-            store,
-            run,
-            control_path,
-            control,
-            listener,
-            port,
-        } = bind(&directory, port).await?;
+        Self::run(directory, Some(relay), log, shutdown, ready).await
+    }
+
+    /// Serves, dialling `relay` or else the one `hub.json` names.
+    async fn run(
+        directory: PathBuf,
+        relay: Option<String>,
+        log: Log,
+        shutdown: impl Future<Output = ()>,
+        ready: oneshot::Sender<()>,
+    ) -> Result<(), String> {
+        let (
+            Bound {
+                store,
+                run,
+                control_path,
+                control,
+            },
+            keys,
+        ) = open(&directory).await?;
+        let relay = relay.unwrap_or_else(|| store.config().relay.clone());
         let (events, mut inbox) = mpsc::channel(EVENT_QUEUE);
         let (dead_tokens, mut dead) = mpsc::channel(PUSH_QUEUE);
         let (activity_reports, mut reports) = mpsc::channel(ACTIVITY_QUEUE);
         let (saves, mut saved) = mpsc::channel(SAVE_QUEUE);
         let activity = load_activity(&store, activity_reports).await;
-        let (streams, mut accepted) = mpsc::channel(16);
-        let room = Arc::new(Room::default());
+        let Link {
+            wanted,
+            state,
+            mut arrivals,
+            task: link_task,
+        } = Link::start(relay.clone(), &keys, log);
         let (requests, mut controls) = mpsc::channel(16);
-        let (published_in, published) = watch::channel(Publication::Unknown);
-        let gate = Admission {
-            owner: owner.clone(),
-            room,
-            published: published.clone(),
-        };
-        let accept_task = tokio::spawn(accept_tcp(listener, gate, streams)).abort_handle();
-        let publish_task =
-            tokio::spawn(watch_published(port, publisher, recheck, published_in)).abort_handle();
-        let control_task =
-            tokio::spawn(serve_control(control, requests, published.clone())).abort_handle();
+        let control_task = tokio::spawn(serve_control(control, requests, state)).abort_handle();
         let writer = crate::store::Writer::start(directory.clone());
         let mut hub = Hub {
             store,
@@ -907,8 +790,10 @@ impl Hub {
             git: Git::new(),
             turns: HashMap::new(),
             index: tail::SharedIndex::default(),
-            owner,
-            port,
+            keys,
+            relay,
+            name: host_name(),
+            wanted,
             conns: HashMap::new(),
             pending: HashMap::new(),
             buckets: HashMap::new(),
@@ -925,9 +810,11 @@ impl Hub {
             cap: Limiter::default(),
             activity,
             observed: Vec::new(),
-            published,
+            lingering: None,
+            pairings: Pairings::default(),
             ids: 0,
         };
+        hub.want_relay();
         hub.sessions.refresh().await;
         hub.listed = hub.sessions.frame().into();
         let (mut refresh, mut reload, mut sweep) = (
@@ -936,12 +823,12 @@ impl Hub {
             every(SWEEP_EVERY),
         );
         let mut shutdown = std::pin::pin!(shutdown);
-        let _ = ready.send(port);
+        let _ = ready.send(());
         loop {
             // `refresh` is not cancel-safe, so it runs in a handler, never as a branch.
             tokio::select! {
                 () = &mut shutdown => break,
-                Some(upgraded) = accepted.recv() => hub.accept(upgraded),
+                Some(arrival) = arrivals.recv() => hub.accept(arrival),
                 Some(event) = inbox.recv() => hub.on_event(event).await,
                 update = hub.sessions.next() => hub.on_update(update),
                 Some(request) = controls.recv() => hub.on_control(request).await,
@@ -958,13 +845,45 @@ impl Hub {
             }
         }
         control_task.abort();
-        publish_task.abort();
-        accept_task.abort();
+        link_task.abort();
         for (_, conn) in hub.conns.drain() {
             conn.task.abort();
         }
         let _ = tokio::fs::remove_file(&control_path).await;
         Ok(())
+    }
+
+    /// Tells the relay link whether it should be up: while a device is paired, a pairing secret
+    /// is out and unexpired, or a phone waits for the answer to its `pair` (its secret already
+    /// spent, its device not yet saved), and for a moment after a revoke or a refused pairing
+    /// ([`linger`](Self::linger)), so that phone hears it before its socket goes with the link.
+    fn want_relay(&mut self) {
+        let now = Instant::now();
+        self.lingering = self.lingering.filter(|until| *until > now);
+        let wanted = !self.store.devices().is_empty()
+            || self.store.pairing_open(SystemTime::now())
+            || self.conns.values().any(|state| state.awaiting)
+            || self.lingering.is_some();
+        self.wanted.send_if_modified(|was| {
+            let changed = *was != wanted;
+            *was = wanted;
+            changed
+        });
+    }
+
+    /// Keeps the relay link up for a moment, whatever else wants it: a phone just told it is
+    /// revoked or refused hears it before its socket goes with the link.
+    fn linger(&mut self) {
+        self.lingering = Some(Instant::now() + REVOKED_GRACE + CLOSE_WITHIN);
+    }
+
+    /// Marks whether `conn`'s phone waits for the answer to its `pair` (see [`Conn::awaiting`]),
+    /// and tells the relay link. A connection that goes stops waiting with it.
+    fn await_answer(&mut self, conn: u64, awaiting: bool) {
+        if let Some(state) = self.conns.get_mut(&conn) {
+            state.awaiting = awaiting;
+        }
+        self.want_relay();
     }
 
     /// A number never handed out before.
@@ -973,9 +892,15 @@ impl Hub {
         self.ids
     }
 
-    /// Starts the task that serves one upgraded connection, which brings its seat, and drops the
-    /// waiting connections the room let go to make room for it.
-    fn accept(&mut self, (ws, seat): Upgraded) {
+    /// Starts the task that serves one phone past its handshake, which brings its seat.
+    fn accept(
+        &mut self,
+        Arrival {
+            channel,
+            peer,
+            seat,
+        }: Arrival,
+    ) {
         let conn = self.next_id();
         let (out, outbox) = mpsc::channel(OUTBOUND_QUEUE);
         let (replay, replays) = mpsc::channel(REPLAY_QUEUE);
@@ -985,7 +910,8 @@ impl Hub {
             listing: Arc::clone(&listing),
             replays,
         };
-        let task = tokio::spawn(connection(ws, conn, writer, self.events.clone())).abort_handle();
+        let task =
+            tokio::spawn(connection(channel, conn, writer, self.events.clone())).abort_handle();
         self.conns.insert(
             conn,
             Conn {
@@ -994,29 +920,16 @@ impl Hub {
                 offered: None,
                 replay,
                 task,
-                opened: Instant::now(),
+                opened: seat.since(),
+                key: hex(&peer.key),
                 device: None,
+                awaiting: false,
                 subscriptions: HashMap::new(),
                 background: false,
                 listings: Listings::default(),
                 seat,
             },
         );
-        self.let_go_evicted();
-    }
-
-    /// Drops the connections the room let go, while they waited for their hello, to make room
-    /// for newer ones (see [`Room`]): only a socket that has waited [`WAIT_KEPT`] goes.
-    fn let_go_evicted(&mut self) {
-        let evicted: Vec<u64> = self
-            .conns
-            .iter()
-            .filter(|(_, state)| state.device.is_none() && state.seat.evicted())
-            .map(|(&conn, _)| conn)
-            .collect();
-        for conn in evicted {
-            self.drop_conn(conn);
-        }
     }
 
     /// What a connection task reported.
@@ -1065,22 +978,18 @@ impl Hub {
     }
 
     /// One frame from a phone.
-    async fn on_message(&mut self, conn: u64, text: Option<String>) {
+    async fn on_message(&mut self, conn: u64, text: String) {
         let Some(state) = self.conns.get(&conn) else {
             return;
         };
-        match (state.device.clone(), text) {
-            (None, Some(text)) => self.unauthenticated(conn, &text).await,
-            (None, None) => {
-                self.refuse(conn, 0, Code::Invalid, NOT_TEXT);
-                self.close(conn);
-            }
-            (Some(device), text) => self.authenticated(conn, &device, text.as_deref()).await,
+        match state.device.clone() {
+            None => self.unauthenticated(conn, &text).await,
+            Some(device) => self.authenticated(conn, &device, &text).await,
         }
     }
 
-    /// A frame before `hello`: only `hello` and `pair` are taken; anything else, or a failure,
-    /// is refused and closes the connection.
+    /// A frame before `hello`: only `hello` from a known key and `pair` are taken; anything
+    /// else, or a failure, is refused and closes the connection.
     async fn unauthenticated(&mut self, conn: u64, text: &str) {
         let (req, command) = match parse_phone(text) {
             Ok(parsed) => parsed,
@@ -1091,28 +1000,30 @@ impl Hub {
             }
         };
         let now = SystemTime::now();
+        let Some(key) = self.conns.get(&conn).map(|state| state.key.clone()) else {
+            return;
+        };
         match command {
-            PhoneCommand::Hello { token, background } => {
-                // A revoke by the CLI must be seen before the token is believed.
+            PhoneCommand::Hello { background } => {
+                // A revoke by the CLI must be seen before the key is believed.
                 self.store.reload_if_changed().await;
-                let Some((device, seen)) = self.store.recognise(token.expose(), &self.owner, now)
-                else {
+                let Some((device, seen)) = self.store.recognise(&key, now) else {
                     self.refuse(conn, req, Code::Unpaired, "Unknown device; pair it again");
                     self.close(conn);
                     return;
                 };
                 if let Some(seen) = seen {
                     // Off the loop; a device revoked meanwhile is let go at the next reload.
-                    self.save(seen_change(&device.token_sha256, seen), |_| AfterSave::Seen);
+                    self.save(seen_change(&device.key, seen), |_| AfterSave::Seen);
                 }
                 let name = device.name.clone();
                 // Judged on news from now. Any hello but a background one is the app in front,
                 // which drives the Live Activity itself while it is; nothing ends.
                 if let Some(activity) = self.activity.as_mut() {
-                    activity.hello(&device.token_sha256);
+                    activity.hello(&device.key);
                     if !background {
                         let tokens = device.activity.as_ref();
-                        activity.connected(&device.token_sha256, tokens, now);
+                        activity.connected(&device.key, tokens, now);
                     }
                 }
                 // Out of the waiting room before the phone hears it is in.
@@ -1121,7 +1032,7 @@ impl Hub {
                     state.device = Some(device);
                     state.background = background;
                 }
-                self.send(conn, &welcome(&name));
+                self.send(conn, &welcome(&name, &self.name));
                 // A fresh hello is answered at once, whenever the last list went.
                 let frame = self.sessions.frame().into();
                 self.offer_sessions(conn, &frame);
@@ -1130,30 +1041,12 @@ impl Hub {
                 secret,
                 name,
                 platform,
-            } => match self
-                .store
-                .begin_pair(secret.expose(), &name, &platform, &self.owner, now)
-            {
-                // Answered once the device is saved (see `on_saved`).
-                Ok(pairing) => {
-                    let change = pair_change(pairing.device.clone());
-                    self.save(change, move |result| AfterSave::Paired {
-                        conn,
-                        req,
-                        pairing,
-                        result,
-                    });
-                }
-                Err(reason) => {
-                    let code = if reason == SECRET_REFUSED {
-                        Code::Unpaired
-                    } else {
-                        Code::Invalid
-                    };
-                    self.refuse(conn, req, code, reason);
-                    self.close(conn);
-                }
-            },
+            } => {
+                // The device is the key the handshake proved, paired through this relay once the
+                // owner says yes.
+                self.pair((conn, req, &key), secret.expose(), &name, &platform)
+                    .await;
+            }
             _ => {
                 self.refuse(conn, req, Code::Unpaired, "Say hello first");
                 self.close(conn);
@@ -1162,22 +1055,16 @@ impl Hub {
     }
 
     /// A frame from a device that said hello.
-    /// `None` is a frame that was not text: it spends a command and is refused.
-    async fn authenticated(&mut self, conn: u64, device: &Device, text: Option<&str>) {
+    async fn authenticated(&mut self, conn: u64, device: &Device, text: &str) {
         self.store.reload_if_changed().await;
         if !self.paired(device) {
             self.revoke(conn);
             return;
         }
-        let req = text.map_or(0, req_of);
-        if !self.take_token(&device.token_sha256) {
-            self.refuse(conn, req, Code::RateLimited, RATE_REFUSED);
+        if !self.take_token(&device.key) {
+            self.refuse(conn, req_of(text), Code::RateLimited, RATE_REFUSED);
             return;
         }
-        let Some(text) = text else {
-            self.refuse(conn, 0, Code::Invalid, NOT_TEXT);
-            return;
-        };
         let (req, command) = match parse_phone(text) {
             Ok(parsed) => parsed,
             Err(reason) => {
@@ -1273,7 +1160,7 @@ impl Hub {
         token: Option<String>,
         kinds: Option<PushKinds>,
     ) {
-        let change = push_change(&device.token_sha256, token.clone(), kinds);
+        let change = push_change(&device.key, token.clone(), kinds);
         let device = device.clone();
         self.save(change, move |result| AfterSave::Push {
             conn,
@@ -1313,11 +1200,7 @@ impl Hub {
         let on = token.is_some();
         // The connections of this device carry a copy of it.
         for state in self.conns.values_mut() {
-            if let Some(held) = state
-                .device
-                .as_mut()
-                .filter(|held| held.token_sha256 == device.token_sha256)
-            {
+            if let Some(held) = state.device.as_mut().filter(|held| held.key == device.key) {
                 held.push_token.clone_from(&token);
                 if let Some(kinds) = kinds {
                     held.push_kinds = kinds;
@@ -1338,7 +1221,7 @@ impl Hub {
     /// off the loop; `req` is answered once that is saved ([`activity_saved`](Self::activity_saved)).
     /// Neither a token nor the device's hash reaches the audit line or a log.
     fn activity(&self, conn: u64, device: &Device, req: u64, command: PhoneCommand) {
-        let hash = &device.token_sha256;
+        let hash = &device.key;
         let exposed = |token: Option<Secret>| token.map(|token| token.expose().to_owned());
         let (change, cleared) =
             if let PhoneCommand::RegisterActivity { token, start_token } = command {
@@ -1399,7 +1282,7 @@ impl Hub {
         }
         // Forgotten now, not at the next look: a register just after it starts afresh.
         if cleared && let Some(activity) = self.activity.as_mut() {
-            activity.cleared(&device.token_sha256);
+            activity.cleared(&device.key);
         }
         self.copy_activity_tokens();
         self.store.audit(&device.name, "", what).await;
@@ -1415,7 +1298,7 @@ impl Hub {
             .values_mut()
             .filter_map(|state| state.device.as_mut())
         {
-            if let Some(stored) = devices.iter().find(|d| d.token_sha256 == held.token_sha256) {
+            if let Some(stored) = devices.iter().find(|d| d.key == held.key) {
                 held.activity.clone_from(&stored.activity);
             }
         }
@@ -1439,27 +1322,7 @@ impl Hub {
         }
         match then {
             AfterSave::Seen => {}
-            AfterSave::Paired {
-                conn,
-                req,
-                pairing,
-                result,
-            } => {
-                let reason = match result {
-                    Ok(Ok(())) => {
-                        // Who paired, and when; never the token or the secret.
-                        self.store.audit(&pairing.device.name, "", "paired").await;
-                        self.send(conn, &paired(&pairing.token, &pairing.device.name));
-                        return;
-                    }
-                    Ok(Err(reason)) => reason,
-                    Err(_) => PAIR_NOT_SAVED,
-                };
-                // The phone may try again with the same code.
-                self.store.unspend(pairing);
-                self.refuse(conn, req, Code::Invalid, reason);
-                self.close(conn);
-            }
+            AfterSave::Paired { pending, result } => self.paired_saved(pending, result).await,
             AfterSave::Push {
                 conn,
                 req,
@@ -1926,11 +1789,20 @@ impl Hub {
     async fn on_control(&mut self, request: Control) {
         match request {
             Control::PairSecret(reply) => {
-                let _ = reply.send(self.store.pairing_secret(SystemTime::now()));
+                let _ = reply.send(self.open_pairing());
             }
+            Control::PairWait { attempt, reply } => self.wait_for_phone(&attempt, reply),
+            Control::PairCurrent { attempt, reply } => {
+                let _ = reply.send(self.current_attempt(&attempt));
+            }
+            Control::PairAnswer {
+                pending,
+                accept,
+                reply,
+            } => self.answer(pending, accept, reply),
             Control::Status(reply) => {
                 self.store.reload_if_changed().await;
-                let _ = reply.send((self.port, self.store.devices().len()));
+                let _ = reply.send(self.store.devices().len());
             }
             Control::Watch(watcher) => self.watch(watcher),
         }
@@ -1948,18 +1820,23 @@ impl Hub {
         for conn in revoked {
             self.revoke(conn);
         }
+        self.want_relay();
     }
 
     /// Refuses, for their phones, the commands no session answered in time, and closes
-    /// connections that never said hello.
+    /// connections that never said hello 10 seconds after their `connect`, but for a phone held
+    /// for the owner's answer.
     fn sweep(&mut self) {
         let now = Instant::now();
         self.launches.running(self.sessions.phone_started(), now);
-        self.let_go_evicted();
         let silent: Vec<u64> = self
             .conns
             .iter()
-            .filter(|(_, state)| state.device.is_none() && now >= state.opened + HELLO_WITHIN)
+            .filter(|(_, state)| {
+                state.device.is_none()
+                    && !state.awaiting
+                    && now >= state.opened + FIRST_FRAME_WITHIN
+            })
             .map(|(&conn, _)| conn)
             .collect();
         for conn in silent {
@@ -1978,22 +1855,23 @@ impl Hub {
         }
     }
 
-    /// Every second: refuses what timed out, and sends the pushes and Live Activity sends due.
+    /// Every second: refuses what timed out (a held pairing too), sends the pushes and Live
+    /// Activity sends due, and lets the relay link go once the last pairing secret expired with
+    /// nothing paired.
     fn tick(&mut self) {
         self.sweep();
+        self.pairing_tick(Instant::now());
         self.flush_push();
         self.flush_activity();
+        self.want_relay();
     }
 
     /// Whether `device` is still paired.
     fn paired(&self, device: &Device) -> bool {
-        self.store
-            .devices()
-            .iter()
-            .any(|d| d.token_sha256 == device.token_sha256)
+        self.store.devices().iter().any(|d| d.key == device.key)
     }
 
-    /// Takes one command from the bucket of the device whose token hash is `key`.
+    /// Takes one command from the bucket of the device whose key is `key`.
     fn take_token(&mut self, key: &str) -> bool {
         let now = Instant::now();
         self.buckets
@@ -2038,6 +1916,7 @@ impl Hub {
         let Some(state) = self.forget(conn) else {
             return;
         };
+        self.linger();
         let told = state
             .out
             .try_send(Out::Text(
@@ -2073,7 +1952,7 @@ impl Hub {
         }
         for device in self.store.devices() {
             if device.push_token.is_some() {
-                self.pusher.offer(&device.token_sha256, &notices, now);
+                self.pusher.offer(&device.key, &notices, now);
             }
         }
         self.observed = snapshots;
@@ -2087,11 +1966,7 @@ impl Hub {
         self.cap.prune(now);
         let mut batch = Vec::new();
         for key in self.pusher.waiting() {
-            let known = self
-                .store
-                .devices()
-                .iter()
-                .find(|device| device.token_sha256 == key);
+            let known = self.store.devices().iter().find(|device| device.key == key);
             let token = known.and_then(|device| device.push_token.clone());
             let kinds = known.map(|device| device.push_kinds).unwrap_or_default();
             let connected = token.is_none() || in_front(&self.conns, &key);
@@ -2105,8 +1980,7 @@ impl Hub {
         if batch.is_empty() {
             return;
         }
-        let mac = push_mac(&self.published.borrow());
-        self.sender.dispatch(batch, mac);
+        self.sender.dispatch(batch, self.keys.channel().to_owned());
     }
 
     /// Sends what each device's Live Activity is due, in the background, while no connection of
@@ -2117,13 +1991,12 @@ impl Hub {
         let Some(activity) = self.activity.as_mut() else {
             return;
         };
-        let mac = push_mac(&self.published.borrow());
         let conns = &self.conns;
         activity.flush(
             self.store.devices(),
             |key| in_front(conns, key),
             &mut self.cap,
-            mac.as_deref(),
+            self.keys.channel(),
             (Instant::now(), SystemTime::now()),
         );
     }
@@ -2139,7 +2012,7 @@ impl Hub {
             .store
             .devices()
             .iter()
-            .find(|device| device.token_sha256 == report.device)
+            .find(|device| device.key == report.device)
             .and_then(|device| device.activity.as_ref()?.token.clone());
         if !activity.reported(report, stored.as_deref()) {
             return;
@@ -2168,14 +2041,15 @@ impl Hub {
         }
     }
 
-    /// Removes `conn` and its unanswered commands; its replays stop as it drops. When it was its
-    /// device's last connection, the approvals that device was spared while looking are offered
-    /// to it again.
+    /// Removes `conn`, its unanswered commands and a pairing held on it; its replays stop as it
+    /// drops. When it was its device's last connection, the approvals that device was spared
+    /// while looking are offered to it again.
     fn forget(&mut self, conn: u64) -> Option<Conn> {
         let state = self.conns.remove(&conn)?;
         self.pending.retain(|_, pending| pending.conn != conn);
+        self.pairing_conn_gone(conn);
         if let Some(device) = &state.device {
-            let key = &device.token_sha256;
+            let key = &device.key;
             // A background connection going was never the app in front.
             let still_here = state.background || in_front(&self.conns, key);
             // The app leaves the front: what its activity shows is current as of now.
@@ -2184,7 +2058,7 @@ impl Hub {
                     .store
                     .devices()
                     .iter()
-                    .find(|known| &known.token_sha256 == key)
+                    .find(|known| &known.key == key)
                     .and_then(|known| known.activity.as_ref());
                 activity.left(key, tokens, (Instant::now(), SystemTime::now()));
             }
@@ -2193,7 +2067,7 @@ impl Hub {
                 .store
                 .devices()
                 .iter()
-                .any(|known| &known.token_sha256 == key && known.push_token.is_some());
+                .any(|known| &known.key == key && known.push_token.is_some());
             if !still_here && reachable {
                 self.pusher.disconnected(key, Instant::now());
             }
@@ -2306,20 +2180,17 @@ fn broadcast(watchers: &mut Vec<mpsc::Sender<String>>, frame: &str) {
     watchers.retain(|watcher| watcher.try_send(frame.to_owned()).is_ok());
 }
 
-/// What the hub serves from: its files, the run directory, and both sockets, bound.
+/// What the hub serves from: its files, the run directory, and the control socket, bound.
 struct Bound {
     store: Store,
     run: PathBuf,
     control_path: PathBuf,
     control: UnixListener,
-    listener: TcpListener,
-    /// The loopback port it listens on.
-    port: u16,
 }
 
 /// Opens the hub's files in `directory`, readies its run directory and binds the control
-/// socket there and `127.0.0.1:<port>` (0 for any).
-async fn bind(directory: &Path, port: u16) -> Result<Bound, String> {
+/// socket there.
+async fn bind(directory: &Path) -> Result<Bound, String> {
     let store = Store::open(directory).await.map_err(|e| {
         format!(
             "Couldn't open the hub's files in {}: {e}",
@@ -2332,21 +2203,111 @@ async fn bind(directory: &Path, port: u16) -> Result<Bound, String> {
         .map_err(|e| format!("Couldn't prepare {}: {e}", run.display()))?;
     let control_path = run.join("hub.sock");
     let control = bind_control(&control_path).await?;
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|e| format!("Couldn't listen on 127.0.0.1:{port}: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("Couldn't read the port: {e}"))?
-        .port();
     Ok(Bound {
         store,
         run,
         control_path,
         control,
-        listener,
-        port,
     })
+}
+
+/// The relay link's task and its ends the hub holds.
+struct Link {
+    /// Whether the link should be up.
+    wanted: watch::Sender<bool>,
+    /// Where it stands.
+    state: watch::Receiver<RelayState>,
+    /// The phones it hands over past their handshake.
+    arrivals: mpsc::Receiver<Arrival>,
+    /// Its task.
+    task: AbortHandle,
+}
+
+impl Link {
+    /// Starts the link to the relay at `relay` for the hub with `keys`, down until it is wanted.
+    fn start(relay: String, keys: &Arc<HubKeys>, log: Log) -> Self {
+        let (arrived, arrivals) = mpsc::channel(ARRIVAL_QUEUE);
+        let (wanted, wanted_by_link) = watch::channel(false);
+        let (relay_state, state) = watch::channel(RelayState::Off);
+        let link = relay::run(
+            relay,
+            Arc::clone(keys),
+            wanted_by_link,
+            Arc::new(Room::default()),
+            arrived,
+            relay_state,
+            log,
+        );
+        Self {
+            wanted,
+            state,
+            arrivals,
+            task: tokio::spawn(link).abort_handle(),
+        }
+    }
+}
+
+/// [`bind`], then the hub's keys ([`load_keys`]); a hub that cannot use its keys gives its
+/// control socket back.
+async fn open(directory: &Path) -> Result<(Bound, Arc<HubKeys>), String> {
+    let mut bound = bind(directory).await?;
+    match load_keys(directory, &mut bound.store).await {
+        Ok(keys) => Ok((bound, Arc::new(keys))),
+        Err(error) => {
+            let path = bound.control_path.clone();
+            drop(bound);
+            let _ = tokio::fs::remove_file(&path).await;
+            Err(error)
+        }
+    }
+}
+
+/// The hub's keys in `directory`. A hub about to make its key forgets every device first, with
+/// its push and Live Activity tokens: those phones pinned another key and can never connect
+/// again. The forgetting comes before the key file exists, so no failure after the key is made
+/// (a directory sync that fails, a crash) can leave a key whose devices were not forgotten.
+async fn load_keys(directory: &Path, store: &mut Store) -> Result<HubKeys, String> {
+    let file = directory.join("hub.key");
+    let absent = matches!(
+        tokio::fs::symlink_metadata(&file).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    if absent {
+        forget_devices(directory, store).await?;
+    }
+    let (keys, made) = HubKeys::load_or_create(directory)
+        .await
+        .map_err(|e| format!("Couldn't use the hub's key: {e}"))?;
+    // The file was removed after the look above: this load made a key the forgetting missed.
+    if made && !absent {
+        forget_devices(directory, store).await?;
+    }
+    Ok(keys)
+}
+
+/// Forgets every device in `store`, the store of `directory`, for a new key.
+async fn forget_devices(directory: &Path, store: &mut Store) -> Result<(), String> {
+    store.forget_all().await.map_err(|e| {
+        format!(
+            "Couldn't forget the devices of an old key in {}: {e}",
+            directory.display()
+        )
+    })
+}
+
+/// The Mac's own host name, at most [`NAME_LIMIT`] characters, without a trailing `.local`;
+/// `Mac` when it has none.
+fn host_name() -> String {
+    let uname = rustix::system::uname();
+    let full = uname.nodename().to_string_lossy();
+    let name: String = full
+        .strip_suffix(".local")
+        .unwrap_or(&full)
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(NAME_LIMIT)
+        .collect();
+    if name.is_empty() { "Mac".into() } else { name }
 }
 
 /// Makes `run` ready for the hub's socket: creates it owner-only if missing, refuses one that is
@@ -2389,61 +2350,11 @@ async fn bind_control(path: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
-/// Accepts TCP connections and upgrades each in its own task, handing the upgraded ones, with
-/// their seats, to the hub loop. At most [`MAX_HANDSHAKES`] upgrade at once: one accepted past
-/// that lets the oldest go, so sockets that stall mid-request cannot keep a phone out, and each
-/// has [`HANDSHAKE_WITHIN`] in all.
-async fn accept_tcp(listener: TcpListener, gate: Admission, hub: mpsc::Sender<Upgraded>) {
-    let mut upgrading: VecDeque<AbortHandle> = VecDeque::new();
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                if hub.is_closed() {
-                    return;
-                }
-                upgrading.retain(|task| !task.is_finished());
-                if upgrading.len() >= MAX_HANDSHAKES
-                    && let Some(oldest) = upgrading.pop_front()
-                {
-                    oldest.abort();
-                }
-                let (gate, hub) = (gate.clone(), hub.clone());
-                let task = tokio::spawn(async move {
-                    if let Some(upgraded) = handshake(stream, &gate).await {
-                        let _ = hub.send(upgraded).await;
-                    }
-                });
-                upgrading.push_back(task.abort_handle());
-            }
-            // Out of descriptors, say: wait rather than spin.
-            Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
-        }
-    }
-}
-
-/// Where the hub is published, as Tailscale last said.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Publication {
-    /// Not asked yet.
-    Unknown,
-    /// Not published.
-    Nowhere,
-    /// Published at this HTTPS URL.
-    At(String),
-}
-
-/// The hub's [`Publication`], as last asked.
-type Published = watch::Receiver<Publication>;
-
-/// Whether the device whose token hash is `key` has the app in front: a connection of it whose
+/// Whether the device whose key is `key` has the app in front: a connection of it whose
 /// hello was not a background one, on any screen. The pusher and the Live Activity share it.
 fn in_front(conns: &HashMap<u64, Conn>, key: &str) -> bool {
     conns.values().any(|conn| {
-        !conn.background
-            && conn
-                .device
-                .as_ref()
-                .is_some_and(|device| device.token_sha256 == key)
+        !conn.background && conn.device.as_ref().is_some_and(|device| device.key == key)
     })
 }
 
@@ -2461,49 +2372,17 @@ async fn load_activity(store: &Store, reports: mpsc::Sender<Report>) -> Option<A
     Some(Activity::new(config, signer, reports))
 }
 
-/// The `mac` a push names: the host of the hub's published URL, when it is published and that
-/// host is a DNS name ([`push::mac_of`]); `None` otherwise.
-fn push_mac(publication: &Publication) -> Option<String> {
-    match publication {
-        Publication::At(url) => push::mac_of(url),
-        Publication::Unknown | Publication::Nowhere => None,
-    }
-}
-
-/// Asks `publisher` where `port` is published, now and then every `recheck`, so that control
-/// requests answer from what it last said and never wait on Tailscale.
-async fn watch_published(
-    port: u16,
-    publisher: Publisher,
-    recheck: Duration,
-    published: watch::Sender<Publication>,
+/// Accepts control clients, each answered in its own task; `relay` says where the hub stands
+/// with the relay.
+async fn serve_control(
+    listener: UnixListener,
+    hub: mpsc::Sender<Control>,
+    relay: watch::Receiver<RelayState>,
 ) {
-    loop {
-        let url = publisher(port).await;
-        published.send_replace(url.map_or(Publication::Nowhere, Publication::At));
-        tokio::time::sleep(recheck).await;
-    }
-}
-
-/// Where the hub is published, as last asked; waits for the first answer, for at most
-/// [`CONTROL_WITHIN`].
-async fn last_published(published: &mut Published) -> Option<String> {
-    let known = published.wait_for(|state| *state != Publication::Unknown);
-    match timeout(CONTROL_WITHIN, known).await {
-        Ok(Ok(state)) => match &*state {
-            Publication::At(url) => Some(url.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Accepts control clients, each answered in its own task.
-async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>, published: Published) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(control_client(stream, hub.clone(), published.clone()));
+                tokio::spawn(control_client(stream, hub.clone(), relay.clone()));
             }
             // Out of descriptors, say: wait rather than spin.
             Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
@@ -2512,7 +2391,11 @@ async fn serve_control(listener: UnixListener, hub: mpsc::Sender<Control>, publi
 }
 
 /// Reads one request line from a control client and writes one answer line.
-async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>, mut published: Published) {
+async fn control_client(
+    stream: UnixStream,
+    hub: mpsc::Sender<Control>,
+    relay: watch::Receiver<RelayState>,
+) {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     let mut reader = BufReader::new(read.take(CONTROL_LIMIT));
@@ -2522,11 +2405,16 @@ async fn control_client(stream: UnixStream, hub: mpsc::Sender<Control>, mut publ
     {
         return;
     }
-    if request_kind(&line) == "watch" {
-        watch_stream(&mut reader, &mut write, &hub).await;
-        return;
+    match request_kind(&line).as_str() {
+        "watch" => return watch_stream(&mut reader, &mut write, &hub).await,
+        "pair_wait" => {
+            if let Some(attempt) = pair_wait_request(&line) {
+                return pair_wait(&mut reader, &mut write, &hub, attempt).await;
+            }
+        }
+        _ => {}
     }
-    let answer = control_answer(&line, &hub, &mut published).await;
+    let answer = control_answer(&line, &hub, &relay).await;
     let _ = timeout(
         CONTROL_WITHIN,
         write.write_all(format!("{answer}\n").as_bytes()),
@@ -2574,46 +2462,164 @@ async fn watch_stream(
     }
 }
 
-/// The hub's loopback port and how many phones are paired; `None` once the hub is stopping.
-async fn hub_status(hub: &mpsc::Sender<Control>) -> Option<(u16, usize)> {
-    let (reply, status) = oneshot::channel();
-    hub.send(Control::Status(reply)).await.ok()?;
-    status.await.ok()
+/// Answers a `pair_wait` once the hub has an answer for it; a client that leaves first (its side
+/// closed) ends the wait.
+async fn pair_wait(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    write: &mut OwnedWriteHalf,
+    hub: &mpsc::Sender<Control>,
+    attempt: String,
+) {
+    let (reply, mut answer) = oneshot::channel();
+    let answer = if hub
+        .send(Control::PairWait { attempt, reply })
+        .await
+        .is_err()
+    {
+        stopping()
+    } else {
+        let mut ignored = [0u8; 64];
+        loop {
+            tokio::select! {
+                answer = &mut answer => break answer.unwrap_or_else(|_| stopping()),
+                // The client sends nothing more; a read that ends means it left.
+                read = reader.read(&mut ignored) => {
+                    if read.is_ok_and(|n| n > 0) {
+                        continue;
+                    }
+                    return;
+                }
+            }
+        }
+    };
+    let _ = timeout(
+        CONTROL_WITHIN,
+        write.write_all(format!("{answer}\n").as_bytes()),
+    )
+    .await;
 }
 
-/// The answer to one control request.
+/// The answer to a control request the hub cannot take: it is stopping.
+fn stopping() -> Value {
+    json!({"error": "The hub is stopping"})
+}
+
+/// The answer to `pair_secret` for `attempt`, which a newer opening replaced while it waited:
+/// no link, as its secret is gone.
+fn superseded(attempt: &str) -> Value {
+    json!({
+        "link": null,
+        "expired": true,
+        "attempt": attempt,
+        "reason": SUPERSEDED,
+    })
+}
+
+/// The attempt a `pair_wait` request line names: a string.
+fn pair_wait_request(line: &str) -> Option<String> {
+    let request: Value = serde_json::from_str(line).ok()?;
+    Some(request.get("attempt")?.as_str()?.to_owned())
+}
+
+/// The `pending` id (a string) and the yes or no of a `pair_answer` request line.
+fn pair_answer_request(line: &str) -> Option<(String, bool)> {
+    let request: Value = serde_json::from_str(line).ok()?;
+    Some((
+        request.get("pending")?.as_str()?.to_owned(),
+        request.get("accept")?.as_bool()?,
+    ))
+}
+
+/// The answer to one control request: `pair_secret` opens a pairing (which brings the relay link
+/// up) and gives its link and attempt once the relay has the hub, unless a newer opening
+/// replaces it first, which it hears at once; a `pair_wait` that names no attempt is refused;
+/// `pair_answer` says yes or no for the held phone and hears how that went; `status` gives where
+/// the hub stands with the relay and how many phones are paired.
 async fn control_answer(
     line: &str,
     hub: &mpsc::Sender<Control>,
-    published: &mut Published,
+    relay: &watch::Receiver<RelayState>,
 ) -> Value {
     let kind = request_kind(line);
-    let gone = || json!({"error": "The hub is stopping"});
     match kind.as_str() {
         "pair_secret" => {
-            // A secret is minted only for a hub a phone can reach: the port must be published.
-            let Some((port, _)) = hub_status(hub).await else {
-                return gone();
-            };
-            let Some(url) = last_published(published).await else {
-                return json!({"secret": null, "url": null,
-                    "reason": format!("Publish it first: tailscale serve --bg {port}")});
-            };
-            let (reply, secret) = oneshot::channel();
+            let (reply, opened) = oneshot::channel();
             if hub.send(Control::PairSecret(reply)).await.is_err() {
-                return gone();
+                return stopping();
             }
-            let Ok(secret) = secret.await else {
-                return gone();
-            };
-            json!({"secret": secret, "url": url})
+            match opened.await {
+                Ok(Opened::Link {
+                    link,
+                    host,
+                    attempt,
+                    replaced,
+                }) => {
+                    let mut relay = relay.clone();
+                    let registered = relay.wait_for(|state| *state == RelayState::Registered);
+                    // A newer opening while the relay link comes up: this one's opener hears at
+                    // once. A hub that stops drops the word unsent, and only the relay answers.
+                    let replaced = async {
+                        if replaced.await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    let registered = tokio::select! {
+                        registered = timeout(REGISTERED_WITHIN, registered) => {
+                            registered.is_ok_and(|registered| registered.is_ok())
+                        }
+                        () = replaced => return superseded(&attempt),
+                    };
+                    if registered {
+                        // Another opening meanwhile replaced this one's secret: its link is dead.
+                        let (reply, current) = oneshot::channel();
+                        let asked = Control::PairCurrent {
+                            attempt: attempt.clone(),
+                            reply,
+                        };
+                        if hub.send(asked).await.is_err() {
+                            return stopping();
+                        }
+                        match current.await {
+                            Ok(true) => json!({"link": link, "attempt": attempt}),
+                            Ok(false) => superseded(&attempt),
+                            Err(_) => stopping(),
+                        }
+                    } else {
+                        json!({"link": null, "reason": format!("Can't reach the relay at {host}")})
+                    }
+                }
+                Ok(Opened::Waiting) => json!({"link": null, "reason": PHONE_WAITS}),
+                Ok(Opened::Unlinkable) => {
+                    json!({"error": "The relay's address can't go in a pairing link"})
+                }
+                Err(_) => stopping(),
+            }
         }
-        "status" => {
-            let Some((port, devices)) = hub_status(hub).await else {
-                return gone();
+        "pair_answer" => {
+            let Some((pending, accept)) = pair_answer_request(line) else {
+                return json!({"error": "pair_answer needs pending and accept"});
             };
-            let url = last_published(published).await;
-            json!({"port": port, "published": url.is_some(), "url": url, "devices": devices})
+            let (reply, answer) = oneshot::channel();
+            let request = Control::PairAnswer {
+                pending,
+                accept,
+                reply,
+            };
+            if hub.send(request).await.is_err() {
+                return stopping();
+            }
+            answer.await.unwrap_or_else(|_| stopping())
+        }
+        "pair_wait" => json!({"error": "pair_wait needs attempt"}),
+        "status" => {
+            let (reply, devices) = oneshot::channel();
+            if hub.send(Control::Status(reply)).await.is_err() {
+                return stopping();
+            }
+            let Ok(devices) = devices.await else {
+                return stopping();
+            };
+            json!({"relay": relay.borrow().as_str(), "devices": devices})
         }
         _ => json!({"error": "Unknown request"}),
     }
@@ -2764,138 +2770,23 @@ struct Writer {
     replays: mpsc::Receiver<ReplayItem>,
 }
 
-/// Serves one upgraded connection: frames both ways until either side ends.
+/// Serves one phone's channel: frames both ways until either side ends.
 async fn connection(
-    ws: WebSocketStream<TcpStream>,
+    channel: Secure<Stream>,
     conn: u64,
     mut writer: Writer,
     events: mpsc::Sender<ConnEvent>,
 ) {
-    pump(ws, conn, &mut writer, &events).await;
+    pump(channel, conn, &mut writer, &events).await;
     let _ = events.send(ConnEvent::Closed { conn }).await;
 }
 
-/// What every handshake is checked against: the owner's login, the hub's room, and where the
-/// hub is published, as `tailscale serve status` last said (the cache `status` and
-/// `pair_secret` answer from; nothing is asked on a request's way in).
-#[derive(Debug, Clone)]
-struct Admission {
-    owner: String,
-    room: Arc<Room>,
-    published: Published,
-}
-
-/// The WebSocket upgrade, refused as [`Gate`] says, within [`HANDSHAKE_WITHIN`]: the connection
-/// and the seat it took.
-async fn handshake(stream: TcpStream, admission: &Admission) -> Option<Upgraded> {
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_MESSAGE))
-        .max_frame_size(Some(MAX_MESSAGE));
-    let published = match &*admission.published.borrow() {
-        Publication::At(url) => url.split_once("://").map(|(_, rest)| {
-            let authority = rest.split('/').next().unwrap_or_default();
-            host_of(authority).to_owned()
-        }),
-        _ => None,
-    };
-    let mut seat = None;
-    let gate = Gate {
-        owner: &admission.owner,
-        room: &admission.room,
-        published: published.as_deref(),
-        seat: &mut seat,
-    };
-    let ws = timeout(
-        HANDSHAKE_WITHIN,
-        accept_hdr_async_with_config(stream, gate, Some(config)),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    Some((ws, seat?))
-}
-
-/// The handshake check: the request must carry `Tailscale-User-Login` equal to the owner's and
-/// come from no other site's web page (403), and the hub must have room for it (503). `seat`
-/// gets the place it took.
-#[derive(Debug)]
-struct Gate<'a> {
-    owner: &'a str,
-    room: &'a Arc<Room>,
-    /// The host of the hub's published URL, when it is published.
-    published: Option<&'a str>,
-    seat: &'a mut Option<Seat>,
-}
-
-impl Callback for Gate<'_> {
-    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
-        let headers = request.headers();
-        let login = headers
-            .get("Tailscale-User-Login")
-            .and_then(|value| value.to_str().ok());
-        if login != Some(self.owner) || foreign_origin(headers, self.published) {
-            return Err(refusal(StatusCode::FORBIDDEN, "Forbidden"));
-        }
-        let Some(seat) = self.room.seat() else {
-            return Err(refusal(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Too many connections",
-            ));
-        };
-        *self.seat = Some(seat);
-        Ok(response)
-    }
-}
-
-/// A handshake refusal with `status`.
-fn refusal(status: StatusCode, text: &str) -> ErrorResponse {
-    let mut response = ErrorResponse::new(Some(text.to_owned()));
-    *response.status_mut() = status;
-    response
-}
-
-/// Whether a web page of another site may have opened this socket: an `Origin` is there and its
-/// host (any case, any port) is none of the `Host` the request names, the `X-Forwarded-Host`
-/// that `tailscale serve` may add, and `published`, the host of the hub's published URL (the
-/// app's socket names it whatever `tailscale serve` forwards as `Host`). A browser sends
-/// `Origin` with every WebSocket and cannot set the others; the app's socket sends none, or
-/// the hub's own address.
-fn foreign_origin(headers: &HeaderMap, published: Option<&str>) -> bool {
-    let Some(origin) = headers.get("Origin") else {
-        return false;
-    };
-    let Some(origin) = origin
-        .to_str()
-        .ok()
-        .and_then(|origin| origin.split_once("://"))
-        .map(|(_, authority)| host_of(authority))
-    else {
-        return true;
-    };
-    let named = |name: &str| {
-        let value = headers.get(name)?.to_str().ok()?;
-        Some(host_of(value.split(',').next().unwrap_or_default()))
-    };
-    ![named("Host"), named("X-Forwarded-Host"), published]
-        .into_iter()
-        .flatten()
-        .any(|host| !host.is_empty() && host.eq_ignore_ascii_case(origin))
-}
-
-/// The host of `authority` (`host`, `host:port` or `[v6]:port`), without its port.
-fn host_of(authority: &str) -> &str {
-    let authority = authority.trim();
-    match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
-    }
-}
-
 /// Moves frames between the phone and the hub loop: what the phone sends goes to the hub,
-/// and replayed and live frames go to the phone. A frame over [`MAX_MESSAGE`], a write that
-/// stalls, or the hub letting go ends it.
+/// and replayed and live frames go to the phone. A frame over `MAX_MESSAGE` or anything else the
+/// channel refuses, a write that stalls, a ping still unanswered when the next falls due, or the
+/// hub letting go ends it.
 async fn pump(
-    mut ws: WebSocketStream<TcpStream>,
+    mut channel: Secure<Stream>,
     conn: u64,
     writer: &mut Writer,
     events: &mpsc::Sender<ConnEvent>,
@@ -2906,38 +2797,33 @@ async fn pump(
         replays,
     } = writer;
     let mut replaying = true;
-    let mut alive = Liveness::default();
     let mut pings = interval_at(Instant::now() + PING_EVERY, PING_EVERY);
     pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
+        // `ping` and `send` are not cancel safe: they run in handlers, never as branches.
         tokio::select! {
             _ = pings.tick() => {
-                // A connection that stopped answering (a phone gone behind tailscaled) ends.
-                let sent = timeout(WRITE_STALL, ws.send(Message::Ping(Vec::new().into()))).await;
-                if !alive.ping() || !sent.is_ok_and(|sent| sent.is_ok()) {
+                // False when the last ping is still unanswered: the phone is gone, whatever the
+                // relay says of its socket.
+                let sent = timeout(WRITE_STALL, channel.ping()).await;
+                if !sent.unwrap_or(false) {
                     return;
                 }
             }
-            incoming = ws.next() => {
-                let text = match incoming {
-                    Some(Ok(Message::Text(text))) => Some(text.as_str().to_owned()),
-                    Some(Ok(Message::Binary(_))) => None,
-                    Some(Ok(Message::Pong(_))) => {
-                        alive.pong();
-                        continue;
+            incoming = channel.next() => match incoming {
+                Incoming::Text(text) => {
+                    if events.send(ConnEvent::Message { conn, text }).await.is_err() {
+                        return;
                     }
-                    Some(Ok(Message::Ping(_) | Message::Frame(_))) => continue,
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => return,
-                };
-                if events.send(ConnEvent::Message { conn, text }).await.is_err() {
-                    return;
                 }
-            }
+                Incoming::Pong | Incoming::Skip => {}
+                Incoming::Closed => return,
+            },
             item = replays.recv(), if replaying => match item {
                 Some(ReplayItem::Frame { frame, current }) => {
                     // A subscription since dropped or replaced has its acknowledgement out
                     // already: what it left queued would follow it.
-                    if current.load(Ordering::Acquire) && !write(&mut ws, frame.into()).await {
+                    if current.load(Ordering::Acquire) && !write(&mut channel, &frame).await {
                         return;
                     }
                 }
@@ -2952,19 +2838,19 @@ async fn pump(
             },
             item = outbox.recv() => match item {
                 Some(Out::Text(frame)) => {
-                    if !write(&mut ws, frame.into()).await {
+                    if !write(&mut channel, &frame).await {
                         return;
                     }
                 }
                 Some(Out::Sessions) => {
                     if let Some(frame) = take_listing(listing)
-                        && !write(&mut ws, frame).await
+                        && !write(&mut channel, frame.as_str()).await
                     {
                         return;
                     }
                 }
                 Some(Out::Close) | None => {
-                    let _ = timeout(CLOSE_WITHIN, ws.close(None)).await;
+                    let _ = timeout(CLOSE_WITHIN, channel.close()).await;
                     return;
                 }
             },
@@ -2972,11 +2858,11 @@ async fn pump(
     }
 }
 
-/// Writes one text frame; false if it failed or stalled.
-async fn write(ws: &mut WebSocketStream<TcpStream>, frame: Utf8Bytes) -> bool {
-    timeout(WRITE_STALL, ws.send(Message::text(frame)))
+/// Writes one frame; false if it failed or stalled.
+async fn write(channel: &mut Secure<Stream>, frame: &str) -> bool {
+    timeout(WRITE_STALL, channel.send(frame))
         .await
-        .is_ok_and(|sent| sent.is_ok())
+        .is_ok_and(|sent| sent)
 }
 
 #[cfg(test)]
@@ -2989,20 +2875,6 @@ mod tests {
             .iter()
             .map(|&(journal, seq)| (journal.to_owned(), seq, format!("{journal}{seq}")))
             .collect()
-    }
-
-    #[test]
-    fn pushes_name_the_mac_only_while_the_hub_is_published() {
-        let at = |url: &str| Publication::At(url.to_owned());
-        assert_eq!(
-            push_mac(&at("https://Studio.tail1234.ts.net")).as_deref(),
-            Some("studio.tail1234.ts.net")
-        );
-        assert_eq!(push_mac(&Publication::Unknown), None);
-        assert_eq!(push_mac(&Publication::Nowhere), None);
-        // A published URL whose host is no DNS name is no `mac`.
-        assert_eq!(push_mac(&at("https://user@studio.ts.net")), None);
-        assert_eq!(push_mac(&at("https://-studio.ts.net")), None);
     }
 
     #[test]
@@ -3058,108 +2930,6 @@ mod tests {
     }
 
     #[test]
-    fn an_origin_counts_as_foreign_unless_it_names_the_requests_host() {
-        let headers = |pairs: &[(&'static str, &'static str)]| {
-            let mut map = HeaderMap::new();
-            for &(name, value) in pairs {
-                map.insert(name, value.parse().unwrap());
-            }
-            map
-        };
-        let host = ("Host", "mac.tail1234.ts.net");
-        assert!(!foreign_origin(&headers(&[host]), None), "no Origin");
-        for same in [
-            "https://mac.tail1234.ts.net",
-            "https://MAC.tail1234.ts.net:443",
-        ] {
-            assert!(
-                !foreign_origin(&headers(&[host, ("Origin", same)]), None),
-                "{same}"
-            );
-        }
-        for other in ["https://evil.example", "null", "mac.tail1234.ts.net", ""] {
-            assert!(
-                foreign_origin(&headers(&[host, ("Origin", other)]), None),
-                "{other}"
-            );
-        }
-        let v6 = headers(&[("Host", "[::1]:47823"), ("Origin", "http://[::1]:47823")]);
-        assert!(!foreign_origin(&v6, None));
-        let no_host = headers(&[("Origin", "https://mac.tail1234.ts.net")]);
-        assert!(foreign_origin(&no_host, None));
-    }
-
-    #[test]
-    fn an_origin_naming_the_published_host_is_never_foreign() {
-        // What `tailscale serve` may forward: the loopback Host, no X-Forwarded-Host.
-        let request = |origin: &'static str| {
-            let mut map = HeaderMap::new();
-            map.insert("Host", "127.0.0.1:47823".parse().unwrap());
-            map.insert("Origin", origin.parse().unwrap());
-            map
-        };
-        let published = Some("mac.qa.ts.net");
-        for ours in ["https://mac.qa.ts.net", "https://MAC.qa.ts.net:443"] {
-            assert!(!foreign_origin(&request(ours), published), "{ours}");
-        }
-        for other in ["https://evil.example", "https://other.qa.ts.net"] {
-            assert!(foreign_origin(&request(other), published), "{other}");
-        }
-        // Not published: the request's own host alone names the hub.
-        assert!(foreign_origin(&request("https://mac.qa.ts.net"), None));
-        assert!(!foreign_origin(&request("http://127.0.0.1:47823"), None));
-    }
-
-    #[test]
-    fn a_seat_is_given_back_and_only_open_connections_are_capped() {
-        let room = Arc::new(Room::default());
-        // Connections past hello take seats past the waiting room's size, up to the cap.
-        let seats: Vec<Seat> = (0..MAX_CONNECTIONS)
-            .filter_map(|_| room.seat())
-            .inspect(Seat::admitted)
-            .collect();
-        assert_eq!(seats.len(), MAX_CONNECTIONS);
-        assert!(room.seat().is_none(), "every connection is open");
-        drop(seats);
-        assert_eq!(room.open.load(Ordering::Acquire), 0);
-        assert!(room.seat().is_some());
-        // Ten seconds to say hello.
-        assert_eq!(HELLO_WITHIN, Duration::from_secs(10));
-    }
-
-    #[test]
-    fn a_waiting_socket_younger_than_two_seconds_is_never_let_go() {
-        let room = Arc::new(Room::default());
-        let start = Instant::now();
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        // Thirty-two wait, one every 10 ms.
-        let waiting: Vec<Seat> = (0..MAX_WAITING as u64)
-            .map(|n| room.seat_at(at(n * 10)).expect("room to wait"))
-            .collect();
-        // A newcomer while all are younger than 2 s: turned away, and nobody is let go.
-        assert!(room.seat_at(at(1000)).is_none());
-        assert!(waiting.iter().all(|seat| !seat.evicted()));
-        assert_eq!(room.open.load(Ordering::Acquire), MAX_WAITING);
-        // Once the oldest has waited 2 s, a newcomer lets it go, and only it.
-        let newcomer = room.seat_at(at(2000)).expect("room once the oldest is old");
-        assert!(waiting[0].evicted());
-        assert!(waiting[1..].iter().all(|seat| !seat.evicted()));
-        // The next has waited only 1.99 s: the room is full again.
-        assert!(room.seat_at(at(2000)).is_none());
-        // A connection that says hello leaves the room, and is never let go after.
-        waiting[5].admitted();
-        let another = room.seat_at(at(2001)).expect("the hello made room");
-        assert!(
-            room.seat_at(at(9000)).is_some(),
-            "the 2nd oldest makes room"
-        );
-        assert!(waiting[1].evicted() && !waiting[5].evicted());
-        // One that goes away frees its place.
-        drop((newcomer, another));
-        assert!(room.seat_at(at(2002)).is_some());
-    }
-
-    #[test]
     fn a_waiting_sessions_frame_is_replaced_not_queued() {
         let (out, mut outbox) = mpsc::channel(4);
         let listing = Listing::default();
@@ -3195,12 +2965,13 @@ mod tests {
         let dir = octet_testkit::TempDir::new("hub-writeorder");
         let mut store = Store::open(dir.path()).await.expect("the store");
         let secret = store.pairing_secret(SystemTime::now());
-        let (_, device) = store
+        let device = store
             .pair(
                 &secret,
                 "Order phone",
                 "ios",
-                "owner@example",
+                &"ab".repeat(32),
+                "",
                 SystemTime::now(),
             )
             .await
@@ -3218,7 +2989,7 @@ mod tests {
             let (writer, saves, device) = (writer.clone(), saves.clone(), device.clone());
             tokio::spawn(async move {
                 for n in [2 * round + 1, 2 * round + 2] {
-                    let change = activity_change(&device.token_sha256, tokens(n));
+                    let change = activity_change(&device.key, tokens(n));
                     let device = device.clone();
                     queue_save(&writer, &saves, change, move |result| AfterSave::Activity {
                         conn: n,
@@ -3280,26 +3051,15 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_that_misses_two_pongs_is_let_go() {
-        let mut alive = Liveness::default();
-        assert!(alive.ping(), "first ping");
-        assert!(alive.ping(), "one missed pong is forgiven");
-        assert!(!alive.ping(), "two missed pongs end it");
-        let mut alive = Liveness::default();
-        for _ in 0..10 {
-            assert!(alive.ping());
-            alive.pong();
-        }
-    }
-
-    #[test]
     fn debug_output_never_shows_what_a_phone_sent_or_was_sent() {
         let secret = "f00dfeed".repeat(8);
         let message = ConnEvent::Message {
             conn: 3,
-            text: Some(format!("{{\"type\":\"hello\",\"token\":\"{secret}\"}}")),
+            text: format!("{{\"type\":\"pair\",\"secret\":\"{secret}\"}}"),
         };
-        let paired = Out::Text(format!("{{\"type\":\"paired\",\"token\":\"{secret}\"}}"));
+        let paired = Out::Text(format!(
+            "{{\"type\":\"register_push\",\"token\":\"{secret}\"}}"
+        ));
         for shown in [format!("{message:?}"), format!("{paired:?}")] {
             assert!(!shown.contains(&secret), "{shown}");
             assert!(shown.contains("bytes"), "{shown}");

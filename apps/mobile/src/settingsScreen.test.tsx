@@ -24,6 +24,11 @@ jest.mock("expo-constants", () => ({
   },
 }));
 
+// The real measurement takes seconds; its own test runs it (src/dev/cryptoBench.test.ts).
+const measured = () => ({ handshakeMs: 12.34, megabytesPerSecond: 45.67 });
+let mockBench: () => { handshakeMs: number; megabytesPerSecond: number } = measured;
+jest.mock("./dev/cryptoBench", () => ({ runCryptoBench: () => mockBench() }));
+
 const auth = LocalAuthentication as jest.Mocked<typeof LocalAuthentication>;
 const notifications = Notifications as jest.Mocked<typeof Notifications>;
 
@@ -56,7 +61,7 @@ const turn = async (on: boolean) => {
 describe("Settings", () => {
   it("shows the hub's host only and the device name", async () => {
     await open();
-    expect(screen.getByText("mac.tail1234.ts.net")).toBeTruthy();
+    expect(screen.getByText("relay.example.test")).toBeTruthy();
     expect(screen.queryByText(/wss:/)).toBeNull();
     expect(screen.getByText("Shubh's iPhone")).toBeTruthy();
   });
@@ -64,7 +69,7 @@ describe("Settings", () => {
   it("ends with the footer, naming the app version from the app's config", async () => {
     await open();
     expect(
-      screen.getByText("Octet v4.5.6 · talks to your Macs directly over your tailnet; nothing passes through a relay."),
+      screen.getByText("Octet v4.5.6 · reaches your Macs through a relay, end-to-end encrypted."),
     ).toBeTruthy();
   });
 
@@ -72,7 +77,7 @@ describe("Settings", () => {
     mockConfig = null;
     await open();
     expect(screen.queryByText(/ v\d/)).toBeNull();
-    expect(screen.getByText("Octet · talks to your Macs directly over your tailnet; nothing passes through a relay.")).toBeTruthy();
+    expect(screen.getByText("Octet · reaches your Macs through a relay, end-to-end encrypted.")).toBeTruthy();
     mockConfig = { version: "4.5.6" };
   });
 
@@ -236,7 +241,7 @@ describe("Settings", () => {
       expect(await SecureStore.getItemAsync(tokenKeyOf(M))).toBeNull();
       expect((await loadSettings()).pairings).toEqual([]);
       expect(rig.hub.snapshot()).toEqual({ status: "unpaired", notice: null, offer: false, macs: [], notices: [] });
-      expect(await screen.findByText("Scan the code from /remote-control pair")).toBeTruthy();
+      expect(await screen.findByText("Scan the code from octet pair")).toBeTruthy();
       expect(rig.view.getPathname()).toBe("/pair");
       expect(screen.queryByText(/unpaired on/)).toBeNull();
     });
@@ -569,5 +574,32 @@ describe("Settings › Live Activity", () => {
     expect(island()?.props.value).toBe(true);
     expect((await loadSettings()).liveActivity).toBe(true);
     expect(socket.commandsOf("register_activity")).toHaveLength(2);
+  });
+});
+
+describe("Settings › Encryption speed", () => {
+  const measure = () => screen.getByRole("button", { name: "Measure encryption speed" });
+
+  it("is not measured until asked, then shows the handshake time and the rate", async () => {
+    await open();
+    expect(screen.getByText("Encryption speed")).toBeTruthy();
+    expect(screen.getByText("Not measured")).toBeTruthy();
+    await act(async () => fireEvent.press(measure()));
+    expect(screen.getByText("Measuring…")).toBeTruthy();
+    expect(measure().props.accessibilityState).toMatchObject({ disabled: true });
+    await flush();
+    expect(screen.getByText("Handshake 12.3 ms · 45.7 MiB/s")).toBeTruthy();
+    expect(measure().props.accessibilityState).toMatchObject({ disabled: false });
+  });
+
+  it("says so when the measurement fails", async () => {
+    mockBench = () => {
+      throw new Error("the measured handshake failed");
+    };
+    await open();
+    await act(async () => fireEvent.press(measure()));
+    await flush();
+    expect(screen.getByText("Could not measure")).toBeTruthy();
+    mockBench = measured;
   });
 });

@@ -11,8 +11,8 @@ import Pair from "../app/pair";
 import Sessions from "../app/index";
 import Session from "../app/session/[id]";
 import Usage from "../app/usage";
-import { FakeClock, Sockets } from "./client/fakes";
-import { HubContext, Fleet, TOKEN_KEY } from "./hub";
+import { FakeClock, Sockets, pairingOf } from "./client/fakes";
+import { HubContext, Fleet, tokenKeyOf } from "./hub";
 import { DRAWER_MS } from "./components/Drawer";
 import { MENU_DISMISS_MS } from "./components/ModelModeMenu";
 import { closeDrawer, openDrawer } from "./drawer";
@@ -21,7 +21,7 @@ import type { JournalEvent, SessionInfo, StateInfo, ToolData } from "./protocol"
 import * as words from "./session";
 import * as cardWords from "./inbox";
 import { octetStore } from "./store";
-import { applyM, k, newM, sessionPath } from "./testKeys";
+import { M, applyM, k, newM, sessionPath } from "./testKeys";
 import { resetTextSize } from "./textSizeRig";
 import { dark, light } from "./theme";
 
@@ -50,8 +50,8 @@ const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
 
 beforeEach(async () => {
   await AsyncStorage.clear();
-  await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-  await saveSettings({ hubUrl: "wss://mac.tail1234.ts.net/" });
+  await SecureStore.setItemAsync(tokenKeyOf(M), TOKEN);
+  await saveSettings({ pairings: [pairingOf(M, "mac", "relay.example.test")] });
   octetStore.getState().reset();
   resetTextSize();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
@@ -69,7 +69,7 @@ async function launch(list: SessionInfo[], at?: string) {
   const sockets = new Sockets();
   const clock = new FakeClock();
   const hub = new Fleet({
-    factory: sockets.factory,
+    factory: () => sockets.factory,
     store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },

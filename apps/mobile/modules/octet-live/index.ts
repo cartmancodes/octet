@@ -7,7 +7,7 @@ export type ActivityKind = "running" | "approval" | "done";
 
 /**
  * The content state, exactly as the hub sends it in `aps.content-state`: `session` is the hub's raw
- * session id (`{pid}-{started}`) or "", and `mac` is the hub's published host or "". It names no
+ * session id (`{pid}-{started}`) or "", and `mac` is the Mac's channel id or "". It names no
  * session, command or workspace; the widget reads those from the App Group.
  */
 export interface ActivityState {
@@ -19,7 +19,7 @@ export interface ActivityState {
   approvals: number;
 }
 
-/** A Deny tapped in the widget: the host and raw session it showed, and the approval's id. `id`
+/** A Deny tapped in the widget: the channel id and raw session it showed, and the approval's id. `id`
  * names the tap's own request (a UUID): the app says when its send for it settled
  * (`denySettled`), which lets the widget's Deny return and iOS suspend the app. */
 export interface DenyEvent {
@@ -61,11 +61,10 @@ export const ACTIVITY_ATTRIBUTES_TYPE = "OctetActivity";
 /** The App Group the app and the widget share. */
 export const APP_GROUP = "group.dev.octet.mobile";
 
-/** The App Group key for a session, as the widget sees it: `<mac>/<raw session>`, the host
- * lowercased and without a trailing dot (the widget looks it up the same way), so a host that
- * differs only in case still finds its entry. */
+/** The App Group key for a session, as the widget sees it: `<mac>/<raw session>`, the content
+ * state's `mac` (the Mac's channel id) as it is, an opaque string, as the widget looks it up. */
 export function entryKey(mac: string, session: string): string {
-  return `${mac.replace(/\.$/, "").toLowerCase()}/${session}`;
+  return `${mac}/${session}`;
 }
 
 const nothing: Subscription = { remove: () => undefined };

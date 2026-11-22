@@ -35,6 +35,13 @@ pub(crate) enum Parsed {
     HubHelp,
     /// `octet hub ...`.
     Hub(HubArgs),
+    /// `octet pair --help`.
+    PairHelp,
+    /// `octet pair`: pair a phone, starting the hub first if it is not running.
+    Pair {
+        /// Where the hub's files live (`--journal-dir`).
+        journal_dir: Option<PathBuf>,
+    },
     Run(Box<Args>),
 }
 
@@ -60,10 +67,6 @@ pub(crate) enum HubAction {
 pub(crate) struct HubArgs {
     pub(crate) action: HubAction,
     pub(crate) journal_dir: Option<PathBuf>,
-    /// The loopback port to serve on; the hub's configured one when absent.
-    pub(crate) port: Option<u16>,
-    /// The tailnet owner's login; Tailscale's own answer when absent.
-    pub(crate) owner: Option<String>,
 }
 
 /// What to run.
@@ -177,6 +180,9 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
     let mut args = args.into_iter().peekable();
     if args.next_if(|first| first == "hub").is_some() {
         return parse_hub(args);
+    }
+    if args.next_if(|first| first == "pair").is_some() {
+        return parse_pair(args);
     }
     let mut engine = "codex".to_owned();
     let mut binary = None;
@@ -305,7 +311,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
 /// Parses the arguments after `hub`: an action (`serve` unless named) and its options.
 fn parse_hub(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
     let mut args = args;
-    let (mut action, mut journal_dir, mut port, mut owner) = (None, None, None, None);
+    let (mut action, mut journal_dir) = (None, None);
     let mut print = false;
     while let Some(arg) = args.next() {
         let arg = arg.into_string().map_err(|arg| {
@@ -318,20 +324,6 @@ fn parse_hub(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
             "--help" | "-h" => return Ok(Parsed::HubHelp),
             "--journal-dir" => {
                 journal_dir = Some(PathBuf::from(value(&mut args, &arg)?));
-                continue;
-            }
-            "--port" => {
-                port = Some(
-                    text(&mut args, &arg)?
-                        .parse::<u16>()
-                        .ok()
-                        .filter(|port| *port > 0)
-                        .ok_or_else(|| usage("Port must be a whole number from 1 to 65535"))?,
-                );
-                continue;
-            }
-            "--owner" => {
-                owner = Some(text(&mut args, &arg)?);
                 continue;
             }
             "--print" => {
@@ -359,9 +351,6 @@ fn parse_hub(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
         }
     }
     let mut action = action.unwrap_or(HubAction::Serve);
-    if !matches!(action, HubAction::Serve) && (port.is_some() || owner.is_some()) {
-        return Err(usage("--port and --owner apply to serve"));
-    }
     if print {
         match &mut action {
             HubAction::Install { print } => *print = true,
@@ -371,9 +360,27 @@ fn parse_hub(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
     Ok(Parsed::Hub(HubArgs {
         action,
         journal_dir,
-        port,
-        owner,
     }))
+}
+
+/// Parses the arguments after `pair`: only where the hub's files live.
+fn parse_pair(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
+    let mut args = args;
+    let mut journal_dir = None;
+    while let Some(arg) = args.next() {
+        let arg = arg.into_string().map_err(|arg| {
+            usage(format!(
+                "Unknown argument {}. Use pair --help.",
+                arg.to_string_lossy()
+            ))
+        })?;
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(Parsed::PairHelp),
+            "--journal-dir" => journal_dir = Some(PathBuf::from(value(&mut args, &arg)?)),
+            other => return Err(usage(format!("Unknown argument {other}. Use pair --help."))),
+        }
+    }
+    Ok(Parsed::Pair { journal_dir })
 }
 
 /// Refuses a prompt the session would refuse, before one opens.
@@ -487,21 +494,9 @@ mod tests {
     fn hub_serves_unless_told_otherwise() {
         let plain = hub(&[]);
         assert_eq!(plain.action, HubAction::Serve);
-        assert_eq!(
-            (plain.port, plain.owner, plain.journal_dir),
-            (None, None, None)
-        );
-        let full = hub(&[
-            "--journal-dir",
-            "/d",
-            "--port",
-            "65535",
-            "--owner",
-            "me@x",
-            "serve",
-        ]);
-        assert_eq!(full.port, Some(65535));
-        assert_eq!(full.owner.as_deref(), Some("me@x"));
+        assert_eq!(plain.journal_dir, None);
+        let full = hub(&["--journal-dir", "/d", "serve"]);
+        assert_eq!(full.action, HubAction::Serve);
         assert_eq!(full.journal_dir, Some(PathBuf::from("/d")));
         assert_eq!(hub(&["devices"]).action, HubAction::Devices);
         assert_eq!(
@@ -543,21 +538,14 @@ mod tests {
     #[test]
     fn hub_usage_errors_name_the_problem() {
         for (list, message) in [
+            // The hub listens on no port, and has no tailnet owner.
             (
-                &["hub", "--port", "0"][..],
-                "Port must be a whole number from 1 to 65535",
+                &["hub", "--port", "47823"][..],
+                "Unknown argument --port. Use hub --help.",
             ),
             (
-                &["hub", "--port", "65536"][..],
-                "Port must be a whole number from 1 to 65535",
-            ),
-            (
-                &["hub", "--port", "x"][..],
-                "Port must be a whole number from 1 to 65535",
-            ),
-            (
-                &["hub", "--port"][..],
-                "--port requires a value. Use --help.",
+                &["hub", "--owner", "me@x"][..],
+                "Unknown argument --owner. Use hub --help.",
             ),
             (
                 &["hub", "revoke"][..],
@@ -574,18 +562,6 @@ mod tests {
             (
                 &["hub", "devices", "watch"][..],
                 "Name one hub action. Use hub --help.",
-            ),
-            (
-                &["hub", "watch", "--port", "5"][..],
-                "--port and --owner apply to serve",
-            ),
-            (
-                &["hub", "devices", "--owner", "x"][..],
-                "--port and --owner apply to serve",
-            ),
-            (
-                &["hub", "install", "--port", "5"][..],
-                "--port and --owner apply to serve",
             ),
             (
                 &["hub", "uninstall", "--print"][..],

@@ -1,63 +1,23 @@
 //! `start` against a fake `tmux` first on `PATH`: a script that records its arguments and exits 0.
 //! This is its own test binary with one test, so changing `PATH` before anything else runs
 //! cannot race another test.
-use futures_util::{SinkExt, StreamExt};
 use octet_core::remote::run::Registration;
 use octet_hub::Hub;
+use octet_testkit::relay::{Phone, Relay, control, pair};
 use serde_json::{Value, json};
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpStream, UnixListener, UnixStream},
-    sync::oneshot,
-    time::timeout,
-};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
-};
+use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
+use tokio::{net::UnixListener, sync::oneshot, time::timeout};
 
-const OWNER: &str = "owner@example";
 const WAIT: Duration = Duration::from_secs(5);
 const CAP: &str = "8 sessions started from the phone are running; end one first";
 
-type Phone = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
 async fn send(phone: &mut Phone, message: Value) {
-    let sent = timeout(WAIT, phone.send(Message::text(message.to_string()))).await;
-    sent.expect("send in time").expect("send");
+    phone.send(&message).await;
 }
 
 /// The next frame of type `kind`.
 async fn recv_kind(phone: &mut Phone, kind: &str) -> Value {
-    timeout(WAIT, async {
-        loop {
-            match phone.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(text.as_str()).expect("a frame");
-                    if frame["type"] == kind {
-                        return frame;
-                    }
-                }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                other => panic!("expected a frame, got {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("a frame arrives")
-}
-
-async fn control(run: &std::path::Path, request: Value) -> Option<Value> {
-    let stream = UnixStream::connect(run.join("hub.sock")).await.ok()?;
-    let (read, mut write) = stream.into_split();
-    write
-        .write_all(format!("{request}\n").as_bytes())
-        .await
-        .ok()?;
-    let mut line = String::new();
-    BufReader::new(read).read_line(&mut line).await.ok()?;
-    serde_json::from_str(&line).ok()
+    phone.recv_kind(kind).await
 }
 
 fn start_command(req: u64, workspace: &str) -> Value {
@@ -84,15 +44,7 @@ async fn start(phone: &mut Phone, req: u64, workspace: &str) -> Value {
 }
 
 async fn recv_kind_any(phone: &mut Phone) -> Value {
-    loop {
-        match phone.next().await {
-            Some(Ok(Message::Text(text))) => {
-                return serde_json::from_str(text.as_str()).expect("a frame");
-            }
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-            other => panic!("expected a frame, got {other:?}"),
-        }
-    }
+    phone.next().await.expect("a frame, not the end")
 }
 
 #[test]
@@ -155,64 +107,25 @@ fn a_started_session_counts_until_it_registers() {
     runtime.block_on(async {
         let (stop, stopped) = oneshot::channel::<()>();
         let data = root.clone();
+        let relay = Relay::start().await;
+        let url = relay.url();
         tokio::spawn(async move {
             let shutdown = async {
                 let _ = stopped.await;
             };
-            Hub::serve_with(
-                data,
-                0,
-                OWNER.to_owned(),
-                shutdown,
-                oneshot::channel().0,
-                (
-                    |_| Box::pin(async { Some("https://mac.tail1234.ts.net".to_owned()) }),
-                    Duration::from_secs(10),
-                ),
-            )
-            .await
+            let log = Arc::new(|_: &str| {});
+            Hub::serve_with(data, url, log, shutdown, oneshot::channel().0).await
         });
-        let status = timeout(WAIT, async {
-            loop {
-                if let Some(status) = control(&run, json!({"type": "status"})).await {
-                    return status;
-                }
+        timeout(WAIT, async {
+            while control(&run, &json!({"type": "status"})).await.is_none() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
         .expect("the hub starts");
-        let port = status["port"].as_u64().expect("a port");
-        let secret = control(&run, json!({"type": "pair_secret"}))
-            .await
-            .expect("a secret");
-        let connect = || async {
-            let mut request = format!("ws://127.0.0.1:{port}/")
-                .into_client_request()
-                .expect("request");
-            request
-                .headers_mut()
-                .insert("Tailscale-User-Login", OWNER.parse().expect("header"));
-            let (phone, _) = timeout(WAIT, connect_async(request))
-                .await
-                .expect("in time")
-                .expect("connects");
-            phone
-        };
-        let mut pairing = connect().await;
-        send(
-            &mut pairing,
-            json!({"v": 1, "req": 1, "type": "pair", "secret": secret["secret"], "name": "Pixel",
-                "platform": "android"}),
-        )
-        .await;
-        let paired = recv_kind(&mut pairing, "paired").await;
-        let mut phone = connect().await;
-        send(
-            &mut phone,
-            json!({"v": 1, "req": 2, "type": "hello", "token": paired["token"]}),
-        )
-        .await;
+        let (link, key, _) = pair(&run, "Pixel").await;
+        let mut phone = Phone::connect(&link, &key).await.expect("connects");
+        send(&mut phone, json!({"v": 1, "req": 2, "type": "hello"})).await;
         recv_kind(&mut phone, "welcome").await;
         let place = workspace.to_string_lossy().into_owned();
 

@@ -1,6 +1,6 @@
-//! The hub's WebSocket API end to end: a fake bridge (a Unix socket and a written registration),
-//! real journal files, and phones connecting over loopback.
-use futures_util::{SinkExt, StreamExt};
+//! The hub's phone API end to end: a fake bridge (a Unix socket and a written registration), real
+//! journal files, an in-process relay, and phones that reach the hub through it over the Noise
+//! channel, as the app does.
 use octet_core::remote::{
     protocol::{
         Code, ack, bridge_catalog_frame, bridge_state_frame, parse_bridge_command, refused,
@@ -8,72 +8,41 @@ use octet_core::remote::{
     run::Registration,
 };
 use octet_hub::{Hub, Store};
+use octet_testkit::relay::{Link, Phone, PhoneKey, Relay, control, pair, pair_link, relay_state};
 use serde_json::{Value, json};
 use std::{
-    future::Future,
     io::Write as _,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{
-        TcpStream, UnixListener, UnixStream,
+        UnixListener, UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::oneshot,
     time::timeout,
 };
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{self, Message, client::IntoClientRequest},
-};
 
-/// The tailnet login the hub is told is its owner.
-const OWNER: &str = "owner@example";
 /// How long any one step may take before the test fails.
 const WAIT: Duration = Duration::from_secs(5);
 /// The journal every fake session writes.
 const JOURNAL: &str = "session-1-1.jsonl";
 
-type Phone = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-/// The address the fake `tailscale serve` shows every hub at.
-const SERVED_URL: &str = "https://mac.tail1234.ts.net";
-/// Ports whose hub the fake `tailscale serve` does not publish.
-static UNPUBLISHED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
-/// The port of every question the fake `tailscale serve` was asked.
-static ASKED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
-/// How often a test hub asks the fake `tailscale serve` again.
-const RECHECK: Duration = Duration::from_secs(10);
-
-/// A stand-in for asking Tailscale: every hub is published, except those in [`UNPUBLISHED`].
-fn fake_publisher(port: u16) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
-    ASKED.lock().expect("lock").push(port);
-    let hidden = UNPUBLISHED.lock().expect("lock").contains(&port);
-    Box::pin(async move { (!hidden).then(|| SERVED_URL.to_owned()) })
-}
-
-/// A loopback port nothing listens on now.
-async fn free_port() -> u16 {
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a free port");
-    probe.local_addr().expect("an address").port()
-}
-
-/// A data directory under `/tmp` (socket paths are limited to about 104 bytes), and the hub
-/// serving it once started.
+/// A data directory under `/tmp` (socket paths are limited to about 104 bytes), the relay, and
+/// the hub serving it once started.
 struct Env {
     root: PathBuf,
     run: PathBuf,
-    port: u16,
+    relay: Option<Relay>,
+    /// The hub's link, once a pairing gave it: its identity and channel never change.
+    link: Mutex<Option<Link>>,
     stop: Option<oneshot::Sender<()>>,
 }
 
@@ -88,67 +57,49 @@ impl Env {
         Self {
             root,
             run,
-            port: 0,
+            relay: None,
+            link: Mutex::new(None),
             stop: None,
         }
     }
 
-    /// Starts the hub on a free port and waits until its control socket answers.
+    /// Starts a relay and the hub, pointed at it, and waits until its control socket answers.
     async fn start(&mut self) {
-        self.start_with(0, RECHECK).await;
+        let relay = Relay::start().await;
+        let url = relay.url();
+        self.relay = Some(relay);
+        self.start_hub(url).await;
     }
 
-    /// Starts the hub on `port` (0 for any), asking Tailscale again every `recheck`, and waits
-    /// until its control socket answers.
-    async fn start_with(&mut self, port: u16, recheck: Duration) {
+    /// Starts the hub, dialling `relay`, and waits until its control socket answers.
+    async fn start_hub(&mut self, relay: String) {
         let (stop, stopped) = oneshot::channel::<()>();
         let directory = self.root.clone();
         tokio::spawn(async move {
             let shutdown = async {
                 let _ = stopped.await;
             };
-            Hub::serve_with(
-                directory,
-                port,
-                OWNER.to_owned(),
-                shutdown,
-                oneshot::channel().0,
-                (fake_publisher, recheck),
-            )
-            .await
+            let log = Arc::new(|_: &str| {});
+            Hub::serve_with(directory, relay, log, shutdown, oneshot::channel().0).await
         });
         self.stop = Some(stop);
-        let status = timeout(WAIT, async {
-            loop {
-                if let Some(status) = self.try_control(&json!({"type": "status"})).await {
-                    return status;
-                }
+        timeout(WAIT, async {
+            while control(&self.run, &json!({"type": "status"}))
+                .await
+                .is_none()
+            {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
         .expect("the hub starts");
-        self.port = u16::try_from(status["port"].as_u64().expect("a port")).expect("a port");
-    }
-
-    async fn try_control(&self, request: &Value) -> Option<Value> {
-        let stream = UnixStream::connect(self.run.join("hub.sock")).await.ok()?;
-        let (read, mut write) = stream.into_split();
-        write
-            .write_all(format!("{request}\n").as_bytes())
-            .await
-            .ok()?;
-        let mut line = String::new();
-        BufReader::new(read).read_line(&mut line).await.ok()?;
-        serde_json::from_str(&line).ok()
     }
 
     /// One request on the control socket, and its answer.
     async fn control(&self, request: Value) -> Value {
-        timeout(WAIT, self.try_control(&request))
+        control(&self.run, &request)
             .await
             .expect("the control socket answers")
-            .expect("a JSON answer")
     }
 
     /// Appends records `seqs` to the journal `name`.
@@ -217,32 +168,55 @@ impl Env {
         }
     }
 
-    /// Pairs a phone called `name` and returns its token.
-    async fn pair(&self, name: &str) -> String {
-        let mut phone = connect(self.port, Some(OWNER)).await.expect("connects");
-        self.pair_on(&mut phone, name).await
+    /// The hub's link, from the pairing that gave it, or else from a new pairing secret (which
+    /// brings the relay link up).
+    async fn link(&self) -> Link {
+        let known = self.link.lock().expect("lock").clone();
+        if let Some(link) = known {
+            return link;
+        }
+        let link = pair_link(&self.run).await;
+        *self.link.lock().expect("lock") = Some(link.clone());
+        link
     }
 
-    /// Pairs a phone called `name` over `phone` and returns its token.
-    async fn pair_on(&self, phone: &mut Phone, name: &str) -> String {
-        let secret = self.control(json!({"type": "pair_secret"})).await;
-        let secret = secret["secret"].as_str().expect("a secret").to_owned();
-        send(
-            phone,
-            json!({"v": 1, "req": 1, "type": "pair", "secret": secret, "name": name,
-                "platform": "ios"}),
-        )
-        .await;
-        let paired = recv(phone).await;
-        assert_eq!(paired["type"], "paired", "{paired}");
-        assert_eq!(paired["device"], name);
-        paired["token"].as_str().expect("a token").to_owned()
+    /// Pairs a phone called `name` and returns its key.
+    async fn pair(&self, name: &str) -> PhoneKey {
+        let (link, key, paired) = pair(&self.run, name).await;
+        assert_eq!(paired["device"], name, "{paired}");
+        *self.link.lock().expect("lock") = Some(link);
+        key
+    }
+
+    /// A phone past its handshake as `key`, once the relay has the hub, before it says anything.
+    async fn connect(&self, key: &PhoneKey) -> Phone {
+        let link = self.link().await;
+        relay_state(&self.run, "registered").await;
+        Phone::connect(&link, key)
+            .await
+            .expect("the phone connects")
+    }
+
+    /// A phone whose key the hub does not know, past its handshake.
+    async fn stranger(&self) -> Phone {
+        self.connect(&PhoneKey::new()).await
+    }
+
+    /// A fresh connection of `key` that said hello, and the `sessions` frame it got.
+    async fn hello(&self, key: &PhoneKey) -> (Phone, Value) {
+        let mut phone = self.connect(key).await;
+        send(&mut phone, json!({"v": 1, "req": 2, "type": "hello"})).await;
+        let welcome = recv(&mut phone).await;
+        assert_eq!(welcome["type"], "welcome", "{welcome}");
+        let sessions = recv(&mut phone).await;
+        assert_eq!(sessions["type"], "sessions", "{sessions}");
+        (phone, sessions)
     }
 
     /// A paired phone that said hello, and the `sessions` frame it got.
     async fn phone(&self, name: &str) -> (Phone, Value) {
-        let token = self.pair(name).await;
-        hello(self.port, &token).await
+        let key = self.pair(name).await;
+        self.hello(&key).await
     }
 }
 
@@ -298,89 +272,28 @@ async fn bridge_write(write: &mut OwnedWriteHalf, frame: Value) {
         .expect("bridge write");
 }
 
-async fn connect(port: u16, login: Option<&str>) -> Result<Phone, tungstenite::Error> {
-    let mut request = format!("ws://127.0.0.1:{port}/")
-        .into_client_request()
-        .expect("a request");
-    if let Some(login) = login {
-        request
-            .headers_mut()
-            .insert("Tailscale-User-Login", login.parse().expect("a header"));
-    }
-    timeout(WAIT, connect_async(request))
-        .await
-        .expect("the handshake ends")
-        .map(|(phone, _)| phone)
-}
-
-/// A fresh connection that said hello with `token`, and the `sessions` frame it got.
-async fn hello(port: u16, token: &str) -> (Phone, Value) {
-    let mut phone = connect(port, Some(OWNER)).await.expect("connects");
-    send(
-        &mut phone,
-        json!({"v": 1, "req": 2, "type": "hello", "token": token}),
-    )
-    .await;
-    let welcome = recv(&mut phone).await;
-    assert_eq!(welcome["type"], "welcome", "{welcome}");
-    let sessions = recv(&mut phone).await;
-    assert_eq!(sessions["type"], "sessions", "{sessions}");
-    (phone, sessions)
-}
-
 async fn send(phone: &mut Phone, message: Value) {
-    timeout(WAIT, phone.send(Message::text(message.to_string())))
-        .await
-        .expect("send in time")
-        .expect("send");
+    phone.send(&message).await;
 }
 
-/// The next text frame, parsed; fails if none comes or the connection ends.
+/// The next frame, parsed; fails if none comes or the connection ends.
 async fn recv(phone: &mut Phone) -> Value {
-    timeout(WAIT, async {
-        loop {
-            match phone.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    return serde_json::from_str(text.as_str()).expect("a JSON frame");
-                }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                other => panic!("expected a frame, got {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("a frame arrives")
+    phone.recv().await
 }
 
-/// The next text frame of type `kind`, passing over others (such as `sessions`).
+/// The next frame of type `kind`, passing over others (such as `sessions`).
 async fn recv_kind(phone: &mut Phone, kind: &str) -> Value {
-    loop {
-        let frame = recv(phone).await;
-        if frame["type"] == kind {
-            return frame;
-        }
-    }
+    phone.recv_kind(kind).await
 }
 
-/// Whether the connection ends soon; text frames before the end are passed over.
+/// Whether the connection ends soon; frames before the end are passed over.
 async fn closes(phone: &mut Phone) -> bool {
-    timeout(WAIT, async {
-        loop {
-            match phone.next().await {
-                Some(Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_))) => {}
-                _ => return,
-            }
-        }
-    })
-    .await
-    .is_ok()
+    phone.closes().await
 }
 
-/// Whether no text frame arrives for a while.
+/// Whether no frame arrives for a while.
 async fn quiet(phone: &mut Phone) -> bool {
-    timeout(Duration::from_millis(400), recv(phone))
-        .await
-        .is_err()
+    phone.quiet().await
 }
 
 fn subscribe(req: u64, session: &str, after: Option<u64>) -> Value {
@@ -397,81 +310,23 @@ async fn pair_then_hello_lists_sessions() {
     let bridge = env.bridge(5001, 0..1).await;
     env.start().await;
     let status = env.control(json!({"type": "status"})).await;
-    assert_eq!(status["devices"], 0, "{status}");
-    assert_eq!(status["published"], true, "{status}");
-    assert_eq!(status["url"], SERVED_URL, "{status}");
-    let secret = env.control(json!({"type": "pair_secret"})).await;
-    let text = secret["secret"].as_str().expect("a secret");
-    assert_eq!(text.len(), 64);
-    assert_eq!(secret["url"], SERVED_URL, "{secret}");
+    assert_eq!(status, json!({"relay": "off", "devices": 0}));
+    let link = env.link().await;
+    assert_eq!(link.channel.len(), 64);
+    assert_eq!(link.relay(), env.relay.as_ref().expect("a relay").url());
     assert!(env.control(json!({"type": "nope"})).await["error"].is_string());
 
-    let token = env.pair("Test phone").await;
-    assert_eq!(token.len(), 64);
+    let key = env.pair("Test phone").await;
     assert_eq!(env.control(json!({"type": "status"})).await["devices"], 1);
-    let (_phone, sessions) = hello(env.port, &token).await;
+    let devices = Store::open(&env.root).await.expect("the store");
+    let device = &devices.devices()[0];
+    assert_eq!(device.key, key.public_hex(), "a device is its key");
+    assert_eq!(device.relay, env.relay.as_ref().expect("a relay").url());
+    let (_phone, sessions) = env.hello(&key).await;
     let rows = sessions["sessions"].as_array().expect("rows");
     assert_eq!(rows.len(), 1, "{sessions}");
     assert_eq!(rows[0]["id"], bridge.id);
     assert_eq!(rows[0]["engine"], "claude");
-}
-
-#[tokio::test]
-async fn the_hub_asks_tailscale_at_start_and_then_every_so_often_not_per_request() {
-    let mut env = Env::new();
-    env.start().await;
-    for _ in 0..5 {
-        assert_eq!(
-            env.control(json!({"type": "status"})).await["published"],
-            true
-        );
-        assert!(env.control(json!({"type": "pair_secret"})).await["secret"].is_string());
-    }
-    let asked = ASKED
-        .lock()
-        .expect("lock")
-        .iter()
-        .filter(|p| **p == env.port)
-        .count();
-    assert_eq!(asked, 1, "asked once, at start");
-}
-
-#[tokio::test]
-async fn an_unpublished_hub_mints_no_pairing_secret() {
-    let mut env = Env::new();
-    let port = free_port().await;
-    UNPUBLISHED.lock().expect("lock").push(port);
-    env.start_with(port, Duration::from_millis(100)).await;
-    let status = env.control(json!({"type": "status"})).await;
-    assert_eq!(status["published"], false, "{status}");
-    assert!(status["url"].is_null(), "{status}");
-    assert_eq!(status["port"], env.port);
-    let refusal = env.control(json!({"type": "pair_secret"})).await;
-    assert!(refusal["secret"].is_null(), "{refusal}");
-    assert!(refusal["url"].is_null(), "{refusal}");
-    assert_eq!(
-        refusal["reason"],
-        format!("Publish it first: tailscale serve --bg {}", env.port)
-    );
-    // Once published, the hub sees it at its next look, and the secret pairs a phone.
-    UNPUBLISHED
-        .lock()
-        .expect("lock")
-        .retain(|port| *port != env.port);
-    let status = timeout(WAIT, async {
-        loop {
-            let status = env.control(json!({"type": "status"})).await;
-            if status["published"] == true {
-                return status;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the hub looks again");
-    assert_eq!(status["url"], SERVED_URL, "{status}");
-    let token = env.pair("Test phone").await;
-    assert_eq!(token.len(), 64);
 }
 
 #[tokio::test]
@@ -487,15 +342,15 @@ async fn unauthenticated_and_flooding_clients_are_refused() {
     };
 
     // A command before hello: refused with its own req, then the socket closes.
-    let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
+    let mut stranger = env.stranger().await;
     send(&mut stranger, prompt(41, &session)).await;
     let refusal = recv(&mut stranger).await;
     assert_eq!(refusal["type"], "refused", "{refusal}");
     assert_eq!(refusal["req"], 41);
     assert_eq!(refusal["code"], "unpaired");
     assert!(closes(&mut stranger).await);
-    // A bad token: refused and closed too.
-    let mut liar = connect(env.port, Some(OWNER)).await.expect("connects");
+    // A hello from a key the hub does not know, with an old app's token: refused and closed.
+    let mut liar = env.stranger().await;
     send(
         &mut liar,
         json!({"v": 1, "req": 3, "type": "hello", "token": "0".repeat(64)}),
@@ -507,14 +362,6 @@ async fn unauthenticated_and_flooding_clients_are_refused() {
         (Some("refused"), Some("unpaired"))
     );
     assert!(closes(&mut liar).await);
-
-    // Another tailnet login, or none: turned away during the handshake.
-    for login in [Some("someone@example"), Some("owner@example.evil"), None] {
-        match connect(env.port, login).await {
-            Err(tungstenite::Error::Http(response)) => assert_eq!(response.status(), 403),
-            other => panic!("{login:?} got in: {other:?}"),
-        }
-    }
 
     // A flood: the first 60 commands are taken, the rest refused until the bucket refills.
     let (mut flood, _) = env.phone("Flood phone").await;
@@ -541,37 +388,17 @@ async fn unauthenticated_and_flooding_clients_are_refused() {
         .count();
     assert!(limited >= 39, "{reasons:?}");
 
-    // Frames that are not text spend the bucket too.
-    let (mut binary, _) = env.phone("Binary phone").await;
-    for _ in 0..60 {
-        binary
-            .send(Message::binary(vec![1, 2, 3]))
-            .await
-            .expect("send");
-    }
-    for _ in 0..60 {
-        let frame = recv_kind(&mut binary, "refused").await;
-        assert_eq!(frame["reason"], "Send each message as a text frame");
-        assert_eq!(frame["code"], "invalid");
-    }
-    send(&mut binary, prompt(7, "nobody")).await;
-    let frame = recv_kind(&mut binary, "refused").await;
-    assert_eq!(frame["reason"], "Too many commands; wait a minute");
-
     // A frame over the limit closes the connection.
     let (mut big, _) = env.phone("Big phone").await;
     let text = "x".repeat(200 * 1024);
-    let _ = big
-        .send(Message::text(
-            prompt(5, &session).to_string().replace("hi", &text),
-        ))
+    big.send_text(&prompt(5, &session).to_string().replace("hi", &text))
         .await;
     assert!(closes(&mut big).await);
 
     // A revoked device's next frame closes it, and its idle connections close soon after.
     let token = env.pair("Lost phone").await;
-    let (mut revoked, _) = hello(env.port, &token).await;
-    let (mut idle, _) = hello(env.port, &token).await;
+    let (mut revoked, _) = env.hello(&token).await;
+    let (mut idle, _) = env.hello(&token).await;
     let mut cli = Store::open(&env.root).await.expect("the store");
     assert!(cli.revoke("Lost phone").await);
     send(&mut revoked, prompt(6, &session)).await;
@@ -601,8 +428,8 @@ async fn a_revoked_phone_is_told_so_before_it_is_closed() {
     env.start().await;
     let token = env.pair("Lost phone").await;
     // One phone is found by the hub's reload; the other by its next frame.
-    let (mut idle, _) = hello(env.port, &token).await;
-    let (mut chatty, _) = hello(env.port, &token).await;
+    let (mut idle, _) = env.hello(&token).await;
+    let (mut chatty, _) = env.hello(&token).await;
     let mut cli = Store::open(&env.root).await.expect("the store");
     assert!(cli.revoke("Lost phone").await);
     send(
@@ -620,7 +447,7 @@ async fn subscribe_replays_then_streams() {
     let bridge = env.bridge(5003, 0..5).await;
     env.start().await;
     let token = env.pair("Test phone").await;
-    let (mut phone, _) = hello(env.port, &token).await;
+    let (mut phone, _) = env.hello(&token).await;
     send(&mut phone, subscribe(3, &bridge.id, Some(2))).await;
     // The replay says where it starts, then replays.
     assert_eq!(
@@ -649,7 +476,7 @@ async fn subscribe_replays_then_streams() {
 
     // A phone that comes back with its cursor gets nothing it has, then what is new.
     drop(phone);
-    let (mut again, _) = hello(env.port, &token).await;
+    let (mut again, _) = env.hello(&token).await;
     send(&mut again, subscribe(4, &bridge.id, Some(5))).await;
     assert_eq!(recv(&mut again).await["from"], "cursor");
     assert_eq!(recv(&mut again).await, ack(4, "Subscribed"));
@@ -662,7 +489,7 @@ async fn subscribe_replays_then_streams() {
     );
 
     // Without a cursor: every record from the start, then live.
-    let (mut fresh, _) = hello(env.port, &token).await;
+    let (mut fresh, _) = env.hello(&token).await;
     send(&mut fresh, subscribe(5, &bridge.id, None)).await;
     assert_eq!(recv(&mut fresh).await["from"], "start");
     for seq in 0..7 {
@@ -676,7 +503,7 @@ async fn subscribe_replays_then_streams() {
     );
 
     // A record the replay reads before the tail does (it polls every 100 ms) arrives once.
-    let (mut racer, _) = hello(env.port, &token).await;
+    let (mut racer, _) = env.hello(&token).await;
     env.journal(JOURNAL, 7..8);
     send(&mut racer, subscribe(7, &bridge.id, Some(6))).await;
     assert_eq!(recv(&mut racer).await["type"], "subscribed");
@@ -1083,7 +910,7 @@ async fn watch_streams_sessions_and_live_events() {
     );
     // A phone's view of the rows has the NOW line too.
     let token = env.pair("Test phone").await;
-    let (_phone, sessions) = hello(env.port, &token).await;
+    let (_phone, sessions) = env.hello(&token).await;
     assert_eq!(
         sessions["sessions"][0]["now"], "Running Bash cargo test",
         "{sessions}"
@@ -1128,20 +955,10 @@ async fn audit_records_remote_actions() {
 }
 
 #[tokio::test]
-async fn a_pairing_is_audited_without_its_token_or_secret() {
+async fn a_pairing_is_audited_without_its_key_or_secret() {
     let mut env = Env::new();
     env.start().await;
-    let mut phone = connect(env.port, Some(OWNER)).await.expect("connects");
-    let secret = env.control(json!({"type": "pair_secret"})).await;
-    let secret = secret["secret"].as_str().expect("a secret").to_owned();
-    send(
-        &mut phone,
-        json!({"v": 1, "req": 1, "type": "pair", "secret": secret, "name": "Test phone",
-            "platform": "ios"}),
-    )
-    .await;
-    let paired = recv(&mut phone).await;
-    let token = paired["token"].as_str().expect("a token");
+    let (link, key, _) = pair(&env.run, "Test phone").await;
     let audit = std::fs::read_to_string(env.root.join("hub-audit.jsonl")).expect("the audit log");
     let lines: Vec<Value> = audit
         .lines()
@@ -1152,7 +969,7 @@ async fn a_pairing_is_audited_without_its_token_or_secret() {
     assert_eq!(lines[0]["session"], "");
     assert_eq!(lines[0]["what"], "paired");
     assert!(
-        !audit.contains(token) && !audit.contains(&secret),
+        !audit.contains(&key.public_hex()) && !audit.contains(&link.secret),
         "{audit}"
     );
 }
@@ -1257,7 +1074,7 @@ async fn push_commands_before_hello_are_refused_as_unpaired() {
         register(42, None),
         json!({"v": 1, "req": 43, "type": "ping"}),
     ] {
-        let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
+        let mut stranger = env.stranger().await;
         let req = command["req"].clone();
         send(&mut stranger, command).await;
         let refusal = recv(&mut stranger).await;
@@ -1607,7 +1424,7 @@ async fn activity_commands_before_hello_are_refused_as_unpaired() {
         register_activity(44, Some(ACTIVITY), Some(START)),
         clear_activity(45),
     ] {
-        let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
+        let mut stranger = env.stranger().await;
         let req = command["req"].clone();
         send(&mut stranger, command).await;
         let refusal = recv(&mut stranger).await;
@@ -1687,7 +1504,7 @@ async fn a_typed_command_needs_hello_names_its_session_and_is_audited() {
     let (mut read, mut write) = bridge.accept().await;
     let command = |req: u64, session: &str, name: &str| json!({"v": 1, "req": req, "type": "command", "session": session, "name": name});
     // Before hello it is refused as unpaired, and the connection closes.
-    let mut stranger = connect(env.port, Some(OWNER)).await.expect("connects");
+    let mut stranger = env.stranger().await;
     send(&mut stranger, command(1, &bridge.id, "new")).await;
     let refusal = recv(&mut stranger).await;
     assert_eq!(
@@ -1872,87 +1689,6 @@ async fn a_long_replay_hands_over_to_live_without_gaps_or_repeats() {
     assert!(quiet(&mut phone).await);
 }
 
-#[tokio::test]
-async fn silent_connections_cannot_lock_a_phone_out() {
-    let mut env = Env::new();
-    env.start().await;
-    let token = env.pair("Test phone").await;
-    // Thirty-two upgraded sockets that never say hello fill the waiting room.
-    let mut waiting = Vec::new();
-    for _ in 0..32 {
-        waiting.push(connect(env.port, Some(OWNER)).await.expect("connects"));
-    }
-    // While they are all younger than 2 seconds, a newcomer is turned away, and comes back.
-    match connect(env.port, Some(OWNER)).await {
-        Err(tungstenite::Error::Http(response)) => assert_eq!(response.status(), 503),
-        other => panic!("a full room of young sockets let one in: {other:?}"),
-    }
-    tokio::time::sleep(Duration::from_millis(2100)).await;
-    // Then a paired phone comes in at once and says hello: the oldest silent socket makes room.
-    let began = std::time::Instant::now();
-    // (The helper waits for `welcome`, then the session list.)
-    let (_phone, sessions) = hello(env.port, &token).await;
-    assert_eq!(sessions["type"], "sessions");
-    assert!(
-        began.elapsed() < Duration::from_secs(5),
-        "{:?}",
-        began.elapsed()
-    );
-    assert!(
-        closes(&mut waiting[0]).await,
-        "the oldest silent socket was let go"
-    );
-    // The phone left the waiting room; another silent socket fills it again, and the next
-    // phone still comes in, letting the oldest silent one go: it is never the phone that waits.
-    waiting.push(connect(env.port, Some(OWNER)).await.expect("connects"));
-    let (_again, sessions) = hello(env.port, &token).await;
-    assert_eq!(sessions["type"], "sessions");
-    assert!(closes(&mut waiting[1]).await);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_storm_of_reconnects_cannot_push_out_a_phone_slow_to_say_hello() {
-    let mut env = Env::new();
-    env.start().await;
-    let token = env.pair("Test phone").await;
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Eight loops, each upgrading a socket, waiting 50 ms and closing it, again and again.
-    let storms: Vec<_> = (0..8)
-        .map(|_| {
-            let (stop, port) = (std::sync::Arc::clone(&stop), env.port);
-            tokio::spawn(async move {
-                let mut upgrades = 0;
-                while !stop.load(Ordering::Relaxed) {
-                    if let Ok(mut socket) = connect(port, Some(OWNER)).await {
-                        upgrades += 1;
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        let _ = socket.close(None).await;
-                    }
-                }
-                upgrades
-            })
-        })
-        .collect();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    // A phone on a slow link: upgraded mid-storm, it takes a second to say hello.
-    let mut phone = connect(env.port, Some(OWNER)).await.expect("connects");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    send(
-        &mut phone,
-        json!({"v": 1, "req": 2, "type": "hello", "token": token}),
-    )
-    .await;
-    let welcome = recv(&mut phone).await;
-    stop.store(true, Ordering::Relaxed);
-    assert_eq!(welcome["type"], "welcome", "{welcome}");
-    assert_eq!(recv(&mut phone).await["type"], "sessions");
-    let mut upgrades = 0;
-    for storm in storms {
-        upgrades += storm.await.expect("a storm loop");
-    }
-    assert!(upgrades >= 80, "the storm upgraded {upgrades} sockets");
-}
-
 /// A journal in `env`'s data directory for a Claude session `session` in `cwd`.
 fn recorded(env: &Env, stamp: u64, cwd: &std::path::Path, session: &str, prompt: &str) {
     let header = json!({"engine": "claude", "cwd": cwd, "resume": null, "model": "opus",
@@ -2127,111 +1863,6 @@ async fn at_most_eight_phone_started_sessions_run() {
     );
 }
 
-/// A handshake from the owner with `headers` added (a header named again replaces the first).
-async fn connect_with(port: u16, headers: &[(&str, &str)]) -> Result<Phone, tungstenite::Error> {
-    let mut request = format!("ws://127.0.0.1:{port}/")
-        .into_client_request()
-        .expect("a request");
-    request
-        .headers_mut()
-        .insert("Tailscale-User-Login", OWNER.parse().expect("a header"));
-    for &(name, value) in headers {
-        let name = tungstenite::http::HeaderName::from_bytes(name.as_bytes()).expect("a name");
-        request
-            .headers_mut()
-            .insert(name, value.parse().expect("a header"));
-    }
-    timeout(WAIT, connect_async(request))
-        .await
-        .expect("the handshake ends")
-        .map(|(phone, _)| phone)
-}
-
-/// Whether a handshake was refused with `status`.
-fn refused_with(result: &Result<Phone, tungstenite::Error>, status: u16) -> bool {
-    matches!(result, Err(tungstenite::Error::Http(response)) if response.status() == status)
-}
-
-#[tokio::test]
-async fn a_web_page_of_another_site_is_refused_at_the_handshake() {
-    let mut env = Env::new();
-    env.start().await;
-    let here = format!("http://127.0.0.1:{}", env.port);
-    for origin in ["https://evil.example", "null", "https://127.0.0.2"] {
-        let result = connect_with(env.port, &[("Origin", origin)]).await;
-        assert!(refused_with(&result, 403), "{origin}: {result:?}");
-    }
-    // The app's own socket: no Origin, or the hub's own address.
-    assert!(connect_with(env.port, &[]).await.is_ok());
-    assert!(connect_with(env.port, &[("Origin", &here)]).await.is_ok());
-    // Through `tailscale serve`, the request names the published host.
-    let served = [
-        ("Host", "mac.tail1234.ts.net"),
-        ("Origin", "https://mac.tail1234.ts.net"),
-    ];
-    assert!(connect_with(env.port, &served).await.is_ok());
-    let forwarded = [
-        ("X-Forwarded-Host", "mac.tail1234.ts.net"),
-        ("Origin", "https://MAC.tail1234.ts.net"),
-    ];
-    assert!(connect_with(env.port, &forwarded).await.is_ok());
-}
-
-#[tokio::test]
-async fn an_origin_naming_the_published_host_is_accepted_whatever_the_host_header() {
-    // `tailscale serve` may hand the request on as Host 127.0.0.1:<port>, with no
-    // X-Forwarded-Host: the phone's Origin then names only the published address.
-    let mut env = Env::new();
-    env.start().await;
-    let published = connect_with(env.port, &[("Origin", "https://mac.tail1234.ts.net")]).await;
-    assert!(published.is_ok(), "{published:?}");
-    let shouted = connect_with(env.port, &[("Origin", "https://MAC.tail1234.ts.net:443")]).await;
-    assert!(shouted.is_ok(), "{shouted:?}");
-    for origin in ["https://evil.example", "https://other.tail1234.ts.net"] {
-        let result = connect_with(env.port, &[("Origin", origin)]).await;
-        assert!(refused_with(&result, 403), "{origin}: {result:?}");
-    }
-    // Unpublished, only the request's own host names the hub.
-    let mut hidden = Env::new();
-    let port = free_port().await;
-    UNPUBLISHED.lock().expect("lock").push(port);
-    hidden.start_with(port, RECHECK).await;
-    let result = connect_with(hidden.port, &[("Origin", "https://mac.tail1234.ts.net")]).await;
-    assert!(refused_with(&result, 403), "{result:?}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn handshakes_that_stall_do_not_keep_a_phone_out() {
-    let mut env = Env::new();
-    env.start().await;
-    let token = env.pair("Test phone").await;
-    // Sixty sockets that start a request and never finish it.
-    let mut stalled = Vec::new();
-    for _ in 0..60 {
-        let mut socket = TcpStream::connect(("127.0.0.1", env.port))
-            .await
-            .expect("connects");
-        socket
-            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
-            .await
-            .expect("writes");
-        stalled.push(socket);
-    }
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let (_phone, sessions) = timeout(Duration::from_secs(6), hello(env.port, &token))
-        .await
-        .expect("a phone gets in within 6 seconds");
-    assert_eq!(sessions["type"], "sessions");
-    // The newest stalled handshake is let go 5 seconds after it began.
-    let mut last = stalled.pop().expect("a socket");
-    let mut byte = [0; 1];
-    let ended = timeout(Duration::from_secs(5), last.read(&mut byte)).await;
-    assert!(
-        ended.is_ok_and(|read| read.is_err() || read.is_ok_and(|n| n == 0)),
-        "a stalled handshake is cut within 5 seconds"
-    );
-}
-
 #[tokio::test]
 async fn a_run_directory_that_is_a_symlink_is_refused() {
     let root = PathBuf::from(format!("/tmp/ohs{}-link", std::process::id()));
@@ -2242,11 +1873,10 @@ async fn a_run_directory_that_is_a_symlink_is_refused() {
     std::os::unix::fs::symlink(&elsewhere, root.join("run")).expect("planted symlink");
     let serving = Hub::serve_with(
         root.clone(),
-        0,
-        OWNER.to_owned(),
+        "ws://127.0.0.1:9".to_owned(),
+        Arc::new(|_: &str| {}),
         std::future::pending(),
         oneshot::channel().0,
-        (fake_publisher, RECHECK),
     );
     let result = timeout(Duration::from_secs(2), serving).await;
     let socket = elsewhere.join("hub.sock").exists();
@@ -2304,20 +1934,14 @@ async fn more_live_events_than_the_outbox_holds_wait_for_a_slow_phone_at_the_han
     tokio::time::sleep(Duration::from_millis(800)).await;
     let mut seqs = Vec::new();
     let read = timeout(Duration::from_secs(30), async {
-        loop {
-            match phone.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(text.as_str()).expect("JSON");
-                    match frame["type"].as_str() {
-                        Some("event") => seqs.push(frame["seq"].as_u64().expect("a seq")),
-                        Some("ack") => return Some(frame),
-                        _ => {}
-                    }
-                }
-                Some(Ok(_)) => {}
-                _ => return None,
+        while let Some(frame) = phone.next().await {
+            match frame["type"].as_str() {
+                Some("event") => seqs.push(frame["seq"].as_u64().expect("a seq")),
+                Some("ack") => return Some(frame),
+                _ => {}
             }
         }
+        None
     })
     .await
     .expect("the phone reads in time");
@@ -2511,7 +2135,7 @@ async fn changes_and_diffs_work_on_the_sessions_workspace() {
 
     // Another connection has a listing of its own.
     let token = env.pair("Other phone").await;
-    let (mut other, _) = hello(env.port, &token).await;
+    let (mut other, _) = env.hello(&token).await;
     send(&mut other, diff(7, "later.txt")).await;
     assert_eq!(
         recv_kind(&mut other, "refused").await,
@@ -2873,10 +2497,92 @@ async fn a_phone_that_says_hello_mid_window_is_not_left_with_a_passing_list() {
     // Within the window the session goes idle, and a phone says hello: its list shows `idle`.
     bridge_write(&mut write, bridge_state_frame(&state("idle"))).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
-    let (mut phone, sessions) = hello(env.port, &token).await;
+    let (mut phone, sessions) = env.hello(&token).await;
     assert_eq!(sessions["sessions"][0]["phase"], "idle", "{sessions}");
     // Then, still within the window, it runs again: the list the others last got. The phone,
     // which last got `idle`, must hear of it.
     bridge_write(&mut write, bridge_state_frame(&state("running"))).await;
     listed_as(&mut phone, &bridge.id, "running", 0).await;
+}
+
+#[tokio::test]
+async fn the_hub_registers_again_after_the_relay_restarts_and_a_phone_resumes_from_its_cursor() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5201, 0..5).await;
+    env.start().await;
+    let key = env.pair("Test phone").await;
+    let (mut phone, _) = env.hello(&key).await;
+    send(&mut phone, subscribe(3, &bridge.id, Some(2))).await;
+    assert_eq!(recv(&mut phone).await["type"], "subscribed");
+    let mut cursor = 2;
+    loop {
+        let frame = recv(&mut phone).await;
+        if frame == ack(3, "Subscribed") {
+            break;
+        }
+        cursor = frame["seq"].as_u64().expect("a seq");
+    }
+    assert_eq!(cursor, 4);
+    // The relay goes away: the phone's channel goes with it, and the hub dials again.
+    let relay = env.relay.take().expect("a relay");
+    let addr = relay.addr();
+    relay.stop().await;
+    assert!(closes(&mut phone).await);
+    relay_state(&env.run, "connecting").await;
+    env.journal(JOURNAL, 5..7);
+    let relay = timeout(WAIT, async {
+        loop {
+            if let Some(relay) = Relay::start_at(addr, octet_testkit::relay::roomy()).await {
+                return relay;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the relay's port is free again");
+    env.relay = Some(relay);
+    // Back on its backoff, the hub has its channel again; the pairing held.
+    relay_state(&env.run, "registered").await;
+    assert_eq!(env.control(json!({"type": "status"})).await["devices"], 1);
+    let (mut again, _) = env.hello(&key).await;
+    send(&mut again, subscribe(4, &bridge.id, Some(cursor))).await;
+    assert_eq!(recv(&mut again).await["from"], "cursor");
+    for seq in [5, 6] {
+        assert_eq!(recv(&mut again).await["seq"], seq);
+    }
+    assert_eq!(recv(&mut again).await, ack(4, "Subscribed"));
+}
+
+#[tokio::test]
+#[expect(
+    non_snake_case,
+    reason = "the size is named as the plan names it, in KiB"
+)]
+async fn an_event_of_200_KiB_reaches_the_phone_whole() {
+    let mut env = Env::new();
+    let bridge = env.bridge(5202, 0..1).await;
+    env.start().await;
+    let (mut phone, _) = env.phone("Test phone").await;
+    send(&mut phone, subscribe(2, &bridge.id, Some(0))).await;
+    assert_eq!(recv_kind(&mut phone, "ack").await, ack(2, "Subscribed"));
+    // Four chunks on the wire: three of 65,000 bytes and the rest.
+    let text: String = (0..200 * 1024)
+        .map(|n| char::from(b'a' + u8::try_from(n % 26).expect("a letter")))
+        .collect();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(env.root.join(JOURNAL))
+        .expect("journal");
+    let record = json!({"format": "octet-preview-1", "seq": 1, "type": "text", "data": text});
+    writeln!(file, "{record}").expect("journal write");
+    let event = recv_kind(&mut phone, "event").await;
+    assert_eq!(event["seq"], 1);
+    assert_eq!(
+        event["event"]["data"],
+        json!(text),
+        "the text arrives whole"
+    );
+    // The channel goes on.
+    send(&mut phone, json!({"v": 1, "req": 3, "type": "ping"})).await;
+    assert_eq!(recv_kind(&mut phone, "ack").await, ack(3, "pong"));
 }

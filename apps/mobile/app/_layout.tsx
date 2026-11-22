@@ -80,9 +80,9 @@ export default function RootLayout() {
   }, [hub, live]);
 
   // A tap opens the session it names on the Mac it names (`Fleet.tapKey`: the pairing of the
-  // push's host, or the only one when it names none), as the drawer does (back to it when it is in
-  // the stack); unpaired, the phone can only pair. A tap for no valid session, a host no pairing
-  // has, no host with several Macs, or a session that Mac has ended lands on the Inbox, and
+  // push's channel id), as the drawer does (back to it when it is in the stack); unpaired, the
+  // phone can only pair. A tap for no valid session, a channel no pairing has, none (a push from
+  // before the relay, naming a hostname), or a session that Mac has ended lands on the Inbox, and
   // nothing is sent. (The Session screen handles a session found gone once its Mac lists.)
   const open = (tap: Tap) => {
     if (status === "unpaired") {
@@ -93,7 +93,7 @@ export default function RootLayout() {
     if (key === null) router.replace("/");
     else openSession(router, nav.getRootState(), pathname, key);
   };
-  // The Island's Allow (`octet://approve/<host>/<raw>/<approval>`, src/navigation.ts): for a known
+  // The Island's Allow (`octet://approve/<channel id>/<raw>/<approval>`, src/navigation.ts): for a known
   // Mac (`Fleet.approveNow`, through `keyFor`), a session it lists as live and that approval
   // waiting there, the session opens as from a tap, and its Permission card asks for Face ID and
   // waits out the arm as everywhere. Anything else, a forged, stale or unknown link, opens the

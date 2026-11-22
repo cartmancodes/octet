@@ -147,8 +147,8 @@ pub(crate) const COMMANDS: &[Spec] = &[
     spec(
         Cmd::RemoteControl,
         "/remote-control",
-        "/remote-control · /remote-control pair: check phone access, or pair a phone",
-        "Check phone access, or pair a phone by QR",
+        "/remote-control · /remote-control pair: the hub, its relay and paired phones, or pair one",
+        "Hub and relay status, or pair a phone by QR",
     ),
     spec(
         Cmd::Queue,

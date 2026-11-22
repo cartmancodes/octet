@@ -11,21 +11,23 @@ import type { ComponentType } from "react";
 import RootLayout from "../app/_layout";
 import Pair from "../app/pair";
 import Sessions from "../app/index";
-import { FakeClock, Sockets, type FakeSocket } from "./client/fakes";
+import { FakeClock, Sockets, pairingOf, phoneUrlOf, type FakeSocket } from "./client/fakes";
 import { LiveApiContext, type LiveApi } from "./activity";
 import { HubContext, Fleet, TOKEN_KEY, tokenKeyOf } from "./hub";
 import { saveSettings } from "./persist";
 import type { SessionInfo } from "./protocol";
 import { octetStore } from "./store";
-import { newM } from "./testKeys";
+import { M, newM } from "./testKeys";
 
 jest.mock("expo-camera", () => ({
   CameraView: () => null,
   useCameraPermissions: () => [{ granted: false, canAskAgain: false, status: "denied" }, jest.fn()],
 }));
 
+/** The private key, as hex, each saved pairing's keychain entry holds. */
 export const TOKEN = "cd".repeat(32);
-export const HUB_URL = "wss://mac.tail1234.ts.net/";
+/** The relay host the one Mac is reached through. */
+export const RELAY = "relay.example.test";
 
 export const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo => ({
   id,
@@ -38,11 +40,12 @@ export const info = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo 
   ...extra,
 });
 
-/** Call in `beforeEach`: a saved token and hub address, an empty store. */
+/** Call in `beforeEach`: the one Mac paired (its key in its keychain entry, its pairing in
+ * settings), an empty store. */
 export async function pairedStorage(): Promise<void> {
   await AsyncStorage.clear();
-  await SecureStore.setItemAsync(TOKEN_KEY, TOKEN);
-  await saveSettings({ hubUrl: HUB_URL, deviceName: "Shubh's iPhone" });
+  await SecureStore.setItemAsync(tokenKeyOf(M), TOKEN);
+  await saveSettings({ pairings: [pairingOf(M, "mac", RELAY, { deviceName: "Shubh's iPhone" })], deviceName: "Shubh's iPhone" });
   octetStore.getState().reset();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));
 }
@@ -59,7 +62,7 @@ export async function mount(url: string, routes: Record<string, ComponentType>, 
   const sockets = new Sockets();
   const clock = new FakeClock();
   const hub = new Fleet({
-    factory: sockets.factory,
+    factory: () => sockets.factory,
     store: octetStore,
     platform: "ios",
     clientOptions: { now: clock.now, schedule: clock.schedule, random: () => 1 },
@@ -130,10 +133,11 @@ export const MACS = [
   { id: "m00000004", host: "pro" },
 ] as const;
 
-/** The hub address of the Mac whose host label is `host`. */
-export const macUrl = (host: string): string => `wss://${host}.tail1234.ts.net/`;
+/** The address of the phone sockets to the Mac whose host label is `host`, which is reached through
+ * a relay of its own name (`<host>.relay.example.test`). */
+export const macUrl = (host: string): string => phoneUrlOf(host, `${host}.relay.example.test`);
 
-/** Call in `beforeEach`: the first `count` of `MACS` paired (each its token in its own keychain
+/** Call in `beforeEach`: the first `count` of `MACS` paired (each its key in its own keychain
  * entry), Face ID off, an empty store. */
 export async function pairedMacs(count: number = 2): Promise<void> {
   await AsyncStorage.clear();
@@ -143,7 +147,7 @@ export async function pairedMacs(count: number = 2): Promise<void> {
   await saveSettings({
     deviceName: "Shubh's iPhone",
     faceId: false,
-    pairings: macs.map((m) => ({ id: m.id, hubUrl: macUrl(m.host), deviceName: "Shubh's iPhone", macName: m.host })),
+    pairings: macs.map((m) => pairingOf(m.id, m.host, `${m.host}.relay.example.test`, { deviceName: "Shubh's iPhone" })),
   });
   octetStore.getState().reset();
   jest.spyOn(AppState, "addEventListener").mockImplementation(() => ({ remove: jest.fn() }));

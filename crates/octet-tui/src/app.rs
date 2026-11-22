@@ -397,6 +397,8 @@ pub(crate) struct App {
     pub(crate) turn_not_sent: bool,
     /// Why the bridge to a hub is off, when it could not start or broke; `/remote-control` says it.
     pub(crate) remote_off: Option<String>,
+    /// The pairing `/remote-control pair` opened, while it waits for a phone or the owner's answer.
+    pub(crate) pairing: Option<crate::remote::PairWait>,
     /// Whether the Task sidebar shows on wide terminals; F2 flips it.
     pub(crate) sidebar: bool,
     /// The terminal's width at the last frame, for F2 to say when the sidebar can show.
@@ -473,6 +475,7 @@ impl App {
             pending_skill: None,
             turn_not_sent: false,
             remote_off: None,
+            pairing: None,
             sidebar: true,
             last_width: 0,
             mode_chosen: config.mode,
@@ -930,6 +933,12 @@ impl App {
         let paused = if paused { "; paused" } else { "" };
         self.error(format!("Goal persistence failed{paused}: {error}"));
     }
+    /// The pairing question waits for the owner's answer.
+    pub(crate) fn pairing_asked(&self) -> bool {
+        self.pairing
+            .as_ref()
+            .is_some_and(|wait| wait.question.is_some())
+    }
     /// A turn is running or an approval waits: the session is busy.
     pub(crate) fn turn_open(&self) -> bool {
         self.conn.is_running() || !self.overlay.approvals.is_empty()
@@ -1094,6 +1103,9 @@ impl App {
                 if first {
                     self.overlay.front_changed();
                 }
+                // Keys reach an approval before the palette, so it must not wait under one: the
+                // palette closes, and (taking no keys while an approval is open) stays closed.
+                self.overlay.palette = false;
             }
             Event::ApprovalClosed(id) => {
                 let front = self.overlay.approvals.front().map(|asked| asked.id);

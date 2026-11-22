@@ -161,23 +161,24 @@ const newestFirst = (a: ListedSession, b: ListedSession): number =>
 
 /**
  * What the widget's App Group holds: for each session with an approval waiting, keyed the way the
- * widget sees it (`<host>/<raw session>`, from its content state), the session's name (at most
+ * widget sees it (`<channel id>/<raw session>`, from its content state), the session's name (at most
  * `NAME_CHARS`), what the approval runs (its command, folded so no line of it hides below blank
  * ones, else its action; at most `COMMAND_CHARS`) and the approval's id. Each value is cleaned of
  * control characters. Newest first, at most `ENTRIES_LIMIT`, within `ENTRIES_BYTES` of JSON. A
- * session whose Mac has no host (`hostOf` null), or whose raw id is not a session id, is left out.
+ * session whose Mac has no channel id (`channelOf` null), or whose raw id is not a session id, is
+ * left out.
  */
-export function widgetEntries(sessions: readonly ListedSession[], hostOf: (mac: string) => string | null): Record<string, WidgetEntry> {
+export function widgetEntries(sessions: readonly ListedSession[], channelOf: (mac: string) => string | null): Record<string, WidgetEntry> {
   const out: Record<string, WidgetEntry> = {};
   let bytes = 2; // {}
   let count = 0;
   for (const s of sessions.filter((x) => x.approvals > 0 && x.approval).sort(newestFirst)) {
     if (count >= ENTRIES_LIMIT) break;
-    const host = hostOf(s.mac);
+    const channel = channelOf(s.mac);
     // A key the widget could never be shown (an id not of the hub's shape) is not kept.
-    if (host === null || !s.approval || !isSessionId(s.raw)) continue;
+    if (channel === null || !s.approval || !isSessionId(s.raw)) continue;
     const { id, summary } = s.approval;
-    const key = entryKey(host, s.raw);
+    const key = entryKey(channel, s.raw);
     const entry: WidgetEntry = {
       name: field(sessionName(s.workspace), NAME_CHARS),
       command: field(foldCommand(summary.command ?? summary.action).text, COMMAND_CHARS),

@@ -1,16 +1,15 @@
-//! A phone drives a live terminal interface through the real hub: the `octet hub` process, an
-//! `octet` interface on a PTY against the fake Codex, and a WebSocket client on loopback.
-#![cfg(unix)]
-use futures_util::{SinkExt, StreamExt};
+//! A phone drives a live terminal interface through the real hub: the `octet hub` process
+//! (a debug build, pointed at an in-process relay by `OCTET_HUB_RELAY_URL`), an `octet`
+//! interface on a PTY against the fake Codex, and a phone that reaches the hub through the relay
+//! over the Noise channel, as the app does.
+#![cfg(all(unix, debug_assertions))]
+use octet_testkit::relay::{Link, Phone, PhoneKey, Relay, pair};
 use serde_json::{Value, json};
 use std::{
     fs::File,
     future::Future,
     io::{Read, Write as _},
-    os::{
-        fd::FromRawFd,
-        unix::{fs::PermissionsExt, process::CommandExt},
-    },
+    os::{fd::FromRawFd, unix::process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -21,20 +20,12 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, UnixStream},
+    net::UnixStream,
     time::{sleep, timeout},
 };
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
-};
 
-/// The tailnet login the hub is told is its owner.
-const OWNER: &str = "test@example";
 /// How long any one step may take before the test fails.
 const WAIT: Duration = Duration::from_secs(10);
-
-type Phone = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Everything the test starts, and what it needs to say why a step failed.
 struct World {
@@ -42,9 +33,12 @@ struct World {
     dir: PathBuf,
     /// Where the hub process writes its output.
     hub_log: PathBuf,
-    /// The directory holding a fake `tailscale` that shows the hub as published.
+    /// The directory holding stand-ins for the vendor CLIs.
     bin: PathBuf,
-    port: u16,
+    /// The relay the hub dials.
+    _relay: Relay,
+    /// The hub's link, once a phone paired.
+    link: Mutex<Option<Link>>,
     hub: Child,
     tui: Child,
     /// Everything the interface has written to its terminal so far.
@@ -56,7 +50,7 @@ struct World {
 }
 
 impl World {
-    /// Starts the hub on a free port, then the interface, and waits for it to register.
+    /// Starts a relay, the hub pointed at it, then the interface, and waits for it to register.
     async fn start() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = format!(
@@ -69,17 +63,19 @@ impl World {
         std::fs::create_dir_all(&dir).expect("data directory");
         let hub_log = PathBuf::from("/tmp").join(format!("{id}.hub.log"));
         let bin = PathBuf::from("/tmp").join(format!("{id}.bin"));
-        std::fs::create_dir_all(&bin).expect("fake tailscale directory");
+        std::fs::create_dir_all(&bin).expect("stand-ins directory");
         // The interface probes the other providers by name: stand-ins, never
         // the installed CLIs.
         octet_testkit::vendor_stand_ins(&bin);
-        let (hub, port) = spawn_hub(&dir, &hub_log, &bin).await;
+        let relay = Relay::start().await;
+        let hub = spawn_hub(&dir, &hub_log, &relay.url()).await;
         let (tui, screen, master, slave) = spawn_interface(&dir, &bin);
         let mut world = Self {
             dir,
             hub_log,
             bin,
-            port,
+            _relay: relay,
+            link: Mutex::new(None),
             hub,
             tui,
             screen,
@@ -167,44 +163,27 @@ impl World {
         serde_json::from_str(&line).ok()
     }
 
-    /// A WebSocket connection carrying the owner's tailnet login.
-    async fn connect(&self) -> Phone {
-        let mut request = format!("ws://127.0.0.1:{}/", self.port)
-            .into_client_request()
-            .expect("a request");
-        request
-            .headers_mut()
-            .insert("Tailscale-User-Login", OWNER.parse().expect("a header"));
-        let (phone, _) = self
-            .within("the WebSocket handshake", Box::pin(connect_async(request)))
+    /// A phone past its handshake as `key`, through the relay.
+    async fn connect(&self, key: &PhoneKey) -> Phone {
+        let link = self
+            .link
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("a phone paired");
+        self.within("the phone's handshake", Phone::connect(&link, key))
             .await
-            .expect("the handshake succeeds");
-        phone
+            .expect("the handshake succeeds")
     }
 
     async fn send(&self, phone: &mut Phone, message: Value) {
-        self.within(
-            "sending a frame",
-            phone.send(Message::text(message.to_string())),
-        )
-        .await
-        .expect("send");
+        self.within("sending a frame", phone.send(&message)).await;
     }
 
-    /// The next text frame, parsed.
+    /// The next frame, parsed.
     async fn recv(&self, phone: &mut Phone) -> Value {
-        self.within("a frame from the hub", async {
-            loop {
-                match phone.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        return serde_json::from_str(text.as_str()).expect("a JSON frame");
-                    }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                    other => panic!("expected a frame, got {other:?}\n{}", self.evidence()),
-                }
-            }
-        })
-        .await
+        let frame = self.within("a frame from the hub", phone.next()).await;
+        frame.unwrap_or_else(|| panic!("the channel ended\n{}", self.evidence()))
     }
 
     /// Whether no frame arrives for a while.
@@ -245,13 +224,10 @@ impl World {
     }
 
     /// A phone that has paired (once) and said hello, and the `sessions` frame it got.
-    async fn hello(&self, token: &str) -> (Phone, Value) {
-        let mut phone = self.connect().await;
-        self.send(
-            &mut phone,
-            json!({"v": 1, "req": 2, "type": "hello", "token": token}),
-        )
-        .await;
+    async fn hello(&self, key: &PhoneKey) -> (Phone, Value) {
+        let mut phone = self.connect(key).await;
+        self.send(&mut phone, json!({"v": 1, "req": 2, "type": "hello"}))
+            .await;
         let welcome = self.recv(&mut phone).await;
         assert_eq!(welcome["type"], "welcome", "{welcome}");
         let sessions = self.recv(&mut phone).await;
@@ -259,25 +235,12 @@ impl World {
         (phone, sessions)
     }
 
-    /// Pairs a new device and returns its token.
-    async fn pair(&self) -> String {
-        let secret = self
-            .within("the pairing secret", async {
-                self.control(&json!({"type": "pair_secret"})).await
-            })
-            .await
-            .expect("a control answer");
-        let secret = secret["secret"].as_str().expect("a secret");
-        let mut phone = self.connect().await;
-        self.send(
-            &mut phone,
-            json!({"v": 1, "req": 1, "type": "pair", "secret": secret, "name": "Test phone",
-                "platform": "ios"}),
-        )
-        .await;
-        let paired = self.recv(&mut phone).await;
-        assert_eq!(paired["type"], "paired", "{paired}");
-        paired["token"].as_str().expect("a token").to_owned()
+    /// Pairs a new device and returns its key.
+    async fn pair(&self) -> PhoneKey {
+        let run = self.dir.join("run");
+        let (link, key, _) = self.within("pairing", pair(&run, "Test phone")).await;
+        *self.link.lock().expect("lock") = Some(link);
+        key
     }
 
     /// Types `keys` at the desk.
@@ -394,68 +357,33 @@ impl Events {
 
 /// An `octet` interface on a PTY (`--engine codex` against the fake vendor), the output reader's
 /// shared buffer and the terminal's two ends.
-/// How many ports [`spawn_hub`] tries: a port found free can be taken by a parallel test before
-/// the hub binds it.
-const PORT_TRIES: usize = 5;
-
-/// Starts `octet hub` on a free loopback port, behind a fake `tailscale` in `bin` that answers
-/// `serve status --json` with that port proxied at a tailnet name (the hub only pairs phones once
-/// it is published). Another port is tried when the one found free was taken before the hub
-/// could listen on it.
-async fn spawn_hub(dir: &Path, hub_log: &Path, bin: &Path) -> (Child, u16) {
-    for _ in 0..PORT_TRIES {
-        let port = {
-            let probe = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
-            probe.local_addr().expect("an address").port()
-        };
-        let served = json!({
-            "TCP": {"443": {"HTTPS": true}},
-            "Web": {"mac.tail1234.ts.net:443": {"Handlers": {"/": {
-                "Proxy": format!("http://127.0.0.1:{port}")}}}},
-        });
-        let script = bin.join("tailscale");
-        std::fs::write(&script, format!("#!/bin/sh\necho '{served}'\n")).expect("fake tailscale");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let log = File::create(hub_log).expect("hub log");
-        let mut hub = Command::new(env!("CARGO_BIN_EXE_octet"))
-            .env("PATH", path)
-            .args(["hub", "--journal-dir"])
-            .arg(dir)
-            .args(["--port", &port.to_string(), "--owner", OWNER])
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().expect("log handle"))
-            .stderr(log)
-            .spawn()
-            .expect("the hub starts");
-        // The control socket is bound before the port, so only an answer to `status`, which
-        // the hub gives once both are bound, says the port is the hub's.
-        let limit = tokio::time::Instant::now() + WAIT;
-        loop {
-            if hub_status(dir).await.is_some() {
-                return (hub, port);
-            }
-            if let Some(status) = hub.try_wait().expect("wait") {
-                let output = std::fs::read_to_string(hub_log).unwrap_or_default();
-                assert!(
-                    output.contains("Address already in use"),
-                    "the hub exited early ({status})\n{output}"
-                );
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < limit,
-                "timed out: the hub answers on hub.sock\n{}",
-                std::fs::read_to_string(hub_log).unwrap_or_default()
-            );
-            sleep(Duration::from_millis(20)).await;
+/// Starts `octet hub`, pointed at the relay at `relay` (a debug build takes it from
+/// `OCTET_HUB_RELAY_URL`), and waits until it answers on its control socket.
+async fn spawn_hub(dir: &Path, hub_log: &Path, relay: &str) -> Child {
+    let log = File::create(hub_log).expect("hub log");
+    let mut hub = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .env("OCTET_HUB_RELAY_URL", relay)
+        .args(["hub", "--journal-dir"])
+        .arg(dir)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("log handle"))
+        .stderr(log)
+        .spawn()
+        .expect("the hub starts");
+    let limit = tokio::time::Instant::now() + WAIT;
+    while hub_status(dir).await.is_none() {
+        if let Some(status) = hub.try_wait().expect("wait") {
+            let output = std::fs::read_to_string(hub_log).unwrap_or_default();
+            panic!("the hub exited early ({status})\n{output}");
         }
+        assert!(
+            tokio::time::Instant::now() < limit,
+            "timed out: the hub answers on hub.sock\n{}",
+            std::fs::read_to_string(hub_log).unwrap_or_default()
+        );
+        sleep(Duration::from_millis(20)).await;
     }
-    panic!("no free port held long enough for the hub in {PORT_TRIES} tries");
+    hub
 }
 
 /// The hub's answer to `status` on its control socket, if it gives one within a second.
@@ -469,7 +397,7 @@ async fn hub_status(dir: &Path) -> Option<Value> {
         BufReader::new(stream).read_line(&mut line).await.ok()?;
         serde_json::from_str::<Value>(&line)
             .ok()
-            .filter(|v| v.get("port").is_some())
+            .filter(|v| v.get("relay").is_some())
     };
     timeout(Duration::from_secs(1), ask).await.ok().flatten()
 }
@@ -554,7 +482,7 @@ fn spawn_interface(dir: &Path, bin: &Path) -> (Child, Arc<Mutex<Vec<u8>>>, File,
 /// A paired phone looking at one session, and what it has been sent.
 struct Drive<'a> {
     world: &'a World,
-    token: String,
+    token: PhoneKey,
     phone: Phone,
     session: String,
     seen: Events,
