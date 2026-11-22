@@ -57,7 +57,9 @@ pub enum ProcessCheck {
 /// - unfinished and released: a new attempt (a change step's continuing its
 ///   vendor session) when the tree is the input tree, `Reconcile` otherwise;
 /// - a write attempt that failed (not a config error) and left the tree
-///   changed: `Reconcile`;
+///   changed: `Reconcile`; but a tests attempt that failed after its
+///   handoff compares with its evidence candidate, and another tree is
+///   `Drift`;
 /// - anything else (finished, or failed with the tree unchanged): `Drift`
 ///   when the tree is not the tip's, otherwise [`machine::next`].
 ///
@@ -195,6 +197,16 @@ fn found(def: &Resolved, state: &RunState, obs: &Observation) -> Next {
     match &info.state {
         AttemptState::Finished => durable(def, state, obs),
         AttemptState::Failed(failure) => {
+            if let Some(candidate) = info.handoff {
+                // After the handoff the tester phase is committed: the tree
+                // is compared with the evidence candidate's, and another
+                // tree is drift.
+                return if machine::tree_of(state, candidate) == Some(obs.live_tree.as_str()) {
+                    durable(def, state, obs)
+                } else {
+                    drift_pause(obs, &format!("attempt {}'s evidence", attempt.0))
+                };
+            }
             let reconcile = !step.read_only() && !matches!(failure, Failure::ConfigError { .. });
             if reconcile && changed {
                 reconcile_pause(def, attempt, info)
@@ -610,6 +622,29 @@ mod tests {
     fn after_handoff_with_another_tree_is_drift() {
         let (case, _) = through("test", 1, |r| matches!(r, Record::EvidenceCommand { .. }));
         // The tree before the tester's edits, or any other.
+        for tree in ["t1", "t-edit"] {
+            assert_pause(&case.recover(&obs(tree, true)), PauseReason::Drift);
+        }
+    }
+
+    #[test]
+    fn a_tests_attempt_failing_after_the_handoff_compares_with_its_candidate() {
+        let (mut case, _) = through("test", 1, |r| matches!(r, Record::EvidenceCommand { .. }));
+        let attempt = case.attempt();
+        case.push(Record::AttemptFailed {
+            attempt,
+            failure: Failure::LocalFailure {
+                detail: "snapshot failed".into(),
+            },
+        });
+        // The tester's edits are committed (K2): nothing to reconcile.
+        let state = case.state();
+        assert_eq!(
+            case.recover(&obs("t2", true)),
+            machine::next(&case.def, &state)
+        );
+        assert_pause(&case.recover(&obs("t2", true)), PauseReason::LocalFailure);
+        // Another tree after the handoff is drift, not partial tester work.
         for tree in ["t1", "t-edit"] {
             assert_pause(&case.recover(&obs(tree, true)), PauseReason::Drift);
         }

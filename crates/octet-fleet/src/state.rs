@@ -59,6 +59,9 @@ pub struct AttemptInfo {
     pub history: Vec<ArtifactId>,
     /// The latest vendor session ID it logged.
     pub vendor_session: Option<String>,
+    /// The candidate of its latest `evidence_started`: once set, the tester
+    /// phase is committed, even if the attempt later fails.
+    pub handoff: Option<CandidateId>,
     /// Where it stands.
     pub state: AttemptState,
 }
@@ -415,6 +418,7 @@ impl Replayer<'_> {
                 requires: requires.to_vec(),
                 history: history.to_vec(),
                 vendor_session: None,
+                handoff: None,
                 state: AttemptState::Unfinished {
                     released: false,
                     interrupted: false,
@@ -442,6 +446,7 @@ impl Replayer<'_> {
         self.commit(candidate)?;
         self.resume_from_pause();
         let info = self.attempt(attempt)?;
+        info.handoff = Some(candidate);
         if reopen {
             info.state = AttemptState::Unfinished {
                 released: true,
