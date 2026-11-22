@@ -162,7 +162,11 @@ fn finding_number(step_id: &str, id: &str) -> Option<u32> {
 /// `changes_requested` or `tests_failed` marks the rejector's producer in
 /// `needs_revision`, and the producer's next accepted artifact clears the
 /// mark. A new attempt or evidence phase starting ends the pause the run was
-/// in.
+/// in. An attempt that failed is never finished, except when it is the
+/// latest attempt and a `Reconcile` pause logged after its failure adopted a
+/// candidate: then a change step's `attempt_finished` naming that candidate
+/// finishes it, and a tests step's `evidence_started` on it (restart 0)
+/// re-opens it into its evidence phase.
 ///
 /// # Errors
 ///
@@ -197,6 +201,7 @@ pub fn replay(
     let mut replayer = Replayer {
         def,
         proposals: BTreeMap::from([(base.id, base.clone())]),
+        reconciling_failure: None,
         state: RunState {
             tip: base.id,
             candidates: vec![base],
@@ -234,6 +239,8 @@ struct Replayer<'a> {
     def: &'a Resolved,
     /// Every candidate record seen, committed or not.
     proposals: BTreeMap<CandidateId, CommittedCandidate>,
+    /// The failed attempt the pending `Reconcile` pause was logged for.
+    reconciling_failure: Option<AttemptId>,
     state: RunState,
 }
 
@@ -287,17 +294,7 @@ impl Replayer<'_> {
                 attempt,
                 candidate,
                 restart,
-            } => {
-                self.attempt(*attempt)?;
-                self.commit(*candidate)?;
-                self.resume_from_pause();
-                if let AttemptState::Unfinished { evidence, .. } =
-                    &mut self.attempt(*attempt)?.state
-                {
-                    *evidence = Some((*candidate, *restart));
-                }
-                Ok(())
-            }
+            } => self.evidence_started(*attempt, *candidate, *restart),
             Record::EvidenceCommand { attempt, .. } | Record::EvidenceResult { attempt, .. } => {
                 self.attempt(*attempt).map(|_| ())
             }
@@ -341,6 +338,14 @@ impl Replayer<'_> {
     fn run_level(&mut self, record: &Record) -> Result<(), String> {
         match record {
             Record::Paused { reason, .. } => {
+                self.reconciling_failure = match (reason, self.state.attempts.iter().next_back()) {
+                    (PauseReason::Reconcile, Some((id, info)))
+                        if matches!(info.state, AttemptState::Failed(_)) =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                };
                 self.state.pending_pause = Some(*reason);
                 self.state.decisions_since_pause.clear();
                 Ok(())
@@ -420,13 +425,47 @@ impl Replayer<'_> {
         Ok(())
     }
 
+    /// The tester-to-evidence handoff, or an evidence restart: commits the
+    /// candidate and ends the pause.
+    fn evidence_started(
+        &mut self,
+        attempt: AttemptId,
+        candidate: CandidateId,
+        restart: u32,
+    ) -> Result<(), String> {
+        let step = self.attempt(attempt)?.step;
+        // A failed tests attempt whose tree was adopted re-opens into its
+        // evidence phase on the adopted candidate.
+        let reopen = restart == 0
+            && matches!(self.def.steps[step].refs, Refs::Tests { .. })
+            && self.adopted_failure(attempt, candidate);
+        self.commit(candidate)?;
+        self.resume_from_pause();
+        let info = self.attempt(attempt)?;
+        if reopen {
+            info.state = AttemptState::Unfinished {
+                released: true,
+                interrupted: false,
+                evidence: None,
+            };
+        }
+        if let AttemptState::Unfinished { evidence, .. } = &mut info.state {
+            *evidence = Some((candidate, restart));
+        }
+        Ok(())
+    }
+
     fn attempt_finished(
         &mut self,
         attempt: AttemptId,
         outcome: &Accepted,
         candidate: Option<CandidateId>,
     ) -> Result<(), String> {
-        self.open_attempt(attempt)?;
+        let adopted = matches!(outcome, Accepted::ChangeProduced { .. })
+            && candidate.is_some_and(|k| self.adopted_failure(attempt, k));
+        if !adopted {
+            self.open_attempt(attempt)?;
+        }
         if let Some(candidate) = candidate {
             self.commit(candidate)?;
         }
@@ -623,7 +662,34 @@ impl Replayer<'_> {
         }
     }
 
+    /// `attempt` failed, is the latest attempt, and the pending `Reconcile`
+    /// pause logged after its failure adopted `candidate`: its tree may
+    /// become the attempt's outcome.
+    fn adopted_failure(&self, attempt: AttemptId, candidate: CandidateId) -> bool {
+        let latest = self.state.attempts.keys().next_back() == Some(&attempt);
+        let failed = self
+            .state
+            .attempts
+            .get(&attempt)
+            .is_some_and(|info| matches!(info.state, AttemptState::Failed(_)));
+        let adopted = self
+            .state
+            .decisions_since_pause
+            .iter()
+            .rev()
+            .find_map(|d| match d {
+                Decision::Adopt { candidate } => Some(*candidate),
+                _ => None,
+            });
+        latest
+            && failed
+            && self.reconciling_failure == Some(attempt)
+            && self.state.pending_pause == Some(PauseReason::Reconcile)
+            && adopted == Some(candidate)
+    }
+
     fn resume_from_pause(&mut self) {
+        self.reconciling_failure = None;
         self.state.pending_pause = None;
         self.state.decisions_since_pause.clear();
     }
@@ -1279,6 +1345,129 @@ mod tests {
         log.push(start(1, "implement"));
         let state = run(&log, &[]).unwrap();
         assert_eq!(state.pending_pause, None);
+    }
+
+    #[test]
+    fn a_failed_attempt_finishes_only_when_its_reconcile_adopted_it() {
+        let def = def();
+        let artifacts = [art(&def, 0, "implement")];
+        let failed = vec![
+            base(),
+            start(0, "implement"),
+            Record::AttemptFailed {
+                attempt: AttemptId(0),
+                failure: Failure::Transient {
+                    detail: "overloaded".into(),
+                },
+            },
+        ];
+        let reconcile = Record::Paused {
+            reason: PauseReason::Reconcile,
+            detail: String::new(),
+        };
+        let adopt = |k: u32| Record::Decision {
+            decision: Decision::Adopt {
+                candidate: CandidateId(k),
+            },
+        };
+        let finished = |k: u32| Record::AttemptFinished {
+            attempt: AttemptId(0),
+            outcome: Accepted::ChangeProduced {
+                change: ArtifactId(0),
+            },
+            candidate: Some(CandidateId(k)),
+        };
+        let log = |tail: Vec<Record>| [failed.clone(), tail].concat();
+        let refused = |tail: Vec<Record>| {
+            let error = replay(&def, &log(tail), &artifacts).unwrap_err();
+            assert!(error.reason.contains("already ended"), "{error}");
+        };
+        // No pause, a pause without adopt, another candidate adopted, or a
+        // later attempt superseding it: still refused.
+        refused(vec![proposal(1, 0, Origin::Change), finished(1)]);
+        refused(vec![
+            reconcile.clone(),
+            proposal(1, 0, Origin::Change),
+            finished(1),
+        ]);
+        refused(vec![
+            reconcile.clone(),
+            proposal(1, 0, Origin::Change),
+            proposal(2, 0, Origin::Change),
+            adopt(2),
+            finished(1),
+        ]);
+        refused(vec![
+            reconcile.clone(),
+            proposal(1, 0, Origin::Change),
+            adopt(1),
+            start(1, "implement"),
+            finished(1),
+        ]);
+        // A Reconcile after the failure, then adopt: the change is finished.
+        let state = replay(
+            &def,
+            &log(vec![
+                reconcile.clone(),
+                proposal(1, 0, Origin::Change),
+                adopt(1),
+                finished(1),
+            ]),
+            &artifacts,
+        )
+        .unwrap();
+        assert_eq!(state.attempts[&AttemptId(0)].state, AttemptState::Finished);
+        assert_eq!(state.tip, CandidateId(1));
+        assert_eq!(state.latest[idx(&def, "implement")], Some(ArtifactId(0)));
+    }
+
+    #[test]
+    fn an_adopted_failed_tests_attempt_reopens_into_evidence() {
+        let def = def();
+        let reconcile = Record::Paused {
+            reason: PauseReason::Reconcile,
+            detail: String::new(),
+        };
+        let adopt = Record::Decision {
+            decision: Decision::Adopt {
+                candidate: CandidateId(1),
+            },
+        };
+        let tests = |tail: Vec<Record>| {
+            let mut log = vec![
+                base(),
+                start(0, "test"),
+                Record::AttemptFailed {
+                    attempt: AttemptId(0),
+                    failure: Failure::Unknown { detail: "?".into() },
+                },
+            ];
+            log.extend(tail);
+            log.push(Record::EvidenceStarted {
+                attempt: AttemptId(0),
+                candidate: CandidateId(1),
+                restart: 0,
+            });
+            replay(&def, &log, &[]).unwrap().attempts[&AttemptId(0)]
+                .state
+                .clone()
+        };
+        assert_eq!(
+            tests(vec![
+                reconcile.clone(),
+                proposal(1, 0, Origin::Tests),
+                adopt
+            ]),
+            AttemptState::Unfinished {
+                released: true,
+                interrupted: false,
+                evidence: Some((CandidateId(1), 0)),
+            }
+        );
+        assert!(matches!(
+            tests(vec![reconcile, proposal(1, 0, Origin::Tests)]),
+            AttemptState::Failed(_)
+        ));
     }
 
     #[test]

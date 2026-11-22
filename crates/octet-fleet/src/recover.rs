@@ -151,10 +151,12 @@ fn decided(
             Decision::Keep,
             AttemptState::Unfinished { .. } | AttemptState::Failed(_),
         ) => Some(Next::Run(continued(def, state, info))),
+        // An unfinished attempt, or one that failed and left the tree
+        // changed: replay lets the adopting record finish (or re-open) it.
         (
             PauseReason::Reconcile,
             Decision::Adopt { candidate },
-            AttemptState::Unfinished { .. },
+            AttemptState::Unfinished { .. } | AttemptState::Failed(_),
         ) => match kind {
             Kind::Change => Some(Next::FinishAdopted {
                 attempt,
@@ -167,15 +169,6 @@ fn decided(
             }),
             Kind::Document | Kind::Verdict => None,
         },
-        (PauseReason::Reconcile, Decision::Adopt { .. }, AttemptState::Failed(_)) => {
-            Some(Next::Pause(
-                PauseReason::Reconcile,
-                format!(
-                    "attempt {} failed, so its tree cannot become its outcome; keep or stop",
-                    attempt.0
-                ),
-            ))
-        }
         (
             PauseReason::UnstableTests,
             Decision::Retry,
@@ -693,6 +686,78 @@ mod tests {
             case.pause(PauseReason::Interrupted);
             assert_eq!(case.recover(&obs), row, "{:?}", case.records.last());
         }
+    }
+
+    #[test]
+    fn adopting_a_failed_attempt_finishes_it() {
+        // A change attempt that failed with the tree changed: Reconcile,
+        // adopt, the adopted candidate becomes its change, then the tests
+        // run on it.
+        let (mut case, dispatch) = through("implement", 1, vendor);
+        let attempt = case.attempt();
+        case.push(Record::AttemptFailed {
+            attempt,
+            failure: Failure::Transient {
+                detail: "overloaded".into(),
+            },
+        });
+        let edited = obs("t-edit", true);
+        assert_pause(&case.recover(&edited), PauseReason::Reconcile);
+        case.pause(PauseReason::Reconcile);
+        let k = case.propose("t-edit", Origin::Change);
+        case.decide(Decision::Adopt { candidate: k });
+        assert_eq!(
+            case.recover(&edited),
+            Next::FinishAdopted {
+                attempt,
+                candidate: k,
+            }
+        );
+        let change = ArtifactId(u32::try_from(case.artifacts.len()).unwrap());
+        case.artifacts.push(ArtifactMeta {
+            id: change,
+            step: dispatch.step,
+            requires: dispatch.requires.clone(),
+            candidate: Some(k),
+        });
+        case.push(Record::AttemptFinished {
+            attempt,
+            outcome: Accepted::ChangeProduced { change },
+            candidate: Some(k),
+        });
+        let Next::Run(tests) = case.recover(&edited) else {
+            panic!("{:?}", case.recover(&edited));
+        };
+        assert_eq!(case.def.steps[tests.step].id, "test");
+        assert_eq!(tests.input_candidate, k);
+        assert_eq!(tests.requires, [change]);
+
+        // A tests attempt that failed with the tree changed: adopt runs the
+        // evidence on the adopted candidate, which re-opens the attempt.
+        let (mut case, _) = through("test", 1, vendor);
+        let attempt = case.attempt();
+        case.push(Record::AttemptFailed {
+            attempt,
+            failure: Failure::LocalFailure {
+                detail: "disk full".into(),
+            },
+        });
+        assert_pause(&case.recover(&edited), PauseReason::Reconcile);
+        case.pause(PauseReason::Reconcile);
+        let k = case.propose("t-edit", Origin::Tests);
+        case.decide(Decision::Adopt { candidate: k });
+        let evidence = Next::Evidence {
+            attempt,
+            candidate: k,
+            restart: 0,
+        };
+        assert_eq!(case.recover(&edited), evidence);
+        case.push(Record::EvidenceStarted {
+            attempt,
+            candidate: k,
+            restart: 0,
+        });
+        assert_eq!(case.recover(&edited), evidence);
     }
 
     #[test]

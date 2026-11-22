@@ -53,8 +53,8 @@ pub enum Next {
         /// The restart count.
         restart: u32,
     },
-    /// Finish an unfinished change attempt with the candidate a `Reconcile`
-    /// pause adopted: the runner writes the change artifact, then
+    /// Finish a change attempt (unfinished, or failed with the tree changed)
+    /// with the candidate a `Reconcile` pause adopted: the runner writes the change artifact, then
     /// `attempt_finished { change_produced, candidate }`.
     FinishAdopted {
         /// The change attempt.
