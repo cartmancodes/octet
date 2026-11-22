@@ -1,6 +1,6 @@
 # Fleet workflows: a self-improving multi-provider loop
 
-Status: revision 3 (2026-11-22). The owner approved the Rust architecture (the `octet-fleet`
+Status: revision 4 (2026-11-22). The owner approved the Rust architecture (the `octet-fleet`
 crate, a pure `machine`, independent roles and profiles, headless first, provider replies kept
 apart from the evidence Octet collects) and has twice requested changes to the execution
 contract. Both reviews and a builder check are folded in; see "Changed after review" at the end.
@@ -16,19 +16,22 @@ between stages, a `VERDICT:` line grepped out of the reply, and a manual wait-an
 Codex hit its usage limit. Nothing stopped a stage from being skipped, nothing noticed a crash
 halfway through coding, and the loop had to be babysat.
 
-The owner wants Octet to run that loop itself: **research → plan review → implement → test →
-final review, and keep improving after review, implementation, test and the final review until
-the final reviewer passes it.** Each stage can use a different provider and model. Rust, not a
-model, decides whether coding may start and whether the run may finish.
+The owner wants Octet to run that loop itself: **research ⇄ research review → plan ⇄ plan
+review → implement → test → final review, and keep improving after review, implementation, test
+and the final review until the final reviewer passes it.** Research is a stage of its own with
+its own review loop; **implementation starts only once the research and the plan are both
+approved.** Each stage can use a different provider and model. Rust, not a model, decides
+whether coding may start and whether the run may finish.
 
 ## The invariant
 
 Everything below exists to make one rule executable. The run is recorded `Completed` only when:
 
-> **The final reviewer approved candidate K with tree T, under evidence record E and plan
-> approval A; E is a complete passing record for T (every command started on T, and the tree was
-> T when each command ended); E and the approval were produced under A, which is the current
-> approval of the current plan; and the runner's last observation of the live workspace,
+> **The final reviewer approved candidate K with tree T, under evidence record E and the
+> document approvals A (the plan's, and through it the research's); E is a complete passing
+> record for T (every command started on T, and the tree was T when each command ended); E and
+> the approval were produced under A, each of which is the current approval of the current
+> document; and the runner's last observation of the live workspace,
 > taken immediately before writing `completed` and persisted in that record, equals T.**
 
 `machine` decides from the log whether the logged artifacts satisfy the first four parts; the
@@ -40,9 +43,12 @@ by asking which parts are not yet satisfied, so no path can skip it.
 - **One run, one ID.** `octet fleet run` starts a run; `octet fleet resume ID` continues it after a
   pause, a Ctrl+C, a crash or a reboot.
 - **Per-step provider, model, effort and permissions**, from a YAML workflow in the project.
-- **The loop**: a rejected plan goes back to research; failed tests go back to the coder; a
-  rejected change goes back to the coder, then tests, then a fresh final review, until the
-  invariant holds.
+- **The loops**: rejected research goes back to the researcher; a rejected plan goes back to the
+  planner; failed tests go back to the coder; a rejected change goes back to the coder, then
+  tests, then a fresh final review, until the invariant holds. Each loop has its own round cap
+  and stall checks.
+- **Implementation is gated**: a change step runs only when every document it builds on (the
+  plan, and the research the plan builds on) has a current approval.
 - **Capped and stall-aware** (owner's choice B): `max_rounds` backward jumps per edge (default 5,
   so at most six attempts of the step that rejects), and an early pause when a round makes no
   progress.
@@ -55,8 +61,10 @@ by asking which parts are not yet satisfied, so no path can skip it.
   can produce `Approved`.
 - **A durably accepted step is never repeated**, and no writer starts while another writer from
   this or an earlier run may still be alive, or on a tree with unexplained changes.
-- **Modularity visible in the YAML**: every step names the artifacts it consumes, so a second plan
-  or an architecture review is a YAML edit and a role, with no scheduler change.
+- **Modularity visible in the YAML**: every step names the artifacts it consumes, so a research
+  stage, a second plan or an architecture review is a YAML edit and a role, with no scheduler
+  change. (The research stage itself is an example: it is a `document` step and a `verdict` step,
+  nothing more.)
 
 ## Non-goals (v1)
 
@@ -127,11 +135,11 @@ The `octet` binary adds the `fleet` subcommand and a headless front end.
 ### The workflow file
 
 `<cwd>/.octet/workflows/<name>.yaml` for a bare name, or a path. Example (ships as
-`docs/fleet/five-stage.yaml`):
+`docs/fleet/research-plan-build.yaml`):
 
 ```yaml
 version: 1
-name: five-stage
+name: research-plan-build
 limits:
   max_rounds: 5            # backward jumps per edge
   transient_retries: 3
@@ -142,23 +150,33 @@ profiles:
   opencode-test:   { engine: opencode, mode: accept-edits }
   claude-review:   { engine: claude, model: claude-opus-5-5 }
 roles:
-  researcher: { kind: plan,    instructions: "Investigate the code and write a plan …" }
-  reviewer:   { kind: verdict, instructions: "Review against the task …" }
-  coder:      { kind: change,  instructions: "Implement the approved plan …" }
-  tester:     { kind: tests,   instructions: "Write or select tests for the change …" }
+  researcher: { kind: document, instructions: "Investigate the code: what exists, what the task touches, risks …" }
+  planner:    { kind: document, instructions: "Write an implementation plan from the approved research …" }
+  reviewer:   { kind: verdict,  instructions: "Review against the task …" }
+  coder:      { kind: change,   instructions: "Implement the approved plan …" }
+  tester:     { kind: tests,    instructions: "Write or select tests for the change …" }
 steps:
   - id: research
     role: researcher
     profile: claude-research
-  - id: review_plan
+  - id: review_research
     role: reviewer
     profile: codex-review
     reviews: research          # rejection goes back to research (the producer)
+  - id: plan
+    role: planner
+    profile: claude-research
+    inputs:
+      - { from: research, approval_from: review_research }
+  - id: review_plan
+    role: reviewer
+    profile: codex-review
+    reviews: plan              # rejection goes back to plan
   - id: implement
     role: coder
     profile: codex-code
-    plan_from: research
-    approval_from: review_plan
+    inputs:
+      - { from: plan, approval_from: review_plan }
   - id: test
     role: tester
     profile: opencode-test
@@ -178,18 +196,25 @@ A **role**: `kind` and `instructions`. A **step**: `id`, `role`, `profile`, and 
 
 | Kind | References (required) | Produces | Accepted outcomes |
 |---|---|---|---|
-| `plan` | — | plan `P` (reply text) | `Produced` |
-| `verdict` on a plan | `reviews: <plan step>` | plan approval `A(P)` | `Approved`, `ChangesRequested` |
-| `change` | `plan_from`, `approval_from` | change `C`, a new candidate | `Produced` |
+| `document` | optional `inputs` | document `D` (reply text): research, a plan, … | `Produced` |
+| `verdict` on a document | `reviews: <document step>` | document approval `A(D)` | `Approved`, `ChangesRequested` |
+| `change` | `inputs` (at least one) | change `C`, a new candidate | `Produced` |
 | `tests` | `change_from` | a derived candidate (tester edits), then evidence `E` | `TestsPassed`, `TestsFailed` |
 | `verdict` on a change | `reviews: <change step>`, `evidence_from: <tests step>` | change approval `R(K, E)` | `Approved`, `ChangesRequested` |
 
-Plus `session` (`fresh` default for verdict and plan steps, `continue` for change and tests),
-and `commands` and `timeout` (tests). Read-only is not a setting: plan and verdict steps are
+**`inputs`** lists the documents a step builds on, each as `{from: <document step>,
+approval_from: <verdict step>}`. **A document can only be consumed through its approval**: there
+is no way to name a document without the verdict step that approves it, so nothing downstream of
+research can start before research is approved. The plan's own input is the approved research,
+and the coder's input is the approved plan, so the coder transitively requires both.
+
+Plus `session` (`fresh` default for verdict and document steps, `continue` for change and tests),
+and `commands` and `timeout` (tests). Read-only is not a setting: document and verdict steps are
 always read-only, change and tests steps always write.
 
 **Edges go to the producer.** In v1 a negative outcome always routes to the step that produced
-the rejected artifact: a plan review's rejection to its `reviews` step, a change review's to its
+the rejected artifact: a document review's rejection to its `reviews` step (research review →
+research, plan review → plan), a change review's to its
 `reviews` step, a test failure to its `change_from` step. The YAML may spell the edge
 (`on_changes_requested`, `on_tests_failed`) for readability; if it does, it must name that
 producer. So every negative outcome has a route, and no edge can target a step that cannot revise
@@ -203,11 +228,14 @@ A run refuses to start unless:
 - `version` is 1; step IDs are unique; every role, profile and reference resolves to a step of
   the right kind that comes **earlier**; any spelled edge names the producer; every engine parses,
   its binary resolves, `effort` passes the engine's check, `mode` parses.
-- **The plan gate**: every change step's `approval_from` is a verdict step whose `reviews` is that
-  change step's `plan_from`. A change step cannot run until that approval is current.
+- **The approval gate**: every `inputs` entry names a document step and an `approval_from` verdict
+  step whose `reviews` is that same document step; every change step has at least one input. A
+  step cannot run until every approval it requires, directly or through its inputs' inputs, is
+  current, so the coder waits for both the research and the plan approval.
 - **The completion gate**: the last step is a verdict reviewing a change step, with
   `evidence_from` a tests step whose `change_from` is that same change step.
-- Plan and verdict profiles have mode `ask` (or none); anything else is rejected, not overridden.
+- Document and verdict profiles have mode `ask` (or none); anything else is rejected, not
+  overridden.
 - `commands` is non-empty for tests steps.
 - The workspace is in a git work tree that is not a sparse checkout (see "Snapshots").
 - **Ownership is resolved**: no live process holds the work tree, and no earlier run left an
@@ -248,11 +276,16 @@ earlier findings, the previous artifact being revised). History never affects cu
 
 | Artifact | Requires | History |
 |---|---|---|
-| plan `P` | — | the rejection and findings that prompted a revision |
-| plan approval `A(P)` | `P` | earlier findings of this review step |
-| change `C` (candidate K) | `A(P)` | the feedback that prompted it |
-| evidence `E(K)` | `A(P)`; K is the tip | — |
-| change approval `R(K, E)` | `A(P)`, `E(K)`; K is the tip | earlier findings of this review step |
+| document `D` (research `D_r`, plan `D_p`) | the approvals of its `inputs` (the plan: `A(D_r)`) | the rejection and findings that prompted a revision |
+| document approval `A(D)` | `D` | earlier findings of this review step |
+| change `C` (candidate K) | the approvals of its `inputs` (`A(D_p)`, hence `A(D_r)`) | the feedback that prompted it |
+| evidence `E(K)` | what `C` requires; K is the tip | — |
+| change approval `R(K, E)` | what `C` requires, `E(K)`; K is the tip | earlier findings of this review step |
+
+Requirements are transitive through currency: `A(D_p)` requires `D_p`, which requires `A(D_r)`,
+which requires `D_r`. A new research document would make everything built on it stale, plan
+included. (In v1 no edge can send the run back to research once the plan exists, since edges go
+to the producer; the rule matters for workflows with more stages.)
 
 An artifact is **current** when it is the latest of its step, everything it requires is current,
 and any "K is the tip" condition holds. A **rejection** (a `ChangesRequested` or `TestsFailed`)
@@ -271,12 +304,16 @@ the mark is cleared, because the rejected artifact is no longer the latest of it
 
 Worked traces (each a unit test):
 
-- `research(P1) → review_plan rejects P1 → research(P2)`: P1 needs revision → research runs with
-  the rejection as history → P2 is accepted and is now the latest plan, P1's mark clears, P2
-  requires nothing → `A(P2)` is missing → next is exactly `review_plan(P2)`.
+- `research(D1) → review_research rejects D1 → research(D2)`: D1 needs revision → research runs
+  with the rejection as history → D2 is accepted and is now the latest research, D1's mark clears,
+  D2 requires nothing → `A(D2)` is missing → next is exactly `review_research(D2)`.
+- `research(D2) approved → plan`: before `A(D2)` exists, `plan` and `implement` are never next;
+  after it, next is exactly `plan`, given `D2` under `A(D2)`.
+- `plan(P1) → review_plan rejects P1 → plan(P2)`: as for research; next is exactly
+  `review_plan(P2)`, and `A(D2)` stays current throughout (the plan loop never re-runs research).
 - `implement(C1 = K1) → tester edits (K2, parent K1) → evidence(K2) passes → review approves
-  R(K2, E(K2))`: C1 stays current (its requirement `A(P)` is current); E and R bind to K2 = tip →
-  ready to complete; **implement ran once**.
+  R(K2, E(K2))`: C1 stays current (its requirements `A(P)` and `A(D)` are current); E and R bind
+  to K2 = tip → ready to complete; **implement ran once**.
 - `… → evidence(K2) fails`: K2's change needs revision → implement runs with the failure as
   history, from the live tree (K2, tester files included) → K3 → tests → …
 - `… → review_change rejects R(K2)`: C needs revision → implement → K3 → E(K2) and R are no longer
@@ -329,11 +366,17 @@ and tree:
 
 | Step | Receives |
 |---|---|
-| plan | task; history (the rejection and findings) |
-| verdict on a plan | task; plan `P`; its own open findings |
-| change | task; plan `P` under `A(P)`; history (findings, or failing evidence) |
-| tests | task; plan; the patch base..tip |
-| verdict on a change | task; plan; the patch base..K; evidence `E(K)`; its own open findings |
+| document (research) | task; history (the rejection and findings) |
+| verdict on research | task; research `D_r`; its own open findings |
+| document (plan) | task; approved research `D_r`; history |
+| verdict on a plan | task; approved research; plan `D_p`; its own open findings |
+| change | task; approved plan (and the approved research it builds on); history (findings, or failing evidence) |
+| tests | task; approved plan; the patch base..tip |
+| verdict on a change | task; approved plan; the patch base..K; evidence `E(K)`; its own open findings |
+
+In general a step receives its own `inputs` in full and, for documents further up the chain,
+their approved text too *(builder's call: whether to cut upstream documents to a summary when the
+prompt budget is tight; the step's direct inputs are never cut)*.
 
 The patch is `git diff --binary <base> <K>`: everything this run changed, including tester files.
 Over the prompt budget, the prompt carries the `--stat`, and the full patch is a file **inside the
@@ -345,7 +388,7 @@ under `<run>/attempts/<id>/` and can also run `git diff` themselves.
 
 v1 promises **isolation of the user's workspace, plus detection**, not OS-level write prevention:
 
-- Every plan and verdict attempt runs in a **scratch clone**: `git clone --shared --no-checkout` of
+- Every document and verdict attempt runs in a **scratch clone**: `git clone --shared --no-checkout` of
   the repo into `<run>/attempts/<id>/tree`, then a detached checkout of the candidate's commit, with
   the vendor's cwd at the same relative path as `--cwd`. The reviewer sees exactly K, and an edit,
   an index change or a ref change lands in the clone, not in the user's checkout or refs.
@@ -561,9 +604,11 @@ reviewed patch contains the tester's file, the approval names the exact evidence
 every durable prefix of the log gives the same next action as the uninterrupted run. The other
 worked traces in "Artifacts, candidates and the machine" are milestone-1 tests too.
 
-- **Unit (pure):** validation (plan and completion gates, producer-only edges, wrong-kind
-  references); the machine: requires vs history, the `P1 → rejection → P2 → review_plan(P2)`
-  trace, derived candidates, staleness, rounds, every stall rule, every pause's decision and next
+- **Unit (pure):** validation (the approval gate, including a change step whose input names a
+  document without its approval step, and a plan whose input skips the research approval; the
+  completion gate; producer-only edges; wrong-kind references); the machine: requires vs history,
+  the `D1 → rejection → D2 → review_research(D2)` and `P1 → rejection → P2 → review_plan(P2)`
+  traces, implement never next before both approvals, derived candidates, staleness, rounds, every stall rule, every pause's decision and next
   action, the invariant; verdict validation order and precedence; torn-tail repair.
 - **Snapshots** against real `git init` repos: tracked-but-ignored files kept, staged additions
   kept, an `assume-unchanged` file edited `v1 → v2` captured as `v2`, a sparse checkout refused,
@@ -576,7 +621,9 @@ worked traces in "Artifacts, candidates and the machine" are milestone-1 tests t
   codex and claude dialects.
 - **Release tests** (process tests, `crates/octet/tests/fleet.rs`; fake Claude researching and
   reviewing, fake Codex coding and testing):
-  1. **The five-stage run**: plan approved → implement → the tester holds, Octet is SIGKILLed once
+  1. **The full run**: review_research rejects the first research → research revises → approved
+     → plan → review_plan approves → implement (its prompt carries the approved plan and the
+     approved second research, never the rejected first) → the tester holds, Octet is SIGKILLed once
      `attempt_started test` is durable → resume re-runs the tester, **the coder ran once** → a
      command fails, **the run cannot complete** → implement round 2 (resumed session) → tests pass
      → review_change requests changes → implement → test → a **fresh** review approves; its
@@ -615,6 +662,14 @@ scratch clones (they are new paths, so their `.agents` configuration does not lo
 accepts that).
 
 ## Changed after review
+
+From the owner's request after revision 3 (revision 4):
+
+- **A research stage with its own review loop** before planning: research ⇄ review_research →
+  plan ⇄ review_plan → implement → test → review_change. The `plan` kind became `document`, used
+  by both the researcher and the planner; steps name their documents through `inputs`, each with
+  the verdict step that approves it, so a document can only be consumed once approved and the
+  coder transitively requires both approvals. No new scheduler concept was needed.
 
 From the owner's second review (revision 3):
 
