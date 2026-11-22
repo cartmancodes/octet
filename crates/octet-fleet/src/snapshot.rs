@@ -91,7 +91,7 @@ pub struct Repo {
 
 /// The one place a git [`Command`] is built: runs in `dir`, with the fixed
 /// config and without the inherited `GIT_*` variables.
-fn command<I, S>(dir: &Path, args: I) -> Command
+pub(crate) fn command<I, S>(dir: &Path, args: I) -> Command
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -119,7 +119,7 @@ where
 }
 
 /// Runs `cmd` to completion, feeding it `input`; its standard output.
-async fn exec(mut cmd: Command, input: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+pub(crate) async fn exec(mut cmd: Command, input: &[u8]) -> Result<Vec<u8>, SnapshotError> {
     cmd.stdin(if input.is_empty() {
         Stdio::null()
     } else {
