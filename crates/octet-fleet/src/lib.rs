@@ -7,6 +7,7 @@ pub mod definition;
 pub mod machine;
 pub mod record;
 pub mod recover;
+pub mod snapshot;
 pub mod state;
 pub mod validate;
 
