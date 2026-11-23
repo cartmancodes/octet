@@ -302,7 +302,8 @@ fn wait_for(path: &Path) {
 /// `resumed` whether this session resumed an earlier one.
 ///
 /// The turn is logged (one JSON line in the script's `log`: `key`, `cwd`,
-/// `resumed` and the whole `prompt`), its files changed and its survivor
+/// `resumed`, the whole `prompt`, and `at_ms`, when it began in milliseconds
+/// since the Unix epoch), its files changed and its survivor
 /// started, as the module's hold modes say. A key the script lacks is
 /// logged with `"missing": true` and answered `fleet-fake: no turn <key>`.
 /// What the dialect still has to do is in the [`FleetTurn`].
@@ -312,7 +313,12 @@ pub(crate) fn turn(prompt: &str, cwd: &Path, resumed: bool) -> Option<FleetTurn>
     let key = key(prompt)?;
     let played = plays(&script.log, &key);
     let turn = script.turns.get(&key).and_then(|turns| turns.play(played));
-    let mut entry = json!({"key": key, "cwd": cwd, "resumed": resumed, "prompt": prompt});
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    let mut entry = json!({
+        "key": key, "cwd": cwd, "resumed": resumed, "prompt": prompt, "at_ms": at_ms,
+    });
     if turn.is_none() {
         entry["missing"] = json!(true);
     }

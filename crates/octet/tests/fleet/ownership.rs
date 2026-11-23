@@ -177,10 +177,17 @@ fn a_child_that_outlives_its_leader_is_found_and_only_it_is_killed() {
     assert!(exited(marked), "the marked child outlived the kill");
     assert!(alive(unmarked), "the unmarked child was signalled");
     assert_eq!(last_pause(&records), PauseReason::ProcessesUnverified);
+    // Listed with its command, and alone.
+    let detail = pause_detail(&records);
+    assert!(detail.contains(&format!("[{unmarked}]")), "{detail}");
     assert!(
-        pause_detail(&records).ends_with(&format!("[{unmarked}]")),
-        "{records:#?}"
+        detail.contains(&format!(
+            "{unmarked}: {} fleet-survivor",
+            octet_testkit::protocol_child().display()
+        )),
+        "{detail}"
     );
+    assert!(!detail.contains(&format!("{marked}:")), "{detail}");
 
     // `stop` is refused until it is released.
     let refused = bench.stop_run(&run).finish();
@@ -328,7 +335,18 @@ fn an_older_run_waits_while_a_newer_runs_child_lives() {
     assert!(other.stderr.contains(&y), "{}", other.stderr);
     assert_eq!(bench.run_ids().len(), 2);
     // `stop Y` is refused while it is alive.
-    bench.stop_run(&y).finish().expect_code(3);
+    let refused = bench.stop_run(&y).finish();
+    refused.expect_code(3);
+    assert!(
+        refused.stderr.contains("still running"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains(&child.to_string()),
+        "{}",
+        refused.stderr
+    );
     assert!(
         !bench
             .records_of(&y)

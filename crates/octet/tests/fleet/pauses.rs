@@ -191,3 +191,81 @@ fn unstable_tests_retried_run_afresh_on_the_tip() {
     assert_eq!(bench.plays_of("test#1").len(), 1);
     bench.assert_passing_evidence_is_whole(&records, 1);
 }
+
+/// From the spec's "Plus" list: a transient retry that survives a restart
+/// and waits out its backoff. The researcher hits a usage limit; Octet is
+/// killed while it waits; the resumed run waits until the logged time
+/// before the retry starts. It takes over a minute: the first backoff is
+/// 60 s (spec, "Failures": 1, 5, then 15 minutes), and no setting shortens
+/// it.
+#[test]
+fn a_transient_retry_survives_a_restart_and_waits_out_its_backoff() {
+    let bench = Bench::new("octet-fleet-transient");
+    let workflow = bench.workflow(&small(&["test -f feature.txt"], 1));
+    let mut turns = small_turns();
+    turns["research#1"] = json!([
+        {"fail": true},
+        {"reply": "The repository holds a README and fixture.txt."},
+    ]);
+    bench.script(&turns);
+    let mut octet = bench.run(&workflow, &[]);
+    let records = bench.await_record(&mut octet, "the retry", |record| {
+        matches!(record, Record::Retry { .. })
+    });
+    let first = last_attempt_of(&records, "research").unwrap();
+    let eligible = records
+        .iter()
+        .find_map(|record| match record {
+            Record::Retry {
+                attempt,
+                count: 1,
+                eligible_at,
+                ..
+            } if *attempt == first => Some(*eligible_at),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            Record::AttemptFailed {
+                attempt,
+                failure: Failure::Transient { eligible_at: Some(at), .. },
+            } if *attempt == first && *at == eligible
+        )),
+        "{records:#?}"
+    );
+    // Killed while it waits, well before the retry is due.
+    assert!(now_ms() < u128::from(eligible) * 1000);
+    octet.sigkill();
+    assert_eq!(attempts(&bench.records(), "research"), 1);
+
+    let resumed = bench.resume(None, &[]).finish();
+    resumed.expect_code(0);
+    // The resumed run said it was waiting for the logged time.
+    let waiting = format!(
+        "{{\"at\":{eligible},\"attempt\":{},\"type\":\"retrying\"}}",
+        first.0
+    );
+    assert!(resumed.stdout.contains(&waiting), "{}", resumed.stdout);
+    let records = bench.records();
+    assert!(matches!(records.last(), Some(Record::Completed { .. })));
+    assert_eq!(attempts(&records, "research"), 2);
+    // The retry is a new attempt, and it began no earlier than the logged
+    // time.
+    let plays = bench.plays_of("research#1");
+    assert_eq!(plays.len(), 2);
+    let began = u128::from(plays[1]["at_ms"].as_u64().unwrap());
+    assert!(
+        began >= u128::from(eligible) * 1000,
+        "the retry began at {began} ms, before {eligible} s"
+    );
+}
+
+/// The time now, in milliseconds since the Unix epoch.
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}

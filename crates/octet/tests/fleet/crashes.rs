@@ -178,13 +178,7 @@ fn crash_before_registration(name: &str, point: &str) {
     // run's leftover process and starts nothing.
     bench.resume(None, &[]).finish().expect_code(2);
     let after = bench.records();
-    assert!(
-        matches!(
-            last_pause(&after),
-            PauseReason::ProcessesRunning | PauseReason::ProcessesUnverified
-        ),
-        "{after:#?}"
-    );
+    assert_eq!(last_pause(&after), held_gate_pause(point), "{after:#?}");
     assert_eq!(started(&after), started(&records));
     // Nor does a new run: the work tree is still this run's.
     let other = bench.run(&workflow, &[]).finish();
@@ -219,6 +213,19 @@ fn crash_before_registration(name: &str, point: &str) {
         ran.iter().any(|pid| bench.started_pids().contains(pid)),
         "{ran:?}"
     );
+}
+
+/// The pause `resume` makes for a gate held at `point`. Past `session` the
+/// gate's identity is registered: verified. Before it, the gate is verified
+/// only through what it shows: on Linux its held `sleep` carries the marker
+/// it exported; on macOS `ps` shows no environment for `sh`, so nothing in
+/// its registered group is verified.
+fn held_gate_pause(point: &str) -> PauseReason {
+    if point == "go" || cfg!(target_os = "linux") {
+        PauseReason::ProcessesRunning
+    } else {
+        PauseReason::ProcessesUnverified
+    }
 }
 
 /// The spec's release test 5, killed before `attempt_session` is durable.
@@ -491,6 +498,54 @@ fn killed_after_the_handoff(name: &str, edited: bool) {
     };
     assert_eq!(*candidate, committed);
     bench.assert_passing_evidence_is_whole(&records, 1);
+}
+
+/// The spec's release test 9, killed immediately before `evidence_started`
+/// is durable, with the tester's edit already proposed: Octet is held at the
+/// handoff's test pause, the `candidate{origin: tests}` record its last. A
+/// candidate record is only a proposal: recovery sees a tester whose edit
+/// nothing committed.
+#[test]
+fn a_crash_with_the_testers_candidate_only_proposed_reconciles() {
+    let (bench, workflow) = handoff_bench("octet-fleet-handoff-proposed", true);
+    let pauses = bench.side("pauses");
+    std::fs::create_dir_all(&pauses).unwrap();
+    let mut octet = bench.run(&workflow, &pause_env(&pauses));
+    pause_at(&mut octet, &pauses, |held| held.starts_with("handoff-"));
+    octet.sigkill();
+    let records = bench.records();
+    let tester = last_attempt_of(&records, "test").unwrap();
+    assert!(
+        matches!(
+            records.last(),
+            Some(Record::Candidate {
+                origin: Origin::Tests,
+                ..
+            })
+        ),
+        "{records:#?}"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| matches!(record, Record::EvidenceStarted { .. })),
+        "{records:#?}"
+    );
+    await_gone(&bench, tester);
+
+    // "Tests attempt, no evidence_started, tree changed": Reconcile, and no
+    // attempt starts.
+    bench.resume(None, &[]).finish().expect_code(2);
+    let after = bench.records();
+    assert_eq!(last_pause(&after), PauseReason::Reconcile);
+    assert_eq!(started(&after), started(&records));
+    assert_eq!(bench.plays_of("test#1").len(), 1);
+    assert!(
+        !after
+            .iter()
+            .any(|record| matches!(record, Record::EvidenceStarted { .. })),
+        "{after:#?}"
+    );
 }
 
 /// Release test 9: before the handoff, with a tester that edited the tree.
