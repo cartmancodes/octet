@@ -748,19 +748,20 @@ impl Driver {
         self.own(attempt).await
     }
 
-    /// Whether no process of `attempt` is alive: none carries its marker,
-    /// matches an identity registered for it, or is in a registered group.
+    /// Whether no process of `attempt` is alive, as [`nothing_left`] says.
     /// An unreadable registry is not known to be empty.
     async fn gone(&self, records: &[Record], attempt: AttemptId) -> Result<bool, RunnerError> {
         let Ok(registry) = gate::read_processes(&self.attempt_dir(attempt)).await else {
             return Ok(false);
         };
-        let identities = identities_of(records, attempt);
-        let mut groups: Vec<u32> = identities.iter().map(|identity| identity.pid).collect();
-        groups.extend(registry);
         let processes = ownership::list_processes().await?;
-        let check = ownership::check(&processes, &self.marker(attempt), &identities, &groups, &[]);
-        Ok(check == ProcessCheck::Clear)
+        Ok(nothing_left(
+            records,
+            attempt,
+            &registry,
+            &processes,
+            &self.marker(attempt),
+        ))
     }
 
     /// Removes this run from the work tree's ownership record.
@@ -821,6 +822,34 @@ fn logs_pause(pending: Option<PauseReason>, reason: PauseReason) -> bool {
     }
 }
 
+/// Whether none of `processes` is `attempt`'s: none carries its `marker`,
+/// matches an identity the log registered for it, or is in a registered
+/// group (those identities' and the gate `registry`'s), leaving out every
+/// PID the log released: released processes are ignored from then on (spec,
+/// "Leftover processes").
+fn nothing_left(
+    records: &[Record],
+    attempt: AttemptId,
+    registry: &[u32],
+    processes: &[ownership::ProcessInfo],
+    marker: &str,
+) -> bool {
+    let identities = identities_of(records, attempt);
+    let mut groups: Vec<u32> = identities.iter().map(|identity| identity.pid).collect();
+    groups.extend_from_slice(registry);
+    let released: Vec<u32> = records
+        .iter()
+        .filter_map(|record| match record {
+            Record::Decision {
+                decision: Decision::Release { pids },
+            } => Some(pids.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    ownership::check(processes, marker, &identities, &groups, &released) == ProcessCheck::Clear
+}
+
 /// The detail of the latest `paused` record.
 fn last_pause_detail(records: &[Record]) -> Option<String> {
     records.iter().rev().find_map(|record| match record {
@@ -832,6 +861,45 @@ fn last_pause_detail(records: &[Record]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::ownership::ProcessInfo;
+    use crate::record::Identity;
+
+    fn process(pid: u32, pgid: u32) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid: 1,
+            pgid,
+            start: "Mon Jan  1 00:00:00 2026".into(),
+            marker: None,
+            command: "a stranger".into(),
+        }
+    }
+
+    #[test]
+    fn a_released_process_leaves_nothing_unresolved() {
+        let attempt = AttemptId(3);
+        let session = Record::AttemptSession {
+            attempt,
+            journal: PathBuf::from("journal"),
+            identities: vec![Identity {
+                pid: 100,
+                start: "gone".into(),
+            }],
+        };
+        // A process in the attempt's registered group, unverified.
+        let processes = [process(101, 100)];
+        let mut records = vec![session];
+        assert!(!nothing_left(&records, attempt, &[], &processes, "r/3"));
+        // Released, it is ignored from then on.
+        records.push(Record::Decision {
+            decision: Decision::Release { pids: vec![101] },
+        });
+        assert!(nothing_left(&records, attempt, &[], &processes, "r/3"));
+        // A member of a registry group counts as well.
+        let processes = [process(201, 200)];
+        assert!(!nothing_left(&records, attempt, &[200], &processes, "r/3"));
+    }
 
     #[test]
     fn a_processes_pause_replaces_a_pause_the_observation_answers() {
