@@ -71,6 +71,11 @@ pub struct AttemptPlan<'a> {
     pub interrupt: Option<Signals>,
     /// The one follow-up a reply may get, in the same session.
     pub follow_up: Option<FollowUp<'a>>,
+    /// Tests only: with the gate registered, create
+    /// `held-session-<attempt>` here and wait for `continue-session-<attempt>`
+    /// before `attempt_session` is appended; then `held-go-<attempt>` and
+    /// `continue-go-<attempt>` before the gate is released.
+    pub pause_hook: Option<PathBuf>,
 }
 
 /// A prompt sent once, in the same session, after a reply that `accept`
@@ -179,12 +184,18 @@ async fn attend(
         Err(Unregistered::Failed(detail)) => return Ok(local(detail)),
         Err(Unregistered::Interrupted) => return Ok(TurnEnd::Interrupted),
     };
+    if let Err(detail) = test_pause(plan, "session").await {
+        return Ok(local(detail));
+    }
     let record = Record::AttemptSession {
         attempt: plan.attempt,
         journal: session.journal().to_path_buf(),
         identities,
     };
     log.append(&record).await?;
+    if let Err(detail) = test_pause(plan, "go").await {
+        return Ok(local(detail));
+    }
     // Only now may the vendor run.
     if let Err(error) = gate::release(&plan.attempt_dir).await {
         return Ok(local(format!("Cannot release the vendor: {error}")));
@@ -192,6 +203,17 @@ async fn attend(
     Turn::new(plan, early)
         .drive(session, log, approver, events)
         .await
+}
+
+/// The plan's test pause `<what>-<attempt>`, if it has a pause hook. An
+/// error is a local failure, as text.
+async fn test_pause(plan: &AttemptPlan<'_>, what: &str) -> Result<(), String> {
+    let Some(dir) = &plan.pause_hook else {
+        return Ok(());
+    };
+    crate::evidence::test_pause(dir, &format!("{what}-{}", plan.attempt.0))
+        .await
+        .map_err(|error| format!("The test pause failed: {error}"))
 }
 
 fn local(detail: String) -> TurnEnd {
@@ -731,6 +753,7 @@ mod tests {
             data_dir: temp.path().to_path_buf(),
             interrupt: None,
             follow_up: None,
+            pause_hook: None,
         };
         // Two requests wait; the engine closes both at once, the second
         // first, while the first is being asked.
@@ -826,6 +849,7 @@ mod tests {
             data_dir: temp.path().to_path_buf(),
             interrupt,
             follow_up,
+            pause_hook: None,
         };
         let mut session = Script {
             events: events.into(),

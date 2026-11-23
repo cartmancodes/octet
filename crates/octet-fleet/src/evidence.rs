@@ -43,8 +43,10 @@ const TAIL_BYTES: usize = 16 * 1024;
 /// The held command: waits for the go line, then becomes the real command.
 const HELD: &str = r#"read _ || exit 125; exec sh -c "$1""#;
 
-/// Tests only: the variable naming the directory of the pause after each held
-/// spawn ([`EvidenceRun::pause_hook`]). The runner reads it.
+/// Tests only: the variable naming the directory of the test pauses: after
+/// each held spawn ([`EvidenceRun::pause_hook`]), and around a vendor's
+/// registration ([`crate::step::AttemptPlan::pause_hook`]). The runner reads
+/// it.
 pub const TEST_PAUSE_ENV: &str = "OCTET_FLEET_TEST_PAUSE_DIR";
 
 /// The pause hook that `value`, the [`TEST_PAUSE_ENV`] variable, names: none
@@ -316,7 +318,7 @@ impl Pass<'_> {
         };
         let mut stdin = leader.child().stdin.take();
         if let Some(dir) = self.pause_hook {
-            pause(dir, self.restart, index).await?;
+            test_pause(dir, &format!("{}-{index}", self.restart)).await?;
         }
         let pre_tree = take(self.repo, &self.scratch_index).await?;
         if pre_tree != self.tree {
@@ -420,11 +422,11 @@ impl Pass<'_> {
     }
 }
 
-/// The test pause: announces that command `index` is held and waits to be told
-/// to go on.
-async fn pause(dir: &Path, restart: u32, index: usize) -> std::io::Result<()> {
-    tokio::fs::write(dir.join(format!("held-{restart}-{index}")), b"").await?;
-    let go = dir.join(format!("continue-{restart}-{index}"));
+/// A test pause in `dir`: announces `held-<point>` and waits to be told to go
+/// on (`continue-<point>`).
+pub(crate) async fn test_pause(dir: &Path, point: &str) -> std::io::Result<()> {
+    tokio::fs::write(dir.join(format!("held-{point}")), b"").await?;
+    let go = dir.join(format!("continue-{point}"));
     while !tokio::fs::try_exists(&go).await? {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

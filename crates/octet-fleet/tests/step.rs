@@ -123,6 +123,7 @@ impl Bench {
             data_dir: self.dir.path().join("data"),
             interrupt: None,
             follow_up: None,
+            pause_hook: None,
         }
     }
 
@@ -322,6 +323,61 @@ async fn the_vendor_does_not_run_before_registration() {
         registered_first.load(Ordering::SeqCst),
         "the vendor ran before its session was in the log"
     );
+}
+
+/// Waits, at most a minute, for `path` to exist.
+async fn await_file(path: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !path.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_test_pauses_hold_the_registration_and_the_release() {
+    let (bench, mut log) = Bench::new(&json!({"work#1": {"reply": "ok"}})).await;
+    let pauses = bench.dir.path().join("pauses");
+    std::fs::create_dir_all(&pauses).unwrap();
+    let step = bench.step("codex", Kind::Document);
+    let dispatch = dispatch();
+    let (mut approve, _) = approver(true);
+    let plan = AttemptPlan {
+        pause_hook: Some(pauses.clone()),
+        ..bench.plan(&step, &dispatch, &fleet_prompt())
+    };
+    let log_file = bench.run.root.join("log.jsonl");
+    let go = bench.attempt_dir().join("go");
+    let marker = bench.marker();
+    let registered = || {
+        read_records(&log_file)
+            .iter()
+            .any(|record| matches!(record, Record::AttemptSession { .. }))
+    };
+    let checks = async {
+        // Held before the session is logged: the gate is registered, nothing
+        // is in the log, and the vendor has not run.
+        await_file(&pauses.join("held-session-0")).await;
+        let pids = octet_fleet::gate::read_processes(&bench.attempt_dir())
+            .await
+            .unwrap();
+        assert!(!pids.is_empty());
+        assert!(!registered());
+        assert!(!go.exists() && !marker.exists());
+        std::fs::write(pauses.join("continue-session-0"), "").unwrap();
+        // Held after it, before the release: logged, still not run.
+        await_file(&pauses.join("held-go-0")).await;
+        assert!(registered());
+        assert!(!go.exists() && !marker.exists());
+        std::fs::write(pauses.join("continue-go-0"), "").unwrap();
+    };
+    let ((end, _), ()) = tokio::join!(attempt(plan, &mut log, &mut approve), checks);
+    assert_eq!(replied(end), "ok");
+    assert!(go.exists() && marker.exists());
 }
 
 #[tokio::test]

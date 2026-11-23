@@ -154,6 +154,9 @@ impl Driver {
             data_dir: self.data_dir.clone(),
             interrupt: Some(self.io.signals.clone()),
             follow_up,
+            pause_hook: crate::evidence::pause_hook_from(std::env::var_os(
+                crate::evidence::TEST_PAUSE_ENV,
+            )),
         };
         let end = step::run_attempt(
             plan,
