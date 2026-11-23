@@ -389,7 +389,9 @@ pub async fn diff(repo: &Repo, from: &str, to: &str, stat: bool) -> Result<Strin
 /// path as the repository's `cwd_rel`.
 ///
 /// The clone shares the repository's objects, so `commit` (kept under a ref
-/// there) arrives with it; refs are not cloned, and the user's hooks do not run.
+/// there) arrives with it; refs are not cloned, the clone has no remote (a
+/// push from it cannot reach the user's refs), and the user's hooks do not
+/// run.
 ///
 /// # Errors
 ///
@@ -409,6 +411,9 @@ pub async fn scratch_clone(
     );
     clone.arg(&repo.top).arg(&target);
     exec(clone, &[]).await?;
+    // No remote: a vendor's `git push` from the clone must not reach the
+    // user's refs (the objects come through the alternates anyway).
+    git(&target, no_hooks.into_iter().chain(["remote", "remove", "origin"])).await?;
     let checkout = ["checkout", "--quiet", "--detach", commit, "--"];
     git(&target, no_hooks.into_iter().chain(checkout)).await?;
     let mut cwd = into.to_path_buf();
@@ -767,6 +772,44 @@ mod tests {
         keep(&repo, "run", 1, &tree)
             .await
             .expect("kept without signing or identity");
+    }
+
+    #[tokio::test]
+    async fn a_push_from_a_scratch_clone_cannot_reach_the_users_refs() {
+        let dir = init();
+        write(dir.path(), "a.txt", "a\n");
+        commit_all(dir.path());
+        let branch = sh(dir.path(), &["symbolic-ref", "--short", "HEAD"]);
+        let head = sh(dir.path(), &["rev-parse", "HEAD"]);
+        let scratch = TempDir::new("octet-fleet-scratch");
+        let (repo, tree) = snap(&dir, &scratch).await;
+        let commit = keep(&repo, "run", 1, &tree).await.expect("kept");
+        let into = TempDir::new("octet-fleet-clone");
+        let cwd = scratch_clone(&repo, &commit, &into.path().join("tree"))
+            .await
+            .expect("clones");
+        assert_eq!(sh(&cwd, &["remote"]), "", "the clone names no remote");
+        // A vendor commits in the clone and pushes, as an allowlisted
+        // `git push` would.
+        write(&cwd, "a.txt", "pushed\n");
+        sh(&cwd, &["add", "-A"]);
+        sh(&cwd, &["commit", "--quiet", "-m", "vendor"]);
+        for target in [
+            format!("HEAD:refs/heads/{branch}"),
+            "HEAD:refs/heads/evil".to_owned(),
+        ] {
+            let pushed = std::process::Command::new("git")
+                .args(["push", "--quiet", "origin", &target])
+                .current_dir(&cwd)
+                .output()
+                .expect("git runs");
+            assert!(!pushed.status.success(), "{target}: the push failed");
+        }
+        assert_eq!(sh(dir.path(), &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            sh(dir.path(), &["for-each-ref", "--format=%(refname)", "refs/heads"]),
+            format!("refs/heads/{branch}")
+        );
     }
 
     #[tokio::test]
