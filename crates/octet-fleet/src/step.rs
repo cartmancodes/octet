@@ -12,14 +12,16 @@
 //! Log appends are awaited in the loop's bodies, never inside a `select!`:
 //! [`Log::append`] is not cancel-safe.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
 use octet_core::background::Background;
-use octet_core::{ApprovalSummary, Command, Config, Engine, Event, Mode, Outcome, Session};
+use octet_core::{
+    ApprovalSummary, Command, Config, Engine, Event, Mode, Outcome, SendError, Session,
+};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -102,6 +104,12 @@ pub enum StepError {
 /// `events` must be read while this runs: each send is awaited, and a
 /// receiver that stops reading stalls the attempt (its session then stops
 /// as a stalled consumer). A dropped receiver is ignored.
+///
+/// **Not cancel-safe.** The future appends to the run log, so dropping it
+/// (in a `select!` or a `timeout`) can cut an append short, and `Session`'s
+/// `Drop` does not wait for the journal's tail. Interrupting an attempt must
+/// end its turn through a hook that returns [`TurnEnd::Interrupted`] (Task
+/// 14), never by dropping this future.
 ///
 /// # Errors
 ///
@@ -286,6 +294,35 @@ impl Reply {
     }
 }
 
+/// The approval an `ApprovalClosed` event closes.
+fn closed_id(event: &Event) -> Option<u64> {
+    if let Event::ApprovalClosed(id) = event {
+        Some(*id)
+    } else {
+        None
+    }
+}
+
+/// What a turn needs of its session: its events and its commands. A trait so
+/// the turn's logic can be tested against a scripted event sequence.
+trait Link {
+    /// The next event; `None` once the stream has ended. Cancel-safe.
+    fn next(&mut self) -> impl Future<Output = Option<Event>> + Send;
+
+    /// Sends `command` to the vendor.
+    fn send(&self, command: Command) -> Result<(), SendError>;
+}
+
+impl Link for Session {
+    fn next(&mut self) -> impl Future<Output = Option<Event>> + Send {
+        self.events.recv()
+    }
+
+    fn send(&self, command: Command) -> Result<(), SendError> {
+        self.handle.send(command)
+    }
+}
+
 /// One attempt's turn, from `Ready` to its end.
 struct Turn<'p> {
     attempt: AttemptId,
@@ -295,6 +332,10 @@ struct Turn<'p> {
     prompt: Option<String>,
     /// Events read but not yet handled.
     queue: VecDeque<Event>,
+    /// Approvals whose `ApprovalClosed` is in `queue`: read ahead of their
+    /// request, which must then not be asked or answered. An ID leaves the
+    /// set when its close is handled.
+    closed: HashSet<u64>,
     /// A turn runs: between `Started` and `Finished`.
     running: bool,
     /// The prompt's turn completed and background work may start another.
@@ -314,6 +355,7 @@ impl<'p> Turn<'p> {
             engine: &plan.step.profile.engine,
             read_only: plan.step.read_only(),
             prompt: Some(plan.prompt.clone()),
+            closed: early.iter().filter_map(closed_id).collect(),
             queue: early,
             running: false,
             held: false,
@@ -326,7 +368,7 @@ impl<'p> Turn<'p> {
 
     async fn drive(
         &mut self,
-        session: &mut Session,
+        session: &mut (impl Link + Send),
         log: &mut Log,
         approver: &mut dyn Approver,
         events: &mpsc::Sender<FleetEvent>,
@@ -336,7 +378,7 @@ impl<'p> Turn<'p> {
                 Some(event)
             } else {
                 tokio::select! {
-                    event = session.events.recv() => event,
+                    event = session.next() => event,
                     () = self.background.grace_over(), if self.held => {
                         if !self.background.pending() {
                             return Ok(self.replied());
@@ -369,7 +411,7 @@ impl<'p> Turn<'p> {
     async fn handle(
         &mut self,
         event: Event,
-        session: &mut Session,
+        session: &mut (impl Link + Send),
         log: &mut Log,
         approver: &mut dyn Approver,
     ) -> Result<Option<TurnEnd>, StepError> {
@@ -384,7 +426,7 @@ impl<'p> Turn<'p> {
                     self.logged = Some(id);
                 }
                 if let Some(prompt) = self.prompt.take()
-                    && let Err(error) = session.handle.send(Command::Prompt(prompt))
+                    && let Err(error) = session.send(Command::Prompt(prompt))
                 {
                     return Ok(Some(local(format!("Cannot send the prompt: {error}"))));
                 }
@@ -398,6 +440,11 @@ impl<'p> Turn<'p> {
             Event::Text(text) => self.reply.push(&text),
             Event::Tool(_) => self.reply.tool(),
             Event::Error(text) => self.error = Some(text),
+            // Closed before its turn came: nobody can answer it any more.
+            Event::Approval { id, .. } if self.closed.contains(&id) => {}
+            Event::ApprovalClosed(id) => {
+                self.closed.remove(&id);
+            }
             Event::Approval { id, summary, .. } => {
                 let allow = if self.read_only {
                     Some(false)
@@ -407,7 +454,7 @@ impl<'p> Turn<'p> {
                 // An answer that cannot be delivered leaves the request to
                 // time out, which denies it.
                 if let Some(allow) = allow {
-                    let _ = session.handle.send(Command::Answer { id, allow });
+                    let _ = session.send(Command::Answer { id, allow });
                 }
             }
             Event::Finished { outcome } => {
@@ -428,18 +475,21 @@ impl<'p> Turn<'p> {
         approver: &mut dyn Approver,
         summary: &ApprovalSummary,
         id: u64,
-        session: &mut Session,
+        session: &mut (impl Link + Send),
     ) -> Option<bool> {
         let mut asking = approver.ask(summary);
         loop {
             tokio::select! {
                 allow = &mut asking => return Some(allow),
-                event = session.events.recv() => match event {
+                event = session.next() => match event {
                     Some(event) => {
-                        let closed = matches!(event, Event::ApprovalClosed(closed) if closed == id);
+                        let closed = closed_id(&event);
                         self.queue.push_back(event);
-                        if closed {
-                            return None;
+                        if let Some(closed) = closed {
+                            self.closed.insert(closed);
+                            if closed == id {
+                                return None;
+                            }
                         }
                     }
                     None => return None,
@@ -502,7 +552,143 @@ impl<'p> Turn<'p> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use octet_testkit::TempDir;
+
     use super::*;
+    use crate::record::CandidateId;
+    use crate::store::{self, RunFile};
+
+    /// A session that plays `script`, then waits forever, and keeps every
+    /// command sent to it.
+    struct Script {
+        events: VecDeque<Event>,
+        sent: RefCell<Vec<Command>>,
+    }
+
+    impl Link for Script {
+        async fn next(&mut self) -> Option<Event> {
+            match self.events.pop_front() {
+                Some(event) => Some(event),
+                None => std::future::pending().await,
+            }
+        }
+
+        fn send(&self, command: Command) -> Result<(), SendError> {
+            self.sent.borrow_mut().push(command);
+            Ok(())
+        }
+    }
+
+    /// An approver that never answers, and counts how often it is asked.
+    struct Silent(Arc<AtomicUsize>);
+
+    impl Approver for Silent {
+        fn ask<'a>(
+            &'a mut self,
+            _summary: &'a ApprovalSummary,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn approval(id: u64) -> Event {
+        Event::Approval {
+            id,
+            detail: String::new(),
+            summary: ApprovalSummary::new("Run a shell command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_closed_while_another_is_asked_is_never_asked() {
+        let temp = TempDir::new("octet-fleet-step-unit");
+        let run_file = RunFile {
+            workflow: crate::sim::shipped(),
+            hash: "0123456789abcdef".into(),
+            task: "a task".into(),
+            top: PathBuf::from("/work/repo"),
+            cwd_rel: PathBuf::new(),
+            base: CandidateId(0),
+            base_tree: "t0".into(),
+            octet_version: "0.0.0-test".into(),
+        };
+        let run = store::create(temp.path(), "f0000000001-abcd", &run_file)
+            .await
+            .expect("run");
+        let (mut log, _) = Log::open(&run).await.expect("log");
+        let workflow = crate::sim::shipped();
+        let step = workflow
+            .steps
+            .iter()
+            .find(|step| !step.read_only())
+            .expect("a write step");
+        let dispatch = Dispatch {
+            step: 0,
+            round: 1,
+            input_candidate: CandidateId(0),
+            requires: Vec::new(),
+            history: Vec::new(),
+            resume_session: None,
+            not_before: None,
+        };
+        let plan = AttemptPlan {
+            step,
+            dispatch: &dispatch,
+            attempt: AttemptId(0),
+            prompt: "go".into(),
+            cwd: temp.path().to_path_buf(),
+            attempt_dir: temp.path().to_path_buf(),
+            marker: "r/0".into(),
+            data_dir: temp.path().to_path_buf(),
+        };
+        // Two requests wait; the engine closes both at once, the second
+        // first, while the first is being asked.
+        let mut session = Script {
+            events: VecDeque::from([
+                Event::Ready {
+                    session: String::new(),
+                },
+                Event::Started,
+                approval(1),
+                approval(2),
+                Event::ApprovalClosed(2),
+                Event::ApprovalClosed(1),
+                Event::Text("done".into()),
+                Event::Finished {
+                    outcome: Outcome::Completed,
+                },
+            ]),
+            sent: RefCell::default(),
+        };
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut approver = Silent(Arc::clone(&asked));
+        let (tx, _rx) = mpsc::channel(64);
+        let end = tokio::time::timeout(
+            Duration::from_secs(5),
+            Turn::new(&plan, VecDeque::new()).drive(&mut session, &mut log, &mut approver, &tx),
+        )
+        .await
+        .expect("the attempt waited on a closed approval")
+        .expect("no log error");
+        assert_eq!(
+            end,
+            TurnEnd::Replied {
+                text: "done".into()
+            }
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "asked about a closed request"
+        );
+        // Neither closed request is answered.
+        assert_eq!(session.sent.into_inner(), [Command::Prompt("go".into())]);
+    }
 
     #[test]
     fn text_after_a_tool_is_a_new_paragraph() {
