@@ -547,19 +547,14 @@ impl Driver {
         })
     }
 
-    /// Pauses for `reason`. A pause already logged is not logged again (its
-    /// detail is the logged one), and a processes pause never replaces
-    /// another pending pause: lifting it would drop that pause.
+    /// Pauses for `reason`, logged as [`logs_pause`] says. A pause already
+    /// logged keeps its logged detail.
     async fn pause(&mut self, reason: PauseReason, detail: String) -> Result<RunEnd, RunnerError> {
         let view = self.load().await?;
         let pending = view.state.pending_pause;
-        let processes = matches!(
-            reason,
-            PauseReason::ProcessesRunning | PauseReason::ProcessesUnverified
-        );
         let detail = if pending == Some(reason) {
             last_pause_detail(&view.records).unwrap_or(detail)
-        } else if processes && pending.is_some() {
+        } else if !logs_pause(pending, reason) {
             detail
         } else {
             self.append(&Record::Paused {
@@ -791,10 +786,59 @@ fn identities_of(records: &[Record], attempt: AttemptId) -> Vec<Identity> {
     identities
 }
 
+/// Whether a pause for `reason` is appended while the log waits on
+/// `pending`. Not the same pause twice; and a processes pause never replaces
+/// a pause that waits for a decision, which lifting it would drop. One the
+/// next observation answers (an interrupt, a processes pause) it does
+/// replace: a run that waits on unverified processes once the verified ones
+/// are killed says so in its log.
+fn logs_pause(pending: Option<PauseReason>, reason: PauseReason) -> bool {
+    let answered = |reason: PauseReason| {
+        matches!(
+            reason,
+            PauseReason::Interrupted
+                | PauseReason::ProcessesRunning
+                | PauseReason::ProcessesUnverified
+        )
+    };
+    let processes = matches!(
+        reason,
+        PauseReason::ProcessesRunning | PauseReason::ProcessesUnverified
+    );
+    match pending {
+        Some(pending) if pending == reason => false,
+        Some(pending) if processes => answered(pending),
+        _ => true,
+    }
+}
+
 /// The detail of the latest `paused` record.
 fn last_pause_detail(records: &[Record]) -> Option<String> {
     records.iter().rev().find_map(|record| match record {
         Record::Paused { detail, .. } => Some(detail.clone()),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_processes_pause_replaces_a_pause_the_observation_answers() {
+        use PauseReason::{Interrupted, ProcessesRunning, ProcessesUnverified, UnstableTests};
+        // Logged afresh, a processes pause drops nothing: its own kind and an
+        // interrupt are answered by the next observation.
+        assert!(logs_pause(None, ProcessesRunning));
+        assert!(logs_pause(Some(ProcessesRunning), ProcessesUnverified));
+        assert!(logs_pause(Some(ProcessesUnverified), ProcessesRunning));
+        assert!(logs_pause(Some(Interrupted), ProcessesRunning));
+        // It never replaces a pause that waits for a decision.
+        assert!(!logs_pause(Some(UnstableTests), ProcessesRunning));
+        assert!(!logs_pause(Some(UnstableTests), ProcessesUnverified));
+        // The same pause is not logged twice; another pause is logged.
+        assert!(!logs_pause(Some(ProcessesRunning), ProcessesRunning));
+        assert!(!logs_pause(Some(UnstableTests), UnstableTests));
+        assert!(logs_pause(Some(ProcessesRunning), UnstableTests));
+    }
 }
