@@ -8,6 +8,7 @@
 mod antigravity;
 mod claude;
 mod codex;
+mod fleet;
 mod opencode;
 mod wire;
 
@@ -22,6 +23,7 @@ use std::{
 use wire::emit;
 
 fn main() {
+    fleet::record_start();
     let mode = env::args().nth(1).expect("mode");
     match mode.as_str() {
         "app-server" => codex::run(),

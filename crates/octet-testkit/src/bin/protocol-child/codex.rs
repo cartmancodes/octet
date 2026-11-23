@@ -1,5 +1,6 @@
 //! The fake Codex app server: `thread/*`, `turn/*`, `model/list` and `skills/list`, with
 //! the scripts in `scenario` chosen by the turn's text or the thread's model.
+use crate::fleet;
 use crate::wire::{codex_delta, codex_turn_completed, emit, goal_reply};
 use octet_testkit::scenario;
 use serde_json::{Value, json};
@@ -23,6 +24,8 @@ struct CodexFixture {
     ignores_interrupt: bool,
     /// What the last `thread/*` request asked for, for `PARAMS`.
     thread_params: Value,
+    /// The thread was opened with `thread/resume`, which fleet turns log.
+    resumed: bool,
 }
 
 pub(crate) fn run() {
@@ -93,6 +96,7 @@ impl CodexFixture {
             );
             return;
         }
+        self.resumed = v["method"] == "thread/resume";
         self.thread_params = p.clone();
         self.thread_params["method"] = v["method"].clone();
         // "report-stricter" simulates a managed requirement that overrides
@@ -169,7 +173,26 @@ impl CodexFixture {
         emit(
             &json!({"method":"turn/started","params":{"threadId":"fixture-thread","turn":{"id":self.active}}}),
         );
-        self.turn_script(text, v);
+        if !self.fleet_turn(text) {
+            self.turn_script(text, v);
+        }
+    }
+
+    /// Performs the fleet script's turn for `text`, if it has one: its reply
+    /// and the turn's end, or no end at all for a held turn, which stays open
+    /// until interrupted, like `HOLD`.
+    fn fleet_turn(&self, text: &str) -> bool {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(scripted) = fleet::turn(text, &cwd, self.resumed) else {
+            return false;
+        };
+        if !scripted.hold {
+            fleet_reply(&self.active, &scripted.reply);
+            if scripted.exit_after {
+                process::exit(0);
+            }
+        }
+        true
     }
 
     /// What the turn does, chosen by its text.
@@ -364,6 +387,15 @@ fn reply(active: &str, text: &str, v: &Value) {
     );
     emit(
         &json!({"method":"thread/tokenUsage/updated","params":{"threadId":"fixture-thread","tokenUsage":{"total":{"totalTokens":42}}}}),
+    );
+    emit(&codex_turn_completed(active, "completed"));
+}
+
+/// A fleet turn's reply, as the agent's message, and the turn's completion.
+fn fleet_reply(active: &str, reply: &str) {
+    emit(&codex_delta("fixture-thread", active, "msg", reply));
+    emit(
+        &json!({"method":"item/completed","params":{"threadId":"fixture-thread","turnId":active,"item":{"id":"msg","type":"agentMessage","text":reply}}}),
     );
     emit(&codex_turn_completed(active, "completed"));
 }
