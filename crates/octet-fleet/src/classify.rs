@@ -113,21 +113,122 @@ const TABLE: &[Row] = &[
 /// `stopped_mid_turn` says the vendor stopped while the turn ran: an error
 /// the table does not know is then transient (the process went away), where
 /// otherwise it is [`FailureClass::Unknown`].
+///
+/// A Codex usage limit names its reset as a local clock time ("try again at
+/// 9:04 AM"); reading it runs `date` once for the local time.
 #[must_use]
 pub fn classify(engine: &str, error_text: &str, stopped_mid_turn: bool) -> FailureClass {
+    classify_at(engine, error_text, stopped_mid_turn, local_now)
+}
+
+/// [`classify`], with `now` reading the local clock (only for a Codex text
+/// that names a clock time).
+fn classify_at(
+    engine: &str,
+    error_text: &str,
+    stopped_mid_turn: bool,
+    now: impl FnOnce() -> Option<LocalNow>,
+) -> FailureClass {
     let text = error_text.to_lowercase();
     let row = TABLE
         .iter()
         .find(|row| row.engine.is_none_or(|only| only == engine) && text.contains(row.needle));
     match row.map(|row| row.kind) {
         Some(Kind::Transient) => FailureClass::Transient {
-            reset_at: reset_at(error_text),
+            reset_at: reset_at(error_text).or_else(|| {
+                let clock = clock_time(&text).filter(|_| engine == "codex")?;
+                Some(next_occurrence(clock, now()?))
+            }),
         },
         Some(Kind::Config) => FailureClass::ConfigError,
         Some(Kind::Local) => FailureClass::LocalFailure,
         None if stopped_mid_turn => FailureClass::Transient { reset_at: None },
         None => FailureClass::Unknown,
     }
+}
+
+/// Seconds in a day.
+const DAY: u32 = 24 * 60 * 60;
+
+/// The local time: the Unix second, and how far into the local day it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalNow {
+    epoch: u64,
+    seconds_of_day: u32,
+}
+
+/// The local time from `date`, which every macOS and Linux has; `None` when
+/// it cannot be read.
+fn local_now() -> Option<LocalNow> {
+    let output = std::process::Command::new("date")
+        .arg("+%s %H %M %S")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_date(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `date '+%s %H %M %S'`'s output.
+fn parse_date(text: &str) -> Option<LocalNow> {
+    let mut fields = text.split_whitespace();
+    let epoch = fields.next()?.parse().ok()?;
+    let mut part = |limit: u32| fields.next()?.parse::<u32>().ok().filter(|n| *n < limit);
+    let (hours, minutes, seconds) = (part(24)?, part(60)?, part(61)?);
+    Some(LocalNow {
+        epoch,
+        seconds_of_day: hours * 3600 + minutes * 60 + seconds.min(59),
+    })
+}
+
+/// The clock time a lowercased text names after "try again at ", as seconds
+/// into the day: `H:MM am|pm`, or `HH:MM` on a 24-hour clock.
+fn clock_time(text: &str) -> Option<u32> {
+    let (_, rest) = text.split_once("try again at ")?;
+    let (hours, rest) = rest.split_once(':')?;
+    let number = |digits: &str| {
+        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| digits.parse::<u32>().ok())
+            .flatten()
+    };
+    let hours = number(hours).filter(|_| hours.len() <= 2)?;
+    let minutes = number(rest.get(..2)?).filter(|m| *m < 60)?;
+    let after = &rest[2..];
+    if after.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let after = after.trim_start();
+    let hours = if let Some(pm) = after
+        .strip_prefix("am")
+        .map(|_| false)
+        .or_else(|| after.strip_prefix("pm").map(|_| true))
+    {
+        if !(1..=12).contains(&hours) {
+            return None;
+        }
+        hours % 12 + if pm { 12 } else { 0 }
+    } else if hours < 24 {
+        hours
+    } else {
+        return None;
+    };
+    Some(hours * 3600 + minutes * 60)
+}
+
+/// The Unix second of the next time the local clock shows `clock` (seconds
+/// into the day): today if it is still ahead, else tomorrow. It adds the
+/// wall-clock difference, so across a daylight-saving change it is up to an
+/// hour off.
+fn next_occurrence(clock: u32, now: LocalNow) -> u64 {
+    let ahead = if clock >= now.seconds_of_day {
+        clock - now.seconds_of_day
+    } else {
+        clock + DAY - now.seconds_of_day
+    };
+    now.epoch + u64::from(ahead)
 }
 
 /// The reset time a usage-limit text names, as Claude Code writes it: the
@@ -252,13 +353,16 @@ mod tests {
     /// limit: those rows rest on the fixtures above.
     const REAL: &[(&str, &str, FailureClass)] = &[
         // Codex 0.15x, the 2026-11-06 music-decoder runs (three times;
-        // only the clock time differed).
+        // only the clock time differed). At [`TEN_AM`], 9:04 AM is
+        // tomorrow: 23 h 04 min ahead.
         (
             "codex",
             "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
              visit https://chatgpt.com/codex/settings/usage to purchase more credits or try \
              again at 9:04 AM. (usageLimitExceeded)",
-            FailureClass::Transient { reset_at: None },
+            FailureClass::Transient {
+                reset_at: Some(1_800_083_040),
+            },
         ),
         // Codex 0.154.0 with a model the ChatGPT account does not serve
         // (Octet's headless probe, 2026-10-23; the same text for
@@ -309,22 +413,125 @@ mod tests {
              gemini-nonexistent-x",
             FailureClass::ConfigError,
         ),
-        // Octet's own text when Antigravity looks signed out; what agy
-        // itself then says is unconfirmed.
+        // Octet's own text when Antigravity looks signed out (its `SIGN_IN`,
+        // which then quotes agy; agy's own words are unconfirmed).
         (
             "antigravity",
-            "Sign in to Antigravity first: run `agy`. Antigravity said: Authentication required",
+            "Sign in to Antigravity first: run `agy`",
             FailureClass::ConfigError,
         ),
     ];
 
+    /// 10:00:00 local time, at Unix second 1 800 000 000.
+    const TEN_AM: LocalNow = LocalNow {
+        epoch: 1_800_000_000,
+        seconds_of_day: 10 * 3600,
+    };
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "it stands in for the clock, which can fail"
+    )]
+    fn ten_am() -> Option<LocalNow> {
+        Some(TEN_AM)
+    }
+
     #[test]
     fn real_vendor_texts_are_classified() {
         for (engine, text, class) in REAL {
-            assert_eq!(classify(engine, text, false), *class, "{engine}: {text:?}");
+            assert_eq!(
+                classify_at(engine, text, false, ten_am),
+                *class,
+                "{engine}: {text:?}"
+            );
             // A known text keeps its class when the vendor then goes away.
-            assert_eq!(classify(engine, text, true), *class, "{engine}: {text:?}");
+            assert_eq!(
+                classify_at(engine, text, true, ten_am),
+                *class,
+                "{engine}: {text:?}"
+            );
         }
+    }
+
+    /// The reset Codex names in `when`, at [`TEN_AM`].
+    fn codex_reset(when: &str) -> Option<u64> {
+        let text =
+            format!("You've hit your usage limit. … try again at {when}. (usageLimitExceeded)");
+        match classify_at("codex", &text, false, ten_am) {
+            FailureClass::Transient { reset_at } => reset_at,
+            other => panic!("{when}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_names_its_reset_as_a_local_clock_time() {
+        let at = |seconds: u64| Some(TEN_AM.epoch + seconds);
+        // Later today.
+        assert_eq!(codex_reset("2:10 PM"), at(4 * 3600 + 10 * 60));
+        assert_eq!(codex_reset("7:13 PM"), at(9 * 3600 + 13 * 60));
+        assert_eq!(codex_reset("12:05 PM"), at(2 * 3600 + 5 * 60));
+        assert_eq!(codex_reset("10:00 AM"), at(0));
+        // Earlier in the day: tomorrow.
+        assert_eq!(codex_reset("9:04 AM"), at(23 * 3600 + 4 * 60));
+        assert_eq!(codex_reset("12:30 AM"), at(14 * 3600 + 30 * 60));
+        // A 24-hour clock, either way round.
+        assert_eq!(codex_reset("18:45"), at(8 * 3600 + 45 * 60));
+        assert_eq!(codex_reset("06:00"), at(20 * 3600));
+        // Anything else names no time.
+        for when in [
+            "13:04 PM", "0:30 AM", "24:00", "9:4 AM", "9:60 AM", "noon", "9:041 AM",
+        ] {
+            assert_eq!(codex_reset(when), None, "{when}");
+        }
+    }
+
+    #[test]
+    fn a_clock_time_without_a_clock_names_no_reset() {
+        let text = "You've hit your usage limit. Try again at 9:04 AM. (usageLimitExceeded)";
+        assert_eq!(
+            classify_at("codex", text, false, || None),
+            FailureClass::Transient { reset_at: None }
+        );
+    }
+
+    #[test]
+    fn the_clock_is_read_only_for_a_codex_clock_time() {
+        let reads = std::cell::Cell::new(0);
+        let clock = || {
+            reads.set(reads.get() + 1);
+            Some(TEN_AM)
+        };
+        for (engine, text) in [
+            ("codex", "You've hit your usage limit. (usageLimitExceeded)"),
+            ("claude", "Claude AI usage limit reached|1767225600"),
+            ("opencode", "Rate limit exceeded; try again at 9:04 AM"),
+            ("codex", "The 'x' model is not supported when using Codex."),
+        ] {
+            let _ = classify_at(engine, text, false, clock);
+        }
+        assert_eq!(reads.get(), 0);
+        let _ = classify_at("codex", "usage limit; try again at 9:04 AM", false, clock);
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn the_local_clock_reads() {
+        let now = local_now().expect("`date` gives the local time");
+        assert!(now.seconds_of_day < 86_400, "{now:?}");
+        let system = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now.epoch.abs_diff(system) < 60, "{now:?} vs {system}");
+        assert_eq!(
+            parse_date("1800000000 09 04 59\n"),
+            Some(LocalNow {
+                epoch: 1_800_000_000,
+                seconds_of_day: 9 * 3600 + 4 * 60 + 59
+            })
+        );
+        assert_eq!(parse_date("1800000000 24 00 00"), None);
+        assert_eq!(parse_date("soon"), None);
     }
 
     #[test]
