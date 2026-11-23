@@ -57,10 +57,22 @@ impl Driver {
         // left its scratch clone (an accepted one's is already gone): a new
         // attempt discards it (spec, "State found": "discard its clone").
         // Each attempt discards its predecessor's, so none is left behind.
+        // One that cannot be removed is a local failure: the run pauses
+        // before the new attempt starts.
         if let Some((&previous, info)) = view.state.attempts.iter().next_back()
             && info.state != AttemptState::Finished
         {
-            let _ = tokio::fs::remove_dir_all(self.attempt_dir(previous).join("tree")).await;
+            let clone = self.attempt_dir(previous).join("tree");
+            match tokio::fs::remove_dir_all(&clone).await {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    let detail = format!("cannot discard the clone {}: {error}", clone.display());
+                    return self
+                        .pause(PauseReason::LocalFailure, detail)
+                        .await
+                        .map(Some);
+                }
+                _ => {}
+            }
         }
         if !step.read_only() {
             self.own(attempt).await?;

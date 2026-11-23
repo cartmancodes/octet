@@ -966,8 +966,9 @@ async fn an_unfinished_write_attempt_keeps_its_claim_on_the_work_tree() {
     assert_eq!(listed(&bench.data), [bench.run_id().await]);
 }
 
-#[tokio::test]
-async fn a_new_attempt_discards_the_clone_of_an_interrupted_one() {
+/// A run of [`SMALL`] interrupted while its researcher holds its turn; its
+/// bench and the interrupted attempt's clone.
+async fn research_interrupted() -> (Bench, PathBuf) {
     let mut turns = small_turns();
     turns["research#1"] = json!([
         {"hold": "before_write"},
@@ -1004,7 +1005,38 @@ async fn a_new_attempt_discards_the_clone_of_an_interrupted_one() {
         .join("0")
         .join("tree");
     assert!(clone.exists());
+    (bench, clone)
+}
+
+#[tokio::test]
+async fn a_new_attempt_discards_the_clone_of_an_interrupted_one() {
+    let (bench, clone) = research_interrupted().await;
     let (end, _) = resume_with(&bench, None).await;
     assert_eq!(end, RunEnd::Completed);
     assert!(!clone.exists(), "the interrupted attempt's clone is kept");
+}
+
+#[tokio::test]
+async fn a_clone_that_cannot_be_discarded_pauses_the_run() {
+    let (bench, clone) = research_interrupted().await;
+    // Something that is not a directory stands where the clone was.
+    std::fs::remove_dir_all(&clone).unwrap();
+    std::fs::write(&clone, "not a clone").unwrap();
+    let before = bench.attempts_of("research").await;
+    let (end, _) = resume_with(&bench, None).await;
+    assert_eq!(end, RunEnd::Paused(PauseReason::LocalFailure));
+    assert_eq!(bench.attempts_of("research").await, before);
+    let records = bench.records().await;
+    assert!(
+        matches!(
+            records.last(),
+            Some(Record::Paused { reason: PauseReason::LocalFailure, detail })
+                if detail.contains(&clone.display().to_string())
+        ),
+        "{records:#?}"
+    );
+    // Once it can be, `retry` discards it and the run goes on.
+    std::fs::remove_file(&clone).unwrap();
+    let (end, _) = resume_with(&bench, Some(Decision::Retry)).await;
+    assert_eq!(end, RunEnd::Completed);
 }
