@@ -305,7 +305,8 @@ the trust prompt shows it.
 
 When the run cannot decide what comes next on its own, it pauses: it records why, prints the
 command that resumes it, and exits 3. On a terminal you choose the decision at once; otherwise
-pass it to `resume`:
+pass it to `resume` (off a terminal, resuming a run that awaits a decision without `--decision`
+exits 2 and names the decisions it offers):
 
 ```sh
 octet fleet resume RUN_ID --decision keep
@@ -321,7 +322,7 @@ Every pause can also be ended with `stop`. After a decision is logged, the next 
 | `round_limit` | A jump back would exceed `max_rounds` on that edge. | `continue` → the pending jump is taken (one round past the limit) · `rounds N` → raise the cap, then the same · `stop` |
 | `stalled` | A round made no progress (below). | `continue` → go on past the stall · `rounds N` · `stop` |
 | `unstable_tests` | The tree changed during the test commands on three runs of the list. | `retry` → the evidence runner starts afresh on the current tip, restart count reset · `stop` |
-| `drift` | The live tree is not the tree the run last recorded. | `adopt` → the live tree becomes a derived candidate (origin `drift`); tests and review run again on it · `stop` |
+| `drift` | The live tree is not the tree the run last recorded. | `adopt` → the live tree becomes a derived candidate (origin `drift`); next is whatever step is now due: once a change exists, its tests and then its review run again on the new candidate (the coder does not); before that, the run goes on to the next document step · `stop` |
 | `access_violation` | A read-only step changed its scratch clone. Nothing it produced is used. | `retry` → a new attempt of the same step in a fresh clone · `stop` |
 | `processes_running` | A process verified as the run's is still alive. | `kill` → verified processes signalled, then the check runs again · `wait` → the check runs again · `stop` (refused while verified processes are alive) |
 | `processes_unverified` | A process in a registered group is alive but cannot be shown to be the run's. | `release` → the listed PIDs are logged as not the run's, then the check runs again · `wait` · `stop` (refused until released) |
@@ -339,10 +340,17 @@ Every pause can also be ended with `stop`. After a decision is logged, the next 
 produce passing tests, and only a valid review can produce an approval.
 
 **Interrupts.** Ctrl+C (or SIGTERM) interrupts the running turn or command, records it, and exits
-130 (or 143). `resume` needs no decision for it: an interrupted read-only step runs again in a
-fresh clone; a write step that left the tree unchanged runs again (continuing its vendor
-session); one that changed the tree pauses `reconcile`; an interrupted evidence run starts its
-command list again from the first command, without running the tester again.
+130 (or 143). `resume` needs no decision for it; what the log and the tree show decides:
+
+- a read-only step runs again in a fresh clone;
+- a write step whose vendor never started (Octet had not released it): tree unchanged → it runs
+  again; tree changed → `drift`;
+- a coder or tester that left the tree unchanged runs again (a coder continues its vendor
+  session); one that changed the tree pauses `reconcile`;
+- an interrupted evidence run starts its command list again from the first command, without
+  running the tester again, if the tree is still its candidate; otherwise → `drift`.
+
+The same rules apply after a crash or a reboot.
 
 **Stopping.** `stop` (or `octet fleet stop RUN_ID`) records the run as stopped and leaves the tree
 as it is. It prints the command that would discard the run's changes:
@@ -368,10 +376,13 @@ How a turn that did not reply failed decides what happens:
 | Unknown | anything not matched | pause |
 
 Retries wait 1, 5, then 15 minutes, or until the reset time a usage-limit error names when that
-is later (Claude's `…|<epoch>` form). The wait is in the log, so a restarted run still waits it
-out. After `transient_retries`, the run pauses `transient_exhausted`; `resume --decision retry`
-tries again. Codex's usage-limit text names only a clock time ("try again at 9:04 AM"), which
-Octet does not read, so a Codex limit that lasts hours usually ends in that pause.
+is later, but never more than a day. Claude names its reset as a Unix time (`…|<epoch>`). Codex
+names a local clock time ("…or try again at 9:04 AM."): Octet reads the local clock (it runs
+`date` once) and waits for the next time the clock shows it, today if still ahead, otherwise
+tomorrow; across a daylight-saving change that can be an hour off. A text whose time cannot be
+read falls back to the backoff. The wait is in the log, so a restarted run still waits it out.
+After `transient_retries`, the run pauses `transient_exhausted`; `resume --decision retry` tries
+again.
 
 The errors Octet recognises per provider (from their real texts) are in
 `crates/octet-fleet/src/classify.rs`, each a test case naming where it was seen.
@@ -382,19 +393,20 @@ The errors Octet recognises per provider (from their real texts) are in
 |---|---|
 | 0 | Completed (or stopped by `stop`). |
 | 1 | Failed: a config error, or a failure the run cannot pause on. |
-| 2 | Usage or validation error, an untrusted workflow off a terminal, a decision the pause does not offer, or a run refused (another run owns the work tree). Nothing ran. |
+| 2 | Usage or validation error; an untrusted workflow off a terminal; a work tree that is not a git work tree or is a sparse checkout; `resume` of a paused run off a terminal without the `--decision` it needs, or with one the pause does not offer; no such run; or a run refused because another run owns the work tree. Nothing ran. |
 | 3 | Paused; the resume command is printed. Also a `stop` the run refuses. |
 | 130 | Interrupted by SIGINT (Ctrl+C). |
 | 143 | Interrupted by SIGTERM. |
 
 ## What a completed run guarantees
 
-These are the design's guarantees, in its own words.
+The guarantees below are quoted from the design (the `>` blocks are its exact words; `<run>` is
+the run's directory). The plain text around them explains and is not part of the quotation.
 
 ### The invariant
 
-The run is recorded `Completed` only when:
-
+> The run is recorded `Completed` only when:
+>
 > **The final reviewer approved candidate K with tree T, under evidence record E and the
 > document approvals A (in the shipped workflow, the plan's and through it the research's); E is
 > a complete passing record for T (for every command, the tree Octet observed immediately before
@@ -411,65 +423,79 @@ approval, and the observed tree.
 The tester's own turn is never evidence. After it, Octet snapshots the tree (the tester's edits
 become a derived candidate) and runs the workflow's commands itself.
 
-**The guarantee: for every command, the tree Octet observed immediately before releasing it and
-immediately after it exited equals T, and both observations are persisted in the evidence
-record.**
+> **The guarantee: for every command, the tree Octet observed immediately before releasing it and
+> immediately after it exited equals T, and both observations are persisted in the evidence
+> record.**
 
 On the first observation that differs, the record so far is void: the observed tree becomes a
 new candidate and the whole command list starts again (at most 2 restarts; a third pauses
-`unstable_tests`). This catches a command that changes a fixture and a later one that uses and
-restores it (the first post-observation differs), and an edit made by anyone between two commands
-(the next pre-observation differs).
+`unstable_tests`).
 
-It cannot see a change made and undone within a single command's lifetime, by that command or by
-anyone else.
+> This catches a command that changes a fixture and a later one that uses and restores it (the
+> first post-observation differs), and an edit made by anyone between two commands (the next
+> pre-observation differs). It cannot see a change made and undone within a single command's
+> lifetime, by that command or by anyone else
 
 ### Read-only steps: isolation, not a sandbox
 
-In what follows, K is the candidate a step is given.
+K is the candidate the step is given.
 
-v1 promises **isolation of the user's workspace, plus detection**, not OS-level write prevention:
-
-- Every document and verdict attempt runs in a **scratch clone**: `git clone --shared
-  --no-checkout` of the repo into `<run>/attempts/<id>/tree`, then a detached checkout of the
-  candidate's commit, with the vendor's cwd at the same relative path as `--cwd`. The reviewer
-  sees exactly K, and an edit, an index change or a ref change lands in the clone, not in the
-  user's checkout or refs.
-- The runner **denies every approval** a read-only step raises.
-- The clone's tree is compared before and after; any change is `AccessViolation`. The verdict is
-  discarded and the run pauses with the diff. Nothing an `AccessViolation` produced is adopted.
-- **Not promised**: a vendor writing outside its working directory by absolute path. Such a write
-  into the user's workspace is still caught by the drift check at the next transition.
+> v1 promises **isolation of the user's workspace, plus detection**, not OS-level write
+> prevention:
+>
+> - Every document and verdict attempt runs in a **scratch clone**: `git clone --shared
+>   --no-checkout` of the repo into `<run>/attempts/<id>/tree`, then a detached checkout of the
+>   candidate's commit, with the vendor's cwd at the same relative path as `--cwd`. The reviewer
+>   sees exactly K, and an edit, an index change or a ref change lands in the clone, not in the
+>   user's checkout or refs.
+> - The runner **denies every approval** a read-only step raises.
+> - The clone's tree is compared before and after; any change is `AccessViolation`. The verdict
+>   is discarded and the run pauses with the diff. Nothing an `AccessViolation` produced is
+>   adopted.
+> - **Not promised**: a vendor writing outside its working directory by absolute path. Such a
+>   write into the user's workspace is still caught by the drift check at the next transition.
 
 ### Snapshots: sparse checkouts and submodules
 
-Snapshots are git trees built from a copy of your index; they never touch your index, `HEAD` or
-branches, and they keep the tree alive under `refs/octet-fleet/<run>/<seq>`. A dirty start is
-fine: the starting snapshot includes it, and the run's patch is relative to it.
+> `snapshot::take` builds a tree without touching the user's index, HEAD or branches.
 
-- **Sparse checkouts are refused** (`core.sparseCheckout` set, or any index entry with
-  `skip-worktree`): clearing the flag would record the absent files as deleted, and keeping it
-  would hide edits.
-- Submodules are captured as their recorded gitlink; content changes inside a submodule are not
-  seen.
+Each snapshot is kept alive by a ref, `refs/octet-fleet/<run>/<seq>`.
+
+> **sparse checkouts are refused** at validation (`core.sparseCheckout` set, or any index entry
+> with `skip-worktree`): clearing the flag would record the absent files as deleted, and keeping
+> it would hide edits. The run's own state lives in `<data_dir>`, never in the work tree. A dirty
+> start is fine: the base candidate includes it, and the patch is relative to it. Submodules are
+> captured as their recorded gitlink; content changes inside a submodule are not seen
+
+"At validation" means when `octet fleet run` checks the work tree before it starts (exit 2);
+`octet fleet validate` itself does not look at git.
 
 ### Accepted work is never repeated
 
-A step whose `attempt_finished` is durable is never repeated. A vendor that finished just before
-Octet crashed is an unfinished attempt, and goes to the recovery rules above.
+> The guarantee is precisely: **a step whose `attempt_finished` is durable is never repeated.** A
+> child that finished just before the parent crashed is an unfinished attempt and goes to
+> reconciliation.
 
 ### Process ownership
 
-No vendor and no test command runs until its identity is in the log. Each vendor is started
-through a per-attempt gate script that records its PID and waits for Octet's go-ahead; each test
-command waits on a pipe for its go line. Processes carry an `OCTET_FLEET_ATTEMPT=<run>/<attempt>`
-marker in their environment.
+> **No execution before registration.** No vendor binary and no test command runs until its
+> identity is durable in the log. Both are started **held** by an Octet-controlled gate and
+> released only afterwards.
 
-While a run is driven, Octet holds a lock on the run and on the work tree, and keeps a record of
-every run that may still have a writer on the work tree. `run`, `resume` and `stop` check it first:
-a writer is admitted only when no other run is listed, and the refusal names the run to `resume`
-or `stop` first. Octet signals only processes it can verify as the run's (the marker, or a PID
-and start time it recorded), and never one it cannot.
+Each vendor is started through a per-attempt gate script that records its PID and waits for
+Octet's go-ahead; each test command waits on a pipe for its go line. Processes carry an
+`OCTET_FLEET_ATTEMPT=<run>/<attempt>` marker in their environment. While a run is driven, Octet
+holds a lock on the run and on the work tree, and keeps a record of every run that may still have
+a writer on the work tree.
+
+> A writer is admitted only when no run other than the one being driven is listed.
+
+`run`, `resume` and `stop` all check that record first, and a refusal names the run to `resume`
+or `stop` first. Octet signals only processes it verifies as the run's (the marker, or a PID and
+start time it recorded):
+
+> `kill` signals **only verified processes** (SIGTERM, SIGKILL after 5 s), then the check runs
+> again.
 
 ## Where things live
 

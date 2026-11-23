@@ -464,6 +464,7 @@ fn signal_code(signal: &str) -> i32 {
 struct Terminal {
     ask: bool,
     prompter: Prompter,
+    console: Console,
 }
 
 impl Approver for Terminal {
@@ -473,7 +474,7 @@ impl Approver for Terminal {
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
             if !self.ask {
-                warn(&format!(
+                self.console.warn(&format!(
                     "denied an approval ({}); nothing can ask. Set mode: auto or full-access \
                      in the profile for unattended runs.",
                     denied(summary)
@@ -504,6 +505,68 @@ impl Approver for Terminal {
 }
 
 // ---- showing events ----------------------------------------------------
+
+/// Stdout and stderr as a terminal shows them, in one place: whatever the
+/// renderer and the approver write goes through here, so a warning on stderr
+/// starts on a line of its own even while a reply streams on stdout.
+#[derive(Clone)]
+struct Console(Arc<std::sync::Mutex<Streams>>);
+
+struct Streams {
+    stdout: Box<dyn Write + Send>,
+    stderr: Box<dyn Write + Send>,
+    /// The text on stdout is not at the start of a line.
+    mid_line: bool,
+}
+
+impl Console {
+    fn new() -> Self {
+        Self::with_output(Box::new(std::io::stdout()), Box::new(std::io::stderr()))
+    }
+
+    fn with_output(stdout: Box<dyn Write + Send>, stderr: Box<dyn Write + Send>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Streams {
+            stdout,
+            stderr,
+            mid_line: false,
+        })))
+    }
+
+    fn streams(&self) -> std::sync::MutexGuard<'_, Streams> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `text` on stdout as it is.
+    fn out(&self, text: &str) {
+        let mut streams = self.streams();
+        let _ = streams.stdout.write_all(text.as_bytes());
+        let _ = streams.stdout.flush();
+        if !text.is_empty() {
+            streams.mid_line = !text.ends_with('\n');
+        }
+    }
+
+    /// Ends stdout's line, if it is mid-line.
+    fn end_line(&self) {
+        let mut streams = self.streams();
+        if streams.mid_line {
+            let _ = streams.stdout.write_all(b"\n");
+            let _ = streams.stdout.flush();
+            streams.mid_line = false;
+        }
+    }
+
+    /// A warning on stderr as `--print` writes it, on a line of its own: a
+    /// reply rarely ends with a newline.
+    fn warn(&self, text: &str) {
+        self.end_line();
+        let mut streams = self.streams();
+        let _ = writeln!(streams.stderr, "octet: {text}");
+        let _ = streams.stderr.flush();
+    }
+}
 
 /// `event` as one JSON object. A child's event goes through
 /// [`event_json`]; the caller adds the step to it.
@@ -552,43 +615,26 @@ struct Renderer {
     json: bool,
     /// The step each attempt runs, to wrap its session's events.
     steps: HashMap<AttemptId, String>,
-    /// The text on stdout is not at the start of a line.
-    mid_line: bool,
     /// The run's ID, once the run said it.
     run: Option<String>,
     /// Anything but the start and a pause happened.
     progress: bool,
     /// The command that shows a completed run's change.
     diff_command: Option<String>,
-    /// Where events go: stdout.
-    stdout: Box<dyn Write + Send>,
-    /// Where the vendor's notices and errors go: stderr.
-    stderr: Box<dyn Write + Send>,
+    /// Where events go: stdout, and the vendor's notices and errors to
+    /// stderr.
+    console: Console,
 }
 
 impl Renderer {
-    fn new(json: bool) -> Self {
-        Self::with_output(
-            json,
-            Box::new(std::io::stdout()),
-            Box::new(std::io::stderr()),
-        )
-    }
-
-    fn with_output(
-        json: bool,
-        stdout: Box<dyn Write + Send>,
-        stderr: Box<dyn Write + Send>,
-    ) -> Self {
+    fn new(json: bool, console: Console) -> Self {
         Self {
             json,
             steps: HashMap::new(),
-            mid_line: false,
             run: None,
             progress: false,
             diff_command: None,
-            stdout,
-            stderr,
+            console,
         }
     }
 
@@ -600,30 +646,20 @@ impl Renderer {
         self.end_line();
     }
 
-    fn out(&mut self, text: &str) {
-        let _ = self.stdout.write_all(text.as_bytes());
-        let _ = self.stdout.flush();
-        if !text.is_empty() {
-            self.mid_line = !text.ends_with('\n');
-        }
+    fn out(&self, text: &str) {
+        self.console.out(text);
     }
 
-    /// A vendor's notice or error, on stderr as `--print` writes it, on a
-    /// line of its own: a terminal shows both streams in one place, and a
-    /// reply rarely ends with a newline.
-    fn warn(&mut self, text: &str) {
-        self.end_line();
-        let _ = writeln!(self.stderr, "octet: {text}");
-        let _ = self.stderr.flush();
+    /// A vendor's notice or error, on stderr on a line of its own.
+    fn warn(&self, text: &str) {
+        self.console.warn(text);
     }
 
-    fn end_line(&mut self) {
-        if self.mid_line {
-            self.out("\n");
-        }
+    fn end_line(&self) {
+        self.console.end_line();
     }
 
-    fn line(&mut self, text: &str) {
+    fn line(&self, text: &str) {
         self.end_line();
         self.out(&format!("{text}\n"));
     }
@@ -653,7 +689,7 @@ impl Renderer {
         }
     }
 
-    fn show_text(&mut self, event: &FleetEvent) {
+    fn show_text(&self, event: &FleetEvent) {
         match event {
             FleetEvent::RunStarted { run } => self.line(&format!("run {}", plain(run))),
             FleetEvent::AttemptStarted {
@@ -731,6 +767,7 @@ struct Front {
     stopping: bool,
     signals: Signals,
     prompter: Prompter,
+    console: Console,
 }
 
 impl Front {
@@ -749,6 +786,7 @@ impl Front {
             stopping,
             signals: watch_signals()?,
             prompter: Prompter::new(),
+            console: Console::new(),
         })
     }
 
@@ -756,6 +794,7 @@ impl Front {
         let approver = Terminal {
             ask: self.interactive,
             prompter: self.prompter.clone(),
+            console: self.console.clone(),
         };
         RunnerIo::new(events, Box::new(approver), self.signals.clone())
     }
@@ -822,7 +861,7 @@ async fn drive(front: &Front, first: Call) -> Result<i32, CliError> {
     let mut call = first;
     loop {
         let (events, received) = mpsc::channel(64);
-        let mut renderer = Renderer::new(front.json);
+        let mut renderer = Renderer::new(front.json, front.console.clone());
         let (result, ()) = tokio::join!(front.call(&call, events), renderer.consume(received));
         let given = matches!(
             &call,
@@ -1133,6 +1172,7 @@ async fn run_command(
         stopping: false,
         signals,
         prompter,
+        console: Console::new(),
     };
     drive(&front, Call::Start(Box::new(start))).await
 }
@@ -1341,8 +1381,10 @@ mod tests {
     #[test]
     fn a_vendor_error_starts_on_its_own_line() {
         let screen = Screen::default();
-        let mut renderer =
-            Renderer::with_output(false, Box::new(screen.clone()), Box::new(screen.clone()));
+        let mut renderer = Renderer::new(
+            false,
+            Console::with_output(Box::new(screen.clone()), Box::new(screen.clone())),
+        );
         let session = |event| FleetEvent::Session {
             attempt: AttemptId(0),
             event,
@@ -1358,6 +1400,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_approval_denied_off_a_terminal_starts_on_its_own_line() {
+        let screen = Screen::default();
+        let console = Console::with_output(Box::new(screen.clone()), Box::new(screen.clone()));
+        let mut renderer = Renderer::new(false, console.clone());
+        renderer.show(&FleetEvent::Session {
+            attempt: AttemptId(0),
+            event: Event::Text("I will run the tests".into()),
+        });
+        let mut approver = Terminal {
+            ask: false,
+            prompter: Prompter::new(),
+            console,
+        };
+        let mut summary = ApprovalSummary::new("Run a shell command");
+        summary.command = Some("make test".into());
+        assert!(!approver.ask(&summary).await);
+        renderer.show(&FleetEvent::Session {
+            attempt: AttemptId(0),
+            event: Event::Text("Done".into()),
+        });
+        let shown = String::from_utf8(screen.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            shown.starts_with(
+                "I will run the tests\noctet: denied an approval (Run a shell command: make test)"
+            ),
+            "{shown:?}"
+        );
+        assert!(shown.ends_with("unattended runs.\nDone"), "{shown:?}");
+    }
+
     #[test]
     fn events_are_json_lines_with_their_step() {
         let started = fleet_event_json(&FleetEvent::AttemptStarted {
@@ -1370,7 +1443,7 @@ mod tests {
         assert_eq!(started["type"], "attempt_started");
         assert_eq!(started["round"], 2);
         assert_eq!(started["model"], Value::Null);
-        let mut renderer = Renderer::new(true);
+        let mut renderer = Renderer::new(true, Console::new());
         renderer.show(&FleetEvent::AttemptStarted {
             attempt: AttemptId(3),
             step: "implement".into(),
