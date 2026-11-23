@@ -352,6 +352,100 @@ pub async fn read_artifact_meta(dir: &RunDir, id: ArtifactId) -> Result<Artifact
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Reads every whole record of run `dir`'s log without changing the file: a
+/// torn last line is left in place and skipped, and a missing log has no
+/// records. For readers that hold no lock (`status`) and for the runner,
+/// which appends through its own [`Log`].
+///
+/// # Errors
+///
+/// [`StoreError::Corrupt`] when a complete line is not a [`Record`];
+/// [`StoreError::Io`] when the file cannot be read.
+pub async fn read_log(dir: &RunDir) -> Result<Vec<Record>, StoreError> {
+    let bytes = match tokio::fs::read(dir.root.join("log.jsonl")).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let whole = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    bytes[..whole]
+        .split_inclusive(|&b| b == b'\n')
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_slice(line).map_err(|source| StoreError::Corrupt {
+                line: index + 1,
+                source,
+            })
+        })
+        .collect()
+}
+
+/// The metadata of every artifact whose files [`write_artifact`] finished,
+/// by ID. An artifact a crash left without its metadata is not listed; one
+/// whose metadata exists but that no record names yet is (replay ignores it).
+///
+/// # Errors
+///
+/// [`StoreError::Io`] when the directory or a file cannot be read;
+/// [`StoreError::Json`] when a metadata file does not parse.
+pub async fn read_artifact_metas(dir: &RunDir) -> Result<Vec<ArtifactMeta>, StoreError> {
+    let mut entries = tokio::fs::read_dir(dir.root.join("artifacts")).await?;
+    let mut metas = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        metas.push(read_artifact_meta(dir, ArtifactId(id)).await?);
+    }
+    metas.sort_by_key(|meta| meta.id);
+    Ok(metas)
+}
+
+/// Reads an artifact's body, `artifacts/<id>.<ext>`.
+///
+/// # Errors
+///
+/// [`StoreError::Io`] when it is absent or unreadable.
+pub async fn read_artifact_body(
+    dir: &RunDir,
+    id: ArtifactId,
+    ext: &str,
+) -> Result<Vec<u8>, StoreError> {
+    Ok(tokio::fs::read(artifact_path(dir, id, ext)).await?)
+}
+
+/// The IDs of every run under `data_dir`, sorted (so oldest first).
+///
+/// # Errors
+///
+/// [`StoreError::Io`] when the fleet directory exists but cannot be read.
+pub async fn list_runs(data_dir: &Path) -> Result<Vec<String>, StoreError> {
+    let fleet = data_dir.join("fleet");
+    let mut entries = match tokio::fs::read_dir(&fleet).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut runs = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let is_run = run_root(data_dir, &name).is_some()
+            && tokio::fs::try_exists(entry.path().join("run.json")).await?;
+        if is_run {
+            runs.push(name);
+        }
+    }
+    runs.sort();
+    Ok(runs)
+}
+
 /// The directory an attempt keeps its journal, scratch clone and patch in. No
 /// I/O: the directory is made when the attempt starts.
 #[must_use]

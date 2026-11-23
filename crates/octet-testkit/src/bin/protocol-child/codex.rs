@@ -179,14 +179,16 @@ impl CodexFixture {
     }
 
     /// Performs the fleet script's turn for `text`, if it has one: its reply
-    /// and the turn's end, or no end at all for a held turn, which stays open
-    /// until interrupted, like `HOLD`.
+    /// and the turn's end, its usage-limit failure, or no end at all for a
+    /// held turn, which stays open until interrupted, like `HOLD`.
     fn fleet_turn(&self, text: &str) -> bool {
         let cwd = std::env::current_dir().unwrap();
         let Some(scripted) = fleet::turn(text, &cwd, self.resumed) else {
             return false;
         };
-        if !scripted.hold {
+        if scripted.fail {
+            fail(&self.active);
+        } else if !scripted.hold {
             fleet_reply(&self.active, &scripted.reply);
             if scripted.exit_after {
                 process::exit(0);

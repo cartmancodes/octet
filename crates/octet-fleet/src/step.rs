@@ -8,6 +8,10 @@
 //! [`FleetEvent::Session`], answers approvals (always deny for a read-only
 //! step, else the [`Approver`]'s answer), logs each new vendor session ID,
 //! and waits out the vendor's background tasks before it takes the reply.
+//! A reply its [`FollowUp`] does not accept gets that follow-up prompt once,
+//! in the same session. The run's interrupt ([`AttemptPlan::interrupt`])
+//! ends the turn with [`TurnEnd::Interrupted`]; the future itself is never
+//! dropped.
 //!
 //! Log appends are awaited in the loop's bodies, never inside a `select!`:
 //! [`Log::append`] is not cancel-safe.
@@ -25,7 +29,6 @@ use octet_core::{
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::FleetEvent;
 use crate::classify::{FailureClass, classify};
 use crate::gate;
 use crate::machine::Dispatch;
@@ -33,6 +36,7 @@ use crate::ownership;
 use crate::record::{AttemptId, Identity, Record};
 use crate::store::{Log, StoreError};
 use crate::validate::Step;
+use crate::{FleetEvent, Signals, signalled};
 
 /// How long the gate may take to register its PID after the session opens.
 const REGISTRATION: Duration = Duration::from_secs(30);
@@ -62,6 +66,29 @@ pub struct AttemptPlan<'a> {
     pub marker: String,
     /// Octet's data directory, for a provider that keeps files there.
     pub data_dir: PathBuf,
+    /// The run's signals: once this holds a signal's name, the turn ends
+    /// with [`TurnEnd::Interrupted`]. `None`: never interrupted.
+    pub interrupt: Option<Signals>,
+    /// The one follow-up a reply may get, in the same session.
+    pub follow_up: Option<FollowUp<'a>>,
+}
+
+/// A prompt sent once, in the same session, after a reply that `accept`
+/// refuses (the contract's corrective prompt). The reply to it is the
+/// attempt's reply, accepted or not.
+pub struct FollowUp<'a> {
+    /// Whether a reply is acceptable as it is.
+    pub accept: &'a (dyn Fn(&str) -> bool + Sync),
+    /// The prompt sent after a reply `accept` refuses.
+    pub prompt: String,
+}
+
+impl std::fmt::Debug for FollowUp<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FollowUp")
+            .field("prompt", &self.prompt)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Answers a write step's approval requests; the front end implements it.
@@ -84,8 +111,8 @@ pub enum TurnEnd {
     },
     /// The turn, or the session, failed; the text says how.
     Failed(FailureClass, String),
-    /// The run's own interrupt ended the turn. The runner's interrupt hook
-    /// (Task 14) produces it; nothing in this module does yet.
+    /// The run's own interrupt ([`AttemptPlan::interrupt`]) ended the turn,
+    /// or the registration before it.
     Interrupted,
 }
 
@@ -107,9 +134,9 @@ pub enum StepError {
 ///
 /// **Not cancel-safe.** The future appends to the run log, so dropping it
 /// (in a `select!` or a `timeout`) can cut an append short, and `Session`'s
-/// `Drop` does not wait for the journal's tail. Interrupting an attempt must
-/// end its turn through a hook that returns [`TurnEnd::Interrupted`] (Task
-/// 14), never by dropping this future.
+/// `Drop` does not wait for the journal's tail. An attempt is interrupted
+/// through [`AttemptPlan::interrupt`], which ends the turn with
+/// [`TurnEnd::Interrupted`], never by dropping this future.
 ///
 /// # Errors
 ///
@@ -145,9 +172,12 @@ async fn attend(
     events: &mpsc::Sender<FleetEvent>,
 ) -> Result<TurnEnd, StepError> {
     let mut early = VecDeque::new();
-    let identities = match register(session, &plan.attempt_dir, &mut early).await {
+    let mut interrupt = plan.interrupt.clone();
+    let registered = register(session, &plan.attempt_dir, &mut early, &mut interrupt).await;
+    let identities = match registered {
         Ok(identities) => identities,
-        Err(detail) => return Ok(local(detail)),
+        Err(Unregistered::Failed(detail)) => return Ok(local(detail)),
+        Err(Unregistered::Interrupted) => return Ok(TurnEnd::Interrupted),
     };
     let record = Record::AttemptSession {
         attempt: plan.attempt,
@@ -209,42 +239,54 @@ async fn open(plan: &AttemptPlan<'_>, engine: Engine, mode: Mode) -> Result<Sess
         .map_err(|error| format!("Cannot open the session: {error}"))
 }
 
+/// Why the vendor was not registered; the gate stays held either way.
+enum Unregistered {
+    /// Registration failed, as the text says.
+    Failed(String),
+    /// The run's interrupt came first.
+    Interrupted,
+}
+
 /// Waits for the gate to register at least one PID and reads each one's
 /// identity. Session events that arrive meanwhile are kept in `early`, in
-/// order. Any failure leaves the gate held.
+/// order. Any failure, and the run's interrupt, leaves the gate held.
 async fn register(
     session: &mut Session,
     dir: &Path,
     early: &mut VecDeque<Event>,
-) -> Result<Vec<Identity>, String> {
+    interrupt: &mut Option<Signals>,
+) -> Result<Vec<Identity>, Unregistered> {
     let deadline = Instant::now() + REGISTRATION;
     let pids = loop {
-        let pids = gate::read_processes(dir)
-            .await
-            .map_err(|error| format!("Cannot read the vendor's registration: {error}"))?;
+        let pids = gate::read_processes(dir).await.map_err(|error| {
+            Unregistered::Failed(format!("Cannot read the vendor's registration: {error}"))
+        })?;
         if !pids.is_empty() {
             break pids;
         }
         if Instant::now() >= deadline {
-            return Err(format!(
+            return Err(Unregistered::Failed(format!(
                 "The vendor gate did not register within {} s",
                 REGISTRATION.as_secs()
-            ));
+            )));
         }
         tokio::select! {
             event = session.events.recv() => {
                 let Some(event) = event else {
-                    return Err(ended_before_registration(early));
+                    return Err(Unregistered::Failed(ended_before_registration(early)));
                 };
                 early.push_back(event);
             }
             () = tokio::time::sleep(REGISTRATION_POLL) => {}
+            _ = signalled(interrupt) => return Err(Unregistered::Interrupted),
         }
     };
     let mut identities = Vec::with_capacity(pids.len());
     for pid in pids {
         let Some(start) = ownership::start_time(pid).await else {
-            return Err(format!("Cannot read the start time of process {pid}"));
+            return Err(Unregistered::Failed(format!(
+                "Cannot read the start time of process {pid}"
+            )));
         };
         identities.push(Identity { pid, start });
     }
@@ -330,6 +372,12 @@ struct Turn<'p> {
     read_only: bool,
     /// The prompt, until it is sent.
     prompt: Option<String>,
+    /// The follow-up, until it is sent.
+    follow_up: Option<FollowUp<'p>>,
+    /// The run's signals.
+    interrupt: Option<Signals>,
+    /// The run's interrupt came while an approval was asked.
+    interrupted: bool,
     /// Events read but not yet handled.
     queue: VecDeque<Event>,
     /// Approvals whose `ApprovalClosed` is in `queue`: read ahead of their
@@ -355,6 +403,12 @@ impl<'p> Turn<'p> {
             engine: &plan.step.profile.engine,
             read_only: plan.step.read_only(),
             prompt: Some(plan.prompt.clone()),
+            follow_up: plan.follow_up.as_ref().map(|f| FollowUp {
+                accept: f.accept,
+                prompt: f.prompt.clone(),
+            }),
+            interrupt: plan.interrupt.clone(),
+            interrupted: false,
             closed: early.iter().filter_map(closed_id).collect(),
             queue: early,
             running: false,
@@ -380,11 +434,14 @@ impl<'p> Turn<'p> {
                 tokio::select! {
                     event = session.next() => event,
                     () = self.background.grace_over(), if self.held => {
-                        if !self.background.pending() {
-                            return Ok(self.replied());
+                        if !self.background.pending()
+                            && let Some(end) = self.complete(session)
+                        {
+                            return Ok(end);
                         }
                         continue;
                     }
+                    _ = signalled(&mut self.interrupt) => return Ok(TurnEnd::Interrupted),
                 }
             };
             let Some(event) = event else {
@@ -451,6 +508,9 @@ impl<'p> Turn<'p> {
                 } else {
                     self.ask(approver, &summary, id, session).await
                 };
+                if self.interrupted {
+                    return Ok(Some(TurnEnd::Interrupted));
+                }
                 // An answer that cannot be delivered leaves the request to
                 // time out, which denies it.
                 if let Some(allow) = allow {
@@ -459,7 +519,7 @@ impl<'p> Turn<'p> {
             }
             Event::Finished { outcome } => {
                 self.running = false;
-                return Ok(self.finished(&outcome));
+                return Ok(self.finished(&outcome, session));
             }
             Event::Stopped => return Ok(Some(self.stopped())),
             _ => {}
@@ -469,7 +529,8 @@ impl<'p> Turn<'p> {
 
     /// Asks the approver while still reading the session, so a slow answer
     /// cannot stall it. `None` when the request closed (timed out or
-    /// withdrawn) or the session ended first: there is nothing to answer.
+    /// withdrawn) or the session ended first: there is nothing to answer;
+    /// and when the run's interrupt came, which sets `interrupted`.
     async fn ask(
         &mut self,
         approver: &mut dyn Approver,
@@ -478,9 +539,14 @@ impl<'p> Turn<'p> {
         session: &mut (impl Link + Send),
     ) -> Option<bool> {
         let mut asking = approver.ask(summary);
+        let mut interrupt = self.interrupt.clone();
         loop {
             tokio::select! {
                 allow = &mut asking => return Some(allow),
+                _ = signalled(&mut interrupt) => {
+                    self.interrupted = true;
+                    return None;
+                }
                 event = session.next() => match event {
                     Some(event) => {
                         let closed = closed_id(&event);
@@ -499,14 +565,14 @@ impl<'p> Turn<'p> {
     }
 
     /// A turn ended: the reply, unless background work may start another
-    /// turn, or the turn's failure.
-    fn finished(&mut self, outcome: &Outcome) -> Option<TurnEnd> {
+    /// turn or the reply gets its follow-up, or the turn's failure.
+    fn finished(&mut self, outcome: &Outcome, session: &impl Link) -> Option<TurnEnd> {
         match outcome {
             Outcome::Completed if self.background.pending() => {
                 self.held = true;
                 None
             }
-            Outcome::Completed => Some(self.replied()),
+            Outcome::Completed => self.complete(session),
             Outcome::Interrupted => {
                 let detail = self
                     .error
@@ -541,6 +607,24 @@ impl<'p> Turn<'p> {
             Some(detail) => TurnEnd::Failed(classify(self.engine, &detail, mid_turn), detail),
             None => TurnEnd::Failed(FailureClass::Unknown, UNFINISHED.into()),
         }
+    }
+
+    /// The turn's work is done: its reply, unless the follow-up is due,
+    /// which is then sent and the turn goes on.
+    fn complete(&mut self, session: &impl Link) -> Option<TurnEnd> {
+        let due = self
+            .follow_up
+            .as_ref()
+            .is_some_and(|follow_up| !(follow_up.accept)(&self.reply.text));
+        if due && let Some(follow_up) = self.follow_up.take() {
+            if let Err(error) = session.send(Command::Prompt(follow_up.prompt)) {
+                return Some(local(format!("Cannot send the follow-up prompt: {error}")));
+            }
+            self.held = false;
+            self.reply = Reply::default();
+            return None;
+        }
+        Some(self.replied())
     }
 
     fn replied(&mut self) -> TurnEnd {
@@ -645,6 +729,8 @@ mod tests {
             attempt_dir: temp.path().to_path_buf(),
             marker: "r/0".into(),
             data_dir: temp.path().to_path_buf(),
+            interrupt: None,
+            follow_up: None,
         };
         // Two requests wait; the engine closes both at once, the second
         // first, while the first is being asked.
@@ -688,6 +774,196 @@ mod tests {
         );
         // Neither closed request is answered.
         assert_eq!(session.sent.into_inner(), [Command::Prompt("go".into())]);
+    }
+
+    /// A run log in `temp`, for a turn to append to.
+    async fn log_in(temp: &TempDir) -> Log {
+        let run_file = RunFile {
+            workflow: crate::sim::shipped(),
+            hash: "0123456789abcdef".into(),
+            task: "a task".into(),
+            top: PathBuf::from("/work/repo"),
+            cwd_rel: PathBuf::new(),
+            base: CandidateId(0),
+            base_tree: "t0".into(),
+            octet_version: "0.0.0-test".into(),
+        };
+        let run = store::create(temp.path(), "f0000000001-abcd", &run_file)
+            .await
+            .expect("run");
+        Log::open(&run).await.expect("log").0
+    }
+
+    /// Drives a turn of the shipped workflow's step `step` over `events`,
+    /// with `interrupt` and `follow_up` and an approver that never answers;
+    /// its end and the commands sent.
+    async fn turn_over(
+        step: usize,
+        events: Vec<Event>,
+        interrupt: Option<Signals>,
+        follow_up: Option<FollowUp<'_>>,
+    ) -> (TurnEnd, Vec<Command>) {
+        let temp = TempDir::new("octet-fleet-step-unit");
+        let mut log = log_in(&temp).await;
+        let workflow = crate::sim::shipped();
+        let dispatch = Dispatch {
+            step: 0,
+            round: 1,
+            input_candidate: CandidateId(0),
+            requires: Vec::new(),
+            history: Vec::new(),
+            resume_session: None,
+            not_before: None,
+        };
+        let plan = AttemptPlan {
+            step: &workflow.steps[step],
+            dispatch: &dispatch,
+            attempt: AttemptId(0),
+            prompt: "go".into(),
+            cwd: temp.path().to_path_buf(),
+            attempt_dir: temp.path().to_path_buf(),
+            marker: "r/0".into(),
+            data_dir: temp.path().to_path_buf(),
+            interrupt,
+            follow_up,
+        };
+        let mut session = Script {
+            events: events.into(),
+            sent: RefCell::default(),
+        };
+        let mut approver = Silent(Arc::new(AtomicUsize::new(0)));
+        let (tx, _rx) = mpsc::channel(64);
+        let end = tokio::time::timeout(
+            Duration::from_secs(5),
+            Turn::new(&plan, VecDeque::new()).drive(&mut session, &mut log, &mut approver, &tx),
+        )
+        .await
+        .expect("the turn ended")
+        .expect("no log error");
+        (end, session.sent.into_inner())
+    }
+
+    fn turn_of(text: &str) -> [Event; 3] {
+        [
+            Event::Started,
+            Event::Text(text.into()),
+            Event::Finished {
+                outcome: Outcome::Completed,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_refused_reply_gets_its_follow_up_once() {
+        let ready = Event::Ready {
+            session: String::new(),
+        };
+        let accept = |text: &str| text == "good";
+        let follow_up = || FollowUp {
+            accept: &accept,
+            prompt: "fix it".into(),
+        };
+        // Refused, then accepted.
+        let events: Vec<Event> = std::iter::once(ready.clone())
+            .chain(turn_of("bad"))
+            .chain(turn_of("good"))
+            .collect();
+        let (end, sent) = turn_over(0, events, None, Some(follow_up())).await;
+        assert_eq!(
+            end,
+            TurnEnd::Replied {
+                text: "good".into()
+            }
+        );
+        assert_eq!(
+            sent,
+            [
+                Command::Prompt("go".into()),
+                Command::Prompt("fix it".into())
+            ]
+        );
+        // Refused twice: the second reply is the attempt's, with no third prompt.
+        let events: Vec<Event> = std::iter::once(ready.clone())
+            .chain(turn_of("bad"))
+            .chain(turn_of("worse"))
+            .collect();
+        let (end, sent) = turn_over(0, events, None, Some(follow_up())).await;
+        assert_eq!(
+            end,
+            TurnEnd::Replied {
+                text: "worse".into()
+            }
+        );
+        assert_eq!(sent.len(), 2);
+        // Accepted at once: no follow-up.
+        let events: Vec<Event> = std::iter::once(ready).chain(turn_of("good")).collect();
+        let (end, sent) = turn_over(0, events, None, Some(follow_up())).await;
+        assert_eq!(
+            end,
+            TurnEnd::Replied {
+                text: "good".into()
+            }
+        );
+        assert_eq!(sent, [Command::Prompt("go".into())]);
+    }
+
+    #[tokio::test]
+    async fn the_run_interrupt_ends_the_turn() {
+        let (signal, signals) = tokio::sync::watch::channel(None);
+        let events = vec![
+            Event::Ready {
+                session: String::new(),
+            },
+            Event::Started,
+            Event::Text("partial".into()),
+        ];
+        let interrupting = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            signal.send(Some("SIGTERM")).expect("the turn listens");
+        };
+        let ((end, _), ()) = tokio::join!(turn_over(0, events, Some(signals), None), interrupting);
+        assert_eq!(end, TurnEnd::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn a_signal_sent_before_the_turn_waits_ends_it() {
+        let (signal, signals) = tokio::sync::watch::channel(None);
+        signal.send(Some("SIGINT")).expect("the turn listens");
+        let events = vec![
+            Event::Ready {
+                session: String::new(),
+            },
+            Event::Started,
+        ];
+        let (end, _) = turn_over(0, events, Some(signals), None).await;
+        assert_eq!(end, TurnEnd::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn the_run_interrupt_ends_an_approval_being_asked() {
+        let workflow = crate::sim::shipped();
+        let write = workflow
+            .steps
+            .iter()
+            .position(|step| !step.read_only())
+            .expect("a write step");
+        let (signal, signals) = tokio::sync::watch::channel(None);
+        let events = vec![
+            Event::Ready {
+                session: String::new(),
+            },
+            Event::Started,
+            approval(1),
+        ];
+        let interrupting = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            signal.send(Some("SIGINT")).expect("the turn listens");
+        };
+        let ((end, sent), ()) =
+            tokio::join!(turn_over(write, events, Some(signals), None), interrupting);
+        assert_eq!(end, TurnEnd::Interrupted);
+        // The request is left unanswered.
+        assert_eq!(sent, [Command::Prompt("go".into())]);
     }
 
     #[test]

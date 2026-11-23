@@ -228,7 +228,7 @@ fn after_a_failure(def: &Resolved, state: &RunState) -> Option<Next> {
 /// accepted attempt or a failure of another class. Unfinished attempts (a
 /// crash, an interrupt) neither count nor end the streak, so they cannot
 /// reset the retries.
-fn transient_streak(state: &RunState, step: usize) -> u32 {
+pub(crate) fn transient_streak(state: &RunState, step: usize) -> u32 {
     let mut failures: u32 = 0;
     for info in state
         .attempts
@@ -245,6 +245,28 @@ fn transient_streak(state: &RunState, step: usize) -> u32 {
         }
     }
     failures
+}
+
+/// The backoff before transient retry `count` (from 1), in seconds: 1, 5,
+/// then 15 minutes (spec, "Failures"); later retries wait 15 minutes too.
+pub const RETRY_BACKOFF_SECS: [u64; 3] = [60, 300, 900];
+
+/// The longest a usage limit's reset time may push a retry out, in seconds
+/// (a day): a reset time further away is taken for a misread clock.
+pub const MAX_RESET_WAIT_SECS: u64 = 24 * 60 * 60;
+
+/// When transient retry `count` (from 1) may start, in seconds since the
+/// Unix epoch: the backoff from `now`, or the reset time the error named
+/// when that is later (but at most [`MAX_RESET_WAIT_SECS`] away). A reset
+/// time in the past, or a wrong one, never shortens the backoff.
+#[must_use]
+pub fn retry_at(now: u64, count: u32, reset_at: Option<u64>) -> u64 {
+    let index = usize::try_from(count.max(1) - 1)
+        .unwrap_or(usize::MAX)
+        .min(RETRY_BACKOFF_SECS.len() - 1);
+    let backoff = now.saturating_add(RETRY_BACKOFF_SECS[index]);
+    let reset = reset_at.map_or(0, |at| at.min(now.saturating_add(MAX_RESET_WAIT_SECS)));
+    backoff.max(reset)
 }
 
 /// A stall: the point it is waived at and a line for the user.
@@ -613,6 +635,20 @@ fn requirements(state: &RunState, artifact: ArtifactId) -> BTreeSet<ArtifactId> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retries_back_off_one_five_then_fifteen_minutes() {
+        use super::retry_at;
+        assert_eq!(retry_at(1_000, 1, None), 1_060);
+        assert_eq!(retry_at(1_000, 2, None), 1_300);
+        assert_eq!(retry_at(1_000, 3, None), 1_900);
+        assert_eq!(retry_at(1_000, 9, None), 1_900);
+        // A later reset time wins; an earlier or absurd one does not shorten
+        // the backoff, and a far one is cut to a day.
+        assert_eq!(retry_at(1_000, 1, Some(5_000)), 5_000);
+        assert_eq!(retry_at(1_000, 1, Some(10)), 1_060);
+        assert_eq!(retry_at(1_000, 1, Some(u64::MAX)), 1_000 + 24 * 60 * 60);
+    }
+
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 

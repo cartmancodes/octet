@@ -121,6 +121,8 @@ impl Bench {
             attempt_dir: self.attempt_dir(),
             marker: format!("{RUN}/0"),
             data_dir: self.dir.path().join("data"),
+            interrupt: None,
+            follow_up: None,
         }
     }
 

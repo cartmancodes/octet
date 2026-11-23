@@ -294,8 +294,9 @@ impl ClaudeFixture {
     }
 
     /// Performs the fleet script's turn for the user message `v`, if it has
-    /// one: its reply and the turn's end, or only the turn's start for a held
-    /// turn, which stays open until interrupted, like `HOLD`.
+    /// one: its reply and the turn's end, its usage-limit failure, or only the
+    /// turn's start for a held turn, which stays open until interrupted, like
+    /// `HOLD`.
     fn fleet_turn(&self, v: &Value) -> bool {
         let text = v
             .pointer("/message/content/0/text")
@@ -305,7 +306,12 @@ impl ClaudeFixture {
         let Some(scripted) = fleet::turn(text, &cwd, self.launched_with("--resume")) else {
             return false;
         };
-        if scripted.hold {
+        if scripted.fail {
+            emit(&claude_init(self.sid));
+            emit(
+                &json!({"type":"result","subtype":"error_during_execution","is_error":true,"errors":["Claude AI usage limit reached"],"session_id":self.sid,"total_cost_usd":0.0}),
+            );
+        } else if scripted.hold {
             emit(&claude_init(self.sid));
         } else {
             self.say(&scripted.reply);

@@ -12,7 +12,9 @@
 //! reads the identity, observes the tree, appends `evidence_command`, and only
 //! then writes the go line. On the first observation that is not the
 //! candidate's tree the pass stops and the caller starts the next one (see
-//! [`EvidenceOutcome::Changed`]).
+//! [`EvidenceOutcome::Changed`]). The run's interrupt kills the running
+//! command's group and ends the pass before its result is logged
+//! ([`EvidenceOutcome::Interrupted`]).
 
 use std::io::SeekFrom;
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,12 +25,14 @@ use std::time::{Duration, Instant};
 use octet_proc::GroupLeader;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use crate::contract::CommandSummary;
 use crate::ownership::start_time;
 use crate::record::{AttemptId, CandidateId, Identity, Record};
 use crate::snapshot::{Repo, SnapshotError, take};
 use crate::store::{Log, StoreError};
+use crate::{FleetEvent, Signals, signal_now, signalled};
 
 /// How many restarts a tests attempt may make: a third change is unstable.
 const MAX_RESTARTS: u32 = 2;
@@ -85,6 +89,12 @@ pub struct EvidenceRun<'a> {
     /// The attempt's directory: output goes to `evidence/<restart>-<index>.out`,
     /// the scratch index to `index.tmp`.
     pub attempt_dir: PathBuf,
+    /// The run's signals: once this holds a signal's name, the running
+    /// command's group is killed and the pass ends. `None`: never.
+    pub interrupt: Option<Signals>,
+    /// Where [`FleetEvent::EvidenceCommand`] goes as each command is
+    /// released. `None`: nowhere.
+    pub events: Option<mpsc::Sender<FleetEvent>>,
 }
 
 /// What one command did.
@@ -140,6 +150,9 @@ pub enum EvidenceOutcome {
     },
     /// An observation differed on the last allowed pass.
     Unstable,
+    /// The run's interrupt ended the pass: a command released and not yet
+    /// done was killed with its group, and its result is not in the log.
+    Interrupted(&'static str),
 }
 
 /// The outcome of a pass that saw `observed` where `tree` belonged.
@@ -184,6 +197,8 @@ enum Step {
     Done(CommandResult),
     /// An observation was this tree, not the candidate's.
     Observed(String),
+    /// The run's interrupt came; the command, if released, was killed.
+    Interrupted(&'static str),
 }
 
 /// Kills `leader`'s group, then reaps the leader so no zombie is left.
@@ -221,6 +236,8 @@ pub async fn run(run: EvidenceRun<'_>) -> Result<EvidenceOutcome, EvidenceError>
         marker,
         pause_hook,
         attempt_dir,
+        interrupt,
+        events,
         candidate: _,
     } = run;
     let pass = Pass {
@@ -233,11 +250,17 @@ pub async fn run(run: EvidenceRun<'_>) -> Result<EvidenceOutcome, EvidenceError>
         pause_hook: pause_hook.as_deref(),
         evidence_dir: &evidence_dir,
         scratch_index: attempt_dir.join("index.tmp"),
+        interrupt,
+        events,
     };
     for (index, command) in commands.iter().enumerate() {
+        if let Some(signal) = signal_now(pass.interrupt.as_ref()) {
+            return Ok(EvidenceOutcome::Interrupted(signal));
+        }
         match pass.command(log, index, command).await? {
             Step::Done(result) => results.push(result),
             Step::Observed(observed) => return Ok(changed(observed, restart)),
+            Step::Interrupted(signal) => return Ok(EvidenceOutcome::Interrupted(signal)),
         }
     }
     let passed = results
@@ -257,6 +280,8 @@ struct Pass<'a> {
     pause_hook: Option<&'a Path>,
     evidence_dir: &'a Path,
     scratch_index: PathBuf,
+    interrupt: Option<Signals>,
+    events: Option<mpsc::Sender<FleetEvent>>,
 }
 
 impl Pass<'_> {
@@ -288,6 +313,12 @@ impl Pass<'_> {
             kill_and_reap(&mut leader).await;
             return Ok(Step::Observed(pre_tree));
         }
+        // Interrupted before release: the command never runs.
+        if let Some(signal) = signal_now(self.interrupt.as_ref()) {
+            drop(stdin);
+            kill_and_reap(&mut leader).await;
+            return Ok(Step::Interrupted(signal));
+        }
         log.append(&Record::EvidenceCommand {
             attempt: self.attempt,
             restart: self.restart,
@@ -297,13 +328,31 @@ impl Pass<'_> {
             pre_tree: pre_tree.clone(),
         })
         .await?;
+        if let Some(events) = &self.events {
+            // Nobody listening is not a reason to stop the pass.
+            let _ = events
+                .send(FleetEvent::EvidenceCommand {
+                    index,
+                    command: command.to_owned(),
+                })
+                .await;
+        }
         // Release: the go line, then end of file.
         let started = Instant::now();
         if let Some(mut pipe) = stdin.take() {
             pipe.write_all(b"go\n").await?;
             pipe.shutdown().await?;
         }
-        let in_time = leader.exited_within(self.timeout).await;
+        let mut interrupt = self.interrupt.clone();
+        let in_time = tokio::select! {
+            in_time = leader.exited_within(self.timeout) => in_time,
+            signal = signalled(&mut interrupt) => {
+                // Its result is never logged: the record of this pass stays
+                // without it, which recovery reads as an interrupted pass.
+                kill_and_reap(&mut leader).await;
+                return Ok(Step::Interrupted(signal));
+            }
+        };
         // Kill in both cases: a member left behind by a command that finished
         // must not edit the tree after the post observation. The leader is
         // still unreaped, so its group id still names this group.
@@ -494,6 +543,8 @@ mod tests {
                 marker: "f0000000001-0001/0".into(),
                 pause_hook,
                 attempt_dir: self.attempt_dir.clone(),
+                interrupt: None,
+                events: None,
             })
             .await
             .expect("the pass runs")
@@ -866,6 +917,8 @@ mod tests {
                 marker: "m".into(),
                 pause_hook: Some(hook),
                 attempt_dir,
+                interrupt: None,
+                events: None,
             })
             .await
         });
@@ -882,6 +935,61 @@ mod tests {
         );
         assert!(!ran.exists(), "it never ran");
         assert!(f.records().await.is_empty(), "and it was never recorded");
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_kills_the_running_command_before_its_result() {
+        let f = Fixture::new().await;
+        let token = "marker-41771";
+        let started = f.side("started");
+        let commands = cmds(&[&format!(
+            "echo {token}; touch '{}'; sleep 60",
+            started.display()
+        )]);
+        let (repo, mut log, tree, attempt_dir) = (
+            f.repo.clone(),
+            Log::open(&f.run_dir).await.expect("log").0,
+            f.tree.clone(),
+            f.attempt_dir.clone(),
+        );
+        let (signal, signals) = tokio::sync::watch::channel(None);
+        let (events, mut released) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            run(EvidenceRun {
+                repo: &repo,
+                log: &mut log,
+                attempt: AttemptId(0),
+                candidate: CandidateId(0),
+                tree,
+                restart: 0,
+                commands: &commands,
+                timeout: Duration::from_secs(60),
+                marker: "m".into(),
+                pause_hook: None,
+                attempt_dir,
+                interrupt: Some(signals),
+                events: Some(events),
+            })
+            .await
+        });
+        assert!(matches!(
+            released.recv().await,
+            Some(FleetEvent::EvidenceCommand { index: 0, .. })
+        ));
+        wait_for(&started).await;
+        signal.send(Some("SIGINT")).expect("the pass listens");
+        let outcome = tokio::time::timeout(PATIENCE, task)
+            .await
+            .expect("the pass ended")
+            .expect("joined")
+            .expect("no error");
+        assert_eq!(outcome, EvidenceOutcome::Interrupted("SIGINT"));
+        assert!(gone(token).await, "the command was killed with its group");
+        let records = f.records().await;
+        assert!(
+            matches!(records.as_slice(), [Record::EvidenceCommand { .. }]),
+            "the command is logged, its result is not: {records:?}"
+        );
     }
 
     #[tokio::test]

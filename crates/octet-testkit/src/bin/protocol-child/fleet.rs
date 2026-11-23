@@ -11,11 +11,16 @@
 //!  "turns": {"<step>#<round>": {"write": {"<rel path>": "<content>"},
 //!                               "delete": ["<rel path>"], "reply": "<text>",
 //!                               "hold": "before_write" | "after_write",
-//!                               "spawn_survivor": true, "exit_after": true}}}
+//!                               "spawn_survivor": true, "exit_after": true,
+//!                               "fail": true}}}
 //! ```
 //!
 //! Every turn field is optional, and so is `startup_marker`. A turn is found
-//! by its key, `<step>#<round>`; a key seen again plays the same turn.
+//! by its key, `<step>#<round>`; a key seen again plays the same turn. A key
+//! may instead map to a list of turns: its first play performs the first,
+//! its second the second, and so on, the last repeating (plays are counted
+//! in the log). `fail` makes the dialect fail the turn as a usage limit
+//! does, after its writes, with no reply.
 //!
 //! Hold modes, for a turn that must be stopped by the run's own interrupt:
 //! - `before_write`: the turn is logged and then held. Nothing else happens:
@@ -57,6 +62,8 @@ pub(crate) struct FleetTurn {
     pub hold: bool,
     /// Exit the process once the reply and the turn's completion are sent.
     pub exit_after: bool,
+    /// Fail the turn as a usage limit does, instead of replying.
+    pub fail: bool,
 }
 
 /// A fleet script. Any field or value this does not know is an error: a
@@ -70,7 +77,27 @@ struct Script {
     #[serde(default)]
     startup_marker: Option<PathBuf>,
     /// The turns, by `<step>#<round>`.
-    turns: BTreeMap<String, Turn>,
+    turns: BTreeMap<String, Turns>,
+}
+
+/// A key's turn, or its turns in the order they are played.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Turns {
+    /// The same turn on every play.
+    One(Turn),
+    /// One turn per play, the last repeating.
+    Many(Vec<Turn>),
+}
+
+impl Turns {
+    /// The turn of play `played` (counting from 0).
+    fn play(&self, played: usize) -> Option<&Turn> {
+        match self {
+            Self::One(turn) => Some(turn),
+            Self::Many(turns) => turns.get(played).or_else(|| turns.last()),
+        }
+    }
 }
 
 /// One scripted turn; every field is optional.
@@ -95,6 +122,9 @@ struct Turn {
     /// Exit after the reply.
     #[serde(default)]
     exit_after: bool,
+    /// Fail the turn as a usage limit does.
+    #[serde(default)]
+    fail: bool,
 }
 
 /// Where a held turn stops; see the module's hold modes.
@@ -129,6 +159,18 @@ fn append(path: &Path, text: &str) {
         .unwrap();
     file.write_all(text.as_bytes()).unwrap();
     file.flush().unwrap();
+}
+
+/// How often `key` was played before: its lines in the turn log `log`.
+fn plays(log: &Path, key: &str) -> usize {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|entry| entry["key"].as_str() == Some(key))
+        })
+        .count()
 }
 
 /// Records this process's start in the script's `startup_marker`, if there
@@ -218,7 +260,8 @@ fn spawn_survivor() {
 pub(crate) fn turn(prompt: &str, cwd: &Path, resumed: bool) -> Option<FleetTurn> {
     let script = script()?;
     let key = key(prompt)?;
-    let turn = script.turns.get(&key);
+    let played = plays(&script.log, &key);
+    let turn = script.turns.get(&key).and_then(|turns| turns.play(played));
     let mut entry = json!({"key": key, "cwd": cwd, "resumed": resumed, "prompt": prompt});
     if turn.is_none() {
         entry["missing"] = json!(true);
@@ -229,6 +272,7 @@ pub(crate) fn turn(prompt: &str, cwd: &Path, resumed: bool) -> Option<FleetTurn>
             reply: format!("fleet-fake: no turn {key}"),
             hold: false,
             exit_after: false,
+            fail: false,
         });
     };
     if matches!(turn.hold, Some(Hold::BeforeWrite)) {
@@ -245,6 +289,7 @@ pub(crate) fn turn(prompt: &str, cwd: &Path, resumed: bool) -> Option<FleetTurn>
         reply: turn.reply.clone(),
         hold: false,
         exit_after: turn.exit_after,
+        fail: turn.fail,
     })
 }
 
@@ -254,6 +299,7 @@ fn held() -> FleetTurn {
         reply: String::new(),
         hold: true,
         exit_after: false,
+        fail: false,
     }
 }
 
@@ -311,8 +357,34 @@ mod tests {
             "delete":["g"],"reply":"r","hold":"after_write","spawn_survivor":true,
             "exit_after":true},"b#1":{}}}"#,
         );
-        assert!(matches!(script.turns["a#1"].hold, Some(Hold::AfterWrite)));
-        assert!(script.turns["b#1"].hold.is_none());
+        let first = |key: &str| script.turns[key].play(0).unwrap();
+        assert!(matches!(first("a#1").hold, Some(Hold::AfterWrite)));
+        assert!(first("b#1").hold.is_none());
+    }
+
+    #[test]
+    fn a_list_of_turns_plays_in_order_and_repeats_its_last() {
+        let script = parse_script(r#"{"log":"l","turns":{"a#1":[{"fail":true},{"reply":"r"}]}}"#);
+        let turns = &script.turns["a#1"];
+        assert!(turns.play(0).unwrap().fail);
+        assert_eq!(turns.play(1).unwrap().reply, "r");
+        assert_eq!(turns.play(5).unwrap().reply, "r");
+    }
+
+    #[test]
+    fn plays_are_counted_in_the_log() {
+        let dir = std::env::temp_dir().join(format!("fleet-plays-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log");
+        fs::write(
+            &log,
+            "{\"key\":\"a#1\"}\n{\"key\":\"b#1\"}\n{\"key\":\"a#1\"}\n",
+        )
+        .unwrap();
+        assert_eq!(plays(&log, "a#1"), 2);
+        assert_eq!(plays(&log, "c#1"), 0);
+        assert_eq!(plays(&dir.join("absent"), "a#1"), 0);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

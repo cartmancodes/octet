@@ -11,6 +11,7 @@ pub mod machine;
 pub mod ownership;
 pub mod record;
 pub mod recover;
+pub mod runner;
 pub mod snapshot;
 pub mod state;
 pub mod step;
@@ -21,6 +22,36 @@ pub mod validate;
 mod sim;
 
 use record::{AttemptId, CandidateId, Origin, PauseReason};
+
+pub use runner::{
+    Clock, RunEnd, RunSummary, RunnerError, RunnerIo, Start, resume, start, status, stop,
+};
+pub use step::Approver;
+
+/// The run's signals: the name of the signal (`SIGINT`, `SIGTERM`) that asked
+/// the run to stop, once one has.
+pub type Signals = tokio::sync::watch::Receiver<Option<&'static str>>;
+
+/// The name of the signal `signals` holds now, if any.
+pub(crate) fn signal_now(signals: Option<&Signals>) -> Option<&'static str> {
+    signals.and_then(|receiver| *receiver.borrow())
+}
+
+/// Resolves with the name of the signal `signals` holds, as soon as it holds
+/// one; never, without a receiver or once its sender is gone. Cancel-safe.
+pub(crate) async fn signalled(signals: &mut Option<Signals>) -> &'static str {
+    if let Some(receiver) = signals {
+        loop {
+            if let Some(signal) = *receiver.borrow_and_update() {
+                return signal;
+            }
+            if receiver.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+    std::future::pending().await
+}
 
 /// What a run reports to its front end, in order, as it happens. The log is
 /// the record of a run; these are for showing it.

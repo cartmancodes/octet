@@ -347,6 +347,17 @@ pub async fn keep(repo: &Repo, run: &str, seq: u32, tree: &str) -> Result<String
     Ok(commit)
 }
 
+/// The commit [`keep`] put under `refs/octet-fleet/<run>/<seq>`.
+///
+/// # Errors
+///
+/// A [`SnapshotError`] when the ref does not exist or git fails.
+pub async fn kept(repo: &Repo, run: &str, seq: u32) -> Result<String, SnapshotError> {
+    let name = format!("refs/octet-fleet/{run}/{seq}^{{commit}}");
+    let out = git(&repo.top, ["rev-parse", "--verify", "--quiet", &name]).await?;
+    Ok(line(&out))
+}
+
 /// The patch from tree or commit `from` to `to`: binary-safe, or a `--stat`
 /// summary when `stat` is set.
 ///

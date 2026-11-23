@@ -152,7 +152,14 @@ fn decided(
             PauseReason::Reconcile,
             Decision::Keep,
             AttemptState::Unfinished { .. } | AttemptState::Failed(_),
-        ) => Some(Next::Run(continued(def, state, info))),
+        ) => {
+            let mut dispatch = continued(def, state, info);
+            // A kept transient failure still waits out its backoff.
+            if matches!(info.state, AttemptState::Failed(Failure::Transient { .. })) {
+                dispatch.not_before = state.retry.get(&attempt).map(|&(_, at)| at);
+            }
+            Some(Next::Run(dispatch))
+        }
         // An unfinished attempt, or one that failed and left the tree
         // changed: replay lets the adopting record finish (or re-open) it.
         (
@@ -248,6 +255,44 @@ fn found(def: &Resolved, state: &RunState, obs: &Observation) -> Next {
             }
         }
     }
+}
+
+/// The decisions open at a pause, as the user names them (spec, "Recovery
+/// and decisions"). `stop` ends every pause; an interrupt needs no decision.
+#[must_use]
+pub fn options(reason: PauseReason) -> Vec<&'static str> {
+    let own: &[&str] = match reason {
+        PauseReason::Reconcile => &["keep", "adopt"],
+        PauseReason::RoundLimit | PauseReason::Stalled => &["continue", "rounds"],
+        PauseReason::Drift => &["adopt"],
+        PauseReason::ProcessesRunning => &["kill", "wait"],
+        PauseReason::ProcessesUnverified => &["release", "wait"],
+        PauseReason::Interrupted => &[],
+        PauseReason::UnstableTests
+        | PauseReason::AccessViolation
+        | PauseReason::InvalidOutput
+        | PauseReason::TransientExhausted
+        | PauseReason::LocalFailure
+        | PauseReason::Unknown => &["retry"],
+    };
+    own.iter().copied().chain(["stop"]).collect()
+}
+
+/// Whether `decision` is one of [`options`]`(reason)`.
+#[must_use]
+pub fn allows(reason: PauseReason, decision: &Decision) -> bool {
+    let name = match decision {
+        Decision::Keep => "keep",
+        Decision::Adopt { .. } => "adopt",
+        Decision::Continue => "continue",
+        Decision::Rounds { .. } => "rounds",
+        Decision::Retry => "retry",
+        Decision::Kill => "kill",
+        Decision::Wait => "wait",
+        Decision::Release { .. } => "release",
+        Decision::Stop => "stop",
+    };
+    options(reason).contains(&name)
 }
 
 /// A new attempt of `info`'s step that continues its vendor session: the
@@ -887,6 +932,60 @@ mod tests {
             restart: 0,
         });
         assert_eq!(case.recover(&edited), evidence);
+    }
+
+    #[test]
+    fn keeping_a_transient_failure_waits_out_its_backoff() {
+        let (mut case, dispatch) = through("implement", 1, vendor);
+        let attempt = case.attempt();
+        let session = session_of(&case, "implement");
+        case.push(Record::AttemptFailed {
+            attempt,
+            failure: Failure::Transient {
+                detail: "overloaded".into(),
+            },
+        });
+        case.push(Record::Retry {
+            attempt,
+            class: "transient".into(),
+            count: 1,
+            eligible_at: 4_000,
+        });
+        let edited = obs("t-edit", true);
+        assert_pause(&case.recover(&edited), PauseReason::Reconcile);
+        case.pause(PauseReason::Reconcile);
+        case.decide(Decision::Keep);
+        assert_eq!(
+            case.recover(&edited),
+            Next::Run(Dispatch {
+                resume_session: Some(session),
+                not_before: Some(4_000),
+                ..dispatch
+            })
+        );
+    }
+
+    #[test]
+    fn every_pause_offers_stop_and_its_own_decisions() {
+        assert_eq!(options(PauseReason::Reconcile), ["keep", "adopt", "stop"]);
+        assert_eq!(options(PauseReason::Interrupted), ["stop"]);
+        assert!(allows(
+            PauseReason::Drift,
+            &Decision::Adopt {
+                candidate: CandidateId(1)
+            }
+        ));
+        assert!(!allows(PauseReason::Drift, &Decision::Keep));
+        assert!(allows(PauseReason::RoundLimit, &Decision::Rounds { n: 9 }));
+        assert!(allows(
+            PauseReason::ProcessesUnverified,
+            &Decision::Release { pids: vec![] }
+        ));
+        assert!(!allows(
+            PauseReason::ProcessesRunning,
+            &Decision::Release { pids: vec![] }
+        ));
+        assert!(allows(PauseReason::Unknown, &Decision::Stop));
     }
 
     /// The `RoundLimit`, `Stalled` and `UnstableTests` rows.
