@@ -711,31 +711,42 @@ impl Drop for Octet {
     }
 }
 
-/// SIGKILLs every process whose `OCTET_FLEET_ATTEMPT` marker names a run in
-/// `data`: a vendor or a test command of a run this test drove.
-fn kill_marked(data: &Path) {
+/// The PIDs of the live processes whose `OCTET_FLEET_ATTEMPT` marker names a
+/// run in `data`: a vendor or a test command of a run this test drove. Empty
+/// when the processes cannot be listed.
+fn marked(data: &Path) -> Vec<u32> {
     let runs = runs_in(data);
     if runs.is_empty() {
-        return;
+        return Vec::new();
     }
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     else {
-        return;
+        return Vec::new();
     };
     let Ok(processes) = runtime.block_on(octet_fleet::ownership::list_processes()) else {
-        return;
+        return Vec::new();
     };
-    for process in processes {
-        let ours = process.marker.as_deref().is_some_and(|marker| {
-            runs.iter().any(|run| {
-                marker
-                    .strip_prefix(run.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
+    processes
+        .into_iter()
+        .filter(|process| {
+            process.marker.as_deref().is_some_and(|marker| {
+                runs.iter().any(|run| {
+                    marker
+                        .strip_prefix(run.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
             })
-        });
-        if ours && let Ok(pid) = i32::try_from(process.pid) {
+        })
+        .map(|process| process.pid)
+        .collect()
+}
+
+/// SIGKILLs every process [`marked`] finds for `data`.
+fn kill_marked(data: &Path) {
+    for pid in marked(data) {
+        if let Ok(pid) = i32::try_from(pid) {
             // SAFETY: kill(2) of a process carrying this test's run marker.
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
@@ -751,9 +762,11 @@ fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// Waits until every process the log or the gate registered for `attempt`
-/// is gone, for at most [`SHORT`].
-fn await_gone(bench: &Bench, records: &[Record], attempt: AttemptId) {
+/// The live processes of `attempt`: those its `attempt_session` records
+/// or its gate registry (`<attempt>/processes`, read afresh) name, and any
+/// carrying a marker of the bench's run.
+fn attempt_processes(bench: &Bench, attempt: AttemptId) -> Vec<u32> {
+    let records = bench.records();
     let mut pids: Vec<u32> = records
         .iter()
         .filter_map(|record| match record {
@@ -777,8 +790,26 @@ fn await_gone(bench: &Bench, records: &[Record], attempt: AttemptId) {
             .lines()
             .filter_map(|line| line.trim().parse::<u32>().ok()),
     );
-    let gone = octet_testkit::wait_until(SHORT, || !pids.iter().any(|&pid| alive(pid)));
-    assert!(gone, "the killed driver's processes {pids:?} outlived it");
+    pids.retain(|&pid| alive(pid));
+    pids.extend(marked(&bench.data));
+    pids
+}
+
+/// Waits until the killed driver's processes of `attempt` are gone, for at
+/// most [`SHORT`]. A gate spawned just before the kill may register itself
+/// late, so "gone" must hold on two looks 200 ms apart.
+fn await_gone(bench: &Bench, attempt: AttemptId) {
+    let mut left = Vec::new();
+    let gone = octet_testkit::wait_until(SHORT, || {
+        left = attempt_processes(bench, attempt);
+        if !left.is_empty() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        left = attempt_processes(bench, attempt);
+        left.is_empty()
+    });
+    assert!(gone, "the killed driver's processes {left:?} outlived it");
 }
 
 // ---- 1. the full run ---------------------------------------------------
@@ -834,7 +865,7 @@ fn the_full_run() {
         .0;
     // The held tester reads its input from Octet: it ends at end of input,
     // and the gate gives up once Octet is gone. Resume starts when they have.
-    await_gone(&bench, &bench.records(), killed);
+    await_gone(&bench, killed);
 
     // From now on the tester writes its test, which fails on the first
     // feature.txt.
@@ -1114,6 +1145,11 @@ fn a_change_used_and_restored_is_caught() {
             "command {index} ran in the voided pass: {records:#?}"
         );
     }
+    // B did run and pass: in pass 1, on the tree A changed.
+    assert_eq!(exit_of(&records, attempt, 1, 1), Some(0), "{records:#?}");
+    let (b_pre, b_post) = observations(&records, attempt, 1, 1);
+    assert!(b_pre.is_some() && b_pre == b_post, "{records:#?}");
+    assert_eq!(b_pre, post, "B ran on the tree A left: {records:#?}");
     // Wherever B ran, its pass was voided too: C's restore changed the tree.
     for record in &records {
         if let Record::EvidenceResult {
@@ -1229,6 +1265,7 @@ fn an_edit_before_completion_is_drift() {
     let Some(Record::Completed {
         candidate,
         tree,
+        evidence,
         observed_tree,
         ..
     }) = records.last()
@@ -1238,6 +1275,28 @@ fn an_edit_before_completion_is_drift() {
     assert_eq!(observed_tree, tree);
     assert_eq!(*tree, bench.live_tree());
     assert_eq!(origin_of(&records, *candidate), Origin::Drift);
+    let body = bench.evidence(*evidence);
+    assert_eq!(body["candidate"], candidate.0);
+    assert_eq!(body["tree"], tree.as_str());
+    // After the drift, the tests and the final review ran again; the coder
+    // did not.
+    let drift = position(&records, |r| {
+        matches!(
+            r,
+            Record::Paused {
+                reason: PauseReason::Drift,
+                ..
+            }
+        )
+    })
+    .unwrap();
+    let again: Vec<&str> = started(&records[drift..])
+        .into_iter()
+        .map(|(_, step)| step)
+        .collect();
+    assert_eq!(again, ["test", "review_change"], "{records:#?}");
+    assert_eq!(bench.plays_of("test#2").len(), 1);
+    assert_eq!(bench.plays_of("review_change#2").len(), 1);
     let listed = git(&bench.work, &["ls-tree", "--name-only", tree]);
     assert!(listed.lines().any(|name| name == "late.txt"), "{listed}");
     bench.assert_passing_evidence_is_whole(&records, commands.len());
@@ -1252,8 +1311,12 @@ fn answer_pauses(dir: PathBuf, stop: Arc<AtomicBool>, edit: impl Fn() + Send + '
     std::thread::spawn(move || {
         let deadline = Instant::now() + PATIENCE;
         while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            // The directory goes with the test: then there is nothing to answer.
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                break;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
                 let Some(point) = name.strip_prefix("held-") else {
                     continue;
                 };
@@ -1264,7 +1327,9 @@ fn answer_pauses(dir: PathBuf, stop: Arc<AtomicBool>, edit: impl Fn() + Send + '
                 if point == "0-1" {
                     edit();
                 }
-                std::fs::write(go, "").unwrap();
+                if std::fs::write(go, "").is_err() {
+                    return;
+                }
             }
             std::thread::sleep(Duration::from_millis(5));
         }
