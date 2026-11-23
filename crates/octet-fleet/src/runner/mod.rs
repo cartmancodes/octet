@@ -41,6 +41,9 @@ use crate::store::{self, Log, RunDir, RunFile, StoreError};
 use crate::validate::Resolved;
 use crate::{Signals, signal_now, signalled};
 
+/// The most diffstat lines a `Drift` pause shows.
+const DIFFSTAT_LINES: usize = 40;
+
 /// What a new run is started with.
 #[derive(Debug, Clone)]
 pub struct Start {
@@ -561,6 +564,11 @@ impl Driver {
     async fn pause(&mut self, reason: PauseReason, detail: String) -> Result<RunEnd, RunnerError> {
         let view = self.load().await?;
         let pending = view.state.pending_pause;
+        let detail = if pending != Some(reason) && reason == PauseReason::Drift {
+            self.with_diffstat(detail).await
+        } else {
+            detail
+        };
         let detail = if pending == Some(reason) {
             last_pause_detail(&view.records).unwrap_or(detail)
         } else if !logs_pause(pending, reason) {
@@ -582,6 +590,35 @@ impl Driver {
             .await;
         }
         Ok(RunEnd::Paused(reason))
+    }
+
+    /// A drift detail with the diffstat between its two trees added before
+    /// its last line (the command for the whole change), at most
+    /// [`DIFFSTAT_LINES`] lines of it.
+    async fn with_diffstat(&self, detail: String) -> String {
+        let Some((expected, live)) = recover::drift_trees(&detail) else {
+            return detail;
+        };
+        let stat = match snapshot::diff(&self.repo, expected, live, true).await {
+            Ok(stat) => {
+                let lines: Vec<&str> = stat.lines().collect();
+                if lines.len() > DIFFSTAT_LINES {
+                    let summary = lines.last().copied().unwrap_or_default();
+                    let more = lines.len() - DIFFSTAT_LINES;
+                    format!(
+                        "{}\n ... {more} more lines\n{summary}",
+                        lines[..DIFFSTAT_LINES - 1].join("\n")
+                    )
+                } else {
+                    lines.join("\n")
+                }
+            }
+            Err(error) => format!("(no diffstat: {error})"),
+        };
+        match detail.rsplit_once('\n') {
+            Some((head, command)) if !stat.is_empty() => format!("{head}\n{stat}\n{command}"),
+            _ => detail,
+        }
     }
 
     /// A signal ended the run's work: `attempt`, if one ran (its turn or an

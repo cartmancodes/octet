@@ -494,13 +494,30 @@ async fn an_edit_after_approval_is_drift() {
             .iter()
             .any(|r| matches!(r, Record::Completed { .. }))
     );
-    assert!(matches!(
-        records.last(),
-        Some(Record::Paused {
-            reason: PauseReason::Drift,
-            ..
-        })
-    ));
+    let Some(Record::Paused {
+        reason: PauseReason::Drift,
+        detail,
+    }) = records.last()
+    else {
+        panic!("{:?}", records.last());
+    };
+    // The pause shows what changed: the diffstat and the command for the
+    // whole diff, between the recorded tree and the live one.
+    assert!(detail.contains("late.txt"), "{detail}");
+    assert!(detail.contains("1 file changed"), "{detail}");
+    let command = detail
+        .lines()
+        .find_map(|line| line.split_once("git diff ").map(|(_, trees)| trees))
+        .unwrap_or_else(|| panic!("no git diff command: {detail}"));
+    let trees: Vec<&str> = command.split_whitespace().collect();
+    assert_eq!(trees.len(), 2, "{detail}");
+    let shown = std::process::Command::new("git")
+        .args(["diff", "--stat", trees[0], trees[1]])
+        .current_dir(&bench.work)
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{shown:?}");
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("late.txt"));
     // `adopt` derives a candidate from the tip; the tests and the review
     // run again on it, the coder does not.
     let (end, _) = resume_with(

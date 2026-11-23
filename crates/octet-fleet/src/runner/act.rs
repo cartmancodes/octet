@@ -13,6 +13,7 @@ use crate::classify::FailureClass;
 use crate::contract::{self, HeaderIds, Patch, PromptInputs};
 use crate::definition::Kind;
 use crate::machine::{self, Dispatch};
+use crate::recover;
 use crate::record::{
     Accepted, ArtifactId, ArtifactMeta, AttemptId, CandidateId, Failure, Finding, Origin,
     PauseReason, Record, Status,
@@ -745,10 +746,8 @@ impl Driver {
             }
         };
         if observed != tree {
-            let detail = format!(
-                "the live tree {observed} is not the approved tree {tree} of candidate {}",
-                candidate.0
-            );
+            let what = format!("the approved candidate {}", candidate.0);
+            let detail = recover::drift_detail(&tree, &observed, &what);
             return self.pause(PauseReason::Drift, detail).await.map(Some);
         }
         self.append(&Record::Completed {

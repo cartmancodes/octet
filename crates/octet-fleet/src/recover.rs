@@ -227,7 +227,11 @@ fn found(def: &Resolved, state: &RunState, obs: &Observation) -> Next {
                 return if machine::tree_of(state, candidate) == Some(obs.live_tree.as_str()) {
                     durable(def, state, obs)
                 } else {
-                    drift_pause(obs, &format!("attempt {}'s evidence", attempt.0))
+                    drift_pause(
+                        obs,
+                        machine::tree_of(state, candidate),
+                        &format!("attempt {}'s evidence", attempt.0),
+                    )
                 };
             }
             let reconcile = !step.read_only() && !matches!(failure, Failure::ConfigError { .. });
@@ -252,12 +256,20 @@ fn found(def: &Resolved, state: &RunState, obs: &Observation) -> Next {
                         restart,
                     }
                 } else {
-                    drift_pause(obs, &format!("attempt {}'s evidence", attempt.0))
+                    drift_pause(
+                        obs,
+                        machine::tree_of(state, candidate),
+                        &format!("attempt {}'s evidence", attempt.0),
+                    )
                 };
             }
             if !(*released && obs.go_created) {
                 return if changed {
-                    drift_pause(obs, &format!("attempt {}, which never ran", attempt.0))
+                    drift_pause(
+                        obs,
+                        input_tree,
+                        &format!("attempt {}, which never ran", attempt.0),
+                    )
                 } else {
                     Next::Run(machine::again(def, state, info))
                 };
@@ -331,17 +343,36 @@ fn durable(def: &Resolved, state: &RunState, obs: &Observation) -> Next {
 fn drift(state: &RunState, obs: &Observation) -> Option<Next> {
     let tip = machine::tree_of(state, state.tip);
     (tip != Some(obs.live_tree.as_str()))
-        .then(|| drift_pause(obs, &format!("candidate {}", state.tip.0)))
+        .then(|| drift_pause(obs, tip, &format!("candidate {}", state.tip.0)))
 }
 
-fn drift_pause(obs: &Observation, expected: &str) -> Next {
+/// A `Drift` pause: the live tree is not `expected`, the tree of `what`.
+fn drift_pause(obs: &Observation, expected: Option<&str>, what: &str) -> Next {
     Next::Pause(
         PauseReason::Drift,
-        format!(
-            "the live tree {} is not the tree of {expected}",
-            obs.live_tree
-        ),
+        drift_detail(expected.unwrap_or("(unknown)"), &obs.live_tree, what),
     )
+}
+
+/// The start of a drift detail's last line, before the command that shows
+/// the whole change.
+const WHOLE_CHANGE: &str = "the whole change: git diff ";
+
+/// A `Drift` pause's detail: both trees, and on its last line the command
+/// that shows the whole change. The runner adds the diffstat before that
+/// line; [`drift_trees`] reads the trees back.
+#[must_use]
+pub fn drift_detail(expected: &str, live: &str, what: &str) -> String {
+    format!("the live tree {live} is not the tree {expected} of {what}\n{WHOLE_CHANGE}{expected} {live}")
+}
+
+/// The recorded and the live tree a [`drift_detail`] names.
+#[must_use]
+pub fn drift_trees(detail: &str) -> Option<(&str, &str)> {
+    let command = detail.lines().last()?.strip_prefix(WHOLE_CHANGE)?;
+    let (expected, live) = command.split_once(' ')?;
+    let hex = |tree: &str| !tree.is_empty() && tree.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex(expected) && hex(live)).then_some((expected, live))
 }
 
 fn reconcile_pause(def: &Resolved, attempt: AttemptId, info: &AttemptInfo) -> Next {
@@ -500,6 +531,19 @@ mod tests {
     /// The vendor session the sim logs for `attempt` of `step`.
     fn session_of(case: &Case, step: &str) -> String {
         format!("{step}-session-{}", case.attempt().0)
+    }
+
+    #[test]
+    fn a_drift_detail_names_both_trees_and_the_command() {
+        let detail = drift_detail("abc123", "def456", "candidate 3");
+        assert_eq!(
+            detail,
+            "the live tree def456 is not the tree abc123 of candidate 3\n\
+             the whole change: git diff abc123 def456"
+        );
+        assert_eq!(drift_trees(&detail), Some(("abc123", "def456")));
+        assert_eq!(drift_trees("the live tree changed"), None);
+        assert_eq!(drift_trees("x\nthe whole change: git diff a; b"), None);
     }
 
     #[test]
