@@ -68,7 +68,7 @@ fn script(attempt_dir: &Path, real_binary: &Path, marker: &str, octet_pid: u32) 
     };
     push(&[b"#!/bin/sh"]);
     push(&[b"export OCTET_FLEET_ATTEMPT=", &quote(OsStr::new(marker))]);
-    push(&[b"echo $$ >> ", &processes]);
+    push(&[b"echo $$ >> ", &processes, b" || exit 125"]);
     push(&[b"if [ ! -e ", &go, b" ]; then"]);
     push(&[b"  n=0"]);
     push(&[
@@ -132,14 +132,22 @@ pub async fn write_gate(
 
 /// The PIDs the gate has registered in `<attempt_dir>/processes`, in order.
 /// Blank and unparseable lines are skipped; no file is no PIDs.
-pub async fn read_processes(attempt_dir: &Path) -> Vec<u32> {
-    let Ok(bytes) = tokio::fs::read(attempt_dir.join(PROCESSES)).await else {
-        return Vec::new();
+///
+/// # Errors
+///
+/// [`GateError::Io`] when the file exists but cannot be read: an unreadable
+/// registry must never pass for an empty one, or a gate would be released
+/// unregistered.
+pub async fn read_processes(attempt_dir: &Path) -> Result<Vec<u32>, GateError> {
+    let bytes = match tokio::fs::read(attempt_dir.join(PROCESSES)).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
     };
-    String::from_utf8_lossy(&bytes)
+    Ok(String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(|line| line.trim().parse().ok())
-        .collect()
+        .collect())
 }
 
 /// Lets the gate through: creates `<attempt_dir>/go` and makes it durable.
@@ -247,7 +255,10 @@ mod tests {
         let mut child = launch(&gate, &["a", "b c"]);
         // It registers itself first.
         assert!(wait_until(QUICK, || !read_processes_now(&attempt).is_empty()));
-        assert_eq!(read_processes(&attempt).await, vec![child.id()]);
+        assert_eq!(
+            read_processes(&attempt).await.expect("read"),
+            vec![child.id()]
+        );
         std::thread::sleep(Duration::from_millis(300));
         assert!(
             !dir.path().join("ran").exists(),
@@ -292,7 +303,10 @@ mod tests {
             "it gave up promptly"
         );
         assert!(!dir.path().join("ran").exists());
-        assert_eq!(read_processes(&attempt).await, vec![child.id()]);
+        assert_eq!(
+            read_processes(&attempt).await.expect("read"),
+            vec![child.id()]
+        );
     }
 
     #[tokio::test]
@@ -308,7 +322,7 @@ mod tests {
         let mut second = launch(&gate, &["two"]);
         assert!(second.wait().expect("waits").success());
         assert_eq!(
-            read_processes(&attempt).await,
+            read_processes(&attempt).await.expect("read"),
             vec![first.id(), second.id()]
         );
         let ran = fs::read_to_string(dir.path().join("ran")).expect("ran");
@@ -319,13 +333,16 @@ mod tests {
     async fn processes_skips_blank_and_garbage_lines() {
         let dir = TempDir::new("octet-fleet-gate");
         let attempt = attempt_dir(&dir);
-        assert!(read_processes(&attempt).await.is_empty());
+        assert!(read_processes(&attempt).await.expect("read").is_empty());
         fs::write(
             attempt.join(PROCESSES),
             "12\n\nx7\n 34 \n-1\n99999999999\n56",
         )
         .expect("write");
-        assert_eq!(read_processes(&attempt).await, vec![12, 34, 56]);
+        assert_eq!(
+            read_processes(&attempt).await.expect("read"),
+            vec![12, 34, 56]
+        );
     }
 
     #[tokio::test]
@@ -339,5 +356,45 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_registry_is_an_error_not_no_pids() {
+        let dir = TempDir::new("octet-fleet-gate");
+        let attempt = attempt_dir(&dir);
+        // A directory where the file belongs: reading it fails, and not with NotFound.
+        fs::create_dir(attempt.join(PROCESSES)).expect("directory");
+        assert!(matches!(
+            read_processes(&attempt).await,
+            Err(GateError::Io(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_gate_refuses_to_run_when_it_cannot_register() {
+        for released in [false, true] {
+            let dir = TempDir::new("octet-fleet-gate");
+            let attempt = attempt_dir(&dir);
+            let gate = write_gate(&attempt, &target(dir.path()), "r/0", std::process::id())
+                .await
+                .expect("written");
+            // The append fails: a directory is where the registry belongs.
+            fs::create_dir(attempt.join(PROCESSES)).expect("directory");
+            if released {
+                release(&attempt).await.expect("released");
+            }
+            let started = Instant::now();
+            let mut child = launch(&gate, &["x"]);
+            assert_eq!(
+                child.wait().expect("waits").code(),
+                Some(125),
+                "released: {released}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "it did not wait"
+            );
+            assert!(!dir.path().join("ran").exists(), "released: {released}");
+        }
     }
 }

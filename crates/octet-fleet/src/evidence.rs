@@ -904,12 +904,23 @@ mod tests {
 
     #[test]
     fn a_tail_does_not_start_mid_character() {
-        let text = "é".repeat(TAIL_BYTES);
-        // 16 KiB is an even number of 2-byte characters, so shift by one byte.
-        let bytes = format!("a{text}").into_bytes();
+        // The odd byte comes after the text, so the raw last 16 KiB starts on the
+        // second byte of a two-byte character.
+        let bytes = format!("{}a", "é".repeat(TAIL_BYTES)).into_bytes();
+        let raw = &bytes[bytes.len() - TAIL_BYTES..];
+        assert!(
+            String::from_utf8_lossy(raw).starts_with('\u{fffd}'),
+            "the raw cut starts mid-character, so the skip matters"
+        );
         let tail = tail_of(&bytes);
         assert!(!tail.contains('\u{fffd}'), "no replacement character");
-        assert!(tail.chars().all(|c| c == 'é'));
+        let (accents, last) = tail.split_at(tail.len() - 1);
+        assert!(accents.chars().all(|c| c == 'é') && last == "a");
+        assert_eq!(
+            tail.len(),
+            TAIL_BYTES - 1,
+            "one byte of the cut character is dropped"
+        );
         assert_eq!(tail_of(b"short"), "short");
         assert_eq!(tail_of(b""), "");
     }
