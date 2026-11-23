@@ -560,10 +560,26 @@ struct Renderer {
     progress: bool,
     /// The command that shows a completed run's change.
     diff_command: Option<String>,
+    /// Where events go: stdout.
+    stdout: Box<dyn Write + Send>,
+    /// Where the vendor's notices and errors go: stderr.
+    stderr: Box<dyn Write + Send>,
 }
 
 impl Renderer {
     fn new(json: bool) -> Self {
+        Self::with_output(
+            json,
+            Box::new(std::io::stdout()),
+            Box::new(std::io::stderr()),
+        )
+    }
+
+    fn with_output(
+        json: bool,
+        stdout: Box<dyn Write + Send>,
+        stderr: Box<dyn Write + Send>,
+    ) -> Self {
         Self {
             json,
             steps: HashMap::new(),
@@ -571,6 +587,8 @@ impl Renderer {
             run: None,
             progress: false,
             diff_command: None,
+            stdout,
+            stderr,
         }
     }
 
@@ -583,12 +601,20 @@ impl Renderer {
     }
 
     fn out(&mut self, text: &str) {
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(text.as_bytes());
-        let _ = out.flush();
+        let _ = self.stdout.write_all(text.as_bytes());
+        let _ = self.stdout.flush();
         if !text.is_empty() {
             self.mid_line = !text.ends_with('\n');
         }
+    }
+
+    /// A vendor's notice or error, on stderr as `--print` writes it, on a
+    /// line of its own: a terminal shows both streams in one place, and a
+    /// reply rarely ends with a newline.
+    fn warn(&mut self, text: &str) {
+        self.end_line();
+        let _ = writeln!(self.stderr, "octet: {text}");
+        let _ = self.stderr.flush();
     }
 
     fn end_line(&mut self) {
@@ -649,7 +675,7 @@ impl Renderer {
             }
             FleetEvent::Session { event, .. } => match event {
                 Event::Text(text) => self.out(&clean(text)),
-                Event::Notice(text) | Event::Error(text) => warn(&plain(text)),
+                Event::Notice(text) | Event::Error(text) => self.warn(&plain(text)),
                 _ => {}
             },
             FleetEvent::Candidate { id, origin } => {
@@ -1294,6 +1320,41 @@ mod tests {
         assert_eq!(
             workflow_path("/abs/flow.yaml", cwd),
             Path::new("/abs/flow.yaml")
+        );
+    }
+
+    /// One buffer behind both of a renderer's outputs, as a terminal shows
+    /// stdout and stderr interleaved.
+    #[derive(Clone, Default)]
+    struct Screen(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Screen {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_vendor_error_starts_on_its_own_line() {
+        let screen = Screen::default();
+        let mut renderer =
+            Renderer::with_output(false, Box::new(screen.clone()), Box::new(screen.clone()));
+        let session = |event| FleetEvent::Session {
+            attempt: AttemptId(0),
+            event,
+        };
+        renderer.show(&session(Event::Text("It may not exist.".into())));
+        renderer.show(&session(Event::Error("It may not exist.".into())));
+        renderer.show(&session(Event::Text("Next".into())));
+        renderer.show(&session(Event::Notice("a notice".into())));
+        let shown = String::from_utf8(screen.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            shown,
+            "It may not exist.\noctet: It may not exist.\nNext\noctet: a notice\n"
         );
     }
 
