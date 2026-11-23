@@ -27,12 +27,14 @@
 //! A held turn ends only when the dialect's interrupt handling ends it, and
 //! `exit_after` does not apply to it.
 use octet_testkit::scenario::FLEET_SCRIPT_ENV;
-use serde_json::{Map, Value, json};
+use serde::Deserialize;
+use serde_json::json;
 use std::{
+    collections::BTreeMap,
     env,
     fs::{self, OpenOptions},
     io::Write,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     process::{self, Command, Stdio},
 };
 
@@ -57,19 +59,73 @@ pub(crate) struct FleetTurn {
     pub exit_after: bool,
 }
 
+/// A fleet script. Any field or value this does not know is an error: a
+/// typo in a script must fail the test, never be ignored.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Script {
+    /// Where every turn is logged.
+    log: PathBuf,
+    /// Where each start of the vendor appends its process ID.
+    #[serde(default)]
+    startup_marker: Option<PathBuf>,
+    /// The turns, by `<step>#<round>`.
+    turns: BTreeMap<String, Turn>,
+}
+
+/// One scripted turn; every field is optional.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Turn {
+    /// Files to write, relative path to content.
+    #[serde(default)]
+    write: BTreeMap<String, String>,
+    /// Files to delete, after the writes.
+    #[serde(default)]
+    delete: Vec<String>,
+    /// The reply text.
+    #[serde(default)]
+    reply: String,
+    /// Where to hold the turn, if at all.
+    #[serde(default)]
+    hold: Option<Hold>,
+    /// Start a process that outlives the turn.
+    #[serde(default)]
+    spawn_survivor: bool,
+    /// Exit after the reply.
+    #[serde(default)]
+    exit_after: bool,
+}
+
+/// Where a held turn stops; see the module's hold modes.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Hold {
+    /// Before anything is changed.
+    BeforeWrite,
+    /// After the changes, before the reply.
+    AfterWrite,
+}
+
+/// The script in `text`; a script that does not parse fails the test.
+fn parse_script(text: &str) -> Script {
+    serde_json::from_str(text).unwrap_or_else(|error| panic!("invalid fleet script: {error}"))
+}
+
 /// The script `OCTET_FLEET_SCRIPT` names, if it is set.
-fn script() -> Option<Value> {
+fn script() -> Option<Script> {
     let path = env::var_os(FLEET_SCRIPT_ENV)?;
-    let text = fs::read_to_string(&path).unwrap();
-    Some(serde_json::from_str(&text).unwrap())
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("fleet script {}: {error}", path.to_string_lossy()));
+    Some(parse_script(&text))
 }
 
 /// Appends `text` to the file `path`, in one write, creating it.
-fn append(path: &Value, text: &str) {
+fn append(path: &Path, text: &str) {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path.as_str().unwrap())
+        .open(path)
         .unwrap();
     file.write_all(text.as_bytes()).unwrap();
     file.flush().unwrap();
@@ -80,27 +136,35 @@ fn append(path: &Value, text: &str) {
 /// any dialect starts, so before it reads its input.
 pub(crate) fn record_start() {
     if let Some(script) = script()
-        && script["startup_marker"].is_string()
+        && let Some(marker) = script.startup_marker
     {
-        append(&script["startup_marker"], &format!("{}\n", process::id()));
+        append(&marker, &format!("{}\n", process::id()));
     }
 }
 
-/// The script key of a prompt whose first line is a fleet header:
-/// `<step>#<round>`.
+/// The script key of a prompt, `<step>#<round>`, or `None` for a prompt that
+/// is not a fleet prompt: one whose first line does not start with the
+/// header prefix. A first line that does but is not a header, as octet-fleet
+/// writes it, is a bug in the fake or in the contract, and fails the test.
+///
+/// The step ID runs to the first ` round=`, and may contain anything else.
 fn key(prompt: &str) -> Option<String> {
     let line = prompt.lines().next()?;
-    let fields = line.strip_prefix(HEADER_PREFIX)?.strip_suffix(']')?;
-    let field = |name: &str| {
-        fields
-            .split(' ')
-            .find_map(|part| part.strip_prefix(name)?.strip_prefix('='))
-    };
-    Some(format!("{}#{}", field("step")?, field("round")?))
+    let fields = line.strip_prefix(HEADER_PREFIX)?;
+    let malformed = || -> ! { panic!("malformed fleet header: {line:?}") };
+    let (step, rest) = fields
+        .strip_prefix("step=")
+        .and_then(|rest| rest.split_once(" round="))
+        .unwrap_or_else(|| malformed());
+    let round = rest.split(' ').next().unwrap_or_default();
+    if step.is_empty() || round.is_empty() || !round.bytes().all(|b| b.is_ascii_digit()) {
+        malformed();
+    }
+    Some(format!("{step}#{round}"))
 }
 
 /// `relative` under `cwd`; a path that leaves it is a bug in the script.
-fn inside(cwd: &Path, relative: &str) -> std::path::PathBuf {
+fn inside(cwd: &Path, relative: &str) -> PathBuf {
     let path = Path::new(relative);
     assert!(
         path.components()
@@ -111,15 +175,14 @@ fn inside(cwd: &Path, relative: &str) -> std::path::PathBuf {
 }
 
 /// The files a turn changes, relative to `cwd`: its writes, then its deletes.
-fn change_files(turn: &Value, cwd: &Path) {
-    let none = Map::new();
-    for (relative, content) in turn["write"].as_object().unwrap_or(&none) {
+fn change_files(turn: &Turn, cwd: &Path) {
+    for (relative, content) in &turn.write {
         let path = inside(cwd, relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, content.as_str().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
     }
-    for relative in turn["delete"].as_array().into_iter().flatten() {
-        match fs::remove_file(inside(cwd, relative.as_str().unwrap())) {
+    for relative in &turn.delete {
+        match fs::remove_file(inside(cwd, relative)) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => panic!("{error}"),
             _ => {}
         }
@@ -155,12 +218,12 @@ fn spawn_survivor() {
 pub(crate) fn turn(prompt: &str, cwd: &Path, resumed: bool) -> Option<FleetTurn> {
     let script = script()?;
     let key = key(prompt)?;
-    let turn = script["turns"].get(&key);
+    let turn = script.turns.get(&key);
     let mut entry = json!({"key": key, "cwd": cwd, "resumed": resumed, "prompt": prompt});
     if turn.is_none() {
         entry["missing"] = json!(true);
     }
-    append(&script["log"], &format!("{entry}\n"));
+    append(&script.log, &format!("{entry}\n"));
     let Some(turn) = turn else {
         return Some(FleetTurn {
             reply: format!("fleet-fake: no turn {key}"),
@@ -168,21 +231,20 @@ pub(crate) fn turn(prompt: &str, cwd: &Path, resumed: bool) -> Option<FleetTurn>
             exit_after: false,
         });
     };
-    let hold = turn["hold"].as_str();
-    if hold == Some("before_write") {
+    if matches!(turn.hold, Some(Hold::BeforeWrite)) {
         return Some(held());
     }
     change_files(turn, cwd);
-    if turn["spawn_survivor"] == true {
+    if turn.spawn_survivor {
         spawn_survivor();
     }
-    if hold == Some("after_write") {
+    if matches!(turn.hold, Some(Hold::AfterWrite)) {
         return Some(held());
     }
     Some(FleetTurn {
-        reply: turn["reply"].as_str().unwrap_or("").to_owned(),
+        reply: turn.reply.clone(),
         hold: false,
-        exit_after: turn["exit_after"] == true,
+        exit_after: turn.exit_after,
     })
 }
 
@@ -192,5 +254,88 @@ fn held() -> FleetTurn {
         reply: String::new(),
         hold: true,
         exit_after: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER: &str = "[octet-fleet step=build round=2 attempt=1 candidate=c1 tree=t1]";
+
+    #[test]
+    fn a_header_gives_its_step_and_round() {
+        assert_eq!(key(HEADER).as_deref(), Some("build#2"));
+        assert_eq!(key(&format!("{HEADER}\nbody")).as_deref(), Some("build#2"));
+        assert_eq!(
+            key(&format!("{HEADER}\r\nbody")).as_deref(),
+            Some("build#2")
+        );
+    }
+
+    #[test]
+    fn a_step_id_may_hold_spaces() {
+        let line = "[octet-fleet step=my step round=10 attempt=1 candidate=c tree=t]";
+        assert_eq!(key(line).as_deref(), Some("my step#10"));
+    }
+
+    #[test]
+    fn other_prompts_are_not_fleet_prompts() {
+        assert_eq!(key("hold"), None);
+        assert_eq!(key(""), None);
+        assert_eq!(key(&format!("text first\n{HEADER}")), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed fleet header")]
+    fn a_header_without_a_round_fails() {
+        key("[octet-fleet step=a attempt=1]");
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed fleet header")]
+    fn a_header_with_a_round_that_is_not_a_number_fails() {
+        key("[octet-fleet step=a round=x attempt=1]");
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed fleet header")]
+    fn a_header_that_does_not_start_with_the_step_fails() {
+        key("[octet-fleet round=1 step=a]");
+    }
+
+    #[test]
+    fn a_complete_script_parses() {
+        let script = parse_script(
+            r#"{"log":"l","startup_marker":"m","turns":{"a#1":{"write":{"f":"x"},
+            "delete":["g"],"reply":"r","hold":"after_write","spawn_survivor":true,
+            "exit_after":true},"b#1":{}}}"#,
+        );
+        assert!(matches!(script.turns["a#1"].hold, Some(Hold::AfterWrite)));
+        assert!(script.turns["b#1"].hold.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid fleet script")]
+    fn an_unknown_hold_fails() {
+        parse_script(r#"{"log":"l","turns":{"a#1":{"hold":"befor_write"}}}"#);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid fleet script")]
+    fn an_unknown_turn_key_fails() {
+        parse_script(r#"{"log":"l","turns":{"a#1":{"exit_afer":true}}}"#);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid fleet script")]
+    fn an_unknown_script_key_fails() {
+        parse_script(r#"{"log":"l","turns":{},"startup_markr":"m"}"#);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid fleet script")]
+    fn a_field_of_the_wrong_type_fails() {
+        parse_script(r#"{"log":"l","turns":{"a#1":{"exit_after":"true"}}}"#);
     }
 }
