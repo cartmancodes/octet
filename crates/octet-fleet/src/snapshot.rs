@@ -401,14 +401,28 @@ pub async fn scratch_clone(
     commit: &str,
     into: &Path,
 ) -> Result<PathBuf, SnapshotError> {
+    clone_with_env(repo, commit, into, &[]).await
+}
+
+/// [`scratch_clone`] with `env` set on the `git clone` process (a test's
+/// stand-in for the user's global git config).
+async fn clone_with_env(
+    repo: &Repo,
+    commit: &str,
+    into: &Path,
+    env: &[(&str, &str)],
+) -> Result<PathBuf, SnapshotError> {
     let target = std::path::absolute(into)?;
     let no_hooks = ["-c", "core.hooksPath=/dev/null"];
     let mut clone = command(
         &repo.top,
         no_hooks
             .into_iter()
-            .chain(["clone", "--quiet", "--shared", "--no-checkout"]),
+            .chain(["clone", "--quiet", "--shared", "--no-checkout"])
+            // A user's `clone.defaultRemoteName` must not rename it.
+            .chain(["--origin", "origin"]),
     );
+    clone.envs(env.iter().copied());
     clone.arg(&repo.top).arg(&target);
     exec(clone, &[]).await?;
     // No remote: a vendor's `git push` from the clone must not reach the
@@ -806,7 +820,19 @@ mod tests {
         // `git push` would.
         write(&cwd, "a.txt", "pushed\n");
         sh(&cwd, &["add", "-A"]);
-        sh(&cwd, &["commit", "--quiet", "-m", "vendor"]);
+        sh(
+            &cwd,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "vendor",
+            ],
+        );
         for target in [
             format!("HEAD:refs/heads/{branch}"),
             "HEAD:refs/heads/evil".to_owned(),
@@ -828,6 +854,27 @@ mod tests {
             ),
             format!("refs/heads/{branch}")
         );
+    }
+
+    #[tokio::test]
+    async fn a_scratch_clone_has_no_remote_whatever_the_default_remote_name() {
+        let dir = init();
+        write(dir.path(), "a.txt", "a\n");
+        commit_all(dir.path());
+        let scratch = TempDir::new("octet-fleet-scratch");
+        let (repo, tree) = snap(&dir, &scratch).await;
+        let commit = keep(&repo, "run", 1, &tree).await.expect("kept");
+        let into = TempDir::new("octet-fleet-clone");
+        // As if the user's global config said `clone.defaultRemoteName=upstream`.
+        let config = [
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "clone.defaultRemoteName"),
+            ("GIT_CONFIG_VALUE_0", "upstream"),
+        ];
+        let cwd = clone_with_env(&repo, &commit, &into.path().join("tree"), &config)
+            .await
+            .expect("clones");
+        assert_eq!(sh(&cwd, &["remote"]), "", "the clone names no remote");
     }
 
     #[tokio::test]

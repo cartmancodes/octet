@@ -342,12 +342,12 @@ Every pause can also be ended with `stop`. After a decision is logged, the next 
 | `processes_unverified` | A process in a registered group is alive but cannot be shown to be the run's. Each is listed with its command, as alive now. | `release` → the listed PIDs are logged as not the run's, then the check runs again · `wait` · `stop` (refused until released) |
 | `invalid_output` | A reply stayed invalid after the corrective prompt. | `retry` → a new attempt of the same step · `stop` |
 | `transient_exhausted`, `local_failure`, `unknown` | Retries ran out, Octet's own side failed, or a failure Octet does not recognise. | `retry` → a new attempt of the same step (if the tree changed, `reconcile` first) · `stop` |
+| `interrupted` | Ctrl+C or SIGTERM. | No decision: `resume` goes straight on (below). |
 
 A local failure that happens while another pause waits for its decision (Octet cannot observe
 the tree, or cannot remove an old scratch clone) does not replace that pause: the error is
 shown, and you are asked that pause's decision; if you already gave it, `retry` (or a plain
 `resume`) lets it stand and tries again.
-| `interrupted` | Ctrl+C or SIGTERM. | No decision: `resume` goes straight on (below). |
 
 **Stalls** pause early, before the round cap:
 
