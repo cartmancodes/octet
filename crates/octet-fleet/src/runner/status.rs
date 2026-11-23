@@ -1,9 +1,9 @@
 //! `status`: what each run's log says, read without taking any lock.
 
-use std::fs::{File, TryLockError};
 use std::path::Path;
 
 use super::RunnerError;
+use crate::ownership;
 use crate::record::{Record, Status};
 use crate::state::replay;
 use crate::store;
@@ -32,10 +32,9 @@ pub struct RunSummary {
 ///
 /// Read-only: no lock is taken and nothing is written. The log is replayed
 /// as it is (a torn last line is skipped, not cut). A run that has not
-/// ended is `running` while another process holds its lock, which a
-/// momentary non-blocking shared lock attempt tells (released at once), and
-/// otherwise `paused`: a pause, an interrupt or a crash, which `resume`
-/// continues. A run whose log never got its first record (a start that
+/// ended is `running` while the process its lock file names
+/// ([`ownership::run_holder`]) is alive, and otherwise `paused`: a pause,
+/// an interrupt or a crash, which `resume` continues. A run whose log never got its first record (a start that
 /// died) is `failed`.
 ///
 /// # Errors
@@ -96,21 +95,11 @@ async fn summary(data_dir: &Path, id: &str) -> Result<RunSummary, RunnerError> {
         "stopped"
     } else if state.failed.is_some() {
         "failed"
-    } else if locked(&dir.root.join("lock")) {
+    } else if ownership::run_holder(&dir).await.is_some() {
         "running"
     } else {
         "paused"
     }
     .into();
     Ok(summary)
-}
-
-/// Whether another process holds the lock file `path` now. A missing or
-/// unreadable file is not held.
-fn locked(path: &Path) -> bool {
-    let Ok(file) = File::open(path) else {
-        return false;
-    };
-    // Dropping the file releases a lock this took.
-    matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock))
 }

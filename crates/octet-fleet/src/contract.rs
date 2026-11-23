@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::definition::Kind;
 use crate::machine::Dispatch;
 use crate::record::{AttemptId, CandidateId, Finding, Severity, Status};
-use crate::validate::{Refs, Resolved, Step};
+use crate::validate::{Refs, Step};
 
 /// The start of the first line of every prompt:
 /// `[octet-fleet step=<id> round=<n> attempt=<a> candidate=<c> tree=<t>]`.
@@ -133,42 +133,6 @@ pub struct Verdict {
 #[must_use]
 pub fn prompt(step: &Step, dispatch: &Dispatch, ids: &HeaderIds, inputs: &PromptInputs) -> String {
     build(step, dispatch, ids, inputs, inputs.patch)
-}
-
-/// The document steps whose approved text step `step` receives, in
-/// workflow order. A document or change step gets the documents it builds
-/// on, directly or through their own inputs; a tests step or a change
-/// review gets those of the change it tests or reviews; a document review
-/// gets the documents the reviewed document builds on and then, last, the
-/// reviewed document itself.
-///
-/// # Panics
-///
-/// If `step` is not a step index of `def`.
-#[must_use]
-pub fn document_steps(def: &Resolved, step: usize) -> Vec<usize> {
-    let upstream = |of: usize| -> Vec<usize> {
-        let mut documents: Vec<usize> = def
-            .approvals_required(of)
-            .into_iter()
-            .filter_map(|approval| match def.steps[approval].refs {
-                Refs::ReviewDocument { document } => Some(document),
-                _ => None,
-            })
-            .collect();
-        documents.sort_unstable();
-        documents.dedup();
-        documents
-    };
-    match def.steps[step].refs {
-        Refs::Document { .. } | Refs::Change { .. } => upstream(step),
-        Refs::Tests { change, .. } | Refs::ReviewChange { change, .. } => upstream(change),
-        Refs::ReviewDocument { document } => {
-            let mut documents = upstream(document);
-            documents.push(document);
-            documents
-        }
-    }
 }
 
 /// Whether the prompt fits [`octet_core::PROMPT_LIMIT`] with `patch` inline.
@@ -479,32 +443,6 @@ pub fn parse_verdict(reply: &str, open: &[&Finding]) -> Result<Verdict, String> 
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn each_step_receives_its_upstream_documents_in_order() {
-        let def = crate::sim::shipped();
-        let index = |id: &str| def.steps.iter().position(|s| s.id == id).expect("a step");
-        let ids = |steps: Vec<usize>| -> Vec<&str> {
-            steps
-                .into_iter()
-                .map(|s| def.steps[s].id.as_str())
-                .collect()
-        };
-        assert!(document_steps(&def, index("research")).is_empty());
-        assert_eq!(
-            ids(document_steps(&def, index("review_research"))),
-            ["research"]
-        );
-        assert_eq!(ids(document_steps(&def, index("plan"))), ["research"]);
-        // The document under review comes last.
-        assert_eq!(
-            ids(document_steps(&def, index("review_plan"))),
-            ["research", "plan"]
-        );
-        for step in ["implement", "test", "review_change"] {
-            assert_eq!(ids(document_steps(&def, index(step))), ["research", "plan"]);
-        }
-    }
-
     use std::path::PathBuf;
 
     use super::*;

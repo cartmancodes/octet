@@ -917,6 +917,7 @@ mod tests {
                 attempt: AttemptId(1),
                 failure: Failure::Transient {
                     detail: "429".into(),
+                    eligible_at: None,
                 },
             },
             Record::AttemptInterrupted {
@@ -1363,6 +1364,7 @@ mod tests {
                 attempt: AttemptId(0),
                 failure: Failure::Transient {
                     detail: "overloaded".into(),
+                    eligible_at: None,
                 },
             },
         ];

@@ -155,8 +155,8 @@ fn decided(
         ) => {
             let mut dispatch = continued(def, state, info);
             // A kept transient failure still waits out its backoff.
-            if matches!(info.state, AttemptState::Failed(Failure::Transient { .. })) {
-                dispatch.not_before = state.retry.get(&attempt).map(|&(_, at)| at);
+            if let AttemptState::Failed(Failure::Transient { eligible_at, .. }) = info.state {
+                dispatch.not_before = machine::retry_eligible(state, attempt, eligible_at);
             }
             Some(Next::Run(dispatch))
         }
@@ -560,6 +560,7 @@ mod tests {
             attempt,
             failure: Failure::Transient {
                 detail: "overloaded".into(),
+                eligible_at: None,
             },
         });
         assert_pause(
@@ -594,6 +595,7 @@ mod tests {
             attempt,
             failure: Failure::Transient {
                 detail: "overloaded".into(),
+                eligible_at: None,
             },
         });
         assert_pause(&failed.recover(&obs("t-edit", true)), PauseReason::Drift);
@@ -779,6 +781,7 @@ mod tests {
             attempt,
             failure: Failure::Transient {
                 detail: "overloaded".into(),
+                eligible_at: None,
             },
         });
         let edited = obs("t-edit", true);
@@ -943,6 +946,7 @@ mod tests {
             attempt,
             failure: Failure::Transient {
                 detail: "overloaded".into(),
+                eligible_at: None,
             },
         });
         case.push(Record::Retry {
@@ -1157,6 +1161,7 @@ mod tests {
                 attempt,
                 failure: Failure::Transient {
                     detail: "overloaded".into(),
+                    eligible_at: None,
                 },
             });
             let Next::Run(retry) = case.recover(&obs("t0", true)) else {

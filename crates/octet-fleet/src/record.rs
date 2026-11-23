@@ -148,6 +148,13 @@ pub enum Failure {
     Transient {
         /// What happened.
         detail: String,
+        /// When the retry may start, in seconds since the Unix epoch; `None`
+        /// when the retries are used up. The `retry` record logged after it
+        /// says the same: carried here too so that a crash between the two
+        /// appends cannot lose the backoff. Absent in logs written before
+        /// it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eligible_at: Option<u64>,
     },
     /// The vendor is misconfigured.
     ConfigError {

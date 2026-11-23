@@ -328,8 +328,24 @@ async fn a_full_run_completes() {
     let Io {
         runner: io, events, ..
     } = channels();
-    let (end, events) = patiently(start(bench.start(workflow), io), events, |_| {}).await;
+    // While the run is driven, `status` (no lock taken) says it is running.
+    let during = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&during);
+    let data = bench.data.clone();
+    let (end, events) = patiently(start(bench.start(workflow), io), events, |event| {
+        if let FleetEvent::AttemptStarted { step, .. } = event
+            && step == "plan"
+        {
+            let (seen, data) = (Arc::clone(&seen), data.clone());
+            tokio::spawn(async move {
+                let runs = status(&data, None).await.unwrap();
+                *seen.lock().unwrap() = Some(runs[0].state.clone());
+            });
+        }
+    })
+    .await;
     assert_eq!(end, RunEnd::Completed, "{events:#?}");
+    assert_eq!(during.lock().unwrap().as_deref(), Some("running"));
     let records = bench.records().await;
     let (tree, observed_tree) = completed(&records);
     assert_eq!(observed_tree, tree);
@@ -589,6 +605,82 @@ async fn a_transient_retry_waits_out_its_backoff_across_a_restart() {
 }
 
 #[tokio::test]
+async fn a_transient_failure_that_changed_the_tree_keeps_its_backoff() {
+    let mut turns = small_turns();
+    turns["implement#1"] = json!([
+        {"write": {"partial.txt": "half done\n"}, "fail": true},
+        {"write": {"feature.txt": "done\n"}, "reply": "Finished."},
+    ]);
+    let bench = Bench::new(&turns);
+    let workflow = bench.workflow(SMALL, &["test -f feature.txt"]);
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let anchor = tokio::time::Instant::now();
+    let clock = Clock::new(move || epoch + anchor.elapsed().as_secs());
+    let Io {
+        runner: mut io,
+        events,
+        ..
+    } = channels();
+    io.clock = clock.clone();
+    let (end, _) = patiently(start(bench.start(workflow), io), events, |_| {}).await;
+    // The coder edited before the usage limit: the tree is reconciled, and
+    // the backoff is logged all the same.
+    assert_eq!(end, RunEnd::Paused(PauseReason::Reconcile));
+    let records = bench.records().await;
+    let at = records
+        .iter()
+        .find_map(|r| match r {
+            Record::AttemptFailed {
+                failure: Failure::Transient { eligible_at, .. },
+                ..
+            } => *eligible_at,
+            _ => None,
+        })
+        .expect("the failure carries its retry time");
+    assert!(
+        records.iter().any(
+            |r| matches!(r, Record::Retry { count: 1, eligible_at, .. } if *eligible_at == at)
+        )
+    );
+    assert!(at >= epoch + 60, "{at}");
+
+    // `keep` continues the coder only once the backoff is over.
+    tokio::time::pause();
+    let Io {
+        runner: mut io,
+        events,
+        ..
+    } = channels();
+    io.clock = clock.clone();
+    let started_at = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&started_at);
+    let id = bench.run_id().await;
+    let (end, _) = drive(
+        resume(&bench.data, &id, Some(Decision::Keep), io),
+        events,
+        |event| {
+            if let FleetEvent::AttemptStarted { step, .. } = event
+                && step == "implement"
+            {
+                *seen.lock().unwrap() = Some(clock.now());
+                tokio::time::resume();
+            }
+        },
+    )
+    .await;
+    assert_eq!(end.unwrap(), RunEnd::Completed);
+    let started_at = started_at
+        .lock()
+        .unwrap()
+        .expect("the kept attempt started");
+    assert!(started_at >= at, "kept at {started_at}, before {at}");
+    assert_eq!(bench.attempts_of("implement").await, 2);
+}
+
+#[tokio::test]
 async fn decisions_apply() {
     reconcile_keep().await;
     reconcile_adopt().await;
@@ -665,6 +757,22 @@ async fn reconciling(then: Value) -> Bench {
         matches!(refused, Err(RunnerError::Refused(_))),
         "{refused:?}"
     );
+    assert_eq!(bench.records().await.len(), before);
+    // A signal before anything runs leaves the pause, and nothing else, in
+    // the log: the decision is not taken and no interrupt pause hides it.
+    let Io {
+        runner: io,
+        events,
+        signal,
+    } = channels();
+    signal.send(Some("SIGINT")).unwrap();
+    let (end, _) = patiently(
+        resume(&bench.data, &id, Some(Decision::Keep), io),
+        events,
+        |_| {},
+    )
+    .await;
+    assert_eq!(end, RunEnd::Interrupted("SIGINT"));
     assert_eq!(bench.records().await.len(), before);
     bench
 }

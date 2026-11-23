@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, watch};
 pub use status::{RunSummary, status};
 
 use crate::FleetEvent;
+use crate::gate;
 use crate::machine::Next;
 use crate::ownership::{self, Held, OwnershipError, Unresolved};
 use crate::record::{AttemptId, CandidateId, Decision, Identity, Origin, PauseReason, Record};
@@ -494,7 +495,14 @@ impl Driver {
     /// Which live processes are the run's (spec, "Leftover processes"): those
     /// of every attempt not accepted, by its marker, its registered
     /// identities and their groups, less the PIDs the user released.
-    async fn leftovers(&self, view: &View) -> Result<ProcessCheck, OwnershipError> {
+    ///
+    /// The PIDs in `<attempt>/processes` count too (a launch after `go`, or a
+    /// crash between the gate's registration and `attempt_session`): as
+    /// groups, not identities. Their start times were never recorded, so a
+    /// PID reused since is indistinguishable from the gate; a live process
+    /// there without the marker is reported unverified and never signalled.
+    /// An unreadable registry is an error, never an empty one.
+    async fn leftovers(&self, view: &View) -> Result<ProcessCheck, String> {
         let open: Vec<AttemptId> = view
             .state
             .attempts
@@ -505,12 +513,20 @@ impl Driver {
         if open.is_empty() {
             return Ok(ProcessCheck::Clear);
         }
-        let processes = ownership::list_processes().await?;
+        let processes = ownership::list_processes()
+            .await
+            .map_err(|error| error.to_string())?;
         let released: Vec<u32> = view.state.released_pids.iter().copied().collect();
         let (mut verified, mut unverified) = (Vec::new(), Vec::new());
         for attempt in open {
             let identities = identities_of(&view.records, attempt);
-            let groups: Vec<u32> = identities.iter().map(|identity| identity.pid).collect();
+            let mut groups: Vec<u32> = identities.iter().map(|identity| identity.pid).collect();
+            let registry = gate::read_processes(&self.attempt_dir(attempt))
+                .await
+                .map_err(|error| format!("attempt {}'s registry: {error}", attempt.0))?;
+            groups.extend(registry);
+            groups.sort_unstable();
+            groups.dedup();
             let marker = self.marker(attempt);
             match ownership::check(&processes, &marker, &identities, &groups, &released) {
                 ProcessCheck::Clear => {}
@@ -564,8 +580,11 @@ impl Driver {
         Ok(RunEnd::Paused(reason))
     }
 
-    /// A signal ended the run's work: `attempt`, if one ran, is interrupted
-    /// (not finished), and the run pauses.
+    /// A signal ended the run's work: `attempt`, if one ran (its turn or an
+    /// evidence command), is interrupted (not finished), and the run pauses.
+    /// With nothing running and a pause pending, nothing is logged: that
+    /// pause, and any decision already taken at it, stands for the next
+    /// `resume`; an interrupt pause would lift it unanswered.
     async fn interrupted(
         &mut self,
         attempt: Option<AttemptId>,
@@ -577,6 +596,8 @@ impl Driver {
                 signal: signal.to_owned(),
             })
             .await?;
+        } else if self.load().await?.state.pending_pause.is_some() {
+            return Ok(RunEnd::Interrupted(signal));
         }
         let detail = format!("{signal} interrupted the run; resume it to go on");
         self.append(&Record::Paused {

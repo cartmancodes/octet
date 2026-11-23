@@ -195,10 +195,13 @@ fn after_a_failure(def: &Resolved, state: &RunState) -> Option<Next> {
         return Some(Next::Run(dispatch(def, state, info.step, None)));
     }
     let (reason, detail) = match failure {
-        Failure::Transient { detail } => {
+        Failure::Transient {
+            detail,
+            eligible_at,
+        } => {
             let failures = transient_streak(state, info.step);
             if failures <= def.limits.transient_retries {
-                let not_before = state.retry.get(attempt).map(|&(_, at)| at);
+                let not_before = retry_eligible(state, *attempt, *eligible_at);
                 return Some(Next::Run(dispatch(def, state, info.step, not_before)));
             }
             (
@@ -222,6 +225,16 @@ fn after_a_failure(def: &Resolved, state: &RunState) -> Option<Next> {
         Failure::Interrupted { .. } | Failure::ConfigError { .. } => return None,
     };
     Some(Next::Pause(reason, detail))
+}
+
+/// When a transient failure's retry may start: its `retry` record's time,
+/// else the time its failure record carries (a crash between the two).
+pub(crate) fn retry_eligible(
+    state: &RunState,
+    attempt: AttemptId,
+    eligible_at: Option<u64>,
+) -> Option<u64> {
+    state.retry.get(&attempt).map(|&(_, at)| at).or(eligible_at)
 }
 
 /// The transient failures of `step` in a row, newest first, back to its last
@@ -617,6 +630,56 @@ fn invariant(def: &Resolved, state: &RunState) -> Result<Next, String> {
     })
 }
 
+/// The documents an attempt of `dispatch` reads, in workflow order: every
+/// document artifact its requirements reach (the approved documents it
+/// builds on, through approvals and changes). For a document review, the
+/// reviewed document, which it requires directly, is last.
+///
+/// # Errors
+///
+/// A line naming what is missing: a document review that requires no
+/// document of the step it reviews.
+pub(crate) fn documents_for(
+    def: &Resolved,
+    state: &RunState,
+    dispatch: &Dispatch,
+) -> Result<Vec<ArtifactId>, String> {
+    let step_of = |id: &ArtifactId| state.artifacts.get(id).map(|meta| meta.step);
+    let reviewed = match def.steps[dispatch.step].refs {
+        Refs::ReviewDocument { document } => Some(
+            dispatch
+                .requires
+                .iter()
+                .copied()
+                .find(|id| step_of(id) == Some(document))
+                .ok_or_else(|| {
+                    format!(
+                        "{} requires no document of {} to review",
+                        def.steps[dispatch.step].id, def.steps[document].id
+                    )
+                })?,
+        ),
+        _ => None,
+    };
+    let mut reached = BTreeSet::new();
+    for &required in &dispatch.requires {
+        reached.insert(required);
+        reached.extend(requirements(state, required));
+    }
+    let mut documents: Vec<ArtifactId> = reached
+        .into_iter()
+        .filter(|id| Some(*id) != reviewed)
+        .filter(|id| {
+            step_of(id)
+                .and_then(|step| def.steps.get(step))
+                .is_some_and(|step| matches!(step.refs, Refs::Document { .. }))
+        })
+        .collect();
+    documents.sort_by_key(|id| (step_of(id), *id));
+    documents.extend(reviewed);
+    Ok(documents)
+}
+
 /// Everything `artifact` requires, transitively.
 fn requirements(state: &RunState, artifact: ArtifactId) -> BTreeSet<ArtifactId> {
     let mut seen = BTreeSet::new();
@@ -635,6 +698,50 @@ fn requirements(state: &RunState, artifact: ArtifactId) -> BTreeSet<ArtifactId> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_attempt_reads_the_documents_it_requires_reviewed_last() {
+        use super::{Next, documents_for};
+        use crate::record::Record;
+        use crate::sim;
+        let def = sim::shipped();
+        let log = sim::run(&def, &sim::Script::default());
+        let index = |id: &str| def.steps.iter().position(|s| s.id == id).expect("a step");
+        // The state each step's first attempt was dispatched from.
+        let dispatched = |step: &str| {
+            let at = log
+                .records
+                .iter()
+                .position(|r| matches!(r, Record::AttemptStarted { step: s, .. } if s == step))
+                .expect("the step ran");
+            let Next::Run(dispatch) = log.decisions[at].clone() else {
+                panic!("{:?}", log.decisions[at]);
+            };
+            let state =
+                crate::state::replay(&def, &log.records[..at], &log.artifacts).expect("replays");
+            (state, dispatch)
+        };
+        let steps = |step: &str| -> Vec<String> {
+            let (state, dispatch) = dispatched(step);
+            documents_for(&def, &state, &dispatch)
+                .expect("documents")
+                .into_iter()
+                .map(|id| def.steps[state.artifacts[&id].step].id.clone())
+                .collect()
+        };
+        assert!(steps("research").is_empty());
+        assert_eq!(steps("review_research"), ["research"]);
+        assert_eq!(steps("plan"), ["research"]);
+        assert_eq!(steps("review_plan"), ["research", "plan"]);
+        for step in ["implement", "test", "review_change"] {
+            assert_eq!(steps(step), ["research", "plan"], "{step}");
+        }
+        // A review that requires no document of its step is refused.
+        let (state, mut dispatch) = dispatched("review_plan");
+        dispatch.requires.clear();
+        assert!(documents_for(&def, &state, &dispatch).is_err());
+        assert_eq!(dispatch.step, index("review_plan"));
+    }
+
     #[test]
     fn retries_back_off_one_five_then_fifteen_minutes() {
         use super::retry_at;
@@ -1729,6 +1836,7 @@ mod tests {
                 attempt,
                 Failure::Transient {
                     detail: "rate limited".into(),
+                    eligible_at: None,
                 },
             );
             log.retry(attempt, count, at);
@@ -1738,6 +1846,7 @@ mod tests {
             attempt,
             Failure::Transient {
                 detail: "rate limited".into(),
+                eligible_at: None,
             },
         );
         let detail = log.paused(PauseReason::TransientExhausted);
@@ -1753,6 +1862,7 @@ mod tests {
             review,
             Failure::Transient {
                 detail: "overloaded".into(),
+                eligible_at: None,
             },
         );
         log.run("review_research");

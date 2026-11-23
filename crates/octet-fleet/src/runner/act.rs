@@ -243,15 +243,10 @@ impl Driver {
             tree: tree.to_owned(),
         };
         let mut documents = Vec::new();
-        for document in contract::document_steps(&self.def, dispatch.step) {
-            let Some(artifact) = state.latest[document] else {
-                continue;
-            };
+        for artifact in machine::documents_for(&self.def, state, dispatch)? {
             let text = self.text_of(artifact).await?;
-            documents.push((self.def.steps[document].id.clone(), text));
-        }
-        if matches!(step.refs, Refs::ReviewDocument { .. }) && documents.is_empty() {
-            return Err(format!("{} has no document to review", step.id));
+            let step = state.artifacts[&artifact].step;
+            documents.push((self.def.steps[step].id.clone(), text));
         }
         let evidence = match step.refs {
             Refs::ReviewChange { evidence, .. } => {
@@ -388,8 +383,11 @@ impl Driver {
             .map_err(|error| format!("evidence {} is unreadable: {error}", artifact.0))
     }
 
-    /// A failed turn: the failure, and for a transient one with the tree
-    /// unchanged and retries left, the retry and when it may start.
+    /// A failed turn: the failure; for a transient one with retries left,
+    /// when the retry may start, in the failure itself and in a `retry`
+    /// record after it. Whether the tree let the attempt be retried is
+    /// recovery's call (a changed tree reconciles; a `keep` then still
+    /// waits out the backoff).
     async fn failed(
         &mut self,
         dispatch: &Dispatch,
@@ -398,35 +396,36 @@ impl Driver {
         detail: String,
     ) -> Result<Flow, RunnerError> {
         let failure = match class {
-            FailureClass::Transient { .. } => Failure::Transient { detail },
+            FailureClass::Transient { reset_at } => {
+                // This attempt is still unfinished, so it is not in the streak yet.
+                let view = self.load().await?;
+                let count = machine::transient_streak(&view.state, dispatch.step).saturating_add(1);
+                let eligible_at = (count <= self.def.limits.transient_retries)
+                    .then(|| machine::retry_at(self.io.clock.now(), count, reset_at));
+                self.fail(
+                    attempt,
+                    Failure::Transient {
+                        detail,
+                        eligible_at,
+                    },
+                )
+                .await?;
+                if let Some(eligible_at) = eligible_at {
+                    self.append(&Record::Retry {
+                        attempt,
+                        class: "transient".into(),
+                        count,
+                        eligible_at,
+                    })
+                    .await?;
+                }
+                return Ok(None);
+            }
             FailureClass::ConfigError => Failure::ConfigError { detail },
             FailureClass::LocalFailure => Failure::LocalFailure { detail },
             FailureClass::Unknown => Failure::Unknown { detail },
         };
-        self.fail(attempt, failure).await?;
-        let FailureClass::Transient { reset_at } = class else {
-            return Ok(None);
-        };
-        // Retried only while the tree is the attempt's input; otherwise
-        // recovery reconciles it.
-        let view = self.load().await?;
-        let input = machine::tree_of(&view.state, dispatch.input_candidate);
-        let unchanged = self
-            .live_tree()
-            .await
-            .is_ok_and(|live| Some(live.as_str()) == input);
-        let count = machine::transient_streak(&view.state, dispatch.step);
-        if unchanged && count <= self.def.limits.transient_retries {
-            let eligible_at = machine::retry_at(self.io.clock.now(), count, reset_at);
-            self.append(&Record::Retry {
-                attempt,
-                class: "transient".into(),
-                count,
-                eligible_at,
-            })
-            .await?;
-        }
-        Ok(None)
+        self.fail(attempt, failure).await
     }
 
     /// Logs `failure` for `attempt`.

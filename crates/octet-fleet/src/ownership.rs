@@ -95,19 +95,27 @@ fn holder_note(holder: Option<&str>) -> String {
     holder.map_or_else(String::new, |run| format!(" (run {run})"))
 }
 
-/// The run lock and the work tree lock, both held. Dropping it releases them.
+/// The run lock and the work tree lock, both held. Dropping it empties the run lock file (so
+/// [`run_holder`] no longer names this process) and releases both.
 #[derive(Debug)]
 pub struct Held {
-    _run: File,
+    run: File,
     _worktree: File,
     /// The work tree the lock is for.
     hash: String,
 }
 
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = self.run.set_len(0);
+    }
+}
+
 /// Takes the locks for driving run `run`, whose ID is the name of its directory, on the work
 /// tree named by `worktree_hash` (see [`worktree_hash`]). The run lock goes first, then the
-/// work tree's, whose file then holds the run's ID so a refused run can name it. The run's log
-/// is never opened here.
+/// work tree's, whose file then holds the run's ID so a refused run can name it. Once both are
+/// held, the run lock file holds this process's PID and start time, which [`run_holder`] reads
+/// without locking. The run's log is never opened here.
 ///
 /// # Errors
 ///
@@ -143,11 +151,32 @@ pub async fn lock(
     worktree_file.set_len(0)?;
     (&worktree_file).write_all(run_id.as_bytes())?;
     worktree_file.sync_all()?;
-    Ok(Held {
-        _run: run_file,
+    let held = Held {
+        run: run_file,
         _worktree: worktree_file,
         hash: worktree_hash.to_string(),
-    })
+    };
+    // Unreadable, our own start time leaves the file empty: the run is then never reported
+    // as driven, which only `status` reads.
+    let pid = std::process::id();
+    held.run.set_len(0)?;
+    if let Some(start) = start_time(pid).await {
+        (&held.run).write_all(format!("{pid} {start}").as_bytes())?;
+        held.run.sync_all()?;
+    }
+    Ok(held)
+}
+
+/// The process driving the run whose directory is `run`: the PID [`lock`] wrote into the run
+/// lock file, while a process with that PID and the start time written beside it is alive.
+/// Takes no lock: an empty, missing or stale file is no driver.
+pub async fn run_holder(run: &RunDir) -> Option<u32> {
+    let text = tokio::fs::read_to_string(run.root.join("lock"))
+        .await
+        .ok()?;
+    let (pid, start) = text.trim().split_once(' ')?;
+    let pid: u32 = pid.parse().ok()?;
+    (start_time(pid).await.as_deref() == Some(start)).then_some(pid)
 }
 
 /// Opens (creating, owner-only) a lock file without changing its contents.
@@ -732,6 +761,20 @@ mod tests {
         assert_eq!(meta.modified().expect("mtime"), before);
         drop(held);
         lock_when_free(data.path(), &run, "aaaa").await;
+    }
+
+    #[tokio::test]
+    async fn the_run_lock_names_its_driver_while_held() {
+        let data = TempDir::new("ownership-holder");
+        let run = run_dir(data.path(), "r1");
+        assert_eq!(run_holder(&run).await, None, "no lock file yet");
+        let held = lock(data.path(), &run, "aaaa").await.expect("lock");
+        assert_eq!(run_holder(&run).await, Some(std::process::id()));
+        drop(held);
+        assert_eq!(run_holder(&run).await, None, "released");
+        // A holder that is gone, or a PID now someone else's, is no driver.
+        std::fs::write(run.root.join("lock"), "1 Thu Jan  1 00:00:00 1970").expect("write");
+        assert_eq!(run_holder(&run).await, None);
     }
 
     #[tokio::test]
