@@ -261,12 +261,13 @@ const JUST_PASSED: u32 = 60 * 60;
 /// tomorrow. It adds the wall-clock difference, so across a daylight-saving
 /// change it is up to an hour off.
 fn next_occurrence(clock: u32, now: LocalNow) -> u64 {
-    let ahead = if clock >= now.seconds_of_day {
-        clock - now.seconds_of_day
-    } else if (now.seconds_of_day + DAY - clock) % DAY <= JUST_PASSED {
+    // Both are under a day, so neither sum overflows; a time that passed
+    // shortly before midnight counts as just passed after it.
+    let passed = (now.seconds_of_day + DAY - clock) % DAY;
+    let ahead = if passed <= JUST_PASSED {
         0
     } else {
-        clock + DAY - now.seconds_of_day
+        (clock + DAY - now.seconds_of_day) % DAY
     };
     now.epoch + u64::from(ahead)
 }
@@ -550,6 +551,18 @@ mod tests {
                 "at {label}"
             );
         }
+        // Just before midnight, seen just after it: now, not tonight.
+        let text_late = "Usage limit. Try again at 11:50 PM. (usageLimitExceeded)";
+        let after_midnight = LocalNow {
+            epoch: 1_800_000_000,
+            seconds_of_day: 10 * 60,
+        };
+        assert_eq!(
+            classify_at("codex", text_late, false, || Some(after_midnight)),
+            FailureClass::Transient {
+                reset_at: Some(1_800_000_000)
+            }
+        );
         // More than an hour ago: tomorrow.
         let now = LocalNow {
             epoch: 1_800_000_000,

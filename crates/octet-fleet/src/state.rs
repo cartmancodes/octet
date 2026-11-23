@@ -639,9 +639,10 @@ impl Replayer<'_> {
     /// Applies a `continue` or `rounds N` taken at a round limit or a stall.
     /// A round decision is for the rejector whose jump the run waits to take;
     /// `rounds N` only raises the cap: never below the cap in force (at a
-    /// stall) or the jumps already taken, so the pending jump is always taken. A stall decision waives exactly the stall
-    /// the run paused on. Only the first such decision under a pause counts,
-    /// so a decision logged twice does not grant two rounds.
+    /// stall) or the jumps already taken, so the pending jump is always
+    /// taken. A stall decision waives exactly the stall the run paused on.
+    /// Only the first such decision under a pause counts, so a decision
+    /// logged twice does not grant two rounds.
     fn past_the_limit(&mut self, decision: &Decision) {
         let reason = self.state.pending_pause;
         let already = self
