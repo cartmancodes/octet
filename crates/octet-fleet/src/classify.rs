@@ -157,19 +157,51 @@ struct LocalNow {
     seconds_of_day: u32,
 }
 
-/// The local time from `date`, which every macOS and Linux has; `None` when
-/// it cannot be read.
+/// How long `date` may take before the local time counts as unreadable.
+const DATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The local time from `date`, which every macOS and Linux has at `/bin/date`
+/// (else the one on `PATH`); `None` when it cannot be read within
+/// [`DATE_TIMEOUT`].
 fn local_now() -> Option<LocalNow> {
-    let output = std::process::Command::new("date")
-        .arg("+%s %H %M %S")
+    let program = if std::path::Path::new("/bin/date").is_file() {
+        "/bin/date"
+    } else {
+        "date"
+    };
+    let stdout = run_bounded(program, &["+%s %H %M %S"], DATE_TIMEOUT)?;
+    parse_date(&String::from_utf8_lossy(&stdout))
+}
+
+/// `program`'s standard output when it exits successfully within `limit`;
+/// `None` (and the process killed) otherwise. Its output is a line, so it
+/// cannot fill the pipe while it is waited for.
+fn run_bounded(program: &str, args: &[&str], limit: std::time::Duration) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new(program)
+        .args(args)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_date(&String::from_utf8_lossy(&output.stdout))
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    child.stdout.take()?.read_to_end(&mut stdout).ok()?;
+    status.success().then_some(stdout)
 }
 
 /// `date '+%s %H %M %S'`'s output.
@@ -218,13 +250,21 @@ fn clock_time(text: &str) -> Option<u32> {
     Some(hours * 3600 + minutes * 60)
 }
 
+/// How long ago a named clock time may be and still count as now: Codex names
+/// its reset to the minute, so a retry at that minute can fail again a few
+/// seconds before the real reset, and its text names the same minute.
+const JUST_PASSED: u32 = 60 * 60;
+
 /// The Unix second of the next time the local clock shows `clock` (seconds
-/// into the day): today if it is still ahead, else tomorrow. It adds the
-/// wall-clock difference, so across a daylight-saving change it is up to an
-/// hour off.
+/// into the day): today if it is still ahead, now if it passed within the
+/// last hour ([`JUST_PASSED`]; the usual backoff then applies), else
+/// tomorrow. It adds the wall-clock difference, so across a daylight-saving
+/// change it is up to an hour off.
 fn next_occurrence(clock: u32, now: LocalNow) -> u64 {
     let ahead = if clock >= now.seconds_of_day {
         clock - now.seconds_of_day
+    } else if (now.seconds_of_day + DAY - clock) % DAY <= JUST_PASSED {
+        0
     } else {
         clock + DAY - now.seconds_of_day
     };
@@ -353,15 +393,15 @@ mod tests {
     /// limit: those rows rest on the fixtures above.
     const REAL: &[(&str, &str, FailureClass)] = &[
         // Codex 0.15x, the 2026-11-06 music-decoder runs (three times;
-        // only the clock time differed). At [`TEN_AM`], 9:04 AM is
-        // tomorrow: 23 h 04 min ahead.
+        // only the clock time differed). At [`TEN_AM`], 9:04 AM passed
+        // within the last hour, so it counts as now.
         (
             "codex",
             "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
              visit https://chatgpt.com/codex/settings/usage to purchase more credits or try \
              again at 9:04 AM. (usageLimitExceeded)",
             FailureClass::Transient {
-                reset_at: Some(1_800_083_040),
+                reset_at: Some(1_800_000_000),
             },
         ),
         // Codex 0.154.0 with a model the ChatGPT account does not serve
@@ -471,8 +511,11 @@ mod tests {
         assert_eq!(codex_reset("7:13 PM"), at(9 * 3600 + 13 * 60));
         assert_eq!(codex_reset("12:05 PM"), at(2 * 3600 + 5 * 60));
         assert_eq!(codex_reset("10:00 AM"), at(0));
+        // Within the last hour: now (the reset has just passed).
+        assert_eq!(codex_reset("9:04 AM"), at(0));
+        assert_eq!(codex_reset("9:00 AM"), at(0));
         // Earlier in the day: tomorrow.
-        assert_eq!(codex_reset("9:04 AM"), at(23 * 3600 + 4 * 60));
+        assert_eq!(codex_reset("8:59 AM"), at(22 * 3600 + 59 * 60));
         assert_eq!(codex_reset("12:30 AM"), at(14 * 3600 + 30 * 60));
         // A 24-hour clock, either way round.
         assert_eq!(codex_reset("18:45"), at(8 * 3600 + 45 * 60));
@@ -483,6 +526,41 @@ mod tests {
         ] {
             assert_eq!(codex_reset(when), None, "{when}");
         }
+    }
+
+    #[test]
+    fn a_named_time_just_passed_is_now_not_tomorrow() {
+        let text = "You've hit your usage limit. Try again at 9:04 AM. (usageLimitExceeded)";
+        // Codex names the minute; its real reset is a few seconds into it.
+        for (seconds_of_day, label) in [
+            (9 * 3600 + 4 * 60 + 30, "9:04:30"),
+            (9 * 3600 + 4 * 60, "9:04:00"),
+            (9 * 3600 + 30 * 60, "9:30"),
+            (10 * 3600 + 3 * 60 + 59, "10:03:59"),
+        ] {
+            let now = LocalNow {
+                epoch: 1_800_000_000,
+                seconds_of_day,
+            };
+            assert_eq!(
+                classify_at("codex", text, false, || Some(now)),
+                FailureClass::Transient {
+                    reset_at: Some(1_800_000_000)
+                },
+                "at {label}"
+            );
+        }
+        // More than an hour ago: tomorrow.
+        let now = LocalNow {
+            epoch: 1_800_000_000,
+            seconds_of_day: 10 * 3600 + 5 * 60,
+        };
+        assert_eq!(
+            classify_at("codex", text, false, || Some(now)),
+            FailureClass::Transient {
+                reset_at: Some(1_800_000_000 + 23 * 3600 - 60)
+            }
+        );
     }
 
     #[test]
@@ -532,6 +610,21 @@ mod tests {
         );
         assert_eq!(parse_date("1800000000 24 00 00"), None);
         assert_eq!(parse_date("soon"), None);
+    }
+
+    #[test]
+    fn a_hung_clock_reads_as_none_within_its_limit() {
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_bounded("sleep", &["5"], std::time::Duration::from_millis(200)),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(
+            run_bounded("sh", &["-c", "echo hi"], DATE_TIMEOUT).as_deref(),
+            Some(&b"hi\n"[..])
+        );
+        assert_eq!(run_bounded("sh", &["-c", "exit 1"], DATE_TIMEOUT), None);
     }
 
     #[test]

@@ -378,11 +378,14 @@ How a turn that did not reply failed decides what happens:
 Retries wait 1, 5, then 15 minutes, or until the reset time a usage-limit error names when that
 is later, but never more than a day. Claude names its reset as a Unix time (`…|<epoch>`). Codex
 names a local clock time ("…or try again at 9:04 AM."): Octet reads the local clock (it runs
-`date` once) and waits for the next time the clock shows it, today if still ahead, otherwise
-tomorrow; across a daylight-saving change that can be an hour off. A text whose time cannot be
-read falls back to the backoff. The wait is in the log, so a restarted run still waits it out.
-After `transient_retries`, the run pauses `transient_exhausted`; `resume --decision retry` tries
-again.
+`date` once, for at most two seconds) and waits for the next time the clock shows it, today if
+still ahead. A time that passed within the last hour counts as now, so the usual backoff applies
+(Codex names the minute, and a retry at that minute can fail a few seconds before the real
+reset); an older time means tomorrow. Across a daylight-saving change the wait can be an hour
+off. A text whose time cannot be read falls back to the backoff. The wait is in the log, so a
+restarted run still waits it out. After `transient_retries`, the run pauses
+`transient_exhausted`; `resume --decision retry` tries again, and starts a fresh count: the next
+transient failure is retried after the 1-minute backoff again.
 
 The errors Octet recognises per provider (from their real texts) are in
 `crates/octet-fleet/src/classify.rs`, each a test case naming where it was seen.
