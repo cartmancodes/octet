@@ -26,11 +26,12 @@ use std::{
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
 };
 use tokio::{
     io::AsyncReadExt,
     signal::unix::{SignalKind, signal},
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, watch},
 };
 
 /// How many times `run` draws a run ID when it finds the one it drew taken
@@ -79,7 +80,9 @@ pub(crate) async fn fleet(
             Ok(0)
         }
         FleetAction::Validate { workflow, cwd } => validate_command(&workflow, cwd).await,
-        FleetAction::Status { run } => status_command(&data_dir, run.as_deref()).await,
+        FleetAction::Status { run } => {
+            status_command(&data_dir, run.as_deref(), journal_dir.as_deref()).await
+        }
         FleetAction::Stop { run } => {
             let front = Front::new(data_dir, journal_dir, false, false, true)?;
             let decision = Some(Decision::Stop);
@@ -151,18 +154,59 @@ fn say(text: &str) {
     let _ = err.flush();
 }
 
-/// `text` as one word for a shell, quoted if it needs it.
-fn quote(text: &str) -> String {
-    let text = plain(text);
+/// `text` as one word for a shell, quoted if it needs it. `None` when it has
+/// a control character: that cannot be shown faithfully, and a command that
+/// names a different path than the real one must never be printed.
+fn shell_word(text: &str) -> Option<String> {
+    if text.chars().any(char::is_control) {
+        return None;
+    }
     let plain_word = !text.is_empty()
         && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "/._-+:=@%,".contains(c));
-    if plain_word {
-        text
+    Some(if plain_word {
+        text.to_owned()
     } else {
         format!("'{}'", text.replace('\'', "'\\''"))
+    })
+}
+
+/// `octet fleet resume RUN` as the user would type it to go on from
+/// `options`, naming `--journal-dir` when one was given.
+fn resume_command(run: &str, options: &[&str], journal_dir: Option<&Path>) -> String {
+    let dir = journal_dir.map(|dir| shell_word(&dir.display().to_string()));
+    let (Some(run), true) = (shell_word(run), dir.as_ref().is_none_or(Option::is_some)) else {
+        return "octet fleet resume RUN_ID (the run ID or the journal directory has a control \
+                character, so the exact command is not shown)"
+            .into();
+    };
+    let mut command = format!("octet fleet resume {run}");
+    if !options.is_empty() {
+        let _ = write!(command, " --decision <{}>", options.join("|"));
     }
+    if options.contains(&"rounds") {
+        command.push_str(" [--rounds N]");
+    }
+    if let Some(dir) = dir.flatten() {
+        let _ = write!(command, " --journal-dir {dir}");
+    }
+    command
+}
+
+/// What discarding a stopped run's changes does.
+const DISCARD: &str = "to discard the run's changes: this restores the work tree to the run's \
+starting snapshot (so it also discards any edit made since), removes untracked files that are not \
+in that snapshot (ignored files are kept) and leaves the index unstaged";
+
+/// The command that discards a run's changes: the work tree at `top` back to
+/// the snapshot `tree`, then the index back to `HEAD`. `None` when a path has
+/// a control character and so cannot be shown safely.
+fn discard_command(top: &str, tree: &str) -> Option<String> {
+    let (top, tree) = (shell_word(top)?, shell_word(tree)?);
+    Some(format!(
+        "git -C {top} read-tree --reset -u {tree} && git -C {top} clean -fd && git -C {top} reset -q"
+    ))
 }
 
 /// The serialized name of `value` (`reconcile`, `drift`, …).
@@ -300,22 +344,70 @@ async fn remember_trust(data_dir: &Path, hash: &str, summary: &str) -> Result<()
 
 // ---- reading the user --------------------------------------------------
 
-/// One line of stdin, read on a thread of its own: a prompt nobody answers
-/// must not hold the process open once the run is over.
-fn read_line() -> oneshot::Receiver<Option<String>> {
-    let (tx, rx) = oneshot::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let read = std::io::stdin().read_line(&mut line);
-        let _ = tx.send(read.ok().filter(|bytes| *bytes > 0).map(|_| line));
-    });
-    rx
+/// The lines of an input, read by one thread for the life of the process and
+/// handed over a channel. Every prompt takes its answer from here, so a
+/// prompt that is dropped (an approval that closed, a signal) leaves no reader
+/// behind to swallow the next answer; what was typed for it is still queued,
+/// and the next prompt discards it ([`LineSource::drain`]) before it asks.
+struct LineSource {
+    lines: mpsc::UnboundedReceiver<String>,
 }
 
-/// Shows `prompt` on stderr and reads the answer; `None` at end of input.
-async fn ask_line(prompt: &str) -> Option<String> {
-    say(prompt);
-    read_line().await.ok().flatten()
+impl LineSource {
+    /// Reads lines with `read_line` on a thread of its own, so a prompt nobody
+    /// answers cannot hold the process open. The end of input closes the
+    /// channel.
+    fn new(
+        mut read_line: impl FnMut(&mut String) -> std::io::Result<usize> + Send + 'static,
+    ) -> Self {
+        let (tx, lines) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                match read_line(&mut line) {
+                    Ok(bytes) if bytes > 0 && tx.send(line).is_ok() => {}
+                    _ => break,
+                }
+            }
+        });
+        Self { lines }
+    }
+
+    /// Drops every line already waiting: answers to prompts that are gone.
+    fn drain(&mut self) {
+        while self.lines.try_recv().is_ok() {}
+    }
+
+    /// The next line; `None` at the end of input. Cancel-safe.
+    async fn next(&mut self) -> Option<String> {
+        self.lines.recv().await
+    }
+}
+
+/// Asks the user questions on stderr and reads the answers from stdin, one
+/// at a time. Cloned into the approver; the stdin reader starts with the
+/// first question.
+#[derive(Clone)]
+struct Prompter {
+    source: Arc<tokio::sync::Mutex<Option<LineSource>>>,
+}
+
+impl Prompter {
+    fn new() -> Self {
+        Self {
+            source: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Shows `prompt` and reads the answer; `None` at end of input. Cancel-safe.
+    async fn ask(&self, prompt: &str) -> Option<String> {
+        let mut source = self.source.lock().await;
+        let source =
+            source.get_or_insert_with(|| LineSource::new(|line| std::io::stdin().read_line(line)));
+        source.drain();
+        say(prompt);
+        source.next().await
+    }
 }
 
 /// Whether `answer` says yes.
@@ -371,6 +463,7 @@ fn signal_code(signal: &str) -> i32 {
 /// denied with a warning, as `--print` does.
 struct Terminal {
     ask: bool,
+    prompter: Prompter,
 }
 
 impl Approver for Terminal {
@@ -402,7 +495,10 @@ impl Approver for Terminal {
                 "  allowing grants: {}\nAllow? [y/N] ",
                 plain(&summary.scope)
             );
-            ask_line(&text).await.is_some_and(|answer| yes(&answer))
+            self.prompter
+                .ask(&text)
+                .await
+                .is_some_and(|answer| yes(&answer))
         })
     }
 }
@@ -608,6 +704,7 @@ struct Front {
     /// The call is `stop`, whose refusal is a pause, not a usage error.
     stopping: bool,
     signals: Signals,
+    prompter: Prompter,
 }
 
 impl Front {
@@ -625,12 +722,14 @@ impl Front {
             interactive,
             stopping,
             signals: watch_signals()?,
+            prompter: Prompter::new(),
         })
     }
 
     fn io(&self, events: mpsc::Sender<FleetEvent>) -> RunnerIo {
         let approver = Terminal {
             ask: self.interactive,
+            prompter: self.prompter.clone(),
         };
         RunnerIo::new(events, Box::new(approver), self.signals.clone())
     }
@@ -658,24 +757,9 @@ impl Front {
         }
     }
 
-    /// `octet fleet resume RUN` and the options it was given, as the user
-    /// would type it to go on from `options`.
+    /// The command that resumes `run` from a pause with `options`.
     fn resume_command(&self, run: &str, options: &[&str]) -> String {
-        let mut command = format!("octet fleet resume {}", quote(run));
-        if !options.is_empty() {
-            let _ = write!(command, " --decision <{}>", options.join("|"));
-        }
-        if options.contains(&"rounds") {
-            command.push_str(" [--rounds N]");
-        }
-        if let Some(dir) = &self.journal_dir {
-            let _ = write!(
-                command,
-                " --journal-dir {}",
-                quote(&dir.display().to_string())
-            );
-        }
-        command
+        resume_command(run, options, self.journal_dir.as_deref())
     }
 }
 
@@ -821,9 +905,8 @@ async fn choose(front: &Front, reason: PauseReason, options: &[&'static str]) ->
     }
     text.push_str("Decision (number or name): ");
     loop {
-        say(&text);
         let line = tokio::select! {
-            line = read_line() => line.ok().flatten(),
+            line = front.prompter.ask(&text) => line,
             name = next_signal(&mut signals) => return Choice::Signal(name),
         };
         let Some(line) = line else {
@@ -841,7 +924,11 @@ async fn choose(front: &Front, reason: PauseReason, options: &[&'static str]) ->
             continue;
         };
         let rounds = if picked == "rounds" {
-            let Some(answer) = ask_line("Raise the cap to how many rounds? ").await else {
+            let Some(answer) = front
+                .prompter
+                .ask("Raise the cap to how many rounds? ")
+                .await
+            else {
                 return Choice::None;
             };
             let Some(rounds) = answer.trim().parse::<u32>().ok().filter(|n| *n >= 1) else {
@@ -902,27 +989,21 @@ async fn completed(front: &Front, run: &str, diff_command: Option<&str>) {
 /// The end of a stopped run: the tree is as the run left it, and this
 /// command would discard its changes.
 async fn stopped(front: &Front, run: &str) {
-    let (shown, command) = match store::open(&front.data_dir, run).await {
-        Ok((_, file)) => {
-            let top = quote(&file.top.display().to_string());
-            (
-                true,
-                format!(
-                    "git -C {top} read-tree --reset -u {tree} && git -C {top} clean -fd",
-                    tree = quote(&file.base_tree)
-                ),
-            )
-        }
-        Err(_) => (false, String::new()),
-    };
     println!(
         "stopped {}; the work tree is as the run left it",
         plain(run)
     );
-    if shown {
-        println!(
-            "to discard the run's changes (and any untracked file not in the starting tree): {command}"
-        );
+    let Ok((_, file)) = store::open(&front.data_dir, run).await else {
+        return;
+    };
+    match discard_command(&file.top.display().to_string(), &file.base_tree) {
+        Some(command) => println!("{DISCARD}:\n  {command}"),
+        None => println!(
+            "the work tree's path has a control character, so no command is shown; the run's \
+             starting snapshot is the tree {} (ref refs/octet-fleet/{}/0)",
+            plain(&file.base_tree),
+            plain(run)
+        ),
     }
 }
 
@@ -982,6 +1063,7 @@ async fn run_command(
     // The terminal answers questions unless stdin carried the task.
     let interactive = terminal() && !from_stdin;
     let signals = watch_signals()?;
+    let prompter = Prompter::new();
     let known = tokio::fs::try_exists(trust_path(&data_dir, &hash)?)
         .await
         .unwrap_or(false);
@@ -993,7 +1075,7 @@ async fn run_command(
         } else if interactive {
             let mut signals = signals.clone();
             let answer = tokio::select! {
-                answer = ask_line("Trust this workflow and run it? [y/N] ") => answer,
+                answer = prompter.ask("Trust this workflow and run it? [y/N] ") => answer,
                 name = next_signal(&mut signals) => return Ok(signal_code(name)),
             };
             answer.is_some_and(|answer| yes(&answer))
@@ -1024,12 +1106,17 @@ async fn run_command(
         interactive,
         stopping: false,
         signals,
+        prompter,
     };
     drive(&front, Call::Start(Box::new(start))).await
 }
 
 /// `status`: every run in a table, or one run in detail.
-async fn status_command(data_dir: &Path, run: Option<&str>) -> Result<i32, CliError> {
+async fn status_command(
+    data_dir: &Path,
+    run: Option<&str>,
+    journal_dir: Option<&Path>,
+) -> Result<i32, CliError> {
     let runs = octet_fleet::status(data_dir, run)
         .await
         .map_err(cli_error)?;
@@ -1046,7 +1133,10 @@ async fn status_command(data_dir: &Path, run: Option<&str>) -> Result<i32, CliEr
             println!("ref:       {}", plain(reference));
         }
         if summary.state == "paused" {
-            println!("resume:    octet fleet resume {}", quote(&summary.id));
+            println!(
+                "resume:    {}",
+                resume_command(&summary.id, &[], journal_dir)
+            );
         }
         return Ok(0);
     }
@@ -1118,8 +1208,75 @@ mod tests {
 
     #[test]
     fn shell_words_are_quoted_only_when_they_need_it() {
-        assert_eq!(quote("/work/repo"), "/work/repo");
-        assert_eq!(quote("/my work/it's"), "'/my work/it'\\''s'");
+        assert_eq!(shell_word("/work/repo").as_deref(), Some("/work/repo"));
+        assert_eq!(
+            shell_word("/my work/it's").as_deref(),
+            Some("'/my work/it'\\''s'")
+        );
+    }
+
+    #[test]
+    fn a_path_with_a_control_character_never_becomes_a_command() {
+        assert_eq!(shell_word("/work/a\nb"), None);
+        assert_eq!(shell_word("/work/a\u{1b}[2Jb"), None);
+        assert_eq!(discard_command("/work/repo\n/..", "abc123"), None);
+        assert_eq!(discard_command("/work/repo", "abc\u{7}"), None);
+        let command = discard_command("/my work", "4b825dc6").unwrap();
+        assert_eq!(
+            command,
+            "git -C '/my work' read-tree --reset -u 4b825dc6 \
+             && git -C '/my work' clean -fd && git -C '/my work' reset -q"
+        );
+        let plain = resume_command("f1-0001", &["continue", "rounds", "stop"], None);
+        assert_eq!(
+            plain,
+            "octet fleet resume f1-0001 --decision <continue|rounds|stop> [--rounds N]"
+        );
+        let named = resume_command("f1-0001", &[], Some(Path::new("/my data")));
+        assert_eq!(named, "octet fleet resume f1-0001 --journal-dir '/my data'");
+        let unsafe_dir = resume_command("f1-0001", &[], Some(Path::new("/d\nx")));
+        assert!(!unsafe_dir.contains("--journal-dir"), "{unsafe_dir}");
+        assert!(resume_command("a\nb", &[], None).contains("not shown"));
+    }
+
+    /// A prompter over a socket we type into.
+    fn typed() -> (Prompter, std::os::unix::net::UnixStream) {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut input = std::io::BufReader::new(theirs);
+        let source = LineSource::new(move |line| std::io::BufRead::read_line(&mut input, line));
+        let prompter = Prompter {
+            source: Arc::new(tokio::sync::Mutex::new(Some(source))),
+        };
+        (prompter, ours)
+    }
+
+    const PATIENCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+    #[tokio::test]
+    async fn an_abandoned_prompt_does_not_swallow_the_next_answer() {
+        let (prompter, mut typing) = typed();
+        // The first prompt is dropped unanswered, as a closed approval is.
+        let abandoned = tokio::time::timeout(PATIENCE, prompter.ask("first? ")).await;
+        assert!(abandoned.is_err());
+        // What the user typed for it afterwards is stale; the next prompt
+        // must not take it, and must take the answer typed for itself.
+        typing.write_all(b"stale\n").unwrap();
+        tokio::time::sleep(PATIENCE).await;
+        let asked = prompter.ask("second? ");
+        let answer = async {
+            tokio::time::sleep(PATIENCE).await;
+            typing.write_all(b"fresh\n").unwrap();
+        };
+        let (line, ()) = tokio::join!(asked, answer);
+        assert_eq!(line.as_deref(), Some("fresh\n"));
+    }
+
+    #[tokio::test]
+    async fn the_end_of_input_ends_every_prompt() {
+        let (prompter, typing) = typed();
+        drop(typing);
+        assert_eq!(prompter.ask("one? ").await, None);
+        assert_eq!(prompter.ask("two? ").await, None);
     }
 
     #[test]
