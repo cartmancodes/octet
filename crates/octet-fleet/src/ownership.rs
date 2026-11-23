@@ -8,10 +8,19 @@
 //! live processes are a run's, and [`kill_verified`] stops only those.
 //!
 //! A process is the run's when it carries the attempt's `OCTET_FLEET_ATTEMPT` marker in its
-//! environment or matches a registered `(pid, start time)` identity; a process in a registered
-//! group with neither is only ever reported, never signalled.
+//! environment or matches a registered `(pid, start time)` identity, or when its parent is one
+//! of the run's (see [`check`]: a live verified parent really forked it, and an orphan's parent
+//! is init, never a reused PID). A process in a registered group with none of these is only ever
+//! reported, never signalled.
+//!
+//! On macOS `ps` shows no environment for Apple's own platform binaries (`/bin/sh`, `sleep`,
+//! `git`, ...), so the marker is invisible for them: the gate, which is `/bin/sh` until it
+//! `exec`s the vendor, is verified by its registered identity, and an Apple-binary descendant
+//! by its ancestry. An orphan of such a binary that left its parent is seen only as a member of
+//! a registered group, so it is reported as unverified (a pause, never a signal). Linux reads
+//! every environment, so the marker is always visible there.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -54,6 +63,14 @@ pub enum OwnershipError {
         /// The run that holds it, when it could be read from the lock file.
         holder: Option<String>,
     },
+    /// The lock held is for another work tree than the record being written.
+    #[error("the lock held is for work tree {held}, not {asked}")]
+    WrongWorktree {
+        /// The work tree the held lock is for.
+        held: String,
+        /// The work tree the record is for.
+        asked: String,
+    },
     /// Another run still has unresolved ownership of the work tree.
     #[error("run {run} still has unresolved ownership of this work tree; resume or stop it first")]
     OtherRunUnresolved {
@@ -83,6 +100,8 @@ fn holder_note(holder: Option<&str>) -> String {
 pub struct Held {
     _run: File,
     _worktree: File,
+    /// The work tree the lock is for.
+    hash: String,
 }
 
 /// Takes the locks for driving run `run`, whose ID is the name of its directory, on the work
@@ -127,6 +146,7 @@ pub async fn lock(
     Ok(Held {
         _run: run_file,
         _worktree: worktree_file,
+        hash: worktree_hash.to_string(),
     })
 }
 
@@ -214,13 +234,20 @@ pub async fn load(data_dir: &Path, hash: &str) -> Result<WorktreeRecord, Ownersh
 ///
 /// # Errors
 ///
+/// [`OwnershipError::WrongWorktree`] when `held` is the lock of another work tree than `hash`;
 /// [`OwnershipError::Io`] or [`OwnershipError::Json`] when it cannot be written.
 pub async fn save(
-    _held: &Held,
+    held: &Held,
     data_dir: &Path,
     hash: &str,
     record: &WorktreeRecord,
 ) -> Result<(), OwnershipError> {
+    if held.hash != hash {
+        return Err(OwnershipError::WrongWorktree {
+            held: held.hash.clone(),
+            asked: hash.to_string(),
+        });
+    }
     let dir = worktrees_dir(data_dir);
     create_private_dir(&dir).await?;
     let path = record_path(data_dir, hash);
@@ -257,6 +284,8 @@ pub fn admit(record: &WorktreeRecord, driving: &str) -> Result<(), OwnershipErro
 pub struct ProcessInfo {
     /// The process ID.
     pub pid: u32,
+    /// Its parent: `1` (or a subreaper) once the real parent has exited.
+    pub ppid: u32,
     /// Its process group.
     pub pgid: u32,
     /// Its start time, in the form [`start_time`] reports and an [`Identity`] stores.
@@ -297,7 +326,7 @@ mod platform {
 
     pub(super) async fn list() -> Result<Vec<ProcessInfo>, OwnershipError> {
         let out = ps()
-            .args(["-A", "-E", "-ww", "-o", "pid=,pgid=,lstart=,command="])
+            .args(["-A", "-E", "-ww", "-o", "pid=,ppid=,pgid=,lstart=,command="])
             .output()
             .await?;
         if !out.status.success() {
@@ -345,10 +374,11 @@ mod platform {
         Some(token)
     }
 
-    /// One `pid pgid Www Mmm dd hh:mm:ss yyyy command…` line.
+    /// One `pid ppid pgid Www Mmm dd hh:mm:ss yyyy command…` line.
     pub(super) fn parse_line(line: &str) -> Option<ProcessInfo> {
         let mut rest = line;
         let pid = token(&mut rest)?.parse().ok()?;
+        let ppid = token(&mut rest)?.parse().ok()?;
         let pgid = token(&mut rest)?.parse().ok()?;
         let mut start = Vec::with_capacity(5);
         for _ in 0..5 {
@@ -357,6 +387,7 @@ mod platform {
         let command = rest.trim().to_string();
         Some(ProcessInfo {
             pid,
+            ppid,
             pgid,
             start: start.join(" "),
             marker: marker_in(&command),
@@ -378,7 +409,7 @@ mod platform {
     }
 
     pub(super) async fn start(pid: u32) -> Option<String> {
-        tokio::task::spawn_blocking(move || stat(pid).map(|(_, start)| start))
+        tokio::task::spawn_blocking(move || stat(pid).map(|(_, _, start)| start))
             .await
             .ok()
             .flatten()
@@ -404,13 +435,14 @@ mod platform {
     }
 
     fn read_process(pid: u32) -> Option<ProcessInfo> {
-        let (pgid, start) = stat(pid)?;
+        let (ppid, pgid, start) = stat(pid)?;
         let marker = fs::read(format!("/proc/{pid}/environ"))
             .ok()
             .and_then(|environ| marker_in(&environ));
         let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
         Some(ProcessInfo {
             pid,
+            ppid,
             pgid,
             start,
             marker,
@@ -418,16 +450,22 @@ mod platform {
         })
     }
 
-    /// The group and start time (clock ticks since boot, as decimal text) from `/proc/<pid>/stat`.
-    fn stat(pid: u32) -> Option<(u32, String)> {
+    /// The parent, group and start time (clock ticks since boot, as decimal text) from
+    /// `/proc/<pid>/stat`.
+    fn stat(pid: u32) -> Option<(u32, u32, String)> {
         parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
     }
 
     /// Fields after the last `)` (the command name may hold anything): the state is field 3, so
-    /// the group, field 5, is the third and the start time, field 22, the twentieth.
-    pub(super) fn parse_stat(stat: &str) -> Option<(u32, String)> {
+    /// the parent, field 4, is the second, the group, field 5, the third and the start time,
+    /// field 22, the twentieth.
+    pub(super) fn parse_stat(stat: &str) -> Option<(u32, u32, String)> {
         let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
-        Some((fields.get(2)?.parse().ok()?, (*fields.get(19)?).to_string()))
+        Some((
+            fields.get(1)?.parse().ok()?,
+            fields.get(2)?.parse().ok()?,
+            (*fields.get(19)?).to_string(),
+        ))
     }
 
     /// The value of `OCTET_FLEET_ATTEMPT=` in a NUL-separated environment.
@@ -446,10 +484,13 @@ mod platform {
     }
 }
 
-/// Which live processes are the attempt's: `Verified` when any carries `attempt_marker` or
-/// matches a `registered` identity, else `Unverified` when any is in one of the registered
-/// `groups`, else `Clear`. Octet's own process and the `released` PIDs are never counted. The
-/// PIDs are sorted.
+/// Which live processes are the attempt's: `Verified` when any carries `attempt_marker`, matches
+/// a `registered` identity, or is a descendant of one that does; else `Unverified` when any is in
+/// one of the registered `groups`; else `Clear`. A process whose parent is verified (and alive:
+/// it is in the list) was forked by it, and an orphan's parent is init, never a reused PID, so
+/// ancestry cannot adopt a stranger. Octet's own process and the `released` PIDs are dropped
+/// first, so neither is ever counted nor confers verification on its children. The PIDs are
+/// sorted.
 pub fn check(
     processes: &[ProcessInfo],
     attempt_marker: &str,
@@ -458,29 +499,42 @@ pub fn check(
     released: &[u32],
 ) -> ProcessCheck {
     let own = std::process::id();
-    let mut verified = Vec::new();
-    let mut unverified = Vec::new();
-    for process in processes {
-        if process.pid == own || released.contains(&process.pid) {
-            continue;
-        }
-        let known = registered
-            .iter()
-            .any(|identity| identity.pid == process.pid && identity.start == process.start);
-        if process.marker.as_deref() == Some(attempt_marker) || known {
-            verified.push(process.pid);
-        } else if groups.contains(&process.pgid) {
-            unverified.push(process.pid);
+    let live: Vec<&ProcessInfo> = processes
+        .iter()
+        .filter(|process| process.pid != own && !released.contains(&process.pid))
+        .collect();
+    let mut verified: BTreeSet<u32> = live
+        .iter()
+        .filter(|process| {
+            process.marker.as_deref() == Some(attempt_marker)
+                || registered
+                    .iter()
+                    .any(|identity| identity.pid == process.pid && identity.start == process.start)
+        })
+        .map(|process| process.pid)
+        .collect();
+    // Descendants to a fixed point: each pass adopts the children of what is verified so far.
+    loop {
+        let before = verified.len();
+        verified.extend(
+            live.iter()
+                .filter(|process| verified.contains(&process.ppid))
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+        );
+        if verified.len() == before {
+            break;
         }
     }
-    for pids in [&mut verified, &mut unverified] {
-        pids.sort_unstable();
-        pids.dedup();
-    }
+    let unverified: BTreeSet<u32> = live
+        .iter()
+        .filter(|process| !verified.contains(&process.pid) && groups.contains(&process.pgid))
+        .map(|process| process.pid)
+        .collect();
     if !verified.is_empty() {
-        ProcessCheck::Verified(verified)
+        ProcessCheck::Verified(verified.into_iter().collect())
     } else if !unverified.is_empty() {
-        ProcessCheck::Unverified(unverified)
+        ProcessCheck::Unverified(unverified.into_iter().collect())
     } else {
         ProcessCheck::Clear
     }
@@ -580,7 +634,12 @@ mod tests {
             if own_group {
                 std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
             }
-            let child = cmd.spawn().expect("the helper starts");
+            self.spawn_command(&mut cmd)
+        }
+
+        /// Starts `cmd`, to be killed and reaped with the others.
+        fn spawn_command(&mut self, cmd: &mut Command) -> u32 {
+            let child = cmd.spawn().expect("the process starts");
             let pid = child.id();
             self.children.push(child);
             self.pids.push(pid);
@@ -627,6 +686,24 @@ mod tests {
         RunDir { root }
     }
 
+    /// Locks once the lock is free. A lock is released when every copy of its file is closed,
+    /// and a child another test is forking holds a copy until it execs (std's files close on
+    /// exec), so a lock just dropped can stay busy for a moment.
+    async fn lock_when_free(data: &Path, run: &RunDir, hash: &str) -> Held {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match lock(data, run, hash).await {
+                Ok(held) => return held,
+                Err(OwnershipError::RunBusy | OwnershipError::WorktreeBusy { .. })
+                    if Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("the lock never came free: {error:?}"),
+            }
+        }
+    }
+
     fn unresolved(attempt: u32) -> Unresolved {
         Unresolved {
             attempt: AttemptId(attempt),
@@ -654,9 +731,7 @@ mod tests {
         assert_eq!(std::fs::read(&log).expect("log"), b"{\"kind\":\"x\"}\n");
         assert_eq!(meta.modified().expect("mtime"), before);
         drop(held);
-        lock(data.path(), &run, "aaaa")
-            .await
-            .expect("free once dropped");
+        lock_when_free(data.path(), &run, "aaaa").await;
     }
 
     #[tokio::test]
@@ -691,14 +766,9 @@ mod tests {
             other => panic!("expected WorktreeBusy, got {other:?}"),
         }
         // The refused run's own lock was released again, and another work tree is free.
-        let other_tree = lock(data.path(), &second, "bbbb")
-            .await
-            .expect("other tree");
-        drop(other_tree);
+        drop(lock_when_free(data.path(), &second, "bbbb").await);
         drop(held);
-        lock(data.path(), &second, "aaaa")
-            .await
-            .expect("free once dropped");
+        lock_when_free(data.path(), &second, "aaaa").await;
     }
 
     #[tokio::test]
@@ -740,6 +810,22 @@ mod tests {
             load(data.path(), "aaaa").await.expect("load"),
             WorktreeRecord::default()
         );
+    }
+
+    #[tokio::test]
+    async fn a_record_is_saved_only_under_its_own_worktree_lock() {
+        let data = TempDir::new("ownership-wrong");
+        let run = run_dir(data.path(), "r1");
+        let held = lock(data.path(), &run, "aaaa").await.expect("lock");
+        let saved = save(&held, data.path(), "bbbb", &WorktreeRecord::default()).await;
+        match saved {
+            Err(OwnershipError::WrongWorktree { held, asked }) => {
+                assert_eq!((held.as_str(), asked.as_str()), ("aaaa", "bbbb"));
+            }
+            other => panic!("expected WrongWorktree, got {other:?}"),
+        }
+        assert!(!data.path().join("fleet/worktrees/bbbb.json").exists());
+        assert!(!data.path().join("fleet/worktrees/bbbb.json.tmp").exists());
     }
 
     #[tokio::test]
@@ -828,36 +914,171 @@ mod tests {
     async fn an_unmarked_group_member_is_unverified() {
         let mut kids = Kids::default();
         let marker = "run-group/0";
-        // The parent is marked and leads its own group; the sleeper it starts has no marker.
-        let leader = kids.spawn("parent", Some(marker), true);
+        // Neither the leader nor the sleeper it starts carries a marker, and the leader is not
+        // registered, so nothing is verified, and the members are known only by their group.
+        let leader = kids.spawn("parent", None, true);
         let group = leader;
         let list = list_until(|l| {
-            has_marker(l, leader, marker)
-                && l.iter()
-                    .any(|p| p.pgid == group && p.pid != leader && p.marker.is_none())
+            l.iter()
+                .any(|p| p.pgid == group && p.pid != leader && p.ppid == leader)
         })
         .await;
         let member = list
             .iter()
-            .find(|p| p.pgid == group && p.pid != leader && p.marker.is_none())
+            .find(|p| p.pgid == group && p.pid != leader && p.ppid == leader)
             .map(|p| p.pid)
             .expect("the member");
         kids.pids.push(member);
-        assert!(list.iter().any(|p| p.pid == member && p.marker.is_none()));
-        // The marked leader is verified, and verified wins over unverified.
+        let mut both = vec![leader, member];
+        both.sort_unstable();
         assert_eq!(
             check(&list, marker, &[], &[group], &[]),
-            ProcessCheck::Verified(vec![leader])
+            ProcessCheck::Unverified(both.clone())
         );
-        // With the leader released, the unmarked member is all that is left.
+        // Without the registered group they are nobody's business.
+        assert_eq!(check(&list, marker, &[], &[], &[]), ProcessCheck::Clear);
+        // Released, the leader neither counts nor makes its child the run's.
         assert_eq!(
             check(&list, marker, &[], &[group], &[leader]),
             ProcessCheck::Unverified(vec![member])
         );
-        // Without the registered group the member is nobody's business.
+        // Registered by identity, the leader is verified and so is its child, by ancestry.
+        let start = start_time(leader).await.expect("start time");
+        let identity = Identity { pid: leader, start };
         assert_eq!(
-            check(&list, marker, &[], &[], &[leader]),
-            ProcessCheck::Clear
+            check(
+                &list,
+                marker,
+                std::slice::from_ref(&identity),
+                &[group],
+                &[]
+            ),
+            ProcessCheck::Verified(both)
+        );
+        // Released as well as registered: released wins, and the child is unverified again.
+        assert_eq!(
+            check(&list, marker, &[identity], &[group], &[leader]),
+            ProcessCheck::Unverified(vec![member])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_descendant_with_no_visible_marker_is_verified_by_ancestry() {
+        let mut kids = Kids::default();
+        let marker = "run-ancestry/0";
+        // Real system binaries: on macOS their environment is not shown, so only the shell's
+        // registered identity and the sleep's parentage can make them the run's.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30 & wait"])
+            .env_remove(MARKER_VAR)
+            .stdin(Stdio::null());
+        let shell = kids.spawn_command(&mut cmd);
+        let list = list_until(|l| l.iter().any(|p| p.ppid == shell)).await;
+        let sleeper = list.iter().find(|p| p.ppid == shell).expect("the sleeper");
+        kids.pids.push(sleeper.pid);
+        assert_eq!(sleeper.marker, None);
+        assert_eq!(check(&list, marker, &[], &[], &[]), ProcessCheck::Clear);
+        let start = start_time(shell).await.expect("start time");
+        let identity = Identity { pid: shell, start };
+        let mut expected = vec![shell, sleeper.pid];
+        expected.sort_unstable();
+        assert_eq!(
+            check(&list, marker, &[identity], &[], &[]),
+            ProcessCheck::Verified(expected)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_ps_line_is_parsed_into_its_fields() {
+        let line = "  812   799   799 Mon Nov  3 10:11:12 2026     sleep 30 HOME=/h OCTET_FLEET_ATTEMPT=r/1 X=y";
+        let info = platform::parse_line(line).expect("a line");
+        assert_eq!((info.pid, info.ppid, info.pgid), (812, 799, 799));
+        assert_eq!(info.start, "Mon Nov 3 10:11:12 2026");
+        assert_eq!(info.marker.as_deref(), Some("r/1"));
+        assert!(
+            info.command.starts_with("sleep 30 HOME=/h"),
+            "{}",
+            info.command
+        );
+        assert!(platform::parse_line("not a line").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proc_stat_is_parsed_after_the_last_paren() {
+        let stat =
+            "812 (a) b) c) S 799 798 797 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 123456 1000 50";
+        // ppid 799, pgrp 798, starttime is field 22 (counting the pid as 1).
+        let (ppid, pgid, start) = platform::parse_stat(stat).expect("a stat");
+        assert_eq!((ppid, pgid, start.as_str()), (799, 798, "123456"));
+        assert!(platform::parse_stat("812 no parens").is_none());
+    }
+
+    fn info(pid: u32, ppid: u32, pgid: u32, marker: Option<&str>) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid,
+            pgid,
+            start: format!("start-{pid}"),
+            marker: marker.map(str::to_string),
+            command: format!("cmd-{pid}"),
+        }
+    }
+
+    #[test]
+    fn ancestry_reaches_every_generation_whatever_the_list_order() {
+        // 40 is listed before its parent 30, which is listed before its parent 20.
+        let list = [
+            info(40, 30, 7, None),
+            info(30, 20, 7, None),
+            info(20, 10, 7, None),
+            info(10, 1, 7, Some("m")),
+            info(50, 1, 7, None),
+            info(60, 99, 8, None),
+        ];
+        assert_eq!(
+            check(&list, "m", &[], &[], &[]),
+            ProcessCheck::Verified(vec![10, 20, 30, 40])
+        );
+        // The unrelated process in the registered group is the only unverified one, and only
+        // when nothing is verified.
+        assert_eq!(
+            check(&list[4..], "m", &[], &[7], &[]),
+            ProcessCheck::Unverified(vec![50])
+        );
+    }
+
+    #[test]
+    fn a_released_parent_confers_nothing_on_its_children() {
+        let list = [
+            info(10, 1, 7, Some("m")),
+            info(20, 10, 7, None),
+            info(30, 20, 7, None),
+        ];
+        // Releasing the middle one cuts its subtree off, not the rest.
+        assert_eq!(
+            check(&list, "m", &[], &[], &[20]),
+            ProcessCheck::Verified(vec![10])
+        );
+        // Releasing the root leaves no verified process, and the children are not the run's.
+        assert_eq!(check(&list, "m", &[], &[], &[10]), ProcessCheck::Clear);
+        assert_eq!(
+            check(&list, "m", &[], &[7], &[10]),
+            ProcessCheck::Unverified(vec![20, 30])
+        );
+    }
+
+    #[test]
+    fn octets_own_children_are_not_the_runs() {
+        let own = std::process::id();
+        // Something Octet itself started (the `ps` of a listing) is the child of a pid that is
+        // never verified, even one carrying the marker.
+        let list = [info(own, 1, 7, Some("m")), info(900, own, 7, None)];
+        assert_eq!(check(&list, "m", &[], &[], &[]), ProcessCheck::Clear);
+        assert_eq!(
+            check(&list, "m", &[], &[7], &[]),
+            ProcessCheck::Unverified(vec![900])
         );
     }
 
@@ -878,6 +1099,7 @@ mod tests {
     fn octet_itself_is_never_listed_as_the_runs() {
         let own = ProcessInfo {
             pid: std::process::id(),
+            ppid: 1,
             pgid: 5,
             start: "s".into(),
             marker: Some("m".into()),
