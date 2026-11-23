@@ -12,6 +12,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use octet_fleet::evidence::TEST_PAUSE_ENV;
+use octet_fleet::ownership::ProcessInfo;
 use octet_fleet::record::{Accepted, AttemptId, CandidateId, Origin, PauseReason, Record};
 use octet_testkit::TempDir;
 use serde_json::{Value, json};
@@ -129,6 +130,23 @@ pub(crate) fn verdict(kind: &str, new: &[&str], resolved: &[&str]) -> String {
     format!("I read it closely.\n\n```json\n{block}\n```\n")
 }
 
+/// A verdict reply: `kind`, with `new` blocking findings, giving each earlier
+/// finding of `previous` its status (`open` or `resolved`).
+pub(crate) fn verdict_previous(kind: &str, new: &[&str], previous: &[(&str, &str)]) -> String {
+    let block = json!({
+        "verdict": kind,
+        "new_findings": new
+            .iter()
+            .map(|summary| json!({"severity": "blocking", "summary": summary}))
+            .collect::<Vec<_>>(),
+        "previous": previous
+            .iter()
+            .map(|(id, status)| json!({"id": id, "status": status}))
+            .collect::<Vec<_>>(),
+    });
+    format!("I read it again.\n\n```json\n{block}\n```\n")
+}
+
 /// A verdict approving, resolving `resolved`.
 pub(crate) fn approve(resolved: &[&str]) -> String {
     verdict("approved", &[], resolved)
@@ -216,17 +234,38 @@ impl Bench {
         self.dir.path().join(name)
     }
 
-    /// Writes the fake's script: `turns`, logged to the bench's turn log.
+    /// Writes the fake's script: `turns`, logged to the bench's turn log;
+    /// every vendor process appends its PID to [`Bench::started_pids`]'s file
+    /// as it starts.
     pub(crate) fn script(&self, turns: &Value) {
-        let body = json!({"log": self.turns, "turns": turns});
+        let body = json!({
+            "log": self.turns,
+            "startup_marker": self.side("started.pids"),
+            "turns": turns,
+        });
         std::fs::write(&self.script, body.to_string()).unwrap();
     }
 
     /// Writes `yaml` as the workflow; its path.
     pub(crate) fn workflow(&self, yaml: &str) -> PathBuf {
-        let path = self.side("workflow.yaml");
+        self.workflow_named("workflow.yaml", yaml)
+    }
+
+    /// Writes `yaml` as the workflow file `name`; its path.
+    pub(crate) fn workflow_named(&self, name: &str, yaml: &str) -> PathBuf {
+        let path = self.side(name);
         std::fs::write(&path, yaml).unwrap();
         path
+    }
+
+    /// The PIDs of the vendor processes that started, from the script's
+    /// startup marker: a gate whose PID is not here never ran its vendor.
+    pub(crate) fn started_pids(&self) -> Vec<u32> {
+        std::fs::read_to_string(self.side("started.pids"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.trim().parse().unwrap())
+            .collect()
     }
 
     /// Starts `octet fleet ARGS --journal-dir DATA` with the script named,
@@ -244,7 +283,7 @@ impl Bench {
             command.env_remove(name);
         }
         command.envs(env.iter().copied());
-        Octet::spawn(command, &self.data)
+        Octet::spawn(command)
     }
 
     /// `octet fleet run WORKFLOW --task … --cwd WORK --trust --output json`.
@@ -263,9 +302,33 @@ impl Bench {
         self.octet(&args, env)
     }
 
-    /// `octet fleet resume RUN [--decision D] --output json`.
+    /// `octet fleet resume RUN [--decision D] --output json`, for the only
+    /// run.
     pub(crate) fn resume(&self, decision: Option<&str>, env: &[(&str, &OsStr)]) -> Octet {
+        self.resume_run(&self.run_id(), decision, env)
+    }
+
+    /// `octet fleet resume RUN ARGS --output json`, for the only run.
+    pub(crate) fn resume_args(&self, args: &[&str]) -> Octet {
         let run = self.run_id();
+        let mut all: Vec<&OsStr> = vec!["resume".as_ref(), run.as_ref()];
+        all.extend(args.iter().map(OsStr::new));
+        all.extend::<[&OsStr; 2]>(["--output".as_ref(), "json".as_ref()]);
+        self.octet(&all, &[])
+    }
+
+    /// `octet fleet stop RUN`.
+    pub(crate) fn stop_run(&self, run: &str) -> Octet {
+        self.octet(&["stop".as_ref(), run.as_ref()], &[])
+    }
+
+    /// `octet fleet resume RUN [--decision D] --output json`.
+    pub(crate) fn resume_run(
+        &self,
+        run: &str,
+        decision: Option<&str>,
+        env: &[(&str, &OsStr)],
+    ) -> Octet {
         let mut args: Vec<&OsStr> = vec!["resume".as_ref(), run.as_ref()];
         if let Some(decision) = decision {
             args.extend::<[&OsStr; 2]>(["--decision".as_ref(), decision.as_ref()]);
@@ -282,7 +345,40 @@ impl Bench {
     }
 
     pub(crate) fn run_dir(&self) -> PathBuf {
-        self.data.join("fleet").join(self.run_id())
+        self.run_dir_of(&self.run_id())
+    }
+
+    /// The directory of run `run`.
+    pub(crate) fn run_dir_of(&self, run: &str) -> PathBuf {
+        self.data.join("fleet").join(run)
+    }
+
+    /// The directory of attempt `attempt` of the only run.
+    pub(crate) fn attempt_dir(&self, attempt: AttemptId) -> PathBuf {
+        self.run_dir().join("attempts").join(attempt.0.to_string())
+    }
+
+    /// The IDs of the runs in the data directory, oldest first.
+    pub(crate) fn run_ids(&self) -> Vec<String> {
+        runs_in(&self.data)
+    }
+
+    /// The runs the work tree's ownership record lists: those with
+    /// unresolved ownership of it.
+    pub(crate) fn listed_runs(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.data.join("fleet").join("worktrees")) else {
+            return Vec::new();
+        };
+        let mut listed = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                listed.extend(record["runs"].as_object().unwrap().keys().cloned());
+            }
+        }
+        listed.sort();
+        listed
     }
 
     /// Every whole record of the run's log; none before the log exists. A
@@ -291,7 +387,13 @@ impl Bench {
         if runs_in(&self.data).is_empty() {
             return Vec::new();
         }
-        let text = std::fs::read_to_string(self.run_dir().join("log.jsonl")).unwrap_or_default();
+        self.records_of(&self.run_id())
+    }
+
+    /// Every whole record of run `run`'s log, as [`Bench::records`].
+    pub(crate) fn records_of(&self, run: &str) -> Vec<Record> {
+        let text =
+            std::fs::read_to_string(self.run_dir_of(run).join("log.jsonl")).unwrap_or_default();
         let whole = text.rfind('\n').map_or(0, |end| end + 1);
         text[..whole]
             .lines()
@@ -587,13 +689,13 @@ impl Ended {
     }
 }
 
-/// A running `octet`, leading its own process group. Dropped, it kills that
-/// group and every process carrying a marker of a run in its data
-/// directory, so nothing it started outlives the test.
+/// A running `octet`, leading its own process group. Dropped unreaped, it
+/// kills that group. What its vendors and commands leave behind the
+/// [`Bench`] kills when the test ends: a test may keep such a process alive
+/// from one `octet` to the next on purpose.
 pub(crate) struct Octet {
     child: Child,
     reaped: bool,
-    data: PathBuf,
     stdout: mpsc::Receiver<String>,
     stderr: mpsc::Receiver<String>,
 }
@@ -610,7 +712,7 @@ fn collect(mut pipe: impl std::io::Read + Send + 'static) -> mpsc::Receiver<Stri
 }
 
 impl Octet {
-    pub(crate) fn spawn(mut command: Command, data: &Path) -> Self {
+    pub(crate) fn spawn(mut command: Command) -> Self {
         command
             .process_group(0)
             .stdin(Stdio::null())
@@ -622,7 +724,6 @@ impl Octet {
         Self {
             child,
             reaped: false,
-            data: data.to_path_buf(),
             stdout,
             stderr,
         }
@@ -653,6 +754,13 @@ impl Octet {
             take(&self.stdout),
             take(&self.stderr)
         )
+    }
+
+    /// Sends `signal` to `octet` alone, which must still be running.
+    pub(crate) fn signal(&mut self, signal: i32) {
+        assert!(self.running(), "octet ended: {}", self.output_so_far());
+        // SAFETY: kill(2) of a child this test spawned and has not reaped.
+        assert_eq!(unsafe { libc::kill(self.pid(), signal) }, 0);
     }
 
     /// SIGKILLs `octet` alone (not its group) and reaps it.
@@ -697,7 +805,6 @@ impl Drop for Octet {
             unsafe { libc::killpg(self.pid(), libc::SIGKILL) };
             let _ = self.child.wait();
         }
-        kill_marked(&self.data);
     }
 }
 
@@ -752,11 +859,11 @@ pub(crate) fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// The live processes of `attempt`: those its `attempt_session` records
-/// or its gate registry (`<attempt>/processes`, read afresh) name, and any
-/// carrying a marker of the bench's run.
-pub(crate) fn attempt_processes(bench: &Bench, attempt: AttemptId) -> Vec<u32> {
-    let records = bench.records();
+/// The live processes of `attempt` of run `run`: those its
+/// `attempt_session` records or its gate registry (`<attempt>/processes`,
+/// read afresh) name, and any carrying a marker of the bench's runs.
+pub(crate) fn attempt_processes_of(bench: &Bench, run: &str, attempt: AttemptId) -> Vec<u32> {
+    let records = bench.records_of(run);
     let mut pids: Vec<u32> = records
         .iter()
         .filter_map(|record| match record {
@@ -769,17 +876,7 @@ pub(crate) fn attempt_processes(bench: &Bench, attempt: AttemptId) -> Vec<u32> {
         })
         .flatten()
         .collect();
-    let registry = bench
-        .run_dir()
-        .join("attempts")
-        .join(attempt.0.to_string())
-        .join("processes");
-    pids.extend(
-        std::fs::read_to_string(registry)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.trim().parse::<u32>().ok()),
-    );
+    pids.extend(registered(bench, run, attempt));
     pids.retain(|&pid| alive(pid));
     pids.extend(marked(&bench.data));
     pids
@@ -789,14 +886,19 @@ pub(crate) fn attempt_processes(bench: &Bench, attempt: AttemptId) -> Vec<u32> {
 /// most [`SHORT`]. A gate spawned just before the kill may register itself
 /// late, so "gone" must hold on two looks 200 ms apart.
 pub(crate) fn await_gone(bench: &Bench, attempt: AttemptId) {
+    await_gone_of(bench, &bench.run_id(), attempt);
+}
+
+/// [`await_gone`] for `attempt` of run `run`.
+pub(crate) fn await_gone_of(bench: &Bench, run: &str, attempt: AttemptId) {
     let mut left = Vec::new();
     let gone = octet_testkit::wait_until(SHORT, || {
-        left = attempt_processes(bench, attempt);
+        left = attempt_processes_of(bench, run, attempt);
         if !left.is_empty() {
             return false;
         }
         std::thread::sleep(Duration::from_millis(200));
-        left = attempt_processes(bench, attempt);
+        left = attempt_processes_of(bench, run, attempt);
         left.is_empty()
     });
     assert!(gone, "the killed driver's processes {left:?} outlived it");
@@ -834,4 +936,301 @@ pub(crate) fn answer_pauses(dir: PathBuf, stop: Arc<AtomicBool>, edit: impl Fn()
             std::thread::sleep(Duration::from_millis(5));
         }
     });
+}
+
+// ---- processes ---------------------------------------------------------
+
+/// Every live process, as Octet lists them; none when they cannot be listed.
+pub(crate) fn processes() -> Vec<ProcessInfo> {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return Vec::new();
+    };
+    runtime
+        .block_on(octet_fleet::ownership::list_processes())
+        .unwrap_or_default()
+}
+
+/// Whether process `pid` has exited: it is gone, or it is a zombie that its
+/// (stopped or dead) parent has not reaped yet.
+pub(crate) fn exited(pid: u32) -> bool {
+    !alive(pid) || zombie(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn zombie(pid: u32) -> bool {
+    // The state is the field after the command name, which ends at the last `)`.
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let end = stat.rfind(')')?;
+            Some(stat[end + 1..].trim_start().starts_with('Z'))
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(target_os = "macos")]
+fn zombie(pid: u32) -> bool {
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    state.is_empty() || state.starts_with('Z')
+}
+
+/// Waits, at most [`SHORT`], until `pid` has [`exited`].
+pub(crate) fn await_exited(pid: u32, what: &str) {
+    assert!(
+        octet_testkit::wait_until(SHORT, || exited(pid)),
+        "{what} ({pid}) did not exit within {SHORT:?}"
+    );
+}
+
+/// The survivors this bench's fake vendors started, alive now: the fake run
+/// as `fleet-survivor SECS SCRIPT`, naming the bench's script. (On macOS the
+/// listed command goes on with the environment, so `octet` itself names the
+/// script too; only a survivor's command starts so.)
+pub(crate) fn survivors(bench: &Bench) -> Vec<ProcessInfo> {
+    let start = format!(
+        "{} fleet-survivor ",
+        octet_testkit::protocol_child().display()
+    );
+    let script = format!(" {}", bench.script.display());
+    processes()
+        .into_iter()
+        .filter(|process| process.command.starts_with(&start) && process.command.contains(&script))
+        .collect()
+}
+
+impl Drop for Bench {
+    /// Kills, however the test ended, every process carrying a marker of one
+    /// of the bench's runs, and the survivors its fakes started (one without
+    /// the marker included).
+    fn drop(&mut self) {
+        kill_marked(&self.data);
+        for survivor in survivors(self) {
+            if let Ok(pid) = i32::try_from(survivor.pid) {
+                // SAFETY: kill(2) of a survivor naming this bench's script.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+/// The PIDs the gate registered for `attempt` of run `run`.
+pub(crate) fn registered(bench: &Bench, run: &str, attempt: AttemptId) -> Vec<u32> {
+    let registry = bench
+        .run_dir_of(run)
+        .join("attempts")
+        .join(attempt.0.to_string())
+        .join("processes");
+    std::fs::read_to_string(registry)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+// ---- synchronising with octet ------------------------------------------
+
+/// Waits until `path` exists while `octet` runs. Fails the test, with what
+/// was seen, when `octet` ends first or [`PATIENCE`] passes.
+pub(crate) fn await_path(octet: &mut Octet, path: &Path) {
+    let deadline = Instant::now() + PATIENCE;
+    while !path.exists() {
+        assert!(
+            octet.running(),
+            "octet ended before {}: {}",
+            path.display(),
+            octet.output_so_far()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no {} within {PATIENCE:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Waits until `holds` while `octet` runs. Fails the test, with what was
+/// seen, when `octet` ends first or [`PATIENCE`] passes.
+pub(crate) fn await_until(octet: &mut Octet, what: &str, holds: impl Fn() -> bool) {
+    let deadline = Instant::now() + PATIENCE;
+    while !holds() {
+        assert!(
+            octet.running(),
+            "octet ended before {what}: {}",
+            octet.output_so_far()
+        );
+        assert!(Instant::now() < deadline, "no {what} within {PATIENCE:?}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The path a fake's `wait_for: path` turn creates once it waits.
+pub(crate) fn waiting(path: &Path) -> PathBuf {
+    let mut waiting = path.as_os_str().to_owned();
+    waiting.push(".waiting");
+    PathBuf::from(waiting)
+}
+
+/// A test command that appends a line to `runs` and, the first time only,
+/// then becomes a survivor sleeping for minutes (`exec`, keeping its PID):
+/// a command that is still running whenever the test acts.
+pub(crate) fn blocking_once(bench: &Bench, runs: &Path) -> String {
+    format!(
+        "echo ran >> '{runs}'; n=$(wc -l < '{runs}'); [ $n -gt 1 ] || exec '{child}' \
+         fleet-survivor 300 '{script}'",
+        runs = runs.display(),
+        child = octet_testkit::protocol_child().display(),
+        script = bench.script.display(),
+    )
+}
+
+/// The lines of `path`; none when it does not exist.
+pub(crate) fn lines_of(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// The environment that turns the test pauses on, in `dir`.
+pub(crate) fn pause_env(dir: &Path) -> [(&'static str, &OsStr); 1] {
+    [(TEST_PAUSE_ENV, dir.as_os_str())]
+}
+
+/// Lets `octet` through every test pause in `dir` until it holds at a point
+/// `target` accepts (`held-<point>`), and returns that point, still held.
+/// Fails the test when `octet` ends first or [`PATIENCE`] passes.
+pub(crate) fn pause_at(octet: &mut Octet, dir: &Path, target: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(point) = name.strip_prefix("held-") else {
+                continue;
+            };
+            if target(point) {
+                return point.to_owned();
+            }
+            let go = dir.join(format!("continue-{point}"));
+            if !go.exists() {
+                std::fs::write(go, "").unwrap();
+            }
+        }
+        assert!(
+            octet.running(),
+            "octet ended before the pause: {}",
+            octet.output_so_far()
+        );
+        assert!(Instant::now() < deadline, "no pause within {PATIENCE:?}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The attempt of `step` started last in `records`, if any.
+pub(crate) fn last_attempt_of(records: &[Record], step: &str) -> Option<AttemptId> {
+    started(records)
+        .into_iter()
+        .rev()
+        .find(|(_, s)| *s == step)
+        .map(|(attempt, _)| attempt)
+}
+
+/// A `PATH` with a `git` first on it that, the first time Octet runs `git`
+/// while the shell condition `when` holds, SIGKILLs Octet (the process that
+/// ran it) instead of running git, and records that it did in the file it
+/// returns. Otherwise it runs the real `git`. Octet runs no git while a
+/// vendor's turn runs, so "the first git after X" is an exact point.
+pub(crate) fn git_tripwire(bench: &Bench, when: &str) -> (std::ffi::OsString, PathBuf) {
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert!(Path::new(&real_git).is_absolute(), "{real_git:?}");
+    let fired = bench.side("tripwire-fired");
+    let bin = bench.side("tripwire-bin");
+    octet_testkit::write_script(
+        &bin,
+        "git",
+        &format!(
+            "if [ ! -e '{fired}' ] && {{ {when} ; }}; then\n\
+             : > '{fired}'\n\
+             kill -9 $PPID\n\
+             exit 1\n\
+             fi\n\
+             exec '{real_git}' \"$@\"",
+            fired = fired.display(),
+        ),
+    );
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    (path, fired)
+}
+
+/// A `PATH` with a `sleep` first on it that, while the file it returns
+/// first exists, holds every caller before sleeping, appending the caller's
+/// parent PID to the second file as it starts to hold (for at most five
+/// minutes). A gate polls with `sleep`: held there, it cannot see that Octet
+/// is gone, and once let go it does, and exits.
+pub(crate) fn sleep_hold(bench: &Bench) -> (std::ffi::OsString, PathBuf, PathBuf) {
+    let real_sleep = Command::new("sh")
+        .args(["-c", "command -v sleep"])
+        .output()
+        .unwrap();
+    let real_sleep = String::from_utf8(real_sleep.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert!(Path::new(&real_sleep).is_absolute(), "{real_sleep:?}");
+    let hold = bench.side("sleep-hold");
+    let held = bench.side("sleep-held");
+    let bin = bench.side("sleep-bin");
+    octet_testkit::write_script(
+        &bin,
+        "sleep",
+        &format!(
+            "if [ -e '{hold}' ]; then\n\
+             echo $PPID >> '{held}'\n\
+             n=0\n\
+             while [ -e '{hold}' ] && [ $n -lt 30000 ]; do '{real_sleep}' 0.01; n=$((n + 1)); done\n\
+             fi\n\
+             exec '{real_sleep}' \"$@\"",
+            hold = hold.display(),
+            held = held.display(),
+        ),
+    );
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    (path, hold, held)
+}
+
+/// The shell condition "the fake has played turn `key`".
+pub(crate) fn played_turn(bench: &Bench, key: &str) -> String {
+    format!(
+        "grep -q '\"key\":\"{key}\"' '{}' 2>/dev/null",
+        bench.turns.display()
+    )
+}
+
+/// The shell condition "a run's log holds a line with `text`".
+pub(crate) fn logged(bench: &Bench, text: &str) -> String {
+    format!(
+        "cat '{}'/fleet/*/log.jsonl 2>/dev/null | grep -q '{text}'",
+        bench.data.display()
+    )
 }

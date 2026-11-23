@@ -11,7 +11,8 @@
 //!  "turns": {"<step>#<round>": {"write": {"<rel path>": "<content>"},
 //!                               "delete": ["<rel path>"], "reply": "<text>",
 //!                               "hold": "before_write" | "after_write",
-//!                               "spawn_survivor": true, "exit_after": true,
+//!                               "spawn_survivor": true, "unmarked_survivor": true,
+//!                               "wait_for": "<path>", "exit_after": true,
 //!                               "fail": true}}}
 //! ```
 //!
@@ -21,6 +22,19 @@
 //! its second the second, and so on, the last repeating (plays are counted
 //! in the log). `fail` makes the dialect fail the turn as a usage limit
 //! does, after its writes, with no reply.
+//!
+//! A survivor is this binary again (`fleet-survivor`), not `sh`: on macOS
+//! `ps` shows no environment for Apple's binaries, so only a survivor of our
+//! own carries an `OCTET_FLEET_ATTEMPT` marker Octet can see. It has no
+//! stdio and no fleet script, and sleeps for [`SURVIVOR_SECS`]; its command
+//! line names the script, so a test can find every survivor it caused.
+//! `spawn_survivor` keeps the vendor's environment, marker included;
+//! `unmarked_survivor` removes the marker. Both stay in the vendor's process
+//! group.
+//!
+//! `wait_for`, after the changes and survivors: create `<path>.waiting`, then
+//! wait until `<path>` exists (at most [`SURVIVOR_SECS`]) before the reply
+//! or the hold, so a test can act at that point.
 //!
 //! Hold modes, for a turn that must be stopped by the run's own interrupt:
 //! - `before_write`: the turn is logged and then held. Nothing else happens:
@@ -41,6 +55,8 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
     process::{self, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 /// How a fleet prompt's first line starts. The source of truth is
@@ -49,6 +65,13 @@ use std::{
 /// this parses; the testkit cannot depend on that crate, so a change there
 /// must be made here too.
 const HEADER_PREFIX: &str = "[octet-fleet ";
+
+/// The variable whose value marks a fleet attempt's processes; the source of
+/// truth is `octet-fleet`'s `ownership.rs`.
+const MARKER_VAR: &str = "OCTET_FLEET_ATTEMPT";
+
+/// How long a survivor lives, and the longest a `wait_for` waits, in seconds.
+pub(crate) const SURVIVOR_SECS: u64 = 300;
 
 /// What the dialect does for a scripted turn, after [`turn`] has done the
 /// rest.
@@ -119,6 +142,12 @@ struct Turn {
     /// Start a process that outlives the turn.
     #[serde(default)]
     spawn_survivor: bool,
+    /// Start a process that outlives the turn, without the attempt's marker.
+    #[serde(default)]
+    unmarked_survivor: bool,
+    /// Wait for this file before the reply or the hold.
+    #[serde(default)]
+    wait_for: Option<PathBuf>,
     /// Exit after the reply.
     #[serde(default)]
     exit_after: bool,
@@ -231,20 +260,40 @@ fn change_files(turn: &Turn, cwd: &Path) {
     }
 }
 
-/// Starts a process that outlives the turn: `sh -c 'sleep 60'` with this
-/// one's environment and no stdio, never waited for.
-fn spawn_survivor() {
+/// Starts a process that outlives the turn: this binary as
+/// `fleet-survivor SECS SCRIPT`, with this one's environment less the fleet
+/// script (and, unless `marked`, less the attempt's marker), and no stdio;
+/// never waited for.
+fn spawn_survivor(script: &Path, marked: bool) {
+    let mut command = Command::new(env::current_exe().unwrap());
+    command
+        .arg("fleet-survivor")
+        .arg(SURVIVOR_SECS.to_string())
+        .arg(script)
+        .env_remove(FLEET_SCRIPT_ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if !marked {
+        command.env_remove(MARKER_VAR);
+    }
     #[expect(
         clippy::zombie_processes,
         reason = "the survivor outlives the turn, and is meant never to be waited for"
     )]
-    let _survivor = Command::new("sh")
-        .args(["-c", "sleep 60"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let _survivor = command.spawn().unwrap();
+}
+
+/// Announces `<path>.waiting` and waits until `path` exists, for at most
+/// [`SURVIVOR_SECS`].
+fn wait_for(path: &Path) {
+    let mut waiting = path.as_os_str().to_owned();
+    waiting.push(".waiting");
+    fs::write(&waiting, "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(SURVIVOR_SECS);
+    while !path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Performs the scripted turn for `prompt`, if there is one to perform: the
@@ -258,6 +307,7 @@ fn spawn_survivor() {
 /// logged with `"missing": true` and answered `fleet-fake: no turn <key>`.
 /// What the dialect still has to do is in the [`FleetTurn`].
 pub(crate) fn turn(prompt: &str, cwd: &Path, resumed: bool) -> Option<FleetTurn> {
+    let script_path = PathBuf::from(env::var_os(FLEET_SCRIPT_ENV)?);
     let script = script()?;
     let key = key(prompt)?;
     let played = plays(&script.log, &key);
@@ -280,7 +330,13 @@ pub(crate) fn turn(prompt: &str, cwd: &Path, resumed: bool) -> Option<FleetTurn>
     }
     change_files(turn, cwd);
     if turn.spawn_survivor {
-        spawn_survivor();
+        spawn_survivor(&script_path, true);
+    }
+    if turn.unmarked_survivor {
+        spawn_survivor(&script_path, false);
+    }
+    if let Some(path) = &turn.wait_for {
+        wait_for(path);
     }
     if matches!(turn.hold, Some(Hold::AfterWrite)) {
         return Some(held());
@@ -355,10 +411,12 @@ mod tests {
         let script = parse_script(
             r#"{"log":"l","startup_marker":"m","turns":{"a#1":{"write":{"f":"x"},
             "delete":["g"],"reply":"r","hold":"after_write","spawn_survivor":true,
-            "exit_after":true},"b#1":{}}}"#,
+            "unmarked_survivor":true,"wait_for":"w","exit_after":true},"b#1":{}}}"#,
         );
         let first = |key: &str| script.turns[key].play(0).unwrap();
         assert!(matches!(first("a#1").hold, Some(Hold::AfterWrite)));
+        assert!(first("a#1").unmarked_survivor);
+        assert_eq!(first("a#1").wait_for.as_deref(), Some(Path::new("w")));
         assert!(first("b#1").hold.is_none());
     }
 

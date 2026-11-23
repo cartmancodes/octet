@@ -31,6 +31,14 @@ fn main() {
         "acp" if env::args().any(|arg| arg == "--cli_dir_name") => antigravity::run(),
         "acp" => opencode::run(),
         "session" => opencode::session_command(),
+        // A fleet turn's survivor: sleeps for the seconds given, then exits.
+        "fleet-survivor" => {
+            let secs = env::args()
+                .nth(2)
+                .and_then(|secs| secs.parse().ok())
+                .unwrap_or(fleet::SURVIVOR_SECS);
+            thread::sleep(Duration::from_secs(secs));
+        }
         "debug" => opencode::debug_command(),
         "split" => {
             let mut stdout = io::stdout().lock();

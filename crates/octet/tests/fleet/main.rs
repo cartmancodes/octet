@@ -11,13 +11,18 @@
 //! artifacts and the fake's turn log, never from timing.
 //!
 //! Every wait is bounded and fails the test with what was seen. Every `octet`
-//! a test starts leads its own process group, which is killed when the test
-//! ends however it ends, together with any process still carrying one of the
-//! test's run markers.
+//! a test starts leads its own process group, killed if it is still running
+//! when the test lets go of it; when the test ends, however it ends, every
+//! process still carrying one of its run markers is killed, and so is every
+//! survivor its fakes started.
 #![expect(
     clippy::unwrap_used,
     reason = "test code: an unwrap that fails is the test failing"
 )]
 
 mod common;
+mod crashes;
+mod interrupts;
+mod ownership;
+mod pauses;
 mod run_and_evidence;
