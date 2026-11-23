@@ -188,7 +188,7 @@ impl Driver {
                 commands: &commands,
                 timeout: Duration::from_secs(timeout_secs),
                 marker: format!("{}/{}", self.id, attempt.0),
-                pause_hook: None,
+                pause_hook: evidence::pause_hook_from(std::env::var_os(evidence::TEST_PAUSE_ENV)),
                 attempt_dir: attempt_dir.clone(),
                 interrupt: Some(self.io.signals.clone()),
                 events: Some(self.io.events.clone()),

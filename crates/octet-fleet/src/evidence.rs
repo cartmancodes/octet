@@ -43,6 +43,17 @@ const TAIL_BYTES: usize = 16 * 1024;
 /// The held command: waits for the go line, then becomes the real command.
 const HELD: &str = r#"read _ || exit 125; exec sh -c "$1""#;
 
+/// Tests only: the variable naming the directory of the pause after each held
+/// spawn ([`EvidenceRun::pause_hook`]). The runner reads it.
+pub const TEST_PAUSE_ENV: &str = "OCTET_FLEET_TEST_PAUSE_DIR";
+
+/// The pause hook that `value`, the [`TEST_PAUSE_ENV`] variable, names: none
+/// when it is unset or empty.
+#[must_use]
+pub fn pause_hook_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
 /// Why a pass could not be completed.
 #[derive(Debug, thiserror::Error)]
 pub enum EvidenceError {
@@ -575,6 +586,16 @@ mod tests {
             EvidenceOutcome::Complete { passed, results } => (passed, results),
             other => panic!("expected Complete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_pause_hook_is_the_directory_its_variable_names() {
+        assert_eq!(pause_hook_from(None), None);
+        assert_eq!(pause_hook_from(Some("".into())), None);
+        assert_eq!(
+            pause_hook_from(Some("/tmp/pause".into())),
+            Some(PathBuf::from("/tmp/pause"))
+        );
     }
 
     #[tokio::test]
