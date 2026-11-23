@@ -1,23 +1,7 @@
-//! Release tests for `octet fleet`, numbered as the spec's "Release tests":
-//! `octet fleet` runs as a child process against a real git work tree, with
-//! the scripted fake vendors (`protocol-child`) in every step: the Claude
-//! dialect researching, planning and reviewing, the Codex dialect coding and
-//! testing.
-//!
-//! Each test has its own directory: the work tree `work/`, the data directory
-//! `data/`, the fleet script and its turn log. The script is named to the
-//! `octet` process (`OCTET_FLEET_SCRIPT`), and every vendor inherits it
-//! through the gate. What a test asserts it reads from the run's log, its
-//! artifacts and the fake's turn log, never from timing.
-//!
-//! Every wait is bounded and fails the test with what was seen. Every `octet`
-//! a test starts leads its own process group, which is killed when the test
-//! ends however it ends, together with any process still carrying one of the
-//! test's run markers.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test code: an unwrap that fails is the test failing"
-)]
+//! What the release tests share: the workflows and scripts they run, the
+//! bench (a git work tree, a data directory, the fake's script and turn
+//! log), the `octet` process and its drop guard, the readers of a run's log,
+//! and the bounded waits.
 
 use std::ffi::OsStr;
 use std::os::unix::process::CommandExt;
@@ -34,22 +18,22 @@ use serde_json::{Value, json};
 
 /// How long one `octet fleet` command may take. Generous: a freshly built
 /// binary can stall at its first launch on macOS while it is assessed.
-const PATIENCE: Duration = Duration::from_secs(300);
+pub(crate) const PATIENCE: Duration = Duration::from_secs(300);
 
 /// How long the processes of a killed driver may take to go away.
-const SHORT: Duration = Duration::from_secs(30);
+pub(crate) const SHORT: Duration = Duration::from_secs(30);
 
 /// The task every run is given.
-const TASK: &str = "Add the feature.";
+pub(crate) const TASK: &str = "Add the feature.";
 
 /// The git variables a test's git, and `octet`, must not inherit.
-const GIT_ENV: [&str; 3] = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"];
+pub(crate) const GIT_ENV: [&str; 3] = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"];
 
 // ---- workflows and scripts ---------------------------------------------
 
 /// The profiles: Claude for documents and reviews, Codex for the coder and
 /// the tester, every one running the fake.
-fn profiles() -> String {
+pub(crate) fn profiles() -> String {
     let binary = octet_testkit::protocol_child();
     let binary = binary.display();
     format!(
@@ -68,7 +52,7 @@ roles:\n\
 }
 
 /// The tests step and the final review, running `commands`.
-fn tail_steps(commands: &[&str]) -> String {
+pub(crate) fn tail_steps(commands: &[&str]) -> String {
     format!(
         "\x20 - id: test\n\
 \x20   role: tester\n\
@@ -83,7 +67,7 @@ evidence_from: test }}\n",
 
 /// The shipped `research-plan-build` workflow's steps, on the fake profiles,
 /// with its tests step running `commands`.
-fn research_plan_build(commands: &[&str]) -> String {
+pub(crate) fn research_plan_build(commands: &[&str]) -> String {
     format!(
         "version: 1\n\
 name: research-plan-build\n\
@@ -109,7 +93,7 @@ steps:\n\
 
 /// A small workflow: the research and its review, the coder, the tests
 /// (running `commands`) and the final review, `max_rounds` jumps per edge.
-fn small(commands: &[&str], max_rounds: u32) -> String {
+pub(crate) fn small(commands: &[&str], max_rounds: u32) -> String {
     format!(
         "version: 1\n\
 name: small\n\
@@ -130,7 +114,7 @@ steps:\n\
 
 /// A verdict reply: `kind`, with `new` blocking findings, resolving
 /// `resolved`.
-fn verdict(kind: &str, new: &[&str], resolved: &[&str]) -> String {
+pub(crate) fn verdict(kind: &str, new: &[&str], resolved: &[&str]) -> String {
     let block = json!({
         "verdict": kind,
         "new_findings": new
@@ -146,13 +130,13 @@ fn verdict(kind: &str, new: &[&str], resolved: &[&str]) -> String {
 }
 
 /// A verdict approving, resolving `resolved`.
-fn approve(resolved: &[&str]) -> String {
+pub(crate) fn approve(resolved: &[&str]) -> String {
     verdict("approved", &[], resolved)
 }
 
 /// The turns of the small workflow where every step does its work and every
 /// review approves; the coder writes `feature.txt`.
-fn small_turns() -> Value {
+pub(crate) fn small_turns() -> Value {
     json!({
         "research#1": {"reply": "The repository holds a README and fixture.txt."},
         "review_research#1": {"reply": approve(&[])},
@@ -165,12 +149,12 @@ fn small_turns() -> Value {
 // ---- git ---------------------------------------------------------------
 
 /// `git ARGS` in `dir`; its stdout.
-fn git(dir: &Path, args: &[&str]) -> String {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
     git_with(dir, args, &[])
 }
 
 /// `git ARGS` in `dir` with `env` set; its stdout.
-fn git_with(dir: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> String {
+pub(crate) fn git_with(dir: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> String {
     let mut command = Command::new("git");
     command.args(args).current_dir(dir);
     for name in GIT_ENV {
@@ -190,16 +174,16 @@ fn git_with(dir: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> String {
 
 /// One test's directory: a git work tree with a tracked `fixture.txt`
 /// (`v1`), a data directory, and the fake's script and turn log.
-struct Bench {
+pub(crate) struct Bench {
     dir: TempDir,
-    work: PathBuf,
-    data: PathBuf,
-    script: PathBuf,
-    turns: PathBuf,
+    pub(crate) work: PathBuf,
+    pub(crate) data: PathBuf,
+    pub(crate) script: PathBuf,
+    pub(crate) turns: PathBuf,
 }
 
 impl Bench {
-    fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         let dir = TempDir::new(name);
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
@@ -228,18 +212,18 @@ impl Bench {
     }
 
     /// A path in the test's directory, outside the work tree.
-    fn side(&self, name: &str) -> PathBuf {
+    pub(crate) fn side(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
 
     /// Writes the fake's script: `turns`, logged to the bench's turn log.
-    fn script(&self, turns: &Value) {
+    pub(crate) fn script(&self, turns: &Value) {
         let body = json!({"log": self.turns, "turns": turns});
         std::fs::write(&self.script, body.to_string()).unwrap();
     }
 
     /// Writes `yaml` as the workflow; its path.
-    fn workflow(&self, yaml: &str) -> PathBuf {
+    pub(crate) fn workflow(&self, yaml: &str) -> PathBuf {
         let path = self.side("workflow.yaml");
         std::fs::write(&path, yaml).unwrap();
         path
@@ -247,7 +231,7 @@ impl Bench {
 
     /// Starts `octet fleet ARGS --journal-dir DATA` with the script named,
     /// `env` added and stdin closed.
-    fn octet(&self, args: &[&OsStr], env: &[(&str, &OsStr)]) -> Octet {
+    pub(crate) fn octet(&self, args: &[&OsStr], env: &[(&str, &OsStr)]) -> Octet {
         let mut command = Command::new(env!("CARGO_BIN_EXE_octet"));
         command
             .arg("fleet")
@@ -264,7 +248,7 @@ impl Bench {
     }
 
     /// `octet fleet run WORKFLOW --task … --cwd WORK --trust --output json`.
-    fn run(&self, workflow: &Path, env: &[(&str, &OsStr)]) -> Octet {
+    pub(crate) fn run(&self, workflow: &Path, env: &[(&str, &OsStr)]) -> Octet {
         let args: [&OsStr; 9] = [
             "run".as_ref(),
             workflow.as_os_str(),
@@ -280,7 +264,7 @@ impl Bench {
     }
 
     /// `octet fleet resume RUN [--decision D] --output json`.
-    fn resume(&self, decision: Option<&str>, env: &[(&str, &OsStr)]) -> Octet {
+    pub(crate) fn resume(&self, decision: Option<&str>, env: &[(&str, &OsStr)]) -> Octet {
         let run = self.run_id();
         let mut args: Vec<&OsStr> = vec!["resume".as_ref(), run.as_ref()];
         if let Some(decision) = decision {
@@ -291,19 +275,19 @@ impl Bench {
     }
 
     /// The only run's ID.
-    fn run_id(&self) -> String {
+    pub(crate) fn run_id(&self) -> String {
         let runs = runs_in(&self.data);
         assert_eq!(runs.len(), 1, "{runs:?}");
         runs.into_iter().next().unwrap()
     }
 
-    fn run_dir(&self) -> PathBuf {
+    pub(crate) fn run_dir(&self) -> PathBuf {
         self.data.join("fleet").join(self.run_id())
     }
 
     /// Every whole record of the run's log; none before the log exists. A
     /// torn last line (being written) is left out.
-    fn records(&self) -> Vec<Record> {
+    pub(crate) fn records(&self) -> Vec<Record> {
         if runs_in(&self.data).is_empty() {
             return Vec::new();
         }
@@ -318,7 +302,7 @@ impl Bench {
     /// Polls the log until a record `found` accepts is in it, while `octet`
     /// runs; the records then. Fails the test, with what was seen, when
     /// `octet` ends first or [`PATIENCE`] passes.
-    fn await_record(
+    pub(crate) fn await_record(
         &self,
         octet: &mut Octet,
         what: &str,
@@ -344,7 +328,7 @@ impl Bench {
     }
 
     /// The fake's turn log: one object per turn played.
-    fn played(&self) -> Vec<Value> {
+    pub(crate) fn played(&self) -> Vec<Value> {
         std::fs::read_to_string(&self.turns)
             .unwrap_or_default()
             .lines()
@@ -353,7 +337,7 @@ impl Bench {
     }
 
     /// The turns played for `key`, in order.
-    fn plays_of(&self, key: &str) -> Vec<Value> {
+    pub(crate) fn plays_of(&self, key: &str) -> Vec<Value> {
         self.played()
             .into_iter()
             .filter(|turn| turn["key"] == key)
@@ -361,7 +345,7 @@ impl Bench {
     }
 
     /// The body of evidence artifact `id`.
-    fn evidence(&self, id: octet_fleet::record::ArtifactId) -> Value {
+    pub(crate) fn evidence(&self, id: octet_fleet::record::ArtifactId) -> Value {
         let path = self
             .run_dir()
             .join("artifacts")
@@ -371,7 +355,7 @@ impl Bench {
 
     /// The tree of the live work tree, taken as a snapshot takes it: every
     /// file, tracked or not, through a scratch index.
-    fn live_tree(&self) -> String {
+    pub(crate) fn live_tree(&self) -> String {
         let index = self.side("scratch-index");
         let _ = std::fs::remove_file(&index);
         let env = [("GIT_INDEX_FILE", index.as_os_str())];
@@ -385,7 +369,7 @@ impl Bench {
     /// each command's `pre_tree` and `post_tree`, in the artifact and in the
     /// log of the pass that produced it, equal the record's tree, and every
     /// command of the step has its result.
-    fn assert_passing_evidence_is_whole(&self, records: &[Record], commands: usize) {
+    pub(crate) fn assert_passing_evidence_is_whole(&self, records: &[Record], commands: usize) {
         for record in records {
             let Record::AttemptFinished {
                 attempt,
@@ -417,12 +401,13 @@ impl Bench {
 }
 
 /// The IDs of the runs under `data`.
-fn runs_in(data: &Path) -> Vec<String> {
+pub(crate) fn runs_in(data: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(data.join("fleet")) else {
         return Vec::new();
     };
     let mut runs: Vec<String> = entries
-        .map(|entry| entry.unwrap().path())
+        // An entry that cannot be read is no run of this test's.
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.join("run.json").exists())
         .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
@@ -433,7 +418,7 @@ fn runs_in(data: &Path) -> Vec<String> {
 // ---- reading the log ---------------------------------------------------
 
 /// The steps of the attempts started, in order, with their attempt IDs.
-fn started(records: &[Record]) -> Vec<(AttemptId, &str)> {
+pub(crate) fn started(records: &[Record]) -> Vec<(AttemptId, &str)> {
     records
         .iter()
         .filter_map(|record| match record {
@@ -444,12 +429,12 @@ fn started(records: &[Record]) -> Vec<(AttemptId, &str)> {
 }
 
 /// The position in the log of the first record `found` accepts.
-fn position(records: &[Record], found: impl Fn(&Record) -> bool) -> Option<usize> {
+pub(crate) fn position(records: &[Record], found: impl Fn(&Record) -> bool) -> Option<usize> {
     records.iter().position(found)
 }
 
 /// Whether `record` finished a tests attempt that passed.
-fn passed(record: &Record) -> bool {
+pub(crate) fn passed(record: &Record) -> bool {
     matches!(
         record,
         Record::AttemptFinished {
@@ -460,7 +445,7 @@ fn passed(record: &Record) -> bool {
 }
 
 /// Whether `record` finished a tests attempt that failed.
-fn failed(record: &Record) -> bool {
+pub(crate) fn failed(record: &Record) -> bool {
     matches!(
         record,
         Record::AttemptFinished {
@@ -471,7 +456,7 @@ fn failed(record: &Record) -> bool {
 }
 
 /// The candidate and restart of `attempt`'s last evidence phase.
-fn last_phase(records: &[Record], attempt: AttemptId) -> (CandidateId, u32) {
+pub(crate) fn last_phase(records: &[Record], attempt: AttemptId) -> (CandidateId, u32) {
     records
         .iter()
         .rev()
@@ -488,7 +473,7 @@ fn last_phase(records: &[Record], attempt: AttemptId) -> (CandidateId, u32) {
 
 /// The logged `pre_tree` and `post_tree` of command `index` in `attempt`'s
 /// pass `restart`, where logged.
-fn observations(
+pub(crate) fn observations(
     records: &[Record],
     attempt: AttemptId,
     restart: u32,
@@ -518,7 +503,12 @@ fn observations(
 }
 
 /// The exit of command `index` in `attempt`'s pass `restart`.
-fn exit_of(records: &[Record], attempt: AttemptId, restart: u32, index: usize) -> Option<i32> {
+pub(crate) fn exit_of(
+    records: &[Record],
+    attempt: AttemptId,
+    restart: u32,
+    index: usize,
+) -> Option<i32> {
     records
         .iter()
         .find_map(|record| match record {
@@ -535,7 +525,7 @@ fn exit_of(records: &[Record], attempt: AttemptId, restart: u32, index: usize) -
 }
 
 /// The tree of candidate `id`, from its `candidate` record.
-fn tree_of(records: &[Record], id: CandidateId) -> String {
+pub(crate) fn tree_of(records: &[Record], id: CandidateId) -> String {
     records
         .iter()
         .find_map(|record| match record {
@@ -546,7 +536,7 @@ fn tree_of(records: &[Record], id: CandidateId) -> String {
 }
 
 /// The origin of candidate `id`.
-fn origin_of(records: &[Record], id: CandidateId) -> Origin {
+pub(crate) fn origin_of(records: &[Record], id: CandidateId) -> Origin {
     records
         .iter()
         .find_map(|record| match record {
@@ -557,7 +547,7 @@ fn origin_of(records: &[Record], id: CandidateId) -> Origin {
 }
 
 /// The only tests attempt of the run.
-fn only_test_attempt(records: &[Record]) -> AttemptId {
+pub(crate) fn only_test_attempt(records: &[Record]) -> AttemptId {
     let tests: Vec<AttemptId> = started(records)
         .into_iter()
         .filter(|(_, step)| *step == "test")
@@ -568,7 +558,7 @@ fn only_test_attempt(records: &[Record]) -> AttemptId {
 }
 
 /// The pause the log ends with.
-fn last_pause(records: &[Record]) -> PauseReason {
+pub(crate) fn last_pause(records: &[Record]) -> PauseReason {
     match records.last() {
         Some(Record::Paused { reason, .. }) => *reason,
         other => panic!("the log ends with {other:?}, not a pause"),
@@ -578,15 +568,15 @@ fn last_pause(records: &[Record]) -> PauseReason {
 // ---- the octet process -------------------------------------------------
 
 /// What an `octet` process left.
-struct Ended {
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
+pub(crate) struct Ended {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 impl Ended {
     /// Asserts the exit code, showing the output when it is another.
-    fn expect_code(&self, code: i32) {
+    pub(crate) fn expect_code(&self, code: i32) {
         assert_eq!(
             self.code,
             Some(code),
@@ -600,7 +590,7 @@ impl Ended {
 /// A running `octet`, leading its own process group. Dropped, it kills that
 /// group and every process carrying a marker of a run in its data
 /// directory, so nothing it started outlives the test.
-struct Octet {
+pub(crate) struct Octet {
     child: Child,
     reaped: bool,
     data: PathBuf,
@@ -620,7 +610,7 @@ fn collect(mut pipe: impl std::io::Read + Send + 'static) -> mpsc::Receiver<Stri
 }
 
 impl Octet {
-    fn spawn(mut command: Command, data: &Path) -> Self {
+    pub(crate) fn spawn(mut command: Command, data: &Path) -> Self {
         command
             .process_group(0)
             .stdin(Stdio::null())
@@ -638,12 +628,12 @@ impl Octet {
         }
     }
 
-    fn pid(&self) -> i32 {
+    pub(crate) fn pid(&self) -> i32 {
         i32::try_from(self.child.id()).unwrap()
     }
 
     /// Whether the process is still running.
-    fn running(&mut self) -> bool {
+    pub(crate) fn running(&mut self) -> bool {
         if self.reaped {
             return false;
         }
@@ -653,7 +643,7 @@ impl Octet {
     }
 
     /// What is known of the output, for a failure message, once it ended.
-    fn output_so_far(&self) -> String {
+    pub(crate) fn output_so_far(&self) -> String {
         let take = |rx: &mpsc::Receiver<String>| {
             rx.recv_timeout(Duration::from_secs(1))
                 .unwrap_or_else(|_| "(not closed)".into())
@@ -666,7 +656,7 @@ impl Octet {
     }
 
     /// SIGKILLs `octet` alone (not its group) and reaps it.
-    fn sigkill(&mut self) {
+    pub(crate) fn sigkill(&mut self) {
         // SAFETY: kill(2) of a child this test spawned and has not reaped.
         assert_eq!(unsafe { libc::kill(self.pid(), libc::SIGKILL) }, 0);
         self.child.wait().unwrap();
@@ -674,7 +664,7 @@ impl Octet {
     }
 
     /// Waits for `octet` to exit, for at most [`PATIENCE`].
-    fn finish(mut self) -> Ended {
+    pub(crate) fn finish(mut self) -> Ended {
         let deadline = Instant::now() + PATIENCE;
         while self.running() {
             assert!(
@@ -714,7 +704,7 @@ impl Drop for Octet {
 /// The PIDs of the live processes whose `OCTET_FLEET_ATTEMPT` marker names a
 /// run in `data`: a vendor or a test command of a run this test drove. Empty
 /// when the processes cannot be listed.
-fn marked(data: &Path) -> Vec<u32> {
+pub(crate) fn marked(data: &Path) -> Vec<u32> {
     let runs = runs_in(data);
     if runs.is_empty() {
         return Vec::new();
@@ -744,7 +734,7 @@ fn marked(data: &Path) -> Vec<u32> {
 }
 
 /// SIGKILLs every process [`marked`] finds for `data`.
-fn kill_marked(data: &Path) {
+pub(crate) fn kill_marked(data: &Path) {
     for pid in marked(data) {
         if let Ok(pid) = i32::try_from(pid) {
             // SAFETY: kill(2) of a process carrying this test's run marker.
@@ -754,7 +744,7 @@ fn kill_marked(data: &Path) {
 }
 
 /// Whether process `pid` exists.
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
@@ -765,7 +755,7 @@ fn alive(pid: u32) -> bool {
 /// The live processes of `attempt`: those its `attempt_session` records
 /// or its gate registry (`<attempt>/processes`, read afresh) name, and any
 /// carrying a marker of the bench's run.
-fn attempt_processes(bench: &Bench, attempt: AttemptId) -> Vec<u32> {
+pub(crate) fn attempt_processes(bench: &Bench, attempt: AttemptId) -> Vec<u32> {
     let records = bench.records();
     let mut pids: Vec<u32> = records
         .iter()
@@ -798,7 +788,7 @@ fn attempt_processes(bench: &Bench, attempt: AttemptId) -> Vec<u32> {
 /// Waits until the killed driver's processes of `attempt` are gone, for at
 /// most [`SHORT`]. A gate spawned just before the kill may register itself
 /// late, so "gone" must hold on two looks 200 ms apart.
-fn await_gone(bench: &Bench, attempt: AttemptId) {
+pub(crate) fn await_gone(bench: &Bench, attempt: AttemptId) {
     let mut left = Vec::new();
     let gone = octet_testkit::wait_until(SHORT, || {
         left = attempt_processes(bench, attempt);
@@ -812,502 +802,12 @@ fn await_gone(bench: &Bench, attempt: AttemptId) {
     assert!(gone, "the killed driver's processes {left:?} outlived it");
 }
 
-// ---- 1. the full run ---------------------------------------------------
-
-/// The spec's release test 1, "The full run".
-#[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one scenario: its assertions follow the spec's sentence in order"
-)]
-fn the_full_run() {
-    let bench = Bench::new("octet-fleet-full");
-    let commands = ["sh feature_test.sh"];
-    let workflow = bench.workflow(&research_plan_build(&commands));
-    let mut turns = json!({
-        "research#1": {"reply": "RESEARCH-ONE: the repository holds a README."},
-        "review_research#1": {
-            "reply": verdict("changes_requested", &["The research misses fixture.txt."], &[])
-        },
-        "research#2": {"reply": "RESEARCH-TWO: the repository holds a README and fixture.txt."},
-        "review_research#2": {"reply": approve(&["review_research/F1"])},
-        "plan#1": {"reply": "PLAN-ONE: 1. Add feature.txt. 2. Test that it works."},
-        "review_plan#1": {"reply": approve(&[])},
-        "implement#1": {"write": {"feature.txt": "broken\n"}, "reply": "Added feature.txt."},
-        // The first tester holds its turn, having done nothing, until Octet dies.
-        "test#1": {"hold": "before_write"},
-        "implement#2": {"write": {"feature.txt": "working\n"}, "reply": "Fixed feature.txt."},
-        "test#2": {"reply": "The test stands."},
-        "review_change#1": {
-            "reply": verdict("changes_requested", &["feature.txt needs a comment."], &[])
-        },
-        "implement#3": {
-            "write": {"feature.txt": "working # the feature\n"},
-            "reply": "Commented feature.txt."
-        },
-        "test#3": {"reply": "The test stands."},
-        "review_change#2": {"reply": approve(&["review_change/F1"])},
-    });
-    bench.script(&turns);
-
-    // Octet is SIGKILLed once the tests attempt's start is durable.
-    let mut octet = bench.run(&workflow, &[]);
-    let records = bench.await_record(
-        &mut octet,
-        "the tests attempt",
-        |record| matches!(record, Record::AttemptStarted { step, .. } if step == "test"),
-    );
-    octet.sigkill();
-    let killed = started(&records)
-        .into_iter()
-        .find(|(_, step)| *step == "test")
-        .unwrap()
-        .0;
-    // The held tester reads its input from Octet: it ends at end of input,
-    // and the gate gives up once Octet is gone. Resume starts when they have.
-    await_gone(&bench, killed);
-
-    // From now on the tester writes its test, which fails on the first
-    // feature.txt.
-    turns["test#1"] = json!({
-        "write": {"feature_test.sh": "grep -q working feature.txt\n"},
-        "reply": "Added feature_test.sh."
-    });
-    bench.script(&turns);
-    bench.resume(None, &[]).finish().expect_code(0);
-
-    let records = bench.records();
-    let played = bench.played();
-    let keys: Vec<&str> = played
-        .iter()
-        .map(|turn| turn["key"].as_str().unwrap())
-        .filter(|key| *key != "test#1")
-        .collect();
-    assert_eq!(
-        keys,
-        [
-            "research#1",
-            "review_research#1",
-            "research#2",
-            "review_research#2",
-            "plan#1",
-            "review_plan#1",
-            "implement#1",
-            "implement#2",
-            "test#2",
-            "review_change#1",
-            "implement#3",
-            "test#3",
-            "review_change#2",
-        ],
-        "{played:#?}"
-    );
-    assert!(
-        !played.iter().any(|turn| turn.get("missing").is_some()),
-        "{played:#?}"
-    );
-
-    // The coder's prompt carries the approved plan and the approved second
-    // research, never the rejected first.
-    let implement = bench.plays_of("implement#1");
-    assert_eq!(implement.len(), 1, "the coder ran once: {implement:#?}");
-    let prompt = implement[0]["prompt"].as_str().unwrap();
-    assert!(
-        prompt.contains("## Approved document (plan)\nPLAN-ONE"),
-        "{prompt}"
-    );
-    assert!(
-        prompt.contains("## Approved document (research)\nRESEARCH-TWO"),
-        "{prompt}"
-    );
-    assert!(!prompt.contains("RESEARCH-ONE"), "{prompt}");
-
-    // Resume re-ran the tester, in a new attempt; the coder ran once before
-    // the tests failed.
-    let first_failure = position(&records, failed).expect("the tests failed once");
-    let before: Vec<(AttemptId, &str)> = started(&records[..first_failure]);
-    let tests: Vec<AttemptId> = before
-        .iter()
-        .filter(|(_, step)| *step == "test")
-        .map(|(attempt, _)| *attempt)
-        .collect();
-    assert_eq!(tests.len(), 2, "{before:?}");
-    assert_eq!(tests[0], killed);
-    assert!(
-        !records.iter().any(|record| matches!(
-            record,
-            Record::AttemptFinished { attempt, .. } if *attempt == killed
-        )),
-        "the killed tester's attempt was accepted: {records:#?}"
-    );
-    let coders = before
-        .iter()
-        .filter(|(_, step)| *step == "implement")
-        .count();
-    assert_eq!(coders, 1, "{before:?}");
-    // The re-run tester's turn is what the failing evidence ran on: its file.
-    let Some(Record::AttemptFinished { attempt: rerun, .. }) = records.get(first_failure) else {
-        unreachable!()
-    };
-    assert_eq!(*rerun, tests[1]);
-    let (tested, _) = last_phase(&records, tests[1]);
-    assert_eq!(origin_of(&records, tested), Origin::Tests);
-
-    // A command failed, and the run could not go on to the final review:
-    // the coder came next, and no review ran before the tests passed.
-    let Some(Record::AttemptFinished {
-        outcome: Accepted::TestsFailed { evidence, failing },
-        ..
-    }) = records.get(first_failure)
-    else {
-        unreachable!()
-    };
-    assert_eq!(failing, &[0]);
-    assert_ne!(bench.evidence(*evidence)["results"][0]["exit"], 0);
-    let after: Vec<&str> = started(&records[first_failure..])
-        .into_iter()
-        .map(|(_, step)| step)
-        .collect();
-    assert_eq!(
-        after,
-        [
-            "implement",
-            "test",
-            "review_change",
-            "implement",
-            "test",
-            "review_change"
-        ]
-    );
-    let first_pass = position(&records, passed).expect("the tests passed");
-    assert!(
-        !started(&records[..first_pass])
-            .iter()
-            .any(|(_, step)| *step == "review_change"),
-        "{records:#?}"
-    );
-    let completed_at = position(&records, |r| matches!(r, Record::Completed { .. })).unwrap();
-    assert_eq!(completed_at, records.len() - 1, "{records:#?}");
-
-    // The coder's second round continued its session.
-    let second = bench.plays_of("implement#2");
-    assert_eq!(second.len(), 1);
-    assert_eq!(second[0]["resumed"], true, "{second:#?}");
-
-    // The final review is fresh: a new attempt in a new session. Its prompt
-    // names the passing evidence's candidate, and its patch has the tester's
-    // file.
-    let reviews: Vec<AttemptId> = started(&records)
-        .into_iter()
-        .filter(|(_, step)| *step == "review_change")
-        .map(|(attempt, _)| attempt)
-        .collect();
-    assert_eq!(reviews.len(), 2);
-    assert_ne!(reviews[0], reviews[1]);
-    let last = bench.plays_of("review_change#2");
-    assert_eq!(last.len(), 1);
-    assert_eq!(last[0]["resumed"], false, "{last:#?}");
-    let Some(Record::Completed {
-        candidate,
-        tree,
-        evidence,
-        observed_tree,
-        ..
-    }) = records.last()
-    else {
-        unreachable!()
-    };
-    assert_eq!(observed_tree, tree);
-    let body = bench.evidence(*evidence);
-    assert_eq!(body["candidate"], candidate.0);
-    assert_eq!(body["tree"], tree.as_str());
-    let prompt = last[0]["prompt"].as_str().unwrap();
-    let k = candidate.0;
-    assert!(
-        prompt.contains(&format!(
-            "## Test evidence for {k}\nCandidate {k} (tree {tree})."
-        )),
-        "{prompt}"
-    );
-    let patch = prompt
-        .split_once(&format!("## Patch (base..{k})\n"))
-        .unwrap_or_else(|| panic!("no patch of {k}: {prompt}"))
-        .1;
-    let patch = patch.split_once("\n## ").map_or(patch, |(patch, _)| patch);
-    assert!(patch.contains("feature_test.sh"), "{patch}");
-    assert!(patch.contains("+grep -q working feature.txt"), "{patch}");
-    assert_eq!(bench.live_tree(), *tree);
-    bench.assert_passing_evidence_is_whole(&records, commands.len());
-}
-
-// ---- 2. wrong-revision approval ----------------------------------------
-
-/// The spec's release test 2, "Wrong-revision approval".
-#[test]
-fn a_wrong_revision_is_never_approved() {
-    let bench = Bench::new("octet-fleet-revision");
-    // A passes on the base fixture; B rewrites it and passes; A fails on it.
-    let commands = ["grep -qx v1 fixture.txt", "printf 'v2\\n' > fixture.txt"];
-    let workflow = bench.workflow(&small(&commands, 5));
-    // Sent back, the coder changes nothing: the run stalls there.
-    let mut turns = small_turns();
-    turns["implement#2"] = json!({"reply": "Nothing to change."});
-    bench.script(&turns);
-    bench.run(&workflow, &[]).finish().expect_code(3);
-
-    let records = bench.records();
-    let attempt = started(&records)
-        .into_iter()
-        .find(|(_, step)| *step == "test")
-        .unwrap()
-        .0;
-    // Pass 0: A passed, B passed and changed the tree, which voided the pass.
-    let base = records
-        .iter()
-        .find_map(|record| match record {
-            Record::EvidenceStarted {
-                attempt: a,
-                candidate,
-                restart: 0,
-            } if *a == attempt => Some(*candidate),
-            _ => None,
-        })
-        .unwrap();
-    let t = tree_of(&records, base);
-    assert_eq!(exit_of(&records, attempt, 0, 0), Some(0));
-    assert_eq!(exit_of(&records, attempt, 0, 1), Some(0));
-    let (_, after_b) = observations(&records, attempt, 0, 1);
-    let after_b = after_b.unwrap();
-    assert_ne!(after_b, t);
-    // Pass 1 ran on B's tree, where A fails: the tests failed.
-    let (derived, restart) = last_phase(&records, attempt);
-    assert_eq!(restart, 1);
-    assert_eq!(origin_of(&records, derived), Origin::Evidence);
-    assert_eq!(tree_of(&records, derived), after_b);
-    assert_eq!(exit_of(&records, attempt, 1, 0), Some(1));
-    assert!(records.iter().any(|record| matches!(
-        record,
-        Record::AttemptFinished {
-            attempt: a,
-            outcome: Accepted::TestsFailed { failing, .. },
-            ..
-        } if *a == attempt && failing == &[0]
-    )));
-    // The run cannot complete: no passing record, no final review, no
-    // completion. The failure sent the run back to the coder, whose
-    // unchanged tree is a stall.
-    assert!(!records.iter().any(passed), "{records:#?}");
-    assert!(
-        !started(&records)
-            .iter()
-            .any(|(_, step)| *step == "review_change"),
-        "{records:#?}"
-    );
-    assert!(bench.plays_of("review_change#1").is_empty());
-    assert!(
-        !records
-            .iter()
-            .any(|r| matches!(r, Record::Completed { .. }))
-    );
-    let after_tests: Vec<&str> = started(&records)
-        .into_iter()
-        .map(|(_, step)| step)
-        .skip_while(|step| *step != "test")
-        .collect();
-    assert_eq!(after_tests, ["test", "implement"], "{records:#?}");
-    assert_eq!(last_pause(&records), PauseReason::Stalled);
-}
-
-// ---- 3. change, use, restore -------------------------------------------
-
-/// The spec's release test 3, "Change, use, restore".
-#[test]
-fn a_change_used_and_restored_is_caught() {
-    let bench = Bench::new("octet-fleet-restore");
-    let commands = [
-        "printf 'changed\\n' > fixture.txt",
-        "grep -qx changed fixture.txt",
-        "printf 'v1\\n' > fixture.txt",
-    ];
-    let workflow = bench.workflow(&small(&commands, 1));
-    bench.script(&small_turns());
-    bench.run(&workflow, &[]).finish().expect_code(3);
-
-    let records = bench.records();
-    let attempt = only_test_attempt(&records);
-    // The boundary after A voided pass 0: neither B nor C was released in it.
-    let (pre, post) = observations(&records, attempt, 0, 0);
-    assert_ne!(pre, post, "{records:#?}");
-    for index in [1, 2] {
-        assert_eq!(
-            observations(&records, attempt, 0, index),
-            (None, None),
-            "command {index} ran in the voided pass: {records:#?}"
-        );
-    }
-    // B did run and pass: in pass 1, on the tree A changed.
-    assert_eq!(exit_of(&records, attempt, 1, 1), Some(0), "{records:#?}");
-    let (b_pre, b_post) = observations(&records, attempt, 1, 1);
-    assert!(b_pre.is_some() && b_pre == b_post, "{records:#?}");
-    assert_eq!(b_pre, post, "B ran on the tree A left: {records:#?}");
-    // Wherever B ran, its pass was voided too: C's restore changed the tree.
-    for record in &records {
-        if let Record::EvidenceResult {
-            restart,
-            index: 1,
-            post_tree,
-            ..
-        } = record
-        {
-            let (_, after_c) = observations(&records, attempt, *restart, 2);
-            assert!(
-                after_c.is_some_and(|after_c| after_c != *post_tree),
-                "pass {restart} was not voided after B: {records:#?}"
-            );
-        }
-    }
-    // No passing record names a pass in which B ran on another tree: there
-    // is none, and the tree would not hold still.
-    assert!(!records.iter().any(passed), "{records:#?}");
-    assert!(
-        !records
-            .iter()
-            .any(|r| matches!(r, Record::AttemptFinished { attempt: a, .. } if *a == attempt)),
-        "{records:#?}"
-    );
-    assert!(
-        !records
-            .iter()
-            .any(|r| matches!(r, Record::Completed { .. }))
-    );
-    assert_eq!(last_pause(&records), PauseReason::UnstableTests);
-}
-
-// ---- 8. the completion boundary ----------------------------------------
-
-/// The spec's release test 8, "The completion boundary".
-///
-/// The edit lands between the final approval and completion through `git`:
-/// Octet observes the tree with `git` from its `PATH`, and the test puts a
-/// wrapper first there that, on the first call after the approval is in
-/// the log, edits the work tree before running the real `git`. So the edit
-/// comes after the approval and before any observation that follows it.
-#[test]
-fn an_edit_before_completion_is_drift() {
-    let bench = Bench::new("octet-fleet-boundary");
-    let commands = ["test -f feature.txt"];
-    let workflow = bench.workflow(&small(&commands, 1));
-    let mut turns = small_turns();
-    turns["test#2"] = json!({"reply": "The commands cover it."});
-    turns["review_change#2"] = json!({"reply": approve(&[])});
-    bench.script(&turns);
-
-    let real_git = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .unwrap();
-    let real_git = String::from_utf8(real_git.stdout)
-        .unwrap()
-        .trim()
-        .to_owned();
-    assert!(Path::new(&real_git).is_absolute(), "{real_git:?}");
-    let edited = bench.side("edited");
-    let late = bench.work.join("late.txt");
-    let bin = bench.side("bin");
-    octet_testkit::write_script(
-        &bin,
-        "git",
-        &format!(
-            "if [ ! -e '{edited}' ] && cat '{data}'/fleet/*/log.jsonl 2>/dev/null \
-             | grep -q '\"type\":\"change_approved\"'; then\n\
-             : > '{edited}'\n\
-             printf 'edited after the approval\\n' > '{late}'\n\
-             fi\n\
-             exec '{real_git}' \"$@\"",
-            edited = edited.display(),
-            data = bench.data.display(),
-            late = late.display(),
-        ),
-    );
-    let path = std::env::join_paths(
-        std::iter::once(bin.clone())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    let env = [("PATH", path.as_os_str())];
-    bench.run(&workflow, &env).finish().expect_code(3);
-
-    // The edit came after the final approval: drift, not completion.
-    let records = bench.records();
-    assert!(edited.exists() && late.exists());
-    let approved = position(&records, |record| {
-        matches!(
-            record,
-            Record::AttemptFinished {
-                outcome: Accepted::ChangeApproved { .. },
-                ..
-            }
-        )
-    })
-    .expect("the final review approved");
-    assert!(
-        !records
-            .iter()
-            .any(|r| matches!(r, Record::Completed { .. }))
-    );
-    assert_eq!(last_pause(&records), PauseReason::Drift);
-    assert!(position(&records, |r| matches!(r, Record::Paused { .. })).unwrap() > approved);
-
-    // Adopted, the tests and the review run again on the edited tree, and the
-    // completed record carries the tree observed last: the live one.
-    bench.resume(Some("adopt"), &env).finish().expect_code(0);
-    let records = bench.records();
-    let Some(Record::Completed {
-        candidate,
-        tree,
-        evidence,
-        observed_tree,
-        ..
-    }) = records.last()
-    else {
-        panic!("{records:#?}");
-    };
-    assert_eq!(observed_tree, tree);
-    assert_eq!(*tree, bench.live_tree());
-    assert_eq!(origin_of(&records, *candidate), Origin::Drift);
-    let body = bench.evidence(*evidence);
-    assert_eq!(body["candidate"], candidate.0);
-    assert_eq!(body["tree"], tree.as_str());
-    // After the drift, the tests and the final review ran again; the coder
-    // did not.
-    let drift = position(&records, |r| {
-        matches!(
-            r,
-            Record::Paused {
-                reason: PauseReason::Drift,
-                ..
-            }
-        )
-    })
-    .unwrap();
-    let again: Vec<&str> = started(&records[drift..])
-        .into_iter()
-        .map(|(_, step)| step)
-        .collect();
-    assert_eq!(again, ["test", "review_change"], "{records:#?}");
-    assert_eq!(bench.plays_of("test#2").len(), 1);
-    assert_eq!(bench.plays_of("review_change#2").len(), 1);
-    let listed = git(&bench.work, &["ls-tree", "--name-only", tree]);
-    assert!(listed.lines().any(|name| name == "late.txt"), "{listed}");
-    bench.assert_passing_evidence_is_whole(&records, commands.len());
-}
-
 // ---- 10. an edit between commands --------------------------------------
 
 /// Answers the evidence runner's test pauses in `dir` until `stop`: each
 /// `held-<restart>-<index>` gets its `continue-…`, and before the one of
 /// command 1 in pass 0 `edit` runs. Ends by itself after [`PATIENCE`].
-fn answer_pauses(dir: PathBuf, stop: Arc<AtomicBool>, edit: impl Fn() + Send + 'static) {
+pub(crate) fn answer_pauses(dir: PathBuf, stop: Arc<AtomicBool>, edit: impl Fn() + Send + 'static) {
     std::thread::spawn(move || {
         let deadline = Instant::now() + PATIENCE;
         while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -1334,73 +834,4 @@ fn answer_pauses(dir: PathBuf, stop: Arc<AtomicBool>, edit: impl Fn() + Send + '
             std::thread::sleep(Duration::from_millis(5));
         }
     });
-}
-
-/// The spec's release test 10, "An edit between commands".
-#[test]
-fn an_edit_between_commands_voids_the_pass_before_the_next_runs() {
-    let bench = Bench::new("octet-fleet-between");
-    let pauses = bench.side("pauses");
-    std::fs::create_dir_all(&pauses).unwrap();
-    // B's first action: a line naming its pass, the newest it is held in.
-    let marks = bench.side("b-ran");
-    let b = bench.side("b.sh");
-    std::fs::write(
-        &b,
-        format!(
-            "n=$(ls \"${TEST_PAUSE_ENV}\" | sed -n 's/^held-\\([0-9]*\\)-1$/\\1/p' | sort -n | tail -n 1)\n\
-             echo \"B ran (restart $n)\" >> '{}'\n\
-             test -f feature.txt\n",
-            marks.display()
-        ),
-    )
-    .unwrap();
-    let b_command = format!("sh '{}'", b.display());
-    let commands = ["test -f feature.txt", b_command.as_str()];
-    let workflow = bench.workflow(&small(&commands, 1));
-    bench.script(&small_turns());
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let fixture = bench.work.join("fixture.txt");
-    answer_pauses(pauses.clone(), Arc::clone(&stop), move || {
-        std::fs::write(&fixture, "edited between commands\n").unwrap();
-    });
-    let ended = bench
-        .run(&workflow, &[(TEST_PAUSE_ENV, pauses.as_os_str())])
-        .finish();
-    stop.store(true, Ordering::Relaxed);
-    ended.expect_code(0);
-
-    let records = bench.records();
-    let attempt = only_test_attempt(&records);
-    // A finished on T; B, edited under while held, was never released in
-    // that pass: it ran once, in the pass on the edited tree.
-    let ran = std::fs::read_to_string(&marks).unwrap();
-    assert_eq!(ran, "B ran (restart 1)\n");
-    let (pre, post) = observations(&records, attempt, 0, 0);
-    assert!(pre.is_some() && pre == post, "{records:#?}");
-    assert_eq!(observations(&records, attempt, 0, 1), (None, None));
-    let (derived, restart) = last_phase(&records, attempt);
-    assert_eq!(restart, 1);
-    assert_eq!(origin_of(&records, derived), Origin::Evidence);
-    assert_ne!(Some(tree_of(&records, derived)), pre);
-    // The suite passed on the edited tree, every observation equal to it.
-    let Some(Record::Completed {
-        candidate,
-        evidence,
-        tree,
-        ..
-    }) = records.last()
-    else {
-        panic!("{records:#?}");
-    };
-    assert_eq!(*candidate, derived);
-    let body = bench.evidence(*evidence);
-    assert_eq!(body["candidate"], derived.0);
-    assert_eq!(body["tree"], tree.as_str());
-    assert_eq!(
-        git(&bench.work, &["show", &format!("{tree}:fixture.txt")]),
-        "edited between commands\n"
-    );
-    bench.assert_passing_evidence_is_whole(&records, commands.len());
 }
