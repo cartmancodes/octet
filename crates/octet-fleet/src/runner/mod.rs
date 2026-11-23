@@ -850,6 +850,12 @@ fn nothing_left(
     ownership::check(processes, marker, &identities, &groups, &released) == ProcessCheck::Clear
 }
 
+/// Tests only: the directory of the test pauses, which
+/// [`crate::evidence::TEST_PAUSE_ENV`] names; none when it is unset.
+fn test_pauses() -> Option<PathBuf> {
+    crate::evidence::pause_hook_from(std::env::var_os(crate::evidence::TEST_PAUSE_ENV))
+}
+
 /// The detail of the latest `paused` record.
 fn last_pause_detail(records: &[Record]) -> Option<String> {
     records.iter().rev().find_map(|record| match record {

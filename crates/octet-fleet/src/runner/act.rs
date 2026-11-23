@@ -175,9 +175,7 @@ impl Driver {
             data_dir: self.data_dir.clone(),
             interrupt: Some(self.io.signals.clone()),
             follow_up,
-            pause_hook: crate::evidence::pause_hook_from(std::env::var_os(
-                crate::evidence::TEST_PAUSE_ENV,
-            )),
+            pause_hook: super::test_pauses(),
         };
         let end = step::run_attempt(
             plan,
@@ -593,6 +591,15 @@ impl Driver {
             Ok(candidate) => candidate,
             Err(detail) => return self.fail(attempt, Failure::LocalFailure { detail }).await,
         };
+        // Tests only: held with the tester's tree proposed, before the
+        // handoff commits it.
+        if let Some(dir) = super::test_pauses()
+            && let Err(error) =
+                crate::evidence::test_pause(&dir, &format!("handoff-{}", attempt.0)).await
+        {
+            let detail = format!("the test pause failed: {error}");
+            return self.fail(attempt, Failure::LocalFailure { detail }).await;
+        }
         self.append(&Record::EvidenceStarted {
             attempt,
             candidate,

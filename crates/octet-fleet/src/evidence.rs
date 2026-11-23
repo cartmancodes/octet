@@ -44,9 +44,10 @@ const TAIL_BYTES: usize = 16 * 1024;
 const HELD: &str = r#"read _ || exit 125; exec sh -c "$1""#;
 
 /// Tests only: the variable naming the directory of the test pauses: after
-/// each held spawn ([`EvidenceRun::pause_hook`]), and around a vendor's
-/// registration ([`crate::step::AttemptPlan::pause_hook`]). The runner reads
-/// it.
+/// each held spawn ([`EvidenceRun::pause_hook`]), around a vendor's
+/// registration ([`crate::step::AttemptPlan::pause_hook`]), and at the
+/// tester-to-evidence handoff, with the tester's tree proposed and not yet
+/// committed (`handoff-<attempt>`). The runner reads it.
 pub const TEST_PAUSE_ENV: &str = "OCTET_FLEET_TEST_PAUSE_DIR";
 
 /// The pause hook that `value`, the [`TEST_PAUSE_ENV`] variable, names: none
