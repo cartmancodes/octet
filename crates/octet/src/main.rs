@@ -4,6 +4,7 @@
 use args::{CliError, HubAction, Parsed, Prompt, Run};
 use std::{io::IsTerminal, path::PathBuf};
 mod args;
+mod fleet;
 mod headless;
 mod hub;
 mod pair;
@@ -57,6 +58,7 @@ fn help() -> String {
         "                 [--print PROMPT|- [--output text|json] | --rpc]",
         "       octet hub [serve|devices|revoke NAME|watch|install|uninstall] (the phone hub; octet hub --help)",
         "       octet pair [--journal-dir PATH] (pair a phone; octet pair --help)",
+        "       octet fleet run|resume|stop|status|validate (workflows; octet fleet --help)",
         "       octet --version | --help",
         "",
         "Headless: --print (-p) runs one prompt and writes the reply; - reads it",
@@ -177,6 +179,19 @@ async fn run() -> Result<i32, CliError> {
                 HubAction::Install { print } => hub::install(directory, print).await,
                 HubAction::Uninstall => hub::uninstall(directory).await,
             };
+        }
+        Parsed::Fleet {
+            action,
+            journal_dir,
+        } => {
+            let explicit = journal_dir.is_some();
+            // `--help` and `validate` touch no storage, so none is made for them.
+            let directory = if action.stores() {
+                data_dir(journal_dir)?
+            } else {
+                PathBuf::new()
+            };
+            return fleet::fleet(action, directory, explicit).await;
         }
         Parsed::PairHelp => {
             print!("{}", pair_help());

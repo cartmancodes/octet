@@ -35,6 +35,12 @@ pub(crate) enum Parsed {
     HubHelp,
     /// `octet hub ...`.
     Hub(HubArgs),
+    /// `octet fleet ...`.
+    Fleet {
+        action: FleetAction,
+        /// Where the fleet's runs live (`--journal-dir`).
+        journal_dir: Option<PathBuf>,
+    },
     /// `octet pair --help`.
     PairHelp,
     /// `octet pair`: pair a phone, starting the hub first if it is not running.
@@ -68,6 +74,64 @@ pub(crate) struct HubArgs {
     pub(crate) action: HubAction,
     pub(crate) journal_dir: Option<PathBuf>,
 }
+
+/// Where a fleet run's task comes from.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TaskSource {
+    Text(String),
+    /// `--task-file PATH`.
+    File(PathBuf),
+    /// `--task -`: all of stdin.
+    Stdin,
+}
+
+/// What `octet fleet` does.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FleetAction {
+    /// Start a run of a workflow.
+    Run {
+        /// A name under `.octet/workflows`, or a path.
+        workflow: String,
+        task: TaskSource,
+        cwd: Option<PathBuf>,
+        /// `--trust`: the resolved workflow may run without asking.
+        trust: bool,
+        /// `--output json`.
+        json: bool,
+    },
+    /// Continue a run, taking a decision first if one is given.
+    Resume {
+        run: String,
+        /// One of [`DECISIONS`].
+        decision: Option<String>,
+        /// The new cap, for the `rounds` decision.
+        rounds: Option<u32>,
+        json: bool,
+    },
+    /// `resume --decision stop`.
+    Stop { run: String },
+    /// Every run, or one in detail.
+    Status { run: Option<String> },
+    /// Check a workflow without running anything.
+    Validate {
+        workflow: String,
+        cwd: Option<PathBuf>,
+    },
+    /// `octet fleet --help`.
+    Help,
+}
+
+impl FleetAction {
+    /// Whether the command reads or writes the fleet's runs.
+    pub(crate) fn stores(&self) -> bool {
+        !matches!(self, FleetAction::Help | FleetAction::Validate { .. })
+    }
+}
+
+/// The decisions `--decision` names (spec, "Recovery and decisions").
+pub(crate) const DECISIONS: [&str; 9] = [
+    "keep", "adopt", "continue", "rounds", "retry", "kill", "wait", "release", "stop",
+];
 
 /// What to run.
 #[derive(Debug, PartialEq, Eq)]
@@ -183,6 +247,9 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Par
     }
     if args.next_if(|first| first == "pair").is_some() {
         return parse_pair(args);
+    }
+    if args.next_if(|first| first == "fleet").is_some() {
+        return parse_fleet(args);
     }
     let mut engine = "codex".to_owned();
     let mut binary = None;
@@ -381,6 +448,201 @@ fn parse_pair(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> 
         }
     }
     Ok(Parsed::Pair { journal_dir })
+}
+
+/// The options of one `octet fleet` command, before they are matched to it.
+#[derive(Default)]
+struct FleetOptions {
+    positional: Vec<String>,
+    task: Option<TaskSource>,
+    cwd: Option<PathBuf>,
+    journal_dir: Option<PathBuf>,
+    trust: bool,
+    json: bool,
+    decision: Option<String>,
+    rounds: Option<u32>,
+}
+
+/// The fleet commands each option applies to.
+fn fleet_option_applies(option: &str) -> Option<&'static [&'static str]> {
+    Some(match option {
+        "--task" | "--task-file" | "--trust" => &["run"],
+        "--cwd" => &["run", "validate"],
+        "--output" => &["run", "resume"],
+        "--decision" | "--rounds" => &["resume"],
+        "--journal-dir" => &["run", "resume", "stop", "status", "validate"],
+        _ => return None,
+    })
+}
+
+/// Parses the arguments after `fleet`: a command, its operand and its options.
+fn parse_fleet(args: impl Iterator<Item = OsString>) -> Result<Parsed, CliError> {
+    let mut args = args;
+    let hint = "Use fleet --help.";
+    let first = args
+        .next()
+        .ok_or_else(|| usage(format!("Name a fleet command. {hint}")))?
+        .into_string()
+        .map_err(|_| usage(format!("Unknown fleet command. {hint}")))?;
+    let help = |journal_dir| {
+        Ok(Parsed::Fleet {
+            action: FleetAction::Help,
+            journal_dir,
+        })
+    };
+    let command: &'static str = match first.as_str() {
+        "--help" | "-h" => return help(None),
+        "run" => "run",
+        "resume" => "resume",
+        "stop" => "stop",
+        "status" => "status",
+        "validate" => "validate",
+        other => return Err(usage(format!("Unknown fleet command {other}. {hint}"))),
+    };
+    let mut options = FleetOptions::default();
+    while let Some(arg) = args.next() {
+        let arg = arg.into_string().map_err(|arg| {
+            usage(format!(
+                "Unknown argument {}. {hint}",
+                arg.to_string_lossy()
+            ))
+        })?;
+        match arg.as_str() {
+            "--help" | "-h" => return help(options.journal_dir),
+            "--trust" | "--task" | "--task-file" | "--cwd" | "--output" | "--decision"
+            | "--rounds" | "--journal-dir" => {}
+            positional if !positional.starts_with("--") => {
+                options.positional.push(arg);
+                continue;
+            }
+            other => return Err(usage(format!("Unknown option {other}. {hint}"))),
+        }
+        let name = fleet_option_applies(&arg).filter(|commands| commands.contains(&command));
+        if name.is_none() {
+            let applies = fleet_option_applies(&arg).map_or_else(String::new, |c| c.join(" and "));
+            return Err(usage(format!("{arg} applies to {applies}. {hint}")));
+        }
+        match arg.as_str() {
+            "--trust" => options.trust = true,
+            "--task" => {
+                let task = verbatim(&mut args, &arg)?;
+                let source = if task == "-" {
+                    TaskSource::Stdin
+                } else {
+                    check_prompt(&task)?;
+                    TaskSource::Text(task)
+                };
+                set_task(&mut options, source)?;
+            }
+            "--task-file" => {
+                let path = PathBuf::from(value(&mut args, &arg)?);
+                set_task(&mut options, TaskSource::File(path))?;
+            }
+            "--cwd" => options.cwd = Some(PathBuf::from(value(&mut args, &arg)?)),
+            "--journal-dir" => options.journal_dir = Some(PathBuf::from(value(&mut args, &arg)?)),
+            "--output" => {
+                options.json = match text(&mut args, &arg)?.as_str() {
+                    "text" => false,
+                    "json" => true,
+                    _ => return Err(usage("Output must be text or json")),
+                };
+            }
+            "--decision" => {
+                let decision = text(&mut args, &arg)?;
+                if !DECISIONS.contains(&decision.as_str()) {
+                    return Err(usage(format!(
+                        "Unknown decision {decision}. Use {}.",
+                        DECISIONS.join(", ")
+                    )));
+                }
+                options.decision = Some(decision);
+            }
+            _ => {
+                options.rounds = Some(
+                    text(&mut args, &arg)?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|rounds| *rounds >= 1)
+                        .ok_or_else(|| usage("Rounds must be a whole number of at least 1"))?,
+                );
+            }
+        }
+    }
+    fleet_action(command, options, hint)
+}
+
+fn set_task(options: &mut FleetOptions, source: TaskSource) -> Result<(), CliError> {
+    if options.task.replace(source).is_some() {
+        return Err(usage("Give the task once: --task, --task-file or --task -"));
+    }
+    Ok(())
+}
+
+/// The command `command` with its operand and options, checked.
+fn fleet_action(command: &str, options: FleetOptions, hint: &str) -> Result<Parsed, CliError> {
+    let FleetOptions {
+        mut positional,
+        task,
+        cwd,
+        journal_dir,
+        trust,
+        json,
+        decision,
+        rounds,
+    } = options;
+    let what = if matches!(command, "run" | "validate") {
+        "workflow"
+    } else {
+        "run"
+    };
+    if let Some(extra) = positional.get(1) {
+        return Err(usage(format!("Unexpected argument {extra}. {hint}")));
+    }
+    let operand = positional.pop();
+    let required =
+        |operand: Option<String>| operand.ok_or_else(|| usage(format!("Name the {what}. {hint}")));
+    let action = match command {
+        "run" => FleetAction::Run {
+            workflow: required(operand)?,
+            task: task.ok_or_else(|| {
+                usage(format!(
+                    "Give the task with --task, --task-file or --task -. {hint}"
+                ))
+            })?,
+            cwd,
+            trust,
+            json,
+        },
+        "resume" => {
+            match (decision.as_deref(), rounds) {
+                (Some("rounds"), None) => {
+                    return Err(usage("--decision rounds requires --rounds N"));
+                }
+                (decision, Some(_)) if decision != Some("rounds") => {
+                    return Err(usage("--rounds applies to --decision rounds"));
+                }
+                _ => {}
+            }
+            FleetAction::Resume {
+                run: required(operand)?,
+                decision,
+                rounds,
+                json,
+            }
+        }
+        "stop" => FleetAction::Stop {
+            run: required(operand)?,
+        },
+        "status" => FleetAction::Status { run: operand },
+        _ => FleetAction::Validate {
+            workflow: required(operand)?,
+            cwd,
+        },
+    };
+    Ok(Parsed::Fleet {
+        action,
+        journal_dir,
+    })
 }
 
 /// Refuses a prompt the session would refuse, before one opens.
@@ -770,5 +1032,248 @@ mod tests {
             workspace(std::path::Path::new("/etc/hosts")),
             Err(usage("Workspace must be a directory"))
         );
+    }
+
+    fn fleet(list: &[&str]) -> (FleetAction, Option<PathBuf>) {
+        let mut full = vec!["fleet"];
+        full.extend_from_slice(list);
+        match parse(&full) {
+            Ok(Parsed::Fleet {
+                action,
+                journal_dir,
+            }) => (action, journal_dir),
+            other => panic!("{list:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fleet_run_takes_a_workflow_and_a_task() {
+        let (action, journal_dir) = fleet(&["run", "wf", "--task", "Add a flag"]);
+        assert_eq!(
+            action,
+            FleetAction::Run {
+                workflow: "wf".into(),
+                task: TaskSource::Text("Add a flag".into()),
+                cwd: None,
+                trust: false,
+                json: false,
+            }
+        );
+        assert_eq!(journal_dir, None);
+        let (action, journal_dir) = fleet(&[
+            "run",
+            "--task-file",
+            "t.md",
+            "plans/wf.yaml",
+            "--cwd",
+            "/w",
+            "--trust",
+            "--output",
+            "json",
+            "--journal-dir",
+            "/d",
+        ]);
+        assert_eq!(
+            action,
+            FleetAction::Run {
+                workflow: "plans/wf.yaml".into(),
+                task: TaskSource::File("t.md".into()),
+                cwd: Some("/w".into()),
+                trust: true,
+                json: true,
+            }
+        );
+        assert_eq!(journal_dir, Some(PathBuf::from("/d")));
+        // `-` reads the task from stdin, and a task may start with dashes.
+        assert!(matches!(
+            fleet(&["run", "wf", "--task", "-"]).0,
+            FleetAction::Run {
+                task: TaskSource::Stdin,
+                ..
+            }
+        ));
+        assert!(matches!(
+            fleet(&["run", "wf", "--task", "--fix it"]).0,
+            FleetAction::Run { task: TaskSource::Text(text), .. } if text == "--fix it"
+        ));
+    }
+
+    #[test]
+    fn fleet_resume_stop_status_and_validate_parse() {
+        assert_eq!(
+            fleet(&["resume", "f1-0001"]).0,
+            FleetAction::Resume {
+                run: "f1-0001".into(),
+                decision: None,
+                rounds: None,
+                json: false,
+            }
+        );
+        assert_eq!(
+            fleet(&[
+                "resume",
+                "f1-0001",
+                "--decision",
+                "keep",
+                "--output",
+                "json"
+            ])
+            .0,
+            FleetAction::Resume {
+                run: "f1-0001".into(),
+                decision: Some("keep".into()),
+                rounds: None,
+                json: true,
+            }
+        );
+        assert_eq!(
+            fleet(&["resume", "f1-0001", "--decision", "rounds", "--rounds", "3"]).0,
+            FleetAction::Resume {
+                run: "f1-0001".into(),
+                decision: Some("rounds".into()),
+                rounds: Some(3),
+                json: false,
+            }
+        );
+        assert_eq!(
+            fleet(&["stop", "f1-0001", "--journal-dir", "/d"]),
+            (
+                FleetAction::Stop {
+                    run: "f1-0001".into()
+                },
+                Some(PathBuf::from("/d"))
+            )
+        );
+        assert_eq!(fleet(&["status"]).0, FleetAction::Status { run: None });
+        assert_eq!(
+            fleet(&["status", "f1-0001"]).0,
+            FleetAction::Status {
+                run: Some("f1-0001".into())
+            }
+        );
+        assert_eq!(
+            fleet(&["validate", "wf", "--cwd", "/w"]).0,
+            FleetAction::Validate {
+                workflow: "wf".into(),
+                cwd: Some("/w".into()),
+            }
+        );
+        for decision in DECISIONS {
+            let rounds: &[&str] = if decision == "rounds" {
+                &["--rounds", "2"]
+            } else {
+                &[]
+            };
+            let mut list = vec!["resume", "r", "--decision", decision];
+            list.extend_from_slice(rounds);
+            assert!(
+                matches!(fleet(&list).0, FleetAction::Resume { decision: Some(d), .. } if d == decision),
+                "{decision}"
+            );
+        }
+        assert_eq!(
+            parse(&["fleet", "--help"]),
+            Ok(Parsed::Fleet {
+                action: FleetAction::Help,
+                journal_dir: None,
+            })
+        );
+        assert!(matches!(
+            parse(&["fleet", "run", "-h"]),
+            Ok(Parsed::Fleet {
+                action: FleetAction::Help,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fleet_usage_errors_name_the_problem() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["fleet"], "Name a fleet command"),
+            (&["fleet", "launch"], "Unknown fleet command launch"),
+            (
+                &["fleet", "run", "wf"],
+                "Give the task with --task, --task-file or --task -",
+            ),
+            (&["fleet", "run", "--task", "x"], "Name the workflow"),
+            (
+                &["fleet", "run", "a", "b", "--task", "x"],
+                "Unexpected argument b",
+            ),
+            (
+                &["fleet", "run", "wf", "--task", "x", "--task-file", "f"],
+                "Give the task once",
+            ),
+            (
+                &["fleet", "run", "wf", "--task", "x", "--task", "y"],
+                "Give the task once",
+            ),
+            (
+                &["fleet", "run", "wf", "--task", "  "],
+                "The prompt is empty",
+            ),
+            (&["fleet", "run", "wf", "--task"], "--task requires a value"),
+            (
+                &["fleet", "run", "wf", "--task", "x", "--output", "xml"],
+                "Output must be text or json",
+            ),
+            (
+                &["fleet", "run", "wf", "--task", "x", "--decision", "keep"],
+                "--decision applies to resume",
+            ),
+            (
+                &["fleet", "run", "wf", "--task", "x", "--bogus"],
+                "Unknown option --bogus",
+            ),
+            (&["fleet", "resume"], "Name the run"),
+            (
+                &["fleet", "resume", "r", "--decision", "bogus"],
+                "Unknown decision bogus. Use keep, adopt",
+            ),
+            (
+                &["fleet", "resume", "r", "--rounds", "0"],
+                "Rounds must be a whole number of at least 1",
+            ),
+            (
+                &["fleet", "resume", "r", "--rounds", "x"],
+                "Rounds must be a whole number of at least 1",
+            ),
+            (
+                &["fleet", "resume", "r", "--decision", "rounds"],
+                "--decision rounds requires --rounds",
+            ),
+            (
+                &[
+                    "fleet",
+                    "resume",
+                    "r",
+                    "--decision",
+                    "keep",
+                    "--rounds",
+                    "2",
+                ],
+                "--rounds applies to --decision rounds",
+            ),
+            (
+                &["fleet", "resume", "r", "--task", "x"],
+                "--task applies to run",
+            ),
+            (&["fleet", "stop"], "Name the run"),
+            (
+                &["fleet", "stop", "r", "--decision", "keep"],
+                "--decision applies to resume",
+            ),
+            (&["fleet", "status", "a", "b"], "Unexpected argument b"),
+            (&["fleet", "validate"], "Name the workflow"),
+            (
+                &["fleet", "validate", "wf", "--trust"],
+                "--trust applies to run",
+            ),
+        ];
+        for (list, expected) in cases {
+            let message = error(list);
+            assert!(message.contains(expected), "{list:?}: {message}");
+        }
     }
 }

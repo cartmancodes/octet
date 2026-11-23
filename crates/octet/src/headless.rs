@@ -15,9 +15,9 @@ use tokio::{
 /// The longest RPC command line: a full prompt, JSON-escaped, with room.
 const LINE_LIMIT: usize = 4 * octet_core::PROMPT_LIMIT;
 /// Exit code after SIGINT, as shells report it.
-const INTERRUPTED: i32 = 130;
+pub(crate) const INTERRUPTED: i32 = 130;
 /// Exit code after SIGTERM, as shells report it.
-const TERMINATED: i32 = 143;
+pub(crate) const TERMINATED: i32 = 143;
 /// Writes `octet: text` to stderr. A closed stderr is not worth a panic:
 /// the session must still shut down.
 pub(crate) fn warn(text: &str) {
@@ -26,7 +26,7 @@ pub(crate) fn warn(text: &str) {
 }
 
 /// `text`'s first line without control characters: vendor text must not steer the terminal.
-fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     text.lines()
         .next()
         .unwrap_or_default()
@@ -36,7 +36,7 @@ fn plain(text: &str) -> String {
 }
 
 /// What a denied approval was for, as it is safe to print.
-fn denied(summary: &octet_core::ApprovalSummary) -> String {
+pub(crate) fn denied(summary: &octet_core::ApprovalSummary) -> String {
     match &summary.command {
         Some(command) => format!("{}: {}", plain(&summary.action), plain(command)),
         None => plain(&summary.action),
@@ -389,7 +389,7 @@ pub(crate) async fn read_prompt() -> Result<String, CliError> {
 
 /// The prompt in `bytes`, less one line ending, checked against the limit
 /// before UTF-8.
-fn prompt_text(mut bytes: Vec<u8>) -> Result<String, CliError> {
+pub(crate) fn prompt_text(mut bytes: Vec<u8>) -> Result<String, CliError> {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
         if bytes.last() == Some(&b'\r') {
