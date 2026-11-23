@@ -1,14 +1,15 @@
 //! Print, JSON and RPC modes: one session without the terminal interface.
 //! Approvals fail closed: print mode denies them, RPC clients answer them.
 use crate::args::{CliError, check_prompt_size};
-use octet_core::{Command, Config, Event, Mode, Outcome, Session, event_json};
+use octet_core::{
+    Command, Config, Event, Mode, Outcome, Session, background::Background, event_json,
+};
 use serde_json::Value;
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     signal::unix::{Signal, SignalKind, signal},
     sync::mpsc,
-    time::{Instant, sleep_until},
 };
 
 /// The longest RPC command line: a full prompt, JSON-escaped, with room.
@@ -17,52 +18,6 @@ const LINE_LIMIT: usize = 4 * octet_core::PROMPT_LIMIT;
 const INTERRUPTED: i32 = 130;
 /// Exit code after SIGTERM, as shells report it.
 const TERMINATED: i32 = 143;
-/// How long a run waits, after the vendor's last background task ends
-/// between turns, for the turn Claude then starts of its own.
-const BACKGROUND_GRACE: Duration = Duration::from_secs(5);
-
-/// The vendor's background tasks. Claude starts a turn of its own when one
-/// ends after its turn did, so a headless run must not end while one runs,
-/// nor just after the last one ended.
-#[derive(Default)]
-struct Background {
-    /// Tasks running.
-    tasks: usize,
-    /// The last task ended between turns: until then a turn may follow.
-    grace: Option<Instant>,
-}
-impl Background {
-    /// Follows the session's events; `idle` when no turn runs.
-    fn track(&mut self, event: &Event, idle: bool) {
-        match event {
-            Event::Background(tasks) => {
-                if *tasks == 0 && self.tasks > 0 && idle {
-                    self.grace = Some(Instant::now() + BACKGROUND_GRACE);
-                }
-                self.tasks = *tasks;
-            }
-            Event::Started => self.grace = None,
-            _ => {}
-        }
-    }
-
-    /// A task runs, or one ended so recently that a turn may still follow.
-    fn pending(&self) -> bool {
-        self.tasks > 0 || self.grace.is_some()
-    }
-
-    /// Ends the grace once it passes; never, when there is none.
-    async fn grace_over(&mut self) {
-        match self.grace {
-            Some(at) => {
-                sleep_until(at).await;
-                self.grace = None;
-            }
-            None => std::future::pending().await,
-        }
-    }
-}
-
 /// Writes `octet: text` to stderr. A closed stderr is not worth a panic:
 /// the session must still shut down.
 pub(crate) fn warn(text: &str) {
@@ -206,7 +161,7 @@ async fn drive_print(
                 if !json {
                     warn(&format!(
                         "waiting for {} background task(s); Ctrl+C stops",
-                        background.tasks
+                        background.tasks()
                     ));
                 }
                 held = Some(code);
