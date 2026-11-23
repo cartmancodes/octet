@@ -965,3 +965,46 @@ async fn an_unfinished_write_attempt_keeps_its_claim_on_the_work_tree() {
     let bench = reconciling(json!({"reply": "Finished."})).await;
     assert_eq!(listed(&bench.data), [bench.run_id().await]);
 }
+
+#[tokio::test]
+async fn a_new_attempt_discards_the_clone_of_an_interrupted_one() {
+    let mut turns = small_turns();
+    turns["research#1"] = json!([
+        {"hold": "before_write"},
+        {"reply": "The repository holds one README."},
+    ]);
+    let bench = Bench::new(&turns);
+    let workflow = bench.workflow(SMALL, &["test -f feature.txt"]);
+    let Io {
+        runner: io,
+        events,
+        signal,
+    } = channels();
+    let log = bench.turns.clone();
+    let (end, _) = patiently(start(bench.start(workflow), io), events, |event| {
+        if matches!(event, FleetEvent::AttemptStarted { step, .. } if step == "research") {
+            // Interrupt once the researcher holds its turn.
+            let (signal, log) = (Arc::clone(&signal), log.clone());
+            tokio::spawn(async move {
+                while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("research#1")) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                signal.send(Some("SIGINT")).unwrap();
+            });
+        }
+    })
+    .await;
+    assert_eq!(end, RunEnd::Interrupted("SIGINT"));
+    let id = bench.run_id().await;
+    let clone = bench
+        .data
+        .join("fleet")
+        .join(&id)
+        .join("attempts")
+        .join("0")
+        .join("tree");
+    assert!(clone.exists());
+    let (end, _) = resume_with(&bench, None).await;
+    assert_eq!(end, RunEnd::Completed);
+    assert!(!clone.exists(), "the interrupted attempt's clone is kept");
+}

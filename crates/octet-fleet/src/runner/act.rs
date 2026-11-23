@@ -18,7 +18,7 @@ use crate::record::{
     PauseReason, Record, Status,
 };
 use crate::snapshot::{self, Repo};
-use crate::state::RunState;
+use crate::state::{AttemptState, RunState};
 use crate::step::{self, AttemptPlan, FollowUp, TurnEnd};
 use crate::store;
 use crate::validate::{Refs, Step};
@@ -53,6 +53,15 @@ impl Driver {
             .keys()
             .next_back()
             .map_or(AttemptId(0), |last| AttemptId(last.0 + 1));
+        // The attempt before this one, left unfinished or failed, may have
+        // left its scratch clone (an accepted one's is already gone): a new
+        // attempt discards it (spec, "State found": "discard its clone").
+        // Each attempt discards its predecessor's, so none is left behind.
+        if let Some((&previous, info)) = view.state.attempts.iter().next_back()
+            && info.state != AttemptState::Finished
+        {
+            let _ = tokio::fs::remove_dir_all(self.attempt_dir(previous).join("tree")).await;
+        }
         if !step.read_only() {
             self.own(attempt).await?;
         }
