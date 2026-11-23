@@ -750,6 +750,15 @@ impl Driver {
             let detail = recover::drift_detail(&tree, &observed, &what);
             return self.pause(PauseReason::Drift, detail).await.map(Some);
         }
+        let open_findings: Vec<Finding> = self
+            .load()
+            .await?
+            .state
+            .findings
+            .into_values()
+            .filter(|(_, status)| *status == Status::Open)
+            .map(|(finding, _)| finding)
+            .collect();
         self.append(&Record::Completed {
             candidate,
             tree: tree.clone(),
@@ -760,8 +769,12 @@ impl Driver {
         .await?;
         self.disown().await?;
         let diff_command = format!("git diff {} {tree}", self.file.base_tree);
-        self.emit(FleetEvent::Completed { tree, diff_command })
-            .await;
+        self.emit(FleetEvent::Completed {
+            tree,
+            diff_command,
+            open_findings,
+        })
+        .await;
         Ok(Some(RunEnd::Completed))
     }
 }

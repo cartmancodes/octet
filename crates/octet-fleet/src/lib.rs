@@ -130,5 +130,8 @@ pub enum FleetEvent {
         tree: String,
         /// A command that shows the run's change.
         diff_command: String,
+        /// The findings still open (minor ones: a blocking finding cannot
+        /// be open at an approval), in ID order.
+        open_findings: Vec<record::Finding>,
     },
 }

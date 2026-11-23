@@ -233,7 +233,7 @@ fenced JSON block:
 - `previous` must list exactly the step's findings still open before this round (all of them,
   each once). The reviewer receives every open finding with its ID.
 - `approved` requires no open **blocking** finding afterwards (open minor findings are allowed and
-  reported). `changes_requested` requires at least one open finding afterwards.
+  reported when the run completes). `changes_requested` requires at least one open finding afterwards.
 - A reply that fails these checks gets one corrective prompt in the same session; if it is still
   invalid the run pauses (`invalid_output`). An invalid reply never counts as a round.
 
@@ -288,13 +288,16 @@ completed f1795467341-a39b
   git diff 5393cdf80cbdf44e72474843f748244f1dd3b233 b578594907aa1f29d92e03ab9034175c16e47f6d
 ```
 
-The last line shows everything the run changed. Fleet never commits, branches or pushes: the
-change is left in the work tree for you.
+The `git diff` line shows everything the run changed. When findings are still open (minor ones,
+from any verdict step), they follow it, one per line: `open findings (N):`, then
+`  <id> [minor] <summary> (<file>)`. Fleet never commits, branches or pushes: the change is left
+in the work tree for you.
 
 `--output json` writes every event as one JSON line instead (`run_started`, `attempt_started`,
 `session` with the vendor's own event and the step, `candidate`, `evidence_command`,
 `attempt_finished`, `retrying`, `paused`, `needs_decision`, `completed`); guidance then goes to
-stderr.
+stderr. `completed` carries `tree`, `diff_command` and `open_findings` (each with `id`,
+`severity`, `summary` and `file`).
 
 **Approvals.** Read-only steps never ask you: every approval they raise is denied. Write steps
 use their profile's mode. On a terminal, `octet fleet` asks y/n on stderr, showing the action,

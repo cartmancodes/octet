@@ -12,7 +12,7 @@ use octet_core::{ApprovalSummary, Event, event_json};
 use octet_fleet::{
     Approver, FleetEvent, RunEnd, RunnerError, RunnerIo, Signals, Start,
     definition::{self, Workflow},
-    record::{AttemptId, CandidateId, Decision, PauseReason, Record},
+    record::{AttemptId, CandidateId, Decision, Finding, PauseReason, Record},
     recover, snapshot,
     snapshot::SnapshotError,
     store::{self, StoreError},
@@ -604,9 +604,14 @@ pub(crate) fn fleet_event_json(event: &FleetEvent) -> Value {
         FleetEvent::NeedsDecision { reason, options } => {
             json!({"type": "needs_decision", "reason": name_of(reason), "options": options})
         }
-        FleetEvent::Completed { tree, diff_command } => {
-            json!({"type": "completed", "tree": tree, "diff_command": diff_command})
-        }
+        FleetEvent::Completed {
+            tree,
+            diff_command,
+            open_findings,
+        } => json!({
+            "type": "completed", "tree": tree, "diff_command": diff_command,
+            "open_findings": open_findings,
+        }),
     }
 }
 
@@ -621,6 +626,8 @@ struct Renderer {
     progress: bool,
     /// The command that shows a completed run's change.
     diff_command: Option<String>,
+    /// The findings a completed run left open.
+    open_findings: Vec<Finding>,
     /// Where events go: stdout, and the vendor's notices and errors to
     /// stderr.
     console: Console,
@@ -634,6 +641,7 @@ impl Renderer {
             run: None,
             progress: false,
             diff_command: None,
+            open_findings: Vec::new(),
             console,
         }
     }
@@ -673,8 +681,14 @@ impl Renderer {
         if let FleetEvent::AttemptStarted { attempt, step, .. } = event {
             self.steps.insert(*attempt, step.clone());
         }
-        if let FleetEvent::Completed { diff_command, .. } = event {
+        if let FleetEvent::Completed {
+            diff_command,
+            open_findings,
+            ..
+        } = event
+        {
             self.diff_command = Some(diff_command.clone());
+            self.open_findings.clone_from(open_findings);
         }
         if self.json {
             let mut value = fleet_event_json(event);
@@ -883,7 +897,13 @@ async fn drive(front: &Front, first: Call) -> Result<i32, CliError> {
         match end {
             RunEnd::Completed => {
                 if !front.json {
-                    completed(front, &run, renderer.diff_command.as_deref()).await;
+                    completed(
+                        front,
+                        &run,
+                        renderer.diff_command.as_deref(),
+                        &renderer.open_findings,
+                    )
+                    .await;
                 }
                 return Ok(0);
             }
@@ -1012,8 +1032,8 @@ async fn choose(front: &Front, reason: PauseReason, options: &[&'static str]) ->
 }
 
 /// The end of a completed run: the invariant's parts, as the log recorded
-/// them, and the command that shows the change.
-async fn completed(front: &Front, run: &str, diff_command: Option<&str>) {
+/// them, the command that shows the change, and the findings left open.
+async fn completed(front: &Front, run: &str, diff_command: Option<&str>, open: &[Finding]) {
     let read = async {
         let (dir, file) = store::open(&front.data_dir, run).await.ok()?;
         let records = store::read_log(&dir).await.ok()?;
@@ -1024,10 +1044,24 @@ async fn completed(front: &Front, run: &str, diff_command: Option<&str>) {
             "run {} completed, but its log cannot be read",
             plain(run)
         ));
+        let mut text = String::new();
+        open_findings_text(&mut text, open);
+        stdout(&text);
         return;
     };
+    stdout(&completed_text(run, &file.base_tree, &records, diff_command, open));
+}
+
+/// [`completed`]'s text.
+fn completed_text(
+    run: &str,
+    base_tree: &str,
+    records: &[Record],
+    diff_command: Option<&str>,
+    open: &[Finding],
+) -> String {
     let mut text = format!("completed {}\n", plain(run));
-    for record in &records {
+    for record in records {
         if let Record::Completed {
             candidate,
             tree,
@@ -1042,13 +1076,45 @@ async fn completed(front: &Front, run: &str, diff_command: Option<&str>) {
                 candidate.0, evidence.0, approval.0
             );
             let diff = diff_command.map_or_else(
-                || format!("git diff {} {tree}", file.base_tree),
+                || format!("git diff {base_tree} {tree}"),
                 str::to_owned,
             );
             let _ = writeln!(text, "  {}", plain(&diff));
         }
     }
-    print!("{text}");
+    open_findings_text(&mut text, open);
+    text
+}
+
+/// The findings a completed run left open (minor ones), one per line, after
+/// a heading; nothing when there are none.
+fn open_findings_text(text: &mut String, open: &[Finding]) {
+    if open.is_empty() {
+        return;
+    }
+    let _ = writeln!(text, "open findings ({}):", open.len());
+    for finding in open {
+        let file = finding
+            .file
+            .as_deref()
+            .map(|file| format!(" ({})", plain(file)))
+            .unwrap_or_default();
+        let _ = writeln!(
+            text,
+            "  {} [{}] {}{file}",
+            plain(&finding.id),
+            name_of(&finding.severity),
+            block(&finding.summary, "    ")
+        );
+    }
+}
+
+/// Writes `text` to stdout; a closed stdout (a pipe whose reader left) is
+/// not an error worth a panic.
+fn stdout(text: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
 }
 
 /// The end of a stopped run: the tree is as the run left it, and this
@@ -1343,6 +1409,54 @@ mod tests {
         drop(typing);
         assert_eq!(prompter.ask("one? ").await, None);
         assert_eq!(prompter.ask("two? ").await, None);
+    }
+
+    #[test]
+    fn open_findings_are_reported_at_completion_as_text_and_json() {
+        use octet_fleet::record::Severity;
+        let open = vec![
+            Finding {
+                id: "review_change/F2".into(),
+                severity: Severity::Minor,
+                summary: "Name the constant.\nIt is used twice.".into(),
+                file: Some("src/lib.rs".into()),
+            },
+            Finding {
+                id: "review_plan/F1".into(),
+                severity: Severity::Minor,
+                summary: "A typo\u{1b}[2J.".into(),
+                file: None,
+            },
+        ];
+        let records = [Record::Completed {
+            candidate: CandidateId(3),
+            tree: "t3".into(),
+            evidence: octet_fleet::record::ArtifactId(5),
+            approval: octet_fleet::record::ArtifactId(6),
+            observed_tree: "t3".into(),
+        }];
+        let text = completed_text("f1-0001", "t0", &records, None, &open);
+        assert!(text.contains("  git diff t0 t3\n"), "{text}");
+        assert!(
+            text.ends_with(
+                "open findings (2):\n  review_change/F2 [minor] Name the constant.\n    \
+                 It is used twice. (src/lib.rs)\n  review_plan/F1 [minor] A typo[2J.\n"
+            ),
+            "{text}"
+        );
+        assert!(!completed_text("f1-0001", "t0", &records, None, &[]).contains("open findings"));
+        let event = FleetEvent::Completed {
+            tree: "t3".into(),
+            diff_command: "git diff t0 t3".into(),
+            open_findings: open,
+        };
+        let value = fleet_event_json(&event);
+        assert_eq!(value["type"], "completed");
+        assert_eq!(value["open_findings"][0]["id"], "review_change/F2");
+        assert_eq!(value["open_findings"][0]["severity"], "minor");
+        assert_eq!(value["open_findings"][0]["file"], "src/lib.rs");
+        assert_eq!(value["open_findings"][1]["summary"], "A typo\u{1b}[2J.");
+        assert_eq!(value["open_findings"].as_array().unwrap().len(), 2);
     }
 
     #[test]

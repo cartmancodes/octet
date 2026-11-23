@@ -23,7 +23,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use octet_core::ApprovalSummary;
 use octet_fleet::definition::parse;
-use octet_fleet::record::{Accepted, CandidateId, Decision, Failure, Origin, PauseReason, Record};
+use octet_fleet::record::{
+    Accepted, CandidateId, Decision, Failure, Origin, PauseReason, Record, Severity,
+};
 use octet_fleet::store::{self, RunDir};
 use octet_fleet::validate::{Host, Refs, Resolved, validate};
 use octet_fleet::{
@@ -463,6 +465,55 @@ async fn a_reviewer_write_is_an_access_violation() {
     let (end, _) = resume_with(&bench, Some(Decision::Retry)).await;
     assert_eq!(end, RunEnd::Completed);
     assert_eq!(bench.attempts_of("review_research").await, 2);
+}
+
+/// An approval with one minor finding, `summary`, about `file`.
+fn approve_with_minor(summary: &str, file: &str) -> String {
+    let block = json!({
+        "verdict": "approved",
+        "new_findings": [{"severity": "minor", "summary": summary, "file": file}],
+        "previous": [],
+    });
+    format!("Fine.\n\n```json\n{block}\n```\n")
+}
+
+#[tokio::test]
+async fn open_minor_findings_are_reported_at_completion() {
+    let mut turns = happy_turns();
+    turns["review_research#1"] = json!({"reply": approve_with_minor("Cite the README.", "README.md")});
+    turns["review_change#1"] =
+        json!({"reply": approve_with_minor("feature.txt could say more.", "feature.txt")});
+    let bench = Bench::new(&turns);
+    let workflow = bench.workflow(SHIPPED, &["test -f feature.txt"]);
+    let Io {
+        runner: io, events, ..
+    } = channels();
+    let (end, events) = patiently(start(bench.start(workflow), io), events, |_| {}).await;
+    assert_eq!(end, RunEnd::Completed, "{events:#?}");
+    let Some(FleetEvent::Completed { open_findings, .. }) = events.last() else {
+        panic!("{:?}", events.last());
+    };
+    let shown: Vec<(&str, Severity, &str, Option<&str>)> = open_findings
+        .iter()
+        .map(|f| (f.id.as_str(), f.severity, f.summary.as_str(), f.file.as_deref()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (
+                "review_change/F1",
+                Severity::Minor,
+                "feature.txt could say more.",
+                Some("feature.txt")
+            ),
+            (
+                "review_research/F1",
+                Severity::Minor,
+                "Cite the README.",
+                Some("README.md")
+            ),
+        ]
+    );
 }
 
 #[tokio::test]
