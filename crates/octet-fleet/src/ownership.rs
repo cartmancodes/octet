@@ -1,0 +1,937 @@
+//! Who may drive a run, who may write its work tree, and which processes are the run's.
+//!
+//! Two OS locks (`File::try_lock`, which die with the process) make one Octet drive a run and one
+//! run write a work tree: [`lock`] takes the run's `lock` file, then the work tree's
+//! `<data_dir>/fleet/worktrees/<hash>.lock`. The work tree's [`WorktreeRecord`] lists every run
+//! with unresolved ownership of it; it is changed only while a [`Held`] proves the lock, and
+//! [`admit`] decides from it whether a run may write. [`list_processes`] and [`check`] tell which
+//! live processes are a run's, and [`kill_verified`] stops only those.
+//!
+//! A process is the run's when it carries the attempt's `OCTET_FLEET_ATTEMPT` marker in its
+//! environment or matches a registered `(pid, start time)` identity; a process in a registered
+//! group with neither is only ever reported, never signalled.
+
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use octet_store::{create_private, create_private_dir, sync_directory};
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
+use tokio::time::Instant;
+
+use crate::record::{AttemptId, Identity};
+use crate::recover::ProcessCheck;
+use crate::snapshot::{SnapshotError, command, exec};
+use crate::store::RunDir;
+
+/// The environment variable the gate exports: `<run>/<attempt>`, inherited by everything the
+/// attempt starts.
+const MARKER_VAR: &str = "OCTET_FLEET_ATTEMPT";
+
+/// How long [`kill_verified`] waits after SIGTERM before SIGKILL.
+const TERM_GRACE: Duration = Duration::from_secs(5);
+
+/// How long [`kill_verified`] waits after SIGKILL for the processes to be gone.
+const KILL_GRACE: Duration = Duration::from_secs(1);
+
+/// How often [`kill_verified`] looks.
+const LOOK: Duration = Duration::from_millis(100);
+
+/// Why ownership could not be taken, read or checked.
+#[derive(Debug, thiserror::Error)]
+pub enum OwnershipError {
+    /// Another Octet is driving this run.
+    #[error("another Octet is driving this run")]
+    RunBusy,
+    /// Another run holds the work tree.
+    #[error("another run holds this work tree{}", holder_note(.holder.as_deref()))]
+    WorktreeBusy {
+        /// The run that holds it, when it could be read from the lock file.
+        holder: Option<String>,
+    },
+    /// Another run still has unresolved ownership of the work tree.
+    #[error("run {run} still has unresolved ownership of this work tree; resume or stop it first")]
+    OtherRunUnresolved {
+        /// The run that must be resumed or stopped.
+        run: String,
+    },
+    /// A lock, the record or the process list could not be read or written.
+    #[error("ownership I/O: {0}")]
+    Io(#[from] io::Error),
+    /// The worktree record is not valid JSON of the expected shape.
+    #[error("the worktree record is unreadable: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Git could not hash the work tree's path.
+    #[error("{0}")]
+    Git(#[from] SnapshotError),
+    /// `ps` could not list the processes.
+    #[error("cannot list processes: {0}")]
+    Ps(String),
+}
+
+fn holder_note(holder: Option<&str>) -> String {
+    holder.map_or_else(String::new, |run| format!(" (run {run})"))
+}
+
+/// The run lock and the work tree lock, both held. Dropping it releases them.
+#[derive(Debug)]
+pub struct Held {
+    _run: File,
+    _worktree: File,
+}
+
+/// Takes the locks for driving run `run`, whose ID is the name of its directory, on the work
+/// tree named by `worktree_hash` (see [`worktree_hash`]). The run lock goes first, then the
+/// work tree's, whose file then holds the run's ID so a refused run can name it. The run's log
+/// is never opened here.
+///
+/// # Errors
+///
+/// [`OwnershipError::RunBusy`] when another Octet drives the run;
+/// [`OwnershipError::WorktreeBusy`] when another run holds the work tree (the run lock is then
+/// released again); [`OwnershipError::Io`] otherwise.
+pub async fn lock(
+    data_dir: &Path,
+    run: &RunDir,
+    worktree_hash: &str,
+) -> Result<Held, OwnershipError> {
+    let run_id = run
+        .root
+        .file_name()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "the run directory has no name")
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let dir = worktrees_dir(data_dir);
+    create_private_dir(&dir).await?;
+    let run_file = open_lock(&run.root.join("lock"))?;
+    try_lock(&run_file).map_err(|e| e.unwrap_or(OwnershipError::RunBusy))?;
+    let path = dir.join(format!("{worktree_hash}.lock"));
+    let worktree_file = open_lock(&path)?;
+    try_lock(&worktree_file).map_err(|e| {
+        e.unwrap_or_else(|| OwnershipError::WorktreeBusy {
+            holder: read_holder(&path),
+        })
+    })?;
+    // Truncate and write after the lock is ours: a refused run reads the previous holder's name
+    // only while that holder still holds the lock.
+    worktree_file.set_len(0)?;
+    (&worktree_file).write_all(run_id.as_bytes())?;
+    worktree_file.sync_all()?;
+    Ok(Held {
+        _run: run_file,
+        _worktree: worktree_file,
+    })
+}
+
+/// Opens (creating, owner-only) a lock file without changing its contents.
+fn open_lock(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Tries the exclusive lock: `Err(None)` when someone else holds it.
+fn try_lock(file: &File) -> Result<(), Option<OwnershipError>> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(None),
+        Err(TryLockError::Error(e)) => Err(Some(e.into())),
+    }
+}
+
+/// The run ID the holder wrote into the lock file; `None` when it is absent or unreadable.
+fn read_holder(path: &Path) -> Option<String> {
+    let mut text = String::new();
+    File::open(path).ok()?.read_to_string(&mut text).ok()?;
+    let id = text.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+fn worktrees_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("fleet").join("worktrees")
+}
+
+/// The hash that names a work tree: git's hash of its canonical top-level path.
+///
+/// # Errors
+///
+/// [`OwnershipError::Io`] when `top` cannot be canonicalized; [`OwnershipError::Git`] when git
+/// cannot hash it.
+pub async fn worktree_hash(top: &Path) -> Result<String, OwnershipError> {
+    let canonical = tokio::fs::canonicalize(top).await?;
+    let cmd = command(&canonical, ["hash-object", "--stdin"]);
+    let out = exec(cmd, canonical.as_os_str().as_bytes()).await?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// The runs with unresolved ownership of one work tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeRecord {
+    /// Run ID to what the run has not resolved.
+    pub runs: BTreeMap<String, Unresolved>,
+}
+
+/// What one run has not resolved: its last write attempt and the processes registered for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unresolved {
+    /// The attempt that may still be writing.
+    pub attempt: AttemptId,
+    /// The processes registered for it, not yet shown to be gone.
+    pub identities: Vec<Identity>,
+}
+
+fn record_path(data_dir: &Path, hash: &str) -> PathBuf {
+    worktrees_dir(data_dir).join(format!("{hash}.json"))
+}
+
+/// Reads the work tree's record; a work tree with none has an empty one.
+///
+/// # Errors
+///
+/// [`OwnershipError::Io`] when the file cannot be read; [`OwnershipError::Json`] when it is not a
+/// record. An unparsable file is never taken for an empty one.
+pub async fn load(data_dir: &Path, hash: &str) -> Result<WorktreeRecord, OwnershipError> {
+    match tokio::fs::read(record_path(data_dir, hash)).await {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(WorktreeRecord::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Replaces the work tree's record, durably: written aside, synced, renamed over it, and the
+/// directory synced. `held` proves the work tree lock is ours; the record changes only under it.
+///
+/// # Errors
+///
+/// [`OwnershipError::Io`] or [`OwnershipError::Json`] when it cannot be written.
+pub async fn save(
+    _held: &Held,
+    data_dir: &Path,
+    hash: &str,
+    record: &WorktreeRecord,
+) -> Result<(), OwnershipError> {
+    let dir = worktrees_dir(data_dir);
+    create_private_dir(&dir).await?;
+    let path = record_path(data_dir, hash);
+    let tmp = dir.join(format!("{hash}.json.tmp"));
+    // A leftover from a crash would fail the exclusive create.
+    match tokio::fs::remove_file(&tmp).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut file = create_private(&tmp).await?;
+    file.write_all(&serde_json::to_vec_pretty(record)?).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&tmp, &path).await?;
+    sync_directory(&dir).await?;
+    Ok(())
+}
+
+/// Whether `driving` may write the work tree: no run other than it is listed.
+///
+/// # Errors
+///
+/// [`OwnershipError::OtherRunUnresolved`] naming the first other listed run.
+pub fn admit(record: &WorktreeRecord, driving: &str) -> Result<(), OwnershipError> {
+    match record.runs.keys().find(|run| run.as_str() != driving) {
+        Some(run) => Err(OwnershipError::OtherRunUnresolved { run: run.clone() }),
+        None => Ok(()),
+    }
+}
+
+/// One live process, as the platform lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessInfo {
+    /// The process ID.
+    pub pid: u32,
+    /// Its process group.
+    pub pgid: u32,
+    /// Its start time, in the form [`start_time`] reports and an [`Identity`] stores.
+    pub start: String,
+    /// The `OCTET_FLEET_ATTEMPT` value in its environment, if any.
+    pub marker: Option<String>,
+    /// Its command line.
+    pub command: String,
+}
+
+/// Lists every process the platform shows, with its environment marker where readable.
+///
+/// # Errors
+///
+/// [`OwnershipError::Ps`] when `ps` fails (macOS); [`OwnershipError::Io`] when `/proc` cannot be
+/// scanned (Linux).
+pub async fn list_processes() -> Result<Vec<ProcessInfo>, OwnershipError> {
+    platform::list().await
+}
+
+/// The start time of `pid` exactly as [`list_processes`] reports it; `None` when it is gone.
+pub async fn start_time(pid: u32) -> Option<String> {
+    platform::start(pid).await
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use tokio::process::Command;
+
+    use super::{MARKER_VAR, OwnershipError, ProcessInfo};
+
+    /// `ps` with the fixed-width-free `lstart` form `Www Mmm dd hh:mm:ss yyyy`.
+    fn ps() -> Command {
+        let mut cmd = Command::new("ps");
+        cmd.env("LC_ALL", "C").kill_on_drop(true);
+        cmd
+    }
+
+    pub(super) async fn list() -> Result<Vec<ProcessInfo>, OwnershipError> {
+        let out = ps()
+            .args(["-A", "-E", "-ww", "-o", "pid=,pgid=,lstart=,command="])
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Err(OwnershipError::Ps(format!(
+                "{}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(parse_line)
+            .collect())
+    }
+
+    pub(super) async fn start(pid: u32) -> Option<String> {
+        let out = ps()
+            .args(["-ww", "-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .await
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let start = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (out.status.success() && !start.is_empty()).then_some(start)
+    }
+
+    /// The value of `OCTET_FLEET_ATTEMPT=`, which `ps -E` appends to the command, among its
+    /// whitespace-separated tokens.
+    fn marker_in(text: &str) -> Option<String> {
+        let prefix = format!("{MARKER_VAR}=");
+        text.split_whitespace()
+            .find_map(|token| token.strip_prefix(prefix.as_str()))
+            .map(str::to_string)
+    }
+
+    /// Takes the next whitespace-delimited token off `rest`.
+    fn token<'a>(rest: &mut &'a str) -> Option<&'a str> {
+        let trimmed = rest.trim_start();
+        let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        if end == 0 {
+            return None;
+        }
+        let (token, tail) = trimmed.split_at(end);
+        *rest = tail;
+        Some(token)
+    }
+
+    /// One `pid pgid Www Mmm dd hh:mm:ss yyyy command…` line.
+    pub(super) fn parse_line(line: &str) -> Option<ProcessInfo> {
+        let mut rest = line;
+        let pid = token(&mut rest)?.parse().ok()?;
+        let pgid = token(&mut rest)?.parse().ok()?;
+        let mut start = Vec::with_capacity(5);
+        for _ in 0..5 {
+            start.push(token(&mut rest)?);
+        }
+        let command = rest.trim().to_string();
+        Some(ProcessInfo {
+            pid,
+            pgid,
+            start: start.join(" "),
+            marker: marker_in(&command),
+            command,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::fs;
+
+    use super::{MARKER_VAR, OwnershipError, ProcessInfo};
+
+    pub(super) async fn list() -> Result<Vec<ProcessInfo>, OwnershipError> {
+        tokio::task::spawn_blocking(scan)
+            .await
+            .map_err(|e| OwnershipError::Ps(e.to_string()))?
+    }
+
+    pub(super) async fn start(pid: u32) -> Option<String> {
+        tokio::task::spawn_blocking(move || stat(pid).map(|(_, start)| start))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn scan() -> Result<Vec<ProcessInfo>, OwnershipError> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir("/proc")? {
+            let Ok(entry) = entry else { continue };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            // A process that vanished or hides itself mid-scan is skipped.
+            if let Some(info) = read_process(pid) {
+                found.push(info);
+            }
+        }
+        Ok(found)
+    }
+
+    fn read_process(pid: u32) -> Option<ProcessInfo> {
+        let (pgid, start) = stat(pid)?;
+        let marker = fs::read(format!("/proc/{pid}/environ"))
+            .ok()
+            .and_then(|environ| marker_in(&environ));
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        Some(ProcessInfo {
+            pid,
+            pgid,
+            start,
+            marker,
+            command: command_text(&cmdline),
+        })
+    }
+
+    /// The group and start time (clock ticks since boot, as decimal text) from `/proc/<pid>/stat`.
+    fn stat(pid: u32) -> Option<(u32, String)> {
+        parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    }
+
+    /// Fields after the last `)` (the command name may hold anything): the state is field 3, so
+    /// the group, field 5, is the third and the start time, field 22, the twentieth.
+    pub(super) fn parse_stat(stat: &str) -> Option<(u32, String)> {
+        let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+        Some((fields.get(2)?.parse().ok()?, (*fields.get(19)?).to_string()))
+    }
+
+    /// The value of `OCTET_FLEET_ATTEMPT=` in a NUL-separated environment.
+    pub(super) fn marker_in(environ: &[u8]) -> Option<String> {
+        let prefix = format!("{MARKER_VAR}=");
+        environ
+            .split(|byte| *byte == 0)
+            .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+    }
+
+    /// A NUL-separated command line as text.
+    pub(super) fn command_text(cmdline: &[u8]) -> String {
+        let text = String::from_utf8_lossy(cmdline);
+        text.trim_end_matches('\0').replace('\0', " ")
+    }
+}
+
+/// Which live processes are the attempt's: `Verified` when any carries `attempt_marker` or
+/// matches a `registered` identity, else `Unverified` when any is in one of the registered
+/// `groups`, else `Clear`. Octet's own process and the `released` PIDs are never counted. The
+/// PIDs are sorted.
+pub fn check(
+    processes: &[ProcessInfo],
+    attempt_marker: &str,
+    registered: &[Identity],
+    groups: &[u32],
+    released: &[u32],
+) -> ProcessCheck {
+    let own = std::process::id();
+    let mut verified = Vec::new();
+    let mut unverified = Vec::new();
+    for process in processes {
+        if process.pid == own || released.contains(&process.pid) {
+            continue;
+        }
+        let known = registered
+            .iter()
+            .any(|identity| identity.pid == process.pid && identity.start == process.start);
+        if process.marker.as_deref() == Some(attempt_marker) || known {
+            verified.push(process.pid);
+        } else if groups.contains(&process.pgid) {
+            unverified.push(process.pid);
+        }
+    }
+    for pids in [&mut verified, &mut unverified] {
+        pids.sort_unstable();
+        pids.dedup();
+    }
+    if !verified.is_empty() {
+        ProcessCheck::Verified(verified)
+    } else if !unverified.is_empty() {
+        ProcessCheck::Unverified(unverified)
+    } else {
+        ProcessCheck::Clear
+    }
+}
+
+/// Stops `pids`, which the caller verified as the run's: SIGTERM, then SIGKILL for those still
+/// alive after five seconds. Returns the PIDs still alive after that (a process killed by SIGKILL that
+/// is a zombie awaiting its parent counts as alive); the caller re-lists and checks again. A PID
+/// that exited and was reused between the caller's listing and this call would be signalled, a
+/// window the caller keeps short by checking just before.
+pub async fn kill_verified(pids: &[u32]) -> Vec<u32> {
+    for pid in pids {
+        octet_proc::signal::terminate(*pid);
+    }
+    wait_gone(pids, TERM_GRACE).await;
+    for pid in pids {
+        if octet_proc::signal::alive(*pid) {
+            octet_proc::signal::kill(*pid);
+        }
+    }
+    wait_gone(pids, KILL_GRACE).await
+}
+
+/// Waits up to `limit` for all of `pids` to be gone; those that are not.
+async fn wait_gone(pids: &[u32], limit: Duration) -> Vec<u32> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let alive: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| octet_proc::signal::alive(*pid))
+            .collect();
+        if alive.is_empty() || Instant::now() >= deadline {
+            return alive;
+        }
+        tokio::time::sleep(LOOK).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use octet_testkit::TempDir;
+
+    use super::*;
+    use crate::store::RunDir;
+
+    /// What a helper process does; see [`helper_process`].
+    const HELPER_VAR: &str = "OCTET_OWNERSHIP_HELPER";
+
+    /// The test binary run again as a helper. Not `sh` and `sleep`: on macOS `ps` does not show
+    /// the environment of Apple's own binaries, only of the likes of this one.
+    fn helper(mode: &str, marker: Option<&str>) -> Command {
+        let mut cmd = Command::new(std::env::current_exe().expect("the test binary"));
+        cmd.args(["--exact", "ownership::tests::helper_process", "--nocapture"])
+            .env(HELPER_VAR, mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match marker {
+            Some(marker) => cmd.env(MARKER_VAR, marker),
+            None => cmd.env_remove(MARKER_VAR),
+        };
+        cmd
+    }
+
+    /// Not a test: the body of the processes the tests start. `sleep` waits; `parent` starts an
+    /// unmarked `sleep` helper in its own process group and waits for it.
+    #[test]
+    fn helper_process() {
+        match std::env::var(HELPER_VAR).as_deref() {
+            Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
+            Ok("parent") => {
+                let _ = helper("sleep", None)
+                    .spawn()
+                    .and_then(|mut child| child.wait());
+            }
+            _ => {}
+        }
+    }
+
+    /// Starts helpers, marked with a marker or with none, and kills and reaps whatever it
+    /// started when dropped, even when a test fails.
+    #[derive(Default)]
+    struct Kids {
+        children: Vec<Child>,
+        pids: Vec<u32>,
+    }
+
+    impl Kids {
+        /// Starts a helper in `mode`; `own_group` makes it lead a new process group.
+        fn spawn(&mut self, mode: &str, marker: Option<&str>, own_group: bool) -> u32 {
+            let mut cmd = helper(mode, marker);
+            if own_group {
+                std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+            }
+            let child = cmd.spawn().expect("the helper starts");
+            let pid = child.id();
+            self.children.push(child);
+            self.pids.push(pid);
+            pid
+        }
+    }
+
+    impl Drop for Kids {
+        fn drop(&mut self) {
+            for pid in &self.pids {
+                octet_proc::signal::kill(*pid);
+            }
+            for child in &mut self.children {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Lists processes until `ready` accepts the list: a child is visible only once it exists.
+    async fn list_until(ready: impl Fn(&[ProcessInfo]) -> bool) -> Vec<ProcessInfo> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let list = list_processes().await.expect("the process list");
+            if ready(&list) {
+                return list;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the expected processes never appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn has_marker(list: &[ProcessInfo], pid: u32, marker: &str) -> bool {
+        list.iter()
+            .any(|p| p.pid == pid && p.marker.as_deref() == Some(marker))
+    }
+
+    /// A run directory with a `run.json`-less root: the lock needs only the directory.
+    fn run_dir(data: &Path, id: &str) -> RunDir {
+        let root = data.join("fleet").join(id);
+        std::fs::create_dir_all(&root).expect("run dir");
+        RunDir { root }
+    }
+
+    fn unresolved(attempt: u32) -> Unresolved {
+        Unresolved {
+            attempt: AttemptId(attempt),
+            identities: vec![Identity {
+                pid: 7,
+                start: "s".into(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_driver_is_refused() {
+        let data = TempDir::new("ownership-driver");
+        let run = run_dir(data.path(), "r1");
+        let log = run.root.join("log.jsonl");
+        std::fs::write(&log, b"{\"kind\":\"x\"}\n").expect("log");
+        let before = std::fs::metadata(&log)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        let held = lock(data.path(), &run, "aaaa").await.expect("first lock");
+        let second = lock(data.path(), &run, "bbbb").await;
+        assert!(matches!(second, Err(OwnershipError::RunBusy)), "{second:?}");
+        let meta = std::fs::metadata(&log).expect("meta");
+        assert_eq!(std::fs::read(&log).expect("log"), b"{\"kind\":\"x\"}\n");
+        assert_eq!(meta.modified().expect("mtime"), before);
+        drop(held);
+        lock(data.path(), &run, "aaaa")
+            .await
+            .expect("free once dropped");
+    }
+
+    #[tokio::test]
+    async fn the_locks_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = TempDir::new("ownership-modes");
+        let run = run_dir(data.path(), "r1");
+        let _held = lock(data.path(), &run, "aaaa").await.expect("lock");
+        for path in [
+            run.root.join("lock"),
+            data.path().join("fleet/worktrees/aaaa.lock"),
+        ] {
+            let mode = std::fs::metadata(&path)
+                .expect("lock file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", path.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_run_on_the_worktree_is_refused() {
+        let data = TempDir::new("ownership-worktree");
+        let first = run_dir(data.path(), "r1");
+        let second = run_dir(data.path(), "r2");
+        let held = lock(data.path(), &first, "aaaa").await.expect("first");
+        let refused = lock(data.path(), &second, "aaaa").await;
+        match refused {
+            Err(OwnershipError::WorktreeBusy { holder }) => {
+                assert_eq!(holder.as_deref(), Some("r1"));
+            }
+            other => panic!("expected WorktreeBusy, got {other:?}"),
+        }
+        // The refused run's own lock was released again, and another work tree is free.
+        let other_tree = lock(data.path(), &second, "bbbb")
+            .await
+            .expect("other tree");
+        drop(other_tree);
+        drop(held);
+        lock(data.path(), &second, "aaaa")
+            .await
+            .expect("free once dropped");
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_wrote_nothing_is_unnamed() {
+        let data = TempDir::new("ownership-unnamed");
+        let first = run_dir(data.path(), "r1");
+        let second = run_dir(data.path(), "r2");
+        let held = lock(data.path(), &first, "aaaa").await.expect("first");
+        std::fs::write(data.path().join("fleet/worktrees/aaaa.lock"), b"").expect("empty it");
+        let refused = lock(data.path(), &second, "aaaa").await;
+        assert!(
+            matches!(refused, Err(OwnershipError::WorktreeBusy { holder: None })),
+            "{refused:?}"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn the_record_round_trips_and_a_missing_one_is_empty() {
+        let data = TempDir::new("ownership-record");
+        let run = run_dir(data.path(), "r1");
+        let held = lock(data.path(), &run, "aaaa").await.expect("lock");
+        assert_eq!(
+            load(data.path(), "aaaa").await.expect("missing"),
+            WorktreeRecord::default()
+        );
+        let record = WorktreeRecord {
+            runs: BTreeMap::from([("r1".to_string(), unresolved(3))]),
+        };
+        save(&held, data.path(), "aaaa", &record)
+            .await
+            .expect("save");
+        assert_eq!(load(data.path(), "aaaa").await.expect("load"), record);
+        assert!(!data.path().join("fleet/worktrees/aaaa.json.tmp").exists());
+        save(&held, data.path(), "aaaa", &WorktreeRecord::default())
+            .await
+            .expect("save again");
+        assert_eq!(
+            load(data.path(), "aaaa").await.expect("load"),
+            WorktreeRecord::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_record_is_an_error_not_an_empty_one() {
+        let data = TempDir::new("ownership-corrupt");
+        let dir = data.path().join("fleet/worktrees");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("aaaa.json"), b"{not json").expect("write");
+        let loaded = load(data.path(), "aaaa").await;
+        assert!(matches!(loaded, Err(OwnershipError::Json(_))), "{loaded:?}");
+    }
+
+    #[tokio::test]
+    async fn the_worktree_hash_names_the_canonical_path() {
+        let data = TempDir::new("ownership-hash");
+        let tree = data.path().join("tree");
+        std::fs::create_dir_all(tree.join("sub")).expect("dirs");
+        let plain = worktree_hash(&tree).await.expect("hash");
+        assert_eq!(plain.len(), 40, "{plain}");
+        let roundabout = tree.join("sub").join("..");
+        assert_eq!(worktree_hash(&roundabout).await.expect("hash"), plain);
+        let other = worktree_hash(&tree.join("sub")).await.expect("hash");
+        assert_ne!(other, plain);
+        let missing = worktree_hash(&tree.join("absent")).await;
+        assert!(matches!(missing, Err(OwnershipError::Io(_))), "{missing:?}");
+    }
+
+    #[test]
+    fn admit_refuses_while_another_run_is_listed() {
+        let mut record = WorktreeRecord::default();
+        assert!(admit(&record, "r2").is_ok(), "an empty record admits");
+        record.runs.insert("r2".into(), unresolved(0));
+        assert!(
+            admit(&record, "r2").is_ok(),
+            "the run itself does not block itself"
+        );
+        record.runs.insert("r9".into(), unresolved(1));
+        record.runs.insert("r5".into(), unresolved(1));
+        match admit(&record, "r2") {
+            Err(OwnershipError::OtherRunUnresolved { run }) => assert_eq!(run, "r5"),
+            other => panic!("expected OtherRunUnresolved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_marked_child_is_verified() {
+        let mut kids = Kids::default();
+        let marker = "run-marked/0";
+        let pid = kids.spawn("sleep", Some(marker), false);
+        let list = list_until(|l| has_marker(l, pid, marker)).await;
+        assert_eq!(
+            check(&list, marker, &[], &[], &[]),
+            ProcessCheck::Verified(vec![pid])
+        );
+        // Another attempt's marker does not claim it, and it is in no registered group.
+        assert_eq!(
+            check(&list, "run-marked/1", &[], &[], &[]),
+            ProcessCheck::Clear
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matching_identity_is_verified() {
+        let mut kids = Kids::default();
+        let pid = kids.spawn("sleep", None, false);
+        let list = list_until(|l| l.iter().any(|p| p.pid == pid)).await;
+        let start = start_time(pid).await.expect("start time");
+        let identity = Identity { pid, start };
+        let marker = "run-identity/0";
+        assert_eq!(
+            check(&list, marker, std::slice::from_ref(&identity), &[], &[]),
+            ProcessCheck::Verified(vec![pid])
+        );
+        // The same PID with another start time is a reused PID, not the run's.
+        let reused = Identity {
+            pid,
+            start: format!("{}x", identity.start),
+        };
+        assert_eq!(
+            check(&list, marker, &[reused], &[], &[]),
+            ProcessCheck::Clear
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmarked_group_member_is_unverified() {
+        let mut kids = Kids::default();
+        let marker = "run-group/0";
+        // The parent is marked and leads its own group; the sleeper it starts has no marker.
+        let leader = kids.spawn("parent", Some(marker), true);
+        let group = leader;
+        let list = list_until(|l| {
+            has_marker(l, leader, marker)
+                && l.iter()
+                    .any(|p| p.pgid == group && p.pid != leader && p.marker.is_none())
+        })
+        .await;
+        let member = list
+            .iter()
+            .find(|p| p.pgid == group && p.pid != leader && p.marker.is_none())
+            .map(|p| p.pid)
+            .expect("the member");
+        kids.pids.push(member);
+        assert!(list.iter().any(|p| p.pid == member && p.marker.is_none()));
+        // The marked leader is verified, and verified wins over unverified.
+        assert_eq!(
+            check(&list, marker, &[], &[group], &[]),
+            ProcessCheck::Verified(vec![leader])
+        );
+        // With the leader released, the unmarked member is all that is left.
+        assert_eq!(
+            check(&list, marker, &[], &[group], &[leader]),
+            ProcessCheck::Unverified(vec![member])
+        );
+        // Without the registered group the member is nobody's business.
+        assert_eq!(
+            check(&list, marker, &[], &[], &[leader]),
+            ProcessCheck::Clear
+        );
+    }
+
+    #[tokio::test]
+    async fn released_pids_are_ignored() {
+        let mut kids = Kids::default();
+        let marker = "run-released/0";
+        let pid = kids.spawn("sleep", Some(marker), false);
+        let list = list_until(|l| has_marker(l, pid, marker)).await;
+        assert_eq!(check(&list, marker, &[], &[], &[pid]), ProcessCheck::Clear);
+        assert_eq!(
+            check(&list, marker, &[], &[], &[pid + 1]),
+            ProcessCheck::Verified(vec![pid])
+        );
+    }
+
+    #[test]
+    fn octet_itself_is_never_listed_as_the_runs() {
+        let own = ProcessInfo {
+            pid: std::process::id(),
+            pgid: 5,
+            start: "s".into(),
+            marker: Some("m".into()),
+            command: "octet".into(),
+        };
+        assert_eq!(check(&[own], "m", &[], &[5], &[]), ProcessCheck::Clear);
+    }
+
+    #[tokio::test]
+    async fn kill_verified_kills_only_those() {
+        let mut kids = Kids::default();
+        let marker = "run-kill/0";
+        let marked = kids.spawn("sleep", Some(marker), false);
+        let bystander = kids.spawn("sleep", None, false);
+        let list =
+            list_until(|l| has_marker(l, marked, marker) && l.iter().any(|p| p.pid == bystander))
+                .await;
+        let ProcessCheck::Verified(pids) = check(&list, marker, &[], &[], &[]) else {
+            panic!("the marked child is verified");
+        };
+        assert_eq!(pids, vec![marked]);
+        // A dead child stays a zombie, which still counts as alive, until its parent reaps it.
+        let reaper = kids.children.remove(0);
+        let reaped = tokio::task::spawn_blocking(move || {
+            let mut reaper = reaper;
+            reaper.wait().expect("reap")
+        });
+        let survivors = kill_verified(&pids).await;
+        assert!(survivors.is_empty(), "{survivors:?}");
+        assert!(!reaped.await.expect("join").success());
+        assert!(
+            octet_proc::signal::alive(bystander),
+            "the bystander was not signalled"
+        );
+        // The reaped child is out of `kids`, whose drop reaps only the bystander.
+        kids.pids.retain(|pid| *pid != marked);
+    }
+
+    #[tokio::test]
+    async fn start_time_agrees_with_the_listing() {
+        let mut kids = Kids::default();
+        let pid = kids.spawn("sleep", None, false);
+        let list = list_until(|l| l.iter().any(|p| p.pid == pid)).await;
+        let listed = list.iter().find(|p| p.pid == pid).expect("listed");
+        assert_eq!(
+            start_time(pid).await.as_deref(),
+            Some(listed.start.as_str())
+        );
+        assert!(!listed.start.is_empty());
+        assert!(
+            listed.command.contains("helper_process"),
+            "{}",
+            listed.command
+        );
+        assert_eq!(start_time(u32::MAX).await, None);
+    }
+}

@@ -5,6 +5,7 @@
 pub mod contract;
 pub mod definition;
 pub mod machine;
+pub mod ownership;
 pub mod record;
 pub mod recover;
 pub mod snapshot;

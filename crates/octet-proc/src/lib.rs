@@ -3,6 +3,7 @@
 compile_error!("Octet supports Linux and macOS only");
 
 mod group;
+pub mod signal;
 pub use group::GroupLeader;
 
 use serde_json::Value;
