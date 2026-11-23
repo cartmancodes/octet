@@ -4,6 +4,8 @@
 
 pub mod contract;
 pub mod definition;
+pub mod evidence;
+pub mod gate;
 pub mod machine;
 pub mod ownership;
 pub mod record;
