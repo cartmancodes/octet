@@ -340,6 +340,12 @@ pub async fn start_time(pid: u32) -> Option<String> {
     platform::start(pid).await
 }
 
+/// The command line of `pid`, without its environment, as a pause lists it; `None` when it is
+/// gone or cannot be read.
+pub async fn command_of(pid: u32) -> Option<String> {
+    platform::command(pid).await
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use tokio::process::Command;
@@ -380,6 +386,16 @@ mod platform {
         let text = String::from_utf8_lossy(&out.stdout);
         let start = text.split_whitespace().collect::<Vec<_>>().join(" ");
         (out.status.success() && !start.is_empty()).then_some(start)
+    }
+
+    pub(super) async fn command(pid: u32) -> Option<String> {
+        let out = ps()
+            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .await
+            .ok()?;
+        let command = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !command.is_empty()).then_some(command)
     }
 
     /// The value of `OCTET_FLEET_ATTEMPT=`, which `ps -E` appends to the command, among its
@@ -442,6 +458,17 @@ mod platform {
             .await
             .ok()
             .flatten()
+    }
+
+    pub(super) async fn command(pid: u32) -> Option<String> {
+        tokio::task::spawn_blocking(move || {
+            let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+            let command = command_text(&cmdline);
+            (!command.is_empty()).then_some(command)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     fn scan() -> Result<Vec<ProcessInfo>, OwnershipError> {
@@ -1179,6 +1206,17 @@ mod tests {
         );
         // The reaped child is out of `kids`, whose drop reaps only the bystander.
         kids.pids.retain(|pid| *pid != marked);
+    }
+
+    #[tokio::test]
+    async fn a_command_line_comes_without_the_environment() {
+        let mut kids = Kids::default();
+        let pid = kids.spawn("sleep", Some("run/0"), false);
+        list_until(|l| l.iter().any(|p| p.pid == pid)).await;
+        let command = command_of(pid).await.expect("its command line");
+        assert!(command.contains("helper_process"), "{command}");
+        assert!(!command.contains(MARKER_VAR), "{command}");
+        assert_eq!(command_of(u32::MAX).await, None);
     }
 
     #[tokio::test]

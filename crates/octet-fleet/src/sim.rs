@@ -201,6 +201,7 @@ impl Sim<'_> {
             live_tree: self.tree.clone(),
             go_created: self.go_created,
             processes: ProcessCheck::Clear,
+            commands: BTreeMap::new(),
         });
     }
 

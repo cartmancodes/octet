@@ -480,10 +480,19 @@ impl Driver {
             .leftovers(view)
             .await
             .map_err(|error| format!("cannot check the run's processes: {error}"))?;
+        let mut commands = std::collections::BTreeMap::new();
+        if let ProcessCheck::Unverified(pids) = &processes {
+            for &pid in pids {
+                if let Some(command) = ownership::command_of(pid).await {
+                    commands.insert(pid, command);
+                }
+            }
+        }
         Ok(Observation {
             live_tree,
             go_created,
             processes,
+            commands,
         })
     }
 

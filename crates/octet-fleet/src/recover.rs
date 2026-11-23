@@ -7,6 +7,9 @@
 //! to a pause the user has decided on, and otherwise falls through to
 //! [`machine::next`].
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
 use crate::definition::Kind;
 use crate::machine::{self, Dispatch, Next};
 use crate::record::{AttemptId, Decision, Failure, PauseReason};
@@ -23,6 +26,9 @@ pub struct Observation {
     pub go_created: bool,
     /// The leftover processes of unfinished attempts.
     pub processes: ProcessCheck,
+    /// The command line of each unverified process, for the pause that lists
+    /// them; a PID missing here is listed without one.
+    pub commands: BTreeMap<u32, String>,
 }
 
 /// The leftover processes found (spec, "Leftover processes").
@@ -73,7 +79,7 @@ pub fn recover(def: &Resolved, state: &RunState, obs: &Observation) -> Next {
     if state.completed || state.stopped || state.failed.is_some() {
         return machine::next(def, state);
     }
-    if let Some(pause) = leftover_processes(state, &obs.processes) {
+    if let Some(pause) = leftover_processes(state, &obs.processes, &obs.commands) {
         return pause;
     }
     let decision = state.decisions_since_pause.last();
@@ -105,8 +111,14 @@ pub fn recover(def: &Resolved, state: &RunState, obs: &Observation) -> Next {
     found(def, state, obs)
 }
 
-/// Verified processes alive, or unverified ones the user has not released.
-fn leftover_processes(state: &RunState, check: &ProcessCheck) -> Option<Next> {
+/// Verified processes alive, or unverified ones the user has not released;
+/// the unverified are listed each with its command (spec, "Leftover
+/// processes").
+fn leftover_processes(
+    state: &RunState,
+    check: &ProcessCheck,
+    commands: &BTreeMap<u32, String>,
+) -> Option<Next> {
     match check {
         ProcessCheck::Clear => None,
         ProcessCheck::Verified(pids) => (!pids.is_empty()).then(|| {
@@ -122,10 +134,14 @@ fn leftover_processes(state: &RunState, check: &ProcessCheck) -> Option<Next> {
                 .filter(|pid| !state.released_pids.contains(pid))
                 .collect();
             (!left.is_empty()).then(|| {
-                Next::Pause(
-                    PauseReason::ProcessesUnverified,
-                    format!("processes that may be the run's are alive: {left:?}"),
-                )
+                let mut detail = format!("processes that may be the run's are alive: {left:?}");
+                for pid in &left {
+                    let command = commands
+                        .get(pid)
+                        .map_or("(command unknown)", String::as_str);
+                    let _ = write!(detail, "\n  {pid}: {command}");
+                }
+                Next::Pause(PauseReason::ProcessesUnverified, detail)
             })
         }
     }
@@ -470,6 +486,7 @@ mod tests {
             live_tree: tree.into(),
             go_created,
             processes: ProcessCheck::Clear,
+            commands: BTreeMap::new(),
         }
     }
 
@@ -747,6 +764,30 @@ mod tests {
             case.decide(Decision::Release { pids: vec![44] });
             assert_eq!(case.recover(&unverified), row);
         }
+    }
+
+    #[test]
+    fn an_unverified_pause_lists_each_process_with_its_command() {
+        let (mut case, clear) = rows().remove(0);
+        let obs = Observation {
+            processes: ProcessCheck::Unverified(vec![43, 44]),
+            commands: BTreeMap::from([(43, "sleep 60".to_owned()), (44, "make test".to_owned())]),
+            ..clear
+        };
+        let Next::Pause(PauseReason::ProcessesUnverified, detail) = case.recover(&obs) else {
+            panic!("not an unverified pause");
+        };
+        assert!(detail.contains("[43, 44]"), "{detail}");
+        assert!(detail.contains("43: sleep 60"), "{detail}");
+        assert!(detail.contains("44: make test"), "{detail}");
+        // A released process is not listed.
+        case.pause(PauseReason::ProcessesUnverified);
+        case.decide(Decision::Release { pids: vec![43] });
+        let Next::Pause(_, detail) = case.recover(&obs) else {
+            panic!("not a pause");
+        };
+        assert!(!detail.contains("sleep 60"), "{detail}");
+        assert!(detail.contains("44: make test"), "{detail}");
     }
 
     #[test]
