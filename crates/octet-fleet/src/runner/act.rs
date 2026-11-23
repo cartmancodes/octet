@@ -75,7 +75,7 @@ impl Driver {
         .await;
         let flow = self.turn(view, step, &dispatch, attempt, kept).await;
         if !step.read_only() {
-            self.own(attempt).await?;
+            self.settle(attempt).await?;
         }
         flow
     }
@@ -631,7 +631,7 @@ impl Driver {
                 Some(candidate),
             )
             .await;
-        self.own(attempt).await?;
+        self.settle(attempt).await?;
         flow
     }
 

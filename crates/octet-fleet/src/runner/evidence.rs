@@ -210,7 +210,9 @@ impl Driver {
                         tree,
                         results: results.iter().map(CommandBody::from).collect(),
                     };
-                    return self.record_evidence(attempt, step, requires, body).await;
+                    let flow = self.record_evidence(attempt, step, requires, body).await?;
+                    self.settle(attempt).await?;
+                    return Ok(flow);
                 }
                 EvidenceOutcome::Changed {
                     tree: observed,

@@ -725,6 +725,40 @@ impl Driver {
         Ok(())
     }
 
+    /// Updates this run's claim on the work tree when write attempt
+    /// `attempt` has ended. Accepted, with none of its processes alive, it
+    /// leaves nothing unresolved (spec, "The worktree ownership record"): the
+    /// run is dropped from the record, so a run paused between attempts does
+    /// not hold the work tree. Otherwise the claim names the attempt and the
+    /// identities registered for it.
+    async fn settle(&self, attempt: AttemptId) -> Result<(), RunnerError> {
+        let view = self.load().await?;
+        let accepted = view
+            .state
+            .attempts
+            .get(&attempt)
+            .is_some_and(|info| info.state == AttemptState::Finished);
+        if accepted && self.gone(&view.records, attempt).await? {
+            return self.disown().await;
+        }
+        self.own(attempt).await
+    }
+
+    /// Whether no process of `attempt` is alive: none carries its marker,
+    /// matches an identity registered for it, or is in a registered group.
+    /// An unreadable registry is not known to be empty.
+    async fn gone(&self, records: &[Record], attempt: AttemptId) -> Result<bool, RunnerError> {
+        let Ok(registry) = gate::read_processes(&self.attempt_dir(attempt)).await else {
+            return Ok(false);
+        };
+        let identities = identities_of(records, attempt);
+        let mut groups: Vec<u32> = identities.iter().map(|identity| identity.pid).collect();
+        groups.extend(registry);
+        let processes = ownership::list_processes().await?;
+        let check = ownership::check(&processes, &self.marker(attempt), &identities, &groups, &[]);
+        Ok(check == ProcessCheck::Clear)
+    }
+
     /// Removes this run from the work tree's ownership record.
     async fn disown(&self) -> Result<(), RunnerError> {
         let mut record = ownership::load(&self.data_dir, &self.hash).await?;

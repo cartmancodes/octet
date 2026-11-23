@@ -920,3 +920,48 @@ async fn round_limit_continue() {
     assert_eq!(end, RunEnd::Completed);
     assert_eq!(bench.attempts_of("research").await, 3);
 }
+
+/// The runs the work tree's ownership record lists.
+fn listed(data: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(data.join("fleet").join("worktrees")) else {
+        return Vec::new();
+    };
+    let mut runs = Vec::new();
+    for entry in entries.flatten() {
+        if entry.path().extension().is_some_and(|ext| ext == "json") {
+            let record: Value =
+                serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+            runs.extend(record["runs"].as_object().unwrap().keys().cloned());
+        }
+    }
+    runs
+}
+
+#[tokio::test]
+async fn a_run_paused_between_attempts_holds_no_claim_on_the_work_tree() {
+    // The tests fail; sent back, the coder changes nothing: a stall, with
+    // every write attempt finished.
+    let mut turns = small_turns();
+    turns["implement#2"] = json!({"reply": "Nothing to change."});
+    let bench = Bench::new(&turns);
+    let workflow = bench.workflow(SMALL, &["test -f absent.txt"]);
+    let Io {
+        runner: io, events, ..
+    } = channels();
+    let (end, _) = patiently(start(bench.start(workflow.clone()), io), events, |_| {}).await;
+    assert_eq!(end, RunEnd::Paused(PauseReason::Stalled));
+    assert!(bench.attempts_of("implement").await >= 2);
+    assert_eq!(listed(&bench.data), Vec::<String>::new());
+    // So another run may write the work tree.
+    let Io {
+        runner: io, events, ..
+    } = channels();
+    let (end, _) = patiently(start(bench.start(workflow), io), events, |_| {}).await;
+    assert_eq!(end, RunEnd::Paused(PauseReason::Stalled));
+}
+
+#[tokio::test]
+async fn an_unfinished_write_attempt_keeps_its_claim_on_the_work_tree() {
+    let bench = reconciling(json!({"reply": "Finished."})).await;
+    assert_eq!(listed(&bench.data), [bench.run_id().await]);
+}
