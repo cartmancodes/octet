@@ -158,7 +158,8 @@ task, the artifacts the step builds on and, for verdicts, the reply format.
 
 ### Steps
 
-Every step has an `id` (letters, digits, `_` and `-`), a `role` and a `profile`. What else it
+Every step has an `id` (one or more ASCII letters, digits, `_` and `-`; anything else, such as
+`review/plan`, is refused at validation), a `role` and a `profile`. What else it
 takes depends on its role's kind:
 
 | Kind | Keys (required) | Produces | Accepted outcomes |
@@ -197,7 +198,7 @@ commands run; Octet never runs a command a model proposes as evidence.
 `octet fleet validate` is static: it starts no vendor and runs no command. A run refuses to start
 unless:
 
-- `version` is 1; step IDs are unique; every role, profile and reference resolves to an
+- `version` is 1; step IDs are unique and only letters, digits, `_` and `-`; every role, profile and reference resolves to an
   **earlier** step of the right kind; any spelled edge names the producer; every engine is known,
   its binary is found, `effort` is one the engine takes, and `mode` is a mode.
 - **The approval gate**: every `inputs` entry names a document step and an `approval_from`

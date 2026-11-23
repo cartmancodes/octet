@@ -238,6 +238,12 @@ pub enum ValidationError {
         /// The version found.
         found: u32,
     },
+    /// A step ID is empty or has a character other than an ASCII letter, a
+    /// digit, `_` or `-` (IDs name findings, log keys and prompt headers).
+    BadStepId {
+        /// The ID.
+        id: String,
+    },
     /// A step ID is used twice.
     DuplicateStep {
         /// The repeated ID.
@@ -392,6 +398,10 @@ impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Version { found } => write!(f, "version: must be 1, found {found}"),
+            Self::BadStepId { id } => write!(
+                f,
+                "step {id:?}: an id must be one or more letters, digits, `_` and `-` (ASCII)"
+            ),
             Self::DuplicateStep { id } => write!(f, "step {id}: id is used more than once"),
             Self::UnknownRole { step, role } => {
                 write!(f, "step {step}: role {role} is not defined")
@@ -484,6 +494,16 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+/// A step ID is one or more ASCII letters, digits, `_` and `-`: it becomes
+/// part of finding IDs (`<step>/F1`), log keys and prompt headers, so a `/`,
+/// a space or a bracket could make one step's findings look like another's.
+fn valid_step_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Checks `workflow` statically and resolves it.
 ///
 /// # Errors
@@ -509,6 +529,11 @@ pub fn validate(workflow: &Workflow, host: &dyn Host) -> Result<Resolved, Vec<Va
         .collect();
     let mut ids: BTreeMap<&str, usize> = BTreeMap::new();
     for (index, step) in workflow.steps.iter().enumerate() {
+        if !valid_step_id(&step.id) {
+            errors.push(ValidationError::BadStepId {
+                id: step.id.clone(),
+            });
+        }
         if ids.insert(step.id.as_str(), index).is_some() {
             errors.push(ValidationError::DuplicateStep {
                 id: step.id.clone(),
@@ -1301,6 +1326,29 @@ steps:
             e,
             ValidationError::Missing { step, key } if step == "test" && key == "commands"
         )));
+    }
+
+    #[test]
+    fn step_ids_are_letters_digits_underscores_and_dashes() {
+        for bad in ["review/plan", "", "a b", "x]", "naïve", "two\\nlines"] {
+            let found = errors(custom(&format!(
+                "{MINIMAL_STEPS}  - {{ id: \"{bad}\", role: doc, profile: p }}\n"
+            )));
+            assert!(
+                found.iter().any(|e| matches!(
+                    e,
+                    ValidationError::BadStepId { id } if id == &bad.replace("\\n", "\n")
+                )),
+                "{bad:?}: {found:?}"
+            );
+            let text = found
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("letters, digits, `_` and `-`"), "{text}");
+        }
+        assert!(custom(&MINIMAL_STEPS.replace("research", "Re-search_2")).is_ok());
     }
 
     #[test]
