@@ -2,9 +2,9 @@
 //! does next (retry, fail the run, or pause).
 //!
 //! [`classify`] matches the error text a session reported against a table of
-//! known texts, per provider or for every one. The table starts with the
-//! fake vendors' fixture texts and the texts Octet itself writes; Task 18
-//! extends it with the real vendors' error texts as they are collected.
+//! known texts, per provider or for every one: the texts Octet itself writes,
+//! the real vendors' error texts seen so far (each a test case naming where
+//! it was seen), and the fake vendors' fixture texts.
 
 /// What kind of failure ended a turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,14 +64,25 @@ const TABLE: &[Row] = &[
     // Octet's session pump (octet-core): the journal or a stalled consumer.
     any("storage failure:", Kind::Local),
     any("did not keep up with the vendor", Kind::Local),
-    // Octet could not start the CLI (octet-engine's driver).
-    any("cannot start ", Kind::Config),
+    // Octet could not start the CLI (octet-engine's driver):
+    // `Cannot start <engine>: <error>. Install the CLI and sign in first.`
+    any("install the cli and sign in first", Kind::Config),
+    // Octet's text when Antigravity looks signed out at session start.
+    only("antigravity", "sign in to antigravity first", Kind::Config),
     // Codex: `codexErrorInfo` kinds, which Octet appends in parentheses.
     only("codex", "(usagelimitexceeded)", Kind::Transient),
     only("codex", "\"httpstatus\":429", Kind::Transient),
     only("codex", "(unauthorized)", Kind::Config),
+    // Codex's refusal of a model the account does not serve.
+    only(
+        "codex",
+        "model is not supported when using codex",
+        Kind::Config,
+    ),
     // Claude Code's usage-limit text, `Claude AI usage limit reached|<epoch>`.
     only("claude", "usage limit reached", Kind::Transient),
+    // Claude Code's refusal of an unknown model.
+    only("claude", "issue with the selected model", Kind::Config),
     // Any provider.
     any("not logged in", Kind::Config),
     any("login required", Kind::Config),
@@ -233,6 +244,100 @@ mod tests {
         ),
         ("codex", "", false, FailureClass::Unknown),
     ];
+
+    /// Texts the real vendors (or Octet in front of them) produced, as
+    /// Octet's error event carried them; each names where it was seen.
+    /// No real sample exists yet for a network error from any provider,
+    /// for Codex or Antigravity being signed out, or for Claude's usage
+    /// limit: those rows rest on the fixtures above.
+    const REAL: &[(&str, &str, FailureClass)] = &[
+        // Codex 0.15x, the 2026-11-06 music-decoder runs (three times;
+        // only the clock time differed).
+        (
+            "codex",
+            "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
+             visit https://chatgpt.com/codex/settings/usage to purchase more credits or try \
+             again at 9:04 AM. (usageLimitExceeded)",
+            FailureClass::Transient { reset_at: None },
+        ),
+        // Codex 0.154.0 with a model the ChatGPT account does not serve
+        // (Octet's headless probe, 2026-10-23; the same text for
+        // `gpt-5.5` and `gpt-6.1-terra`, whose code was `model_not_found`).
+        (
+            "codex",
+            "The 'nonexistent-model-x' model is not supported when using Codex with a \
+             ChatGPT account.",
+            FailureClass::ConfigError,
+        ),
+        (
+            "codex",
+            "The 'gpt-6.1-terra' model is not supported when using Codex with a ChatGPT account.",
+            FailureClass::ConfigError,
+        ),
+        // Claude Code 2.1.289 with an unknown model (Task 18 probe).
+        (
+            "claude",
+            "There's an issue with the selected model (claude-nonexistent-x). It may not \
+             exist or you may not have access to it.",
+            FailureClass::ConfigError,
+        ),
+        // Claude Code without credentials (`--bare`, 2026-11-05 probe).
+        (
+            "claude",
+            "Not logged in · Please run /login",
+            FailureClass::ConfigError,
+        ),
+        // opencode 1.18.25 refusing a model over ACP (2026-10-23 probe).
+        (
+            "opencode",
+            "opencode did not switch to model opencode/nonexistent: Invalid params: model \
+             not found: opencode/nonexistent",
+            FailureClass::ConfigError,
+        ),
+        // opencode's free-model quota (its own log, 2026-11-15).
+        (
+            "opencode",
+            "AI_APICallError: Free usage limit reached. Free models work in OpenCode \
+             (https://opencode.ai); subscribe to OpenCode Go to keep going: \
+             https://opencode.ai/go",
+            FailureClass::Transient { reset_at: None },
+        ),
+        // Antigravity 1.5.5 with an unknown model (Task 18 probe).
+        (
+            "antigravity",
+            "Antigravity refused the model gemini-nonexistent-x: Unknown model ID: \
+             gemini-nonexistent-x",
+            FailureClass::ConfigError,
+        ),
+        // Octet's own text when Antigravity looks signed out; what agy
+        // itself then says is unconfirmed.
+        (
+            "antigravity",
+            "Sign in to Antigravity first: run `agy`. Antigravity said: Authentication required",
+            FailureClass::ConfigError,
+        ),
+    ];
+
+    #[test]
+    fn real_vendor_texts_are_classified() {
+        for (engine, text, class) in REAL {
+            assert_eq!(classify(engine, text, false), *class, "{engine}: {text:?}");
+            // A known text keeps its class when the vendor then goes away.
+            assert_eq!(classify(engine, text, true), *class, "{engine}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn only_octets_own_start_failure_is_a_missing_binary() {
+        assert_eq!(
+            classify(
+                "claude",
+                "Cannot start the build: the cache is locked",
+                false
+            ),
+            FailureClass::Unknown
+        );
+    }
 
     #[test]
     fn known_texts_are_classified() {

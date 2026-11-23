@@ -11,6 +11,9 @@
   connection, for the owner or for self-hosting.
 - [Persistent goals](rust/goals.md): how `/goal` keeps working across turns
   and how it decides it is done.
+- [Fleet workflows](fleet/README.md): `octet fleet`, multi-step runs across
+  providers (research, plan, implement, test, review) with approval gates,
+  pauses and the guarantees a completed run carries.
 
 ## Reference
 
