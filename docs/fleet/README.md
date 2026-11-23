@@ -57,6 +57,11 @@ one.
 `--task -` reads the task from stdin. Nothing can then be asked on the terminal, so a workflow
 not trusted before needs `--trust`, and write steps' approvals are denied.
 
+`status` lists every run; a run that cannot be read (a start that died while writing its files,
+or a damaged file) is listed as `unreadable`, with its error on stderr, and the others are still
+shown. `OCTET_FLEET_TEST_PAUSE_DIR` is for Octet's own tests only: never set it (each of its
+pauses waits up to five minutes for a file a test writes).
+
 ## Writing a workflow
 
 A workflow is a YAML file. The shipped example is
@@ -138,7 +143,7 @@ silently ignored.
 | `model` | The model ID. Not checked statically: a model the vendor refuses fails the run at the first turn. |
 | `effort` | Reasoning effort, checked against what the engine takes. |
 | `mode` | `ask` (default), `accept-edits`, `auto` or `full-access`. |
-| `binary` | The vendor CLI to run (default: the provider's usual binary on `PATH`). |
+| `binary` | The vendor CLI to run (default: the provider's usual binary on `PATH`). A bare name is looked up on `PATH` (absolute entries only); a relative path such as `./bin/wrapper` is relative to the work tree (`--cwd`), not to where you ran `octet`. |
 | `approval_timeout` | How long an approval request may wait for an answer (default `2m`). |
 
 Durations are `<n>s`, `<n>m` or `<n>h`, with `n` at least 1.
@@ -254,6 +259,11 @@ Workflow real-run would run:
 Trust this workflow and run it? [y/N]
 ```
 
+Each value is shown whole and as it is: a control character, a bidirectional override or a
+zero-width character is shown escaped (`\u{202e}`), a line break in a binary path too, and every
+line of a multi-line test command on a line of its own, so the prompt cannot show something other
+than what would run.
+
 On a terminal you answer y or n. Otherwise `--trust` is required (a refusal exits 2 and starts
 nothing). The answer is stored under `<data_dir>/fleet/trusted/<hash>`, keyed by the hash of the
 resolved content, so a changed workflow asks again. `resume` runs the content frozen in the run's
@@ -323,15 +333,20 @@ Every pause can also be ended with `stop`. After a decision is logged, the next 
 |---|---|---|
 | `reconcile` (change step) | A coder's attempt ended unfinished (crash, signal or transient failure) and left the tree changed. | `keep` → continue the same vendor session (or a fresh one if none was logged), told it was interrupted and its partial changes are in place · `adopt` → the current tree becomes the change's candidate; next is the tests step · `stop` |
 | `reconcile` (tests step) | The tester's turn ended unfinished and left the tree changed. | `keep` → continue the tester · `adopt` → the tester's edits become a derived candidate; next is the evidence runner on it · `stop` |
-| `round_limit` | A jump back would exceed `max_rounds` on that edge. | `continue` → the pending jump is taken (one round past the limit) · `rounds N` → raise the cap, then the same · `stop` |
-| `stalled` | A round made no progress (below). | `continue` → go on past the stall · `rounds N` · `stop` |
+| `round_limit` | A jump back would exceed `max_rounds` on that edge. | `continue` → the pending jump is taken (one round past the limit) · `rounds N` → raise the cap (it never lowers it), then the same · `stop` |
+| `stalled` | A round made no progress (below). | `continue` → go on past the stall · `rounds N` → the same, with the cap raised to N (a smaller N leaves the cap as it is) · `stop` |
 | `unstable_tests` | The tree changed during the test commands on three runs of the list. | `retry` → the evidence runner starts afresh on the current tip, restart count reset · `stop` |
 | `drift` | The live tree is not the tree the run last recorded. The pause shows the diffstat between the two trees and the `git diff <recorded> <live>` command that shows the whole change. | `adopt` → the live tree becomes a derived candidate (origin `drift`); next is whatever step is now due: once a change exists, its tests and then its review run again on the new candidate (the coder does not); before that, the run goes on to the next document step · `stop` |
 | `access_violation` | A read-only step changed its scratch clone. Nothing it produced is used. | `retry` → a new attempt of the same step in a fresh clone · `stop` |
-| `processes_running` | A process verified as the run's is still alive. | `kill` → verified processes signalled, then the check runs again · `wait` → the check runs again · `stop` (refused while verified processes are alive) |
-| `processes_unverified` | A process in a registered group is alive but cannot be shown to be the run's. | `release` → the listed PIDs are logged as not the run's, then the check runs again · `wait` · `stop` (refused until released) |
+| `processes_running` | A process verified as the run's is still alive. Each is listed with its command. | `kill` → verified processes signalled, then the check runs again · `wait` → the check runs again · `stop` (refused while verified processes are alive) |
+| `processes_unverified` | A process in a registered group is alive but cannot be shown to be the run's. Each is listed with its command, as alive now. | `release` → the listed PIDs are logged as not the run's, then the check runs again · `wait` · `stop` (refused until released) |
 | `invalid_output` | A reply stayed invalid after the corrective prompt. | `retry` → a new attempt of the same step · `stop` |
 | `transient_exhausted`, `local_failure`, `unknown` | Retries ran out, Octet's own side failed, or a failure Octet does not recognise. | `retry` → a new attempt of the same step (if the tree changed, `reconcile` first) · `stop` |
+
+A local failure that happens while another pause waits for its decision (Octet cannot observe
+the tree, or cannot remove an old scratch clone) does not replace that pause: the error is
+shown, and you are asked that pause's decision; if you already gave it, `retry` (or a plain
+`resume`) lets it stand and tries again.
 | `interrupted` | Ctrl+C or SIGTERM. | No decision: `resume` goes straight on (below). |
 
 **Stalls** pause early, before the round cap:
@@ -506,6 +521,15 @@ started its child, and an orphan is reparented to PID 1, so no stranger is verif
 
 > `kill` signals **only verified processes** (SIGTERM, SIGKILL after 5 s), then the check runs
 > again.
+
+The locks and the ownership record live in the data directory, so they protect a work tree only
+among runs that share one: two runs on the same repository with different `--journal-dir`s do not
+see each other, and both may write to it. Use one data directory per repository.
+
+A process's identity is its PID and start time (on macOS from `ps`, to the second; on Linux the
+start in clock ticks since boot, from `/proc`). On Linux it holds no boot ID, so after a reboot a
+new process with the same PID and the same tick count would match a recorded identity; that
+needs the same PID at the same moment after boot, and a `kill` is still yours to approve.
 
 ## Where things live
 
