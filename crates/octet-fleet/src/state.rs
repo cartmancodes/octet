@@ -62,6 +62,9 @@ pub struct AttemptInfo {
     /// The candidate of its latest `evidence_started`: once set, the tester
     /// phase is committed, even if the attempt later fails.
     pub handoff: Option<CandidateId>,
+    /// It was started by a `retry` decision at a `transient_exhausted`
+    /// pause: its step's transient streak starts again at it.
+    pub fresh_streak: bool,
     /// Where it stands.
     pub state: AttemptState,
 }
@@ -408,6 +411,8 @@ impl Replayer<'_> {
                 return Err(format!("artifact {} is unknown", id.0));
             }
         }
+        let fresh_streak = self.state.pending_pause == Some(PauseReason::TransientExhausted)
+            && self.state.decisions_since_pause.last() == Some(&Decision::Retry);
         self.resume_from_pause();
         self.state.attempts.insert(
             attempt,
@@ -419,6 +424,7 @@ impl Replayer<'_> {
                 history: history.to_vec(),
                 vendor_session: None,
                 handoff: None,
+                fresh_streak,
                 state: AttemptState::Unfinished {
                     released: false,
                     interrupted: false,

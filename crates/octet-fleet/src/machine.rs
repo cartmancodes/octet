@@ -238,8 +238,10 @@ pub(crate) fn retry_eligible(
 }
 
 /// The transient failures of `step` in a row, newest first, back to its last
-/// accepted attempt or a failure of another class. Unfinished attempts (a
-/// crash, an interrupt) neither count nor end the streak, so they cannot
+/// accepted attempt, a failure of another class, or the attempt a `retry`
+/// decision at a `transient_exhausted` pause started (that attempt counts;
+/// the user's retry gives the step its retries again). Unfinished attempts
+/// (a crash, an interrupt) neither count nor end the streak, so they cannot
 /// reset the retries.
 pub(crate) fn transient_streak(state: &RunState, step: usize) -> u32 {
     let mut failures: u32 = 0;
@@ -255,6 +257,9 @@ pub(crate) fn transient_streak(state: &RunState, step: usize) -> u32 {
             }
             AttemptState::Unfinished { .. } => {}
             AttemptState::Finished | AttemptState::Failed(_) => break,
+        }
+        if info.fresh_streak {
+            break;
         }
     }
     failures
@@ -1866,6 +1871,40 @@ mod tests {
             },
         );
         log.run("review_research");
+    }
+
+    #[test]
+    fn a_retry_after_exhausted_retries_starts_a_fresh_streak() {
+        let mut log = Log::new();
+        let transient = || Failure::Transient {
+            detail: "rate limited".into(),
+            eligible_at: None,
+        };
+        let (mut attempt, _) = log.run("research");
+        for (count, at) in [(1, 60), (2, 300), (3, 900)] {
+            log.fail(attempt, transient());
+            log.retry(attempt, count, at);
+            attempt = log.run_after("research", Some(at)).0;
+        }
+        log.fail(attempt, transient());
+        log.paused(PauseReason::TransientExhausted);
+        log.pause(PauseReason::TransientExhausted);
+        log.decide(Decision::Retry);
+        let (attempt, _) = log.run("research");
+        assert_eq!(
+            transient_streak(&log.state(), log.idx("research")),
+            0,
+            "the attempt the user retried is the start of a new streak"
+        );
+        // The next blip is retried after a backoff, not paused at once.
+        log.fail(attempt, transient());
+        assert_eq!(transient_streak(&log.state(), log.idx("research")), 1);
+        log.retry(attempt, 1, 2_060);
+        let (attempt, _) = log.run_after("research", Some(2_060));
+        log.fail(attempt, transient());
+        assert_eq!(transient_streak(&log.state(), log.idx("research")), 2);
+        log.retry(attempt, 2, 2_300);
+        log.run_after("research", Some(2_300));
     }
 
     #[test]
