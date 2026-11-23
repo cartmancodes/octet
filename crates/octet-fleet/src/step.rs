@@ -184,8 +184,8 @@ async fn attend(
         Err(Unregistered::Failed(detail)) => return Ok(local(detail)),
         Err(Unregistered::Interrupted) => return Ok(TurnEnd::Interrupted),
     };
-    if let Err(detail) = test_pause(plan, "session").await {
-        return Ok(local(detail));
+    if let Err(end) = test_pause(plan, "session").await {
+        return Ok(end);
     }
     let record = Record::AttemptSession {
         attempt: plan.attempt,
@@ -193,8 +193,8 @@ async fn attend(
         identities,
     };
     log.append(&record).await?;
-    if let Err(detail) = test_pause(plan, "go").await {
-        return Ok(local(detail));
+    if let Err(end) = test_pause(plan, "go").await {
+        return Ok(end);
     }
     // Only now may the vendor run.
     if let Err(error) = gate::release(&plan.attempt_dir).await {
@@ -205,15 +205,21 @@ async fn attend(
         .await
 }
 
-/// The plan's test pause `<what>-<attempt>`, if it has a pause hook. An
-/// error is a local failure, as text.
-async fn test_pause(plan: &AttemptPlan<'_>, what: &str) -> Result<(), String> {
+/// The plan's test pause `<what>-<attempt>`, if it has a pause hook (tests
+/// only). An error is a local failure; the run's interrupt during it ends
+/// the turn interrupted, before the vendor is released.
+async fn test_pause(plan: &AttemptPlan<'_>, what: &str) -> Result<(), TurnEnd> {
     let Some(dir) = &plan.pause_hook else {
         return Ok(());
     };
-    crate::evidence::test_pause(dir, &format!("{what}-{}", plan.attempt.0))
+    let interrupt = plan.interrupt.as_ref();
+    crate::evidence::test_pause(dir, &format!("{what}-{}", plan.attempt.0), interrupt)
         .await
-        .map_err(|error| format!("The test pause failed: {error}"))
+        .map_err(|error| local(format!("The test pause failed: {error}")))?;
+    if crate::signal_now(interrupt).is_some() {
+        return Err(TurnEnd::Interrupted);
+    }
+    Ok(())
 }
 
 fn local(detail: String) -> TurnEnd {

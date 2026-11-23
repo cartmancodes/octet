@@ -29,7 +29,7 @@ use octet_fleet::record::{
 use octet_fleet::store::{self, RunDir};
 use octet_fleet::validate::{Host, Refs, Resolved, validate};
 use octet_fleet::{
-    Approver, Clock, FleetEvent, RunEnd, RunnerError, RunnerIo, Start, resume, start, status,
+    Approver, Clock, FleetEvent, RunEnd, RunnerError, RunnerIo, Start, resume, start, status, stop,
 };
 use octet_testkit::{TempDir, write_script};
 use serde_json::{Value, json};
@@ -240,7 +240,10 @@ impl Bench {
 
 fn git(dir: &Path, args: &[&str]) {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(args).current_dir(dir);
+    cmd.args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
     for name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
         cmd.env_remove(name);
     }
@@ -480,7 +483,8 @@ fn approve_with_minor(summary: &str, file: &str) -> String {
 #[tokio::test]
 async fn open_minor_findings_are_reported_at_completion() {
     let mut turns = happy_turns();
-    turns["review_research#1"] = json!({"reply": approve_with_minor("Cite the README.", "README.md")});
+    turns["review_research#1"] =
+        json!({"reply": approve_with_minor("Cite the README.", "README.md")});
     turns["review_change#1"] =
         json!({"reply": approve_with_minor("feature.txt could say more.", "feature.txt")});
     let bench = Bench::new(&turns);
@@ -495,7 +499,14 @@ async fn open_minor_findings_are_reported_at_completion() {
     };
     let shown: Vec<(&str, Severity, &str, Option<&str>)> = open_findings
         .iter()
-        .map(|f| (f.id.as_str(), f.severity, f.summary.as_str(), f.file.as_deref()))
+        .map(|f| {
+            (
+                f.id.as_str(),
+                f.severity,
+                f.summary.as_str(),
+                f.file.as_deref(),
+            )
+        })
         .collect();
     assert_eq!(
         shown,
@@ -565,6 +576,8 @@ async fn an_edit_after_approval_is_drift() {
     let shown = std::process::Command::new("git")
         .args(["diff", "--stat", trees[0], trees[1]])
         .current_dir(&bench.work)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
     assert!(shown.status.success(), "{shown:?}");
@@ -1082,6 +1095,15 @@ async fn a_new_attempt_discards_the_clone_of_an_interrupted_one() {
     let (end, _) = resume_with(&bench, None).await;
     assert_eq!(end, RunEnd::Completed);
     assert!(!clone.exists(), "the interrupted attempt's clone is kept");
+}
+
+#[tokio::test]
+async fn stop_discards_the_clone_of_an_interrupted_read_only_attempt() {
+    let (bench, clone) = research_interrupted().await;
+    assert!(clone.exists());
+    let id = bench.run_id().await;
+    assert_eq!(stop(&bench.data, &id).await.unwrap(), RunEnd::Stopped);
+    assert!(!clone.exists(), "a stopped run's clone is kept");
 }
 
 #[tokio::test]

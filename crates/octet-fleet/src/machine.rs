@@ -147,7 +147,7 @@ pub(crate) fn revising_rejector(def: &Resolved, state: &RunState) -> Option<usiz
 
 /// The cap on `rejector`'s jumps: `max_rounds`, or the cap a `rounds N` set,
 /// plus one per `continue` taken past it.
-fn round_cap(def: &Resolved, state: &RunState, rejector: usize) -> u32 {
+pub(crate) fn round_cap(def: &Resolved, state: &RunState, rejector: usize) -> u32 {
     let base = state
         .round_caps
         .get(&rejector)
@@ -1722,6 +1722,29 @@ mod tests {
         // Resolving one of them is progress.
         let mut log = second_rejection(1);
         revised(&mut log);
+    }
+
+    #[test]
+    fn rounds_at_a_stall_never_lower_the_cap() {
+        // Two jumps taken, max_rounds 5; `rounds 1` at the stall must not
+        // make the next rejection a round limit.
+        let mut log = second_rejection(0);
+        log.pause(PauseReason::Stalled);
+        log.decide(Decision::Rounds { n: 1 });
+        revised(&mut log);
+        let review = log.idx("review_change");
+        assert_eq!(log.state().round_caps[&review], 5);
+        let (test, _) = log.run("test");
+        log.tests(test, true);
+        let (review_attempt, _) = log.run("review_change");
+        log.request_changes_resolving(review_attempt, 2);
+        revised(&mut log);
+        // `rounds 9` raises it.
+        let mut log = second_rejection(0);
+        log.pause(PauseReason::Stalled);
+        log.decide(Decision::Rounds { n: 9 });
+        revised(&mut log);
+        assert_eq!(log.state().round_caps[&review], 9);
     }
 
     #[test]

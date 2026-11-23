@@ -13,11 +13,11 @@ use crate::classify::FailureClass;
 use crate::contract::{self, HeaderIds, Patch, PromptInputs};
 use crate::definition::Kind;
 use crate::machine::{self, Dispatch};
-use crate::recover;
 use crate::record::{
     Accepted, ArtifactId, ArtifactMeta, AttemptId, CandidateId, Failure, Finding, Origin,
     PauseReason, Record, Status,
 };
+use crate::recover;
 use crate::snapshot::{self, Repo};
 use crate::state::{AttemptState, RunState};
 use crate::step::{self, AttemptPlan, FollowUp, TurnEnd};
@@ -594,12 +594,16 @@ impl Driver {
         };
         // Tests only: held with the tester's tree proposed, before the
         // handoff commits it.
-        if let Some(dir) = super::test_pauses()
-            && let Err(error) =
-                crate::evidence::test_pause(&dir, &format!("handoff-{}", attempt.0)).await
-        {
-            let detail = format!("the test pause failed: {error}");
-            return self.fail(attempt, Failure::LocalFailure { detail }).await;
+        if let Some(dir) = super::test_pauses() {
+            let point = format!("handoff-{}", attempt.0);
+            let signals = Some(&self.io.signals);
+            if let Err(error) = crate::evidence::test_pause(&dir, &point, signals).await {
+                let detail = format!("the test pause failed: {error}");
+                return self.fail(attempt, Failure::LocalFailure { detail }).await;
+            }
+            if let Some(signal) = crate::signal_now(signals) {
+                return self.interrupted(Some(attempt), signal).await.map(Some);
+            }
         }
         self.append(&Record::EvidenceStarted {
             attempt,

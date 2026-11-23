@@ -7,7 +7,7 @@
 //! Exit codes: 0 completed (or stopped), 1 failed, 2 usage or validation
 //! error, 3 paused (or a `stop` the run refuses), 130 SIGINT, 143 SIGTERM.
 use crate::args::{CliError, FleetAction, TaskSource, check_prompt, workspace};
-use crate::headless::{INTERRUPTED, TERMINATED, denied, plain, prompt_text, warn};
+use crate::headless::{INTERRUPTED, TERMINATED, denied, invisible, plain, prompt_text, warn};
 use octet_core::{ApprovalSummary, Event, event_json};
 use octet_fleet::{
     Approver, FleetEvent, RunEnd, RunnerError, RunnerIo, Signals, Start,
@@ -33,6 +33,14 @@ use tokio::{
     signal::unix::{SignalKind, signal},
     sync::{mpsc, watch},
 };
+
+/// `println!` that never panics: a closed stdout (a pipe whose reader left)
+/// is not worth a panic. See [`stdout`].
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        stdout(&format!("{}\n", format_args!($($arg)*)))
+    };
+}
 
 /// How many times `run` draws a run ID when it finds the one it drew taken
 /// (the ID's random part is 16 bits).
@@ -76,7 +84,7 @@ pub(crate) async fn fleet(
     let journal_dir = explicit.then(|| data_dir.clone());
     match action {
         FleetAction::Help => {
-            print!("{}", help());
+            stdout(help());
             Ok(0)
         }
         FleetAction::Validate { workflow, cwd } => validate_command(&workflow, cwd).await,
@@ -158,7 +166,7 @@ fn say(text: &str) {
 /// a control character: that cannot be shown faithfully, and a command that
 /// names a different path than the real one must never be printed.
 fn shell_word(text: &str) -> Option<String> {
-    if text.chars().any(char::is_control) {
+    if text.chars().any(|c| c.is_control() || invisible(c)) {
         return None;
     }
     let plain_word = !text.is_empty()
@@ -254,9 +262,10 @@ async fn load_workflow(spec: &str, cwd: &Path) -> Result<Workflow, CliError> {
     definition::parse(&yaml).map_err(|e| usage(plain(&e.to_string())))
 }
 
-/// Prints every error and exits 2, or the validated workflow.
-fn validated(workflow: &Workflow) -> Result<Resolved, Vec<ValidationError>> {
-    validate(workflow, &CoreHost)
+/// Every error, or the validated workflow; a relative `binary` is found
+/// under `cwd`.
+fn validated(workflow: &Workflow, cwd: &Path) -> Result<Resolved, Vec<ValidationError>> {
+    validate(workflow, &CoreHost::in_dir(cwd))
 }
 
 fn report_errors(errors: &[ValidationError]) -> i32 {
@@ -273,9 +282,9 @@ async fn validate_command(spec: &str, cwd: Option<PathBuf>) -> Result<i32, CliEr
         None => std::env::current_dir().map_err(|e| CliError::Run(e.to_string()))?,
     })?;
     let workflow = load_workflow(spec, &cwd).await?;
-    match validated(&workflow) {
+    match validated(&workflow, &cwd) {
         Ok(resolved) => {
-            println!(
+            outln!(
                 "{}: valid, {} steps",
                 plain(&resolved.name),
                 resolved.steps.len()
@@ -290,8 +299,13 @@ async fn validate_command(spec: &str, cwd: Option<PathBuf>) -> Result<i32, CliEr
 
 /// What the workflow would execute, for the trust prompt: each step's engine,
 /// absolute binary and mode, and every test command.
+///
+/// Every value is shown whole and as it is: a character that would hide or
+/// reorder text (a control character, a bidirectional or zero-width one) is
+/// shown escaped (`\u{202e}`), a binary path's line break too, and each line
+/// of a multi-line command on a line of its own.
 fn trust_summary(resolved: &Resolved) -> String {
-    let mut text = format!("Workflow {} would run:\n", plain(&resolved.name));
+    let mut text = format!("Workflow {} would run:\n", visible(&resolved.name));
     for Step {
         id, profile, refs, ..
     } in &resolved.steps
@@ -299,18 +313,33 @@ fn trust_summary(resolved: &Resolved) -> String {
         let _ = writeln!(
             text,
             "  {}: {} {} (mode {})",
-            plain(id),
-            plain(&profile.engine),
-            plain(&profile.binary.display().to_string()),
-            plain(&profile.mode)
+            visible(id),
+            visible(&profile.engine),
+            visible(&profile.binary.display().to_string()),
+            visible(&profile.mode)
         );
         if let octet_fleet::validate::Refs::Tests { commands, .. } = refs {
             for command in commands {
-                let _ = writeln!(text, "      $ {}", block(command, "        "));
+                let lines: Vec<String> = command.split('\n').map(visible).collect();
+                let _ = writeln!(text, "      $ {}", lines.join("\n        "));
             }
         }
     }
     text
+}
+
+/// `text` on one line with every control or invisible formatting character
+/// (a line break too) escaped as `\u{…}`, so what is shown is what is there.
+fn visible(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || invisible(c) {
+                format!("\\u{{{:x}}}", u32::from(c))
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Where the trust record of workflow `hash` is.
@@ -968,7 +997,7 @@ fn hint(front: &Front, text: &str) {
     if front.json {
         warn(text);
     } else {
-        println!("{text}");
+        outln!("{text}");
     }
 }
 
@@ -1049,7 +1078,13 @@ async fn completed(front: &Front, run: &str, diff_command: Option<&str>, open: &
         stdout(&text);
         return;
     };
-    stdout(&completed_text(run, &file.base_tree, &records, diff_command, open));
+    stdout(&completed_text(
+        run,
+        &file.base_tree,
+        &records,
+        diff_command,
+        open,
+    ));
 }
 
 /// [`completed`]'s text.
@@ -1075,10 +1110,8 @@ fn completed_text(
                 "  candidate {}\n  tree {tree}\n  evidence artifact {}\n  approval artifact {}\n  observed tree {observed_tree}\n",
                 candidate.0, evidence.0, approval.0
             );
-            let diff = diff_command.map_or_else(
-                || format!("git diff {base_tree} {tree}"),
-                str::to_owned,
-            );
+            let diff =
+                diff_command.map_or_else(|| format!("git diff {base_tree} {tree}"), str::to_owned);
             let _ = writeln!(text, "  {}", plain(&diff));
         }
     }
@@ -1120,7 +1153,7 @@ fn stdout(text: &str) {
 /// The end of a stopped run: the tree is as the run left it, and this
 /// command would discard its changes.
 async fn stopped(front: &Front, run: &str) {
-    println!(
+    outln!(
         "stopped {}; the work tree is as the run left it",
         plain(run)
     );
@@ -1128,8 +1161,8 @@ async fn stopped(front: &Front, run: &str) {
         return;
     };
     match discard_command(&file.top.display().to_string(), &file.base_tree) {
-        Some(command) => println!("{DISCARD}:\n  {command}"),
-        None => println!(
+        Some(command) => outln!("{DISCARD}:\n  {command}"),
+        None => outln!(
             "the work tree's path has a control character, so no command is shown; the run's \
              starting snapshot is the tree {} (ref refs/octet-fleet/{}/0)",
             plain(&file.base_tree),
@@ -1177,7 +1210,7 @@ async fn run_command(
         }
     };
     let workflow = load_workflow(&spec, &cwd).await?;
-    let resolved = match validated(&workflow) {
+    let resolved = match validated(&workflow, &cwd) {
         Ok(resolved) => resolved,
         Err(errors) => return Ok(report_errors(&errors)),
     };
@@ -1253,19 +1286,19 @@ async fn status_command(
         .await
         .map_err(cli_error)?;
     if let (Some(_), [summary]) = (run, runs.as_slice()) {
-        println!("run:       {}", plain(&summary.id));
-        println!("workflow:  {}", plain(&summary.workflow));
-        println!("state:     {}", summary.state);
+        outln!("run:       {}", plain(&summary.id));
+        outln!("workflow:  {}", plain(&summary.workflow));
+        outln!("state:     {}", summary.state);
         match &summary.step {
-            Some(step) => println!("step:      {} (round {})", plain(step), summary.round),
-            None => println!("step:      -"),
+            Some(step) => outln!("step:      {} (round {})", plain(step), summary.round),
+            None => outln!("step:      -"),
         }
-        println!("findings:  {} open", summary.open_findings);
+        outln!("findings:  {} open", summary.open_findings);
         for reference in &summary.refs {
-            println!("ref:       {}", plain(reference));
+            outln!("ref:       {}", plain(reference));
         }
         if summary.state == "paused" {
-            println!(
+            outln!(
                 "resume:    {}",
                 resume_command(&summary.id, &[], journal_dir)
             );
@@ -1273,7 +1306,7 @@ async fn status_command(
         return Ok(0);
     }
     if runs.is_empty() {
-        println!("No runs");
+        outln!("No runs");
         return Ok(0);
     }
     let rows: Vec<[String; 6]> = runs
@@ -1305,7 +1338,16 @@ async fn status_command(
             .zip(&widths)
             .map(|(cell, width)| format!("{cell:<width$}"))
             .collect();
-        println!("{}", cells.join("  ").trim_end());
+        outln!("{}", cells.join("  ").trim_end());
+    }
+    for summary in &runs {
+        if let Some(error) = &summary.error {
+            warn(&format!(
+                "run {} cannot be read: {}",
+                plain(&summary.id),
+                plain(error)
+            ));
+        }
     }
     Ok(0)
 }
@@ -1336,6 +1378,46 @@ mod tests {
             "a]0;xb\nsecond\nthird"
         );
         assert_eq!(block("one\ntwo", "  "), "one\n  two");
+    }
+
+    #[test]
+    fn the_trust_prompt_shows_every_value_whole_and_as_it_is() {
+        struct Anywhere;
+        impl octet_fleet::validate::Host for Anywhere {
+            fn engine_known(&self, _: &str) -> bool {
+                true
+            }
+            fn check_effort(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn resolve_binary(&self, engine: &str, _: Option<&Path>) -> Option<PathBuf> {
+                Some(PathBuf::from(format!("/bin/{engine}")))
+            }
+        }
+        assert_eq!(visible("/bin/cl\u{200b}aude"), "/bin/cl\\u{200b}aude");
+        assert_eq!(visible("rm \u{202e}gpj.sh"), "rm \\u{202e}gpj.sh");
+        assert_eq!(visible("/bin/a\n/bin/b"), "/bin/a\\u{a}/bin/b");
+        assert_eq!(visible("naïve — ok"), "naïve — ok");
+        let shipped = include_str!("../../../docs/fleet/research-plan-build.yaml");
+        let workflow = definition::parse(shipped).unwrap();
+        let mut resolved = validate(&workflow, &Anywhere).unwrap();
+        resolved.steps[0].profile.binary = PathBuf::from("/opt/cl\u{202e}de\nsh");
+        for step in &mut resolved.steps {
+            if let octet_fleet::validate::Refs::Tests { commands, .. } = &mut step.refs {
+                *commands = vec!["make test\nrm -rf \u{200b}/tmp/x".into()];
+            }
+        }
+        let text = trust_summary(&resolved);
+        assert!(text.contains("/opt/cl\\u{202e}de\\u{a}sh"), "{text}");
+        assert!(
+            text.contains("      $ make test\n        rm -rf \\u{200b}/tmp/x\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains('\u{202e}') && !text.contains('\u{200b}'),
+            "{text}"
+        );
+        assert_eq!(shell_word("/work/\u{202e}x"), None);
     }
 
     #[test]

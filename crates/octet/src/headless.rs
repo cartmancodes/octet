@@ -25,14 +25,47 @@ pub(crate) fn warn(text: &str) {
     let _ = writeln!(std::io::stderr(), "octet: {text}");
 }
 
-/// `text`'s first line without control characters: vendor text must not steer the terminal.
+/// `text`'s first line without control or invisible formatting characters:
+/// vendor text must not steer the terminal, nor reorder what it shows.
 pub(crate) fn plain(text: &str) -> String {
     text.lines()
         .next()
         .unwrap_or_default()
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !invisible(*c))
         .collect()
+}
+
+/// A Unicode format character (category `Cf`) that a terminal shows as
+/// nothing or uses to reorder text: the bidirectional controls, the
+/// zero-width characters, the soft hyphen, the byte-order mark, the tag
+/// characters and the like. Text with one can show something other than
+/// what it is.
+pub(crate) fn invisible(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
 }
 
 /// What a denied approval was for, as it is safe to print.
@@ -599,6 +632,14 @@ mod tests {
             Ok("short".to_owned())
         );
         assert_eq!(read_line(&mut reader).await.unwrap(), None);
+    }
+
+    #[test]
+    fn plain_text_loses_bidi_and_zero_width_characters() {
+        assert_eq!(plain("/bin/cl\u{200b}aude"), "/bin/claude");
+        assert_eq!(plain("rm \u{202e}fdp.exe"), "rm fdp.exe");
+        assert_eq!(plain("a\u{2066}b\u{2069}\u{feff}c"), "abc");
+        assert_eq!(plain("naïve — ok"), "naïve — ok");
     }
 
     #[test]

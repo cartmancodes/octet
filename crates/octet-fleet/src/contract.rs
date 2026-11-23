@@ -328,7 +328,8 @@ struct RawBlock {
     previous: Vec<RawPrevious>,
 }
 
-/// The last complete `json` fence of a reply. Other fences are skipped whole.
+/// The last complete `json` fence of a reply (a fence opened and closed on
+/// one line counts). Other fences are skipped whole.
 fn last_json_block(reply: &str) -> Result<&str, String> {
     #[derive(PartialEq)]
     enum In {
@@ -345,7 +346,12 @@ fn last_json_block(reply: &str) -> Result<&str, String> {
         match state {
             In::Text => {
                 if let Some(info) = trimmed.strip_prefix("```") {
-                    if info.trim().eq_ignore_ascii_case("json") {
+                    if let Some(inner) = info.strip_suffix("```") {
+                        // A fence opened and closed on one line.
+                        if let Some(body) = one_line_json(inner) {
+                            last = Some(body);
+                        }
+                    } else if info.trim().eq_ignore_ascii_case("json") {
                         state = In::Json;
                         start = pos + line.len();
                     } else {
@@ -368,6 +374,18 @@ fn last_json_block(reply: &str) -> Result<&str, String> {
         return Err("the JSON block is unterminated".to_owned());
     }
     last.ok_or_else(|| "no JSON block in the reply".to_owned())
+}
+
+/// The body of a fence opened and closed on one line, `inner` being what is
+/// between the backticks, when its info word is `json`.
+fn one_line_json(inner: &str) -> Option<&str> {
+    let inner = inner.trim();
+    let split = inner
+        .find(|c: char| c.is_whitespace() || c == '{' || c == '[')
+        .unwrap_or(inner.len());
+    let (word, body) = inner.split_at(split);
+    let body = body.trim();
+    (word.eq_ignore_ascii_case("json") && !body.is_empty()).then_some(body)
 }
 
 /// Parse and validate a reviewer's reply against the findings open before it.
@@ -553,6 +571,24 @@ mod tests {
             &inputs("\r\u{1b}[2J\n"),
         );
         assert!(p.lines().next().unwrap().ends_with("tree=abc123]"));
+    }
+
+    #[test]
+    fn a_fence_closed_on_its_own_line_does_not_hide_the_block() {
+        let block = r#"{"verdict": "approved", "new_findings": [], "previous": []}"#;
+        // A one-line code fence before the block.
+        let reply = format!("See ```rust let x = 1;```\n```sh ls ```\n\n```json\n{block}\n```\n");
+        assert_eq!(last_json_block(&reply), Ok(format!("{block}\n").as_str()));
+        // The block itself on one line.
+        let reply = format!("Done.\n```json {block} ```\n");
+        assert_eq!(last_json_block(&reply), Ok(block));
+        let reply = format!("Done.\n```JSON{block}```");
+        assert_eq!(last_json_block(&reply), Ok(block));
+        assert!(parse_verdict(&format!("ok\n```json {block}```\n"), &[]).is_ok());
+        // The last block wins, whichever form it has.
+        let earlier = r#"{"verdict": "changes_requested"}"#;
+        let reply = format!("```json\n{earlier}\n```\n```json {block}```\n");
+        assert_eq!(last_json_block(&reply), Ok(block));
     }
 
     #[test]

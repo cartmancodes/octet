@@ -30,6 +30,13 @@ pub(crate) const TASK: &str = "Add the feature.";
 /// The git variables a test's git, and `octet`, must not inherit.
 pub(crate) const GIT_ENV: [&str; 3] = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"];
 
+/// No global or system git config: a developer's own settings (a split
+/// index, an fsmonitor hook, a signing key) must not change what git does.
+pub(crate) const GIT_CONFIG_ISOLATED: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+
 // ---- workflows and scripts ---------------------------------------------
 
 /// The profiles: Claude for documents and reviews, Codex for the coder and
@@ -175,6 +182,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
 pub(crate) fn git_with(dir: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> String {
     let mut command = Command::new("git");
     command.args(args).current_dir(dir);
+    command.envs(GIT_CONFIG_ISOLATED);
     for name in GIT_ENV {
         command.env_remove(name);
     }
@@ -278,7 +286,8 @@ impl Bench {
             .arg("--journal-dir")
             .arg(&self.data)
             .env("OCTET_FLEET_SCRIPT", &self.script)
-            .env_remove(TEST_PAUSE_ENV);
+            .env_remove(TEST_PAUSE_ENV)
+            .envs(GIT_CONFIG_ISOLATED);
         for name in GIT_ENV {
             command.env_remove(name);
         }

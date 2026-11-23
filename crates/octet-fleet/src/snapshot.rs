@@ -413,7 +413,11 @@ pub async fn scratch_clone(
     exec(clone, &[]).await?;
     // No remote: a vendor's `git push` from the clone must not reach the
     // user's refs (the objects come through the alternates anyway).
-    git(&target, no_hooks.into_iter().chain(["remote", "remove", "origin"])).await?;
+    git(
+        &target,
+        no_hooks.into_iter().chain(["remote", "remove", "origin"]),
+    )
+    .await?;
     let checkout = ["checkout", "--quiet", "--detach", commit, "--"];
     git(&target, no_hooks.into_iter().chain(checkout)).await?;
     let mut cwd = into.to_path_buf();
@@ -436,7 +440,10 @@ mod tests {
     /// Runs git in `dir` for a test, as a user would: no inherited `GIT_*`.
     fn sh(dir: &Path, args: &[&str]) -> String {
         let mut cmd = std::process::Command::new("git");
-        cmd.args(args).current_dir(dir);
+        cmd.args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         for name in INHERITED {
             cmd.env_remove(name);
         }
@@ -502,7 +509,13 @@ mod tests {
     fn shared_indexes(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir.join(".git"))
             .expect("git dir")
-            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .filter(|name| name.starts_with("sharedindex."))
             .collect();
         names.sort();
@@ -800,6 +813,8 @@ mod tests {
         ] {
             let pushed = std::process::Command::new("git")
                 .args(["push", "--quiet", "origin", &target])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .current_dir(&cwd)
                 .output()
                 .expect("git runs");
@@ -807,7 +822,10 @@ mod tests {
         }
         assert_eq!(sh(dir.path(), &["rev-parse", "HEAD"]), head);
         assert_eq!(
-            sh(dir.path(), &["for-each-ref", "--format=%(refname)", "refs/heads"]),
+            sh(
+                dir.path(),
+                &["for-each-ref", "--format=%(refname)", "refs/heads"]
+            ),
             format!("refs/heads/{branch}")
         );
     }

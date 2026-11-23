@@ -447,6 +447,43 @@ steps:\n\
 }
 
 #[test]
+fn fleet_output_to_a_closed_stdout_does_not_panic() {
+    let dir = octet_testkit::TempDir::new("octet-fleet-closed-stdout");
+    let data = dir.path().join("data");
+    // A half-created run, so `status` has something to list.
+    let run = data.join("fleet").join("f0000000001-00ab");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("run.json"), "{").unwrap();
+    for args in [&["--help"][..], &["status"][..]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = Command::new(env!("CARGO_BIN_EXE_octet"))
+            .arg("fleet")
+            .args(args)
+            .arg("--journal-dir")
+            .arg(&data)
+            .stdin(std::process::Stdio::null())
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {stderr}");
+    }
+    // The half-created run is listed, not fatal.
+    let output = fleet_cli(&["status"], &data);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(
+        stdout.contains("f0000000001-00ab") && stdout.contains("unreadable"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("cannot be read"), "{stderr}");
+}
+
+#[test]
 fn fleet_run_without_trust_off_a_terminal_is_refused() {
     let dir = octet_testkit::TempDir::new("octet-fleet-trust");
     let work = dir.path().join("work");

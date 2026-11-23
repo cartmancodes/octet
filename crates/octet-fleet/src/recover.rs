@@ -112,8 +112,7 @@ pub fn recover(def: &Resolved, state: &RunState, obs: &Observation) -> Next {
 }
 
 /// Verified processes alive, or unverified ones the user has not released;
-/// the unverified are listed each with its command (spec, "Leftover
-/// processes").
+/// each is listed with its command (spec, "Leftover processes").
 fn leftover_processes(
     state: &RunState,
     check: &ProcessCheck,
@@ -122,10 +121,9 @@ fn leftover_processes(
     match check {
         ProcessCheck::Clear => None,
         ProcessCheck::Verified(pids) => (!pids.is_empty()).then(|| {
-            Next::Pause(
-                PauseReason::ProcessesRunning,
-                format!("processes of the run are still running: {pids:?}"),
-            )
+            let mut detail = format!("processes of the run are still running: {pids:?}");
+            list_commands(&mut detail, pids, commands);
+            Next::Pause(PauseReason::ProcessesRunning, detail)
         }),
         ProcessCheck::Unverified(pids) => {
             let left: Vec<u32> = pids
@@ -135,15 +133,21 @@ fn leftover_processes(
                 .collect();
             (!left.is_empty()).then(|| {
                 let mut detail = format!("processes that may be the run's are alive: {left:?}");
-                for pid in &left {
-                    let command = commands
-                        .get(pid)
-                        .map_or("(command unknown)", String::as_str);
-                    let _ = write!(detail, "\n  {pid}: {command}");
-                }
+                list_commands(&mut detail, &left, commands);
                 Next::Pause(PauseReason::ProcessesUnverified, detail)
             })
         }
+    }
+}
+
+/// Each of `pids` on a line of its own, with its command, so the user
+/// knows what a `kill` or a `release` is about.
+fn list_commands(detail: &mut String, pids: &[u32], commands: &BTreeMap<u32, String>) {
+    for pid in pids {
+        let command = commands
+            .get(pid)
+            .map_or("(command unknown)", String::as_str);
+        let _ = write!(detail, "\n  {pid}: {command}");
     }
 }
 
@@ -363,7 +367,9 @@ const WHOLE_CHANGE: &str = "the whole change: git diff ";
 /// line; [`drift_trees`] reads the trees back.
 #[must_use]
 pub fn drift_detail(expected: &str, live: &str, what: &str) -> String {
-    format!("the live tree {live} is not the tree {expected} of {what}\n{WHOLE_CHANGE}{expected} {live}")
+    format!(
+        "the live tree {live} is not the tree {expected} of {what}\n{WHOLE_CHANGE}{expected} {live}"
+    )
 }
 
 /// The recorded and the live tree a [`drift_detail`] names.
@@ -832,6 +838,23 @@ mod tests {
         };
         assert!(!detail.contains("sleep 60"), "{detail}");
         assert!(detail.contains("44: make test"), "{detail}");
+    }
+
+    #[test]
+    fn a_running_pause_lists_each_process_with_its_command() {
+        let (_, clear) = rows().remove(0);
+        let obs = Observation {
+            processes: ProcessCheck::Verified(vec![43, 44]),
+            commands: BTreeMap::from([(43, "sleep 60".to_owned())]),
+            ..clear
+        };
+        let (case, _) = rows().remove(0);
+        let Next::Pause(PauseReason::ProcessesRunning, detail) = case.recover(&obs) else {
+            panic!("not a running pause");
+        };
+        assert!(detail.contains("[43, 44]"), "{detail}");
+        assert!(detail.contains("\n  43: sleep 60"), "{detail}");
+        assert!(detail.contains("\n  44: (command unknown)"), "{detail}");
     }
 
     #[test]

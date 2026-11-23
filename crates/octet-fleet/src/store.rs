@@ -805,7 +805,10 @@ mod tests {
         let repo = TempDir::new("octet-fleet-store-git");
         std::fs::create_dir_all(repo.path()).expect("repo dir");
         let mut init = std::process::Command::new("git");
-        init.args(["init", "--quiet"]).current_dir(repo.path());
+        init.args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         for name in INHERITED {
             init.env_remove(name);
         }
@@ -817,6 +820,8 @@ mod tests {
         let mut hash = std::process::Command::new("git");
         hash.args(["hash-object", "--stdin"])
             .current_dir(repo.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
         for name in INHERITED {

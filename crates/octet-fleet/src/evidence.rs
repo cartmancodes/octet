@@ -47,7 +47,9 @@ const HELD: &str = r#"read _ || exit 125; exec sh -c "$1""#;
 /// each held spawn ([`EvidenceRun::pause_hook`]), around a vendor's
 /// registration ([`crate::step::AttemptPlan::pause_hook`]), and at the
 /// tester-to-evidence handoff, with the tester's tree proposed and not yet
-/// committed (`handoff-<attempt>`). The runner reads it.
+/// committed (`handoff-<attempt>`). The runner reads it. Never set it
+/// outside tests: each pause waits (at most five minutes, or until the run
+/// is interrupted) for a file a test writes.
 pub const TEST_PAUSE_ENV: &str = "OCTET_FLEET_TEST_PAUSE_DIR";
 
 /// The pause hook that `value`, the [`TEST_PAUSE_ENV`] variable, names: none
@@ -319,7 +321,12 @@ impl Pass<'_> {
         };
         let mut stdin = leader.child().stdin.take();
         if let Some(dir) = self.pause_hook {
-            test_pause(dir, &format!("{}-{index}", self.restart)).await?;
+            test_pause(
+                dir,
+                &format!("{}-{index}", self.restart),
+                self.interrupt.as_ref(),
+            )
+            .await?;
         }
         let pre_tree = take(self.repo, &self.scratch_index).await?;
         if pre_tree != self.tree {
@@ -423,12 +430,44 @@ impl Pass<'_> {
     }
 }
 
-/// A test pause in `dir`: announces `held-<point>` and waits to be told to go
-/// on (`continue-<point>`).
-pub(crate) async fn test_pause(dir: &Path, point: &str) -> std::io::Result<()> {
+/// The longest a test pause waits for its `continue-<point>`.
+const TEST_PAUSE_LIMIT: Duration = Duration::from_secs(300);
+
+/// Tests only: a test pause in `dir`: announces `held-<point>` and waits to
+/// be told to go on (`continue-<point>`), at most [`TEST_PAUSE_LIMIT`] (then
+/// an error, which the caller makes a local failure). The run's `interrupt`
+/// ends the wait at once; the caller then sees the signal and stops.
+pub(crate) async fn test_pause(
+    dir: &Path,
+    point: &str,
+    interrupt: Option<&Signals>,
+) -> std::io::Result<()> {
+    test_pause_within(dir, point, interrupt, TEST_PAUSE_LIMIT).await
+}
+
+async fn test_pause_within(
+    dir: &Path,
+    point: &str,
+    interrupt: Option<&Signals>,
+    limit: Duration,
+) -> std::io::Result<()> {
     tokio::fs::write(dir.join(format!("held-{point}")), b"").await?;
     let go = dir.join(format!("continue-{point}"));
+    let deadline = tokio::time::Instant::now() + limit;
     while !tokio::fs::try_exists(&go).await? {
+        if signal_now(interrupt).is_some() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "no continue-{point} in {} s (the test pause variable {TEST_PAUSE_ENV} is \
+                     for tests only)",
+                    limit.as_secs()
+                ),
+            ));
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Ok(())
@@ -463,7 +502,10 @@ mod tests {
 
     fn git(dir: &Path, args: &[&str]) {
         let mut cmd = std::process::Command::new("git");
-        cmd.args(args).current_dir(dir);
+        cmd.args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         for name in INHERITED {
             cmd.env_remove(name);
         }
@@ -589,6 +631,36 @@ mod tests {
             EvidenceOutcome::Complete { passed, results } => (passed, results),
             other => panic!("expected Complete, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_test_pause_is_bounded_and_interruptible() {
+        let dir = TempDir::new("octet-fleet-test-pause");
+        fs::create_dir_all(dir.path()).unwrap();
+        // Unanswered, it gives up after its limit.
+        let started = std::time::Instant::now();
+        let error = test_pause_within(dir.path(), "a", None, Duration::from_millis(100))
+            .await
+            .expect_err("no continue file");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(dir.path().join("held-a").exists());
+        // An interrupt ends it at once.
+        let (send, signals) = tokio::sync::watch::channel(None);
+        let waiting = test_pause_within(dir.path(), "b", Some(&signals), PATIENCE);
+        let interrupt = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            send.send(Some("SIGINT")).unwrap();
+        };
+        let started = std::time::Instant::now();
+        let (waited, ()) = tokio::join!(waiting, interrupt);
+        waited.expect("an interrupt ends the wait");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Told to go on, it goes on.
+        fs::write(dir.path().join("continue-c"), b"").unwrap();
+        test_pause_within(dir.path(), "c", None, PATIENCE)
+            .await
+            .expect("continues");
     }
 
     #[test]

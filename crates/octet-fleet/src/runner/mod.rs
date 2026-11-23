@@ -484,7 +484,7 @@ impl Driver {
             .await
             .map_err(|error| format!("cannot check the run's processes: {error}"))?;
         let mut commands = std::collections::BTreeMap::new();
-        if let ProcessCheck::Unverified(pids) = &processes {
+        if let ProcessCheck::Verified(pids) | ProcessCheck::Unverified(pids) = &processes {
             for &pid in pids {
                 if let Some(command) = ownership::command_of(pid).await {
                     commands.insert(pid, command);
@@ -560,7 +560,11 @@ impl Driver {
     }
 
     /// Pauses for `reason`, logged as [`logs_pause`] says. A pause already
-    /// logged keeps its logged detail.
+    /// logged keeps its logged detail, except a processes pause, whose
+    /// detail is the observation just made (the processes alive now). A
+    /// local failure that is not logged leaves the pending pause in force:
+    /// the user is asked about it, or, when it already has its decision, to
+    /// `retry` (the decision then stands).
     async fn pause(&mut self, reason: PauseReason, detail: String) -> Result<RunEnd, RunnerError> {
         let view = self.load().await?;
         let pending = view.state.pending_pause;
@@ -570,7 +574,7 @@ impl Driver {
             detail
         };
         let detail = if pending == Some(reason) {
-            last_pause_detail(&view.records).unwrap_or(detail)
+            shown_detail(reason, detail, last_pause_detail(&view.records))
         } else if !logs_pause(pending, reason) {
             detail
         } else {
@@ -582,14 +586,15 @@ impl Driver {
             detail
         };
         self.emit(FleetEvent::Paused { reason, detail }).await;
-        if reason != PauseReason::Interrupted {
+        let asked = asked_about(&view.state, reason);
+        if asked != PauseReason::Interrupted {
             self.emit(FleetEvent::NeedsDecision {
-                reason,
-                options: recover::options(reason),
+                reason: asked,
+                options: recover::options(asked),
             })
             .await;
         }
-        Ok(RunEnd::Paused(reason))
+        Ok(RunEnd::Paused(asked))
     }
 
     /// A drift detail with the diffstat between its two trees added before
@@ -839,24 +844,69 @@ fn identities_of(records: &[Record], attempt: AttemptId) -> Vec<Identity> {
 /// next observation answers (an interrupt, a processes pause) it does
 /// replace: a run that waits on unverified processes once the verified ones
 /// are killed says so in its log.
+///
+/// A local failure (an observation or a clone that failed) never replaces a
+/// pause that waits for a decision either: that pause, and any decision
+/// already logged at it, stands, and the next `resume` observes again.
 fn logs_pause(pending: Option<PauseReason>, reason: PauseReason) -> bool {
-    let answered = |reason: PauseReason| {
-        matches!(
-            reason,
-            PauseReason::Interrupted
-                | PauseReason::ProcessesRunning
-                | PauseReason::ProcessesUnverified
-        )
-    };
-    let processes = matches!(
-        reason,
-        PauseReason::ProcessesRunning | PauseReason::ProcessesUnverified
-    );
     match pending {
         Some(pending) if pending == reason => false,
-        Some(pending) if processes => answered(pending),
+        Some(pending) if processes_pause(reason) || reason == PauseReason::LocalFailure => {
+            answered(pending)
+        }
         _ => true,
     }
+}
+
+/// The detail shown for a pause already logged for `reason`: the logged one,
+/// except for a processes pause, whose `fresh` detail lists the processes
+/// alive now (a `release` acts on those, not on the ones first logged).
+fn shown_detail(reason: PauseReason, fresh: String, logged: Option<String>) -> String {
+    if processes_pause(reason) {
+        fresh
+    } else {
+        logged.unwrap_or(fresh)
+    }
+}
+
+/// A pause the next observation answers, without a decision.
+fn answered(reason: PauseReason) -> bool {
+    reason == PauseReason::Interrupted || processes_pause(reason)
+}
+
+fn processes_pause(reason: PauseReason) -> bool {
+    matches!(
+        reason,
+        PauseReason::ProcessesRunning | PauseReason::ProcessesUnverified
+    )
+}
+
+/// The pause the user is asked about when the run pauses for `reason`:
+/// `reason`, except a local failure that was not logged over a pending
+/// pause ([`logs_pause`]): then the pending pause, unless it has its
+/// decision already, when `retry` (which lets that decision stand) is asked.
+fn asked_about(state: &RunState, reason: PauseReason) -> PauseReason {
+    match state.pending_pause {
+        Some(pending)
+            if reason == PauseReason::LocalFailure && !logs_pause(Some(pending), reason) =>
+        {
+            if decided(state) {
+                PauseReason::LocalFailure
+            } else {
+                pending
+            }
+        }
+        _ => reason,
+    }
+}
+
+/// The pending pause has a decision that ends its wait.
+pub(super) fn decided(state: &RunState) -> bool {
+    state.pending_pause.is_some()
+        && state
+            .decisions_since_pause
+            .last()
+            .is_some_and(crate::machine::ends_the_wait)
 }
 
 /// Whether none of `processes` is `attempt`'s: none carries its `marker`,
@@ -960,5 +1010,56 @@ mod tests {
         assert!(!logs_pause(Some(ProcessesRunning), ProcessesRunning));
         assert!(!logs_pause(Some(UnstableTests), UnstableTests));
         assert!(logs_pause(Some(ProcessesRunning), UnstableTests));
+    }
+
+    #[test]
+    fn a_recurring_processes_pause_shows_the_processes_alive_now() {
+        use PauseReason::{ProcessesRunning, ProcessesUnverified, UnstableTests};
+        let logged = || Some("alive: [7, 8]".to_owned());
+        for reason in [ProcessesRunning, ProcessesUnverified] {
+            assert_eq!(
+                shown_detail(reason, "alive: [8]".into(), logged()),
+                "alive: [8]"
+            );
+        }
+        assert_eq!(
+            shown_detail(UnstableTests, "again".into(), logged()),
+            "alive: [7, 8]"
+        );
+        assert_eq!(shown_detail(UnstableTests, "again".into(), None), "again");
+    }
+
+    #[test]
+    fn a_local_failure_never_replaces_a_pause_that_waits_for_a_decision() {
+        use PauseReason::{
+            Interrupted, LocalFailure, ProcessesRunning, Reconcile, RoundLimit, UnstableTests,
+        };
+        assert!(logs_pause(None, LocalFailure));
+        assert!(logs_pause(Some(Interrupted), LocalFailure));
+        assert!(logs_pause(Some(ProcessesRunning), LocalFailure));
+        assert!(!logs_pause(Some(Reconcile), LocalFailure));
+        assert!(!logs_pause(Some(UnstableTests), LocalFailure));
+        // What the user is asked: the pending pause; or, decided already,
+        // `retry` (its decision stands).
+        let base = Record::Candidate {
+            id: CandidateId(0),
+            tree: "t0".into(),
+            parent: None,
+            origin: Origin::Base,
+        };
+        let mut state = replay(&crate::sim::shipped(), &[base], &[]).unwrap();
+        assert_eq!(asked_about(&state, LocalFailure), LocalFailure);
+        state.pending_pause = Some(Reconcile);
+        assert_eq!(asked_about(&state, LocalFailure), Reconcile);
+        assert_eq!(asked_about(&state, ProcessesRunning), ProcessesRunning);
+        state.decisions_since_pause = vec![Decision::Keep];
+        assert!(decided(&state));
+        assert_eq!(asked_about(&state, LocalFailure), LocalFailure);
+        state.pending_pause = Some(RoundLimit);
+        state.decisions_since_pause = vec![Decision::Wait];
+        assert!(!decided(&state));
+        assert_eq!(asked_about(&state, LocalFailure), RoundLimit);
+        state.pending_pause = Some(Interrupted);
+        assert_eq!(asked_about(&state, LocalFailure), LocalFailure);
     }
 }

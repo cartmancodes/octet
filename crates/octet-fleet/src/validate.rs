@@ -36,9 +36,32 @@ pub trait Host {
     fn resolve_binary(&self, engine: &str, given: Option<&Path>) -> Option<PathBuf>;
 }
 
-/// The real host: `octet_core`'s engines and the process's `PATH`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CoreHost;
+/// The real host: `octet_core`'s engines and the process's `PATH`. A
+/// relative `binary` (`./bin/wrapper`) is found under the directory it was
+/// made [`CoreHost::in_dir`] (the work tree, `--cwd`), else the process's.
+#[derive(Debug, Clone, Default)]
+pub struct CoreHost {
+    base: Option<PathBuf>,
+}
+
+impl CoreHost {
+    /// A host that finds a relative `binary` under `dir`.
+    #[must_use]
+    pub fn in_dir(dir: &Path) -> Self {
+        Self {
+            base: Some(dir.to_path_buf()),
+        }
+    }
+}
+
+/// The first executable `name` in `dirs`, skipping relative directories (a
+/// relative `PATH` entry would give a relative binary, which the gate cannot
+/// run).
+fn search(dirs: impl Iterator<Item = PathBuf>, name: &Path) -> Option<PathBuf> {
+    dirs.filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
 
 impl Host for CoreHost {
     fn engine_known(&self, engine: &str) -> bool {
@@ -58,14 +81,19 @@ impl Host for CoreHost {
             None => PathBuf::from(Engine::parse(engine)?.provider().default_binary),
         };
         if wanted.components().count() > 1 || wanted.is_absolute() {
-            let absolute = std::path::absolute(&wanted).ok()?;
+            let absolute = match &self.base {
+                Some(base) if wanted.is_relative() => base.join(&wanted),
+                _ => wanted,
+            };
+            let absolute = std::path::absolute(absolute).ok()?;
+            let absolute: PathBuf = absolute
+                .components()
+                .filter(|part| !matches!(part, std::path::Component::CurDir))
+                .collect();
             return is_executable(&absolute).then_some(absolute);
         }
         let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map(|dir| dir.join(&wanted))
-            .find(|candidate| is_executable(candidate))
+        search(std::env::split_paths(&path), &wanted)
     }
 }
 
@@ -1469,7 +1497,7 @@ steps:
 
     #[test]
     fn core_host_resolves_engines_efforts_and_binaries() {
-        let host = CoreHost;
+        let host = CoreHost::default();
         assert!(host.engine_known("claude"));
         assert!(!host.engine_known("Claude"));
         assert!(host.check_effort("claude", "high").is_ok());
@@ -1488,5 +1516,58 @@ steps:
             .unwrap();
         assert!(found.is_absolute() && found.ends_with("sh"), "{found:?}");
         assert_eq!(host.resolve_binary("no-such-engine", None), None);
+    }
+
+    #[test]
+    fn a_relative_binary_is_found_under_the_work_tree_not_the_process_cwd() {
+        let work = octet_testkit::TempDir::new("octet-fleet-binary");
+        let bin = work.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let wrapper = bin.join("codex-wrapper");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let host = CoreHost::in_dir(work.path());
+        for given in ["./bin/codex-wrapper", "bin/codex-wrapper"] {
+            assert_eq!(
+                host.resolve_binary("codex", Some(Path::new(given))),
+                Some(wrapper.clone()),
+                "{given}"
+            );
+        }
+        // The process's own directory is not where it is looked for.
+        assert_eq!(
+            CoreHost::in_dir(Path::new("/"))
+                .resolve_binary("codex", Some(Path::new("bin/codex-wrapper"))),
+            None
+        );
+        // An absolute binary is itself; a bare name is searched on PATH.
+        assert_eq!(
+            host.resolve_binary("claude", Some(Path::new("/bin/sh"))),
+            Some(PathBuf::from("/bin/sh"))
+        );
+        assert!(
+            host.resolve_binary("claude", Some(Path::new("sh")))
+                .is_some_and(|found| found.is_absolute())
+        );
+    }
+
+    #[test]
+    fn a_relative_path_entry_is_never_searched() {
+        let dirs = [
+            PathBuf::from("rel/bin"),
+            PathBuf::new(),
+            PathBuf::from("/bin"),
+        ];
+        assert_eq!(
+            search(dirs.iter().cloned(), Path::new("sh")),
+            Some(PathBuf::from("/bin/sh"))
+        );
+        assert_eq!(
+            search([PathBuf::from(".")].into_iter(), Path::new("sh")),
+            None
+        );
     }
 }

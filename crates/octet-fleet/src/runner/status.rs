@@ -26,6 +26,9 @@ pub struct RunSummary {
     /// The git refs the run made (`refs/octet-fleet/<run>/<seq>`), one per
     /// candidate.
     pub refs: Vec<String>,
+    /// Why the run cannot be read (its state is then `unreadable`): a
+    /// half-created run, or a damaged file.
+    pub error: Option<String>,
 }
 
 /// Summarises run `run`, or every run under `data_dir` (oldest first).
@@ -37,10 +40,14 @@ pub struct RunSummary {
 /// an interrupt or a crash, which `resume` continues. A run whose log never got its first record (a start that
 /// died) is `failed`.
 ///
+/// Listing every run, a run that cannot be read (a half-created one, a
+/// damaged file) is listed `unreadable`, with its error, rather than failing
+/// the listing.
+///
 /// # Errors
 ///
-/// [`RunnerError::Store`] when a run cannot be read (for `run`, when there
-/// is no such run); [`RunnerError::Replay`] when a log contradicts its
+/// For `run` only: [`RunnerError::Store`] when it cannot be read (or there
+/// is no such run); [`RunnerError::Replay`] when its log contradicts its
 /// workflow.
 pub async fn status(data_dir: &Path, run: Option<&str>) -> Result<Vec<RunSummary>, RunnerError> {
     let ids = match run {
@@ -49,7 +56,21 @@ pub async fn status(data_dir: &Path, run: Option<&str>) -> Result<Vec<RunSummary
     };
     let mut summaries = Vec::with_capacity(ids.len());
     for id in ids {
-        summaries.push(summary(data_dir, &id).await?);
+        match summary(data_dir, &id).await {
+            Ok(summary) => summaries.push(summary),
+            // One damaged run must not hide every other.
+            Err(error) if run.is_none() => summaries.push(RunSummary {
+                id,
+                workflow: String::new(),
+                state: "unreadable".into(),
+                step: None,
+                round: 0,
+                open_findings: 0,
+                refs: Vec::new(),
+                error: Some(error.to_string()),
+            }),
+            Err(error) => return Err(error),
+        }
     }
     Ok(summaries)
 }
@@ -74,6 +95,7 @@ async fn summary(data_dir: &Path, id: &str) -> Result<RunSummary, RunnerError> {
         round: 0,
         open_findings: 0,
         refs,
+        error: None,
     };
     if records.is_empty() {
         return Ok(summary);
@@ -102,4 +124,27 @@ async fn summary(data_dir: &Path, id: &str) -> Result<RunSummary, RunnerError> {
     }
     .into();
     Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use octet_testkit::TempDir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_half_created_run_is_flagged_not_fatal() {
+        let data = TempDir::new("octet-fleet-status");
+        let run = data.path().join("fleet").join("f0000000001-00ab");
+        std::fs::create_dir_all(&run).unwrap();
+        // A start that died while writing its run file.
+        std::fs::write(run.join("run.json"), "{\"work").unwrap();
+        let runs = status(data.path(), None).await.expect("lists the runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, "f0000000001-00ab");
+        assert_eq!(runs[0].state, "unreadable");
+        assert!(runs[0].error.is_some(), "{:?}", runs[0]);
+        // Asked for by name, the run's own error is the answer.
+        assert!(status(data.path(), Some("f0000000001-00ab")).await.is_err());
+    }
 }

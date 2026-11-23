@@ -11,6 +11,7 @@ use crate::definition::Kind;
 use crate::ownership;
 use crate::record::{CandidateId, Decision, Origin, PauseReason, Record};
 use crate::recover::{self, Observation, ProcessCheck};
+use crate::state::RunState;
 
 impl Driver {
     /// Logs `decision` and what it needs first (an adopted candidate), or
@@ -38,6 +39,11 @@ impl Driver {
                 self.id
             )));
         };
+        if retries_a_decided_pause(&view.state, reason, &decision) {
+            // A local failure stopped the run after this pause's decision:
+            // `retry` lets that decision stand, and logs nothing.
+            return Ok(None);
+        }
         if !recover::allows(reason, &decision) {
             return Err(RunnerError::Refused(format!(
                 "the run is paused ({reason:?}); its decisions are {}",
@@ -83,7 +89,9 @@ impl Driver {
 
     /// `stop`: refused while a verified process is alive or an unverified
     /// one is not released; otherwise `stopped`, and the run no longer owns
-    /// the work tree. The tree is left as it is.
+    /// the work tree. The tree is left as it is; the latest attempt's
+    /// scratch clone, if one is left, is removed (best effort: the run has
+    /// stopped either way).
     async fn stop_run(&mut self, view: &View, obs: &Observation) -> Result<RunEnd, RunnerError> {
         match &obs.processes {
             ProcessCheck::Verified(pids) if !pids.is_empty() => {
@@ -110,8 +118,23 @@ impl Driver {
         .await?;
         self.append(&Record::Stopped).await?;
         self.disown().await?;
+        // A read-only attempt left unfinished keeps its scratch clone (a
+        // full checkout) until the next attempt; a stopped run has none.
+        if let Some(&latest) = view.state.attempts.keys().next_back() {
+            let _ = tokio::fs::remove_dir_all(self.attempt_dir(latest).join("tree")).await;
+        }
         Ok(RunEnd::Stopped)
     }
+}
+
+/// `decision` is a `retry` the pending pause `reason` does not take, and that
+/// pause has its decision already: a local failure (not logged over it)
+/// stopped the run, and the front end asked to `retry`.
+fn retries_a_decided_pause(state: &RunState, reason: PauseReason, decision: &Decision) -> bool {
+    *decision == Decision::Retry
+        && state.pending_pause == Some(reason)
+        && !recover::allows(reason, decision)
+        && super::decided(state)
 }
 
 /// The candidate adopted drift derives from: the tip; for a `Reconcile`,
@@ -131,5 +154,48 @@ fn adopted_origin(driver: &Driver, view: &View, reason: PauseReason) -> Origin {
             Kind::Change | Kind::Document | Kind::Verdict => Origin::Change,
         },
         _ => Origin::Drift,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::replay;
+
+    #[test]
+    fn retry_lets_a_decided_pause_stand_and_nothing_else() {
+        let base = Record::Candidate {
+            id: CandidateId(0),
+            tree: "t0".into(),
+            parent: None,
+            origin: Origin::Base,
+        };
+        let mut state = replay(&crate::sim::shipped(), &[base], &[]).unwrap();
+        state.pending_pause = Some(PauseReason::Reconcile);
+        // Undecided: `retry` is not one of its decisions.
+        assert!(!retries_a_decided_pause(
+            &state,
+            PauseReason::Reconcile,
+            &Decision::Retry
+        ));
+        state.decisions_since_pause = vec![Decision::Keep];
+        assert!(retries_a_decided_pause(
+            &state,
+            PauseReason::Reconcile,
+            &Decision::Retry
+        ));
+        assert!(!retries_a_decided_pause(
+            &state,
+            PauseReason::Reconcile,
+            &Decision::Keep
+        ));
+        // A pause that takes `retry` logs it as usual.
+        state.pending_pause = Some(PauseReason::UnstableTests);
+        state.decisions_since_pause = vec![Decision::Retry];
+        assert!(!retries_a_decided_pause(
+            &state,
+            PauseReason::UnstableTests,
+            &Decision::Retry
+        ));
     }
 }

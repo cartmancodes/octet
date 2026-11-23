@@ -160,14 +160,16 @@ fn a_child_that_outlives_its_leader_is_found_and_only_it_is_killed() {
         .pid;
 
     // On resume the child is found by its marker: ProcessesRunning, listing
-    // it alone.
+    // it alone, with its command.
     bench.resume(None, &[]).finish().expect_code(2);
     let records = bench.records();
     assert_eq!(last_pause(&records), PauseReason::ProcessesRunning);
+    let detail = pause_detail(&records);
     assert!(
-        pause_detail(&records).ends_with(&format!("[{marked}]")),
+        detail.contains(&format!("[{marked}]\n  {marked}: ")),
         "{records:#?}"
     );
+    assert!(!detail.contains(&format!("{unmarked}:")), "{detail}");
 
     // `kill` signals it and nothing else; the check runs again and finds the
     // child without the marker: unverified, never signalled.

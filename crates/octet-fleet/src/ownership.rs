@@ -399,10 +399,12 @@ mod platform {
     }
 
     /// The value of `OCTET_FLEET_ATTEMPT=`, which `ps -E` appends to the command, among its
-    /// whitespace-separated tokens.
-    fn marker_in(text: &str) -> Option<String> {
+    /// whitespace-separated tokens: the last one, since the environment follows the
+    /// arguments (an argument that merely spells a marker comes before the real one).
+    pub(super) fn marker_in(text: &str) -> Option<String> {
         let prefix = format!("{MARKER_VAR}=");
         text.split_whitespace()
+            .rev()
             .find_map(|token| token.strip_prefix(prefix.as_str()))
             .map(str::to_string)
     }
@@ -1072,6 +1074,12 @@ mod tests {
             info.command
         );
         assert!(platform::parse_line("not a line").is_none());
+        // An argument that spells a marker comes before the environment's.
+        let line = "  813   799   799 Mon Nov  3 10:11:12 2026     sh -c OCTET_FLEET_ATTEMPT=x/9 \
+                    HOME=/h OCTET_FLEET_ATTEMPT=r/1";
+        let info = platform::parse_line(line).expect("a line");
+        assert_eq!(info.marker.as_deref(), Some("r/1"));
+        assert_eq!(platform::marker_in("a b"), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -1096,46 +1104,51 @@ mod tests {
         }
     }
 
+    /// Made-up PIDs above every system's largest (Linux's `PID_MAX_LIMIT`
+    /// is 2^22, macOS's 99 999), so none is this test's own PID, which
+    /// `check` skips (in a container the test can run as PID 10 or 20).
+    const P: u32 = 4_200_000;
+
     #[test]
     fn ancestry_reaches_every_generation_whatever_the_list_order() {
         // 40 is listed before its parent 30, which is listed before its parent 20.
         let list = [
-            info(40, 30, 7, None),
-            info(30, 20, 7, None),
-            info(20, 10, 7, None),
-            info(10, 1, 7, Some("m")),
-            info(50, 1, 7, None),
-            info(60, 99, 8, None),
+            info(P + 40, P + 30, 7, None),
+            info(P + 30, P + 20, 7, None),
+            info(P + 20, P + 10, 7, None),
+            info(P + 10, 1, 7, Some("m")),
+            info(P + 50, 1, 7, None),
+            info(P + 60, P + 99, 8, None),
         ];
         assert_eq!(
             check(&list, "m", &[], &[], &[]),
-            ProcessCheck::Verified(vec![10, 20, 30, 40])
+            ProcessCheck::Verified(vec![P + 10, P + 20, P + 30, P + 40])
         );
         // The unrelated process in the registered group is the only unverified one, and only
         // when nothing is verified.
         assert_eq!(
             check(&list[4..], "m", &[], &[7], &[]),
-            ProcessCheck::Unverified(vec![50])
+            ProcessCheck::Unverified(vec![P + 50])
         );
     }
 
     #[test]
     fn a_released_parent_confers_nothing_on_its_children() {
         let list = [
-            info(10, 1, 7, Some("m")),
-            info(20, 10, 7, None),
-            info(30, 20, 7, None),
+            info(P + 10, 1, 7, Some("m")),
+            info(P + 20, P + 10, 7, None),
+            info(P + 30, P + 20, 7, None),
         ];
         // Releasing the middle one cuts its subtree off, not the rest.
         assert_eq!(
-            check(&list, "m", &[], &[], &[20]),
-            ProcessCheck::Verified(vec![10])
+            check(&list, "m", &[], &[], &[P + 20]),
+            ProcessCheck::Verified(vec![P + 10])
         );
         // Releasing the root leaves no verified process, and the children are not the run's.
-        assert_eq!(check(&list, "m", &[], &[], &[10]), ProcessCheck::Clear);
+        assert_eq!(check(&list, "m", &[], &[], &[P + 10]), ProcessCheck::Clear);
         assert_eq!(
-            check(&list, "m", &[], &[7], &[10]),
-            ProcessCheck::Unverified(vec![20, 30])
+            check(&list, "m", &[], &[7], &[P + 10]),
+            ProcessCheck::Unverified(vec![P + 20, P + 30])
         );
     }
 
@@ -1144,11 +1157,11 @@ mod tests {
         let own = std::process::id();
         // Something Octet itself started (the `ps` of a listing) is the child of a pid that is
         // never verified, even one carrying the marker.
-        let list = [info(own, 1, 7, Some("m")), info(900, own, 7, None)];
+        let list = [info(own, 1, 7, Some("m")), info(P + 900, own, 7, None)];
         assert_eq!(check(&list, "m", &[], &[], &[]), ProcessCheck::Clear);
         assert_eq!(
             check(&list, "m", &[], &[7], &[]),
-            ProcessCheck::Unverified(vec![900])
+            ProcessCheck::Unverified(vec![P + 900])
         );
     }
 
