@@ -8,9 +8,10 @@
 //! again to detect a write. [`diff`] renders the change between two trees.
 //!
 //! Every git command here turns `core.fsmonitor`, `core.untrackedCache` and
-//! `core.ignoreStat` off, so no stat cache can hide a change,
-//! and runs without the `GIT_*` variables a hook may have exported, so the
-//! repository is the one named by the working directory.
+//! `core.ignoreStat` off, so no stat cache can hide a change, and
+//! `core.splitIndex` off, so no index write leaves a file in the user's git
+//! directory; and it runs without the `GIT_*` variables a hook may have
+//! exported, so the repository is the one named by the working directory.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -20,14 +21,18 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-/// The config every git command runs with: no cache may hide a change.
-const CONFIG: [&str; 6] = [
+/// The config every git command runs with: no cache may hide a change, and
+/// the scratch index is written whole (a split index would write a
+/// `sharedindex.*` file into the user's git directory).
+const CONFIG: [&str; 8] = [
     "-c",
     "core.fsmonitor=false",
     "-c",
     "core.untrackedCache=false",
     "-c",
     "core.ignoreStat=false",
+    "-c",
+    "core.splitIndex=false",
 ];
 
 /// Variables an outer git (a hook, a script) exports that would point git at
@@ -486,6 +491,39 @@ mod tests {
             .await
             .expect("takes");
         (repo, tree)
+    }
+
+    /// The `sharedindex.*` files in `dir`'s git directory.
+    fn shared_indexes(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir.join(".git"))
+            .expect("git dir")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("sharedindex."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_split_index_repository_gets_no_new_shared_index() {
+        let dir = init();
+        sh(dir.path(), &["config", "core.splitIndex", "true"]);
+        // Every index write would write a new shared index.
+        sh(dir.path(), &["config", "splitIndex.maxPercentChange", "0"]);
+        write(dir.path(), "a.txt", "one\n");
+        commit_all(dir.path());
+        let before = shared_indexes(dir.path());
+        assert!(!before.is_empty(), "the repository uses a split index");
+        write(dir.path(), "b.txt", "two\n");
+        let scratch = TempDir::new("octet-fleet-scratch");
+        let (repo, tree) = snap(&dir, &scratch).await;
+        assert_eq!(paths(dir.path(), &tree), ["a.txt", "b.txt"]);
+        assert_eq!(shared_indexes(dir.path()), before);
+        // A second snapshot, from the scratch copy's own index, adds none either.
+        take(&repo, &scratch.path().join("index.tmp"))
+            .await
+            .expect("takes");
+        assert_eq!(shared_indexes(dir.path()), before);
     }
 
     #[tokio::test]

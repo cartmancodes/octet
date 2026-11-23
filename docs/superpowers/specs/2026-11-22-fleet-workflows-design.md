@@ -775,6 +775,27 @@ accepts that).
 
 ## Changed after review
 
+From the build and the final whole-branch review (after revision 5):
+
+- **Verified includes descendants**: a process is verified as the run's by the marker, by a PID
+  and start time Octet recorded, **or by being a descendant (by parent PID, to a fixed point) of a
+  verified process**. macOS hides the environment of Apple platform binaries (`/bin/sh`, `sleep`,
+  `git`) from `ps -E`, so the marker alone never verifies them, and a run's own shell children
+  would otherwise pause every run as unverified. A live verified parent really forked its child,
+  and an orphan is reparented to PID 1, so no stranger is adopted this way; released PIDs and
+  Octet's own PID are excluded first, and an Apple-binary orphan in a registered group stays
+  unverified (a pause, never a signal).
+- **Snapshots also set `-c core.splitIndex=false`**, so the scratch index is written whole: in a
+  split-index repository, `git add -A` on the copy would otherwise write a `sharedindex.*` file
+  into the user's git directory.
+- **A Drift pause shows the diff** as the diffstat between the recorded and the live tree plus the
+  exact `git diff <recorded> <live>` command; **open minor findings are listed at completion**
+  (text and the JSON `completed` event); **step IDs are `[A-Za-z0-9_-]+`**, refused at validation;
+  a `retry` at `transient_exhausted` starts a fresh transient streak; a Codex reset clock time
+  that passed within the last hour counts as now (the backoff applies), not tomorrow.
+- **Scratch clones have no `origin` remote**, so a vendor's `git push` from a read-only clone
+  cannot change the user's refs (the objects arrive through alternates).
+
 From the owner's third review (revision 5); all six findings applied to revision 4:
 
 - **Vendors start held**: a per-attempt gate is `Config.binary`; it records its PID, waits for

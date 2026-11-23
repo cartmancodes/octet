@@ -498,8 +498,11 @@ a writer on the work tree.
 > A writer is admitted only when no run other than the one being driven is listed.
 
 `run`, `resume` and `stop` all check that record first, and a refusal names the run to `resume`
-or `stop` first. Octet signals only processes it verifies as the run's (the marker, or a PID and
-start time it recorded):
+or `stop` first. Octet signals only processes it verifies as the run's: the marker, a PID and
+start time it recorded, or a descendant (by parent PID) of a verified process. The last rule is
+there because macOS hides the environment of Apple's own binaries (`/bin/sh`, `sleep`, `git`)
+from `ps`, so the marker cannot be seen on a run's shell children. A live verified parent really
+started its child, and an orphan is reparented to PID 1, so no stranger is verified this way.
 
 > `kill` signals **only verified processes** (SIGTERM, SIGKILL after 5 s), then the check runs
 > again.
