@@ -240,9 +240,11 @@ impl Driver {
     }
 
     /// The attempt's prompt: the contract's, with the patch inline when it
-    /// fits and in a file in `patch_dir` when it does not. An error (a
-    /// missing input, a prompt over the limit) is a local failure, as text;
-    /// nothing is ever cut.
+    /// fits and in a file in `patch_dir` when it does not; when the prompt is
+    /// still over the limit, documents, output tails and feedback go to
+    /// files there too ([`contract::fit`]). An error (a missing input, a
+    /// prompt over the limit with everything movable in a file) is a local
+    /// failure, as text; nothing is ever cut.
     #[expect(
         clippy::too_many_arguments,
         reason = "the prompt's inputs, each from a different source"
@@ -284,19 +286,27 @@ impl Driver {
             _ => None,
         };
         let history = self.history(state, dispatch, kept).await?;
+        let direct: Vec<&str> = match &step.refs {
+            Refs::Document { inputs } | Refs::Change { inputs } => inputs
+                .iter()
+                .map(|input| self.def.steps[input.document].id.as_str())
+                .collect(),
+            _ => Vec::new(),
+        };
         let inputs = PromptInputs {
             task: &self.file.task,
             documents: documents
                 .iter()
                 .map(|(id, text)| (id.as_str(), text.as_str()))
                 .collect(),
+            direct,
             patch: None,
             evidence: evidence.as_ref(),
             open_findings: open.iter().collect(),
             history,
         };
         let needs_patch = matches!(step.refs, Refs::Tests { .. } | Refs::ReviewChange { .. });
-        let prompt = if needs_patch {
+        let fitted = if needs_patch {
             let diff = |stat| snapshot::diff(&self.repo, &self.file.base_tree, tree, stat);
             let full = diff(false)
                 .await
@@ -306,15 +316,13 @@ impl Driver {
                     patch: Some(Patch::Inline(&full)),
                     ..inputs
                 };
-                contract::prompt(step, dispatch, &ids, &inputs)
+                contract::fit(step, dispatch, &ids, &inputs, patch_dir)?
             } else {
                 let stat = diff(true)
                     .await
                     .map_err(|error| format!("cannot make the patch's stat: {error}"))?;
                 let path = patch_dir.join(PATCH_FILE);
-                tokio::fs::write(&path, &full)
-                    .await
-                    .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+                write_file(&path, full.as_bytes()).await?;
                 let inputs = PromptInputs {
                     patch: Some(Patch::File {
                         stat: &stat,
@@ -322,20 +330,17 @@ impl Driver {
                     }),
                     ..inputs
                 };
-                contract::prompt(step, dispatch, &ids, &inputs)
+                contract::fit(step, dispatch, &ids, &inputs, patch_dir)?
             }
         } else {
-            contract::prompt(step, dispatch, &ids, &inputs)
+            contract::fit(step, dispatch, &ids, &inputs, patch_dir)?
         };
-        if prompt.len() > octet_core::PROMPT_LIMIT {
-            return Err(format!(
-                "the prompt for {} is {} bytes, over the {} byte limit; nothing was sent",
-                step.id,
-                prompt.len(),
-                octet_core::PROMPT_LIMIT
-            ));
+        // Beside the patch file, and like it written before the read-only
+        // step's `before` snapshot, so they are not a change of its clone.
+        for file in &fitted.files {
+            write_file(&file.path, file.text.as_bytes()).await?;
         }
-        Ok(prompt)
+        Ok(fitted.prompt)
     }
 
     /// The attempt's history, rendered: that it continues an interrupted
@@ -788,6 +793,13 @@ impl Driver {
         .await;
         Ok(Some(RunEnd::Completed))
     }
+}
+
+/// Writes a file a prompt names; an error is a local failure, as text.
+async fn write_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    tokio::fs::write(path, contents)
+        .await
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 /// The open findings of step `step_id`, in ID order.

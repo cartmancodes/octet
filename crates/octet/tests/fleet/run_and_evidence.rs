@@ -576,3 +576,37 @@ fn an_edit_between_commands_voids_the_pass_before_the_next_runs() {
     );
     bench.assert_passing_evidence_is_whole(&records, commands.len());
 }
+
+// ---- documents over the prompt budget ----------------------------------
+
+/// A 50 KB plan and 15 KB research make `review_plan`'s prompt too large to
+/// send inline: the research (upstream) goes to a file in the reviewer's
+/// clone, named in the prompt, and the review is not a change of its clone.
+/// The run completes.
+#[test]
+fn documents_over_the_prompt_budget_reach_the_step_as_files() {
+    let bench = Bench::new("octet-fleet-large-documents");
+    let workflow = bench.workflow(&research_plan_build(&["test -f feature.txt"]));
+    let research = format!("RESEARCH {}", "r".repeat(15 * 1024));
+    let plan = format!("PLAN {}", "p".repeat(50 * 1024));
+    let mut turns = small_turns();
+    turns["research#1"] = json!({"reply": research});
+    turns["plan#1"] = json!({"reply": plan});
+    turns["review_plan#1"] = json!({"reply": approve(&[])});
+    bench.script(&turns);
+    bench.run(&workflow, &[]).finish().expect_code(0);
+    let records = bench.records();
+    assert!(matches!(records.last(), Some(Record::Completed { .. })));
+    let plays = bench.plays_of("review_plan#1");
+    assert_eq!(plays.len(), 1, "{records:#?}");
+    let prompt = plays[0]["prompt"].as_str().unwrap();
+    assert!(prompt.len() <= 64 * 1024);
+    assert!(prompt.contains(&plan), "the plan under review is inline");
+    assert!(!prompt.contains(&research), "the research is not");
+    let cwd = plays[0]["cwd"].as_str().unwrap();
+    assert!(
+        prompt.contains(&format!("`{cwd}/octet-fleet-document-research.md`")),
+        "{cwd}: {}",
+        &prompt[..prompt.len().min(2000)]
+    );
+}

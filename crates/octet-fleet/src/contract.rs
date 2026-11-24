@@ -7,9 +7,9 @@
 //! reply into a typed [`Verdict`], applying the spec's validation order:
 //! block present and well-formed, `previous` exact, then consistency.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -92,6 +92,11 @@ pub struct PromptInputs<'a> {
     /// one is the document under review and the others are approved upstream
     /// documents; for every other step they are all approved documents.
     pub documents: Vec<(&'a str, &'a str)>,
+    /// The step IDs of the documents the step names as its own `inputs`:
+    /// direct inputs, which [`fit`] moves to a file only after every
+    /// upstream document and output tail. A document under review is always
+    /// a direct input.
+    pub direct: Vec<&'a str>,
     /// The patch `base..candidate`, for tests and change-review steps.
     pub patch: Option<Patch<'a>>,
     /// The evidence for the candidate under review.
@@ -132,7 +137,173 @@ pub struct Verdict {
 /// sections. A verdict step's prompt ends with the reply contract.
 #[must_use]
 pub fn prompt(step: &Step, dispatch: &Dispatch, ids: &HeaderIds, inputs: &PromptInputs) -> String {
-    build(step, dispatch, ids, inputs, inputs.patch)
+    build(step, dispatch, ids, inputs, inputs.patch, &Filed::default())
+}
+
+/// A section moved out of a prompt: the file the prompt names, and its whole
+/// text, which the caller writes before the prompt is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionFile {
+    /// Where the prompt says it is.
+    pub path: PathBuf,
+    /// The section's text, in full.
+    pub text: String,
+}
+
+/// A prompt that fits [`octet_core::PROMPT_LIMIT`], and the files it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fitted {
+    /// The prompt.
+    pub prompt: String,
+    /// The sections it names as files; empty when everything fits inline.
+    pub files: Vec<SectionFile>,
+}
+
+/// The sections [`build`] names as files instead of inlining, by index.
+#[derive(Debug, Clone, Default)]
+struct Filed {
+    /// Into [`PromptInputs::documents`].
+    documents: BTreeMap<usize, PathBuf>,
+    /// Into the evidence's results: each command's output tail.
+    tails: BTreeMap<usize, PathBuf>,
+    /// Into [`PromptInputs::history`].
+    feedback: BTreeMap<usize, PathBuf>,
+}
+
+/// One section [`fit`] can move to a file.
+#[derive(Debug, Clone, Copy)]
+enum Bulky {
+    Document(usize),
+    Tail(usize),
+    Feedback(usize),
+}
+
+/// The prompt for a step, as [`prompt`] builds it when it fits
+/// [`octet_core::PROMPT_LIMIT`]. When it does not, bulky sections move to
+/// files in `dir`, the largest first within each group, until it fits:
+/// upstream documents, then output tails (the evidence's and the failing
+/// evidence in the feedback), then the step's direct inputs. Each is named in
+/// the prompt with the instruction to read it in full; nothing is cut. The
+/// patch is not moved here: the caller decides that first ([`fits_inline`]).
+///
+/// # Errors
+///
+/// A line naming the largest section left inline when the prompt is over the
+/// limit with every movable section in a file (the task, say).
+pub fn fit(
+    step: &Step,
+    dispatch: &Dispatch,
+    ids: &HeaderIds,
+    inputs: &PromptInputs,
+    dir: &Path,
+) -> Result<Fitted, String> {
+    let limit = octet_core::PROMPT_LIMIT;
+    let mut filed = Filed::default();
+    let mut text = build(step, dispatch, ids, inputs, inputs.patch, &filed);
+    if text.len() <= limit {
+        return Ok(Fitted {
+            prompt: text,
+            files: Vec::new(),
+        });
+    }
+    let review_last = matches!(step.refs, Refs::ReviewDocument { .. });
+    let mut movable: Vec<(u8, usize, Bulky)> = Vec::new();
+    for (n, (id, body)) in inputs.documents.iter().enumerate() {
+        let direct = inputs.direct.contains(id) || (review_last && n + 1 == inputs.documents.len());
+        movable.push((u8::from(direct) * 2, body.len(), Bulky::Document(n)));
+    }
+    if let Some(evidence) = inputs.evidence {
+        for (n, result) in evidence.results.iter().enumerate() {
+            movable.push((1, result.tail.len(), Bulky::Tail(n)));
+        }
+    }
+    for (n, item) in inputs.history.iter().enumerate() {
+        movable.push((1, item.len(), Bulky::Feedback(n)));
+    }
+    movable.sort_by_key(|&(group, size, _)| (group, std::cmp::Reverse(size)));
+    let mut files = Vec::new();
+    for (_, _, bulky) in movable {
+        let (path, body) = match bulky {
+            Bulky::Document(n) => {
+                let (id, body) = inputs.documents[n];
+                let path = dir.join(format!("octet-fleet-document-{id}.md"));
+                filed.documents.insert(n, path.clone());
+                (path, body)
+            }
+            Bulky::Tail(n) => {
+                let tail = inputs.evidence.map_or("", |e| e.results[n].tail.as_str());
+                let path = dir.join(format!("octet-fleet-output-{}.txt", n + 1));
+                filed.tails.insert(n, path.clone());
+                (path, tail)
+            }
+            Bulky::Feedback(n) => {
+                let path = dir.join(format!("octet-fleet-feedback-{}.md", n + 1));
+                filed.feedback.insert(n, path.clone());
+                (path, inputs.history[n].as_str())
+            }
+        };
+        files.push(SectionFile {
+            path,
+            text: body.to_owned(),
+        });
+        text = build(step, dispatch, ids, inputs, inputs.patch, &filed);
+        if text.len() <= limit {
+            return Ok(Fitted {
+                prompt: text,
+                files,
+            });
+        }
+    }
+    let (name, size) = largest_inline(step, inputs, &filed);
+    Err(format!(
+        "the prompt for {} is {} bytes with every document and output in a file, over the {limit}          byte limit; its largest section, {name}, is {size} bytes; nothing was sent",
+        step.id,
+        text.len(),
+    ))
+}
+
+/// The largest section [`build`] still inlines with `filed`, by name.
+fn largest_inline(step: &Step, inputs: &PromptInputs, filed: &Filed) -> (&'static str, usize) {
+    let mut sizes = vec![
+        ("the instructions", step.instructions.len()),
+        ("the task", inputs.task.len()),
+        (
+            "the open findings",
+            inputs
+                .open_findings
+                .iter()
+                .map(|f| finding_line(f).len())
+                .sum(),
+        ),
+    ];
+    if let Some(Patch::File { stat, .. }) = inputs.patch {
+        sizes.push(("the patch's diffstat", stat.len()));
+    }
+    if let Some(Patch::Inline(patch)) = inputs.patch {
+        sizes.push(("the patch", patch.len()));
+    }
+    if let Some(evidence) = inputs.evidence {
+        sizes.push((
+            "the test evidence",
+            evidence_text(evidence, &filed.tails).len(),
+        ));
+    }
+    if step.kind == Kind::Verdict {
+        sizes.push(("the reply format", CONTRACT.len()));
+    }
+    sizes
+        .into_iter()
+        .max_by_key(|&(_, size)| size)
+        .unwrap_or(("the header", 0))
+}
+
+/// The text a section moved to the file `path` is replaced with.
+fn in_file(what: &str, path: &Path) -> String {
+    format!(
+        "{what} is too large to include here. It is the file `{}`. Read it in full; your work \
+         must cover all of it.",
+        path.display()
+    )
 }
 
 /// Whether the prompt fits [`octet_core::PROMPT_LIMIT`] with `patch` inline.
@@ -145,7 +316,16 @@ pub fn fits_inline(
     inputs: &PromptInputs,
     patch: &str,
 ) -> bool {
-    build(step, dispatch, ids, inputs, Some(Patch::Inline(patch))).len() <= octet_core::PROMPT_LIMIT
+    build(
+        step,
+        dispatch,
+        ids,
+        inputs,
+        Some(Patch::Inline(patch)),
+        &Filed::default(),
+    )
+    .len()
+        <= octet_core::PROMPT_LIMIT
 }
 
 /// The reply contract a verdict step ends with: the spec's block verbatim.
@@ -175,6 +355,7 @@ fn build(
     ids: &HeaderIds,
     inputs: &PromptInputs,
     patch: Option<Patch>,
+    filed: &Filed,
 ) -> String {
     let mut out = format!(
         "{HEADER_PREFIX}step={} round={} attempt={} candidate={} tree={}]\n",
@@ -190,7 +371,10 @@ fn build(
         } else {
             format!("Approved document ({id})")
         };
-        section(&mut out, &title, text);
+        match filed.documents.get(&n) {
+            Some(path) => section(&mut out, &title, &in_file("This document", path)),
+            None => section(&mut out, &title, text),
+        }
     }
     match patch {
         None => {}
@@ -212,11 +396,20 @@ fn build(
         section(
             &mut out,
             &format!("Test evidence for {}", evidence.candidate.0),
-            &evidence_text(evidence),
+            &evidence_text(evidence, &filed.tails),
         );
     }
     if !inputs.history.is_empty() {
-        section(&mut out, "Feedback", &inputs.history.join("\n\n"));
+        let items: Vec<String> = inputs
+            .history
+            .iter()
+            .enumerate()
+            .map(|(n, item)| match filed.feedback.get(&n) {
+                Some(path) => in_file("This feedback", path),
+                None => item.clone(),
+            })
+            .collect();
+        section(&mut out, "Feedback", &items.join("\n\n"));
     }
     let verdict = step.kind == Kind::Verdict;
     if verdict || !inputs.open_findings.is_empty() {
@@ -273,9 +466,10 @@ fn finding_line(f: &Finding) -> String {
     }
 }
 
-fn evidence_text(e: &EvidenceSummary) -> String {
+/// The evidence section; the tails in `filed` are named as files.
+fn evidence_text(e: &EvidenceSummary, filed: &BTreeMap<usize, PathBuf>) -> String {
     let mut out = format!("Candidate {} (tree {}).", e.candidate.0, e.tree);
-    for r in &e.results {
+    for (n, r) in e.results.iter().enumerate() {
         let outcome = if r.timed_out {
             "timed out".to_owned()
         } else {
@@ -288,7 +482,10 @@ fn evidence_text(e: &EvidenceSummary) -> String {
             r.command,
             r.pre_tree,
             r.post_tree,
-            fence(&r.tail)
+            filed.get(&n).map_or_else(
+                || fence(&r.tail),
+                |path| in_file("The end of its output", path)
+            )
         )
         .ok();
     }
@@ -510,6 +707,7 @@ mod tests {
         PromptInputs {
             task,
             documents: Vec::new(),
+            direct: Vec::new(),
             patch: None,
             evidence: None,
             open_findings: Vec::new(),
@@ -890,5 +1088,193 @@ mod tests {
         assert!(p.contains("a.rs | 9 +++++++++"));
         assert!(p.contains("whole patch"));
         assert!(p.len() <= octet_core::PROMPT_LIMIT);
+    }
+
+    fn review_plan_step() -> Step {
+        step(
+            "review_plan",
+            Kind::Verdict,
+            Refs::ReviewDocument { document: 2 },
+        )
+    }
+
+    #[test]
+    fn upstream_documents_go_to_files_first_and_are_kept_whole() {
+        // review_plan with a 50 KB plan and 15 KB research is over the limit
+        // inline; the research (upstream) moves to a file, the plan (under
+        // review) stays.
+        let research = "r".repeat(15 * 1024);
+        let plan = "p".repeat(50 * 1024);
+        let mut i = inputs("TASK");
+        i.documents = vec![("research", &research), ("plan", &plan)];
+        let rp = review_plan_step();
+        assert!(prompt(&rp, &dispatch(1), &ids(), &i).len() > octet_core::PROMPT_LIMIT);
+        let dir = Path::new("/scratch/clone");
+        let fitted = fit(&rp, &dispatch(1), &ids(), &i, dir).unwrap();
+        assert!(fitted.prompt.len() <= octet_core::PROMPT_LIMIT);
+        assert_eq!(
+            fitted.files,
+            vec![SectionFile {
+                path: dir.join("octet-fleet-document-research.md"),
+                text: research.clone(),
+            }]
+        );
+        assert!(fitted.prompt.contains(&plan), "the direct input is inline");
+        assert!(!fitted.prompt.contains(&research[..100]));
+        assert!(fitted.prompt.contains(
+            "It is the file `/scratch/clone/octet-fleet-document-research.md`. Read it in full"
+        ));
+        assert!(
+            fitted.prompt.trim_end().ends_with("```"),
+            "the contract comes last"
+        );
+    }
+
+    #[test]
+    fn a_direct_input_moves_only_after_upstream_documents() {
+        let coder = step(
+            "implement",
+            Kind::Change,
+            Refs::Change {
+                inputs: vec![Input {
+                    document: 2,
+                    approval: 3,
+                }],
+            },
+        );
+        let research = "r".repeat(10 * 1024);
+        let plan = "p".repeat(60 * 1024);
+        let mut i = inputs("TASK");
+        i.documents = vec![("research", &research), ("plan", &plan)];
+        i.direct = vec!["plan"];
+        let dir = Path::new("/attempt");
+        let fitted = fit(&coder, &dispatch(1), &ids(), &i, dir).unwrap();
+        let moved: Vec<&Path> = fitted.files.iter().map(|f| f.path.as_path()).collect();
+        assert_eq!(moved, [dir.join("octet-fleet-document-research.md")]);
+        assert!(fitted.prompt.contains(&plan));
+
+        // A direct input too large on its own goes to a file as well.
+        let plan = "p".repeat(70 * 1024);
+        i.documents = vec![("research", &research), ("plan", &plan)];
+        let fitted = fit(&coder, &dispatch(1), &ids(), &i, dir).unwrap();
+        assert!(fitted.prompt.len() <= octet_core::PROMPT_LIMIT);
+        let moved: Vec<&Path> = fitted.files.iter().map(|f| f.path.as_path()).collect();
+        assert_eq!(
+            moved,
+            [
+                dir.join("octet-fleet-document-research.md"),
+                dir.join("octet-fleet-document-plan.md")
+            ]
+        );
+        assert_eq!(fitted.files[1].text, plan);
+    }
+
+    #[test]
+    fn three_full_output_tails_fit_through_files() {
+        let rc = step(
+            "review_change",
+            Kind::Verdict,
+            Refs::ReviewChange {
+                change: 4,
+                evidence: 5,
+            },
+        );
+        let tail = |c: char| c.to_string().repeat(16 * 1024);
+        let tails = [tail('a'), tail('b'), tail('c')];
+        let ev = EvidenceSummary {
+            candidate: CandidateId(5),
+            tree: "tree5".to_owned(),
+            results: ["cargo fmt --check", "cargo clippy", "cargo test"]
+                .iter()
+                .zip(&tails)
+                .map(|(command, tail)| CommandSummary {
+                    command: (*command).to_owned(),
+                    exit: Some(0),
+                    timed_out: false,
+                    pre_tree: "tree5".to_owned(),
+                    post_tree: "tree5".to_owned(),
+                    tail: tail.clone(),
+                })
+                .collect(),
+        };
+        let plan = "p".repeat(1024);
+        let patch = "+".repeat(16 * 1024);
+        let mut i = inputs("TASK");
+        i.documents = vec![("plan", &plan)];
+        i.patch = Some(Patch::Inline(&patch));
+        i.evidence = Some(&ev);
+        assert!(prompt(&rc, &dispatch(1), &ids(), &i).len() > octet_core::PROMPT_LIMIT);
+        let dir = Path::new("/scratch/clone");
+        let fitted = fit(&rc, &dispatch(1), &ids(), &i, dir).unwrap();
+        assert!(fitted.prompt.len() <= octet_core::PROMPT_LIMIT);
+        // The upstream plan first, then a tail; each file holds its whole text.
+        assert_eq!(
+            fitted.files[0].path,
+            dir.join("octet-fleet-document-plan.md")
+        );
+        assert_eq!(fitted.files[1].path, dir.join("octet-fleet-output-1.txt"));
+        assert_eq!(fitted.files[1].text, tails[0]);
+        assert!(fitted.prompt.contains("The end of its output is too large"));
+        assert!(
+            fitted
+                .prompt
+                .contains("`/scratch/clone/octet-fleet-output-1.txt`")
+        );
+        assert!(fitted.prompt.contains("### `cargo fmt --check`: exit 0"));
+        assert!(fitted.prompt.contains(&patch), "the patch stays inline");
+
+        // The coder's failing evidence (feedback) moves the same way.
+        let coder = step(
+            "implement",
+            Kind::Change,
+            Refs::Change { inputs: Vec::new() },
+        );
+        let mut i = inputs("TASK");
+        i.history = tails.to_vec();
+        i.history.push("x".repeat(16 * 1024));
+        let fitted = fit(&coder, &dispatch(2), &ids(), &i, dir).unwrap();
+        assert!(fitted.prompt.len() <= octet_core::PROMPT_LIMIT);
+        assert_eq!(fitted.files.len(), 1);
+        assert_eq!(fitted.files[0].path, dir.join("octet-fleet-feedback-1.md"));
+        assert!(fitted.prompt.contains("This feedback is too large"));
+    }
+
+    #[test]
+    fn a_prompt_that_fits_is_unchanged_and_names_no_file() {
+        let tester = step(
+            "test",
+            Kind::Tests,
+            Refs::Tests {
+                change: 4,
+                commands: vec!["x".to_owned()],
+                timeout_secs: 60,
+            },
+        );
+        let plan = "p".repeat(30 * 1024);
+        let path = Path::new("/attempt/octet-fleet.patch");
+        let mut i = inputs("TASK");
+        i.documents = vec![("plan", &plan)];
+        i.patch = Some(Patch::File {
+            stat: " a.rs | 9 +++++++++",
+            path,
+        });
+        let fitted = fit(&tester, &dispatch(1), &ids(), &i, Path::new("/attempt")).unwrap();
+        assert_eq!(fitted.prompt, prompt(&tester, &dispatch(1), &ids(), &i));
+        assert!(fitted.files.is_empty());
+        i.patch = Some(Patch::Inline("diff --git a/x b/x"));
+        let fitted = fit(&tester, &dispatch(1), &ids(), &i, Path::new("/attempt")).unwrap();
+        assert_eq!(fitted.prompt, prompt(&tester, &dispatch(1), &ids(), &i));
+        assert!(fitted.files.is_empty());
+    }
+
+    #[test]
+    fn a_task_too_large_for_any_prompt_is_named() {
+        let task = "t".repeat(octet_core::PROMPT_LIMIT);
+        let research = "r".repeat(1024);
+        let mut i = inputs(&task);
+        i.documents = vec![("research", &research)];
+        let err = fit(&doc_step("plan"), &dispatch(1), &ids(), &i, Path::new("/a")).unwrap_err();
+        assert!(err.contains("the task"), "{err}");
+        assert!(err.contains("nothing was sent"), "{err}");
     }
 }

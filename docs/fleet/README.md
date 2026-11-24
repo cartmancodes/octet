@@ -161,6 +161,16 @@ exec codex -c model="gpt-5.6-terra" -c model_reasoning_effort="low" "$@"
 A role is `kind` and `instructions`. The instructions open the step's prompt; Octet adds the
 task, the artifacts the step builds on and, for verdicts, the reply format.
 
+A prompt is at most 64 KiB. When the patch (`base..candidate`, for tests and change reviews) would
+take it over, the prompt carries the patch's diffstat and the whole patch is the file
+`octet-fleet.patch`: in the reviewer's scratch clone, or in `<run>/attempts/<n>/` for a write
+step. If the prompt is still too large, the documents further up the chain go to files beside
+it (`octet-fleet-document-<step>.md`), largest first, then the command output tails and failing
+evidence (`octet-fleet-output-<n>.txt`, `octet-fleet-feedback-<n>.md`), and last the step's own
+inputs. Each file is named in the prompt with the instruction to read it in full; nothing is
+cut. Only a prompt still too large with all of these in files (a task over 64 KiB, say) pauses
+`local_failure`, naming the section that is too large.
+
 ### Steps
 
 Every step has an `id` (one or more ASCII letters, digits, `_` and `-`; anything else, such as
