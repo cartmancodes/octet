@@ -95,7 +95,10 @@ pub struct Repo {
 }
 
 /// The one place a git [`Command`] is built: runs in `dir`, with the fixed
-/// config and without the inherited `GIT_*` variables.
+/// config and without the inherited `GIT_*` variables, in a process group of
+/// its own, so a terminal's Ctrl+C (sent to the whole foreground group)
+/// reaches Octet, which decides what to interrupt, and not a snapshot half
+/// way through.
 pub(crate) fn command<I, S>(dir: &Path, args: I) -> Command
 where
     I: IntoIterator<Item = S>,
@@ -105,6 +108,7 @@ where
     cmd.args(CONFIG)
         .args(args)
         .current_dir(dir)
+        .process_group(0)
         .kill_on_drop(true);
     for name in INHERITED {
         cmd.env_remove(name);

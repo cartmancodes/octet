@@ -352,10 +352,11 @@ mod platform {
 
     use super::{MARKER_VAR, OwnershipError, ProcessInfo};
 
-    /// `ps` with the fixed-width-free `lstart` form `Www Mmm dd hh:mm:ss yyyy`.
+    /// `ps` with the fixed-width-free `lstart` form `Www Mmm dd hh:mm:ss yyyy`, in a process
+    /// group of its own: a terminal's Ctrl+C is for Octet, not for its listing.
     fn ps() -> Command {
         let mut cmd = Command::new("ps");
-        cmd.env("LC_ALL", "C").kill_on_drop(true);
+        cmd.env("LC_ALL", "C").process_group(0).kill_on_drop(true);
         cmd
     }
 

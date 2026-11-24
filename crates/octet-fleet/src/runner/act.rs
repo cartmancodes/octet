@@ -451,12 +451,19 @@ impl Driver {
         self.fail(attempt, failure).await
     }
 
-    /// Logs `failure` for `attempt`.
+    /// Logs `failure` for `attempt`. A local failure while a signal is
+    /// pending is the signal's doing (a helper it reached, an observation it
+    /// cut short): the attempt is interrupted instead.
     pub(super) async fn fail(
         &mut self,
         attempt: AttemptId,
         failure: Failure,
     ) -> Result<Flow, RunnerError> {
+        if matches!(failure, Failure::LocalFailure { .. })
+            && let Some(signal) = crate::signal_now(Some(&self.io.signals))
+        {
+            return self.interrupted(Some(attempt), signal).await.map(Some);
+        }
         let outcome = format!("failed: {}", tag(&failure));
         self.append(&Record::AttemptFailed { attempt, failure })
             .await?;

@@ -175,11 +175,14 @@ fn local_now() -> Option<LocalNow> {
 
 /// `program`'s standard output when it exits successfully within `limit`;
 /// `None` (and the process killed) otherwise. Its output is a line, so it
-/// cannot fill the pipe while it is waited for.
+/// cannot fill the pipe while it is waited for. It runs in a process group
+/// of its own: a terminal's Ctrl+C is for Octet.
 fn run_bounded(program: &str, args: &[&str], limit: std::time::Duration) -> Option<Vec<u8>> {
     use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
     let mut child = std::process::Command::new(program)
         .args(args)
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

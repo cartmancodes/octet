@@ -1,14 +1,15 @@
 //! Release test 13, "Clean interrupts": Ctrl+C (SIGINT) during research,
-//! after a coder edit, and during evidence. Each persisted log maps to
-//! exactly one row of the recovery table, and none asks for a decision about
-//! the interrupt itself.
+//! after a coder edit, and during evidence; and to the whole process group,
+//! as a terminal sends it, while a snapshot's git runs. Each persisted log
+//! maps to exactly one row of the recovery table, and none asks for a
+//! decision about the interrupt itself.
 
 use octet_fleet::record::{AttemptId, PauseReason, Record};
 use serde_json::json;
 
 use crate::common::{
-    Bench, Octet, await_path, await_until, blocking_once, last_attempt_of, last_pause, lines_of,
-    small, small_turns, started,
+    Bench, Octet, await_path, await_until, blocking_once, git_hold, last_attempt_of, last_pause,
+    lines_of, played_turn, small, small_turns, started,
 };
 
 /// Interrupts `octet` with SIGINT: it exits 130, and its log ends with the
@@ -197,4 +198,79 @@ fn an_interrupt_during_evidence_runs_the_evidence_again_from_command_zero() {
     assert_eq!(commands, [(0, 0), (0, 0)]);
     assert_eq!(lines_of(&runs), 2);
     bench.assert_passing_evidence_is_whole(&records, 1);
+}
+
+/// Ctrl+C from a terminal reaches the whole foreground process group. Sent
+/// while Octet waits for the `git` of the snapshot that accepts the coder's
+/// finished turn, it reaches only Octet: that `git` (in a group of its own)
+/// completes, the coder's change is accepted, and the run pauses for the
+/// interrupt with nothing failed. `resume` needs no decision and completes.
+#[test]
+fn a_group_interrupt_during_a_snapshot_leaves_the_snapshot_whole() {
+    let bench = Bench::new("octet-fleet-sigint-group");
+    let workflow = bench.workflow(&small(&["test -f feature.txt"], 1));
+    bench.script(&small_turns());
+    // Octet runs no git while a vendor's turn runs: the first git after the
+    // coder's turn is played is the acceptance snapshot's.
+    let hold = git_hold(&bench, &played_turn(&bench, "implement#1"), false);
+    let mut octet = bench.run(&workflow, &[("PATH", hold.path.as_os_str())]);
+    await_path(&mut octet, &hold.held);
+    octet.signal_group(libc::SIGINT);
+    std::fs::write(&hold.go, "").unwrap();
+    octet.finish().expect_code(130);
+    assert!(hold.survived.exists(), "the held git died of the interrupt");
+
+    let records = bench.records();
+    assert!(
+        !records
+            .iter()
+            .any(|record| matches!(record, Record::AttemptFailed { .. })),
+        "{records:#?}"
+    );
+    let implement = last_attempt_of(&records, "implement").unwrap();
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            Record::AttemptFinished { attempt, .. } if *attempt == implement
+        )),
+        "{records:#?}"
+    );
+    assert_eq!(last_pause(&records), PauseReason::Interrupted);
+
+    bench.resume(None, &[]).finish().expect_code(0);
+    let records = bench.records();
+    assert!(matches!(records.last(), Some(Record::Completed { .. })));
+    no_decision_about_the_interrupt(&records);
+    assert_eq!(bench.plays_of("implement#1").len(), 1);
+}
+
+/// Belt and braces: a snapshot that fails while a signal is pending (its
+/// git, say, killed by the same Ctrl+C) interrupts the attempt rather than
+/// failing it. The coder's edit is then an interrupted attempt's, which
+/// `resume` reconciles, asking nothing about the interrupt.
+#[test]
+fn a_snapshot_that_fails_with_a_signal_pending_interrupts_the_attempt() {
+    let bench = Bench::new("octet-fleet-sigint-failed-snapshot");
+    let workflow = bench.workflow(&small(&["test -f feature.txt"], 1));
+    bench.script(&small_turns());
+    let hold = git_hold(&bench, &played_turn(&bench, "implement#1"), true);
+    let mut octet = bench.run(&workflow, &[("PATH", hold.path.as_os_str())]);
+    await_path(&mut octet, &hold.held);
+    octet.signal(libc::SIGINT);
+    std::fs::write(&hold.go, "").unwrap();
+    let implement = interrupt(&bench, octet, "implement");
+    assert!(hold.survived.exists());
+    let records = bench.records();
+    assert!(
+        !records
+            .iter()
+            .any(|record| matches!(record, Record::AttemptFailed { .. })),
+        "{records:#?}"
+    );
+
+    bench.resume(None, &[]).finish().expect_code(2);
+    let records = bench.records();
+    assert_eq!(last_pause(&records), PauseReason::Reconcile);
+    no_decision_about_the_interrupt(&records);
+    assert_eq!(last_attempt_of(&records, "implement"), Some(implement));
 }

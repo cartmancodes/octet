@@ -772,6 +772,14 @@ impl Octet {
         assert_eq!(unsafe { libc::kill(self.pid(), signal) }, 0);
     }
 
+    /// Sends `signal` to `octet`'s whole process group, as a terminal sends
+    /// Ctrl+C to its foreground group; `octet` must still be running.
+    pub(crate) fn signal_group(&mut self, signal: i32) {
+        assert!(self.running(), "octet ended: {}", self.output_so_far());
+        // SAFETY: killpg(2) of the group this unreaped child leads.
+        assert_eq!(unsafe { libc::killpg(self.pid(), signal) }, 0);
+    }
+
     /// SIGKILLs `octet` alone (not its group) and reaps it.
     pub(crate) fn sigkill(&mut self) {
         // SAFETY: kill(2) of a child this test spawned and has not reaped.
@@ -1187,6 +1195,67 @@ pub(crate) fn git_tripwire(bench: &Bench, when: &str) -> (std::ffi::OsString, Pa
     )
     .unwrap();
     (path, fired)
+}
+
+/// A git hold: a `PATH` with a `git` first on it that, the first time Octet
+/// runs `git` while the shell condition `when` holds, creates `held` and
+/// waits (at most five minutes) for `go` before running the real `git`,
+/// creating `survived` once it is let go; or, when `fails`, exiting 1
+/// then instead (a helper the signal killed). Every other call runs the
+/// real `git` at once.
+pub(crate) struct GitHold {
+    pub(crate) path: std::ffi::OsString,
+    pub(crate) held: PathBuf,
+    pub(crate) go: PathBuf,
+    pub(crate) survived: PathBuf,
+}
+
+/// The absolute path of `program` on this `PATH`.
+fn real(program: &str) -> String {
+    let out = Command::new("sh")
+        .args(["-c", &format!("command -v {program}")])
+        .output()
+        .unwrap();
+    let found = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    assert!(Path::new(&found).is_absolute(), "{found:?}");
+    found
+}
+
+/// A [`GitHold`] for condition `when`.
+pub(crate) fn git_hold(bench: &Bench, when: &str, fails: bool) -> GitHold {
+    let (real_git, real_sleep) = (real("git"), real("sleep"));
+    let held = bench.side("git-held");
+    let go = bench.side("git-go");
+    let survived = bench.side("git-survived");
+    let bin = bench.side("git-hold-bin");
+    octet_testkit::write_script(
+        &bin,
+        "git",
+        &format!(
+            "if [ ! -e '{held}' ] && {{ {when} ; }}; then\n\
+             : > '{held}'\n\
+             n=0\n\
+             while [ ! -e '{go}' ] && [ $n -lt 30000 ]; do '{real_sleep}' 0.01; n=$((n + 1)); done\n\
+             : > '{survived}'\n\
+             {fail}\n\
+             fi\n\
+             exec '{real_git}' \"$@\"",
+            held = held.display(),
+            go = go.display(),
+            survived = survived.display(),
+            fail = if fails { "exit 1" } else { ":" },
+        ),
+    );
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    GitHold {
+        path,
+        held,
+        go,
+        survived,
+    }
 }
 
 /// A `PATH` with a `sleep` first on it that, while the file it returns

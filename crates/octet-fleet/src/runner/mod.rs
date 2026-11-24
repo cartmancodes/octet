@@ -565,7 +565,15 @@ impl Driver {
     /// local failure that is not logged leaves the pending pause in force:
     /// the user is asked about it, or, when it already has its decision, to
     /// `retry` (the decision then stands).
+    ///
+    /// A local failure while a signal is pending is the signal's doing: the
+    /// run is interrupted instead.
     async fn pause(&mut self, reason: PauseReason, detail: String) -> Result<RunEnd, RunnerError> {
+        if reason == PauseReason::LocalFailure
+            && let Some(signal) = signal_now(Some(&self.io.signals))
+        {
+            return self.interrupted(None, signal).await;
+        }
         let view = self.load().await?;
         let pending = view.state.pending_pause;
         let detail = if pending != Some(reason) && reason == PauseReason::Drift {
