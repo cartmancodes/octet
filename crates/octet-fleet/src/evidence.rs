@@ -51,9 +51,10 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 /// each held spawn ([`EvidenceRun::pause_hook`]), around a vendor's
 /// registration ([`crate::step::AttemptPlan::pause_hook`]), and at the
 /// tester-to-evidence handoff, with the tester's tree proposed and not yet
-/// committed (`handoff-<attempt>`). The runner reads it. Never set it
-/// outside tests: each pause waits (at most five minutes, or until the run
-/// is interrupted) for a file a test writes.
+/// committed (`handoff-<attempt>`). The runner reads it; `octet fleet` also
+/// creates `signalled-<SIGNAL>` there once a signal it received is visible
+/// to the run. Never set it outside tests: each pause waits (at most five
+/// minutes, or until the run is interrupted) for a file a test writes.
 pub const TEST_PAUSE_ENV: &str = "OCTET_FLEET_TEST_PAUSE_DIR";
 
 /// The pause hook that `value`, the [`TEST_PAUSE_ENV`] variable, names: none

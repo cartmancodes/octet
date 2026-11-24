@@ -487,6 +487,12 @@ fn watch_signals() -> Result<Signals, CliError> {
             if tx.send(Some(name)).is_err() {
                 break;
             }
+            // Tests only: the run can now see the signal.
+            if let Some(dir) = octet_fleet::evidence::pause_hook_from(std::env::var_os(
+                octet_fleet::evidence::TEST_PAUSE_ENV,
+            )) {
+                let _ = std::fs::write(dir.join(format!("signalled-{name}")), "");
+            }
         }
     });
     Ok(rx)

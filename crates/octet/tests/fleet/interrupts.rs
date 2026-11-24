@@ -7,9 +7,12 @@
 use octet_fleet::record::{AttemptId, PauseReason, Record};
 use serde_json::json;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::common::{
-    Bench, Octet, await_path, await_until, blocking_once, git_hold, last_attempt_of, last_pause,
-    lines_of, played_turn, small, small_turns, started,
+    Bench, Octet, answer_pauses, await_path, await_until, blocking_once, git_hold, last_attempt_of,
+    last_pause, lines_of, pause_env, played_turn, small, small_turns, started,
 };
 
 /// Interrupts `octet` with SIGINT: it exits 130, and its log ends with the
@@ -254,11 +257,21 @@ fn a_snapshot_that_fails_with_a_signal_pending_interrupts_the_attempt() {
     let workflow = bench.workflow(&small(&["test -f feature.txt"], 1));
     bench.script(&small_turns());
     let hold = git_hold(&bench, &played_turn(&bench, "implement#1"), true);
-    let mut octet = bench.run(&workflow, &[("PATH", hold.path.as_os_str())]);
+    // The test pauses are on only for Octet's marker that it has seen the
+    // signal; every pause is let through.
+    let pauses = bench.side("pauses");
+    std::fs::create_dir_all(&pauses).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    answer_pauses(pauses.clone(), Arc::clone(&stop), || {});
+    let [pause] = pause_env(&pauses);
+    let mut octet = bench.run(&workflow, &[pause, ("PATH", hold.path.as_os_str())]);
     await_path(&mut octet, &hold.held);
     octet.signal(libc::SIGINT);
+    // The held git fails only once the run can see the signal.
+    await_path(&mut octet, &pauses.join("signalled-SIGINT"));
     std::fs::write(&hold.go, "").unwrap();
     let implement = interrupt(&bench, octet, "implement");
+    stop.store(true, Ordering::Relaxed);
     assert!(hold.survived.exists());
     let records = bench.records();
     assert!(
