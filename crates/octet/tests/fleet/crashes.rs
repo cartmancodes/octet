@@ -182,7 +182,7 @@ fn crash_before_registration(name: &str, point: &str) {
     assert_eq!(started(&after), started(&records));
     // Nor does a new run: the work tree is still this run's.
     let other = bench.run(&workflow, &[]).finish();
-    other.expect_code(1);
+    other.expect_code(2);
     assert!(other.stderr.contains(&run), "{}", other.stderr);
     assert_eq!(bench.run_ids(), std::slice::from_ref(&run));
     assert!(alive(gate));

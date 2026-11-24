@@ -107,7 +107,7 @@ fn a_second_run_is_refused_and_an_edit_to_a_paused_run_is_drift() {
 
     // A second run on the same work tree is refused, and leaves no run.
     let other = bench.run(&workflow, &[]).finish();
-    other.expect_code(1);
+    other.expect_code(2);
     assert!(other.stderr.contains(&run), "{}", other.stderr);
     assert_eq!(bench.run_ids(), std::slice::from_ref(&run));
 
@@ -260,7 +260,7 @@ fn newer_run(bench: &Bench, x: &str, coder: Value) -> (std::path::PathBuf, Octet
 fn older_is_refused(bench: &Bench, x: &str, y: &str) {
     let before = bench.records_of(x);
     let refused = bench.resume_run(x, Some("continue"), &[]).finish();
-    refused.expect_code(1);
+    refused.expect_code(2);
     assert!(refused.stderr.contains(y), "{}", refused.stderr);
     assert_eq!(bench.records_of(x), before);
 }
@@ -333,7 +333,7 @@ fn an_older_run_waits_while_a_newer_runs_child_lives() {
     // `resume X` and a new `run` are both refused while the child lives.
     older_is_refused(&bench, &x, &y);
     let other = bench.run(&workflow, &[]).finish();
-    other.expect_code(1);
+    other.expect_code(2);
     assert!(other.stderr.contains(&y), "{}", other.stderr);
     assert_eq!(bench.run_ids().len(), 2);
     // `stop Y` is refused while it is alive.

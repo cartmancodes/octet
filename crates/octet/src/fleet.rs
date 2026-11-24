@@ -12,6 +12,7 @@ use octet_core::{ApprovalSummary, Event, event_json};
 use octet_fleet::{
     Approver, FleetEvent, RunEnd, RunnerError, RunnerIo, Signals, Start,
     definition::{self, Workflow},
+    ownership::OwnershipError,
     record::{AttemptId, CandidateId, Decision, Finding, PauseReason, Record},
     recover, snapshot,
     snapshot::SnapshotError,
@@ -884,10 +885,17 @@ fn failure(error: RunnerError, stopping: bool) -> Result<i32, CliError> {
 }
 
 /// `error` as the command line's: what the user asked for is a usage error,
-/// whatever else went wrong a failure.
+/// whatever else went wrong a failure. A run refused because another Octet
+/// drives it or another run owns the work tree ran nothing, so that is a
+/// usage error too; those refusals come only before a run starts or resumes.
 fn cli_error(error: RunnerError) -> CliError {
     match error {
         RunnerError::Refused(reason) => CliError::Usage(plain(&reason)),
+        RunnerError::Ownership(
+            error @ (OwnershipError::RunBusy
+            | OwnershipError::WorktreeBusy { .. }
+            | OwnershipError::OtherRunUnresolved { .. }),
+        ) => CliError::Usage(plain(&error.to_string())),
         RunnerError::Store(StoreError::NoSuchRun(run)) => {
             CliError::Usage(format!("No such run: {}", plain(&run)))
         }

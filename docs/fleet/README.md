@@ -415,7 +415,7 @@ The errors Octet recognises per provider (from their real texts) are in
 |---|---|
 | 0 | Completed (or stopped by `stop`). |
 | 1 | Failed: a config error, or a failure the run cannot pause on. |
-| 2 | Usage or validation error; an untrusted workflow off a terminal; a work tree that is not a git work tree or is a sparse checkout; `resume` of a paused run off a terminal without the `--decision` it needs, or with one the pause does not offer; no such run; or a run refused because another run owns the work tree. Nothing ran. |
+| 2 | Usage or validation error; an untrusted workflow off a terminal; a work tree that is not a git work tree or is a sparse checkout; `resume` of a paused run off a terminal without the `--decision` it needs, or with one the pause does not offer; no such run; or a run refused because another run owns the work tree or another Octet is driving it. Nothing ran. |
 | 3 | Paused; the resume command is printed. Also a `stop` the run refuses. |
 | 130 | Interrupted by SIGINT (Ctrl+C). |
 | 143 | Interrupted by SIGTERM. |
