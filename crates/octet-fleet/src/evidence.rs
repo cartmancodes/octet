@@ -28,7 +28,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::contract::CommandSummary;
-use crate::ownership::start_time;
+use crate::ownership::{list_processes, start_time};
 use crate::record::{AttemptId, CandidateId, Identity, Record};
 use crate::snapshot::{Repo, SnapshotError, take};
 use crate::store::{Log, StoreError};
@@ -221,18 +221,40 @@ enum Step {
     Interrupted(&'static str),
 }
 
-/// Kills `leader`'s group, then reaps the leader so no zombie is left.
+/// How often [`stop_group`] looks whether the group has emptied.
+const GROUP_LOOK: Duration = Duration::from_millis(50);
+
 /// Ends a released command that ran out of time or was interrupted: SIGTERM
-/// to its group, then, once its leader has exited or [`TERM_GRACE`] has
-/// passed, SIGKILL to whatever is left of the group. The leader stays
-/// unreaped.
-async fn stop_group(leader: &GroupLeader) {
+/// to its group (led by `pgid`), then, once the group has no member left
+/// but its exited leader or [`TERM_GRACE`] has passed, SIGKILL to whatever
+/// is left of it. The leader stays unreaped throughout, so the group's id
+/// cannot name another group when the SIGKILL goes out; for the same reason
+/// the group is looked at in the process listing rather than with
+/// `kill(-pgid, 0)`, which an unreaped leader keeps answering on Linux.
+async fn stop_group(leader: &GroupLeader, pgid: u32) {
     if leader.term_group() {
-        leader.exited_within(TERM_GRACE).await;
+        let deadline = Instant::now() + TERM_GRACE;
+        while Instant::now() < deadline && group_alive(leader, pgid).await {
+            tokio::time::sleep(GROUP_LOOK).await;
+        }
     }
     leader.kill_group();
 }
 
+/// Whether the group led by `pgid` still has a member running: its leader,
+/// or any other process in it. A listing that fails ends the wait.
+async fn group_alive(leader: &GroupLeader, pgid: u32) -> bool {
+    if !leader.exited_within(Duration::ZERO).await {
+        return true;
+    }
+    list_processes().await.is_ok_and(|processes| {
+        processes
+            .iter()
+            .any(|process| process.pgid == pgid && process.pid != pgid)
+    })
+}
+
+/// Kills `leader`'s group, then reaps the leader so no zombie is left.
 async fn kill_and_reap(leader: &mut GroupLeader) {
     leader.kill_group();
     let _ = leader.child().wait().await;
@@ -385,7 +407,7 @@ impl Pass<'_> {
             signal = signalled(&mut interrupt) => {
                 // Its result is never logged: the record of this pass stays
                 // without it, which recovery reads as an interrupted pass.
-                stop_group(&leader).await;
+                stop_group(&leader, pid).await;
                 let _ = leader.child().wait().await;
                 return Ok(Step::Interrupted(signal));
             }
@@ -397,7 +419,7 @@ impl Pass<'_> {
         if in_time {
             leader.kill_group();
         } else {
-            stop_group(&leader).await;
+            stop_group(&leader, pid).await;
         }
         let status = leader.child().wait().await?;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -502,7 +524,6 @@ mod tests {
     use octet_testkit::{TempDir, wait_until};
 
     use super::*;
-    use crate::ownership::list_processes;
     use crate::record::Record;
     use crate::snapshot::open_repo;
     use crate::store::{self, RunDir, RunFile};
@@ -1018,6 +1039,30 @@ mod tests {
             "cleaned\n"
         );
         assert!(gone("sleep 31340").await, "the whole group is gone");
+    }
+
+    #[tokio::test]
+    async fn a_forked_child_trapping_sigterm_is_given_the_grace() {
+        let mut f = Fixture::new().await;
+        let cleaned = f.side("child-cleaned");
+        // The command's shell dies of SIGTERM at once; its child traps it and
+        // takes a second to clean up.
+        let child = format!(
+            "trap 'sleep 1; echo cleaned > \"{}\"; exit 0' TERM; \
+             while :; do sleep 0.1; done",
+            cleaned.display()
+        );
+        let commands = cmds(&[&format!("sh -c '{}' & wait", child.replace('\'', "'\\''"))]);
+        let tree = f.tree.clone();
+        let (passed, results) = complete(
+            f.pass(&commands, &tree, 0, Duration::from_secs(1), None)
+                .await,
+        );
+        assert!(!passed && results[0].timed_out);
+        assert_eq!(
+            fs::read_to_string(&cleaned).expect("the child's trap ran"),
+            "cleaned\n"
+        );
     }
 
     #[tokio::test]
