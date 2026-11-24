@@ -11,6 +11,16 @@ Claude Code and Codex CLIs.
 
 ### Added
 
+- `octet fleet` runs a multi-step workflow across providers on a git work tree,
+  headless: research ⇄ research review → plan ⇄ plan review → implement → test
+  → final review, looping back after each rejection until the final reviewer
+  approves. Each step picks its provider (Claude, Codex, opencode or
+  Antigravity), model, effort and permission mode. Rust, not a model, decides
+  when coding may start and whether the run may finish, and the tests are run
+  by Octet itself. A run survives a pause, Ctrl+C, a crash or a reboot
+  (`octet fleet resume ID`), owns its work tree and the processes it started,
+  and pauses for a decision when a loop stalls or hits its round cap. See
+  `docs/fleet/README.md`. No terminal UI view yet.
 - The phone reaches your Mac through a relay, end to end encrypted (Noise), with
   no Tailscale and no account. Pairing is one command: `octet pair` starts the
   hub if needed, shows a QR code, and asks at the Mac to confirm the phone by a
