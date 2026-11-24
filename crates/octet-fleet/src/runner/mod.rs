@@ -456,13 +456,8 @@ impl Driver {
         if let Some((&attempt, _)) = view.state.attempts.iter().next_back() {
             self.emit(FleetEvent::Retrying { attempt, at }).await;
         }
-        let wait = Duration::from_secs(at.saturating_sub(self.io.clock.now()));
         let mut signals = Some(self.io.signals.clone());
-        let signal = tokio::select! {
-            () = tokio::time::sleep(wait) => None,
-            signal = signalled(&mut signals) => Some(signal),
-        };
-        match signal {
+        match wait_until(&self.io.clock, at, &mut signals).await {
             Some(signal) => self.interrupted(None, signal).await.map(Some),
             None => Ok(None),
         }
@@ -827,6 +822,27 @@ impl Driver {
     }
 }
 
+/// The longest one sleep of a backoff lasts before the clock is read again.
+const BACKOFF_SLICE: Duration = Duration::from_secs(60);
+
+/// Waits until `clock` reads `at` or later; the signal `signals` got first,
+/// if one did. It sleeps in slices of at most [`BACKOFF_SLICE`], reading the
+/// clock after each: a sleep does not count the time a machine is suspended,
+/// and the wall clock does.
+async fn wait_until(clock: &Clock, at: u64, signals: &mut Option<Signals>) -> Option<&'static str> {
+    loop {
+        let now = clock.now();
+        if now >= at {
+            return None;
+        }
+        let wait = Duration::from_secs(at - now).min(BACKOFF_SLICE);
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            signal = signalled(signals) => return Some(signal),
+        }
+    }
+}
+
 /// Every identity the log registered for `attempt`: its vendor's and its
 /// evidence commands'.
 fn identities_of(records: &[Record], attempt: AttemptId) -> Vec<Identity> {
@@ -1072,5 +1088,34 @@ mod tests {
         assert_eq!(asked_about(&state, LocalFailure), RoundLimit);
         state.pending_pause = Some(Interrupted);
         assert_eq!(asked_about(&state, LocalFailure), LocalFailure);
+    }
+
+    /// A suspended machine: monotonic time stops while the wall clock does
+    /// not. Here the wall clock jumps past the retry time after 90 s of
+    /// monotonic time; the wait ends within the next slice, not an hour on.
+    #[tokio::test(start_paused = true)]
+    async fn a_wall_clock_past_the_retry_time_ends_the_wait() {
+        let anchor = tokio::time::Instant::now();
+        let clock = Clock::new(move || {
+            let elapsed = anchor.elapsed().as_secs();
+            if elapsed >= 90 {
+                10_000
+            } else {
+                1_000 + elapsed
+            }
+        });
+        let mut signals = None;
+        assert_eq!(wait_until(&clock, 1_000 + 3_600, &mut signals).await, None);
+        let waited = anchor.elapsed();
+        assert!(
+            waited >= Duration::from_secs(90) && waited <= Duration::from_secs(150),
+            "{waited:?}"
+        );
+        // An unsuspended wait still lasts until the time.
+        let anchor = tokio::time::Instant::now();
+        let clock = Clock::new(move || 1_000 + anchor.elapsed().as_secs());
+        assert_eq!(wait_until(&clock, 1_000 + 200, &mut signals).await, None);
+        assert!(anchor.elapsed() >= Duration::from_secs(200));
+        assert!(clock.now() >= 1_200);
     }
 }
