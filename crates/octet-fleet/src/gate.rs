@@ -34,6 +34,10 @@ pub enum GateError {
     /// from another directory.
     #[error("{} is not an absolute path", .0.display())]
     NotAbsolute(PathBuf),
+    /// The system refuses to execute files in the data directory (a `noexec`
+    /// mount), so no gate could run.
+    #[error("the data directory {} does not allow executing files", .0.display())]
+    NoExec(PathBuf),
     /// A file could not be written or synced.
     #[error("gate I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -130,6 +134,50 @@ pub async fn write_gate(
     Ok(path)
 }
 
+/// Checks that files in `dir`, a directory under the data directory
+/// `data_dir`, can be executed, as every gate must be: a two-line script is
+/// written there, run and removed. Only a refusal to execute it (`EACCES`, as
+/// on a `noexec` mount) fails the check; any other outcome is for the gates
+/// themselves to report.
+///
+/// # Errors
+///
+/// [`GateError::NoExec`] naming `data_dir` when the script cannot be
+/// executed; [`GateError::Io`] when it cannot be written.
+pub async fn check_exec(dir: &Path, data_dir: &Path) -> Result<(), GateError> {
+    probe(dir, data_dir, 0o700).await
+}
+
+/// [`check_exec`] with the script's `mode`.
+async fn probe(dir: &Path, data_dir: &Path, mode: u32) -> Result<(), GateError> {
+    let path = dir.join(format!("exec-check-{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(&path)
+        .await?;
+    file.write_all(b"#!/bin/sh\nexit 0\n").await?;
+    file.sync_all().await?;
+    drop(file);
+    let ran = tokio::process::Command::new(&path)
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await;
+    let _ = tokio::fs::remove_file(&path).await;
+    match ran {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(GateError::NoExec(data_dir.to_path_buf()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The PIDs the gate has registered in `<attempt_dir>/processes`, in order.
 /// Blank and unparseable lines are skipped; no file is no PIDs.
 ///
@@ -205,6 +253,28 @@ mod tests {
             .stdin(Stdio::null())
             .spawn()
             .expect("the gate starts")
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_cannot_execute_files_is_named() {
+        let dir = TempDir::new("octet-fleet-gate");
+        fs::create_dir_all(dir.path()).expect("dir");
+        let data = Path::new("/the/data");
+        check_exec(dir.path(), data).await.expect("executable");
+        // A file the system will not execute fails as a `noexec` mount does
+        // (EACCES).
+        match probe(dir.path(), data, 0o600).await {
+            Err(error @ GateError::NoExec(_)) => assert_eq!(
+                error.to_string(),
+                "the data directory /the/data does not allow executing files"
+            ),
+            other => panic!("expected NoExec, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_dir(dir.path()).expect("dir").count(),
+            0,
+            "the check leaves nothing behind"
+        );
     }
 
     #[test]

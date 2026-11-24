@@ -185,8 +185,9 @@ pub enum RunnerError {
 ///
 /// [`RunnerError::Ownership`] when another run holds or owns the work tree;
 /// [`SnapshotError::DataDirInTree`] when the data directory is in the work
-/// tree and not ignored (nothing is made then); the other variants when the
-/// store, git or the log fail.
+/// tree and not ignored (nothing is made then); [`RunnerError::Refused`] when
+/// it does not allow executing files (no run directory is made); the other
+/// variants when the store, git or the log fail.
 pub async fn start(start: Start, io: RunnerIo) -> Result<RunEnd, RunnerError> {
     let repo = snapshot::open_repo(&start.cwd).await?;
     snapshot::check_data_dir(&repo, &start.data_dir).await?;
@@ -196,6 +197,14 @@ pub async fn start(start: Start, io: RunnerIo) -> Result<RunEnd, RunnerError> {
     octet_store::create_private_dir(&fleet)
         .await
         .map_err(StoreError::from)?;
+    // Every attempt runs through a gate script under the data directory.
+    match gate::check_exec(&fleet, &start.data_dir).await {
+        Err(error @ gate::GateError::NoExec(_)) => {
+            return Err(RunnerError::Refused(error.to_string()));
+        }
+        Err(gate::GateError::Io(error)) => return Err(StoreError::from(error).into()),
+        Err(gate::GateError::NotAbsolute(_)) | Ok(()) => {}
+    }
     let scratch = fleet.join(format!("{id}.index.tmp"));
     let base_tree = snapshot::take(&repo, &scratch).await;
     let _ = tokio::fs::remove_file(&scratch).await;
