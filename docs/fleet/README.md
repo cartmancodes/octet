@@ -231,8 +231,8 @@ unless:
 
 `run` also checks that `--cwd` is in a git work tree that is not a sparse checkout, that no
 other run still owns the work tree (see [Process ownership](#process-ownership)), and that the
-data directory is not inside the work tree unless git ignores it (every snapshot would otherwise
-hold the run's own files). A refused data directory is not created. Every vendor starts through
+data directory is not inside the work tree unless git ignores it or it is in a submodule (every
+snapshot would otherwise hold the run's own files). A refused data directory is not created. Every vendor starts through
 a small script in the data directory, so a data directory on a `noexec` mount is refused too,
 before any run directory is made.
 
@@ -379,7 +379,8 @@ shown, and you are asked that pause's decision; if you already gave it, `retry` 
 produce passing tests, and only a valid review can produce an approval.
 
 **Interrupts.** Ctrl+C (or SIGTERM) interrupts the running turn or command, records it, and exits
-130 (or 143). `resume` needs no decision for it; what the log and the tree show decides:
+130 (or 143). Octet first lets any git command it is running finish (normally milliseconds, longer
+for a large repository), so a snapshot is never cut in half. `resume` needs no decision for it; what the log and the tree show decides:
 
 - a read-only step runs again in a fresh clone;
 - a write step whose vendor never started (Octet had not released it): tree unchanged → it runs
@@ -505,9 +506,15 @@ Each snapshot is kept alive by a ref, `refs/octet-fleet/<run>/<seq>`.
 
 > **sparse checkouts are refused** at validation (`core.sparseCheckout` set, or any index entry
 > with `skip-worktree`): clearing the flag would record the absent files as deleted, and keeping
-> it would hide edits. The run's own state lives in `<data_dir>`, never in the work tree. A dirty
-> start is fine: the base candidate includes it, and the patch is relative to it. Submodules are
-> captured as their recorded gitlink; content changes inside a submodule are not seen
+> it would hide edits.
+
+The run's own state lives in `<data_dir>`, which never reaches a snapshot: `run` refuses a data
+directory inside the work tree unless git ignores it, or it is in the git directory or inside a
+submodule.
+
+> A dirty start is fine: the base candidate includes it, and the patch is relative to it.
+> Submodules are captured as their recorded gitlink; content changes inside a submodule are not
+> seen
 
 "At validation" means when `octet fleet run` checks the work tree before it starts (exit 2);
 `octet fleet validate` itself does not look at git.

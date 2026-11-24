@@ -797,6 +797,8 @@ From the build and the final whole-branch review (after revision 5):
   cannot change the user's refs (the objects arrive through alternates).
 - **Octet's ancestors are excluded with its own PID** (PR #10 review): the processes that started
   Octet (by parent PID) are never verified, so a marked tmux server it runs under is never killed.
+- **"Never in the work tree" is enforced as "never in a snapshot"** (PR #10 review): `run` refuses
+  a data directory in the work tree unless git ignores it, or it is in the git directory or a submodule.
 
 From the owner's third review (revision 5); all six findings applied to revision 4:
 
