@@ -74,7 +74,9 @@ Exit codes: 0 completed, 1 failed, 2 usage or validation error, 3 paused, 130 SI
 }
 
 /// Runs one fleet command; the process's exit code. `data_dir` is where runs
-/// live (`validate` and `--help` touch no storage and are given none), and
+/// live (`validate` and `--help` touch no storage and are given none; `run`
+/// is given the path, not made yet, and makes it once the work tree is
+/// known not to snapshot it), and
 /// `explicit` says `--journal-dir` named it, so the commands printed back name
 /// it too.
 pub(crate) async fn fleet(
@@ -900,7 +902,9 @@ fn cli_error(error: RunnerError) -> CliError {
             CliError::Usage(format!("No such run: {}", plain(&run)))
         }
         RunnerError::Snapshot(
-            error @ (SnapshotError::NotARepository(_) | SnapshotError::SparseCheckout(_)),
+            error @ (SnapshotError::NotARepository(_)
+            | SnapshotError::SparseCheckout(_)
+            | SnapshotError::DataDirInTree { .. }),
         ) => CliError::Usage(plain(&error.to_string())),
         other => CliError::Run(plain(&other.to_string())),
     }
@@ -1222,12 +1226,20 @@ async fn run_command(
         Ok(resolved) => resolved,
         Err(errors) => return Ok(report_errors(&errors)),
     };
-    let repo = snapshot::open_repo(&cwd).await.map_err(|e| match e {
-        SnapshotError::NotARepository(_) | SnapshotError::SparseCheckout(_) => {
-            CliError::Usage(plain(&e.to_string()))
-        }
+    let snapshot_error = |e: SnapshotError| match e {
+        SnapshotError::NotARepository(_)
+        | SnapshotError::SparseCheckout(_)
+        | SnapshotError::DataDirInTree { .. } => CliError::Usage(plain(&e.to_string())),
         other => CliError::Run(plain(&other.to_string())),
-    })?;
+    };
+    let repo = snapshot::open_repo(&cwd).await.map_err(snapshot_error)?;
+    // Before the data directory is made (`data_dir` is only its path so
+    // far) and the trust record written there.
+    snapshot::check_data_dir(&repo, &data_dir)
+        .await
+        .map_err(snapshot_error)?;
+    let data_dir = crate::make_data_dir(&data_dir)?;
+    let journal_dir = journal_dir.map(|_| data_dir.clone());
     let bytes = serde_json::to_vec(&resolved).map_err(|e| CliError::Run(e.to_string()))?;
     let hash = store::workflow_hash(&repo.top, &bytes)
         .await

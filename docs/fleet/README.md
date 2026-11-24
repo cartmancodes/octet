@@ -228,8 +228,10 @@ unless:
   overridden.
 - `commands` is non-empty for tests steps.
 
-`run` also checks that `--cwd` is in a git work tree that is not a sparse checkout, and that no
-other run still owns the work tree (see [Process ownership](#process-ownership)).
+`run` also checks that `--cwd` is in a git work tree that is not a sparse checkout, that no
+other run still owns the work tree (see [Process ownership](#process-ownership)), and that the
+data directory is not inside the work tree unless git ignores it (every snapshot would otherwise
+hold the run's own files). A refused data directory is not created.
 
 The generic guarantee is: *a change step runs only when every document in its input chain has a
 current approval.* A minimal workflow with one document, its review and a coder is valid.
@@ -430,7 +432,7 @@ The errors Octet recognises per provider (from their real texts) are in
 |---|---|
 | 0 | Completed (or stopped by `stop`). |
 | 1 | Failed: a config error, or a failure the run cannot pause on. |
-| 2 | Usage or validation error; an untrusted workflow off a terminal; a work tree that is not a git work tree or is a sparse checkout; `resume` of a paused run off a terminal without the `--decision` it needs, or with one the pause does not offer; no such run; or a run refused because another run owns the work tree or another Octet is driving it. Nothing ran. |
+| 2 | Usage or validation error; an untrusted workflow off a terminal; a work tree that is not a git work tree or is a sparse checkout; `resume` of a paused run off a terminal without the `--decision` it needs, or with one the pause does not offer; no such run; a data directory inside the work tree that git does not ignore; or a run refused because another run owns the work tree or another Octet is driving it. Nothing ran. |
 | 3 | Paused; the resume command is printed. Also a `stop` the run refuses. |
 | 130 | Interrupted by SIGINT (Ctrl+C). |
 | 143 | Interrupted by SIGTERM. |

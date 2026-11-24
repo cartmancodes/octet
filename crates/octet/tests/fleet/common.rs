@@ -279,12 +279,22 @@ impl Bench {
     /// Starts `octet fleet ARGS --journal-dir DATA` with the script named,
     /// `env` added and stdin closed.
     pub(crate) fn octet(&self, args: &[&OsStr], env: &[(&str, &OsStr)]) -> Octet {
+        self.octet_with_data(args, env, &self.data)
+    }
+
+    /// [`Bench::octet`] with the data directory `data`.
+    pub(crate) fn octet_with_data(
+        &self,
+        args: &[&OsStr],
+        env: &[(&str, &OsStr)],
+        data: &Path,
+    ) -> Octet {
         let mut command = Command::new(env!("CARGO_BIN_EXE_octet"));
         command
             .arg("fleet")
             .args(args)
             .arg("--journal-dir")
-            .arg(&self.data)
+            .arg(data)
             .env("OCTET_FLEET_SCRIPT", &self.script)
             .env_remove(TEST_PAUSE_ENV)
             .envs(GIT_CONFIG_ISOLATED);
@@ -297,6 +307,16 @@ impl Bench {
 
     /// `octet fleet run WORKFLOW --task … --cwd WORK --trust --output json`.
     pub(crate) fn run(&self, workflow: &Path, env: &[(&str, &OsStr)]) -> Octet {
+        self.run_with_data(workflow, env, &self.data)
+    }
+
+    /// [`Bench::run`] with the data directory `data`.
+    pub(crate) fn run_with_data(
+        &self,
+        workflow: &Path,
+        env: &[(&str, &OsStr)],
+        data: &Path,
+    ) -> Octet {
         let args: [&OsStr; 9] = [
             "run".as_ref(),
             workflow.as_os_str(),
@@ -308,7 +328,7 @@ impl Bench {
             "--output".as_ref(),
             "json".as_ref(),
         ];
-        self.octet(&args, env)
+        self.octet_with_data(&args, env, data)
     }
 
     /// `octet fleet resume RUN [--decision D] --output json`, for the only

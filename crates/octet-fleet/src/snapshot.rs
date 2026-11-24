@@ -78,6 +78,20 @@ pub enum SnapshotError {
         /// Its standard error, trimmed.
         stderr: String,
     },
+    /// The data directory is inside the work tree and git does not ignore
+    /// it: every snapshot would hold the run's own files.
+    #[error(
+        "the data directory {} is inside the work tree {} and git does not ignore it; choose \
+         another with --journal-dir, or add it to .gitignore",
+        .data_dir.display(),
+        .top.display()
+    )]
+    DataDirInTree {
+        /// The data directory, resolved.
+        data_dir: PathBuf,
+        /// The work tree's top level.
+        top: PathBuf,
+    },
     /// Git could not be run, or a file could not be copied.
     #[error("snapshot I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -392,6 +406,76 @@ pub async fn diff(repo: &Repo, from: &str, to: &str, stat: bool) -> Result<Strin
 /// `commit` detached. Returns the directory in the clone at the same relative
 /// path as the repository's `cwd_rel`.
 ///
+/// Checks that snapshots of `repo` leave out the data directory `data_dir`
+/// (which need not exist yet): it is outside the work tree, inside the git
+/// directory, or a directory git ignores.
+///
+/// # Errors
+///
+/// [`SnapshotError::DataDirInTree`] when it is in the work tree and not
+/// ignored; another [`SnapshotError`] when git or the file system fails.
+pub async fn check_data_dir(repo: &Repo, data_dir: &Path) -> Result<(), SnapshotError> {
+    let resolved = resolve(data_dir)?;
+    let Ok(rel) = resolved.strip_prefix(&repo.top) else {
+        return Ok(());
+    };
+    let in_git_dir = resolved.starts_with(&repo.git_dir)
+        || rel.components().next() == Some(std::path::Component::Normal(OsStr::new(".git")));
+    if in_git_dir {
+        return Ok(());
+    }
+    let refused = || SnapshotError::DataDirInTree {
+        data_dir: resolved.clone(),
+        top: repo.top.clone(),
+    };
+    if rel.as_os_str().is_empty() {
+        return Err(refused());
+    }
+    // The trailing slash: a directory pattern (`data/`) matches a directory
+    // that does not exist yet.
+    let mut asked = rel.as_os_str().to_owned();
+    asked.push("/");
+    let mut check = command(&repo.top, ["check-ignore", "-q", "--"]);
+    check
+        .arg(&asked)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let out = check.output().await?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => Err(refused()),
+        _ => Err(SnapshotError::Git {
+            args: format!("check-ignore -q -- {}", Path::new(&asked).display()),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        }),
+    }
+}
+
+/// `path` made absolute, its deepest existing ancestor with symbolic links
+/// resolved (as git reports the top level), the rest as given.
+fn resolve(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut rest = Vec::new();
+    let mut existing = absolute.as_path();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut found) => {
+                found.extend(rest.iter().rev());
+                return Ok(found);
+            }
+            Err(error) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_owned());
+                    existing = parent;
+                }
+                _ => return Err(error),
+            },
+        }
+    }
+}
+
 /// The clone shares the repository's objects, so `commit` (kept under a ref
 /// there) arrives with it; refs are not cloned, the clone has no remote (a
 /// push from it cannot reach the user's refs), and the user's hooks do not
@@ -538,6 +622,44 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[tokio::test]
+    async fn a_data_directory_in_the_tree_must_be_ignored() {
+        let dir = init();
+        write(dir.path(), ".gitignore", "ignored/\n");
+        write(dir.path(), "a.txt", "one\n");
+        commit_all(dir.path());
+        let repo = open_repo(dir.path()).await.expect("opens");
+        let refused = |result: Result<(), SnapshotError>| match result {
+            Err(SnapshotError::DataDirInTree { data_dir, top }) => {
+                assert_eq!(top, repo.top);
+                data_dir
+            }
+            other => panic!("expected DataDirInTree, got {other:?}"),
+        };
+        // Not ignored, existing or not, and the top level itself: refused,
+        // naming the resolved directory.
+        let named = refused(check_data_dir(&repo, &dir.path().join(".octet/data")).await);
+        assert_eq!(named, repo.top.join(".octet/data"));
+        fs::create_dir_all(dir.path().join("data")).expect("dir");
+        refused(check_data_dir(&repo, &dir.path().join("data")).await);
+        refused(check_data_dir(&repo, dir.path()).await);
+        // Ignored (also before it exists), in the git directory, or outside.
+        for ok in [
+            dir.path().join("ignored"),
+            dir.path().join("ignored/deeper"),
+            dir.path().join(".git/octet"),
+            dir.path().parent().expect("a parent").join("elsewhere"),
+        ] {
+            check_data_dir(&repo, &ok)
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", ok.display()));
+        }
+        fs::create_dir_all(dir.path().join("ignored")).expect("dir");
+        check_data_dir(&repo, &dir.path().join("ignored"))
+            .await
+            .expect("an ignored directory");
     }
 
     #[tokio::test]

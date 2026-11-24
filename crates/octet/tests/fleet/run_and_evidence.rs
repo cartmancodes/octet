@@ -12,8 +12,8 @@ use serde_json::json;
 
 use crate::common::{
     Bench, answer_pauses, approve, await_gone, exit_of, failed, git, last_pause, last_phase,
-    observations, only_test_attempt, origin_of, passed, position, research_plan_build, small,
-    small_turns, started, tree_of, verdict,
+    observations, only_test_attempt, origin_of, passed, position, research_plan_build, runs_in,
+    small, small_turns, started, tree_of, verdict,
 };
 
 // ---- 1. the full run ---------------------------------------------------
@@ -609,4 +609,39 @@ fn documents_over_the_prompt_budget_reach_the_step_as_files() {
         "{cwd}: {}",
         &prompt[..prompt.len().min(2000)]
     );
+}
+
+// ---- the data directory ------------------------------------------------
+
+/// A data directory inside the work tree that git does not ignore is
+/// refused before anything is made (every snapshot would hold the run's own
+/// files); an ignored one is fine.
+#[test]
+fn a_data_directory_in_the_tree_must_be_ignored() {
+    let bench = Bench::new("octet-fleet-data-in-tree");
+    let workflow = bench.workflow(&small(&["test -f feature.txt"], 1));
+    bench.script(&small_turns());
+    let inside = bench.work.join(".octet").join("data");
+    let refused = bench.run_with_data(&workflow, &[], &inside).finish();
+    refused.expect_code(2);
+    assert!(refused.stderr.contains(".octet/data"), "{}", refused.stderr);
+    let top = std::fs::canonicalize(&bench.work).unwrap();
+    assert!(
+        refused
+            .stderr
+            .contains(&format!("work tree {}", top.display())),
+        "{}",
+        refused.stderr
+    );
+    assert!(!bench.work.join(".octet").exists(), "nothing was made");
+    assert!(bench.played().is_empty());
+
+    std::fs::write(bench.work.join(".gitignore"), "/.octet/data/\n").unwrap();
+    git(&bench.work, &["add", ".gitignore"]);
+    git(&bench.work, &["commit", "--quiet", "-m", "ignore the data"]);
+    bench
+        .run_with_data(&workflow, &[], &inside)
+        .finish()
+        .expect_code(0);
+    assert_eq!(runs_in(&inside).len(), 1);
 }

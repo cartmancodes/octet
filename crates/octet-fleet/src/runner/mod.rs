@@ -184,9 +184,12 @@ pub enum RunnerError {
 /// # Errors
 ///
 /// [`RunnerError::Ownership`] when another run holds or owns the work tree;
-/// the other variants when the store, git or the log fail.
+/// [`SnapshotError::DataDirInTree`] when the data directory is in the work
+/// tree and not ignored (nothing is made then); the other variants when the
+/// store, git or the log fail.
 pub async fn start(start: Start, io: RunnerIo) -> Result<RunEnd, RunnerError> {
     let repo = snapshot::open_repo(&start.cwd).await?;
+    snapshot::check_data_dir(&repo, &start.data_dir).await?;
     let hash = ownership::worktree_hash(&repo.top).await?;
     let id = store::new_run_id();
     let fleet = start.data_dir.join("fleet");
