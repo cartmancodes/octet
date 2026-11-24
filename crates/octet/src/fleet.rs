@@ -887,12 +887,18 @@ impl Front {
 }
 
 /// How a call that failed ends the command: an error, or the code of a
-/// refused `stop`.
-fn failure(error: RunnerError, stopping: bool) -> Result<i32, CliError> {
+/// refused `stop`. `progressed` says an earlier call of this command (a
+/// resume after a decision picked at a pause) ran something: an ownership
+/// refusal then is a failure, not a usage error, whose exit code says
+/// nothing ran.
+fn failure(error: RunnerError, stopping: bool, progressed: bool) -> Result<i32, CliError> {
     match error {
         RunnerError::Refused(reason) if stopping => {
             warn(&plain(&reason));
             Ok(3)
+        }
+        RunnerError::Ownership(error) if progressed => {
+            Err(CliError::Run(plain(&error.to_string())))
         }
         other => Err(cli_error(other)),
     }
@@ -926,6 +932,8 @@ fn cli_error(error: RunnerError) -> CliError {
 /// that follow; the exit code.
 async fn drive(front: &Front, first: Call) -> Result<i32, CliError> {
     let mut call = first;
+    // Whether any call so far made progress (anything but a start or a pause).
+    let mut progressed = false;
     loop {
         let (events, received) = mpsc::channel(64);
         let mut renderer = Renderer::new(front.json, front.console.clone());
@@ -943,8 +951,11 @@ async fn drive(front: &Front, first: Call) -> Result<i32, CliError> {
             Call::Start(_) => renderer.run.clone(),
         };
         let end = match result {
-            Ok(end) => end,
-            Err(error) => return failure(error, front.stopping),
+            Ok(end) => {
+                progressed |= renderer.progress;
+                end
+            }
+            Err(error) => return failure(error, front.stopping, progressed),
         };
         let run = run.unwrap_or_default();
         match end {
@@ -1388,6 +1399,26 @@ async fn status_command(
 mod tests {
     use super::*;
     use crate::args::DECISIONS;
+    use octet_fleet::ownership::OwnershipError;
+
+    #[test]
+    fn an_ownership_refusal_after_progress_is_a_failure() {
+        let busy = || RunnerError::Ownership(OwnershipError::WorktreeBusy { holder: None });
+        assert!(matches!(
+            failure(busy(), false, false),
+            Err(CliError::Usage(_))
+        ));
+        // A later resume in the same command, after steps ran: not "nothing ran".
+        assert!(matches!(
+            failure(busy(), false, true),
+            Err(CliError::Run(_))
+        ));
+        let driven = RunnerError::Ownership(OwnershipError::RunBusy);
+        assert!(matches!(
+            failure(driven, false, true),
+            Err(CliError::Run(_))
+        ));
+    }
 
     #[test]
     fn a_streamed_reply_keeps_tabs_and_joiners() {
