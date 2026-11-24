@@ -205,8 +205,11 @@ scratch clone (see [the guarantees](#read-only-steps-isolation-not-a-sandbox)); 
 must have mode `ask` (or none). Change and tests steps always write, in the live work tree.
 
 **`commands`** are run by Octet itself, in order, in the work tree, each with `sh -c` in its own
-process group, killed (SIGTERM, then SIGKILL after 5 s) at `timeout`. Only the workflow's
-commands run; Octet never runs a command a model proposes as evidence.
+process group. At `timeout`, or when the run is interrupted, the group gets SIGTERM, then SIGKILL
+for whatever is left once the command's shell has exited or 5 s have passed, so a `trap` on TERM
+can clean up. When a command exits by itself, anything it left running in its group is killed
+(SIGKILL) at once. Only the workflow's commands run; Octet never runs a command a model proposes
+as evidence.
 
 ### What `validate` and `run` check
 

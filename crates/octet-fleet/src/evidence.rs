@@ -43,6 +43,10 @@ const TAIL_BYTES: usize = 16 * 1024;
 /// The held command: waits for the go line, then becomes the real command.
 const HELD: &str = r#"read _ || exit 125; exec sh -c "$1""#;
 
+/// How long a command that ran out of time, or was interrupted, has between
+/// SIGTERM to its group and SIGKILL to what is left of it.
+const TERM_GRACE: Duration = Duration::from_secs(5);
+
 /// Tests only: the variable naming the directory of the test pauses: after
 /// each held spawn ([`EvidenceRun::pause_hook`]), around a vendor's
 /// registration ([`crate::step::AttemptPlan::pause_hook`]), and at the
@@ -218,6 +222,17 @@ enum Step {
 }
 
 /// Kills `leader`'s group, then reaps the leader so no zombie is left.
+/// Ends a released command that ran out of time or was interrupted: SIGTERM
+/// to its group, then, once its leader has exited or [`TERM_GRACE`] has
+/// passed, SIGKILL to whatever is left of the group. The leader stays
+/// unreaped.
+async fn stop_group(leader: &GroupLeader) {
+    if leader.term_group() {
+        leader.exited_within(TERM_GRACE).await;
+    }
+    leader.kill_group();
+}
+
 async fn kill_and_reap(leader: &mut GroupLeader) {
     leader.kill_group();
     let _ = leader.child().wait().await;
@@ -370,14 +385,20 @@ impl Pass<'_> {
             signal = signalled(&mut interrupt) => {
                 // Its result is never logged: the record of this pass stays
                 // without it, which recovery reads as an interrupted pass.
-                kill_and_reap(&mut leader).await;
+                stop_group(&leader).await;
+                let _ = leader.child().wait().await;
                 return Ok(Step::Interrupted(signal));
             }
         };
         // Kill in both cases: a member left behind by a command that finished
-        // must not edit the tree after the post observation. The leader is
-        // still unreaped, so its group id still names this group.
-        leader.kill_group();
+        // must not edit the tree after the post observation (SIGKILL at once);
+        // a command out of time gets SIGTERM first. The leader is still
+        // unreaped, so its group id still names this group.
+        if in_time {
+            leader.kill_group();
+        } else {
+            stop_group(&leader).await;
+        }
         let status = leader.child().wait().await?;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let timed_out = !in_time;
@@ -974,6 +995,45 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_command_out_of_time_gets_sigterm_first() {
+        let mut f = Fixture::new().await;
+        let cleaned = f.side("cleaned");
+        let commands = cmds(&[&format!(
+            "trap \"echo cleaned > '{}'; exit 1\" TERM; sleep 31340 & wait",
+            cleaned.display()
+        )]);
+        let tree = f.tree.clone();
+        let started = Instant::now();
+        let (passed, results) = complete(
+            f.pass(&commands, &tree, 0, Duration::from_secs(1), None)
+                .await,
+        );
+        assert!(!passed && results[0].timed_out);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert_eq!(
+            fs::read_to_string(&cleaned).expect("the trap ran"),
+            "cleaned\n"
+        );
+        assert!(gone("sleep 31340").await, "the whole group is gone");
+    }
+
+    #[tokio::test]
+    async fn a_command_ignoring_sigterm_is_killed_after_the_grace() {
+        let mut f = Fixture::new().await;
+        let token = "sleep 31341";
+        let commands = cmds(&[&format!("trap '' TERM; {token}")]);
+        let tree = f.tree.clone();
+        let started = Instant::now();
+        let (passed, results) = complete(
+            f.pass(&commands, &tree, 0, Duration::from_secs(1), None)
+                .await,
+        );
+        assert!(!passed && results[0].timed_out);
+        assert!(started.elapsed() >= Duration::from_secs(1) + TERM_GRACE);
+        assert!(gone(token).await, "SIGKILL ended it");
     }
 
     #[tokio::test]
