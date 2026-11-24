@@ -256,7 +256,8 @@ pub fn fit(
     }
     let (name, size) = largest_inline(step, inputs, &filed);
     Err(format!(
-        "the prompt for {} is {} bytes with every document and output in a file, over the {limit}          byte limit; its largest section, {name}, is {size} bytes; nothing was sent",
+        "the prompt for {} is {} bytes with every document and output in a file, over the \
+         {limit} byte limit; its largest section, {name}, is {size} bytes; nothing was sent",
         step.id,
         text.len(),
     ))
@@ -1313,5 +1314,6 @@ mod tests {
         let err = fit(&doc_step("plan"), &dispatch(1), &ids(), &i, Path::new("/a")).unwrap_err();
         assert!(err.contains("the task"), "{err}");
         assert!(err.contains("nothing was sent"), "{err}");
+        assert!(!err.contains("  "), "one space between words: {err}");
     }
 }
