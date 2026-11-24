@@ -153,6 +153,18 @@ fn clean(text: &str) -> String {
     text.split('\n').map(plain).collect::<Vec<_>>().join("\n")
 }
 
+/// A vendor's streamed reply, as it is safe to show: like [`clean`], but
+/// tabs (code's indentation) and the zero-width joiners U+200C and U+200D
+/// (Persian, Indic scripts, joined emoji) stay. They only shape what is
+/// shown; every other control and invisible character still goes.
+fn reply_text(text: &str) -> String {
+    text.chars()
+        .filter(|&c| {
+            matches!(c, '\n' | '\t' | '\u{200C}' | '\u{200D}') || !(c.is_control() || invisible(c))
+        })
+        .collect()
+}
+
 /// `text` as one indented block.
 fn block(text: &str, indent: &str) -> String {
     clean(text).replace('\n', &format!("\n{indent}"))
@@ -756,7 +768,7 @@ impl Renderer {
                 ));
             }
             FleetEvent::Session { event, .. } => match event {
-                Event::Text(text) => self.out(&clean(text)),
+                Event::Text(text) => self.out(&reply_text(text)),
                 Event::Notice(text) | Event::Error(text) => self.warn(&plain(text)),
                 _ => {}
             },
@@ -1376,6 +1388,17 @@ async fn status_command(
 mod tests {
     use super::*;
     use crate::args::DECISIONS;
+
+    #[test]
+    fn a_streamed_reply_keeps_tabs_and_joiners() {
+        // A Makefile recipe, a Persian word with a ZWNJ, a joined emoji.
+        let text = "all:\n\tcargo test\nمی\u{200C}خواهم 👩\u{200D}💻";
+        assert_eq!(reply_text(text), text);
+        // Still dropped: other controls, bidi controls and the rest of the
+        // invisible set.
+        let hostile = "a\u{1b}[2J\rb\u{202E}c\u{2066}d\u{200B}e\u{E0041}f\u{7}g";
+        assert_eq!(reply_text(hostile), "a[2Jbcdefg");
+    }
 
     #[test]
     fn every_decision_name_maps_to_a_decision() {
