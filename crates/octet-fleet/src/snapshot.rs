@@ -402,18 +402,16 @@ pub async fn diff(repo: &Repo, from: &str, to: &str, stat: bool) -> Result<Strin
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Clones the repository to `into` without a checkout, then checks out
-/// `commit` detached. Returns the directory in the clone at the same relative
-/// path as the repository's `cwd_rel`.
-///
 /// Checks that snapshots of `repo` leave out the data directory `data_dir`
 /// (which need not exist yet): it is outside the work tree, inside the git
-/// directory, or a directory git ignores.
+/// directory, a directory git ignores, or in a submodule (a snapshot records
+/// only the submodule's commit).
 ///
 /// # Errors
 ///
-/// [`SnapshotError::DataDirInTree`] when it is in the work tree and not
-/// ignored; another [`SnapshotError`] when git or the file system fails.
+/// [`SnapshotError::DataDirInTree`] when it is in the work tree and none of
+/// those holds, or git cannot tell whether it is ignored; another
+/// [`SnapshotError`] when git or the file system fails.
 pub async fn check_data_dir(repo: &Repo, data_dir: &Path) -> Result<(), SnapshotError> {
     let resolved = resolve(data_dir)?;
     let Ok(rel) = resolved.strip_prefix(&repo.top) else {
@@ -440,17 +438,38 @@ pub async fn check_data_dir(repo: &Repo, data_dir: &Path) -> Result<(), Snapshot
         .arg(&asked)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let out = check.output().await?;
-    match out.status.code() {
-        Some(0) => Ok(()),
-        Some(1) => Err(refused()),
-        _ => Err(SnapshotError::Git {
-            args: format!("check-ignore -q -- {}", Path::new(&asked).display()),
-            status: out.status.to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        }),
+        .stderr(Stdio::null());
+    // 0: ignored. 1: not ignored. Anything else (a path in a submodule is
+    // exit 128) is not an answer: only a submodule then lets it pass.
+    if check.status().await?.success() {
+        return Ok(());
     }
+    if in_submodule(repo, rel).await? {
+        return Ok(());
+    }
+    Err(refused())
+}
+
+/// Whether `rel`, relative to the work tree's top level, is a submodule or in
+/// one: the index has a gitlink (mode 160000) at it or at one of its
+/// ancestors.
+async fn in_submodule(repo: &Repo, rel: &Path) -> Result<bool, SnapshotError> {
+    let mut prefixes = Vec::new();
+    let mut prefix = PathBuf::new();
+    for component in rel.components() {
+        prefix.push(component);
+        prefixes.push(prefix.clone());
+    }
+    // Literal: a directory named like pathspec magic means itself.
+    let mut listed = command(
+        &repo.top,
+        ["--literal-pathspecs", "ls-files", "--stage", "-z", "--"],
+    );
+    listed.args(&prefixes);
+    let listed = exec(listed, &[]).await?;
+    Ok(listed
+        .split(|byte| *byte == 0)
+        .any(|entry| entry.starts_with(b"160000 ")))
 }
 
 /// `path` made absolute, its deepest existing ancestor with symbolic links
@@ -476,6 +495,10 @@ fn resolve(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+/// Clones the repository to `into` without a checkout, then checks out
+/// `commit` detached. Returns the directory in the clone at the same relative
+/// path as the repository's `cwd_rel`.
+///
 /// The clone shares the repository's objects, so `commit` (kept under a ref
 /// there) arrives with it; refs are not cloned, the clone has no remote (a
 /// push from it cannot reach the user's refs), and the user's hooks do not
@@ -660,6 +683,45 @@ mod tests {
         check_data_dir(&repo, &dir.path().join("ignored"))
             .await
             .expect("an ignored directory");
+    }
+
+    #[tokio::test]
+    async fn a_data_directory_in_a_submodule_is_outside_the_snapshot() {
+        let inner = init();
+        write(inner.path(), "a.txt", "inner\n");
+        commit_all(inner.path());
+        let dir = init();
+        let source = inner.path().display().to_string();
+        sh(
+            dir.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                &source,
+                "sub",
+            ],
+        );
+        commit_all(dir.path());
+        let repo = open_repo(dir.path()).await.expect("opens");
+        // A snapshot records only the submodule's commit: its contents,
+        // existing or not, are not in the tree.
+        for ok in [dir.path().join("sub/data"), dir.path().join("sub")] {
+            check_data_dir(&repo, &ok)
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", ok.display()));
+        }
+        fs::create_dir_all(dir.path().join("sub/data")).expect("dir");
+        check_data_dir(&repo, &dir.path().join("sub/data"))
+            .await
+            .expect("an existing directory in the submodule");
+        // Beside it, the rule still holds.
+        assert!(matches!(
+            check_data_dir(&repo, &dir.path().join("data")).await,
+            Err(SnapshotError::DataDirInTree { .. })
+        ));
     }
 
     #[tokio::test]
