@@ -526,7 +526,9 @@ struct RawBlock {
 }
 
 /// The last complete `json` fence of a reply (a fence opened and closed on
-/// one line counts). Other fences are skipped whole.
+/// one line counts). Other fences are skipped whole. The reply must end with
+/// it: anything but whitespace after it (text, or a fence of any kind) is an
+/// error, as the reply format says.
 fn last_json_block(reply: &str) -> Result<&str, String> {
     #[derive(PartialEq)]
     enum In {
@@ -536,6 +538,7 @@ fn last_json_block(reply: &str) -> Result<&str, String> {
     }
     let mut state = In::Text;
     let mut start = 0;
+    // The block's body and where its closing line ends.
     let mut last = None;
     let mut pos = 0;
     for line in reply.split_inclusive('\n') {
@@ -546,7 +549,7 @@ fn last_json_block(reply: &str) -> Result<&str, String> {
                     if let Some(inner) = info.strip_suffix("```") {
                         // A fence opened and closed on one line.
                         if let Some(body) = one_line_json(inner) {
-                            last = Some(body);
+                            last = Some((body, pos + line.len()));
                         }
                     } else if info.trim().eq_ignore_ascii_case("json") {
                         state = In::Json;
@@ -559,7 +562,7 @@ fn last_json_block(reply: &str) -> Result<&str, String> {
             In::Json | In::Other => {
                 if trimmed == "```" {
                     if state == In::Json {
-                        last = Some(&reply[start..pos]);
+                        last = Some((&reply[start..pos], pos + line.len()));
                     }
                     state = In::Text;
                 }
@@ -570,7 +573,11 @@ fn last_json_block(reply: &str) -> Result<&str, String> {
     if state == In::Json {
         return Err("the JSON block is unterminated".to_owned());
     }
-    last.ok_or_else(|| "no JSON block in the reply".to_owned())
+    let (body, end) = last.ok_or_else(|| "no JSON block in the reply".to_owned())?;
+    if !reply[end..].trim().is_empty() {
+        return Err("the reply goes on after the JSON block; it must end with it".to_owned());
+    }
+    Ok(body)
 }
 
 /// The body of a fence opened and closed on one line, `inner` being what is
@@ -823,6 +830,36 @@ mod tests {
         let v = parse_verdict(reply, &[]).unwrap();
         assert!(v.approved);
         assert!(v.new_findings.is_empty());
+    }
+
+    #[test]
+    fn the_json_block_must_end_the_reply() {
+        let approved = r#"{"verdict":"approved","new_findings":[],"previous":[]}"#;
+        let rejected = concat!(
+            r#"{"verdict":"changes_requested","new_findings":"#,
+            r#"[{"severity":"blocking","summary":"x"}],"previous":[]}"#
+        );
+        // A verdict-shaped object quoted from the code under review, then the
+        // real verdict in a fence without the `json` tag.
+        let reply = format!(
+            "The fixture holds:\n```json\n{approved}\n```\nMy verdict:\n```\n{rejected}\n```\n"
+        );
+        let err = parse_verdict(&reply, &[]).unwrap_err();
+        assert!(err.contains("after the JSON block"), "{err}");
+        // An approval taken back in text after it.
+        let reply = format!(
+            "```json\n{approved}\n```\nOn reflection, there is a blocking problem in a.rs.\n"
+        );
+        let err = parse_verdict(&reply, &[]).unwrap_err();
+        assert!(err.contains("after the JSON block"), "{err}");
+        // A later fence of any kind, one-line or unterminated, too.
+        let reply = format!("```json\n{approved}\n```\n```sh ls ```\n");
+        assert!(parse_verdict(&reply, &[]).is_err());
+        let reply = format!("```json\n{approved}\n```\n```\nunclosed\n");
+        assert!(parse_verdict(&reply, &[]).is_err());
+        // Whitespace after the block is fine.
+        let reply = format!("ok\n```json\n{approved}\n```\n\n  \n");
+        assert!(parse_verdict(&reply, &[]).unwrap().approved);
     }
 
     fn reply(verdict: &str, new: &str, prev: &str) -> String {

@@ -244,6 +244,8 @@ fenced JSON block:
  "previous": [{"id": "review_change/F3", "status": "resolved" | "open"}]}
 ```
 
+- The block must end the reply: text or another fence (of any kind) after it makes the reply
+  invalid. Earlier `json` fences, such as one quoted from the code under review, are ignored.
 - Octet assigns finding IDs (`<step>/F<n>`), so a reviewer cannot renumber.
 - `previous` must list exactly the step's findings still open before this round (all of them,
   each once). The reviewer receives every open finding with its ID.
