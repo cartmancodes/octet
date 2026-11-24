@@ -795,6 +795,8 @@ From the build and the final whole-branch review (after revision 5):
   that passed within the last hour counts as now (the backoff applies), not tomorrow.
 - **Scratch clones have no `origin` remote**, so a vendor's `git push` from a read-only clone
   cannot change the user's refs (the objects arrive through alternates).
+- **Octet's ancestors are excluded with its own PID** (PR #10 review): the processes that started
+  Octet (by parent PID) are never verified, so a marked tmux server it runs under is never killed.
 
 From the owner's third review (revision 5); all six findings applied to revision 4:
 

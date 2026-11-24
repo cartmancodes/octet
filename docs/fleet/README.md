@@ -537,6 +537,8 @@ start time it recorded, or a descendant (by parent PID) of a verified process. T
 there because macOS hides the environment of Apple's own binaries (`/bin/sh`, `sleep`, `git`)
 from `ps`, so the marker cannot be seen on a run's shell children. A live verified parent really
 started its child, and an orphan is reparented to PID 1, so no stranger is verified this way.
+Octet itself and the processes that started it (its parent, that one's parent, and so on: a
+tmux server a coder once started, say) are never counted, even when they carry a marker.
 
 > `kill` signals **only verified processes** (SIGTERM, SIGKILL after 5 s), then the check runs
 > again.

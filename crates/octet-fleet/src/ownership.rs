@@ -547,9 +547,10 @@ mod platform {
 /// a `registered` identity, or is a descendant of one that does; else `Unverified` when any is in
 /// one of the registered `groups`; else `Clear`. A process whose parent is verified (and alive:
 /// it is in the list) was forked by it, and an orphan's parent is init, never a reused PID, so
-/// ancestry cannot adopt a stranger. Octet's own process and the `released` PIDs are dropped
-/// first, so neither is ever counted nor confers verification on its children. The PIDs are
-/// sorted.
+/// ancestry cannot adopt a stranger. Octet's own process, its ancestors (by parent PID, in the
+/// same listing: they started this Octet, so they are no leftover of an earlier attempt, even
+/// one that inherited a marker) and the `released` PIDs are dropped first, so none is ever
+/// counted nor confers verification on its children. The PIDs are sorted.
 pub fn check(
     processes: &[ProcessInfo],
     attempt_marker: &str,
@@ -558,9 +559,10 @@ pub fn check(
     released: &[u32],
 ) -> ProcessCheck {
     let own = std::process::id();
+    let lineage = ancestry(processes, own);
     let live: Vec<&ProcessInfo> = processes
         .iter()
-        .filter(|process| process.pid != own && !released.contains(&process.pid))
+        .filter(|process| !lineage.contains(&process.pid) && !released.contains(&process.pid))
         .collect();
     let mut verified: BTreeSet<u32> = live
         .iter()
@@ -597,6 +599,25 @@ pub fn check(
     } else {
         ProcessCheck::Clear
     }
+}
+
+/// `pid` and its ancestors in `processes`, by parent PID up to init (or the first one not
+/// listed). Each PID is taken once, so a listing that loops ends the walk.
+fn ancestry(processes: &[ProcessInfo], pid: u32) -> BTreeSet<u32> {
+    let mut lineage = BTreeSet::from([pid]);
+    let mut at = pid;
+    while let Some(parent) = processes
+        .iter()
+        .find(|process| process.pid == at)
+        .map(|process| process.ppid)
+        .filter(|&ppid| ppid > 1)
+    {
+        if !lineage.insert(parent) {
+            break;
+        }
+        at = parent;
+    }
+    lineage
 }
 
 /// Stops `pids`, which the caller verified as the run's: SIGTERM, then SIGKILL for those still
@@ -1164,6 +1185,28 @@ mod tests {
             check(&list, "m", &[], &[7], &[]),
             ProcessCheck::Unverified(vec![P + 900])
         );
+    }
+
+    #[test]
+    fn octets_own_ancestors_are_not_the_runs() {
+        let own = std::process::id();
+        // A tmux server a coder started carries the marker; the user's shell in one of its
+        // panes ran this Octet. Neither is the run's, and the shell is not verified through
+        // the server; another pane's process that carries the marker itself still is.
+        let list = [
+            info(P + 10, 1, P + 10, Some("m")),
+            info(P + 20, P + 10, P + 20, None),
+            info(own, P + 20, own, None),
+            info(P + 30, P + 10, P + 30, Some("m")),
+            info(P + 40, P + 10, P + 40, None),
+        ];
+        assert_eq!(
+            check(&list, "m", &[], &[], &[]),
+            ProcessCheck::Verified(vec![P + 30])
+        );
+        // Without the other pane's marker nothing is verified.
+        let list = [list[0].clone(), list[1].clone(), list[2].clone()];
+        assert_eq!(check(&list, "m", &[], &[], &[]), ProcessCheck::Clear);
     }
 
     #[tokio::test]
