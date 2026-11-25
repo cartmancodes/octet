@@ -832,6 +832,17 @@ mod tests {
         interrupt: Option<Signals>,
         follow_up: Option<FollowUp<'_>>,
     ) -> (TurnEnd, Vec<Command>) {
+        turn_over_with(step, events, interrupt, follow_up, Arc::default()).await
+    }
+
+    /// [`turn_over`] with a [`Silent`] approver counting into `asked`.
+    async fn turn_over_with(
+        step: usize,
+        events: Vec<Event>,
+        interrupt: Option<Signals>,
+        follow_up: Option<FollowUp<'_>>,
+        asked: Arc<AtomicUsize>,
+    ) -> (TurnEnd, Vec<Command>) {
         let temp = TempDir::new("octet-fleet-step-unit");
         let mut log = log_in(&temp).await;
         let workflow = crate::sim::shipped();
@@ -861,7 +872,7 @@ mod tests {
             events: events.into(),
             sent: RefCell::default(),
         };
-        let mut approver = Silent(Arc::new(AtomicUsize::new(0)));
+        let mut approver = Silent(asked);
         let (tx, _rx) = mpsc::channel(64);
         let end = tokio::time::timeout(
             Duration::from_secs(5),
@@ -985,12 +996,18 @@ mod tests {
             Event::Started,
             approval(1),
         ];
+        let asked = Arc::new(AtomicUsize::new(0));
+        // Once the approval is being asked, not after a guessed delay.
         let interrupting = async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            while asked.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             signal.send(Some("SIGINT")).expect("the turn listens");
         };
-        let ((end, sent), ()) =
-            tokio::join!(turn_over(write, events, Some(signals), None), interrupting);
+        let ((end, sent), ()) = tokio::join!(
+            turn_over_with(write, events, Some(signals), None, Arc::clone(&asked)),
+            interrupting
+        );
         assert_eq!(end, TurnEnd::Interrupted);
         // The request is left unanswered.
         assert_eq!(sent, [Command::Prompt("go".into())]);
