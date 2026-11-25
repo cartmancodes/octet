@@ -221,3 +221,10 @@ pub const APPROVAL_ID: &str = "perm-1";
 pub const CANCELLED_APPROVAL_ID: &str = "perm-2";
 /// Codex and Claude: `APPROVALS_9` numbers its requests `cap-1` … `cap-9`.
 pub const CAP_PREFIX: &str = "cap-";
+
+/// The environment variable that names a fleet script (JSON) for
+/// `protocol-child`. Set, and with a prompt whose first line is an
+/// `[octet-fleet ` header, the Codex and Claude fakes perform that header's
+/// scripted turn (see the `fleet` module of `protocol-child`) instead of
+/// choosing a scenario by the prompt's text. Unset, nothing changes.
+pub const FLEET_SCRIPT_ENV: &str = "OCTET_FLEET_SCRIPT";

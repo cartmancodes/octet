@@ -2,8 +2,12 @@
 //! runs headless (`--print`, `--rpc`).
 #![forbid(unsafe_code)]
 use args::{CliError, HubAction, Parsed, Prompt, Run};
-use std::{io::IsTerminal, path::PathBuf};
+use std::{
+    io::IsTerminal,
+    path::{Path, PathBuf},
+};
 mod args;
+mod fleet;
 mod headless;
 mod hub;
 mod pair;
@@ -57,6 +61,7 @@ fn help() -> String {
         "                 [--print PROMPT|- [--output text|json] | --rpc]",
         "       octet hub [serve|devices|revoke NAME|watch|install|uninstall] (the phone hub; octet hub --help)",
         "       octet pair [--journal-dir PATH] (pair a phone; octet pair --help)",
+        "       octet fleet run|resume|stop|status|validate (workflows; octet fleet --help)",
         "       octet --version | --help",
         "",
         "Headless: --print (-p) runs one prompt and writes the reply; - reads it",
@@ -130,7 +135,12 @@ async fn main() -> std::process::ExitCode {
 /// path, so a terminal UI, the hub and the sessions a phone starts, each with its own working
 /// directory, all name the same place.
 fn data_dir(journal_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    let directory = journal_dir
+    make_data_dir(&data_dir_path(journal_dir)?)
+}
+
+/// The data directory [`data_dir`] makes, not made yet and as given.
+fn data_dir_path(journal_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    journal_dir
         .or_else(|| {
             std::env::var_os("XDG_DATA_HOME")
                 .map(PathBuf::from)
@@ -140,14 +150,18 @@ fn data_dir(journal_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
         .or_else(|| octet_core::home_dir().map(|p| p.join(".local/share").join(JOURNAL_DIR)))
         .ok_or_else(|| {
             CliError::Usage("Set --journal-dir or HOME to choose transcript storage".into())
-        })?;
+        })
+}
+
+/// Makes the data directory `directory` (owner-only) if missing; its canonical absolute path.
+pub(crate) fn make_data_dir(directory: &Path) -> Result<PathBuf, CliError> {
     let resolve = || {
         use std::os::unix::fs::DirBuilderExt as _;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(&directory)?;
-        std::fs::canonicalize(&directory)
+            .create(directory)?;
+        std::fs::canonicalize(directory)
     };
     resolve().map_err(|e| CliError::Run(format!("Couldn't use {}: {e}", directory.display())))
 }
@@ -177,6 +191,22 @@ async fn run() -> Result<i32, CliError> {
                 HubAction::Install { print } => hub::install(directory, print).await,
                 HubAction::Uninstall => hub::uninstall(directory).await,
             };
+        }
+        Parsed::Fleet {
+            action,
+            journal_dir,
+        } => {
+            let explicit = journal_dir.is_some();
+            // `--help` and `validate` touch no storage, so none is made for them;
+            // `run` makes it once it has checked where it is.
+            let directory = if matches!(action, args::FleetAction::Run { .. }) {
+                data_dir_path(journal_dir)?
+            } else if action.stores() {
+                data_dir(journal_dir)?
+            } else {
+                PathBuf::new()
+            };
+            return fleet::fleet(action, directory, explicit).await;
         }
         Parsed::PairHelp => {
             print!("{}", pair_help());

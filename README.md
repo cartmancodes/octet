@@ -145,7 +145,8 @@ and provider switching, resume, fork, compaction, reasoning effort, images,
 steering, the session browser, `!` and `@`, goals, export, print/JSON/RPC
 modes and clean shutdown.
 
-Not yet supported: multi-agent (fleet) orchestration and quota routing,
+Multi-step workflows across providers run headless with `octet fleet`
+([guide](docs/fleet/README.md)). Not yet supported: quota routing,
 managing the vendors' plugins and their resource surfaces, Octet-owned history with
 branching and labels, and the Python era's RPC envelope. The
 [parity matrix](docs/rust/parity-matrix.md) says why each waits.

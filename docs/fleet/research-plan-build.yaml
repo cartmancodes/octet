@@ -1,0 +1,87 @@
+version: 1
+name: research-plan-build
+limits:
+  max_rounds: 5            # backward jumps per edge
+  transient_retries: 3
+profiles:
+  claude-research: { engine: claude, model: claude-opus-5-5, effort: high }
+  codex-review:    { engine: codex,  model: gpt-6-astra }
+  codex-code:      { engine: codex,  model: gpt-6-astra, mode: full-access }
+  opencode-test:   { engine: opencode, mode: accept-edits }
+  claude-review:   { engine: claude, model: claude-opus-5-5 }
+roles:
+  researcher:
+    kind: document
+    instructions: >-
+      Investigate the code before anything is designed. Describe what already exists, which
+      files, modules and interfaces the task touches, and how they behave today. List the risks,
+      unknowns and constraints you found, and say which claims you verified by reading code and
+      which you are inferring. Do not change any file and do not propose an implementation; your
+      reply is the research document that a reviewer will approve or send back.
+  planner:
+    kind: document
+    instructions: >-
+      Write an implementation plan from the approved research and the task. Break the work into
+      small ordered steps, and name the files and functions each step changes. Say how each step
+      is verified, including the tests to write first, and call out anything the research left
+      open. Do not change any file; your reply is the plan that a reviewer will approve or send
+      back.
+  reviewer:
+    kind: verdict
+    instructions: >-
+      Review the artifact you are given against the task and against everything it claims to
+      build on. Look for missing requirements, wrong assumptions, unverified claims, and for
+      anything the artifact leaves out that a later step would depend on. When you review a
+      change, read the test evidence and judge the code against it; do not trust a summary.
+      Explain each problem concretely enough for its author to fix it. Your reply ends with a
+      JSON verdict block in the format Octet appends to these instructions, approving the
+      artifact or requesting changes.
+  coder:
+    kind: change
+    instructions: >-
+      Implement the approved plan in the work tree. Follow the plan's order, write each test
+      before the code that makes it pass, and keep the change limited to what the plan covers.
+      If the plan turns out to be wrong or incomplete, make the smallest reasonable choice and
+      say so in your reply. Leave the tree in a state where the project builds, and finish with
+      a short account of what you changed.
+  tester:
+    kind: tests
+    instructions: >-
+      Write or select the tests that show the change does what the plan says. Add missing
+      tests for behaviour the change introduces or alters, and prefer tests that fail without
+      the change. Do not weaken or delete an existing test to make it pass. Octet runs the
+      commands for this step itself and records their output as the evidence the final review
+      reads.
+steps:
+  - id: research
+    role: researcher
+    profile: claude-research
+  - id: review_research
+    role: reviewer
+    profile: codex-review
+    reviews: research          # rejection goes back to research (the producer)
+  - id: plan
+    role: planner
+    profile: claude-research
+    inputs:
+      - { from: research, approval_from: review_research }
+  - id: review_plan
+    role: reviewer
+    profile: codex-review
+    reviews: plan              # rejection goes back to plan
+  - id: implement
+    role: coder
+    profile: codex-code
+    inputs:
+      - { from: plan, approval_from: review_plan }
+  - id: test
+    role: tester
+    profile: opencode-test
+    change_from: implement     # failure goes back to implement (the producer)
+    commands: ["cargo test --workspace"]
+    timeout: 20m
+  - id: review_change
+    role: reviewer
+    profile: claude-review
+    reviews: implement         # rejection goes back to implement
+    evidence_from: test

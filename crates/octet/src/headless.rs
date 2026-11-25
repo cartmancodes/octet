@@ -1,68 +1,23 @@
 //! Print, JSON and RPC modes: one session without the terminal interface.
 //! Approvals fail closed: print mode denies them, RPC clients answer them.
 use crate::args::{CliError, check_prompt_size};
-use octet_core::{Command, Config, Event, Mode, Outcome, Session, event_json};
+use octet_core::{
+    Command, Config, Event, Mode, Outcome, Session, background::Background, event_json,
+};
 use serde_json::Value;
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     signal::unix::{Signal, SignalKind, signal},
     sync::mpsc,
-    time::{Instant, sleep_until},
 };
 
 /// The longest RPC command line: a full prompt, JSON-escaped, with room.
 const LINE_LIMIT: usize = 4 * octet_core::PROMPT_LIMIT;
 /// Exit code after SIGINT, as shells report it.
-const INTERRUPTED: i32 = 130;
+pub(crate) const INTERRUPTED: i32 = 130;
 /// Exit code after SIGTERM, as shells report it.
-const TERMINATED: i32 = 143;
-/// How long a run waits, after the vendor's last background task ends
-/// between turns, for the turn Claude then starts of its own.
-const BACKGROUND_GRACE: Duration = Duration::from_secs(5);
-
-/// The vendor's background tasks. Claude starts a turn of its own when one
-/// ends after its turn did, so a headless run must not end while one runs,
-/// nor just after the last one ended.
-#[derive(Default)]
-struct Background {
-    /// Tasks running.
-    tasks: usize,
-    /// The last task ended between turns: until then a turn may follow.
-    grace: Option<Instant>,
-}
-impl Background {
-    /// Follows the session's events; `idle` when no turn runs.
-    fn track(&mut self, event: &Event, idle: bool) {
-        match event {
-            Event::Background(tasks) => {
-                if *tasks == 0 && self.tasks > 0 && idle {
-                    self.grace = Some(Instant::now() + BACKGROUND_GRACE);
-                }
-                self.tasks = *tasks;
-            }
-            Event::Started => self.grace = None,
-            _ => {}
-        }
-    }
-
-    /// A task runs, or one ended so recently that a turn may still follow.
-    fn pending(&self) -> bool {
-        self.tasks > 0 || self.grace.is_some()
-    }
-
-    /// Ends the grace once it passes; never, when there is none.
-    async fn grace_over(&mut self) {
-        match self.grace {
-            Some(at) => {
-                sleep_until(at).await;
-                self.grace = None;
-            }
-            None => std::future::pending().await,
-        }
-    }
-}
-
+pub(crate) const TERMINATED: i32 = 143;
 /// Writes `octet: text` to stderr. A closed stderr is not worth a panic:
 /// the session must still shut down.
 pub(crate) fn warn(text: &str) {
@@ -70,18 +25,51 @@ pub(crate) fn warn(text: &str) {
     let _ = writeln!(std::io::stderr(), "octet: {text}");
 }
 
-/// `text`'s first line without control characters: vendor text must not steer the terminal.
-fn plain(text: &str) -> String {
+/// `text`'s first line without control or invisible formatting characters:
+/// vendor text must not steer the terminal, nor reorder what it shows.
+pub(crate) fn plain(text: &str) -> String {
     text.lines()
         .next()
         .unwrap_or_default()
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !invisible(*c))
         .collect()
 }
 
+/// A Unicode format character (category `Cf`) that a terminal shows as
+/// nothing or uses to reorder text: the bidirectional controls, the
+/// zero-width characters, the soft hyphen, the byte-order mark, the tag
+/// characters and the like. Text with one can show something other than
+/// what it is.
+pub(crate) fn invisible(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
 /// What a denied approval was for, as it is safe to print.
-fn denied(summary: &octet_core::ApprovalSummary) -> String {
+pub(crate) fn denied(summary: &octet_core::ApprovalSummary) -> String {
     match &summary.command {
         Some(command) => format!("{}: {}", plain(&summary.action), plain(command)),
         None => plain(&summary.action),
@@ -206,7 +194,7 @@ async fn drive_print(
                 if !json {
                     warn(&format!(
                         "waiting for {} background task(s); Ctrl+C stops",
-                        background.tasks
+                        background.tasks()
                     ));
                 }
                 held = Some(code);
@@ -434,7 +422,7 @@ pub(crate) async fn read_prompt() -> Result<String, CliError> {
 
 /// The prompt in `bytes`, less one line ending, checked against the limit
 /// before UTF-8.
-fn prompt_text(mut bytes: Vec<u8>) -> Result<String, CliError> {
+pub(crate) fn prompt_text(mut bytes: Vec<u8>) -> Result<String, CliError> {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
         if bytes.last() == Some(&b'\r') {
@@ -644,6 +632,14 @@ mod tests {
             Ok("short".to_owned())
         );
         assert_eq!(read_line(&mut reader).await.unwrap(), None);
+    }
+
+    #[test]
+    fn plain_text_loses_bidi_and_zero_width_characters() {
+        assert_eq!(plain("/bin/cl\u{200b}aude"), "/bin/claude");
+        assert_eq!(plain("rm \u{202e}fdp.exe"), "rm fdp.exe");
+        assert_eq!(plain("a\u{2066}b\u{2069}\u{feff}c"), "abc");
+        assert_eq!(plain("naïve — ok"), "naïve — ok");
     }
 
     #[test]

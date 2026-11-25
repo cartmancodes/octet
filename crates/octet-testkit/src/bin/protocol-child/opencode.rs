@@ -1,6 +1,7 @@
 //! The fake opencode agent (`opencode acp`): the Agent Client Protocol's
 //! `initialize`, `session/*` requests, with the scripts in `scenario` chosen by
 //! the prompt's text or the model the session was given.
+use crate::fleet;
 use crate::wire::{acp_error, acp_result, acp_text, acp_update, emit};
 use octet_testkit::scenario;
 use serde_json::{Value, json};
@@ -500,6 +501,9 @@ impl OpencodeFixture {
             .find(|block| block["type"] == "text")
             .and_then(|block| block["text"].as_str())
             .unwrap_or("");
+        if self.fleet_turn(&sid, id, text) {
+            return;
+        }
         if echo_images(&sid, id, blocks) {
             return;
         }
@@ -583,6 +587,28 @@ impl OpencodeFixture {
                 end_turn(id);
             }
         }
+    }
+
+    /// Performs the fleet script's turn for the prompt `id`, if it has one:
+    /// its reply and the turn's end, its usage-limit failure, or nothing for
+    /// a held turn, which a cancel ends, like `HOLD`.
+    fn fleet_turn(&mut self, sid: &str, id: &Value, text: &str) -> bool {
+        let cwd = env::current_dir().unwrap();
+        let Some(scripted) = fleet::turn(text, &cwd, self.opened == "session/resume") else {
+            return false;
+        };
+        if scripted.fail {
+            emit(&acp_error(id, -32603, "You've hit your usage limit."));
+        } else if scripted.hold {
+            self.held = Some(id.clone());
+        } else {
+            emit(&acp_text(sid, &scripted.reply));
+            end_turn(id);
+            if scripted.exit_after {
+                process::exit(0);
+            }
+        }
+        true
     }
 
     /// `PARAMS`'s echo: the launch arguments and environment, and what the

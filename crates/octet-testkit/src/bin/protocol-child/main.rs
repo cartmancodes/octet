@@ -8,6 +8,7 @@
 mod antigravity;
 mod claude;
 mod codex;
+mod fleet;
 mod opencode;
 mod wire;
 
@@ -22,6 +23,7 @@ use std::{
 use wire::emit;
 
 fn main() {
+    fleet::record_start();
     let mode = env::args().nth(1).expect("mode");
     match mode.as_str() {
         "app-server" => codex::run(),
@@ -29,6 +31,14 @@ fn main() {
         "acp" if env::args().any(|arg| arg == "--cli_dir_name") => antigravity::run(),
         "acp" => opencode::run(),
         "session" => opencode::session_command(),
+        // A fleet turn's survivor: sleeps for the seconds given, then exits.
+        "fleet-survivor" => {
+            let secs = env::args()
+                .nth(2)
+                .and_then(|secs| secs.parse().ok())
+                .unwrap_or(fleet::SURVIVOR_SECS);
+            thread::sleep(Duration::from_secs(secs));
+        }
         "debug" => opencode::debug_command(),
         "split" => {
             let mut stdout = io::stdout().lock();

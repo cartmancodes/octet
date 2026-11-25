@@ -1,6 +1,7 @@
 //! The fake Claude Code (`--print` stream-json): control requests, answers
 //! to its own permission requests, and user turns, with the scripts in
 //! `scenario` chosen by the prompt's text or a launch argument.
+use crate::fleet;
 use crate::wire::{
     claude_control_error, claude_control_success, claude_delta, claude_init, claude_permission,
     claude_result, emit, goal_reply,
@@ -45,7 +46,8 @@ pub(crate) fn run() {
         match v["type"].as_str() {
             Some("control_request") => claude.control_request(&v),
             Some("control_response") => claude.answered(&v),
-            Some("user") => claude.user(&v),
+            // A fleet script's turn is performed by the guard; no other turn is.
+            Some("user") if !claude.fleet_turn(&v) => claude.user(&v),
             _ => {}
         }
     }
@@ -291,6 +293,35 @@ impl ClaudeFixture {
         }
     }
 
+    /// Performs the fleet script's turn for the user message `v`, if it has
+    /// one: its reply and the turn's end, its usage-limit failure, or only the
+    /// turn's start for a held turn, which stays open until interrupted, like
+    /// `HOLD`.
+    fn fleet_turn(&self, v: &Value) -> bool {
+        let text = v
+            .pointer("/message/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let cwd = env::current_dir().unwrap();
+        let Some(scripted) = fleet::turn(text, &cwd, self.launched_with("--resume")) else {
+            return false;
+        };
+        if scripted.fail {
+            emit(&claude_init(self.sid));
+            emit(
+                &json!({"type":"result","subtype":"error_during_execution","is_error":true,"errors":["Claude AI usage limit reached"],"session_id":self.sid,"total_cost_usd":0.0}),
+            );
+        } else if scripted.hold {
+            emit(&claude_init(self.sid));
+        } else {
+            self.say(&scripted.reply);
+            if scripted.exit_after {
+                process::exit(0);
+            }
+        }
+        true
+    }
+
     /// Answers the held mode switches: the first succeeds, the rest are refused.
     fn flush(&mut self) {
         for (index, id) in self.held.drain(..).enumerate() {
@@ -333,10 +364,16 @@ impl ClaudeFixture {
         } else {
             scenario::CLAUDE_REPLY.to_owned()
         };
+        self.say(&reply);
+    }
+
+    /// The turn's reply `reply`: the session announced, the text streamed and
+    /// whole, and the turn's end.
+    fn say(&self, reply: &str) {
         emit(&claude_init(self.sid));
-        emit(&claude_delta(&reply));
+        emit(&claude_delta(reply));
         emit(&json!({"type":"assistant","message":{"content":[{"type":"text","text":reply}]}}));
-        emit(&claude_result(self.sid, &reply));
+        emit(&claude_result(self.sid, reply));
     }
 }
 
