@@ -430,8 +430,10 @@ pub async fn check_data_dir(repo: &Repo, data_dir: &Path) -> Result<(), Snapshot
         return Err(refused());
     }
     // The trailing slash: a directory pattern (`data/`) matches a directory
-    // that does not exist yet.
-    let mut asked = rel.as_os_str().to_owned();
+    // that does not exist yet. The leading `./`: a name starting with `:` is
+    // not read as pathspec magic (`:/data/` would ask about `data/`).
+    let mut asked = std::ffi::OsString::from("./");
+    asked.push(rel);
     asked.push("/");
     let mut check = command(&repo.top, ["check-ignore", "-q", "--"]);
     check
@@ -452,7 +454,8 @@ pub async fn check_data_dir(repo: &Repo, data_dir: &Path) -> Result<(), Snapshot
 
 /// Whether `rel`, relative to the work tree's top level, is a submodule or in
 /// one: the index has a gitlink (mode 160000) at it or at one of its
-/// ancestors.
+/// ancestors. A gitlink elsewhere below an ancestor (`vendor/lint` for
+/// `vendor/data`) does not count.
 async fn in_submodule(repo: &Repo, rel: &Path) -> Result<bool, SnapshotError> {
     let mut prefixes = Vec::new();
     let mut prefix = PathBuf::new();
@@ -467,9 +470,16 @@ async fn in_submodule(repo: &Repo, rel: &Path) -> Result<bool, SnapshotError> {
     );
     listed.args(&prefixes);
     let listed = exec(listed, &[]).await?;
-    Ok(listed
-        .split(|byte| *byte == 0)
-        .any(|entry| entry.starts_with(b"160000 ")))
+    // `<mode> <object> <stage>\t<path>`, one per NUL.
+    Ok(listed.split(|byte| *byte == 0).any(|entry| {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            return false;
+        };
+        entry.starts_with(b"160000 ")
+            && prefixes
+                .iter()
+                .any(|prefix| prefix.as_os_str().as_bytes() == &entry[tab + 1..])
+    }))
 }
 
 /// `path` made absolute, its deepest existing ancestor with symbolic links
@@ -686,6 +696,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_data_directory_named_like_pathspec_magic_means_itself() {
+        let dir = init();
+        // `data/` at the top is ignored; `:/data` and `:(top)data/data` are
+        // not, though git would read `:/data/` and `:(top)data/` as `data/`.
+        write(dir.path(), ".gitignore", "/data/\n");
+        write(dir.path(), "a.txt", "one\n");
+        commit_all(dir.path());
+        let repo = open_repo(dir.path()).await.expect("opens");
+        for named in [":/data", ":(top)data"] {
+            fs::create_dir_all(dir.path().join(named)).expect("dir");
+            assert!(
+                matches!(
+                    check_data_dir(&repo, &dir.path().join(named)).await,
+                    Err(SnapshotError::DataDirInTree { .. })
+                ),
+                "{named} is not ignored"
+            );
+        }
+        check_data_dir(&repo, &dir.path().join("data"))
+            .await
+            .expect("the ignored directory");
+    }
+
+    #[tokio::test]
     async fn a_data_directory_in_a_submodule_is_outside_the_snapshot() {
         let inner = init();
         write(inner.path(), "a.txt", "inner\n");
@@ -722,6 +756,34 @@ mod tests {
             check_data_dir(&repo, &dir.path().join("data")).await,
             Err(SnapshotError::DataDirInTree { .. })
         ));
+        // Also beside a submodule under a shared parent: only a gitlink at
+        // the path or above it counts, not one elsewhere below an ancestor.
+        sh(
+            dir.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                &source,
+                "vendor/lint",
+            ],
+        );
+        commit_all(dir.path());
+        let repo = open_repo(dir.path()).await.expect("opens");
+        check_data_dir(&repo, &dir.path().join("vendor/lint/data"))
+            .await
+            .expect("a directory in the nested submodule");
+        for beside in ["vendor/data", "vendor/lint-data"] {
+            assert!(
+                matches!(
+                    check_data_dir(&repo, &dir.path().join(beside)).await,
+                    Err(SnapshotError::DataDirInTree { .. })
+                ),
+                "{beside} is only beside the submodule"
+            );
+        }
     }
 
     #[tokio::test]
