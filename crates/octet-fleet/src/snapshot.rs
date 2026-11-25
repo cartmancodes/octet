@@ -698,7 +698,7 @@ mod tests {
     #[tokio::test]
     async fn a_data_directory_named_like_pathspec_magic_means_itself() {
         let dir = init();
-        // `data/` at the top is ignored; `:/data` and `:(top)data/data` are
+        // `data/` at the top is ignored; `:/data` and `:(top)data` are
         // not, though git would read `:/data/` and `:(top)data/` as `data/`.
         write(dir.path(), ".gitignore", "/data/\n");
         write(dir.path(), "a.txt", "one\n");

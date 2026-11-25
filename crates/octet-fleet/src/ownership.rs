@@ -537,21 +537,25 @@ mod platform {
         pub(super) exited: bool,
     }
 
-    /// Read as bytes: the kernel cuts the command name at 15 bytes, which can split a UTF-8
-    /// character, and such a process must still be listed.
     fn stat(pid: u32) -> Option<Stat> {
-        parse_stat(&String::from_utf8_lossy(
-            &fs::read(format!("/proc/{pid}/stat")).ok()?,
-        ))
+        stat_of(&fs::read(format!("/proc/{pid}/stat")).ok()?)
+    }
+
+    /// `/proc/<pid>/stat` read as bytes: the kernel cuts the command name at 15 bytes, which
+    /// can split a UTF-8 character, and such a process must still be listed.
+    pub(super) fn stat_of(bytes: &[u8]) -> Option<Stat> {
+        parse_stat(&String::from_utf8_lossy(bytes))
     }
 
     /// Fields after the last `)` (the command name may hold anything): the state, field 3, is
-    /// the first, the parent, field 4, the second, the group, field 5, the third and the start
-    /// time, field 22, the twentieth.
+    /// the first, the parent, field 4, the second, the group, field 5, the third, the thread
+    /// count, field 20, the eighteenth and the start time, field 22, the twentieth. State `Z`
+    /// with other threads still running is a main thread that exited, not an exited process.
     pub(super) fn parse_stat(stat: &str) -> Option<Stat> {
         let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+        let threads: u32 = fields.get(17)?.parse().ok()?;
         Some(Stat {
-            exited: fields.first()?.starts_with('Z'),
+            exited: fields.first()?.starts_with('Z') && threads <= 1,
             ppid: fields.get(1)?.parse().ok()?,
             pgid: fields.get(2)?.parse().ok()?,
             start: (*fields.get(19)?).to_string(),
@@ -1158,9 +1162,12 @@ mod tests {
         // A zombie whose 15-byte name cut a character in two (read lossily) is still listed.
         let bytes =
             b"815 (\xe0\xa4\x95\xe0\xa4) Z 1 798 797 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 9 0 0";
-        let stat = platform::parse_stat(&String::from_utf8_lossy(bytes)).expect("a stat");
+        let stat = platform::stat_of(bytes).expect("a stat");
         assert!(stat.exited);
         assert_eq!((stat.ppid, stat.pgid), (1, 798));
+        // `Z` with three threads: its main thread exited, the others still run.
+        let stat = "816 (w) Z 1 798 797 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 3 0 9 0 0";
+        assert!(!platform::parse_stat(stat).expect("a stat").exited);
     }
 
     fn info(pid: u32, ppid: u32, pgid: u32, marker: Option<&str>) -> ProcessInfo {
