@@ -28,7 +28,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::contract::CommandSummary;
-use crate::ownership::{list_processes, start_time};
+use crate::ownership::{ProcessInfo, list_processes, start_time};
 use crate::record::{AttemptId, CandidateId, Identity, Record};
 use crate::snapshot::{Repo, SnapshotError, take};
 use crate::store::{Log, StoreError};
@@ -235,7 +235,7 @@ const GROUP_LOOK: Duration = Duration::from_millis(50);
 async fn stop_group(leader: &GroupLeader, pgid: u32) {
     if leader.term_group() {
         let deadline = Instant::now() + TERM_GRACE;
-        while Instant::now() < deadline && group_alive(leader, pgid).await {
+        while Instant::now() < deadline && group_alive(leader, pgid, deadline).await {
             tokio::time::sleep(GROUP_LOOK).await;
         }
     }
@@ -243,16 +243,30 @@ async fn stop_group(leader: &GroupLeader, pgid: u32) {
 }
 
 /// Whether the group led by `pgid` still has a member running: its leader,
-/// or any other process in it. A listing that fails ends the wait.
-async fn group_alive(leader: &GroupLeader, pgid: u32) -> bool {
+/// or any other process in it (see [`member_running`]).
+async fn group_alive(leader: &GroupLeader, pgid: u32, deadline: Instant) -> bool {
     if !leader.exited_within(Duration::ZERO).await {
         return true;
     }
-    list_processes().await.is_ok_and(|processes| {
-        processes
+    member_running(list_processes(), pgid, deadline).await
+}
+
+/// Whether `listing` shows a process of the group led by `pgid`, other than
+/// the leader, that has not exited: a member that exited but is not reaped
+/// (a zombie nobody waits for) runs nothing. A listing that fails, or is
+/// not back by `deadline` (a `/proc` read stuck on a hung mount), shows none
+/// and so ends the wait.
+async fn member_running<E>(
+    listing: impl Future<Output = Result<Vec<ProcessInfo>, E>>,
+    pgid: u32,
+    deadline: Instant,
+) -> bool {
+    match tokio::time::timeout_at(deadline.into(), listing).await {
+        Ok(Ok(processes)) => processes
             .iter()
-            .any(|process| process.pgid == pgid && process.pid != pgid)
-    })
+            .any(|process| process.pgid == pgid && process.pid != pgid && !process.exited),
+        Ok(Err(_)) | Err(_) => false,
+    }
 }
 
 /// Kills `leader`'s group, then reaps the leader so no zombie is left.
@@ -1040,6 +1054,43 @@ mod tests {
             "cleaned\n"
         );
         assert!(gone("sleep 31340").await, "the whole group is gone");
+    }
+
+    fn listed(pid: u32, pgid: u32, exited: bool) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid: 1,
+            pgid,
+            start: String::new(),
+            marker: None,
+            command: String::new(),
+            exited,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_member_that_has_not_exited_holds_the_grace() {
+        let later = Instant::now() + Duration::from_secs(5);
+        let running =
+            |list: Vec<ProcessInfo>| member_running(async move { Ok::<_, ()>(list) }, 700, later);
+        assert!(running(vec![listed(700, 700, true), listed(701, 700, false)]).await);
+        // The leader itself, another group, an unreaped zombie member: none.
+        assert!(!running(vec![listed(700, 700, true)]).await);
+        assert!(!running(vec![listed(701, 9, false)]).await);
+        assert!(!running(vec![listed(701, 700, true)]).await);
+        assert!(!member_running(async { Err::<Vec<ProcessInfo>, _>(()) }, 700, later).await);
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_never_returns_ends_the_grace_at_its_deadline() {
+        let started = Instant::now();
+        let listing = std::future::pending::<Result<Vec<ProcessInfo>, ()>>();
+        assert!(!member_running(listing, 700, started + Duration::from_millis(100)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

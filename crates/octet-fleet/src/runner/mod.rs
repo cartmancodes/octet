@@ -1002,6 +1002,7 @@ mod tests {
             start: "Mon Jan  1 00:00:00 2026".into(),
             marker: None,
             command: "a stranger".into(),
+            exited: false,
         }
     }
 

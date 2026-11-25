@@ -323,6 +323,8 @@ pub struct ProcessInfo {
     pub marker: Option<String>,
     /// Its command line.
     pub command: String,
+    /// It has exited and waits to be reaped (a zombie): it runs nothing.
+    pub exited: bool,
 }
 
 /// Lists every process the platform shows, with its environment marker where readable.
@@ -362,7 +364,13 @@ mod platform {
 
     pub(super) async fn list() -> Result<Vec<ProcessInfo>, OwnershipError> {
         let out = ps()
-            .args(["-A", "-E", "-ww", "-o", "pid=,ppid=,pgid=,lstart=,command="])
+            .args([
+                "-A",
+                "-E",
+                "-ww",
+                "-o",
+                "pid=,ppid=,pgid=,stat=,lstart=,command=",
+            ])
             .output()
             .await?;
         if !out.status.success() {
@@ -422,12 +430,14 @@ mod platform {
         Some(token)
     }
 
-    /// One `pid ppid pgid Www Mmm dd hh:mm:ss yyyy command…` line.
+    /// One `pid ppid pgid stat Www Mmm dd hh:mm:ss yyyy command…` line; a `stat` starting with
+    /// `Z` is a zombie.
     pub(super) fn parse_line(line: &str) -> Option<ProcessInfo> {
         let mut rest = line;
         let pid = token(&mut rest)?.parse().ok()?;
         let ppid = token(&mut rest)?.parse().ok()?;
         let pgid = token(&mut rest)?.parse().ok()?;
+        let exited = token(&mut rest)?.starts_with('Z');
         let mut start = Vec::with_capacity(5);
         for _ in 0..5 {
             start.push(token(&mut rest)?);
@@ -440,6 +450,7 @@ mod platform {
             start: start.join(" "),
             marker: marker_in(&command),
             command,
+            exited,
         })
     }
 }
@@ -457,7 +468,7 @@ mod platform {
     }
 
     pub(super) async fn start(pid: u32) -> Option<String> {
-        tokio::task::spawn_blocking(move || stat(pid).map(|(_, _, start)| start))
+        tokio::task::spawn_blocking(move || stat(pid).map(|stat| stat.start))
             .await
             .ok()
             .flatten()
@@ -494,7 +505,12 @@ mod platform {
     }
 
     fn read_process(pid: u32) -> Option<ProcessInfo> {
-        let (ppid, pgid, start) = stat(pid)?;
+        let Stat {
+            ppid,
+            pgid,
+            start,
+            exited,
+        } = stat(pid)?;
         let marker = fs::read(format!("/proc/{pid}/environ"))
             .ok()
             .and_then(|environ| marker_in(&environ));
@@ -506,25 +522,40 @@ mod platform {
             start,
             marker,
             command: command_text(&cmdline),
+            exited,
         })
     }
 
-    /// The parent, group and start time (clock ticks since boot, as decimal text) from
-    /// `/proc/<pid>/stat`.
-    fn stat(pid: u32) -> Option<(u32, u32, String)> {
-        parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    /// What the listing takes from `/proc/<pid>/stat`.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Stat {
+        pub(super) ppid: u32,
+        pub(super) pgid: u32,
+        /// Clock ticks since boot, as decimal text.
+        pub(super) start: String,
+        /// State `Z`: exited, not yet reaped.
+        pub(super) exited: bool,
     }
 
-    /// Fields after the last `)` (the command name may hold anything): the state is field 3, so
-    /// the parent, field 4, is the second, the group, field 5, the third and the start time,
-    /// field 22, the twentieth.
-    pub(super) fn parse_stat(stat: &str) -> Option<(u32, u32, String)> {
-        let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
-        Some((
-            fields.get(1)?.parse().ok()?,
-            fields.get(2)?.parse().ok()?,
-            (*fields.get(19)?).to_string(),
+    /// Read as bytes: the kernel cuts the command name at 15 bytes, which can split a UTF-8
+    /// character, and such a process must still be listed.
+    fn stat(pid: u32) -> Option<Stat> {
+        parse_stat(&String::from_utf8_lossy(
+            &fs::read(format!("/proc/{pid}/stat")).ok()?,
         ))
+    }
+
+    /// Fields after the last `)` (the command name may hold anything): the state, field 3, is
+    /// the first, the parent, field 4, the second, the group, field 5, the third and the start
+    /// time, field 22, the twentieth.
+    pub(super) fn parse_stat(stat: &str) -> Option<Stat> {
+        let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+        Some(Stat {
+            exited: fields.first()?.starts_with('Z'),
+            ppid: fields.get(1)?.parse().ok()?,
+            pgid: fields.get(2)?.parse().ok()?,
+            start: (*fields.get(19)?).to_string(),
+        })
     }
 
     /// The value of `OCTET_FLEET_ATTEMPT=` in a NUL-separated environment.
@@ -1085,9 +1116,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_ps_line_is_parsed_into_its_fields() {
-        let line = "  812   799   799 Mon Nov  3 10:11:12 2026     sleep 30 HOME=/h OCTET_FLEET_ATTEMPT=r/1 X=y";
+        let line = "  812   799   799 S+   Mon Nov  3 10:11:12 2026     sleep 30 HOME=/h OCTET_FLEET_ATTEMPT=r/1 X=y";
         let info = platform::parse_line(line).expect("a line");
         assert_eq!((info.pid, info.ppid, info.pgid), (812, 799, 799));
+        assert!(!info.exited);
         assert_eq!(info.start, "Mon Nov 3 10:11:12 2026");
         assert_eq!(info.marker.as_deref(), Some("r/1"));
         assert!(
@@ -1097,10 +1129,13 @@ mod tests {
         );
         assert!(platform::parse_line("not a line").is_none());
         // An argument that spells a marker comes before the environment's.
-        let line = "  813   799   799 Mon Nov  3 10:11:12 2026     sh -c OCTET_FLEET_ATTEMPT=x/9 \
+        let line = "  813   799   799 Ss   Mon Nov  3 10:11:12 2026     sh -c OCTET_FLEET_ATTEMPT=x/9 \
                     HOME=/h OCTET_FLEET_ATTEMPT=r/1";
         let info = platform::parse_line(line).expect("a line");
         assert_eq!(info.marker.as_deref(), Some("r/1"));
+        // A zombie: exited, waiting to be reaped.
+        let line = "  814   799   799 Z    Mon Nov  3 10:11:12 2026     <defunct>";
+        assert!(platform::parse_line(line).expect("a line").exited);
         assert_eq!(platform::marker_in("a b"), None);
     }
 
@@ -1110,9 +1145,22 @@ mod tests {
         let stat =
             "812 (a) b) c) S 799 798 797 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 123456 1000 50";
         // ppid 799, pgrp 798, starttime is field 22 (counting the pid as 1).
-        let (ppid, pgid, start) = platform::parse_stat(stat).expect("a stat");
-        assert_eq!((ppid, pgid, start.as_str()), (799, 798, "123456"));
+        assert_eq!(
+            platform::parse_stat(stat).expect("a stat"),
+            platform::Stat {
+                ppid: 799,
+                pgid: 798,
+                start: "123456".into(),
+                exited: false,
+            }
+        );
         assert!(platform::parse_stat("812 no parens").is_none());
+        // A zombie whose 15-byte name cut a character in two (read lossily) is still listed.
+        let bytes =
+            b"815 (\xe0\xa4\x95\xe0\xa4) Z 1 798 797 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 9 0 0";
+        let stat = platform::parse_stat(&String::from_utf8_lossy(bytes)).expect("a stat");
+        assert!(stat.exited);
+        assert_eq!((stat.ppid, stat.pgid), (1, 798));
     }
 
     fn info(pid: u32, ppid: u32, pgid: u32, marker: Option<&str>) -> ProcessInfo {
@@ -1123,6 +1171,7 @@ mod tests {
             start: format!("start-{pid}"),
             marker: marker.map(str::to_string),
             command: format!("cmd-{pid}"),
+            exited: false,
         }
     }
 
@@ -1231,6 +1280,7 @@ mod tests {
             start: "s".into(),
             marker: Some("m".into()),
             command: "octet".into(),
+            exited: false,
         };
         assert_eq!(check(&[own], "m", &[], &[5], &[]), ProcessCheck::Clear);
     }
